@@ -34,6 +34,20 @@
 
 #include "BVNRuntime.h"
 
+// csops() is not declared in a public iOS SDK header, but it is a real,
+// stable libSystem entry point - the same syscall wrapper Apple's own
+// debugserver and every JIT-enabler / anti-debugging library on iOS uses to
+// query a process's own code-signing status.  Querying your own pid needs no
+// entitlement.  Declared here rather than pulled from a private header so the
+// dependency is exactly one function prototype, auditable in place.
+extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr,
+                     size_t usersize);
+
+namespace {
+constexpr unsigned int kCSOpsStatus = 0;   // CS_OPS_STATUS
+constexpr uint32_t kCSDebugged = 0x10000000;  // CS_DEBUGGED
+}  // namespace
+
 #if TARGET_CPU_ARM64 || defined(__aarch64__)
 #define BVN_PROBE_ARM64 1
 #endif
@@ -53,6 +67,17 @@ void setDetail(const char* format, ...) {
     va_end(args);
 }
 
+bool isDebugged() {
+    uint32_t flags = 0;
+    // A nonzero return means the query itself failed (e.g. bad arguments);
+    // that is not the same as "not debugged" and is treated as false rather
+    // than risk a false positive.
+    if (csops(getpid(), kCSOpsStatus, &flags, sizeof(flags)) != 0) {
+        return false;
+    }
+    return (flags & kCSDebugged) != 0;
+}
+
 }  // namespace
 
 extern "C" BVNJITReport BVNJITProbe(void) {
@@ -67,6 +92,12 @@ extern "C" BVNJITReport BVNJITProbe(void) {
 #else
     report.jitCompiledIn = false;
 #endif
+
+    // Read directly from the kernel, independent of whether the mmap probe
+    // below succeeds, so a failure can be told apart: no debugger ever
+    // attached, versus a debugger attached but executable memory is still
+    // unavailable (a signing/entitlement problem, not a JIT-enabler problem).
+    report.debuggerAttached = isDebugged();
 
 #if !defined(BVN_PROBE_ARM64)
     report.status = BVNJITStatusUnavailable;
@@ -84,11 +115,29 @@ extern "C" BVNJITReport BVNJITProbe(void) {
         const int mmapErrno = errno;
         report.status = BVNJITStatusUnavailable;
         report.executableMemoryAvailable = false;
-        setDetail("mmap(PROT_EXEC | MAP_JIT) failed: %s (errno %d). The "
-                  "process does not hold the dynamic-codesigning entitlement. "
-                  "Attach a JIT enabler such as StikDebug and relaunch; "
-                  "BoxedVN cannot enable JIT by itself.",
-                  strerror(mmapErrno), mmapErrno);
+        if (!report.debuggerAttached) {
+            setDetail("mmap(PROT_EXEC | MAP_JIT) failed: %s (errno %d). The "
+                      "kernel does not have this process flagged as debugged "
+                      "(CS_DEBUGGED is not set) - no JIT enabler has actually "
+                      "attached yet, or it detached again. Attach StikDebug "
+                      "(or an equivalent JIT enabler) to THIS app while it is "
+                      "running, then check again; BoxedVN cannot enable JIT "
+                      "by itself.",
+                      strerror(mmapErrno), mmapErrno);
+        } else {
+            setDetail("mmap(PROT_EXEC | MAP_JIT) failed: %s (errno %d), even "
+                      "though the kernel DOES have this process flagged as "
+                      "debugged (CS_DEBUGGED is set). A JIT enabler attached "
+                      "successfully, but the process still cannot get "
+                      "executable memory. This points at the app's own "
+                      "signature: confirm the installed IPA was signed with "
+                      "the 'get-task-allow' entitlement present (it is in "
+                      "ios/app/BoxedVN.entitlements, but some signing tools "
+                      "strip entitlements they don't recognise) and that no "
+                      "other MDM/supervision restriction on this device "
+                      "blocks debugger-granted executable memory.",
+                      strerror(mmapErrno), mmapErrno);
+        }
         return report;
     }
     report.executableMemoryAvailable = true;

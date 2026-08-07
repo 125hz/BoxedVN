@@ -286,6 +286,10 @@ struct StatusView: View {
                 }
                 LabeledContent("ARM64 JIT compiled in",
                                value: model.jit.jitCompiledIn ? "yes" : "no")
+                LabeledContent("Debugger attached (CS_DEBUGGED)") {
+                    Text(model.jit.debuggerAttached ? "yes" : "no")
+                        .foregroundStyle(model.jit.debuggerAttached ? .green : .secondary)
+                }
                 LabeledContent("Executable memory",
                                value: model.jit.executableMemoryAvailable ? "yes" : "no")
                 Text(model.jit.detail).font(.caption).foregroundStyle(.secondary)
@@ -293,9 +297,21 @@ struct StatusView: View {
             }
 
             Section {
-                Text("BoxedVN cannot enable JIT itself. Attach StikDebug or "
-                     + "another JIT enabler to the app, then re-check.")
-                    .font(.caption)
+                // This updates live (every half second) without needing
+                // "Re-check" - the button above exists for an immediate,
+                // deliberate read, not because the badge is otherwise stale.
+                if model.jit.debuggerAttached && !model.jit.executableMemoryAvailable {
+                    Text("A debugger is attached, but executable memory is "
+                         + "still unavailable. This points at the app's own "
+                         + "signature rather than StikDebug - see the detail "
+                         + "above.")
+                        .foregroundStyle(.orange)
+                } else if !model.jit.debuggerAttached {
+                    Text("BoxedVN cannot enable JIT itself. Attach StikDebug or "
+                         + "another JIT enabler to this app while it is "
+                         + "running; the status above updates automatically.")
+                        .font(.caption)
+                }
             }
 
             Section("Runtime") {

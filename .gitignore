@@ -52,3 +52,4 @@ project/mac-xcode/Boxedwine/DerivedDataCoverage
 /lib/mac/
 /ios/BoxedVN.xcodeproj/
 /ios/app/Bundled/
+.DS_Store

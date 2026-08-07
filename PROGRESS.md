@@ -312,16 +312,70 @@ git clone <this fork> && cd boxedvn && git checkout ios
 Full detail, including what a signing tool does to the entitlements, is in
 `docs/BUILD_IOS.md`.
 
+## 1c. JIT still reporting "unavailable" after enabling it (2026-08-07, same day)
+
+After the black-screen fix, the user reported: launched with JIT enabled
+(StikDebug), and Runtime status still said "JIT unavailable."
+
+**Found two real bugs**, both fixed without needing the physical device:
+
+1. **The JIT badge never auto-refreshed.** `AppModel.jit` was set exactly
+   once, at `AppModel.init()` — a `.probe()` call that runs at cold launch,
+   before any JIT enabler has necessarily attached (StikDebug's attach is
+   inherently asynchronous relative to app launch). The only way to get a
+   fresh read was to navigate into **Runtime status** and tap **Re-check**.
+   If the user just glanced at the home screen — which is exactly what
+   "launched with JIT on... still says unavailable" describes — they'd see a
+   permanently stale reading no matter what actually happened afterward.
+   **Fix:** `AppModel.refreshJIT()` is now called on the same 0.5s timer that
+   already polls runtime state (`ios/app/Sources/AppModel.swift`). The probe
+   is one mmap+munmap of a single page — cheap enough to just keep live.
+
+2. **No way to tell "StikDebug never attached" from "it attached but JIT is
+   still broken."** The probe only ever reported the `mmap` failure with one
+   generic message. Added a second, independent signal: `csops(getpid(),
+   CS_OPS_STATUS, ...)` read directly from the kernel
+   (`ios/runtime/src/BVNJIT.mm`), checking the `CS_DEBUGGED` flag. This is
+   the same flag StikDebug's attach is trying to set, checked independently
+   of whether the `mmap` probe below it succeeds. Surfaced as
+   `BVNJITReport.debuggerAttached` through the C ABI, `JITReport` in Swift,
+   and a new "Debugger attached (CS_DEBUGGED)" row in Runtime status, with
+   the detail message now branching on it:
+   - not attached → points at StikDebug/the attach itself
+   - attached but `mmap` still fails → points at the app's own signature
+     (specifically: whether `get-task-allow` survived signing — see below)
+
+**Verified:** rebuilds cleanly, links, runs without crashing on the
+simulator with the new fields wired through end to end (compile + runtime
+smoke test only — the diagnostic's actual discriminating value only shows up
+on a device where `CS_DEBUGGED` genuinely varies, which the simulator can't
+exercise). **Not yet confirmed against a real StikDebug attach.**
+
+**Also checked, not a bug but worth knowing:** the IPA is built and packaged
+unsigned by design (`CODE_SIGNING_ALLOWED=NO`), so `ios/app/BoxedVN.entitlements`
+— confirmed intact, `get-task-allow: true` — is not yet baked into any
+signature at the point this repo produces the IPA. Whether it survives is
+entirely up to the signing tool used afterward (SideStore/Sideloadly/AltStore/
+etc.), and some tools strip entitlements they don't recognise. **If the new
+"Debugger attached" row reads "yes" but "Executable memory" still reads
+"no,"** that is the smoking gun for this — re-sign with a tool/flow that
+preserves it, or check the signed IPA's entitlements directly with
+`codesign -d --entitlements :- BoxedVN.app` after signing.
+
+New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`958b07324a95a3efee2a6e51428b29e56970a334077410b1f099410dd9cd3b56`.
+
 ## 8. Next actions, in order
 
 1. **Sign and install the new IPA** (`build/artifacts/BoxedVN-unsigned.ipa`,
-   SHA-256 `83b2dba2…3ff59`) **on the physical iPhone 17** that showed the
-   black screen. It should now show the library UI, as it does on the
-   simulator. If it still doesn't, that would mean there's a *second*,
-   device-specific issue on top of the one just fixed — capture a screenshot
-   and, if possible, the console log (Settings app → Privacy & Security →
-   Analytics, or Console.app over USB) rather than assuming the same fix
-   didn't take.
+   SHA-256 `958b0732…d3b56`) **on the physical iPhone 17**. It should now (a)
+   show the library UI instead of black, and (b) show live JIT status that
+   updates automatically once StikDebug attaches, with a "Debugger attached"
+   row that tells apart "StikDebug never actually attached" from "it attached
+   but something else (likely `get-task-allow` being stripped at signing) is
+   still blocking executable memory." If JIT is still reported unavailable
+   after this, read that row first — it tells you which of the two problems
+   you're looking at, rather than guessing again.
 2. **Attach StikDebug and re-check JIT.** Expect
    `BVNJITStatusUnavailable` → `Available`. If mmap still fails, capture the
    exact `errno` from the log — that is the whole diagnosis.

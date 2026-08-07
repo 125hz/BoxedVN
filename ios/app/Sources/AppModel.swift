@@ -213,6 +213,15 @@ final class AppModel: ObservableObject {
         // The runtime state lives in C and changes on the main thread inside
         // BVNGuestMain, so it is polled rather than pushed.  Half a second is
         // enough for a state label and costs nothing.
+        //
+        // JIT is polled on the same timer, deliberately not just once at
+        // launch.  A JIT enabler like StikDebug attaches asynchronously,
+        // usually AFTER the app has already started, so a one-shot probe at
+        // cold launch shows "unavailable" forever even once JIT genuinely
+        // becomes available - the user has to know to dig into Runtime
+        // status and tap "Re-check" for the badge to ever catch up. The probe
+        // itself is one mmap+munmap of a single page: cheap enough to just
+        // keep it live rather than rely on the user noticing it's stale.
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
             [weak self] _ in
             Task { @MainActor in
@@ -227,11 +236,19 @@ final class AppModel: ObservableObject {
                         }
                     }
                 }
+                self.refreshJIT()
             }
         }
     }
 
     func refreshJIT() {
-        jit = .probe()
+        let updated = JITReport.probe()
+        // Comparing before assigning avoids an @Published fire (and a
+        // SwiftUI re-render) on every tick when nothing actually changed.
+        if updated.status != jit.status ||
+            updated.debuggerAttached != jit.debuggerAttached ||
+            updated.executableMemoryAvailable != jit.executableMemoryAvailable {
+            jit = updated
+        }
     }
 }

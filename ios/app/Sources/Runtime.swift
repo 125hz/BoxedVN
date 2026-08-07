@@ -24,6 +24,7 @@ struct JITReport {
 
     var status: Status
     var jitCompiledIn: Bool
+    var debuggerAttached: Bool
     var executableMemoryAvailable: Bool
     var detail: String
 
@@ -40,6 +41,7 @@ struct JITReport {
         return JITReport(
             status: status,
             jitCompiledIn: report.jitCompiledIn,
+            debuggerAttached: report.debuggerAttached,
             executableMemoryAvailable: report.executableMemoryAvailable,
             detail: report.detail.map(String.init(cString:)) ?? ""
         )

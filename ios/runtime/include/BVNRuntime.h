@@ -81,6 +81,14 @@ typedef struct {
     BVNJITStatus status;
     // True when this binary contains Boxedwine's ARM64 JIT backend at all.
     bool jitCompiledIn;
+    // True when the kernel has flagged this process CS_DEBUGGED - i.e. a
+    // debugger genuinely attached (StikDebug or equivalent).  Read directly
+    // from the kernel via csops(), independent of whether the mmap probe
+    // below succeeded, so a failure can be told apart: "no debugger ever
+    // attached" (this is false) versus "a debugger attached but executable
+    // memory still isn't available" (this is true, executableMemoryAvailable
+    // is false - a signing/entitlement problem, not a StikDebug problem).
+    bool debuggerAttached;
     // True when mmap(PROT_EXEC | MAP_JIT) succeeded.  This is an observation
     // of what the kernel allowed, not a reading of the signed entitlement
     // blob; on iOS the two coincide because only the dynamic-codesigning
