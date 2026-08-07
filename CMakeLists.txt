@@ -46,6 +46,7 @@ include(cmake/BoxedwineSources.cmake)
 # ---------------------------------------------------------------------------
 option(BOXEDVN_BUILD_TESTS      "Build the host-independent unit tests"        ON)
 option(BOXEDVN_BUILD_CORE       "Build the Boxedwine emulator core"            ON)
+option(BOXEDVN_BUILD_RUNTIME    "Build the Objective-C++ runtime bridge (iOS)"  ON)
 option(BOXEDVN_ENABLE_UI        "Build Boxedwine's built-in Dear ImGui launcher" OFF)
 option(BOXEDVN_ENABLE_MIDI      "Build CoreMIDI support"                       OFF)
 
@@ -113,10 +114,14 @@ if(BOXEDVN_SDL2_ROOT)
             "BOXEDVN_SDL2_ROOT=${BOXEDVN_SDL2_ROOT} does not contain SDL.h.\n"
             "Run scripts/fetch-dependencies.sh to build a pinned SDL2 first.")
     endif()
+    # NO_CMAKE_FIND_ROOT_PATH: when cross-compiling for iOS, CMake otherwise
+    # rewrites the search path into the iPhoneOS sysroot and cannot see our
+    # own prefix.
     find_library(BOXEDVN_SDL2_LIBRARY
         NAMES SDL2 libSDL2.a
         PATHS "${BOXEDVN_SDL2_ROOT}/lib"
         NO_DEFAULT_PATH
+        NO_CMAKE_FIND_ROOT_PATH
         REQUIRED
     )
     message(STATUS "BoxedVN: SDL2 include = ${BOXEDVN_SDL2_INCLUDE_DIR}")
@@ -141,6 +146,15 @@ target_include_directories(boxedwine_asmjit PUBLIC "${BOXEDWINE_ROOT}/lib/asmjit
 target_compile_definitions(boxedwine_asmjit PUBLIC ASMJIT_STATIC)
 target_compile_options(boxedwine_asmjit PRIVATE -w)
 
+if(BOXEDVN_TARGET_IOS)
+    # asmjit's virtmem.cpp calls sys_icache_invalidate() on every __APPLE__
+    # target but only includes <libkern/OSCacheControl.h> under TARGET_OS_OSX,
+    # so it does not compile for iOS.  Force-including the header fixes it
+    # without patching the vendored third-party source.
+    target_compile_options(boxedwine_asmjit PRIVATE
+        -include libkern/OSCacheControl.h)
+endif()
+
 add_library(boxedwine_pugixml STATIC ${BOXEDWINE_PUGIXML})
 target_include_directories(boxedwine_pugixml PUBLIC "${BOXEDWINE_ROOT}/lib/pugixml/src")
 target_compile_options(boxedwine_pugixml PRIVATE -w)
@@ -152,11 +166,17 @@ set(BOXEDWINE_CORE_SOURCES
     ${BOXEDWINE_SOURCE_CPP}
     ${BOXEDWINE_PLATFORM_POSIX}
     ${BOXEDWINE_PLATFORM_SDL}
-    ${BOXEDWINE_PLATFORM_APPLE_COMMON}
 )
 
-if(BOXEDVN_ENABLE_MIDI)
-    list(APPEND BOXEDWINE_CORE_SOURCES ${BOXEDWINE_PLATFORM_APPLE_MIDI})
+if(NOT BOXEDVN_TARGET_IOS)
+    list(APPEND BOXEDWINE_CORE_SOURCES ${BOXEDWINE_PLATFORM_MACOS_ONLY})
+    if(BOXEDVN_ENABLE_MIDI)
+        list(APPEND BOXEDWINE_CORE_SOURCES ${BOXEDWINE_PLATFORM_MACOS_MIDI})
+    endif()
+elseif(BOXEDVN_ENABLE_MIDI)
+    message(FATAL_ERROR
+        "BOXEDVN_ENABLE_MIDI is not supported on iOS: platform/mac/coremidi.cpp "
+        "depends on the macOS-only DLS synth AudioUnit.")
 endif()
 
 if(BOXEDVN_ENABLE_UI)
@@ -166,6 +186,11 @@ else()
     # emulator is driven entirely by startup arguments, which is what the
     # BoxedVN SwiftUI frontend does.
     list(FILTER BOXEDWINE_CORE_SOURCES EXCLUDE REGEX "/source/ui/")
+    # networkutils.cpp is libcurl's only consumer and is referenced solely by
+    # source/ui (the container downloader).  Dropping it removes the libcurl
+    # dependency entirely, which matters on iOS where there is no system
+    # libcurl to link against.
+    list(FILTER BOXEDWINE_CORE_SOURCES EXCLUDE REGEX "/source/util/networkutils\\.cpp$")
 endif()
 
 if(NOT BOXEDVN_TARGET_IOS)
@@ -188,10 +213,17 @@ target_compile_definitions(boxedwine_core PUBLIC
     SDL2=1
     BOXEDWINE_POSIX
     BOXEDWINE_RECORDER
-    BOXEDWINE_CORE_AUDIO
-    __MACOSX_CORE__
     BOXEDWINE_MAC_JIT
 )
+
+if(NOT BOXEDVN_TARGET_IOS)
+    # Wine's CoreAudio driver.  On iOS the SDL audio backend is used instead;
+    # see cmake/BoxedwineSources.cmake.
+    target_compile_definitions(boxedwine_core PUBLIC
+        BOXEDWINE_CORE_AUDIO
+        __MACOSX_CORE__
+    )
+endif()
 
 if(BOXEDVN_ENABLE_MIDI)
     target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_MIDI)
@@ -247,4 +279,6 @@ endif()
 # ---------------------------------------------------------------------------
 # boxedvn_runtime : the narrow C ABI between Swift and the emulator
 # ---------------------------------------------------------------------------
-add_subdirectory(ios/runtime)
+if(BOXEDVN_BUILD_RUNTIME)
+    add_subdirectory(ios/runtime)
+endif()

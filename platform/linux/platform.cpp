@@ -39,18 +39,39 @@ unsigned long long int Platform::getSystemTimeAsMicroSeconds() {
 void Platform::init() {
 }
 
+// Apple's W^X rules for MAP_JIT differ between macOS and iOS.
+//
+// macOS (arm64, Hardened Runtime + com.apple.security.cs.allow-jit): a MAP_JIT
+// region is per-thread either writable or executable, and the thread toggles
+// between the two with pthread_jit_write_protect_np().
+//
+// iOS: pthread_jit_write_protect_np() is explicitly marked unavailable, and
+// calling it does not compile.  A MAP_JIT region is simply RWX once the
+// process holds the dynamic-codesigning entitlement, which on a sideloaded
+// build is granted only while a debugger is attached (StikDebug or an
+// equivalent JIT enabler).  Without that entitlement the mmap of an executable
+// page fails outright, which is what BVNJIT probes for at startup - there is
+// no half-working state to toggle into.
+//
+// Both platforms still need an explicit instruction-cache flush after writing.
+#if defined(BOXEDWINE_MAC_JIT) && !TARGET_OS_IPHONE
+#define BOXEDWINE_APPLE_TOGGLE_JIT_WRITE_PROTECT 1
+#endif
+
+static inline void boxedwineSetJitWriteProtect(bool enabled) {
+#ifdef BOXEDWINE_APPLE_TOGGLE_JIT_WRITE_PROTECT
+    if (__builtin_available(macOS 11.0, *)) {
+        pthread_jit_write_protect_np(enabled);
+    }
+#else
+    (void)enabled;
+#endif
+}
+
 void Platform::writeCodeToMemory(void* address, U32 len, std::function<void()> callback) {
-#ifdef BOXEDWINE_MAC_JIT
-    if (__builtin_available(macOS 11.0, *)) {
-        pthread_jit_write_protect_np(false);
-    }
-#endif
+    boxedwineSetJitWriteProtect(false);
     callback();
-#ifdef BOXEDWINE_MAC_JIT
-    if (__builtin_available(macOS 11.0, *)) {
-        pthread_jit_write_protect_np(true);
-    }
-#endif
+    boxedwineSetJitWriteProtect(true);
 #ifndef __EMSCRIPTEN__
     // GCC, this is required for ARM, but for x86 it will just do nothing
     __builtin___clear_cache((char*)address, (char*)address+len);
@@ -58,17 +79,9 @@ void Platform::writeCodeToMemory(void* address, U32 len, std::function<void()> c
 }
 
 void Platform::writeCodeToMemory(void* address, U32 len, WriteCodeCallback callback, void* context) noexcept {
-#ifdef BOXEDWINE_MAC_JIT
-    if (__builtin_available(macOS 11.0, *)) {
-        pthread_jit_write_protect_np(false);
-    }
-#endif
+    boxedwineSetJitWriteProtect(false);
     callback(context);
-#ifdef BOXEDWINE_MAC_JIT
-    if (__builtin_available(macOS 11.0, *)) {
-        pthread_jit_write_protect_np(true);
-    }
-#endif
+    boxedwineSetJitWriteProtect(true);
 #ifndef __EMSCRIPTEN__
     __builtin___clear_cache((char*)address, (char*)address + len);
 #endif
@@ -114,7 +127,9 @@ void Platform::listNodes(BString nativePath, std::vector<ListNodeResult>& result
     }
 }
 
-#ifndef __MACH__
+// On macOS the CGL-based enumeration in platform/mac/pixelformat.cpp is used
+// instead.  iOS has no CGL, so it falls back to this generic implementation.
+#if !defined(__MACH__) || TARGET_OS_IPHONE
 int getPixelFormats(PixelFormat* pfs, int maxPfs) {
     pfs[1].nSize = 40;
     pfs[1].nVersion = 1;

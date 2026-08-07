@@ -33,13 +33,16 @@
 #include "../../source/opengl/sdl/sdlgl.h"
 #endif
 
-#ifndef __TEST
+#if !defined(__TEST) && !defined(BOXEDWINE_EXTERNAL_MAIN)
 int boxedmain(int argc, const char** argv);
 
 int main(int argc, char** argv) {
     return boxedmain(argc, (const char**)argv);
 }
 #endif
+// BOXEDWINE_EXTERNAL_MAIN is set by the iOS build, where main() has to live in
+// the application shell so that SDL's UIKit application delegate can be
+// subclassed.  See ios/runtime/BVNMain.mm.
 
 static KNativeScreenSDLPtr screen;
 static KOpenGLPtr opengl;

@@ -71,8 +71,10 @@
 #define ASMJIT_NO_X86
 #define BOXEDWINE_MULTI_THREADED
 #define MAP_BOXEDWINE MAP_JIT
+#if !TARGET_OS_IPHONE
 // libraries not built for x64
 #define BOXEDWINE_OPENGL_OSMESA
+#endif
 #else
 #undef BOXEDWINE_MAC_JIT
 #define BOXEDWINE_JIT

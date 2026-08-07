@@ -61,22 +61,30 @@ file(GLOB BOXEDWINE_PLATFORM_SDL CONFIGURE_DEPENDS
     "${BOXEDWINE_ROOT}/platform/sdl/*.cpp"
 )
 
-# Apple-specific platform files.  audiounit.cpp / knativecoreaudio.cpp use
-# AudioToolbox+CoreAudio and coremidi.cpp uses CoreMIDI -- all three frameworks
-# exist on iOS.  macOpenGL.mm is NSOpenGL/AppKit and is macOS-only; it is added
-# by the caller, not here.
-set(BOXEDWINE_PLATFORM_APPLE_COMMON
+# platform/mac is macOS-only in its entirety, despite the frameworks it names
+# nominally existing on iOS:
+#
+#   audiounit.cpp        - kHALOutputParam_Volume, kAudioUnitSubType_DLSSynth
+#                          and kAudioUnitSubType_DefaultOutput are macOS-only;
+#                          iOS uses the RemoteIO unit instead.
+#   knativecoreaudio.cpp - Wine's CoreAudio driver, built on the CoreAudio HAL
+#                          (<CoreAudio/CoreAudio.h>), which iOS does not ship.
+#   pixelformat.cpp      - CGL/desktop-OpenGL pixel format enumeration.
+#   macOpenGL.mm         - NSOpenGL and AppKit.
+#   coremidi.cpp         - depends on audiounit.cpp's DLS synth.
+#
+# On iOS, audio goes through platform/sdl/knativeaudio.cpp (SDL2's coreaudio
+# backend, i.e. AVAudioSession + RemoteIO) and getPixelFormats() comes from the
+# generic implementation in platform/linux/platform.cpp.
+set(BOXEDWINE_PLATFORM_MACOS_ONLY
     "${BOXEDWINE_ROOT}/platform/mac/audiounit.cpp"
     "${BOXEDWINE_ROOT}/platform/mac/knativecoreaudio.cpp"
     "${BOXEDWINE_ROOT}/platform/mac/pixelformat.cpp"
-)
-
-set(BOXEDWINE_PLATFORM_APPLE_MIDI
-    "${BOXEDWINE_ROOT}/platform/mac/coremidi.cpp"
-)
-
-set(BOXEDWINE_PLATFORM_MACOS_ONLY
     "${BOXEDWINE_ROOT}/platform/mac/macOpenGL.mm"
+)
+
+set(BOXEDWINE_PLATFORM_MACOS_MIDI
+    "${BOXEDWINE_ROOT}/platform/mac/coremidi.cpp"
 )
 
 # --- Third-party sources compiled directly into the core ---------------------
