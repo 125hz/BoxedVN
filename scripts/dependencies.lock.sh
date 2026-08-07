@@ -24,3 +24,22 @@ BOXEDVN_SDL2_SHA256="5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9c
 BOXEDVN_XCODEGEN_VERSION="2.46.0"
 BOXEDVN_XCODEGEN_URL="https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
 BOXEDVN_XCODEGEN_SHA256="4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+
+# --- Boxedwine root filesystems ---------------------------------------------
+# Boxedwine runs a real 32-bit Wine inside an emulated Linux and needs a root
+# filesystem to do it.  These are upstream Boxedwine's own TinyCore + Wine
+# builds, taken from the versioned catalogue at
+# http://www.boxedwine.org/v2/26R2/filesV2.xml on 2026-08-07 and pinned by
+# exact URL and SHA-256 here.
+#
+# BoxedVN does NOT redistribute these.  scripts/fetch-rootfs.sh downloads one
+# on demand, and no public release should bundle one until the contents have
+# been licence-reviewed; see docs/BUILD_IOS.md.
+#
+# Each entry is "<id>|<url>|<sha256>|<bytes>|<description>".
+BOXEDVN_ROOTFS_DEFAULT="wine10"
+
+BOXEDVN_ROOTFS_ENTRIES=(
+  "wine10|https://boxedwine.org/v2/5/TinyCore15Wine10.0.zip|f0ed13eaf0c11bc95b229e2a747f04167c4e63445dc274d122758bd7e84b5572|156582181|TinyCore 15 with Wine 10.0 (default; the version BoxedVN is tested against)"
+  "wine11|https://boxedwine.org/v2/7/TinyCore15Wine11.0.zip|41835c49ce0e582a1d7a610243a8e4a95bc59996fb780c09705dc476bb9b6493|162748254|TinyCore 15 with Wine 11.0 (newest upstream build)"
+)

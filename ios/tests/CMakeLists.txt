@@ -19,3 +19,10 @@ add_test(NAME boxedvn_support COMMAND boxedvn_tests)
 set_tests_properties(boxedvn_support PROPERTIES
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
+
+# Dependency pinning: verifies every pin is well formed and that a mismatched
+# checksum is actually refused.  Needs no network access.
+if(UNIX)
+    add_test(NAME boxedvn_dependency_pins
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test-pins.sh")
+endif()

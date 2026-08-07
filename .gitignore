@@ -51,3 +51,4 @@ project/mac-xcode/Boxedwine/DerivedDataCoverage
 /third_party/
 /lib/mac/
 /ios/BoxedVN.xcodeproj/
+/ios/app/Bundled/

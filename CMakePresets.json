@@ -1,0 +1,133 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "ios-device-release",
+      "displayName": "iOS device (arm64, Release)",
+      "description": "The shipping configuration. Produces libboxedvn.a for scripts/build-ios.sh; run scripts/fetch-dependencies.sh --platform ios first.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "iOS",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "17.0",
+        "CMAKE_OSX_SYSROOT": "iphoneos",
+        "CMAKE_BUILD_TYPE": "Release",
+        "BOXEDVN_BUILD_TESTS": "OFF",
+        "BOXEDVN_SDL2_ROOT": "${sourceDir}/third_party/prefix/ios"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "ios-device-debug",
+      "displayName": "iOS device (arm64, Debug)",
+      "inherits": "ios-device-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "macos-dev",
+      "displayName": "macOS development build",
+      "description": "Compiles the emulator core and runs the host-independent test suite on the machine you are sitting at. Uses the host architecture: on an Intel Mac this exercises Boxedwine's x64 JIT, not the ARM64 one.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BOXEDVN_BUILD_TESTS": "ON",
+        "BOXEDVN_BUILD_RUNTIME": "OFF",
+        "BOXEDVN_SDL2_ROOT": "${sourceDir}/third_party/prefix/macos"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "tests-only",
+      "displayName": "Host-independent tests only",
+      "description": "Builds ios/support and its test suite with no SDL2, no emulator core and no Apple SDK beyond a C++20 compiler. This is the preset CI runs for the test job.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BOXEDVN_BUILD_CORE": "OFF",
+        "BOXEDVN_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "ios-simulator-compile-check",
+      "displayName": "iOS Simulator (compile check only)",
+      "description": "Compiles the core against the simulator SDK to catch conditional-compilation mistakes. Boxedwine's ARM64 JIT cannot run under the simulator, so this configuration is never expected to execute a guest.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "iOS",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "17.0",
+        "CMAKE_OSX_SYSROOT": "iphonesimulator",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BOXEDVN_BUILD_TESTS": "OFF",
+        "BOXEDVN_SDL2_ROOT": "${sourceDir}/third_party/prefix/ios-simulator"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ios-device-release",
+      "configurePreset": "ios-device-release"
+    },
+    {
+      "name": "ios-device-debug",
+      "configurePreset": "ios-device-debug"
+    },
+    {
+      "name": "macos-dev",
+      "configurePreset": "macos-dev"
+    },
+    {
+      "name": "tests-only",
+      "configurePreset": "tests-only"
+    },
+    {
+      "name": "ios-simulator-compile-check",
+      "configurePreset": "ios-simulator-compile-check"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "tests-only",
+      "configurePreset": "tests-only",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "default"
+      }
+    },
+    {
+      "name": "macos-dev",
+      "configurePreset": "macos-dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
