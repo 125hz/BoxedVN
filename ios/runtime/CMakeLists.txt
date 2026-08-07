@@ -12,9 +12,27 @@ add_library(boxedvn_runtime STATIC
     src/BVNLog.mm
     src/BVNJIT.mm
     src/BVNPaths.mm
+    src/BVNImport.mm
     src/BVNMacPlatformShim.mm
     src/BVNMain.mm
     src/BVNAppDelegate.mm
+)
+
+# Read BOXEDWINE_VERSION_STR straight out of the upstream header so the value
+# the UI reports can never drift from the core it is linked against.
+file(READ "${BOXEDWINE_ROOT}/include/boxedwine.h" _boxedwine_header)
+string(REGEX MATCH "#define BOXEDWINE_VERSION_STR \"([^\"]+)\""
+       _version_match "${_boxedwine_header}")
+if(NOT CMAKE_MATCH_1)
+    message(FATAL_ERROR
+        "Could not read BOXEDWINE_VERSION_STR from include/boxedwine.h. "
+        "The upstream header layout changed.")
+endif()
+set(BOXEDWINE_VERSION_STRING "${CMAKE_MATCH_1}")
+message(STATUS "BoxedVN: Boxedwine core version = ${BOXEDWINE_VERSION_STRING}")
+
+target_compile_definitions(boxedvn_runtime PRIVATE
+    BVN_BOXEDWINE_VERSION="${BOXEDWINE_VERSION_STRING}"
 )
 
 target_include_directories(boxedvn_runtime PUBLIC
@@ -54,6 +72,11 @@ target_link_libraries(boxedvn_runtime PUBLIC
 
 target_compile_options(boxedvn_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
+# CMake does not enable ARC on its own.  The runtime bridge is written for ARC;
+# the Boxedwine core it links against is plain C++ and unaffected.
+target_compile_options(boxedvn_runtime PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJC,OBJCXX>:-fobjc-arc>)
+
 # ---------------------------------------------------------------------------
 # Bundle every static library the app shell needs into one archive, so the
 # XcodeGen project has a single link input that never needs updating when the
@@ -72,6 +95,7 @@ add_custom_command(
             $<TARGET_FILE:boxedwine_softfloat>
             $<TARGET_FILE:boxedwine_asmjit>
             $<TARGET_FILE:boxedwine_pugixml>
+            "${BOXEDVN_SDL2_LIBRARY}"
     DEPENDS boxedvn_runtime boxedwine_core boxedvn_support
             boxedwine_zlib boxedwine_softfloat boxedwine_asmjit
             boxedwine_pugixml
