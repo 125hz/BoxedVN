@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  BoxedVN ships exactly two entitlements, and each one is load-bearing.
+
+	  get-task-allow
+	      Lets a debugger attach to the app.  That is the mechanism StikDebug
+	      and equivalent JIT enablers use, and attaching is what causes the
+	      kernel to grant dynamic-codesigning, which is what makes
+	      mmap(PROT_EXEC | MAP_JIT) succeed.  Without it Boxedwine's ARM64 JIT
+	      cannot run at all.  Sideloading tools normally set this themselves;
+	      it is declared here so an unsigned IPA carries the intent.
+
+	  com.apple.developer.kernel.increased-memory-limit
+	      Boxedwine reserves a large contiguous region for the emulated guest
+	      address space.  Without the raised limit the app is jetsammed on
+	      devices with less RAM.  This entitlement is honoured only when the
+	      signing identity is allowed to use it; free Apple IDs are not, and
+	      signing tools strip it.  BoxedVN works without it on 6 GB+ devices,
+	      so it is safe to remove.
+
+	  Entitlements deliberately NOT present:
+	      com.apple.security.cs.allow-jit and friends are macOS Hardened
+	      Runtime keys and mean nothing on iOS.
+	      com.apple.private.* keys require Apple-internal signing.
+	      No hypervisor, USB or jailbreak entitlements: BoxedVN emulates in
+	      userspace and needs none of them.
+
+	  See docs/BUILD_IOS.md for what a signing tool may rewrite or drop.
+	-->
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

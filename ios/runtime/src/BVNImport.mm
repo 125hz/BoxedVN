@@ -346,9 +346,11 @@ extern "C" bool BVNManifestUpdateLaunchSettings(
     return true;
 }
 
-extern "C" size_t BVNManifestCopyArguments(const char* manifestPath,
-                                           char out[][BVN_MAX_PATH],
-                                           size_t capacity) {
+extern "C" size_t BVNManifestCopyArgumentsJoined(const char* manifestPath,
+                                                 char* out, size_t capacity) {
+    if (out != nullptr && capacity > 0) {
+        out[0] = '\0';
+    }
     if (manifestPath == nullptr) {
         return 0;
     }
@@ -361,12 +363,16 @@ extern "C" size_t BVNManifestCopyArguments(const char* manifestPath,
     if (!parsed.ok) {
         return 0;
     }
-    const std::vector<std::string>& arguments = parsed.manifest.arguments;
-    const size_t written = arguments.size() < capacity ? arguments.size() : capacity;
-    for (size_t i = 0; i < written && out != nullptr; ++i) {
-        copyInto(out[i], BVN_MAX_PATH, arguments[i]);
+
+    std::string joined;
+    for (const std::string& argument : parsed.manifest.arguments) {
+        if (!joined.empty()) {
+            joined.push_back('\n');
+        }
+        joined += argument;
     }
-    return arguments.size();
+    copyInto(out, capacity, joined);
+    return joined.size() < capacity ? joined.size() : (capacity > 0 ? capacity - 1 : 0);
 }
 
 extern "C" size_t BVNCopyBackendDescriptions(BVNBackendDescription* out,

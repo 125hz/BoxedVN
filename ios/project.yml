@@ -1,0 +1,129 @@
+# BoxedVN - XcodeGen specification for the application shell.
+#
+# Copyright (C) 2026  The BoxedWine Team.  GPLv2; see license.txt.
+#
+# CMake builds all of the C/C++/Objective-C++ into one static archive
+# (libboxedvn.a).  This spec describes only the Swift application that links
+# it.  The generated .xcodeproj is disposable and is not committed; run
+# scripts/build-ios.sh, which regenerates it every time.
+#
+# Paths are relative to this file (the `ios` directory).
+
+name: BoxedVN
+
+options:
+  bundleIdPrefix: org.boxedwine
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+  # Deterministic output: no Xcode-version-dependent defaults leak in.
+  generateEmptyDirectories: false
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_BITCODE: NO
+    # The app is a thin shell over the static archive; there is nothing to
+    # strip that would help, and keeping symbols makes device crash logs
+    # readable without a dSYM lookup.
+    STRIP_INSTALLED_PRODUCT: NO
+    ONLY_ACTIVE_ARCH: NO
+    ARCHS: arm64
+    VALID_ARCHS: arm64
+    # BoxedVN targets physical ARM64 devices; the emulator's JIT cannot run on
+    # a simulator anyway.
+    SUPPORTED_PLATFORMS: iphoneos
+    TARGETED_DEVICE_FAMILY: "1,2"
+
+targets:
+  BoxedVN:
+    type: application
+    platform: iOS
+    sources:
+      - path: app/Sources
+      - path: app/Resources
+        optional: true
+        buildPhase: resources
+      # Populated by scripts/fetch-rootfs.sh when BOXEDVN_BUNDLE_ROOTFS is on.
+      # Optional so a clean clone builds without the multi-hundred-megabyte
+      # root filesystem archive.
+      - path: app/Bundled
+        optional: true
+        buildPhase: resources
+    # No `info:` or `entitlements:` blocks here on purpose.  Those make
+    # XcodeGen *generate* the files at those paths, silently overwriting the
+    # hand-written ones on every run.  Pointing the build settings at the
+    # checked-in files instead keeps them under our control.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.boxedwine.boxedvn
+        PRODUCT_NAME: BoxedVN
+        INFOPLIST_FILE: app/Info.plist
+        CODE_SIGN_ENTITLEMENTS: app/BoxedVN.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: app/BoxedVN-Bridging-Header.h
+        # BVN_LIBRARY_DIR and BVN_INCLUDE_DIR are passed in by
+        # scripts/build-ios.sh so the CMake build directory is not hard-coded.
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(BVN_INCLUDE_DIR)
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(BVN_LIBRARY_DIR)
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -lboxedvn
+          - -lc++
+          # libboxedvn.a contains BVNAppDelegate, which nothing references by
+          # symbol - SDL looks it up by name at runtime - so the linker would
+          # otherwise drop it.  ObjC keeps every Objective-C class; all_load
+          # is not needed and would bloat the binary.
+          - -ObjC
+        CLANG_ENABLE_MODULES: YES
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        # Sideloading tools re-sign the IPA, so CI produces it unsigned.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        DEVELOPMENT_TEAM: ""
+        PROVISIONING_PROFILE_SPECIFIER: ""
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+    dependencies:
+      # Frameworks the merged archive needs.  CMake links these for its own
+      # targets, but a static archive carries no link dependencies, so the
+      # application target has to name them again.
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudio.framework
+      # SDL2's HIDAPI backend (src/hidapi/ios/hid.m) talks to Steam
+      # Controllers over BLE and references CBCentralManager.
+      - sdk: CoreBluetooth.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreMotion.framework
+      - sdk: Foundation.framework
+      - sdk: GameController.framework
+      - sdk: ImageIO.framework
+      - sdk: Metal.framework
+      - sdk: OpenGLES.framework
+      - sdk: QuartzCore.framework
+      - sdk: UIKit.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: libc++.tbd
+      - sdk: libiconv.tbd
+
+schemes:
+  BoxedVN:
+    build:
+      targets:
+        BoxedVN: all
+    run:
+      config: Debug
+    archive:
+      config: Release

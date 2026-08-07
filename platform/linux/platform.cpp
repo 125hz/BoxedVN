@@ -68,23 +68,43 @@ static inline void boxedwineSetJitWriteProtect(bool enabled) {
 #endif
 }
 
+// Instruction cache invalidation.
+//
+// __builtin___clear_cache lowers to a call to compiler-rt's __clear_cache on
+// AArch64, and compiler-rt deliberately does not build that file for Darwin -
+// linking an iOS binary against it fails with an undefined ___clear_cache.
+// Apple's supported call is sys_icache_invalidate, which is what asmjit uses
+// on __APPLE__ too.
+// TargetConditionals.h defines TARGET_OS_IPHONE as 0 or 1, so `#if` is correct
+// here; on non-Apple platforms it is simply undefined and evaluates to 0.
+#if TARGET_OS_IPHONE
+#include <libkern/OSCacheControl.h>
+#endif
+
+static inline void boxedwineFlushInstructionCache(void* address, U32 len) {
+#if TARGET_OS_IPHONE
+    sys_icache_invalidate(address, len);
+#elif !defined(__EMSCRIPTEN__)
+    // GCC, this is required for ARM, but for x86 it will just do nothing
+    __builtin___clear_cache((char*)address, ((char*)address) + len);
+#else
+    (void)address;
+    (void)len;
+#endif
+}
+
 void Platform::writeCodeToMemory(void* address, U32 len, std::function<void()> callback) {
     boxedwineSetJitWriteProtect(false);
     callback();
     boxedwineSetJitWriteProtect(true);
-#ifndef __EMSCRIPTEN__
-    // GCC, this is required for ARM, but for x86 it will just do nothing
-    __builtin___clear_cache((char*)address, (char*)address+len);
-#endif //__EMSCRIPTEN__
+    boxedwineFlushInstructionCache(address, len);
 }
 
 void Platform::writeCodeToMemory(void* address, U32 len, WriteCodeCallback callback, void* context) noexcept {
     boxedwineSetJitWriteProtect(false);
     callback(context);
     boxedwineSetJitWriteProtect(true);
-#ifndef __EMSCRIPTEN__
-    __builtin___clear_cache((char*)address, (char*)address + len);
-#endif
+    boxedwineFlushInstructionCache(address, len);
 }
 
 //#ifdef __EMSCRIPTEN__
@@ -315,9 +335,7 @@ U8* Platform::alloc64kBlock(U32 count, bool executable) {
 
 
 void Platform::clearInstructionCache(void* address, U32 len) {
-#ifndef __EMSCRIPTEN__
-    __builtin___clear_cache((char*)address, ((char*)address) + len);
-#endif
+    boxedwineFlushInstructionCache(address, len);
 }
 
 #ifdef BOXEDWINE_MULTI_THREADED

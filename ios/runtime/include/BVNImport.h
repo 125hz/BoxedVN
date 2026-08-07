@@ -167,11 +167,14 @@ bool BVNManifestUpdateLaunchSettings(const char* manifestPath,
                                      char* error,
                                      size_t errorCapacity);
 
-// Reads the arguments array out of a manifest.  Returns the number of
-// arguments, writing up to `capacity` of them into `out`.
-size_t BVNManifestCopyArguments(const char* manifestPath,
-                                char out[][BVN_MAX_PATH],
-                                size_t capacity);
+// Reads the arguments array out of a manifest as a single newline-separated
+// string.  A newline is not valid inside a shell argument BoxedVN would pass,
+// so the encoding is unambiguous, and it crosses the Swift boundary as one
+// value instead of a 2-D C array.  Returns the number of bytes written,
+// excluding the terminator.
+size_t BVNManifestCopyArgumentsJoined(const char* manifestPath,
+                                      char* out,
+                                      size_t capacity);
 
 // ---------------------------------------------------------------------------
 // Runtime backend description
