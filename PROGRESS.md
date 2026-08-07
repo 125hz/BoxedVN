@@ -28,16 +28,107 @@ is inferred.
 | 5 | Unsigned IPA produced and smoke tested | **done** | `BoxedVN-unsigned.ipa`, 1.9 MB, unzips to `Payload/BoxedVN.app` |
 | 6 | Reproducible scripts for every step | **done** | `scripts/*.sh`, all run clean from a fresh clone |
 | 7 | GitHub Actions workflow | **written, not yet run** | `.github/workflows/build-ios.yml` |
+| 8 | **App launches and renders real UI on-device** | **done, on simulator; fix applied to device build** | see section 1a |
+
+### 1a. The black-screen bug: found, fixed, verified on simulator
+
+The user reported that on a **physical iPhone 17**, BoxedVN installed and
+launched but stayed on a black screen with no UI. Rather than guess, this was
+debugged using the iOS Simulator (see section 1b for why that's valid despite
+BoxedVN targeting devices only) with a real build/install/launch/log cycle.
+
+**Root cause:** `SDL_UIKitRunApp` resolves the app delegate class with
+`[SDLUIKitDelegate getAppDelegateClassName]` — a message sent to the
+`SDLUIKitDelegate` class **by name**, not through dynamic subclass dispatch.
+Objective-C class-method overrides only take effect for a message sent to the
+subclass (or an instance of it); a call site that names the base class
+explicitly always resolves against the base class's own method table,
+regardless of what subclasses exist. `BVNAppDelegate` overrode
+`+getAppDelegateClassName` inside its own `@implementation` block, which is
+exactly the pattern that does **not** work here — SDL's own source comment
+above that method says as much ("make sure to add a **category**"). Without
+the category, `UIApplicationMain` was instantiating SDL's own vanilla
+`SDLUIKitDelegate` the entire time. `BVNAppDelegate` — and therefore
+`createLibraryWindow`, the `BoxedVNFrontend` lookup, and the SwiftUI window —
+never ran at all. `BVNGuestMain` still ran fine (SDL's real delegate calls
+`forward_main` regardless), which is why the process didn't crash and why the
+JIT-probe log lines appeared even with no UI visible.
+
+**A second, smaller bug was found and fixed along the way:** `BVNLogWrite`
+calls made from `createLibraryWindow` happened before `BVNLogStartSessionFile`
+(which was only called from inside `BVNGuestMain`), so any diagnostic from
+window creation — including the one that would have named this exact bug —
+never reached the log file, only an in-memory ring nobody could read because
+the window that would show the log viewer never appeared. Fixed by moving
+`BVNLogStartSessionFile()` to the very first line of
+`-application:didFinishLaunchingWithOptions:`, before anything else runs.
+
+**Fix:** `ios/runtime/src/BVNAppDelegate.mm` now declares
+`@interface SDLUIKitDelegate (BoxedVN)` / `@implementation SDLUIKitDelegate
+(BoxedVN)` with `+getAppDelegateClassName` returning `@"BVNAppDelegate"`. A
+category attaches directly to the real class's method table, so it affects
+every call site including SDL's own.
+
+**Verified on the iPhone 17 simulator** (booted locally, built for x86_64
+since the dev Mac is Intel — see section 1b): before the fix, black screen,
+reproduced exactly as reported. After the fix: the library UI renders —
+title, Runtime status ("JIT unavailable", correctly, since the simulator has
+no ARM64 JIT), Games list, Import actions, Settings, Logs. Confirmed
+repeatable across a full terminate/relaunch cycle.
+
+**Applied to the device build** and repackaged:
+`build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`83b2dba27cd63f89d19a020b7b6758d804cbcc466073b3cbf1280b5b6243ff59`. **Not yet
+installed or tested on the physical iPhone 17** — that is the immediate next
+step, replacing the previous IPA (SHA-256
+`9997e540531a06c78785008c96986d631c0a811ec76ca198360d834c80f88265`), which
+still has the bug.
+
+### 1b. Why the simulator was usable for this despite section 3's warning
+
+`docs/KNOWN_LIMITATIONS_IOS.md` and `docs/BUILD_IOS.md` correctly say the
+simulator can't run a guest (Boxedwine's ARM64 JIT doesn't exist on x86_64,
+and the simulator preset was documented as compile-only for that reason). But
+the black-screen bug was in app-lifecycle code that runs **before** any guest
+session starts, so it was fully reproducible and fixable there. Getting this
+working required:
+
+- Fixing `scripts/fetch-dependencies.sh`'s `ios-simulator` case to pass
+  `-DCMAKE_OSX_ARCHITECTURES="$(uname -m)"` — it previously built with no
+  explicit arch, which is wrong for a cross-compiled simulator target.
+- Building `boxedwine_core` for `iphonesimulator` x86_64. This **worked
+  without any new upstream guards**: `TARGET_CPU_ARM64` is false on x86_64, so
+  `include/boxedwine.h`'s existing `#else` branch selects
+  `BOXEDWINE_JIT_X64` — a real, already-supported Boxedwine backend — and the
+  ARM64-only translation units (`armv8CPU.cpp`, `jitArmV8CodeGen.cpp`, etc.)
+  simply compile to empty objects, exactly as they do on other non-ARM64
+  Boxedwine targets.
+- A new XcodeGen spec, `ios/project-simulator.yml`, since the shipping
+  `ios/project.yml` hard-codes `SUPPORTED_PLATFORMS: iphoneos` /
+  `ARCHS: arm64` (deliberately, for the device-only ship target) and
+  xcodebuild resolves destinations from the project file, not from
+  command-line `-destination`/setting overrides.
+- `mcp__Claude_Code_iOS_Simulator__control` (`attach`, `launch`, `screenshot`)
+  to drive it, plus reading the session log directly out of the simulator's
+  container directory on disk
+  (`~/Library/Developer/CoreSimulator/Devices/<udid>/data/Containers/Data/Application/<container>/Documents/Logs/`).
+
+This is a legitimate, reusable debugging path for any future UI/lifecycle bug
+that doesn't require JIT — worth reaching for before assuming something is
+device-specific.
 
 ## 2. What has NOT been tried
 
 Be explicit about this when reporting status. None of the following has been
 observed, and no claim should be made about them until it has:
 
-- **The app has never been launched on a device.** It builds and packages; it
-  has not been signed, installed, or run.
-- **JIT has never been probed on real hardware.** `BVNJITProbe` is written and
-  compiles, but no device has executed it.
+- **The app has never been launched on a physical device.** It was launched
+  once on a physical iPhone 17 by the user and showed a black screen — that
+  bug is now understood, fixed, and verified on the simulator (section 1a),
+  but the fixed build has not yet gone back onto the physical device.
+- **JIT has never been probed on real hardware.** `BVNJITProbe` is written,
+  compiles, and was confirmed to correctly report "unavailable, not ARM64" on
+  the x86_64 simulator — but no ARM64 device has executed it yet.
 - **The root filesystem has never been mounted.** No guest has started.
 - **Wine has never booted.** Notepad has not run.
 - **No game has been imported on a device.** The importer is unit tested
@@ -223,9 +314,14 @@ Full detail, including what a signing tool does to the entitlements, is in
 
 ## 8. Next actions, in order
 
-1. **Sign and install the IPA.** Confirm it launches to the library UI and
-   that `Runtime status` shows a JIT verdict. This is the first thing that has
-   never been tried and it gates everything after it.
+1. **Sign and install the new IPA** (`build/artifacts/BoxedVN-unsigned.ipa`,
+   SHA-256 `83b2dba2…3ff59`) **on the physical iPhone 17** that showed the
+   black screen. It should now show the library UI, as it does on the
+   simulator. If it still doesn't, that would mean there's a *second*,
+   device-specific issue on top of the one just fixed — capture a screenshot
+   and, if possible, the console log (Settings app → Privacy & Security →
+   Analytics, or Console.app over USB) rather than assuming the same fix
+   didn't take.
 2. **Attach StikDebug and re-check JIT.** Expect
    `BVNJITStatusUnavailable` → `Available`. If mmap still fails, capture the
    exact `errno` from the log — that is the whole diagnosis.

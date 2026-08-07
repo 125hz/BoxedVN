@@ -34,6 +34,16 @@
 
 #include "BVNRuntime.h"
 
+// Implemented in BVNLog.mm.  BVNGuestMain also calls this, but not until
+// after -postFinishLaunch fires, which is *after* this delegate has already
+// created the library window - see the first line of
+// -application:didFinishLaunchingWithOptions: below.  Without starting the
+// log here first, every diagnostic from window creation (including a failed
+// BoxedVNFrontend lookup, the most likely cause of a black screen) lands only
+// in the in-memory ring and is never written to a file anyone can read.  The
+// function is idempotent, so BVNGuestMain's later call is a harmless no-op.
+extern "C" bool BVNLogStartSessionFile(void);
+
 // SDL does not install SDL_uikitappdelegate.h, so the interface BoxedVN
 // subclasses is redeclared here.  It is pinned to the SDL2 version in
 // scripts/dependencies.lock.sh.
@@ -48,16 +58,41 @@
 @property (nonatomic, strong) UIWindow* libraryWindow;
 @end
 
+// SDL_UIKitRunApp resolves the delegate class with
+// [SDLUIKitDelegate getAppDelegateClassName] - a message sent to the
+// SDLUIKitDelegate class object BY NAME, not through a subclass reference.
+// Objective-C class-method overrides only take effect for a message sent to
+// the subclass (or an instance of it); a call site that names the base class
+// explicitly, as this one does, always resolves against the base class's own
+// method table no matter what subclasses exist. Overriding
+// +getAppDelegateClassName inside @implementation BVNAppDelegate below is
+// therefore invisible to this call site - without the category, SDL keeps
+// instantiating its own plain SDLUIKitDelegate and BVNAppDelegate never runs.
+//
+// A category on SDLUIKitDelegate itself replaces its method table entry
+// directly, which *does* affect every call site, including this one. This is
+// exactly what SDL's own subclassing notice above +getAppDelegateClassName in
+// SDL_uikitappdelegate.m asks for.
+@interface SDLUIKitDelegate (BoxedVN)
+@end
+
+@implementation SDLUIKitDelegate (BoxedVN)
++ (NSString*)getAppDelegateClassName {
+    return @"BVNAppDelegate";
+}
+@end
+
 static __weak BVNAppDelegate* gAppDelegate = nil;
 
 @implementation BVNAppDelegate
 
-+ (NSString*)getAppDelegateClassName {
-    return @"BVNAppDelegate";
-}
-
 - (BOOL)application:(UIApplication*)application
     didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
+    // First, unconditionally: everything below can fail in ways that leave
+    // no other trace (a black screen is exactly that kind of failure), so
+    // logging has to be live before any of it runs.
+    BVNLogStartSessionFile();
+
     gAppDelegate = self;
 
     // Let SDL install its lifecycle observers and schedule -postFinishLaunch,

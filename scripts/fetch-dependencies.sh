@@ -114,8 +114,13 @@ build_sdl2() {
             )
             ;;
         ios-simulator)
+            # The simulator runs as a native process at the host's own
+            # architecture (no translation for simulator binaries), so unlike
+            # the device build this cannot default to arm64 - it must match
+            # whatever Mac is running it.
             args+=(
                 -DCMAKE_SYSTEM_NAME=iOS
+                -DCMAKE_OSX_ARCHITECTURES="$(uname -m)"
                 -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0
                 -DCMAKE_OSX_SYSROOT=iphonesimulator
             )

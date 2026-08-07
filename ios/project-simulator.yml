@@ -1,0 +1,114 @@
+# BoxedVN - XcodeGen specification for iOS SIMULATOR debug builds.
+#
+# Copyright (C) 2026  The BoxedWine Team.  GPLv2; see license.txt.
+#
+# This is NOT the shipping configuration - see project.yml for that, which
+# targets physical ARM64 devices only.  Boxedwine's ARM64 JIT cannot run in
+# the simulator, so a guest session will never start here.
+#
+# What the simulator IS useful for: everything that happens before a guest
+# starts - UIApplicationMain, the SDLUIKitDelegate subclass, SwiftUI window
+# creation, the library UI, import, and the JIT probe correctly reporting
+# "not ARM64" / "unavailable".  That covers a real class of bugs (app
+# lifecycle, window setup) independently of device-only JIT/emulation issues.
+#
+# ARCHS is intentionally both x86_64 and arm64: Intel Macs run x86_64
+# simulators, Apple Silicon Macs run arm64 ones, and Xcode picks the one that
+# matches the destination automatically.
+#
+# Usage: scripts/run-ios-simulator.sh
+
+name: BoxedVN
+
+options:
+  bundleIdPrefix: org.boxedwine
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+  generateEmptyDirectories: false
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_BITCODE: NO
+    STRIP_INSTALLED_PRODUCT: NO
+    ONLY_ACTIVE_ARCH: YES
+    ARCHS: "x86_64 arm64"
+    VALID_ARCHS: "x86_64 arm64"
+    SUPPORTED_PLATFORMS: iphonesimulator
+    SDKROOT: iphonesimulator
+    TARGETED_DEVICE_FAMILY: "1,2"
+
+targets:
+  BoxedVN:
+    type: application
+    platform: iOS
+    sources:
+      - path: app/Sources
+      - path: app/Resources
+        optional: true
+        buildPhase: resources
+      - path: app/Bundled
+        optional: true
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.boxedwine.boxedvn
+        PRODUCT_NAME: BoxedVN
+        INFOPLIST_FILE: app/Info.plist
+        CODE_SIGN_ENTITLEMENTS: app/BoxedVN.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: app/BoxedVN-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(BVN_INCLUDE_DIR)
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(BVN_LIBRARY_DIR)
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -lboxedvn
+          - -lc++
+          - -ObjC
+        CLANG_ENABLE_MODULES: YES
+        SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        DEVELOPMENT_TEAM: ""
+        PROVISIONING_PROFILE_SPECIFIER: ""
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+    dependencies:
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudio.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreMotion.framework
+      - sdk: Foundation.framework
+      - sdk: GameController.framework
+      - sdk: ImageIO.framework
+      - sdk: Metal.framework
+      - sdk: OpenGLES.framework
+      - sdk: QuartzCore.framework
+      - sdk: UIKit.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: libc++.tbd
+      - sdk: libiconv.tbd
+
+schemes:
+  BoxedVN:
+    build:
+      targets:
+        BoxedVN: all
+    run:
+      config: Debug
+    archive:
+      config: Debug
