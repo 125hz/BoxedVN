@@ -18,7 +18,8 @@ import Foundation
 struct JITReport {
     enum Status {
         case unknown
-        case available
+        case available        // BVNJITProbeExecute() actually ran generated code
+        case likelyAvailable  // CS_DEBUGGED is set; execution has not been risked
         case unavailable
     }
 
@@ -28,13 +29,13 @@ struct JITReport {
     var executableMemoryAvailable: Bool
     var detail: String
 
-    var isUsable: Bool { status == .available }
+    var isUsable: Bool { status == .available || status == .likelyAvailable }
 
-    static func probe() -> JITReport {
-        let report = BVNJITProbe()
+    private static func convert(_ report: BVNJITReport) -> JITReport {
         let status: Status
         switch report.status {
         case BVNJITStatusAvailable: status = .available
+        case BVNJITStatusLikelyAvailable: status = .likelyAvailable
         case BVNJITStatusUnavailable: status = .unavailable
         default: status = .unknown
         }
@@ -45,6 +46,25 @@ struct JITReport {
             executableMemoryAvailable: report.executableMemoryAvailable,
             detail: report.detail.map(String.init(cString:)) ?? ""
         )
+    }
+
+    /// Safe: never executes generated code, so it can never crash the
+    /// process. This is the only probe automatic code (app launch, the
+    /// polling timer) may ever call.
+    static func probeStatus() -> JITReport {
+        convert(BVNJITProbeStatus())
+    }
+
+    /// UNSAFE. Actually maps, writes and calls a small test function; if
+    /// executable memory is not really available, iOS can deliver an
+    /// uncatchable SIGKILL right here with no way to recover in-process.
+    /// Only call this from a handler for a specific, explicit user action
+    /// where a resulting crash is an acceptable, explainable consequence of
+    /// what they just did — see BVNRuntime.h for the reasoning. Session.launch
+    /// already triggers Boxedwine's own equivalent check before starting a
+    /// guest; do not add another automatic call site for this.
+    static func probeExecuteUnsafe() -> JITReport {
+        convert(BVNJITProbeExecute())
     }
 }
 

@@ -422,17 +422,92 @@ step and the one that actually closes this out.
 New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
 `d6ec5182a98a1051d06eb950dfe05c24a390f9822a790faaf6285fa85d5686e0`.
 
+## 1e. The MAP_JIT fix caused a crash-on-boot regression — fixed by splitting the probe (2026-08-07)
+
+Installing the section-1d IPA made the app **crash on every launch**, before
+any user interaction. Diagnosed from the actual `.ips` crash report (not
+guessed):
+
+- Crashing thread: main thread, inside `AppModel.init()` → `BVNJITProbe()`.
+- `exception`: `EXC_BAD_ACCESS` / `SIGKILL`, `KERN_PROTECTION_FAILURE`.
+- `termination`: `{"namespace":"CODESIGNING","indicator":"Invalid Page"}`.
+- `ktriageinfo`: *"Failed to fault in a page with execute permissions."*
+- The faulting region showed `rw-/rwx SM=COW` — **current** protection was
+  read/write only, despite `PROT_EXEC` having been requested at `mmap()` time
+  and that call having returned successfully.
+
+**What this reveals:** on iOS, `mmap(PROT_EXEC)` succeeding does not mean the
+page can safely be executed. Code-signing enforcement for anonymous
+executable memory is lazy — checked at first *instruction fetch*, not at
+`mmap()` time. When that lazy check fails, the kernel does not return an
+error to the calling code; it delivers an **uncatchable `SIGKILL`** the
+instant execution is attempted. Section 1d's fix (drop `MAP_JIT`, request
+`PROT_EXEC` directly) was directionally correct — `MAP_JIT` genuinely cannot
+work here — but it silently traded a safe failure mode (`mmap` returning
+`EPERM`, handled gracefully) for an unsafe one (a process-killing fault with
+zero recovery path), and that code ran unconditionally on **every cold
+launch** via `AppModel.init()`, not just when actually testing JIT.
+
+**Fix — split into a genuinely safe probe and an explicitly unsafe one:**
+
+- `BVNJITProbeStatus()` — reads `BOXEDWINE_JIT` (compile-time) and
+  `csops(getpid(), CS_OPS_STATUS, ...)` for `CS_DEBUGGED` only. **Never maps
+  or executes anything.** Reports at most `BVNJITStatusLikelyAvailable`.
+  This is now the *only* probe automatic code may call — `AppModel.init()`'s
+  initial value and the 0.5s poll timer's `refreshJIT()` both use it
+  exclusively.
+- `BVNJITProbeExecute()` — the full mmap+write+icache-flush+**call** sequence,
+  unchanged from section 1d's logic, but now clearly documented as unsafe and
+  called from exactly one place: `BVNRuntime.mm`'s `runSession()`, immediately
+  before actually starting a guest. That is a deliberate, user-initiated
+  moment (Launch / Run Wine Notepad was just pressed), and Boxedwine's own
+  real JIT hits the identical risk moments later regardless — so this ties a
+  possible crash to a specific action, not to opening the app.
+- New `BVNJITStatusLikelyAvailable` enum value distinguishes "debugger
+  attached, JIT expected to work, not yet proven" from `Available` ("actually
+  ran generated code successfully") in both the C ABI and the Swift UI.
+
+A related Swift compiler issue surfaced while rebuilding `StatusView`: the
+combined JIT section closure became too complex for the type-checker
+("unable to type-check this expression in reasonable time") once the new
+three-state status text/color logic was added. Fixed by factoring each row
+and the footer into their own small `View` structs
+(`ios/app/Sources/Views.swift`) — a good general pattern to reach for early
+rather than letting one `body` closure grow indefinitely.
+
+**Verified:**
+- Rebuilds and links clean for the arm64 device target.
+- Source-reviewed directly: neither `AppModel.init()` nor the poll timer's
+  `refreshJIT()` reach `BVNJITProbeExecute()` — only `runSession()` does.
+- Smoke-tested on the iPhone 17 simulator: fresh install, launch, screenshot
+  confirms the library UI renders with no crash, process stays alive
+  (`launchctl list` shows it running), no fresh crash report generated. (The
+  simulator can't exercise the actual unsafe-probe risk itself — x86_64 isn't
+  ARM64, so `BVNJITProbeExecute()` takes its early "not ARM64" return there —
+  but it does confirm the split compiles, links, and the automatic paths
+  genuinely never call the risky function during a normal boot.)
+- **Not yet re-tested on the physical iPhone 17** that produced the crash
+  report — that is the real confirmation this is fixed.
+
+New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`5381984f40179e2b5f6d1cce55b325abf91f0563f65336b14006519f673415fa`. This
+supersedes the section-1d build (`d6ec5182…`), which is the one that crashed.
+
 ## 8. Next actions, in order
 
 1. **Sign and install the new IPA** (`build/artifacts/BoxedVN-unsigned.ipa`,
-   SHA-256 `d6ec5182…5686e0` — supersedes the `958b0732…` one; that build still
-   had MAP_JIT and cannot work) **on the physical iPhone 17**, re-attach
-   StikDebug, and re-check Runtime status. Expect `Executable memory: yes` and
-   `Status: Available` this time — the previous test on this device is exactly
-   what diagnosed the MAP_JIT bug (section 1d), so this is the first real
-   confirmation of whether that diagnosis was correct. If it still fails,
-   capture the exact `errno` from the detail text; with MAP_JIT eliminated as
-   a cause, a further failure here would point somewhere new.
+   SHA-256 `5381984f…3415fa` — supersedes `d6ec5182…`, which crashed on boot;
+   see section 1e) **on the physical iPhone 17**. First confirm the app now
+   opens to the library UI at all (that is the crash fix — should need no
+   debugger attached to verify). Then attach StikDebug and open Runtime
+   status: expect `Debugger attached: yes` and `Status: Likely available`
+   automatically. Actual confirmed `Status: Available` only appears after
+   pressing **Run Wine Notepad** or **Launch**, since that is now the only
+   place `BVNJITProbeExecute()` runs — if JIT genuinely doesn't work, expect
+   the crash to happen *there* instead (tied to that action, not to opening
+   the app), and the exact `errno` from the log at that point is the real
+   diagnosis. With MAP_JIT already eliminated as a cause, a failure there
+   would point somewhere new.
 3. **Import a root filesystem** through Settings and confirm the file lands in
    Application Support.
 4. **Run Wine Notepad.** This is the first real end-to-end test: rootfs mount,

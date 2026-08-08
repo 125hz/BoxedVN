@@ -70,11 +70,20 @@ const char* BVNRuntimeStateName(BVNRuntimeState state);
 
 typedef enum {
     BVNJITStatusUnknown = 0,
-    // An executable MAP_JIT page was mapped, written and executed.
+    // Executable memory was mapped, written and actually called - the
+    // strongest confirmation available, only produced by
+    // BVNJITProbeExecute().
     BVNJITStatusAvailable = 1,
-    // Executable memory could not be obtained.  BoxedVN cannot enable this
-    // itself; an external JIT enabler must attach a debugger first.
+    // Confirmed unavailable, or an execute attempt failed before it could
+    // report back (see BVNJITProbeExecute()'s file-header comment - a real
+    // crash there is possible, and this value could theoretically be stale
+    // from before one).
     BVNJITStatusUnavailable = 2,
+    // The kernel has this process flagged CS_DEBUGGED, so JIT is EXPECTED to
+    // work, but nothing has actually tried to execute generated code yet.
+    // Only BVNJITProbeStatus() produces this - it never risks execution, so
+    // it cannot promote this to BVNJITStatusAvailable on its own.
+    BVNJITStatusLikelyAvailable = 3,
 } BVNJITStatus;
 
 typedef struct {
@@ -83,29 +92,52 @@ typedef struct {
     bool jitCompiledIn;
     // True when the kernel has flagged this process CS_DEBUGGED - i.e. a
     // debugger genuinely attached (StikDebug or equivalent).  Read directly
-    // from the kernel via csops(), independent of whether the mmap probe
-    // below succeeded, so a failure can be told apart: "no debugger ever
-    // attached" (this is false) versus "a debugger attached but executable
-    // memory still isn't available" (this is true, executableMemoryAvailable
-    // is false - a signing/entitlement problem, not a StikDebug problem).
+    // from the kernel via csops(), which never touches guest memory and is
+    // always safe to call.
     bool debuggerAttached;
-    // True when mmap(PROT_EXEC | MAP_JIT) succeeded.  This is an observation
-    // of what the kernel allowed, not a reading of the signed entitlement
-    // blob; on iOS the two coincide because only the dynamic-codesigning
-    // entitlement makes that mapping succeed.
+    // True only after BVNJITProbeExecute() has actually mapped, written and
+    // called generated code successfully.  BVNJITProbeStatus() never sets
+    // this true - it does not attempt execution, so it cannot know.
     bool executableMemoryAvailable;
-    // Human-readable detail, including the failing syscall and errno when the
+    // Human-readable detail, including the failing syscall and errno when a
     // probe failed.  Owned by the runtime; valid until the next probe.
     const char* detail;
 } BVNJITReport;
 
-// Allocates a MAP_JIT page, writes a function that returns a known value,
-// flushes the instruction cache and calls it.  This is a real end-to-end test
-// of the same mechanism Boxedwine's JIT uses, not a check of a flag.
+// Safe: reads jitCompiledIn and debuggerAttached only (both via csops() /
+// compile-time flags) and NEVER attempts to execute anything. Call this as
+// often as you like - at startup, on a poll timer, wherever - it cannot
+// crash the process.
 //
-// Safe to call repeatedly; the result is recomputed each time because JIT can
-// become available after the app launches, once a JIT enabler attaches.
-BVNJITReport BVNJITProbe(void);
+// Reports at most BVNJITStatusLikelyAvailable: CS_DEBUGGED being set is
+// necessary for JIT to work but is not sufficient proof, and proving it
+// requires BVNJITProbeExecute()'s risk (see below).
+BVNJITReport BVNJITProbeStatus(void);
+
+// UNSAFE. Actually maps a page, writes a small function into it, flushes the
+// instruction cache, and CALLS it - the same sequence Boxedwine's real JIT
+// depends on. If the process cannot really execute from that page, iOS
+// delivers an uncatchable SIGKILL (CODESIGNING / "Invalid Page") the instant
+// the call is attempted - not a caught exception, not an error return, no
+// recovery possible in-process. On some iOS versions this SIGKILL can happen
+// even when mmap(PROT_EXEC) itself returned success and the process holds
+// CS_DEBUGGED; the failure genuinely cannot be predicted without attempting
+// it.
+//
+// Only call this from a context where a crash is an acceptable, explainable
+// consequence of what the user just did:
+//   - immediately before actually starting a guest (BVNRuntime.mm does this;
+//     Boxedwine's real JIT would hit the identical risk moments later
+//     regardless, so this at least ties the crash to "I pressed Launch"
+//     rather than "the app just opened"), or
+//   - a UI action the user explicitly chose, clearly labelled as possibly
+//     crashing the app.
+//
+// NEVER call this from application startup, a timer, or anywhere else that
+// runs without a specific, understood user action behind it - that is
+// exactly the mistake that made every cold launch crash before this was
+// split out.
+BVNJITReport BVNJITProbeExecute(void);
 
 // ---------------------------------------------------------------------------
 // Storage layout

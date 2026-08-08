@@ -14,7 +14,10 @@ import Foundation
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var games: [Game] = []
-    @Published private(set) var jit: JITReport = .probe()
+    // .probeStatus(), never .probeExecuteUnsafe(): this runs at app launch,
+    // before the user has done anything, and the unsafe probe can crash the
+    // process with no recovery possible. See Runtime.swift / BVNRuntime.h.
+    @Published private(set) var jit: JITReport = .probeStatus()
     @Published private(set) var runtimeState: RuntimeState = .idle
     @Published private(set) var isImporting = false
     @Published var importProgressMessage = ""
@@ -241,8 +244,10 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Safe, timer-driven refresh - never risks executing generated code.
+    /// See Runtime.swift's probeStatus()/probeExecuteUnsafe() split.
     func refreshJIT() {
-        let updated = JITReport.probe()
+        let updated = JITReport.probeStatus()
         // Comparing before assigning avoids an @Published fire (and a
         // SwiftUI re-render) on every tick when nothing actually changed.
         if updated.status != jit.status ||

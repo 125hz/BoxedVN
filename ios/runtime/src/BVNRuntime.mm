@@ -303,7 +303,12 @@ void runSession(const PendingLaunch& launch) {
         return;
     }
 
-    const BVNJITReport jit = BVNJITProbe();
+    // BVNJITProbeExecute(), not the safe status check: this is the one place
+    // in the app where actually confirming JIT works is worth the risk of an
+    // uncatchable crash if it does not, because the user just pressed
+    // Launch/Run Wine Notepad and Boxedwine's real JIT is about to hit the
+    // identical risk moments later regardless. See BVNRuntime.h.
+    const BVNJITReport jit = BVNJITProbeExecute();
     BVNLogWrite(jit.status == BVNJITStatusAvailable ? BVNLogLevelInfo
                                                     : BVNLogLevelWarning,
                 "jit", jit.detail);
@@ -453,9 +458,14 @@ extern "C" int BVNGuestMain(int argc, char* argv[]) {
                 (std::string("BoxedVN starting; Boxedwine core ") +
                  BVNRuntimeBoxedwineVersion()).c_str());
 
-    const BVNJITReport startupJIT = BVNJITProbe();
-    BVNLogWrite(startupJIT.status == BVNJITStatusAvailable ? BVNLogLevelInfo
-                                                           : BVNLogLevelWarning,
+    // Safe status check only: this runs unconditionally on every launch, and
+    // BVNJITProbeExecute() can crash the process with no recovery possible -
+    // see BVNRuntime.h. This is exactly the mistake that made every cold
+    // launch crash before it was split out.
+    const BVNJITReport startupJIT = BVNJITProbeStatus();
+    BVNLogWrite(startupJIT.status == BVNJITStatusLikelyAvailable
+                    ? BVNLogLevelInfo
+                    : BVNLogLevelWarning,
                 "jit", startupJIT.detail);
 
     setState(BVNRuntimeStateIdle);

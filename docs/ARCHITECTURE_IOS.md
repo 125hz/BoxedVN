@@ -188,42 +188,55 @@ undefined `___clear_cache`. `platform/linux/platform.cpp` routes both
 `writeCodeToMemory` overloads and `clearInstructionCache` through one helper
 that calls `sys_icache_invalidate` on iOS.
 
-### The probe
+### The probe — split into a safe check and an unsafe one
 
-`BVNJITProbe` (`ios/runtime/src/BVNJIT.mm`) does not read an entitlement
-string, and does not read `CS_DEBUGGED` alone and infer success from it
-either — a debugger can be genuinely attached and JIT can still be broken for
-an unrelated reason (see below), so the probe performs the whole operation
-Boxedwine's real allocator uses:
+`ios/runtime/src/BVNJIT.mm` exposes **two** entry points, not one, because
+actually testing execution can crash the process with no recovery possible,
+and that risk must never be taken automatically.
 
-1. `mmap(PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS)` — no `MAP_JIT`
+**Why:** a real device crash confirmed that on iOS, `mmap(PROT_EXEC)`
+succeeding does **not** mean the page can safely be executed. Apple's
+code-signing enforcement for anonymous executable memory is lazy — checked at
+first *instruction fetch*, not at `mmap()` time. When that lazy check fails,
+the kernel does not return an error to the process; it delivers an
+**uncatchable `SIGKILL`** (`CODESIGNING` / "Invalid Page") the instant
+execution is attempted. There is no signal handler, no exception, no way to
+guard against it from inside the process. An earlier version of this probe
+called through the mapped page unconditionally at every app launch (inside
+`AppModel.init()`), and crashed the app on boot as a result — every time,
+regardless of whether a JIT enabler was even attached.
+
+`BVNJITProbeStatus()` — **safe, call freely:**
+- reads whether `BOXEDWINE_JIT` is compiled in (compile-time flag)
+- reads `csops(getpid(), CS_OPS_STATUS, ...)` for the `CS_DEBUGGED` flag
+- **never maps or executes anything**
+- reports at most `BVNJITStatusLikelyAvailable` — necessary evidence, not
+  proof
+
+This is the only probe automatic code may call: `AppModel.init()`'s initial
+value and the 0.5s poll timer's `refreshJIT()` (`ios/app/Sources/AppModel.swift`)
+both use it exclusively, so the JIT badge stays live without ever risking a
+crash on a launch or a timer tick the user didn't ask for.
+
+`BVNJITProbeExecute()` — **unsafe, gated to specific call sites:**
+1. `mmap(PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS)` — no `MAP_JIT`; this step alone is safe
 2. write three ARM64 instructions that return `0x4258`
 3. `sys_icache_invalidate`
-4. call it and check the return value
+4. **call it** — the unsafe step; a real `SIGKILL` can happen exactly here
 
-Independently of that, it reads `csops(getpid(), CS_OPS_STATUS, ...)` for the
-`CS_DEBUGGED` flag, so a failure at step 1 can be told apart into two
-different problems, surfaced separately in `BVNJITReport.debuggerAttached`:
+Only called from `BVNRuntime.mm`'s `runSession()`, immediately before
+`boxedmain()` actually starts a guest. That is a deliberate, user-initiated
+moment (the user pressed Launch or Run Wine Notepad), and Boxedwine's own JIT
+would hit the identical risk moments later regardless — so nothing is made
+safer by skipping the check there, but tying a possible crash to a specific
+action the user just took is far better than a silent crash on every cold
+launch.
 
-- **not debugged** — no JIT enabler has attached yet, or it detached; the fix
-  is in StikDebug, not BoxedVN.
-- **debugged, but `mmap` still fails** — a debugger genuinely attached, but
-  executable memory is still unavailable. This points at the app's own
-  signature: most likely `get-task-allow` did not survive whatever tool
-  signed the IPA (see `docs/BUILD_IOS.md`'s entitlements table), since some
-  sideloading tools strip entitlements they don't recognise.
-
-Step 4 returning the wrong value would mean the cache flush or the mapping is
-misbehaving — a JIT built on that would produce wrong results silently, so it
-is treated as unavailable.
-
-The probe is re-run automatically every 0.5s while the app is in the
-foreground (`AppModel`'s existing runtime-state poll timer in
-`ios/app/Sources/AppModel.swift` also drives this), because JIT can become
-available well after launch, whenever a JIT enabler happens to attach — a
-one-shot probe at cold start would show stale results indefinitely.
-`BVNRuntime` also runs it again immediately before starting a guest and
-refuses to start if it fails.
+Whichever probe ran, a debugger-attached-but-`mmap`-still-fails result (only
+observable in the unsafe probe, since the safe one never attempts the mmap)
+points at the app's own signature — most likely `get-task-allow` not
+surviving whatever tool signed the IPA (see `docs/BUILD_IOS.md`'s entitlements
+table) — rather than at StikDebug.
 
 ---
 

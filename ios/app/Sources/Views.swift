@@ -274,45 +274,110 @@ struct GameDetailView: View {
 
 // MARK: - Status
 
+/// Status text/colour and the JIT section body are factored out into their
+/// own small helpers/view: a single large `body` mixing this many
+/// conditionals made the Swift type-checker time out in Release builds
+/// ("unable to type-check this expression in reasonable time").
+private func jitStatusText(_ status: JITReport.Status) -> String {
+    switch status {
+    case .available: return "Available (confirmed by launching)"
+    case .likelyAvailable: return "Likely available (not yet confirmed)"
+    case .unavailable: return "Unavailable"
+    case .unknown: return "Unknown"
+    }
+}
+
+private func jitStatusColor(_ status: JITReport.Status) -> Color {
+    switch status {
+    case .available: return .green
+    case .likelyAvailable: return .yellow
+    case .unavailable, .unknown: return .orange
+    }
+}
+
+/// Every row and the footer are their own small views with an explicit
+/// return type, rather than one large inferred Section closure - see the
+/// comment above jitStatusText for why.
+private struct JITStatusRow: View {
+    let jit: JITReport
+
+    var body: some View {
+        LabeledContent("Status") {
+            Text(jitStatusText(jit.status))
+                .foregroundStyle(jitStatusColor(jit.status))
+        }
+    }
+}
+
+private struct JITDebuggerRow: View {
+    let jit: JITReport
+
+    var body: some View {
+        LabeledContent("Debugger attached (CS_DEBUGGED)") {
+            Text(jit.debuggerAttached ? "yes" : "no")
+                .foregroundStyle(jit.debuggerAttached ? Color.green : Color.secondary)
+        }
+    }
+}
+
+private struct JITFooter: View {
+    var body: some View {
+        Text("This check never risks crashing the app: it reads the kernel's "
+             + "debugged-process flag but never actually executes generated "
+             + "code. iOS does not allow testing real execution safely - the "
+             + "only way to know for certain is to actually launch a guest, "
+             + "at which point Boxedwine's own JIT hits the identical risk. "
+             + "\"Likely available\" means a debugger is attached and JIT is "
+             + "expected to work, but has not been proven yet.")
+    }
+}
+
+private struct JITStatusSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Section {
+            JITStatusRow(jit: model.jit)
+            LabeledContent("ARM64 JIT compiled in",
+                           value: model.jit.jitCompiledIn ? "yes" : "no")
+            JITDebuggerRow(jit: model.jit)
+            LabeledContent("Confirmed by launching a guest",
+                           value: model.jit.executableMemoryAvailable ? "yes" : "not yet")
+            Text(model.jit.detail).font(.caption).foregroundStyle(.secondary)
+            Button("Re-check") { model.refreshJIT() }
+        } header: {
+            Text("JIT")
+        } footer: {
+            JITFooter()
+        }
+    }
+}
+
+private struct JITHintSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Section {
+            // This updates live (every half second) without needing
+            // "Re-check" - the button above exists for an immediate,
+            // deliberate read, not because the badge is otherwise stale.
+            if !model.jit.debuggerAttached {
+                Text("BoxedVN cannot enable JIT itself. Attach StikDebug or "
+                     + "another JIT enabler to this app while it is "
+                     + "running; the status above updates automatically.")
+                    .font(.caption)
+            }
+        }
+    }
+}
+
 struct StatusView: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
         List {
-            Section("JIT") {
-                LabeledContent("Status") {
-                    Text(model.jit.isUsable ? "Available" : "Unavailable")
-                        .foregroundStyle(model.jit.isUsable ? .green : .orange)
-                }
-                LabeledContent("ARM64 JIT compiled in",
-                               value: model.jit.jitCompiledIn ? "yes" : "no")
-                LabeledContent("Debugger attached (CS_DEBUGGED)") {
-                    Text(model.jit.debuggerAttached ? "yes" : "no")
-                        .foregroundStyle(model.jit.debuggerAttached ? .green : .secondary)
-                }
-                LabeledContent("Executable memory",
-                               value: model.jit.executableMemoryAvailable ? "yes" : "no")
-                Text(model.jit.detail).font(.caption).foregroundStyle(.secondary)
-                Button("Re-check") { model.refreshJIT() }
-            }
-
-            Section {
-                // This updates live (every half second) without needing
-                // "Re-check" - the button above exists for an immediate,
-                // deliberate read, not because the badge is otherwise stale.
-                if model.jit.debuggerAttached && !model.jit.executableMemoryAvailable {
-                    Text("A debugger is attached, but executable memory is "
-                         + "still unavailable. This points at the app's own "
-                         + "signature rather than StikDebug - see the detail "
-                         + "above.")
-                        .foregroundStyle(.orange)
-                } else if !model.jit.debuggerAttached {
-                    Text("BoxedVN cannot enable JIT itself. Attach StikDebug or "
-                         + "another JIT enabler to this app while it is "
-                         + "running; the status above updates automatically.")
-                        .font(.caption)
-                }
-            }
+            JITStatusSection()
+            JITHintSection()
 
             Section("Runtime") {
                 LabeledContent("Boxedwine core", value: Session.boxedwineVersion)
