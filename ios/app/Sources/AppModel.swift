@@ -29,7 +29,7 @@ final class AppModel: ObservableObject {
     init() {
         reloadGames()
         startPolling()
-        Log.write("BoxedVN frontend initialised; Boxedwine core "
+        Log.write("BoxedVN \(AppVersion.display) initialised; Boxedwine core "
                   + Session.boxedwineVersion, category: "app")
     }
 

@@ -127,6 +127,19 @@ log "Generating the application project"
     "${XCODEGEN}" generate --spec project.yml --project . --quiet
 ) || die "XcodeGen failed."
 
+# Stamp the build with the commit it came from.  A sideloaded IPA has no
+# update channel, so "which build am I running?" is otherwise unanswerable from
+# the device.  A working tree with uncommitted changes is marked +dirty: the
+# commit alone would be a lie about what is in the binary.
+BUILD_REVISION="unknown"
+if git -C "${BOXEDVN_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+    BUILD_REVISION="$(git -C "${BOXEDVN_ROOT}" rev-parse --short=8 HEAD)"
+    if ! git -C "${BOXEDVN_ROOT}" diff --quiet HEAD 2>/dev/null; then
+        BUILD_REVISION="${BUILD_REVISION}+dirty"
+    fi
+fi
+log "Build revision: ${BUILD_REVISION}"
+
 XCODE_PROJECT="${BOXEDVN_ROOT}/ios/BoxedVN.xcodeproj"
 [[ -d "${XCODE_PROJECT}" ]] || die "XcodeGen did not produce ${XCODE_PROJECT}."
 
@@ -156,6 +169,7 @@ xcodebuild \
     -derivedDataPath "${DERIVED_DATA}" \
     BVN_LIBRARY_DIR="${CMAKE_BUILD_DIR}" \
     BVN_INCLUDE_DIR="${BOXEDVN_ROOT}/ios/runtime/include" \
+    BVN_BUILD_REVISION="${BUILD_REVISION}" \
     "${signing_args[@]}" \
     build \
     >"${BUILD_LOG}" 2>&1

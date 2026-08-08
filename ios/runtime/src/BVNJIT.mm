@@ -37,8 +37,15 @@
  *  actually honours for a CS_DEBUGGED process is a subsequent mprotect()
  *  adding PROT_EXEC.
  *
+ *  PROT_EXEC still has to be passed to mmap even though mmap will not honour
+ *  it, because the mmap prot sets the region's MAXIMUM protection and mprotect
+ *  can never raise a region above its maximum. Mapping rw- only caps the page
+ *  at rw- permanently and the mprotect silently clamps to r-- instead - also
+ *  confirmed on device, as "actual protection is r-- (max rw-)".
+ *
  *  So the sequence - mirrored exactly by Platform::alloc64kBlock on iOS, see
- *  platform/linux/platform.cpp - is: mmap rw-, mprotect to add execute, then
+ *  platform/linux/platform.cpp - is: mmap rwx (for the maximum), write the
+ *  code while the page is still rw-, mprotect to r-x to obtain execute, then
  *  VERIFY with vm_region_64 that the execute bit is genuinely set before
  *  trusting it. The verification is not paranoia: both mmap and mprotect can
  *  report success while leaving the page non-executable, and the only other
@@ -218,24 +225,29 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
 #else
     const size_t pageSize = static_cast<size_t>(getpagesize());
 
-    // Step 1: map the page WITHOUT PROT_EXEC, then add execute permission
-    // with mprotect() - the same sequence Platform::alloc64kBlock uses on
-    // iOS.
+    // Step 1: map the page requesting rwx, then mprotect down to r-x - the
+    // same sequence Platform::alloc64kBlock uses on iOS.
     //
-    // Requesting PROT_EXEC directly in the mmap does not work here and, worse,
-    // does not fail: iOS clamps the *current* protection to rw- while leaving
-    // rwx as the maximum, hands back a perfectly valid pointer, and only
-    // faults later when something jumps into it. mprotect() afterwards is the
-    // call the kernel actually honours for a CS_DEBUGGED process.
-    void* page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE,
+    // The mmap will NOT come back executable: iOS clamps the *current*
+    // protection to rw- while leaving rwx as the maximum, hands back a
+    // perfectly valid pointer, and only faults later when something jumps into
+    // it. mprotect() afterwards is the call the kernel actually honours for a
+    // CS_DEBUGGED process.
+    //
+    // PROT_EXEC still has to be requested here, though, because the mmap prot
+    // sets the region's MAXIMUM protection and mprotect can never raise a
+    // region above its maximum. Mapping rw- only caps the page at rw- forever,
+    // and the mprotect below then silently clamps to r-- instead (confirmed on
+    // device: "actual protection is r-- (max rw-)").
+    void* page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) {
         const int mmapErrno = errno;
         report.status = BVNJITStatusUnavailable;
         report.executableMemoryAvailable = false;
-        setDetail("mmap(PROT_READ | PROT_WRITE) failed: %s (errno %d). This "
-                  "is a plain anonymous mapping with no execute permission "
-                  "requested, so this failure is not about JIT at all - the "
+        setDetail("mmap(PROT_READ | PROT_WRITE | PROT_EXEC) failed: %s "
+                  "(errno %d). iOS normally lets this mapping succeed and just "
+                  "withholds the execute bit, so an outright failure means the "
                   "process is out of address space or memory.",
                   strerror(mmapErrno), mmapErrno);
         return report;
@@ -304,12 +316,23 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
                       "signing.",
                       strerror(mprotectErrno), mprotectErrno, currentText,
                       maximumText);
+        } else if (queried && (maximumProtection & VM_PROT_EXECUTE) == 0) {
+            // Distinct from the case below: the ceiling itself is wrong, so no
+            // mprotect could ever have worked. That is a bug in how the page
+            // was mapped, not a restriction the kernel placed on this process.
+            setDetail("mprotect(PROT_EXEC) reported success, but the region's "
+                      "MAXIMUM protection is %s - it has no execute bit, so no "
+                      "mprotect can ever make this page executable (actual "
+                      "protection %s). The maximum is fixed at mmap time; this "
+                      "page was mapped without PROT_EXEC.",
+                      maximumText, currentText);
         } else {
             setDetail("mprotect(PROT_EXEC) reported success, but the region's "
                       "actual protection is %s (max %s) - the execute bit was "
-                      "not granted. Refusing to jump into a non-executable "
-                      "page; doing so is an instruction-abort permission "
-                      "fault, not a recoverable error.",
+                      "not granted even though the maximum allows it. Refusing "
+                      "to jump into a non-executable page; doing so is an "
+                      "instruction-abort permission fault, not a recoverable "
+                      "error.",
                       currentText, maximumText);
         }
         return report;
@@ -352,7 +375,7 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
     }
 
     report.status = BVNJITStatusAvailable;
-    setDetail("Executable memory obtained (mmap rw- then mprotect to %s), "
+    setDetail("Executable memory obtained (mmap rwx-max then mprotect to %s), "
               "written, cache-flushed and executed successfully. Boxedwine's "
               "ARM64 JIT can run.",
               currentText);

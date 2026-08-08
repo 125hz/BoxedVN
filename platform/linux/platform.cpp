@@ -387,27 +387,34 @@ void Platform::releaseNativeMemory(void* address, U64 len) {
 U8* Platform::alloc64kBlock(U32 count, bool executable) {
     U64 len = 64 * 1024 * (U64)count;
     int prot = PROT_WRITE | PROT_READ;
-#if !TARGET_OS_IPHONE
     if (executable) {
+        // PROT_EXEC must be requested HERE even on iOS, where the mapping will
+        // not actually come back executable.  The mmap prot argument sets the
+        // region's MAXIMUM protection, and mprotect can never raise a region
+        // above its maximum.  Leaving PROT_EXEC out of this call caps the
+        // region at rw- forever, and the later mprotect(PROT_READ|PROT_EXEC)
+        // then silently clamps to r-- (confirmed on device: "actual protection
+        // is r-- (max rw-)").  With PROT_EXEC requested, the maximum is rwx and
+        // the mprotect below can genuinely grant execute.
         prot |= PROT_EXEC;
     }
-#endif
     U8* result = (U8*)mmap(NULL, len, prot, MAP_ANONYMOUS | MAP_PRIVATE | MAP_BOXEDWINE, -1, 0);
     if (result == MAP_FAILED) {
         kpanic_fmt("alloc64kBlock: failed to commit memory : %s", strerror(errno));
     }
 #if TARGET_OS_IPHONE
-    // On iOS, execute permission must be added with a SEPARATE mprotect after
-    // the mapping exists - passing PROT_EXEC to mmap above does not work and,
-    // far worse, does not fail: the kernel clamps the region's current
-    // protection to rw-, leaves rwx as the maximum, and returns a valid
-    // pointer.  The JIT then writes code into it and jumps, and the process
-    // dies on an instruction-abort permission fault rather than on anything
-    // that could have been checked.  (Confirmed from a device crash report:
-    // pc == the mapped address, esr "(Instruction Abort) Permission fault",
-    // region "rw-/rwx".)  mprotect is the call the kernel actually honours
-    // for a process it has flagged CS_DEBUGGED - which is what an external
-    // JIT enabler such as StikDebug arranges.
+    // On iOS the mmap above does NOT return an executable mapping, and does
+    // not fail either: the kernel clamps the region's current protection to
+    // rw-, leaves rwx as the maximum, and returns a valid pointer.  The JIT
+    // would then write code into it and jump, and the process dies on an
+    // instruction-abort permission fault rather than on anything that could
+    // have been checked.  (Confirmed from a device crash report: pc == the
+    // mapped address, esr "(Instruction Abort) Permission fault", region
+    // "rw-/rwx".)  Execute has to be granted by a SEPARATE mprotect, which is
+    // the call the kernel actually honours for a process it has flagged
+    // CS_DEBUGGED - which is what an external JIT enabler such as StikDebug
+    // arranges.  That mprotect only works because PROT_EXEC was requested in
+    // the mmap and so the region's maximum protection is rwx.
     //
     // The block is left r-x, NOT rwx: requesting write alongside execute makes
     // the kernel silently drop the execute bit (see

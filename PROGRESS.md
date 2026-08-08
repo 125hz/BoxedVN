@@ -563,6 +563,98 @@ New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
 which does not fix the actually-reported symptom and was never sent to the
 user).
 
+## 1g. W^X: the two-part JIT memory bug (2026-08-07)
+
+Two separate mistakes, found one after the other because the first fix's
+diagnostic exposed the second. Both were only visible on device.
+
+**Symptom:** the app launched fine and reported `Status: JIT ready`, but
+**Run Wine Notepad** crashed. The `.ips` showed `pc` equal to a freshly mapped
+address and `esr` `(Instruction Abort) Permission fault`, with the region
+listed as `rw-/rwx`.
+
+**Part 1 — `mmap(PROT_EXEC)` does not fail, it clamps.** The region's *current*
+protection came back `rw-` while `rwx` stayed as the *maximum*, and `mmap`
+returned a perfectly valid pointer. Nothing reported an error; the JIT wrote
+code and jumped, and the process died on a fault that cannot be caught. Fixed
+by adding a `mprotect` after the mapping exists (the call the kernel does
+honour for a `CS_DEBUGGED` process) and — importantly — a `vm_region_64`
+verification that the execute bit is *genuinely* set before trusting it.
+
+That verification is what made the rest of this tractable. It turned an
+uncatchable fault into a printed sentence.
+
+**Part 2 — iOS enforces strict W^X, silently.** With the verification in place
+the device reported: *"mprotect(PROT_EXEC) reported success, but the region's
+actual protection is rw- (max rwx)."* `mprotect` returns 0 and withholds the
+execute bit whenever `PROT_WRITE` is requested alongside it. Execution is
+allowed for this process — max is `rwx` — just never at the same time as write.
+Fixed by keeping JIT pages `r-x` and flipping them to `rw-` only around actual
+writes, via a new `boxedwineSetCodeMemoryWritable()` bracketing both
+`Platform::writeCodeToMemory` overloads. Every code write in Boxedwine already
+funnels through those two overloads (verified by grep: `bnativeheap.cpp` plus
+both code generators), because macOS needs the same thing via
+`pthread_jit_write_protect_np`.
+
+**Part 3 — the W^X fix introduced a third failure, from dropping `PROT_EXEC`
+from the `mmap`.** Next device report: *"actual protection is r-- (max rw-)."*
+Note the **maximum** — it had lost its execute bit entirely, so no `mprotect`
+could ever have granted execute, and the one that ran clamped to `r--` instead.
+The mmap `prot` argument sets the region's **maximum** protection, and
+`mprotect` can never raise a region above its maximum. `PROT_EXEC` must
+therefore be passed to `mmap` *even though `mmap` will not honour it*, purely
+to set the ceiling. Fixed in `Platform::alloc64kBlock` and mirrored in
+`BVNJITProbeExecute`.
+
+The final sequence, in both places:
+
+1. `mmap` with `PROT_READ|PROT_WRITE|PROT_EXEC` — comes back `rw-`, max `rwx`.
+2. Write the code while the page is still writable.
+3. `mprotect` to `PROT_READ|PROT_EXEC` — this is what actually grants execute.
+4. `vm_region_64` to **verify** the execute bit is set. Never skip this.
+5. `sys_icache_invalidate`, then execute.
+
+The probe's failure branches now distinguish *max lacks execute* (a bug in how
+the page was mapped) from *current lacks execute despite max allowing it* (the
+kernel refusing this process), because the two have completely different causes
+and the earlier message conflated them.
+
+**Verified:** builds clean for arm64; 26 pin checks pass. **Not yet confirmed
+on device** — steps 1–2 are each confirmed by a device report, but the
+combination has not been run.
+
+**Open risk, stated up front:** `pthread_jit_write_protect_np` on macOS is
+**per-thread**; `mprotect` is **process-wide**. A guest thread executing from a
+page while another thread flips it writable will fault. Wine is multithreaded,
+so this is live, not theoretical. The durable fix is a dual mapping
+(`mach_vm_remap` the same physical pages at an `rw-` address for writing and an
+`r-x` address for executing), which needs Boxedwine's write callbacks to target
+the writable alias instead of the executable address. If crashes appear
+*during* execution rather than at startup, and are timing-dependent, this is
+the first suspect.
+
+## 1h. The app now reports its own version (2026-08-07)
+
+Requested by the user: a sideloaded app has no App Store version history and no
+update prompt, so there was no way to tell whether the installed IPA was the
+newest build. `AppVersion` (`ios/app/Sources/Runtime.swift`) surfaces
+`0.1.0 (3) · 769e6334` — marketing version, build number, git commit — on the
+**first screen** under Runtime, in Runtime status, and in the first line of
+every session log.
+
+- Build number lives in the checked-in XcodeGen specs and is raised by
+  `scripts/bump-build.sh` (`--set`/`--marketing` also available). It is not
+  generated at build time from a timestamp, because a build from a given commit
+  must stay reproducible on the CI runner.
+- Git revision is stamped by `scripts/build-ios.sh` via `BVN_BUILD_REVISION`
+  into the `BVNBuildRevision` Info.plist key. A working tree with uncommitted
+  changes is marked `+dirty`. Anything not built through that script reports
+  `unknown` rather than claiming a revision it doesn't have.
+
+**Run `scripts/bump-build.sh` before packaging any IPA that goes to a device.**
+Two IPAs reporting the same version is exactly the confusion this exists to
+prevent.
+
 ## 8. Next actions, in order
 
 1. **Sign and install the new IPA** (`build/artifacts/BoxedVN-unsigned.ipa`,

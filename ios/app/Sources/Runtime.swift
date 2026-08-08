@@ -68,6 +68,46 @@ struct JITReport {
     }
 }
 
+// MARK: - Version
+
+/// Identifies exactly which build is installed.
+///
+/// BoxedVN is sideloaded, so there is no App Store version history and no
+/// update prompt: the only way to know whether the IPA on the device is the
+/// newest one is for the app to say so itself.  The build number rises with
+/// every packaged IPA (scripts/bump-build.sh) and the revision is the git
+/// commit the binary was compiled from (stamped by scripts/build-ios.sh).
+enum AppVersion {
+    static var marketing: String {
+        string(for: "CFBundleShortVersionString") ?? "0.0.0"
+    }
+
+    static var build: String { string(for: "CFBundleVersion") ?? "0" }
+
+    /// "unknown" for anything not built through scripts/build-ios.sh - see the
+    /// BVN_BUILD_REVISION default in ios/project.yml.  Reported as-is rather
+    /// than hidden, because a build whose provenance cannot be established is
+    /// exactly the case worth seeing.
+    static var revision: String { string(for: "BVNBuildRevision") ?? "unknown" }
+
+    /// e.g. "0.1.0 (2) · 769e6334".  The revision is omitted when unknown
+    /// rather than printed as the word "unknown" beside a real version.
+    static var display: String {
+        let base = "\(marketing) (\(build))"
+        return revision == "unknown" || revision.isEmpty
+            ? base
+            : "\(base) · \(revision)"
+    }
+
+    private static func string(for key: String) -> String? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+}
+
 // MARK: - Storage
 
 enum Storage {

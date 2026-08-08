@@ -71,6 +71,13 @@ struct LibraryView: View {
                     }
                 }
                 LabeledContent("Session", value: model.runtimeState.rawValue)
+                // Deliberately on the first screen, not buried in an About
+                // page: BoxedVN is sideloaded, so this is the only way to tell
+                // whether the installed IPA is the newest build.
+                LabeledContent("Version", value: AppVersion.display)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
 
             Section {
@@ -394,6 +401,8 @@ struct StatusView: View {
             JITHintSection()
 
             Section("Runtime") {
+                LabeledContent("BoxedVN build", value: AppVersion.display)
+                    .textSelection(.enabled)
                 LabeledContent("Boxedwine core", value: Session.boxedwineVersion)
                 LabeledContent("Session", value: model.runtimeState.rawValue)
                 if let code = Session.lastExitCode {

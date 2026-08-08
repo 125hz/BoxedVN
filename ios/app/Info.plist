@@ -20,6 +20,14 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+
+	<!-- The git commit the IPA was built from.  Sideloaded builds carry no
+	     App Store version history, so a marketing version alone cannot tell
+	     you whether an installed IPA is the newest one; the commit can.
+	     scripts/build-ios.sh passes the real value, so a build made any other
+	     way is honestly reported as "unknown" rather than silently wrong. -->
+	<key>BVNBuildRevision</key>
+	<string>$(BVN_BUILD_REVISION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>MinimumOSVersion</key>
