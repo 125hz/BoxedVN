@@ -7,11 +7,18 @@
 
 	  get-task-allow
 	      Lets a debugger attach to the app.  That is the mechanism StikDebug
-	      and equivalent JIT enablers use, and attaching is what causes the
-	      kernel to grant dynamic-codesigning, which is what makes
-	      mmap(PROT_EXEC | MAP_JIT) succeed.  Without it Boxedwine's ARM64 JIT
-	      cannot run at all.  Sideloading tools normally set this themselves;
-	      it is declared here so an unsigned IPA carries the intent.
+	      and equivalent JIT enablers use; a successful attach gets the kernel
+	      to flag the process CS_DEBUGGED, which relaxes code-signing
+	      enforcement for plain mmap()/mprotect() PROT_EXEC transitions on
+	      that process (NOT the same thing as macOS's MAP_JIT - MAP_JIT
+	      itself stays gated behind Apple's "dynamic-codesigning" entitlement,
+	      which is approved only for browser engines and is never obtainable
+	      by a sideloaded app, debugger attached or not - see
+	      include/boxedwine.h's MAP_BOXEDWINE and
+	      ios/runtime/src/BVNJIT.mm).  Without get-task-allow no debugger can
+	      attach at all, and Boxedwine's ARM64 JIT cannot run.  Sideloading
+	      tools normally set this themselves; it is declared here so an
+	      unsigned IPA carries the intent.
 
 	  com.apple.developer.kernel.increased-memory-limit
 	      Boxedwine reserves a large contiguous region for the emulated guest

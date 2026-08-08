@@ -29,13 +29,25 @@ for the exact list of what has and has not been tried.
 
 ## 2. JIT is required and BoxedVN cannot enable it
 
-A sideloaded iOS app cannot map executable memory unless the kernel has granted
-it `dynamic-codesigning`, which happens only while a debugger is attached.
+A sideloaded iOS app cannot map executable memory unless the kernel has
+flagged the process `CS_DEBUGGED`, which happens only while a genuine
+third-party debugger (StikDebug or an equivalent JIT enabler, attaching over
+the real Developer Disk Image / debugserver channel) is attached. This is a
+**different mechanism from macOS's `MAP_JIT`** — `MAP_JIT` itself stays gated
+behind Apple's separate `dynamic-codesigning` entitlement, approved only for
+browser engines and never obtainable by a sideloaded app regardless of
+debugger status, so BoxedVN's iOS allocator never requests it (see
+`docs/ARCHITECTURE_IOS.md` §4).
 
 - **Signing the IPA does not enable JIT.** You must attach StikDebug or an
   equivalent JIT enabler after installing.
-- Without it, `mmap(PROT_EXEC | MAP_JIT)` fails with `EPERM`, `BVNJITProbe`
-  reports Unavailable with the `errno`, and the app refuses to start a guest.
+- Without it, `mmap(PROT_EXEC)` fails with `EPERM`, `BVNJITProbe` reports
+  Unavailable with the `errno`, and the app refuses to start a guest.
+- `BVNJITProbe` checks `CS_DEBUGGED` directly and separately from whether the
+  `mmap` succeeds, so **Runtime status** in the app can tell apart "no
+  debugger has attached" from "a debugger attached, but executable memory is
+  still unavailable" — the second case points at the app's own signature
+  (usually `get-task-allow` being stripped at signing), not at StikDebug.
 - **There is no interpreter fallback path on iOS.** Boxedwine does contain an
   interpreting CPU core, but the JIT build cannot reach it when executable
   memory is unavailable at all. Rather than silently running at an unusable

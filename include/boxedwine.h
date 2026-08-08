@@ -70,8 +70,21 @@
 #define BOXEDWINE_JIT_ARMV8
 #define ASMJIT_NO_X86
 #define BOXEDWINE_MULTI_THREADED
+#if TARGET_OS_IPHONE
+// MAP_JIT is gated behind Apple's "dynamic-codesigning" entitlement, which is
+// approved only for browser engines and is not obtainable by a sideloaded
+// third-party app regardless of JIT-enabler/debugger status. What a
+// legitimate third-party debugger attach (StikDebug or equivalent, over the
+// real Developer Disk Image / debugserver channel) actually relaxes is plain
+// mmap()/mprotect() PROT_EXEC transitions for a process the kernel has
+// flagged CS_DEBUGGED - a completely different, unrelated code path from
+// MAP_JIT. Passing MAP_JIT here on iOS makes the allocation fail outright
+// (EPERM) even with a genuine debugger attached; see BVNJITProbe in
+// ios/runtime/src/BVNJIT.mm, which mirrors this exact allocation strategy so
+// what it reports matches what this call will actually do.
+#define MAP_BOXEDWINE 0
+#else
 #define MAP_BOXEDWINE MAP_JIT
-#if !TARGET_OS_IPHONE
 // libraries not built for x64
 #define BOXEDWINE_OPENGL_OSMESA
 #endif

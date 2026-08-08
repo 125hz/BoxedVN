@@ -137,7 +137,9 @@ on the previous one.
 Open **Runtime status**.
 
 **Expected:** *JIT unavailable*, ARM64 JIT compiled in *yes*, executable memory
-*no*, and a detail line naming `mmap(PROT_EXEC | MAP_JIT)` with an `errno`.
+*no*, and a detail line naming `mmap(PROT_EXEC)` with an `errno`, alongside a
+separate "Debugger attached (CS_DEBUGGED)" reading of *no* — confirming no JIT
+enabler has attached yet, rather than a signing problem.
 
 This is the correct result before a JIT enabler is attached, and confirms the
 probe is doing real work.

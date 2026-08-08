@@ -155,45 +155,75 @@ can show how the last session ended.
 
 Boxedwine's own ARM64 code generator is used — `JitArmV8CodeGen`, reached
 through `BOXEDWINE_MAC_JIT` + `TARGET_CPU_ARM64` in `include/boxedwine.h`,
-which selects `BOXEDWINE_JIT_ARMV8`, `MAP_BOXEDWINE = MAP_JIT`,
-`BOXEDWINE_MULTI_THREADED`, `BOXEDWINE_HOST_EXCEPTIONS` and
-`BOXEDWINE_MEM_CACHE`. There is no separate BoxedVN JIT and there is no
-demonstration JIT.
+which selects `BOXEDWINE_JIT_ARMV8`, `BOXEDWINE_MULTI_THREADED`,
+`BOXEDWINE_HOST_EXCEPTIONS` and `BOXEDWINE_MEM_CACHE`. There is no separate
+BoxedVN JIT and there is no demonstration JIT.
 
-### iOS is not macOS here
+### iOS is not macOS here — and it is not just a different toggle
+
+macOS and iOS gate JIT memory through **two different mechanisms**, not two
+configurations of the same one. Getting this distinction wrong is a real trap:
+an earlier version of this port assumed the iOS mechanism was "MAP_JIT,
+unlocked by CS_DEBUGGED" — plausible, matches a technique that genuinely
+existed pre-iOS 14, and wrong. Apple patched that trick; `MAP_JIT` on iOS
+stays gated behind the separate `dynamic-codesigning` entitlement, which is
+approved only for browser engines and is never obtainable by a sideloaded
+app, debugger attached or not. Passing `MAP_JIT` on iOS fails with `EPERM`
+unconditionally — this is exactly the bug that made the physical-device JIT
+probe report failure even with a genuine StikDebug attach confirmed via
+`CS_DEBUGGED`.
 
 | | macOS arm64 | iOS arm64 |
 |---|---|---|
-| `MAP_JIT` region | per-thread W xor X | RWX |
+| Allocation | `mmap(..., MAP_JIT)` — `MAP_BOXEDWINE = MAP_JIT` | plain `mmap(..., PROT_EXEC)`, no `MAP_JIT` — `MAP_BOXEDWINE = 0` |
+| Region behaviour | per-thread W xor X, toggled | plain RWX for as long as `CS_DEBUGGED` holds |
 | `pthread_jit_write_protect_np` | required around writes | **unavailable; does not compile** |
-| Gate | `com.apple.security.cs.allow-jit` at signing time | `dynamic-codesigning`, granted by the kernel only while a debugger is attached |
+| Gate | `com.apple.security.cs.allow-jit` at signing time (app-controlled) | kernel-set `CS_DEBUGGED`, present only while a genuine third-party debugger (StikDebug or equivalent, over the real Developer Disk Image / debugserver channel) is attached |
 | Instruction cache flush | `__builtin___clear_cache` works | must use `sys_icache_invalidate` |
 
-The last row is a link-time trap: `__builtin___clear_cache` lowers to a call to
-compiler-rt's `__clear_cache` on AArch64, and compiler-rt deliberately does not
-build that file for Darwin. An iOS link fails with an undefined
-`___clear_cache`. `platform/linux/platform.cpp` now routes both
+The last row is a separate link-time trap: `__builtin___clear_cache` lowers to
+a call to compiler-rt's `__clear_cache` on AArch64, and compiler-rt
+deliberately does not build that file for Darwin. An iOS link fails with an
+undefined `___clear_cache`. `platform/linux/platform.cpp` routes both
 `writeCodeToMemory` overloads and `clearInstructionCache` through one helper
 that calls `sys_icache_invalidate` on iOS.
 
 ### The probe
 
 `BVNJITProbe` (`ios/runtime/src/BVNJIT.mm`) does not read an entitlement
-string. It performs the whole operation the JIT depends on:
+string, and does not read `CS_DEBUGGED` alone and infer success from it
+either — a debugger can be genuinely attached and JIT can still be broken for
+an unrelated reason (see below), so the probe performs the whole operation
+Boxedwine's real allocator uses:
 
-1. `mmap(PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT)`
+1. `mmap(PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS)` — no `MAP_JIT`
 2. write three ARM64 instructions that return `0x4258`
 3. `sys_icache_invalidate`
 4. call it and check the return value
 
-Step 1 failing is the normal case before a JIT enabler attaches, and the report
-carries the `errno`. Step 4 returning the wrong value would mean the cache
-flush or the mapping is misbehaving — a JIT built on that would produce wrong
-results silently, so it is treated as unavailable.
+Independently of that, it reads `csops(getpid(), CS_OPS_STATUS, ...)` for the
+`CS_DEBUGGED` flag, so a failure at step 1 can be told apart into two
+different problems, surfaced separately in `BVNJITReport.debuggerAttached`:
 
-The probe is re-run on every call, because JIT can become available after
-launch once a debugger attaches. `BVNRuntime` runs it again immediately before
-starting a guest and refuses to start if it fails.
+- **not debugged** — no JIT enabler has attached yet, or it detached; the fix
+  is in StikDebug, not BoxedVN.
+- **debugged, but `mmap` still fails** — a debugger genuinely attached, but
+  executable memory is still unavailable. This points at the app's own
+  signature: most likely `get-task-allow` did not survive whatever tool
+  signed the IPA (see `docs/BUILD_IOS.md`'s entitlements table), since some
+  sideloading tools strip entitlements they don't recognise.
+
+Step 4 returning the wrong value would mean the cache flush or the mapping is
+misbehaving — a JIT built on that would produce wrong results silently, so it
+is treated as unavailable.
+
+The probe is re-run automatically every 0.5s while the app is in the
+foreground (`AppModel`'s existing runtime-state poll timer in
+`ios/app/Sources/AppModel.swift` also drives this), because JIT can become
+available well after launch, whenever a JIT enabler happens to attach — a
+one-shot probe at cold start would show stale results indefinitely.
+`BVNRuntime` also runs it again immediately before starting a guest and
+refuses to start if it fails.
 
 ---
 

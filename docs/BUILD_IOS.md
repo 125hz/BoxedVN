@@ -158,7 +158,7 @@ inline in that file:
 
 | Key | Purpose | Can a signing tool change it? |
 |-----|---------|-------------------------------|
-| `get-task-allow` | lets a debugger attach, which is how a JIT enabler causes the kernel to grant `dynamic-codesigning` | Tools normally **set** this themselves. It must end up present, or JIT cannot work. |
+| `get-task-allow` | lets a debugger attach at all — a successful attach gets the kernel to flag the process `CS_DEBUGGED`, which relaxes code-signing enforcement for plain `mmap`/`mprotect` `PROT_EXEC` (see `docs/ARCHITECTURE_IOS.md` §4 for why this is *not* the same thing as macOS's `MAP_JIT`) | Tools normally **set** this themselves. It must end up present, or no debugger can attach and JIT cannot work. |
 | `com.apple.developer.kernel.increased-memory-limit` | raises the jetsam limit for the emulated guest address space | **Frequently stripped.** Free Apple IDs are not entitled to it. BoxedVN works without it on devices with plenty of RAM. |
 
 Nothing else is requested. In particular there are no macOS Hardened Runtime
@@ -172,11 +172,18 @@ This trips people up, so it is worth stating plainly: **signing the IPA does
 not give the app JIT.** After installing, you must attach StikDebug or an
 equivalent JIT enabler. Until you do:
 
-- `mmap(PROT_EXEC | MAP_JIT)` fails with `EPERM`,
-- `BVNJITProbe` reports **Unavailable** and includes the `errno`,
+- `mmap(PROT_EXEC)` fails with `EPERM`,
+- `BVNJITProbe` reports **Unavailable**, includes the `errno`, and separately
+  reports whether the kernel has the process flagged `CS_DEBUGGED` at all —
+  telling apart "no JIT enabler has attached" from "one attached, but
+  executable memory is still unavailable" (usually a stripped
+  `get-task-allow` entitlement; see the table above),
 - the app refuses to start a guest and says why.
 
-BoxedVN cannot enable JIT by itself and does not pretend it can.
+BoxedVN cannot enable JIT by itself and does not pretend it can. Runtime
+status in the app re-checks this automatically every half second — there is
+no need to manually re-check after attaching a JIT enabler, though the button
+is still there for an immediate, deliberate read.
 
 To check: open **Runtime status** in the app. It shows whether the ARM64 JIT
 is compiled in, whether executable memory could be obtained, and the exact

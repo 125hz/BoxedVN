@@ -10,15 +10,34 @@
  *  ---------------------------------------------------------------------
  *  Real JIT availability detection.
  *
- *  On iOS a sideloaded app cannot map executable memory unless the kernel has
- *  granted it the dynamic-codesigning entitlement, which happens only while a
- *  debugger is attached.  StikDebug and equivalent tools do exactly that.
- *  BoxedVN cannot grant it to itself and does not pretend otherwise.
+ *  What actually gates executable memory for a sideloaded third-party app on
+ *  iOS is NOT the same thing as macOS's MAP_JIT.  MAP_JIT is gated behind
+ *  Apple's "dynamic-codesigning" entitlement, which is approved only for
+ *  browser engines and cannot be obtained by a sideloaded app no matter what
+ *  debugger is attached - passing MAP_JIT here always fails with EPERM on
+ *  iOS, attached debugger or not. (An earlier version of this file assumed
+ *  CS_DEBUGGED unlocked MAP_JIT; that trick existed pre-iOS 14 and Apple
+ *  patched it. The confusion is common enough that it is worth being
+ *  explicit about here.)
  *
- *  Rather than inferring availability from an entitlement string, this probe
- *  performs the entire operation Boxedwine's JIT depends on: mmap a MAP_JIT
- *  page, write ARM64 instructions into it, flush the instruction cache and
- *  call the result.  If that returns the expected value, the JIT will work.
+ *  What a legitimate third-party debugger attach - StikDebug or equivalent,
+ *  over the real Developer Disk Image / debugserver channel, the same one
+ *  Xcode's own "Debug > Attach to Process" uses - actually does is get the
+ *  kernel to flag the process CS_DEBUGGED, which relaxes code-signing
+ *  enforcement for plain mmap()/mprotect() PROT_EXEC transitions on THAT
+ *  process. No MAP_JIT flag involved at all. BoxedVN cannot cause this
+ *  itself; it requires get-task-allow in its own signature (present in
+ *  ios/app/BoxedVN.entitlements, though a signing tool can strip it) and an
+ *  external JIT enabler to actually attach.
+ *
+ *  This probe performs the exact allocation Platform::alloc64kBlock uses
+ *  for Boxedwine's real JIT code buffers (see include/boxedwine.h's
+ *  MAP_BOXEDWINE and platform/linux/platform.cpp): plain mmap with
+ *  PROT_READ|PROT_WRITE|PROT_EXEC and no MAP_JIT, then a write, an
+ *  instruction-cache flush, and a call through the result. If that returns
+ *  the expected value, Boxedwine's JIT will work; if it fails, the kernel's
+ *  reason (checked via csops() CS_DEBUGGED, independent of the mmap outcome)
+ *  is reported alongside the raw errno rather than a guess.
  *  ---------------------------------------------------------------------
  */
 
@@ -107,17 +126,19 @@ extern "C" BVNJITReport BVNJITProbe(void) {
 #else
     const size_t pageSize = static_cast<size_t>(getpagesize());
 
-    // Step 1: obtain executable memory the same way Platform::alloc64kBlock
-    // does, with MAP_JIT.
+    // Step 1: obtain executable memory the same way
+    // Platform::alloc64kBlock does on iOS - MAP_BOXEDWINE is 0 there, not
+    // MAP_JIT.  See the file header for why MAP_JIT is specifically wrong
+    // here rather than merely unnecessary.
     void* page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) {
         const int mmapErrno = errno;
         report.status = BVNJITStatusUnavailable;
         report.executableMemoryAvailable = false;
         if (!report.debuggerAttached) {
-            setDetail("mmap(PROT_EXEC | MAP_JIT) failed: %s (errno %d). The "
-                      "kernel does not have this process flagged as debugged "
+            setDetail("mmap(PROT_EXEC) failed: %s (errno %d). The kernel "
+                      "does not have this process flagged as debugged "
                       "(CS_DEBUGGED is not set) - no JIT enabler has actually "
                       "attached yet, or it detached again. Attach StikDebug "
                       "(or an equivalent JIT enabler) to THIS app while it is "
@@ -125,9 +146,9 @@ extern "C" BVNJITReport BVNJITProbe(void) {
                       "by itself.",
                       strerror(mmapErrno), mmapErrno);
         } else {
-            setDetail("mmap(PROT_EXEC | MAP_JIT) failed: %s (errno %d), even "
-                      "though the kernel DOES have this process flagged as "
-                      "debugged (CS_DEBUGGED is set). A JIT enabler attached "
+            setDetail("mmap(PROT_EXEC) failed: %s (errno %d), even though "
+                      "the kernel DOES have this process flagged as debugged "
+                      "(CS_DEBUGGED is set). A JIT enabler attached "
                       "successfully, but the process still cannot get "
                       "executable memory. This points at the app's own "
                       "signature: confirm the installed IPA was signed with "
@@ -156,8 +177,10 @@ extern "C" BVNJITReport BVNJITProbe(void) {
         0xD65F03C0,  // ret
     };
 
-    // iOS has no pthread_jit_write_protect_np: a MAP_JIT region is RWX here.
-    // See the comment in platform/linux/platform.cpp.
+    // iOS has no pthread_jit_write_protect_np and this region was never
+    // MAP_JIT in the first place: it is a plain RWX mapping, writable and
+    // executable at once for as long as CS_DEBUGGED holds. See the comment
+    // in platform/linux/platform.cpp.
     memcpy(page, kProbeCode, sizeof(kProbeCode));
 
     // Step 3: flush the instruction cache.  Skipping this is the classic
@@ -191,7 +214,7 @@ extern "C" BVNJITReport BVNJITProbe(void) {
     }
 
     report.status = BVNJITStatusAvailable;
-    setDetail("MAP_JIT page mapped, written, cache-flushed and executed "
+    setDetail("Executable memory mapped, written, cache-flushed and executed "
               "successfully. Boxedwine's ARM64 JIT can run.");
     return report;
 #endif

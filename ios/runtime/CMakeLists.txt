@@ -33,6 +33,16 @@ message(STATUS "BoxedVN: Boxedwine core version = ${BOXEDWINE_VERSION_STRING}")
 
 target_compile_definitions(boxedvn_runtime PRIVATE
     BVN_BOXEDWINE_VERSION="${BOXEDWINE_VERSION_STRING}"
+    # BVNJIT.mm reports whether Boxedwine's ARM64 JIT is compiled into the
+    # core this binary links against.  It cannot detect this by including
+    # boxedwine.h itself - BOXEDWINE_JIT is a macro defined *inside* that
+    # header (derived from BOXEDWINE_MAC_JIT + TARGET_CPU_ARM64), invisible to
+    # any translation unit that does not include it, and pulling that whole
+    # header into a small ObjC++ bridge file is not worth doing for one flag.
+    # This target only ever builds for the iOS ARM64 device target (see the
+    # early return() above), where boxedwine_core unconditionally has
+    # BOXEDWINE_JIT on, so the value here is not a guess.
+    BOXEDWINE_JIT
 )
 
 target_include_directories(boxedvn_runtime PUBLIC

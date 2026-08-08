@@ -39,19 +39,26 @@ unsigned long long int Platform::getSystemTimeAsMicroSeconds() {
 void Platform::init() {
 }
 
-// Apple's W^X rules for MAP_JIT differ between macOS and iOS.
+// Apple's W^X mechanism for JIT memory is completely different on macOS and
+// iOS - not just a different toggle, a different allocation strategy.
 //
-// macOS (arm64, Hardened Runtime + com.apple.security.cs.allow-jit): a MAP_JIT
-// region is per-thread either writable or executable, and the thread toggles
-// between the two with pthread_jit_write_protect_np().
+// macOS (arm64, Hardened Runtime + com.apple.security.cs.allow-jit): the
+// region is allocated with MAP_JIT (see MAP_BOXEDWINE in include/boxedwine.h,
+// macOS branch), which is per-thread either writable or executable, toggled
+// with pthread_jit_write_protect_np().
 //
 // iOS: pthread_jit_write_protect_np() is explicitly marked unavailable, and
-// calling it does not compile.  A MAP_JIT region is simply RWX once the
-// process holds the dynamic-codesigning entitlement, which on a sideloaded
-// build is granted only while a debugger is attached (StikDebug or an
-// equivalent JIT enabler).  Without that entitlement the mmap of an executable
-// page fails outright, which is what BVNJIT probes for at startup - there is
-// no half-working state to toggle into.
+// MAP_JIT itself is the wrong tool entirely - it is gated behind Apple's
+// "dynamic-codesigning" entitlement, approved only for browser engines and
+// unobtainable by a sideloaded app regardless of debugger status.
+// MAP_BOXEDWINE is 0 on iOS (see include/boxedwine.h) - the allocation is a
+// plain mmap with PROT_EXEC and no MAP_JIT flag, requesting a normal RWX
+// mapping outright. What makes that mmap succeed at all is the kernel having
+// flagged this process CS_DEBUGGED, which happens only while a genuine
+// third-party debugger (StikDebug or an equivalent JIT enabler, attaching
+// over the real Developer Disk Image / debugserver channel) is attached.
+// Without that, the mmap fails outright, which is what BVNJITProbe checks for
+// at startup - there is no half-working state to toggle into.
 //
 // Both platforms still need an explicit instruction-cache flush after writing.
 #if defined(BOXEDWINE_MAC_JIT) && !TARGET_OS_IPHONE
