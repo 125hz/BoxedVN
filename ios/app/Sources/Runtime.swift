@@ -97,6 +97,37 @@ enum Storage {
         return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
     }
 
+    /// The app's own Documents folder. Info.plist sets UIFileSharingEnabled
+    /// and LSSupportsOpeningDocumentsInPlace, so this shows up in the Files
+    /// app under "On My iPhone > BoxedVN" and the user can copy files
+    /// straight into it.
+    static var documents: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    }
+
+    /// ZIP archives sitting directly in the app's Documents folder.
+    ///
+    /// This exists as a way to get a root filesystem (or a game) in without
+    /// going through UIDocumentPickerViewController at all. The picker is an
+    /// out-of-process remote view controller and has proven unreliable in
+    /// this app on at least one physical device - rows highlight on tap but
+    /// the selection never completes - so relying on it as the only import
+    /// route is a single point of failure. Copying a file into the app's own
+    /// Documents folder in Files needs no picker, no security-scoped URL and
+    /// no cross-process handshake: the file is simply already inside the
+    /// sandbox.
+    static func documentsZipCandidates() -> [URL] {
+        guard let documents else { return [] }
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: documents,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles])) ?? []
+
+        return entries
+            .filter { $0.pathExtension.lowercased() == "zip" }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
     private static func directory(_ pointer: UnsafePointer<CChar>?) -> URL? {
         guard let pointer else { return nil }
         return URL(fileURLWithPath: String(cString: pointer))

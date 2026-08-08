@@ -21,6 +21,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var runtimeState: RuntimeState = .idle
     @Published private(set) var isImporting = false
     @Published var importProgressMessage = ""
+    @Published private(set) var isInstallingRootFilesystem = false
     @Published var alertMessage: String?
 
     private var pollTimer: Timer?
@@ -113,26 +114,68 @@ final class AppModel: ObservableObject {
         return "\(url.lastPathComponent) (\(sizeText))"
     }
 
-    func importRootFilesystem(from url: URL) {
+    /// - Parameter movingSource: true when `url` is already inside the app's
+    ///   own sandbox (the Documents folder), where the file can simply be
+    ///   moved instead of copied - instant on the same volume, and it avoids
+    ///   leaving a second ~150 MB copy behind. Never true for a URL that came
+    ///   from the document picker: those live outside the sandbox and must be
+    ///   copied, not moved.
+    func importRootFilesystem(from url: URL, movingSource: Bool = false) {
+        guard !isInstallingRootFilesystem else { return }
         guard let destination = Storage.rootFilesystems else {
             alertMessage = "Could not create the root filesystem directory."
             return
         }
-        let needsScope = url.startAccessingSecurityScopedResource()
-        defer { if needsScope { url.stopAccessingSecurityScopedResource() } }
 
-        let target = destination.appendingPathComponent("boxedwine.zip")
-        do {
-            if FileManager.default.fileExists(atPath: target.path) {
-                try FileManager.default.removeItem(at: target)
+        isInstallingRootFilesystem = true
+        // Security-scoped access is required for anything the Files picker
+        // hands back from outside the app container; the picker's own
+        // allowedContentTypes is a selectability hint only (some real ZIPs,
+        // especially ones that arrived via AirDrop, don't resolve cleanly to
+        // public.zip-archive and would otherwise be greyed out and
+        // unselectable), so the actual file is verified as a real ZIP here
+        // before anything is copied.
+        let needsScope = url.startAccessingSecurityScopedResource()
+
+        Task.detached(priority: .userInitiated) {
+            defer { if needsScope { url.stopAccessingSecurityScopedResource() } }
+
+            var listing = BVNZipListing()
+            BVNZipInspect(url.path, &listing)
+            guard listing.ok else {
+                let reason = cString(&listing.error, Int(BVN_MAX_DIAGNOSTIC))
+                await MainActor.run {
+                    self.isInstallingRootFilesystem = false
+                    self.alertMessage = "'\(url.lastPathComponent)' is not a "
+                                       + "valid ZIP archive: \(reason)"
+                }
+                return
             }
-            try FileManager.default.copyItem(at: url, to: target)
-            Log.write("Root filesystem installed from \(url.lastPathComponent)",
-                      category: "rootfs")
-            objectWillChange.send()
-        } catch {
-            alertMessage = "Could not install the root filesystem: "
-                         + error.localizedDescription
+
+            let target = destination.appendingPathComponent("boxedwine.zip")
+            do {
+                if FileManager.default.fileExists(atPath: target.path) {
+                    try FileManager.default.removeItem(at: target)
+                }
+                if movingSource {
+                    try FileManager.default.moveItem(at: url, to: target)
+                } else {
+                    try FileManager.default.copyItem(at: url, to: target)
+                }
+                Log.write("Root filesystem installed from \(url.lastPathComponent)"
+                          + (movingSource ? " (moved from Documents)" : ""),
+                          category: "rootfs")
+                await MainActor.run {
+                    self.isInstallingRootFilesystem = false
+                    self.objectWillChange.send()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isInstallingRootFilesystem = false
+                    self.alertMessage = "Could not install the root filesystem: "
+                                       + error.localizedDescription
+                }
+            }
         }
     }
 

@@ -493,6 +493,76 @@ New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
 `5381984f40179e2b5f6d1cce55b325abf91f0563f65336b14006519f673415fa`. This
 supersedes the section-1d build (`d6ec5182…`), which is the one that crashed.
 
+## 1f. Root filesystem import: file picker wouldn't let the file be selected (2026-08-07)
+
+Two rounds on this, because the first fix addressed a real but different bug
+than the one actually reported.
+
+**Round 1 — wrong diagnosis.** Reported: "opens the picker, but I cannot
+select [wine10.zip]." Assumed the classic `allowedContentTypes: [.zip]`
+selectability bug — `UTType.zip` sometimes fails to match a real ZIP whose
+UTI got lost or ambiguous in transit (very common for AirDropped files), and
+the picker greys the row out so it cannot be tapped at all. Fixed by
+broadening both ZIP-importing `fileImporter` calls
+(`ios/app/Sources/Views.swift`, game import and root filesystem import) to
+`[.zip, .data]` — `.data` is the generic type essentially everything
+conforms to, so it makes the file selectable regardless of how its UTI was
+tagged. Also added real ZIP validation to `AppModel.importRootFilesystem`
+(`BVNZipInspect`, the same check `GameLibrary.importGame` already used for
+games) so a non-ZIP selection is still caught and reported clearly rather
+than silently copied, and moved the copy off the main thread
+(`Task.detached`, matching `importGame`'s existing pattern) since a ~150 MB
+synchronous copy on the main thread would freeze the UI.
+
+**Then the user clarified the actual symptom**, which is a materially
+different bug: *"tapping [the file] does nothing"* — not greyed out, a normal
+row, but tapping it neither selects nor dismisses the picker. Confirmed via
+`AskUserQuestion` rather than guessing again, since a wrong second guess
+would cost another full build/sign/install cycle on the only physical device
+available. Also confirmed: works on the Simulator, fails only on the
+physical device — an AirDrop-from-Mac transfer either way.
+
+**Round 2 — the real cause.** `ios/runtime/src/BVNAppDelegate.mm` sets the
+SwiftUI library window's `windowLevel` to `UIWindowLevelNormal - 1` (a
+sub-normal level), on the theory that it would make a later SDL guest window
+(created at the default normal level) visually cover the library without an
+explicit hide, as a backstop alongside the explicit `.hidden` toggle in
+`BVNFrontendHideLibrary`/`BVNFrontendShowLibrary`. A sub-normal window level
+is non-standard, and non-standard levels are a known source of UIKit
+misbehaving on exactly this kind of case: whether a window can properly
+become key, and whether it correctly receives/routes touches to view
+controllers it presents modally — which is exactly how SwiftUI's
+`.fileImporter` presents `UIDocumentPickerViewController`. This lines up with
+the reported symptom (taps registering as "seen" by the row but not acted
+on) and with it being reproducible only on a physical device, not the
+Simulator, where UIKit's window-level/key-window internals are known to
+sometimes diverge from real hardware — the user's device is additionally on
+an iOS 27 **beta**, which raises the odds of this kind of edge case further.
+
+**Fix:** removed the `windowLevel` override entirely; the library window now
+uses the standard `UIWindowLevelNormal`. This costs nothing structurally —
+`BVNFrontendHideLibrary` already explicitly hides the window before a guest
+starts (`BVNRuntime.mm`'s `runSession()`), so the level trick was never
+load-bearing for the actual show/hide behaviour, only a redundant backstop
+that turned out to have a real cost.
+
+**Verified:** both fixes rebuild and link clean for the arm64 device target.
+The content-type broadening was smoke-tested on the Simulator (picker opens,
+files are selectable) before the real cause was identified; the window-level
+fix has not yet been tested at all — it's a source-level fix reasoned from a
+plausible, well-supported mechanism, not confirmed by reproduction, since
+the failure mode (physical device only) isn't something available to test
+from here. **This is the least-verified fix shipped so far in this project;
+say so plainly if it turns out not to be the answer** rather than reaching
+for a third guess.
+
+New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`54091becda5aaabaf10c2b42eff4d506ad7eb1871061ef3f73396cc22056a1b9`. Supersedes
+`5381984f…` (crash-on-boot fix; still had the picker bug) and
+`f1f60e76…` (an intermediate build with only the content-type broadening,
+which does not fix the actually-reported symptom and was never sent to the
+user).
+
 ## 8. Next actions, in order
 
 1. **Sign and install the new IPA** (`build/artifacts/BoxedVN-unsigned.ipa`,

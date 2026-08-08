@@ -15,6 +15,20 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// `[.zip]` alone leaves real ZIP files greyed out and unselectable in the
+/// system picker for a meaningful fraction of real-world files - most often
+/// ones that arrived via AirDrop, where the sending side's declared UTI
+/// doesn't always resolve cleanly to `public.zip-archive` on the receiving
+/// end (large files in particular). `.data` is the generic "some bytes"
+/// UTType that essentially everything conforms to, so adding it as a second
+/// allowed type makes the file selectable regardless of how its UTI got
+/// tagged in transit. This is a selectability gate only, not a validator -
+/// both call sites verify the picked file is actually a usable ZIP
+/// afterwards (BVNZipInspect via GameLibrary.importGame, and directly in
+/// AppModel.importRootFilesystem), so a non-ZIP selection is still caught
+/// and reported clearly rather than silently accepted.
+let zipImportContentTypes: [UTType] = [.zip, .data]
+
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
 
@@ -116,7 +130,7 @@ struct LibraryView: View {
             }
         }
         .fileImporter(isPresented: $showingGameImporter,
-                      allowedContentTypes: [.zip]) { result in
+                      allowedContentTypes: zipImportContentTypes) { result in
             handleImport(result)
         }
         .fileImporter(isPresented: $showingFolderImporter,
@@ -420,14 +434,22 @@ struct StatusView: View {
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showingRootFilesystemImporter = false
+    @State private var documentsZips: [URL] = []
 
     var body: some View {
         List {
             Section {
                 Text(model.rootFilesystemDescription)
                     .font(.callout)
-                Button("Import root filesystem ZIP…") {
-                    showingRootFilesystemImporter = true
+                if model.isInstallingRootFilesystem {
+                    HStack {
+                        ProgressView()
+                        Text("Installing…")
+                    }
+                } else {
+                    Button("Import root filesystem ZIP…") {
+                        showingRootFilesystemImporter = true
+                    }
                 }
             } header: {
                 Text("Root filesystem")
@@ -435,6 +457,41 @@ struct SettingsView: View {
                 Text("Boxedwine needs a Linux/Wine root filesystem archive. "
                      + "See docs/BUILD_IOS.md for the pinned version BoxedVN "
                      + "is tested against.")
+            }
+
+            // A route that does not involve UIDocumentPickerViewController at
+            // all. The picker is out-of-process and has failed on at least one
+            // physical device (rows highlight but selection never completes),
+            // so this exists as an independent way in rather than a nicety.
+            Section {
+                if documentsZips.isEmpty {
+                    Text("No ZIP files found in BoxedVN's Documents folder.")
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                } else {
+                    ForEach(documentsZips, id: \.path) { url in
+                        Button {
+                            model.importRootFilesystem(from: url, movingSource: true)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(url.lastPathComponent)
+                                Text(fileSizeDescription(url))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .disabled(model.isInstallingRootFilesystem)
+                    }
+                }
+                Button("Refresh") { documentsZips = Storage.documentsZipCandidates() }
+            } header: {
+                Text("Install from BoxedVN's Documents folder")
+            } footer: {
+                Text("If the file picker above will not let you select a file, "
+                     + "use this instead. In the Files app go to On My iPhone > "
+                     + "BoxedVN and copy the ZIP there, then tap Refresh and "
+                     + "pick it from this list. The file is moved, not copied, "
+                     + "so it will not take up space twice.")
             }
 
             Section("Storage") {
@@ -453,13 +510,26 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .onAppear { documentsZips = Storage.documentsZipCandidates() }
+        // A successful install moves the file out of Documents, so the list
+        // has to be re-read once installing finishes.
+        .onChange(of: model.isInstallingRootFilesystem) { _, installing in
+            if !installing { documentsZips = Storage.documentsZipCandidates() }
+        }
         .fileImporter(isPresented: $showingRootFilesystemImporter,
-                      allowedContentTypes: [.zip]) { result in
+                      allowedContentTypes: zipImportContentTypes) { result in
             switch result {
             case .success(let url): model.importRootFilesystem(from: url)
             case .failure(let error): model.alertMessage = error.localizedDescription
             }
         }
+    }
+
+    private func fileSizeDescription(_ url: URL) -> String {
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            return "unknown size"
+        }
+        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
     }
 }
 

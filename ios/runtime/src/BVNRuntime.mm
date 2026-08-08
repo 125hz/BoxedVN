@@ -353,14 +353,6 @@ void runSession(const PendingLaunch& launch) {
     setState(BVNRuntimeStateStopped);
 }
 
-// Services the main run loop until something happens.  This is what keeps
-// SwiftUI responsive while no guest is running.
-void pumpMainRunLoop(CFTimeInterval seconds) {
-    @autoreleasepool {
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, true);
-    }
-}
-
 }  // namespace
 
 extern "C" const char* BVNRuntimeStateName(BVNRuntimeState state) {
@@ -421,6 +413,41 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
     }
     copyString(errorBuffer, errorBufferSize, "");
     BVNLogWrite(BVNLogLevelInfo, "runtime", "launch request accepted");
+
+    // The session runs on the main thread, as SDL's UIKit backend requires,
+    // but it is started from a queued block rather than from BVNGuestMain's
+    // old polling loop (see BVNGuestMain for why that loop is gone). Queuing
+    // it also means this function returns immediately even when called from
+    // the main thread inside a SwiftUI button handler - that handler unwinds
+    // first, and boxedmain() then takes over the main thread cleanly.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        PendingLaunch launch;
+        bool shouldLaunch = false;
+
+        pthread_mutex_lock(&gMutex);
+        if (gHasPendingLaunch && gFrontendReady) {
+            launch = std::move(gPendingLaunch);
+            gPendingLaunch = PendingLaunch();
+            gHasPendingLaunch = false;
+            shouldLaunch = true;
+        }
+        pthread_mutex_unlock(&gMutex);
+
+        if (!shouldLaunch) {
+            return;
+        }
+
+        // SDL disables its UIKit event pump when the function it was given
+        // (BVNGuestMain) returns - see -[SDLUIKitDelegate postFinishLaunch],
+        // which brackets that call with SDL_iPhoneSetEventPump TRUE/FALSE.
+        // Since BVNGuestMain now returns immediately so the real UIKit run
+        // loop can service the library UI, the pump has to be turned back on
+        // here or SDL_PumpEvents would be a no-op for the whole session and
+        // the guest would receive no input.
+        SDL_iPhoneSetEventPump(SDL_TRUE);
+        runSession(launch);
+        SDL_iPhoneSetEventPump(SDL_FALSE);
+    });
     return true;
 }
 
@@ -470,28 +497,34 @@ extern "C" int BVNGuestMain(int argc, char* argv[]) {
 
     setState(BVNRuntimeStateIdle);
 
-    while (true) {
-        PendingLaunch launch;
-        bool shouldLaunch = false;
-
-        pthread_mutex_lock(&gMutex);
-        if (gHasPendingLaunch && gFrontendReady) {
-            launch = std::move(gPendingLaunch);
-            gPendingLaunch = PendingLaunch();
-            gHasPendingLaunch = false;
-            shouldLaunch = true;
-        }
-        pthread_mutex_unlock(&gMutex);
-
-        if (shouldLaunch) {
-            // Leaves the state at Stopped or Failed so the frontend can see
-            // how the session ended; the loop keeps servicing the library UI
-            // from either state and will accept the next launch request.
-            runSession(launch);
-            continue;
-        }
-
-        // 20 ms keeps the SwiftUI UI responsive without spinning the CPU.
-        pumpMainRunLoop(0.02);
-    }
+    // Return, rather than spinning a custom run loop pump forever.
+    //
+    // This used to be a `while (true)` loop calling
+    // CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, true) to keep the
+    // SwiftUI library UI alive while waiting for a launch request. That
+    // worked for simple SwiftUI interaction but subtly broke anything that
+    // depends on run loop modes the pump never serviced - most visibly
+    // UIDocumentPickerViewController (what .fileImporter presents): its file
+    // list rendered correctly, but tapping a row did nothing, because
+    // UIScrollView's touch delivery depends on machinery scheduled in
+    // UITrackingRunLoopMode, which a default-mode-only pump never runs. SDL's
+    // own UIKit_PumpEvents pumps both modes for exactly this reason (see
+    // SDL_uikitevents.m, "Make sure UIScrollView objects scroll properly"),
+    // and BoxedVN's pump had silently deviated from it.
+    //
+    // Adding the missing mode would patch that one symptom, but the whole
+    // custom-pump approach is the actual liability: any UIKit facility
+    // relying on a mode or source the pump doesn't happen to service breaks
+    // in a way that is very hard to attribute. SDL explicitly supports
+    // returning from the supplied main function - see the comment in
+    // -[SDLUIKitDelegate postFinishLaunch] ("We don't actually exit to
+    // support applications that do setup in their main function and then
+    // allow the Cocoa event loop to run") - so returning here hands the main
+    // thread back to the real, unmodified UIKit run loop. While idle BoxedVN
+    // is now an entirely ordinary iOS app, and UIKit behaves accordingly.
+    //
+    // Guest sessions still run on the main thread, started from a main-queue
+    // block by BVNRuntimeRequestLaunch; boxedmain() blocks it for the
+    // session's duration and SDL's own correct event pump takes over then.
+    return 0;
 }

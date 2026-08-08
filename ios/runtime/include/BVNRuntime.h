@@ -17,11 +17,16 @@
  *
  *    * main() calls SDL_UIKitRunApp, so SDL's UIApplication delegate owns the
  *      application lifecycle, and BVNGuestMain runs on the MAIN THREAD.
- *    * While no guest is running, BVNGuestMain services the main run loop,
- *      which is what keeps the SwiftUI library UI alive.
- *    * BVNRuntimeRequestLaunch may be called from any thread.  It only
- *      records the request; the guest is always started from the main thread
- *      by BVNGuestMain, because SDL's UIKit video backend requires it.
+ *    * BVNGuestMain does startup work and RETURNS, handing the main thread
+ *      back to the ordinary UIKit run loop.  While idle, BoxedVN is a normal
+ *      iOS app with no custom run loop pumping - see BVNGuestMain's
+ *      definition for why the previous polling loop was removed (it broke
+ *      UIDocumentPickerViewController's touch handling).
+ *    * BVNRuntimeRequestLaunch may be called from any thread.  It records the
+ *      request and queues the session on the main queue; the guest always
+ *      starts on the main thread, because SDL's UIKit video backend requires
+ *      it.  boxedmain() then blocks the main thread for the session's
+ *      duration and SDL's own event pump takes over.
  *    * Guest CPU and JIT threads are pthreads created by Boxedwine.  Audio
  *      runs on SDL's audio thread.  Frame presentation happens on the main
  *      thread inside the emulator's own loop.
@@ -274,7 +279,8 @@ uint64_t BVNLogGeneration(void);
 int BVNGuestMain(int argc, char* argv[]);
 
 // Set by the app delegate once the SwiftUI library UI is on screen.  Until
-// this is called BVNGuestMain will not service launch requests.
+// this is called, an accepted launch request will not actually start a
+// session.
 void BVNRuntimeNotifyFrontendReady(void);
 
 #ifdef __cplusplus
