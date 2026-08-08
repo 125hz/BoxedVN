@@ -365,20 +365,74 @@ preserves it, or check the signed IPA's entitlements directly with
 New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
 `958b07324a95a3efee2a6e51428b29e56970a334077410b1f099410dd9cd3b56`.
 
+## 1d. The real JIT mechanism was wrong — MAP_JIT is the wrong tool on iOS (2026-08-07)
+
+The physical-device screenshot from section 1c's fix showed something the
+simulator could never have shown: **`CS_DEBUGGED` correctly `yes`** (StikDebug's
+attach genuinely worked) **but `mmap(PROT_EXEC | MAP_JIT)` still `EPERM`.**
+That is a specific, diagnosable combination, not a vague failure — researched
+it rather than guessing again.
+
+**Root cause:** `MAP_JIT` on Apple platforms is gated behind Apple's separate
+`dynamic-codesigning` entitlement, approved only for browser engines. No
+sideloaded third-party app can ever have it, debugger attached or not. The
+mechanism this code was originally built on — "`CS_DEBUGGED` unlocks
+`MAP_JIT`" — genuinely existed pre-iOS 14 and Apple patched it (confirmed via
+research: the pre-14 self-`ptrace(PT_TRACE_ME)` trick some old emulator ports
+used was *also* separately patched around the same time). Passing `MAP_JIT`
+on iOS now fails with `EPERM` unconditionally.
+
+What a **legitimate** third-party debugger attach (StikDebug/Jitterbug/
+SideJITServer, over the real Developer Disk Image / debugserver channel —
+the same one Xcode's own "Debug > Attach to Process" uses) actually grants:
+the kernel flags the process `CS_DEBUGGED`, which relaxes code-signing
+enforcement for **plain `mmap()`/`mprotect()` `PROT_EXEC` transitions** on
+that process. No `MAP_JIT` flag involved anywhere in this path.
+
+**Fix:** `MAP_BOXEDWINE` (`include/boxedwine.h`) is `0` on iOS now, not
+`MAP_JIT` — `Platform::alloc64kBlock` (`platform/linux/platform.cpp`) is
+otherwise unchanged, it just requests `PROT_EXEC` without `MAP_JIT` in the
+flags. Verified via `source/util/bnativeheap.cpp` that Boxedwine allocates its
+JIT code buffer exactly once per block with no follow-up `mprotect` step, so
+this one call site is the only place that needed to change.
+`ios/runtime/src/BVNJIT.mm`'s probe now performs the identical allocation, so
+a passing probe means the real allocator will actually work, not just that
+some other memory trick succeeded.
+
+**A second, smaller bug found while fixing this:** `BVNJIT.mm` never
+`#include`d `boxedwine.h`, so its own `#if defined(BOXEDWINE_JIT)` check was
+always false — "ARM64 JIT compiled in" read "no" on *every* build regardless
+of whether the real JIT was present (it was; 577 `JitArmV8CodeGen` symbols,
+verified separately). Fixed by passing `BOXEDWINE_JIT` as an explicit compile
+definition to `boxedvn_runtime` in `ios/runtime/CMakeLists.txt`, since this
+target only ever builds where it's unconditionally true.
+
+Corrected the same "`CS_DEBUGGED` grants `dynamic-codesigning`" conflation
+everywhere it had been documented (it was in the original section 1a/1c write-up
+above, too — treat those as superseded by this entry, not as still-accurate
+background): `ios/app/BoxedVN.entitlements`, `docs/ARCHITECTURE_IOS.md`,
+`docs/BUILD_IOS.md`, `docs/KNOWN_LIMITATIONS_IOS.md`, `docs/TESTING_IOS.md`.
+
+**Verified:** rebuilds clean for the arm64 device target; confirmed via `nm`/
+`strings` on the linked binary that the corrected `mmap` call and new error
+strings are actually present in what gets shipped. **Not yet re-tested against
+the physical device this diagnosis was built from** — that is the very next
+step and the one that actually closes this out.
+
+New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`d6ec5182a98a1051d06eb950dfe05c24a390f9822a790faaf6285fa85d5686e0`.
+
 ## 8. Next actions, in order
 
 1. **Sign and install the new IPA** (`build/artifacts/BoxedVN-unsigned.ipa`,
-   SHA-256 `958b0732…d3b56`) **on the physical iPhone 17**. It should now (a)
-   show the library UI instead of black, and (b) show live JIT status that
-   updates automatically once StikDebug attaches, with a "Debugger attached"
-   row that tells apart "StikDebug never actually attached" from "it attached
-   but something else (likely `get-task-allow` being stripped at signing) is
-   still blocking executable memory." If JIT is still reported unavailable
-   after this, read that row first — it tells you which of the two problems
-   you're looking at, rather than guessing again.
-2. **Attach StikDebug and re-check JIT.** Expect
-   `BVNJITStatusUnavailable` → `Available`. If mmap still fails, capture the
-   exact `errno` from the log — that is the whole diagnosis.
+   SHA-256 `d6ec5182…5686e0` — supersedes the `958b0732…` one; that build still
+   had MAP_JIT and cannot work) **on the physical iPhone 17**, re-attach
+   StikDebug, and re-check Runtime status. Expect `Executable memory: yes` and
+   `Status: Available` this time — the previous test on this device is exactly
+   what diagnosed the MAP_JIT bug (section 1d), so this is the first real
+   confirmation of whether that diagnosis was correct. If it still fails,
+   capture the exact `errno` from the detail text; with MAP_JIT eliminated as
+   a cause, a further failure here would point somewhere new.
 3. **Import a root filesystem** through Settings and confirm the file lands in
    Application Support.
 4. **Run Wine Notepad.** This is the first real end-to-end test: rootfs mount,
