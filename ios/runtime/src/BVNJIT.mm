@@ -25,24 +25,30 @@
  *  What a legitimate third-party debugger attach - StikDebug or equivalent,
  *  over the real Developer Disk Image / debugserver channel - does is get the
  *  kernel to flag the process CS_DEBUGGED. What CS_DEBUGGED actually buys a
- *  plain (non-MAP_JIT) mmap(PROT_EXEC) is NOT "mmap fails safely if
- *  unavailable" the way MAP_JIT did: mmap can return a valid, non-MAP_FAILED
- *  pointer with rwx permissions requested regardless of CS_DEBUGGED, because
- *  the code-signing check on Apple platforms is enforced lazily, at first
- *  INSTRUCTION FETCH from the page, not at mmap() time. If that lazy check
- *  fails, the kernel does not return an error to this process - it delivers
- *  an uncatchable SIGKILL (CODESIGNING / "Invalid Page") on the spot. This is
- *  confirmed from a real device crash: mmap(PROT_EXEC) succeeded, the process
- *  proceeded to call through the resulting pointer, and was killed instantly
- *  with exactly that reason.
+ *  getting executable memory is a TWO step operation, and the first step lies
+ *  about failing.
  *
- *  This means there is no way to safely "test" whether execution will work
- *  without accepting the same risk Boxedwine's real JIT would hit anyway.
- *  BVNJITProbeStatus() therefore never attempts execution - it can only ever
- *  report that JIT is compiled in and whether CS_DEBUGGED is set, which is
- *  necessary but provably not sufficient. BVNJITProbeExecute() is the one
- *  that actually knows, and it is gated to call sites that accept the risk on
- *  purpose. See BVNRuntime.h for exactly which call sites those are.
+ *  mmap() with PROT_EXEC does not return an error when execution is not
+ *  permitted. It clamps the region's *current* protection to rw-, leaves rwx
+ *  as the maximum, and hands back a perfectly valid pointer. Jumping into
+ *  that page then takes an instruction-abort permission fault. Confirmed from
+ *  a device crash report: pc equal to the mapped address, esr "(Instruction
+ *  Abort) Permission fault", region listed as "rw-/rwx". The call the kernel
+ *  actually honours for a CS_DEBUGGED process is a subsequent mprotect()
+ *  adding PROT_EXEC.
+ *
+ *  So the sequence - mirrored exactly by Platform::alloc64kBlock on iOS, see
+ *  platform/linux/platform.cpp - is: mmap rw-, mprotect to add execute, then
+ *  VERIFY with vm_region_64 that the execute bit is genuinely set before
+ *  trusting it. The verification is not paranoia: both mmap and mprotect can
+ *  report success while leaving the page non-executable, and the only other
+ *  way to discover that is a fault that cannot be caught.
+ *
+ *  BVNJITProbeStatus() never attempts execution at all - it reports only
+ *  whether JIT is compiled in and whether CS_DEBUGGED is set, which is
+ *  necessary but not sufficient. BVNJITProbeExecute() does the full sequence
+ *  above and is gated to call sites that accept the residual risk on purpose.
+ *  See BVNRuntime.h for which those are.
  *  ---------------------------------------------------------------------
  */
 
@@ -50,6 +56,7 @@
 
 #include <errno.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -111,6 +118,47 @@ bool jitCompiledIn() {
 #endif
 }
 
+// Reads the kernel's ACTUAL current and maximum protection for the region
+// containing `address`.
+//
+// This exists because mmap() lying is the entire problem: asking for
+// PROT_READ|PROT_WRITE|PROT_EXEC on iOS does not fail when execution is not
+// permitted - it silently returns a valid pointer to a page whose *current*
+// protection is only rw-, with rwx merely as the maximum. Jumping into that
+// page then takes an instruction-abort permission fault (confirmed on a real
+// device: pc == the mapped address, esr "(Instruction Abort) Permission
+// fault", region "rw-/rwx"). Checking the real protection turns that crash
+// into a diagnostic.
+bool queryProtection(void* address, vm_prot_t* current, vm_prot_t* maximum) {
+    vm_address_t regionAddress = reinterpret_cast<vm_address_t>(address);
+    vm_size_t regionSize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t objectName = MACH_PORT_NULL;
+
+    const kern_return_t result =
+        vm_region_64(mach_task_self(), &regionAddress, &regionSize,
+                     VM_REGION_BASIC_INFO_64,
+                     reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+                     &objectName);
+    if (result != KERN_SUCCESS) {
+        return false;
+    }
+    *current = info.protection;
+    *maximum = info.max_protection;
+    return true;
+}
+
+// "rwx"-style rendering of a vm_prot_t, matching how the crash reporter and
+// vmmap present it, so log output can be compared against a crash report
+// directly.
+void formatProtection(vm_prot_t protection, char out[4]) {
+    out[0] = (protection & VM_PROT_READ) ? 'r' : '-';
+    out[1] = (protection & VM_PROT_WRITE) ? 'w' : '-';
+    out[2] = (protection & VM_PROT_EXECUTE) ? 'x' : '-';
+    out[3] = '\0';
+}
+
 }  // namespace
 
 extern "C" BVNJITReport BVNJITProbeStatus(void) {
@@ -170,39 +218,78 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
 #else
     const size_t pageSize = static_cast<size_t>(getpagesize());
 
-    // Step 1: obtain executable memory the same way
-    // Platform::alloc64kBlock does on iOS - MAP_BOXEDWINE is 0 there, not
-    // MAP_JIT.  See the file header for why MAP_JIT is specifically wrong
-    // here rather than merely unnecessary.  This mmap call itself is safe:
-    // it is Step 4 (actually calling through the pointer) that can crash.
-    void* page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+    // Step 1: map the page WITHOUT PROT_EXEC, then add execute permission
+    // with mprotect() - the same sequence Platform::alloc64kBlock uses on
+    // iOS.
+    //
+    // Requesting PROT_EXEC directly in the mmap does not work here and, worse,
+    // does not fail: iOS clamps the *current* protection to rw- while leaving
+    // rwx as the maximum, hands back a perfectly valid pointer, and only
+    // faults later when something jumps into it. mprotect() afterwards is the
+    // call the kernel actually honours for a CS_DEBUGGED process.
+    void* page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) {
         const int mmapErrno = errno;
         report.status = BVNJITStatusUnavailable;
         report.executableMemoryAvailable = false;
+        setDetail("mmap(PROT_READ | PROT_WRITE) failed: %s (errno %d). This "
+                  "is a plain anonymous mapping with no execute permission "
+                  "requested, so this failure is not about JIT at all - the "
+                  "process is out of address space or memory.",
+                  strerror(mmapErrno), mmapErrno);
+        return report;
+    }
+
+    const bool mprotectOK =
+        mprotect(page, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+    const int mprotectErrno = mprotectOK ? 0 : errno;
+
+    // Step 1b: do NOT trust either call. Ask the kernel what the protection
+    // actually is now. mmap lies by clamping, and mprotect can report success
+    // while the region still lacks execute permission.
+    vm_prot_t currentProtection = 0;
+    vm_prot_t maximumProtection = 0;
+    const bool queried = queryProtection(page, &currentProtection,
+                                         &maximumProtection);
+    char currentText[4] = "???";
+    char maximumText[4] = "???";
+    if (queried) {
+        formatProtection(currentProtection, currentText);
+        formatProtection(maximumProtection, maximumText);
+    }
+
+    if (!queried || (currentProtection & VM_PROT_EXECUTE) == 0) {
+        munmap(page, pageSize);
+        report.status = BVNJITStatusUnavailable;
+        report.executableMemoryAvailable = false;
         if (!report.debuggerAttached) {
-            setDetail("mmap(PROT_EXEC) failed: %s (errno %d). The kernel "
-                      "does not have this process flagged as debugged "
-                      "(CS_DEBUGGED is not set) - no JIT enabler has actually "
+            setDetail("The page is not executable (protection %s, max %s)%s. "
+                      "The kernel does not have this process flagged as "
+                      "debugged (CS_DEBUGGED is not set) - no JIT enabler has "
                       "attached yet, or it detached again. Attach StikDebug "
                       "(or an equivalent JIT enabler) to THIS app while it is "
                       "running, then check again; BoxedVN cannot enable JIT "
                       "by itself.",
-                      strerror(mmapErrno), mmapErrno);
-        } else {
-            setDetail("mmap(PROT_EXEC) failed: %s (errno %d), even though "
+                      currentText, maximumText,
+                      mprotectOK ? "" : " and mprotect(PROT_EXEC) failed");
+        } else if (!mprotectOK) {
+            setDetail("mprotect(PROT_EXEC) failed: %s (errno %d), even though "
                       "the kernel DOES have this process flagged as debugged "
-                      "(CS_DEBUGGED is set). A JIT enabler attached "
-                      "successfully, but the process still cannot get "
-                      "executable memory. This points at the app's own "
-                      "signature: confirm the installed IPA was signed with "
-                      "the 'get-task-allow' entitlement present (it is in "
-                      "ios/app/BoxedVN.entitlements, but some signing tools "
-                      "strip entitlements they don't recognise) and that no "
-                      "other MDM/supervision restriction on this device "
-                      "blocks debugger-granted executable memory.",
-                      strerror(mmapErrno), mmapErrno);
+                      "(CS_DEBUGGED is set). Region protection is %s, max %s. "
+                      "A JIT enabler attached, but this process still cannot "
+                      "obtain executable memory - check that the installed "
+                      "IPA kept the 'get-task-allow' entitlement through "
+                      "signing.",
+                      strerror(mprotectErrno), mprotectErrno, currentText,
+                      maximumText);
+        } else {
+            setDetail("mprotect(PROT_EXEC) reported success, but the region's "
+                      "actual protection is %s (max %s) - the execute bit was "
+                      "not granted. Refusing to jump into a non-executable "
+                      "page; doing so is an instruction-abort permission "
+                      "fault, not a recoverable error.",
+                      currentText, maximumText);
         }
         return report;
     }
@@ -262,8 +349,10 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
     }
 
     report.status = BVNJITStatusAvailable;
-    setDetail("Executable memory mapped, written, cache-flushed and executed "
-              "successfully. Boxedwine's ARM64 JIT can run.");
+    setDetail("Executable memory obtained (mmap rw- then mprotect to %s), "
+              "written, cache-flushed and executed successfully. Boxedwine's "
+              "ARM64 JIT can run.",
+              currentText);
     return report;
 #endif
 }
