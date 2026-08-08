@@ -75,6 +75,50 @@ static inline void boxedwineSetJitWriteProtect(bool enabled) {
 #endif
 }
 
+#if TARGET_OS_IPHONE
+// iOS enforces W^X on JIT memory strictly, and enforces it SILENTLY.
+//
+// mprotect(PROT_READ | PROT_WRITE | PROT_EXEC) returns 0 - success - and then
+// simply does not grant the execute bit, because write was also requested.
+// Reading the region back afterwards shows "rw- (max rwx)": execution is
+// permitted for this process (an attached JIT enabler has it flagged
+// CS_DEBUGGED), just never at the same time as write.  Neither mmap nor
+// mprotect reports this; the only other way to discover it is an
+// instruction-abort fault that cannot be caught.
+//
+// So code pages are kept r-x and flipped to rw- only for the duration of an
+// actual write.  That is precisely what Platform::writeCodeToMemory exists
+// for - macOS uses the same hook for pthread_jit_write_protect_np - so every
+// code write in Boxedwine already funnels through here (bnativeheap.cpp, and
+// the ARMv8 and generic JIT code generators).
+//
+// mprotect works on whole pages, so the requested range is widened to page
+// boundaries.  A 64K block is a single mapping, so widening never touches
+// memory belonging to something else.
+//
+// KNOWN LIMITATION: unlike macOS's pthread_jit_write_protect_np, which is
+// per-thread, mprotect changes protection for the WHOLE PROCESS.  With
+// BOXEDWINE_MULTI_THREADED a guest thread executing from a page while
+// another thread flips that page writable will fault.  See
+// docs/KNOWN_LIMITATIONS_IOS.md - the durable fix is a dual mapping
+// (mach_vm_remap the same physical pages at an rw- address for writing and an
+// r-x address for executing), which needs Boxedwine's write callbacks to
+// target the writable alias rather than the executable address.
+static void boxedwineSetCodeMemoryWritable(void* address, U32 len, bool writable) {
+    static const uintptr_t pageMask = (uintptr_t)getpagesize() - 1;
+    uintptr_t start = (uintptr_t)address & ~pageMask;
+    uintptr_t end = ((uintptr_t)address + len + pageMask) & ~pageMask;
+    int prot = writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);
+
+    if (mprotect((void*)start, end - start, prot) != 0) {
+        kpanic_fmt("could not make JIT memory %s: %s.  On iOS this needs an "
+                   "attached JIT enabler (the kernel must have this process "
+                   "flagged CS_DEBUGGED).",
+                   writable ? "writable" : "executable", strerror(errno));
+    }
+}
+#endif
+
 // Instruction cache invalidation.
 //
 // __builtin___clear_cache lowers to a call to compiler-rt's __clear_cache on
@@ -102,14 +146,26 @@ static inline void boxedwineFlushInstructionCache(void* address, U32 len) {
 
 void Platform::writeCodeToMemory(void* address, U32 len, std::function<void()> callback) {
     boxedwineSetJitWriteProtect(false);
+#if TARGET_OS_IPHONE
+    boxedwineSetCodeMemoryWritable(address, len, true);
+#endif
     callback();
+#if TARGET_OS_IPHONE
+    boxedwineSetCodeMemoryWritable(address, len, false);
+#endif
     boxedwineSetJitWriteProtect(true);
     boxedwineFlushInstructionCache(address, len);
 }
 
 void Platform::writeCodeToMemory(void* address, U32 len, WriteCodeCallback callback, void* context) noexcept {
     boxedwineSetJitWriteProtect(false);
+#if TARGET_OS_IPHONE
+    boxedwineSetCodeMemoryWritable(address, len, true);
+#endif
     callback(context);
+#if TARGET_OS_IPHONE
+    boxedwineSetCodeMemoryWritable(address, len, false);
+#endif
     boxedwineSetJitWriteProtect(true);
     boxedwineFlushInstructionCache(address, len);
 }
@@ -353,19 +409,17 @@ U8* Platform::alloc64kBlock(U32 count, bool executable) {
     // for a process it has flagged CS_DEBUGGED - which is what an external
     // JIT enabler such as StikDebug arranges.
     //
-    // Failing here is reported as a JIT/permission problem specifically,
-    // because that is what it is: the mmap above already succeeded, so this
-    // is not memory exhaustion.  BVNJITProbeExecute (ios/runtime/src/
-    // BVNJIT.mm) performs this identical sequence up front so the app can
-    // report the situation before a guest ever starts.
+    // The block is left r-x, NOT rwx: requesting write alongside execute makes
+    // the kernel silently drop the execute bit (see
+    // boxedwineSetCodeMemoryWritable above).  Writes go through
+    // Platform::writeCodeToMemory, which flips the affected pages to rw- and
+    // back again.
+    //
+    // BVNJITProbeExecute (ios/runtime/src/BVNJIT.mm) performs this identical
+    // sequence up front so the app can report the situation before a guest
+    // ever starts, rather than dying inside the JIT.
     if (executable) {
-        if (mprotect(result, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            kpanic_fmt("alloc64kBlock: could not make memory executable: %s.  "
-                       "On iOS this requires an attached JIT enabler (the "
-                       "kernel must have this process flagged CS_DEBUGGED); "
-                       "BoxedVN cannot grant it to itself.",
-                       strerror(errno));
-        }
+        boxedwineSetCodeMemoryWritable(result, (U32)len, false);
     }
 #endif
     return result;

@@ -241,8 +241,29 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
         return report;
     }
 
+    // Write the code BEFORE asking for execute permission. iOS enforces W^X:
+    // requesting PROT_WRITE together with PROT_EXEC makes mprotect return
+    // success while silently withholding the execute bit (confirmed on
+    // device - the region reads back "rw- (max rwx)"), so the page has to be
+    // writable first and executable second, never both.
+    //
+    //   d2808b08   mov  x8, #0x4258
+    //   aa0803e0   mov  x0, x8
+    //   d65f03c0   ret
+    //
+    // Written as bytes so the encoding is auditable and no assembler is
+    // needed at build time.
+    static const uint32_t kProbeCode[] = {
+        0xD2808B08,  // mov x8, #0x4258
+        0xAA0803E0,  // mov x0, x8
+        0xD65F03C0,  // ret
+    };
+    memcpy(page, kProbeCode, sizeof(kProbeCode));
+
+    // Now drop write and add execute - the same flip
+    // Platform::writeCodeToMemory performs around every real JIT write.
     const bool mprotectOK =
-        mprotect(page, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+        mprotect(page, pageSize, PROT_READ | PROT_EXEC) == 0;
     const int mprotectErrno = mprotectOK ? 0 : errno;
 
     // Step 1b: do NOT trust either call. Ask the kernel what the protection
@@ -294,33 +315,15 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
         return report;
     }
 
-    // Step 2: write a function that returns 0x4258 ("BX").
-    //
-    //   d2808b08   mov  x8, #0x4258
-    //   aa0803e0   mov  x0, x8
-    //   d65f03c0   ret
-    //
-    // Written as bytes so the encoding is auditable and no assembler is
-    // needed at build time.
-    static const uint32_t kProbeCode[] = {
-        0xD2808B08,  // mov x8, #0x4258
-        0xAA0803E0,  // mov x0, x8
-        0xD65F03C0,  // ret
-    };
-
-    // iOS has no pthread_jit_write_protect_np and this region was never
-    // MAP_JIT in the first place: it is a plain mapping, requested rwx at
-    // once. See the comment in platform/linux/platform.cpp.
-    memcpy(page, kProbeCode, sizeof(kProbeCode));
-
-    // Step 3: flush the instruction cache.  Skipping this is a classic cause
-    // of a JIT that appears to work and then produces garbage.
+    // Flush the instruction cache. Skipping this is a classic cause of a JIT
+    // that appears to work and then produces garbage.
     sys_icache_invalidate(page, sizeof(kProbeCode));
 
-    // Step 4: THE UNSAFE STEP. mmap succeeding above does not mean this call
-    // will not be met with an immediate, uncatchable SIGKILL - see the file
-    // header. There is no way to guard this call; if it is going to crash,
-    // it crashes here, synchronously, with no exception to catch.
+    // THE UNSAFE STEP. The execute bit has been verified as genuinely set
+    // above, which removes the failure mode that actually bit on device, but
+    // a call through freshly written memory is still the one operation here
+    // that cannot be guarded - if it does fault, it faults synchronously with
+    // no exception to catch.
     using ProbeFunction = uint32_t (*)(void);
     ProbeFunction probe = reinterpret_cast<ProbeFunction>(page);
     const uint32_t result = probe();
