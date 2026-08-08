@@ -11,6 +11,7 @@ add_library(boxedvn_runtime STATIC
     src/BVNRuntime.mm
     src/BVNLog.mm
     src/BVNJIT.mm
+    src/BVNExecMemory.cpp
     src/BVNPaths.mm
     src/BVNImport.mm
     src/BVNMacPlatformShim.mm

@@ -204,6 +204,17 @@ target_include_directories(boxedwine_core PUBLIC
     "${BOXEDVN_SDL2_INCLUDE_DIR}"
 )
 
+if(BOXEDVN_TARGET_IOS)
+    # platform/linux/platform.cpp asks BVNExecMemory for JIT memory on iOS
+    # rather than calling mmap itself; see the comment there.  Only the header
+    # is needed at compile time - everything ends up in one merged archive, so
+    # the symbol resolves at link time without a target-level dependency (the
+    # same arrangement BVNMacPlatformShim.mm already relies on).
+    target_include_directories(boxedwine_core PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/ios/runtime/include"
+    )
+endif()
+
 # Flags mirrored from the macOS Release configuration of the upstream Xcode
 # project (see cmake/BoxedwineSources.cmake for provenance).
 target_compile_definitions(boxedwine_core PUBLIC

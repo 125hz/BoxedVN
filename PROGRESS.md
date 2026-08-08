@@ -633,6 +633,58 @@ the writable alias instead of the executable address. If crashes appear
 *during* execution rather than at startup, and are timing-dependent, this is
 the first suspect.
 
+## 1i. Stop guessing: probe every allocation strategy at once (2026-08-07)
+
+Attempt 3 (section 1g) failed too, and the message said why: *"the region's
+MAXIMUM protection is rw- … this page was mapped without PROT_EXEC."* But the
+probe **did** pass `PROT_EXEC` to `mmap` in that build — and the two device
+crash reports from earlier builds show `alloc64kBlock`'s regions as
+`rw-/rwx`, i.e. **max did include execute** at some point on this same device.
+
+Those two facts contradict each other, and no amount of reading XNU source
+resolves it from here. **Three guesses, three round trips, three wrong
+answers.** Guessing a fourth time is not a strategy.
+
+So `ios/runtime/src/BVNExecMemory.cpp` now tries **six** allocation strategies
+in one pass, reads back what the kernel actually did for each with
+`vm_region_64`, and uses whichever genuinely produced an executable page:
+
+| # | strategy | needs write flip |
+|---|---|---|
+| 1 | `mmap(rwx)` used as-is | no |
+| 2 | `mmap(rwx)` + `mprotect(rwx)` | no |
+| 3 | `mmap(rwx, MAP_JIT)` | no |
+| 4 | `mmap(rwx, MAP_JIT)` + `mprotect(r-x)` | yes |
+| 5 | `mmap(rwx)` + `mprotect(r-x)` | yes |
+| 6 | `vm_allocate` + `vm_protect(set_maximum)` + `vm_protect(r-x)` | yes |
+
+Order is deliberate: strategies that leave pages writable **and** executable
+come first, because those avoid the process-wide W^X window entirely.
+
+Strategy 5 is the one already known to fail. The genuinely new candidates are
+**3/4** — MAP_JIT was eliminated earlier on the assumption that `CS_DEBUGGED`
+doesn't unlock it, which is worth re-testing rather than trusting — and **6**,
+the Mach interface, which can set a region's *maximum* protection explicitly.
+That is something the BSD layer cannot do after the fact, so if iOS really is
+capping the maximum, 6 is the call that gets past it.
+
+**The structural fix matters more than the matrix.** `Platform::alloc64kBlock`
+now calls `BVNExecMemAlloc` instead of doing its own `mmap`, and
+`boxedwineSetCodeMemoryWritable` forwards to `BVNExecMemSetWritable`. The probe
+and the live allocator were two hand-synchronised copies of the same sequence,
+and failure 3 happened precisely because they drifted. There is now one
+implementation, so **a probe that passes is evidence about the code that
+actually runs the guest.**
+
+Every line of the matrix is written to the session log *as it is produced*,
+before the execution step. If the call into freshly written memory kills the
+process, the log still contains the full table plus "About to execute the probe
+page" — so even a crash returns a complete answer.
+
+**Verified:** builds clean for arm64 with no warnings; 26 pin checks pass.
+**Not confirmed on device.** This build may still not run Notepad — but unlike
+the last three, it cannot come back without telling us which strategy works.
+
 ## 1h. The app now reports its own version (2026-08-07)
 
 Requested by the user: a sideloaded app has no App Store version history and no

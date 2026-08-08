@@ -28,34 +28,25 @@
  *  getting executable memory is a TWO step operation, and the first step lies
  *  about failing.
  *
- *  mmap() with PROT_EXEC does not return an error when execution is not
- *  permitted. It clamps the region's *current* protection to rw-, leaves rwx
- *  as the maximum, and hands back a perfectly valid pointer. Jumping into
- *  that page then takes an instruction-abort permission fault. Confirmed from
- *  a device crash report: pc equal to the mapped address, esr "(Instruction
- *  Abort) Permission fault", region listed as "rw-/rwx". The call the kernel
- *  actually honours for a CS_DEBUGGED process is a subsequent mprotect()
- *  adding PROT_EXEC.
+ *  process is executable memory, and getting it is where three separate
+ *  attempts have now failed on device - mmap lying about PROT_EXEC, iOS
+ *  enforcing W^X silently, and the region maximum being fixed at mmap time.
+ *  Rather than encode a fourth guess, the mechanics live in BVNExecMemory,
+ *  which tries several strategies, reads back what the kernel ACTUALLY did
+ *  with vm_region_64, and uses whichever one works.  Read that header for the
+ *  full history; this file only decides what to tell the user.
  *
- *  PROT_EXEC still has to be passed to mmap even though mmap will not honour
- *  it, because the mmap prot sets the region's MAXIMUM protection and mprotect
- *  can never raise a region above its maximum. Mapping rw- only caps the page
- *  at rw- permanently and the mprotect silently clamps to r-- instead - also
- *  confirmed on device, as "actual protection is r-- (max rw-)".
- *
- *  So the sequence - mirrored exactly by Platform::alloc64kBlock on iOS, see
- *  platform/linux/platform.cpp - is: mmap rwx (for the maximum), write the
- *  code while the page is still rw-, mprotect to r-x to obtain execute, then
- *  VERIFY with vm_region_64 that the execute bit is genuinely set before
- *  trusting it. The verification is not paranoia: both mmap and mprotect can
- *  report success while leaving the page non-executable, and the only other
- *  way to discover that is a fault that cannot be caught.
+ *  Platform::alloc64kBlock on iOS goes through the same module, so a probe
+ *  that passes is evidence about the code that really runs the guest.  It was
+ *  a hand-written copy of the sequence before, and copies drift - that is
+ *  precisely how failure three happened.
  *
  *  BVNJITProbeStatus() never attempts execution at all - it reports only
  *  whether JIT is compiled in and whether CS_DEBUGGED is set, which is
- *  necessary but not sufficient. BVNJITProbeExecute() does the full sequence
- *  above and is gated to call sites that accept the residual risk on purpose.
- *  See BVNRuntime.h for which those are.
+ *  necessary but not sufficient. BVNJITProbeExecute() runs the full matrix
+ *  including the call into freshly written memory, and is gated to call sites
+ *  that accept the residual risk on purpose.  See BVNRuntime.h for which
+ *  those are.
  *  ---------------------------------------------------------------------
  */
 
@@ -70,6 +61,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "BVNExecMemory.h"
 #include "BVNRuntime.h"
 
 // csops() is not declared in a public iOS SDK header, but it is a real,
@@ -95,7 +87,10 @@ namespace {
 
 // Storage for the `detail` string handed back to the caller.  Single-slot on
 // purpose: BVNJITReport documents that it is valid only until the next probe.
-char gDetail[512];
+// Large enough to carry BVNExecMemory's whole strategy table, which is the
+// only place the full picture exists when something goes wrong on a device
+// that is not attached to a debugger.
+char gDetail[2048];
 
 void setDetail(const char* format, ...) __attribute__((format(printf, 1, 2)));
 
@@ -123,47 +118,6 @@ bool jitCompiledIn() {
 #else
     return false;
 #endif
-}
-
-// Reads the kernel's ACTUAL current and maximum protection for the region
-// containing `address`.
-//
-// This exists because mmap() lying is the entire problem: asking for
-// PROT_READ|PROT_WRITE|PROT_EXEC on iOS does not fail when execution is not
-// permitted - it silently returns a valid pointer to a page whose *current*
-// protection is only rw-, with rwx merely as the maximum. Jumping into that
-// page then takes an instruction-abort permission fault (confirmed on a real
-// device: pc == the mapped address, esr "(Instruction Abort) Permission
-// fault", region "rw-/rwx"). Checking the real protection turns that crash
-// into a diagnostic.
-bool queryProtection(void* address, vm_prot_t* current, vm_prot_t* maximum) {
-    vm_address_t regionAddress = reinterpret_cast<vm_address_t>(address);
-    vm_size_t regionSize = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t objectName = MACH_PORT_NULL;
-
-    const kern_return_t result =
-        vm_region_64(mach_task_self(), &regionAddress, &regionSize,
-                     VM_REGION_BASIC_INFO_64,
-                     reinterpret_cast<vm_region_info_t>(&info), &infoCount,
-                     &objectName);
-    if (result != KERN_SUCCESS) {
-        return false;
-    }
-    *current = info.protection;
-    *maximum = info.max_protection;
-    return true;
-}
-
-// "rwx"-style rendering of a vm_prot_t, matching how the crash reporter and
-// vmmap present it, so log output can be compared against a crash report
-// directly.
-void formatProtection(vm_prot_t protection, char out[4]) {
-    out[0] = (protection & VM_PROT_READ) ? 'r' : '-';
-    out[1] = (protection & VM_PROT_WRITE) ? 'w' : '-';
-    out[2] = (protection & VM_PROT_EXECUTE) ? 'x' : '-';
-    out[3] = '\0';
 }
 
 }  // namespace
@@ -223,162 +177,64 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
               "not present. BoxedVN only supports ARM64 devices.");
     return report;
 #else
-    const size_t pageSize = static_cast<size_t>(getpagesize());
+    // Everything below is delegated to BVNExecMemory, which is also what
+    // Platform::alloc64kBlock uses on iOS. That is the point: three separate
+    // bugs in this file came from the probe and the live allocator being two
+    // hand-synchronised copies of the same sequence that quietly diverged.
+    // There is now one implementation, so a probe that passes is evidence
+    // about the code that actually runs the guest.
+    const BVNExecMemStrategy strategy = BVNExecMemProbe(/*allowExecute=*/true);
 
-    // Step 1: map the page requesting rwx, then mprotect down to r-x - the
-    // same sequence Platform::alloc64kBlock uses on iOS.
-    //
-    // The mmap will NOT come back executable: iOS clamps the *current*
-    // protection to rw- while leaving rwx as the maximum, hands back a
-    // perfectly valid pointer, and only faults later when something jumps into
-    // it. mprotect() afterwards is the call the kernel actually honours for a
-    // CS_DEBUGGED process.
-    //
-    // PROT_EXEC still has to be requested here, though, because the mmap prot
-    // sets the region's MAXIMUM protection and mprotect can never raise a
-    // region above its maximum. Mapping rw- only caps the page at rw- forever,
-    // and the mprotect below then silently clamps to r-- instead (confirmed on
-    // device: "actual protection is r-- (max rw-)").
-    void* page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == MAP_FAILED) {
-        const int mmapErrno = errno;
-        report.status = BVNJITStatusUnavailable;
-        report.executableMemoryAvailable = false;
-        setDetail("mmap(PROT_READ | PROT_WRITE | PROT_EXEC) failed: %s "
-                  "(errno %d). iOS normally lets this mapping succeed and just "
-                  "withholds the execute bit, so an outright failure means the "
-                  "process is out of address space or memory.",
-                  strerror(mmapErrno), mmapErrno);
-        return report;
-    }
-
-    // Write the code BEFORE asking for execute permission. iOS enforces W^X:
-    // requesting PROT_WRITE together with PROT_EXEC makes mprotect return
-    // success while silently withholding the execute bit (confirmed on
-    // device - the region reads back "rw- (max rwx)"), so the page has to be
-    // writable first and executable second, never both.
-    //
-    //   d2808b08   mov  x8, #0x4258
-    //   aa0803e0   mov  x0, x8
-    //   d65f03c0   ret
-    //
-    // Written as bytes so the encoding is auditable and no assembler is
-    // needed at build time.
-    static const uint32_t kProbeCode[] = {
-        0xD2808B08,  // mov x8, #0x4258
-        0xAA0803E0,  // mov x0, x8
-        0xD65F03C0,  // ret
-    };
-    memcpy(page, kProbeCode, sizeof(kProbeCode));
-
-    // Now drop write and add execute - the same flip
-    // Platform::writeCodeToMemory performs around every real JIT write.
-    const bool mprotectOK =
-        mprotect(page, pageSize, PROT_READ | PROT_EXEC) == 0;
-    const int mprotectErrno = mprotectOK ? 0 : errno;
-
-    // Step 1b: do NOT trust either call. Ask the kernel what the protection
-    // actually is now. mmap lies by clamping, and mprotect can report success
-    // while the region still lacks execute permission.
-    vm_prot_t currentProtection = 0;
-    vm_prot_t maximumProtection = 0;
-    const bool queried = queryProtection(page, &currentProtection,
-                                         &maximumProtection);
-    char currentText[4] = "???";
-    char maximumText[4] = "???";
-    if (queried) {
-        formatProtection(currentProtection, currentText);
-        formatProtection(maximumProtection, maximumText);
-    }
-
-    if (!queried || (currentProtection & VM_PROT_EXECUTE) == 0) {
-        munmap(page, pageSize);
+    if (strategy == BVNExecMemStrategyNone) {
         report.status = BVNJITStatusUnavailable;
         report.executableMemoryAvailable = false;
         if (!report.debuggerAttached) {
-            setDetail("The page is not executable (protection %s, max %s)%s. "
-                      "The kernel does not have this process flagged as "
-                      "debugged (CS_DEBUGGED is not set) - no JIT enabler has "
-                      "attached yet, or it detached again. Attach StikDebug "
-                      "(or an equivalent JIT enabler) to THIS app while it is "
-                      "running, then check again; BoxedVN cannot enable JIT "
-                      "by itself.",
-                      currentText, maximumText,
-                      mprotectOK ? "" : " and mprotect(PROT_EXEC) failed");
-        } else if (!mprotectOK) {
-            setDetail("mprotect(PROT_EXEC) failed: %s (errno %d), even though "
-                      "the kernel DOES have this process flagged as debugged "
-                      "(CS_DEBUGGED is set). Region protection is %s, max %s. "
-                      "A JIT enabler attached, but this process still cannot "
-                      "obtain executable memory - check that the installed "
-                      "IPA kept the 'get-task-allow' entitlement through "
-                      "signing.",
-                      strerror(mprotectErrno), mprotectErrno, currentText,
-                      maximumText);
-        } else if (queried && (maximumProtection & VM_PROT_EXECUTE) == 0) {
-            // Distinct from the case below: the ceiling itself is wrong, so no
-            // mprotect could ever have worked. That is a bug in how the page
-            // was mapped, not a restriction the kernel placed on this process.
-            setDetail("mprotect(PROT_EXEC) reported success, but the region's "
-                      "MAXIMUM protection is %s - it has no execute bit, so no "
-                      "mprotect can ever make this page executable (actual "
-                      "protection %s). The maximum is fixed at mmap time; this "
-                      "page was mapped without PROT_EXEC.",
-                      maximumText, currentText);
+            setDetail("No way of obtaining executable memory works, and the "
+                      "kernel does not have this process flagged as debugged "
+                      "(CS_DEBUGGED is not set) - no JIT enabler has attached "
+                      "yet, or it detached again. Attach StikDebug (or an "
+                      "equivalent) to THIS app while it is running, then try "
+                      "again; BoxedVN cannot enable JIT by itself.\n\n%s",
+                      BVNExecMemReport());
         } else {
-            setDetail("mprotect(PROT_EXEC) reported success, but the region's "
-                      "actual protection is %s (max %s) - the execute bit was "
-                      "not granted even though the maximum allows it. Refusing "
-                      "to jump into a non-executable page; doing so is an "
-                      "instruction-abort permission fault, not a recoverable "
-                      "error.",
-                      currentText, maximumText);
+            setDetail("A JIT enabler IS attached (CS_DEBUGGED is set), but no "
+                      "way of obtaining executable memory works on this "
+                      "device. Every allocation strategy and what the kernel "
+                      "actually did with it:\n\n%s",
+                      BVNExecMemReport());
         }
         return report;
     }
 
-    // Flush the instruction cache. Skipping this is a classic cause of a JIT
-    // that appears to work and then produces garbage.
-    sys_icache_invalidate(page, sizeof(kProbeCode));
-
-    // THE UNSAFE STEP. The execute bit has been verified as genuinely set
-    // above, which removes the failure mode that actually bit on device, but
-    // a call through freshly written memory is still the one operation here
-    // that cannot be guarded - if it does fault, it faults synchronously with
-    // no exception to catch.
-    using ProbeFunction = uint32_t (*)(void);
-    ProbeFunction probe = reinterpret_cast<ProbeFunction>(page);
-    const uint32_t result = probe();
-
-    // Everything below only runs if the call above did not get the process
-    // killed - i.e. execution is now proven to actually work.
-    munmap(page, pageSize);
     report.executableMemoryAvailable = true;
 
-    if (result != 0x4258) {
+    if (!BVNExecMemExecutionConfirmed()) {
+        // Reached only if the page was executable by every measure and the
+        // call still did not produce the expected value.
         report.status = BVNJITStatusUnavailable;
-        setDetail("Executable memory was mapped and called, but returned "
-                  "0x%08X instead of 0x00004258. The instruction cache flush "
-                  "or the memory mapping is not behaving as expected; the JIT "
-                  "would produce wrong results.",
-                  result);
+        setDetail("Executable memory was obtained but did not behave "
+                  "correctly:\n\n%s", BVNExecMemReport());
         return report;
     }
 
     if (!report.jitCompiledIn) {
         report.status = BVNJITStatusUnavailable;
-        setDetail("Executable memory works, but this binary was built without "
-                  "BOXEDWINE_JIT, so there is no ARM64 code generator to use "
-                  "it.");
+        setDetail("Executable memory works (%s), but this binary was built "
+                  "without BOXEDWINE_JIT, so there is no ARM64 code generator "
+                  "to use it.", BVNExecMemStrategyName(strategy));
         return report;
     }
 
     report.status = BVNJITStatusAvailable;
-    setDetail("Executable memory obtained (mmap rwx-max then mprotect to %s), "
-              "written, cache-flushed and executed successfully. Boxedwine's "
-              "ARM64 JIT can run.",
-              currentText);
+    setDetail("Executable memory obtained with %s, written, cache-flushed and "
+              "executed successfully%s. Boxedwine's ARM64 JIT can run.\n\n%s",
+              BVNExecMemStrategyName(strategy),
+              BVNExecMemNeedsWriteFlip()
+                  ? " (writes need a process-wide protection flip, which is a "
+                    "known multithreading hazard - see "
+                    "docs/KNOWN_LIMITATIONS_IOS.md)"
+                  : "",
+              BVNExecMemReport());
     return report;
 #endif
 }

@@ -76,46 +76,34 @@ static inline void boxedwineSetJitWriteProtect(bool enabled) {
 }
 
 #if TARGET_OS_IPHONE
-// iOS enforces W^X on JIT memory strictly, and enforces it SILENTLY.
-//
-// mprotect(PROT_READ | PROT_WRITE | PROT_EXEC) returns 0 - success - and then
-// simply does not grant the execute bit, because write was also requested.
-// Reading the region back afterwards shows "rw- (max rwx)": execution is
-// permitted for this process (an attached JIT enabler has it flagged
-// CS_DEBUGGED), just never at the same time as write.  Neither mmap nor
-// mprotect reports this; the only other way to discover it is an
-// instruction-abort fault that cannot be caught.
-//
-// So code pages are kept r-x and flipped to rw- only for the duration of an
-// actual write.  That is precisely what Platform::writeCodeToMemory exists
-// for - macOS uses the same hook for pthread_jit_write_protect_np - so every
-// code write in Boxedwine already funnels through here (bnativeheap.cpp, and
-// the ARMv8 and generic JIT code generators).
-//
-// mprotect works on whole pages, so the requested range is widened to page
-// boundaries.  A 64K block is a single mapping, so widening never touches
-// memory belonging to something else.
-//
-// KNOWN LIMITATION: unlike macOS's pthread_jit_write_protect_np, which is
-// per-thread, mprotect changes protection for the WHOLE PROCESS.  With
-// BOXEDWINE_MULTI_THREADED a guest thread executing from a page while
-// another thread flips that page writable will fault.  See
-// docs/KNOWN_LIMITATIONS_IOS.md - the durable fix is a dual mapping
-// (mach_vm_remap the same physical pages at an rw- address for writing and an
-// r-x address for executing), which needs Boxedwine's write callbacks to
-// target the writable alias rather than the executable address.
-static void boxedwineSetCodeMemoryWritable(void* address, U32 len, bool writable) {
-    static const uintptr_t pageMask = (uintptr_t)getpagesize() - 1;
-    uintptr_t start = (uintptr_t)address & ~pageMask;
-    uintptr_t end = ((uintptr_t)address + len + pageMask) & ~pageMask;
-    int prot = writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);
+#include "BVNExecMemory.h"
 
-    if (mprotect((void*)start, end - start, prot) != 0) {
-        kpanic_fmt("could not make JIT memory %s: %s.  On iOS this needs an "
-                   "attached JIT enabler (the kernel must have this process "
-                   "flagged CS_DEBUGGED).",
-                   writable ? "writable" : "executable", strerror(errno));
-    }
+// How executable memory is obtained on iOS is not knowable at compile time.
+// Every documented answer turned out to be wrong on device, in a different
+// way each time, and none of the failures reported an error - see the header
+// comment in ios/runtime/include/BVNExecMemory.h for the three of them.
+//
+// So the decision is made at runtime by BVNExecMemory, which tries each
+// strategy, reads back what the kernel ACTUALLY did with vm_region_64, and
+// uses whichever one produced a genuinely executable page.  This file just
+// asks it for memory.  Crucially the JIT probe in the UI asks the same module
+// the same question, so what the probe reports is what the emulator does -
+// they were two hand-synchronised copies before, and they drifted.
+//
+// Whether writes need a protection flip depends on the winning strategy: some
+// leave pages writable and executable at once, some enforce W^X and need the
+// flip.  BVNExecMemSetWritable is a no-op in the former case.
+//
+// KNOWN LIMITATION, only when a flipping strategy wins: unlike macOS's
+// pthread_jit_write_protect_np, which is per-thread, changing protection
+// affects the WHOLE PROCESS.  With BOXEDWINE_MULTI_THREADED a guest thread
+// executing from a page while another thread flips that page writable will
+// fault.  See docs/KNOWN_LIMITATIONS_IOS.md - the durable fix is a dual
+// mapping (the same physical pages at an rw- address for writing and an r-x
+// address for executing), which needs Boxedwine's write callbacks to target
+// the writable alias rather than the executable address.
+static void boxedwineSetCodeMemoryWritable(void* address, U32 len, bool writable) {
+    BVNExecMemSetWritable(address, (size_t)len, writable);
 }
 #endif
 
@@ -386,49 +374,33 @@ void Platform::releaseNativeMemory(void* address, U64 len) {
 
 U8* Platform::alloc64kBlock(U32 count, bool executable) {
     U64 len = 64 * 1024 * (U64)count;
+
+#if TARGET_OS_IPHONE
+    if (executable) {
+        // Not a plain mmap: which calls produce executable memory on iOS is
+        // decided at runtime, because every compile-time answer was wrong on
+        // device.  See boxedwineSetCodeMemoryWritable above and
+        // ios/runtime/include/BVNExecMemory.h.
+        U8* jitMemory = (U8*)BVNExecMemAlloc((size_t)len);
+        if (!jitMemory) {
+            kpanic_fmt("alloc64kBlock: could not obtain executable memory.  On "
+                       "iOS this needs an attached JIT enabler (the kernel must "
+                       "have this process flagged CS_DEBUGGED).  Runtime status "
+                       "in the app reports exactly which allocation strategies "
+                       "were tried and what the kernel did with each.");
+        }
+        return jitMemory;
+    }
+#endif
+
     int prot = PROT_WRITE | PROT_READ;
     if (executable) {
-        // PROT_EXEC must be requested HERE even on iOS, where the mapping will
-        // not actually come back executable.  The mmap prot argument sets the
-        // region's MAXIMUM protection, and mprotect can never raise a region
-        // above its maximum.  Leaving PROT_EXEC out of this call caps the
-        // region at rw- forever, and the later mprotect(PROT_READ|PROT_EXEC)
-        // then silently clamps to r-- (confirmed on device: "actual protection
-        // is r-- (max rw-)").  With PROT_EXEC requested, the maximum is rwx and
-        // the mprotect below can genuinely grant execute.
         prot |= PROT_EXEC;
     }
     U8* result = (U8*)mmap(NULL, len, prot, MAP_ANONYMOUS | MAP_PRIVATE | MAP_BOXEDWINE, -1, 0);
     if (result == MAP_FAILED) {
         kpanic_fmt("alloc64kBlock: failed to commit memory : %s", strerror(errno));
     }
-#if TARGET_OS_IPHONE
-    // On iOS the mmap above does NOT return an executable mapping, and does
-    // not fail either: the kernel clamps the region's current protection to
-    // rw-, leaves rwx as the maximum, and returns a valid pointer.  The JIT
-    // would then write code into it and jump, and the process dies on an
-    // instruction-abort permission fault rather than on anything that could
-    // have been checked.  (Confirmed from a device crash report: pc == the
-    // mapped address, esr "(Instruction Abort) Permission fault", region
-    // "rw-/rwx".)  Execute has to be granted by a SEPARATE mprotect, which is
-    // the call the kernel actually honours for a process it has flagged
-    // CS_DEBUGGED - which is what an external JIT enabler such as StikDebug
-    // arranges.  That mprotect only works because PROT_EXEC was requested in
-    // the mmap and so the region's maximum protection is rwx.
-    //
-    // The block is left r-x, NOT rwx: requesting write alongside execute makes
-    // the kernel silently drop the execute bit (see
-    // boxedwineSetCodeMemoryWritable above).  Writes go through
-    // Platform::writeCodeToMemory, which flips the affected pages to rw- and
-    // back again.
-    //
-    // BVNJITProbeExecute (ios/runtime/src/BVNJIT.mm) performs this identical
-    // sequence up front so the app can report the situation before a guest
-    // ever starts, rather than dying inside the JIT.
-    if (executable) {
-        boxedwineSetCodeMemoryWritable(result, (U32)len, false);
-    }
-#endif
     return result;
 }
 
