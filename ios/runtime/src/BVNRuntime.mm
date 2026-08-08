@@ -29,11 +29,13 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -79,6 +81,11 @@ int32_t gLastExitCode = INT32_MIN;
 std::string gLastError;
 bool gFrontendReady = false;
 bool gShutdownRequested = false;
+
+// Set for the lifetime of an outstanding call to BVNJITProbeExecute() and
+// never cleared if that call never returns.  See probeJitWithTimeout() below
+// for why a hang, not just a crash, has to be planned for.
+std::atomic<bool> gJitProbeInFlight{false};
 
 void setState(BVNRuntimeState state) {
     pthread_mutex_lock(&gMutex);
@@ -294,6 +301,104 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     return true;
 }
 
+// Calls BVNJITProbeExecute() on a background thread and waits for it with a
+// hard timeout, so a hang inside the probe can never freeze runSession()'s
+// caller - the main thread, which is also the ONLY thread servicing UIKit's
+// run loop.  Before this wrapper, a stuck probe meant a stuck app: no crash,
+// no alert, nothing but a dead UI, because the call sat directly in the path
+// SDL and UIKit both depend on.
+//
+// A hang here is a real possibility, not a defensive nicety: on iOS, a
+// hardware permission fault delivered to a process that has CS_DEBUGGED set
+// WITHOUT an actively listening debugger on the other end of its Mach
+// exception ports can leave the faulting thread parked forever instead of
+// terminating the process. Some external JIT enablers set CS_DEBUGGED and
+// then detach, which is exactly that situation. (Two earlier crash reports
+// for this app WERE terminations - SIGKILL, then SIGBUS - so a plain fault
+// evidently does still crash the process in at least some cases; a genuine
+// hang would be a different, previously unseen failure mode, and this
+// wrapper cannot tell the two apart from the caller's side. It does not need
+// to: either way, the fix is the same - stop waiting, report what is known,
+// and keep the UI alive.)
+//
+// The worker thread is deliberately abandoned on timeout, not joined or
+// cancelled: a thread parked in a kernel trap servicing (or failing to get an
+// acknowledgement for) a hardware exception generally cannot be cancelled
+// from user space, and forcing the issue risks corrupting whatever state the
+// kernel already associated with that fault. One leaked thread is a small
+// price for the main thread never blocking indefinitely.
+constexpr int64_t kJitProbeTimeoutSeconds = 6;
+
+BVNJITReport probeJitWithTimeout() {
+    if (gJitProbeInFlight.load()) {
+        // A previous attempt is still stuck out there. BVNExecMemory's
+        // bookkeeping (which strategy is selected, whether a page is
+        // currently mapped) is plain global state with no locking of its
+        // own - it was never meant to be entered by two threads at once -
+        // so starting a second probe now would race with whatever the first
+        // one is still doing, rather than merely wasting a thread.
+        BVNJITReport report{};
+        report.status = BVNJITStatusUnavailable;
+        report.executableMemoryAvailable = false;
+        report.debuggerAttached = false;
+        report.jitCompiledIn = false;
+        static char detail[256];
+        snprintf(detail, sizeof(detail),
+                 "A previous JIT probe from an earlier launch attempt never "
+                 "returned and is still running. BoxedVN will not start a "
+                 "second one, since the two would race on the same "
+                 "bookkeeping. Force-quit and reopen the app before trying "
+                 "again.");
+        report.detail = detail;
+        return report;
+    }
+
+    gJitProbeInFlight.store(true);
+
+    __block BVNJITReport probeResult{};
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+
+    dispatch_async(
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            probeResult = BVNJITProbeExecute();
+            gJitProbeInFlight.store(false);
+            dispatch_semaphore_signal(finished);
+        });
+
+    const long timedOut = dispatch_semaphore_wait(
+        finished,
+        dispatch_time(DISPATCH_TIME_NOW, kJitProbeTimeoutSeconds * NSEC_PER_SEC));
+
+    if (timedOut != 0) {
+        BVNLogWrite(BVNLogLevelError, "jit",
+                    "The executable-memory probe did not return within the "
+                    "timeout. Treating JIT as unavailable and abandoning the "
+                    "stuck probe thread rather than blocking the main thread "
+                    "indefinitely. Check the log above this line for the "
+                    "last allocation strategy that was attempted - that is "
+                    "the one that hung.");
+        BVNJITReport report{};
+        report.status = BVNJITStatusUnavailable;
+        report.executableMemoryAvailable = false;
+        report.debuggerAttached = false;
+        report.jitCompiledIn = false;
+        static char detail[640];
+        snprintf(detail, sizeof(detail),
+                 "The executable-memory probe did not return within %lld "
+                 "seconds - this looks like a HANG, not a crash. See the "
+                 "'jit' log lines just above this message for the last "
+                 "allocation strategy that was attempted before it stalled; "
+                 "that strategy is the one to rule out next. BoxedVN is "
+                 "treating JIT as unavailable rather than let the app stay "
+                 "frozen.",
+                 (long long)kJitProbeTimeoutSeconds);
+        report.detail = detail;
+        return report;
+    }
+
+    return probeResult;
+}
+
 // Runs one guest session on the main thread.  Returns when the guest exits.
 void runSession(const PendingLaunch& launch) {
     std::string error;
@@ -303,12 +408,15 @@ void runSession(const PendingLaunch& launch) {
         return;
     }
 
-    // BVNJITProbeExecute(), not the safe status check: this is the one place
-    // in the app where actually confirming JIT works is worth the risk of an
-    // uncatchable crash if it does not, because the user just pressed
-    // Launch/Run Wine Notepad and Boxedwine's real JIT is about to hit the
-    // identical risk moments later regardless. See BVNRuntime.h.
-    const BVNJITReport jit = BVNJITProbeExecute();
+    // probeJitWithTimeout(), not a direct call to BVNJITProbeExecute(): this
+    // is the one place in the app where actually confirming JIT works is
+    // worth the risk of a crash if it does not, because the user just
+    // pressed Launch/Run Wine Notepad and Boxedwine's real JIT is about to
+    // hit the identical risk moments later regardless. See BVNRuntime.h.
+    // The timeout wrapper exists because this call runs on the main thread -
+    // the only thread servicing UIKit's run loop - and a hang inside it, not
+    // just a crash, is a real possibility on iOS; see probeJitWithTimeout().
+    const BVNJITReport jit = probeJitWithTimeout();
     BVNLogWrite(jit.status == BVNJITStatusAvailable ? BVNLogLevelInfo
                                                     : BVNLogLevelWarning,
                 "jit", jit.detail);

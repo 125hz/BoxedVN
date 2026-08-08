@@ -6,7 +6,9 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-07
+**Last updated:** 2026-08-07 (session: fixed a full-app freeze on "Run Wine
+Notepad" by adding a timeout around the JIT probe; root cause of the freeze
+itself is still unidentified - see section 1j)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
 `379bf2414a67fc6509d506a6eefdf6ffa7ebf82d` (2026-08-05, "build fix"),
@@ -707,33 +709,131 @@ every session log.
 Two IPAs reporting the same version is exactly the confusion this exists to
 prevent.
 
+## 1j. "Run Wine Notepad" froze the whole app - the probe could hang, not just crash (2026-08-07)
+
+After section 1i's rebuild (build 4, revision `026811d4`), the user reported:
+tapping **Run Wine Notepad** produced no alert at all and froze the entire
+app - no popup, completely unresponsive, had to be force-quit. This is a
+**different failure mode** from every previous report on this project: the
+first three JIT bugs all produced a `.ips` crash report (SIGKILL, then
+SIGBUS) - the process died and the crash reporter had something to say about
+it. A silent freeze with no crash report is not the same bug wearing a new
+face; it means the process did not die, it stopped making progress.
+
+**Root cause, architectural, independent of which strategy hangs:**
+`runSession()` (`ios/runtime/src/BVNRuntime.mm`) runs on the **main thread**
+(SDL's UIKit backend requires this - see the file's own header comment) and,
+until this fix, called `BVNJITProbeExecute()` **synchronously, directly on
+that thread**, with no timeout. The main thread is the only thread servicing
+UIKit's run loop. Anything that blocks it indefinitely presents to the user
+exactly as reported: a totally dead app, no alert, because the alert itself
+needs the main run loop to display.
+
+Something inside the six-strategy probe (section 1i) not returning is
+plausible on iOS specifically: a hardware permission fault delivered to a
+process that has `CS_DEBUGGED` set **without an actively listening debugger**
+on the other end of its Mach exception ports can leave the faulting thread
+parked forever instead of terminating the process. Some external JIT
+enablers (StikDebug included, potentially) set `CS_DEBUGGED` and then detach
+rather than staying attached as a live debug session. This is a real,
+previously-undocumented-in-this-project failure mode, distinct from the
+faults that produced the two earlier `.ips` reports.
+
+**The fix does not require knowing which strategy hangs, and deliberately
+does not guess a specific cause:**
+
+- `probeJitWithTimeout()` (`ios/runtime/src/BVNRuntime.mm`) runs
+  `BVNJITProbeExecute()` on a background queue and waits on a
+  `dispatch_semaphore_t` with a **6-second timeout**. If the probe does not
+  signal in time, the wrapper gives up and returns `BVNJITStatusUnavailable`
+  with a detail message saying plainly that this looks like a hang, not a
+  crash, and pointing at the log.
+- The stuck worker thread is **abandoned on purpose**, not joined or
+  cancelled - a thread parked in a kernel trap servicing a hardware exception
+  generally cannot be cancelled from user space, and forcing it risks
+  corrupting kernel-side state for that fault. One leaked thread is a small
+  price for the main thread never blocking.
+- A `std::atomic<bool> gJitProbeInFlight` guards against a **second**
+  concurrent probe if the user retries after a timeout: `BVNExecMemory`'s
+  strategy-selection state (section 1i) is plain global bookkeeping with no
+  locking of its own, so two probes racing on it would be a new bug layered
+  on top of the first. A retry while one is still stuck gets an immediate,
+  clear "still stuck, restart the app" message instead.
+- Every `BVNExecMemory` strategy line is still written to the log file
+  **unbuffered, as it happens** (section 1i). That did not change. It means
+  that even though this exact freeze gave no popup, **the session log from
+  that freeze already contains the last strategy line that ran before it
+  stalled** - that is the single most useful piece of evidence for whoever
+  picks this up next. See "Immediate next step" below.
+
+**What this fix does and does NOT establish:** it guarantees the app can
+never freeze completely from this call again - a hang now surfaces as a
+clear "JIT unavailable, probe timed out" message after 6 seconds instead of
+requiring a force-quit. It does **not** identify which of the six strategies
+actually hung, or whether the true problem is a hang at all rather than
+something else. That determination needs the log from the freeze that already
+happened, or a fresh attempt with this build.
+
+**Verified:** builds clean for arm64, no warnings, no errors. 26 pin checks
+pass. **Not confirmed on device** - neither the timeout behavior itself, nor
+(obviously) which strategy was actually responsible for the freeze the user
+saw.
+
+### Immediate next step for whoever picks this up (Claude or Codex)
+
+1. **Recover the log from the freeze that already happened**, if the device
+   still has it: BoxedVN's Documents folder is visible over USB/Finder
+   (`UIFileSharingEnabled` is on) or in the Files app under "On My iPhone" →
+   BoxedVN → `Logs/`. Find the newest `boxedvn-*.log` file with a
+   timestamp matching the freeze and read its last few lines. Because
+   `BVNLogWrite` writes to the log file unbuffered (`writeToSinks` in
+   `ios/runtime/src/BVNLog.mm`), the last line present is the last thing that
+   completed - almost certainly one of the six strategy lines from
+   `BVNExecMemProbe` (`ios/runtime/src/BVNExecMemory.cpp`), naming the exact
+   strategy that hung. **This is the fastest possible path to the real root
+   cause** and should be checked before writing any more code.
+2. **Ship build 5** (`ios/project.yml` / `ios/project-simulator.yml` already
+   bumped to `CURRENT_PROJECT_VERSION "5"` as of this session; run
+   `scripts/build-ios.sh` then `scripts/package-ipa.sh` to produce the IPA)
+   and have the user retry **Run Wine Notepad**. Two outcomes:
+   - **It times out again after ~6 seconds** with a popup this time (the
+     actual fix working) - progress, and the log will again show which
+     strategy is stuck; consider removing that specific strategy from
+     `kStrategyOrder` in `BVNExecMemory.cpp` next, since it is worse than
+     useless (a strategy that reports itself as viable and then hangs is more
+     dangerous than one that fails outright).
+   - **It behaves completely differently** (crashes cleanly, or actually
+     works) - also progress; read whatever the log/`.ips` says next.
+3. Only after JIT is confirmed non-hanging and either working or cleanly
+   failing: continue with the milestones below.
+
 ## 8. Next actions, in order
 
-1. **Sign and install the new IPA** (`build/artifacts/BoxedVN-unsigned.ipa`,
-   SHA-256 `5381984f…3415fa` — supersedes `d6ec5182…`, which crashed on boot;
-   see section 1e) **on the physical iPhone 17**. First confirm the app now
-   opens to the library UI at all (that is the crash fix — should need no
-   debugger attached to verify). Then attach StikDebug and open Runtime
-   status: expect `Debugger attached: yes` and `Status: Likely available`
-   automatically. Actual confirmed `Status: Available` only appears after
-   pressing **Run Wine Notepad** or **Launch**, since that is now the only
-   place `BVNJITProbeExecute()` runs — if JIT genuinely doesn't work, expect
-   the crash to happen *there* instead (tied to that action, not to opening
-   the app), and the exact `errno` from the log at that point is the real
-   diagnosis. With MAP_JIT already eliminated as a cause, a failure there
-   would point somewhere new.
-3. **Import a root filesystem** through Settings and confirm the file lands in
-   Application Support.
-4. **Run Wine Notepad.** This is the first real end-to-end test: rootfs mount,
-   Linux kernel emulation, Wine start, framebuffer presentation. Expect
-   problems here, and expect the session log to explain them.
-5. **Verify the session can exit** without force-quitting, and that the
+The status below is accurate as of build 5 (`ios/project.yml`
+`CURRENT_PROJECT_VERSION "5"`). Everything before "Run Wine Notepad" is done;
+Run Wine Notepad itself is what section 1j is about - **start there, not
+here**, until that is resolved.
+
+1. **Resolve the freeze in section 1j** (see "Immediate next step" above) -
+   this blocks everything after it.
+2. **Import a root filesystem** through Settings and confirm the file lands in
+   Application Support. (This step itself is not known to be broken; it is
+   listed in order.)
+3. **Run Wine Notepad and get a real result** - not a freeze, not a silent
+   nothing: either it runs, or it fails with a specific, loggable reason. This
+   is the first real end-to-end test of rootfs mount, Linux kernel emulation,
+   Wine start, and framebuffer presentation.
+4. **Verify the session can exit** without force-quitting, and that the
    library window comes back (`BVNFrontendShowLibrary`).
-6. **Import one DRM-free 32-bit visual novel** and run it.
-7. Only then: input refinement, audio verification, and the GLES renderer.
+5. **Import one DRM-free 32-bit visual novel** and run it.
+6. Only then: input refinement, audio verification, and the GLES renderer.
 
 ## 9. Known open questions
 
+- **What actually froze during "Run Wine Notepad"?** Section 1j fixes the
+  *symptom* (a hang can no longer block the whole app) without yet
+  identifying the *cause*. The most direct path to an answer is the session
+  log from the freeze itself - see section 1j's "Immediate next step".
 - **Does `boxedmain()` survive being called twice?** The design returns to the
   library UI after a session and allows another launch. Boxedwine calls
   `SDL_Init`/`SDL_Quit` inside that span. If a second session breaks, the
