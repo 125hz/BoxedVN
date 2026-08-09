@@ -1,0 +1,446 @@
+/*
+ * BoxedVN - writable Wine-prefix preparation.
+ * GPLv2; see license.txt.
+ */
+
+#include "boxedvn/wine_prefix.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <vector>
+
+extern "C" {
+#include "unzip.h"
+}
+
+namespace fs = std::filesystem;
+
+namespace boxedvn {
+namespace {
+
+constexpr const char* kUserRegistryEntry =
+    "home/username/.wine/user.reg";
+constexpr const char* kSystemRegistryEntry =
+    "home/username/.wine/system.reg";
+
+std::string escapedSection(const std::string& section) {
+    std::string result;
+    result.reserve(section.size() * 2 + 2);
+    result.push_back('[');
+    for (const char c : section) {
+        if (c == '\\') {
+            result.push_back('\\');
+        }
+        result.push_back(c);
+    }
+    result.push_back(']');
+    return result;
+}
+
+bool readFile(const fs::path& path, std::string& contents, std::string& error) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        error = "Could not read Wine registry overlay '" + path.string() +
+                "'.";
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    contents = buffer.str();
+    if (contents.rfind("WINE REGISTRY Version 2", 0) != 0) {
+        error = "Wine registry overlay '" + path.string() +
+                "' has an unrecognised format.";
+        return false;
+    }
+    return true;
+}
+
+bool atomicWrite(const fs::path& path, const std::string& contents,
+                 std::string& error) {
+    const fs::path temporary = path.string() + ".boxedvn-tmp";
+    {
+        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+        if (!stream) {
+            error = "Could not create temporary Wine registry '" +
+                    temporary.string() + "'.";
+            return false;
+        }
+        stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        if (!stream) {
+            error = "Could not write Wine registry '" + temporary.string() +
+                    "'. The device may be full.";
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    fs::rename(temporary, path, ec);
+    if (ec) {
+        error = "Could not install Wine registry overlay '" + path.string() +
+                "': " + ec.message();
+        fs::remove(temporary, ec);
+        return false;
+    }
+    return true;
+}
+
+bool extractEntry(const std::string& archivePath, const char* entryName,
+                  const fs::path& destination, std::string& error) {
+    unzFile zip = unzOpen64(archivePath.c_str());
+    if (zip == nullptr) {
+        error = "Could not open root filesystem ZIP '" + archivePath + "'.";
+        return false;
+    }
+
+    if (unzLocateFile(zip, entryName, 0) != UNZ_OK) {
+        error = "Root filesystem ZIP does not contain '" +
+                std::string(entryName) + "'.";
+        unzClose(zip);
+        return false;
+    }
+    int status = unzOpenCurrentFile(zip);
+    if (status != UNZ_OK) {
+        error = "Could not open '" + std::string(entryName) +
+                "' inside the root filesystem ZIP.";
+        unzClose(zip);
+        return false;
+    }
+
+    std::error_code ec;
+    fs::create_directories(destination.parent_path(), ec);
+    if (ec) {
+        error = "Could not create Wine prefix directory '" +
+                destination.parent_path().string() + "': " + ec.message();
+        unzCloseCurrentFile(zip);
+        unzClose(zip);
+        return false;
+    }
+
+    const fs::path temporary = destination.string() + ".boxedvn-extract";
+    std::FILE* output = std::fopen(temporary.string().c_str(), "wb");
+    if (output == nullptr) {
+        error = "Could not create Wine registry overlay '" +
+                temporary.string() + "': " + std::strerror(errno);
+        unzCloseCurrentFile(zip);
+        unzClose(zip);
+        return false;
+    }
+
+    std::vector<unsigned char> buffer(64 * 1024);
+    int read = 0;
+    bool writeFailed = false;
+    while ((read = unzReadCurrentFile(zip, buffer.data(),
+                                      static_cast<unsigned>(buffer.size()))) > 0) {
+        if (std::fwrite(buffer.data(), 1, static_cast<size_t>(read), output) !=
+            static_cast<size_t>(read)) {
+            writeFailed = true;
+            break;
+        }
+    }
+    std::fclose(output);
+    const int closeStatus = unzCloseCurrentFile(zip);
+    unzClose(zip);
+
+    if (writeFailed || read < 0 || closeStatus != UNZ_OK) {
+        error = "Could not extract '" + std::string(entryName) +
+                "' from the root filesystem ZIP.";
+        fs::remove(temporary, ec);
+        return false;
+    }
+
+    fs::rename(temporary, destination, ec);
+    if (ec) {
+        error = "Could not install Wine registry overlay '" +
+                destination.string() + "': " + ec.message();
+        fs::remove(temporary, ec);
+        return false;
+    }
+    return true;
+}
+
+bool ensureRegistry(const std::string& archivePath, const char* entryName,
+                    const fs::path& destination, bool& extracted,
+                    std::string& error) {
+    std::error_code ec;
+    if (fs::is_regular_file(destination, ec) && !ec) {
+        return true;
+    }
+    extracted = true;
+    return extractEntry(archivePath, entryName, destination, error);
+}
+
+}  // namespace
+
+bool setWineRegistryValue(std::string& registry,
+                          const std::string& section,
+                          const std::string& name,
+                          const std::string& serialisedValue) {
+    const std::string sectionLine = escapedSection(section);
+    const std::string keyPrefix = "\"" + name + "\"=";
+    const std::string replacement = keyPrefix + serialisedValue;
+
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (start <= registry.size()) {
+        const size_t end = registry.find('\n', start);
+        std::string line = registry.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        lines.push_back(std::move(line));
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    const auto isSectionLine = [&sectionLine](const std::string& line) {
+        return line.rfind(sectionLine, 0) == 0 &&
+               (line.size() == sectionLine.size() ||
+                line[sectionLine.size()] == ' ');
+    };
+
+    size_t sectionIndex = lines.size();
+    for (size_t i = 0; i < lines.size(); ++i) {
+        // Wine appends a key timestamp after the closing bracket. Match the
+        // section name while preserving that timestamp verbatim.
+        if (isSectionLine(lines[i])) {
+            sectionIndex = i;
+            break;
+        }
+    }
+
+    bool changed = false;
+    if (sectionIndex == lines.size()) {
+        if (!lines.empty() && !lines.back().empty()) {
+            lines.push_back("");
+        }
+        lines.push_back(sectionLine);
+        lines.push_back(replacement);
+        changed = true;
+    } else {
+        size_t insertion = lines.size();
+        for (size_t i = sectionIndex + 1; i < lines.size(); ++i) {
+            if (!lines[i].empty() && lines[i].front() == '[') {
+                insertion = i;
+                break;
+            }
+            if (lines[i].rfind(keyPrefix, 0) == 0) {
+                if (lines[i] != replacement) {
+                    lines[i] = replacement;
+                    changed = true;
+                }
+                insertion = lines.size();
+                break;
+            }
+        }
+        if (insertion != lines.size()) {
+            lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insertion),
+                         replacement);
+            changed = true;
+        } else {
+            bool keyFound = false;
+            for (size_t i = sectionIndex + 1; i < lines.size(); ++i) {
+                if (!lines[i].empty() && lines[i].front() == '[') {
+                    break;
+                }
+                if (lines[i].rfind(keyPrefix, 0) == 0) {
+                    keyFound = true;
+                    break;
+                }
+            }
+            if (!keyFound) {
+                lines.push_back(replacement);
+                changed = true;
+            }
+        }
+    }
+
+    if (!changed) {
+        return false;
+    }
+    std::ostringstream rebuilt;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        rebuilt << lines[i];
+        if (i + 1 < lines.size()) {
+            rebuilt << '\n';
+        }
+    }
+    registry = rebuilt.str();
+    return true;
+}
+
+bool installBundledDxvk(const std::string& sourceDirectory,
+                        const std::string& writableRootPath,
+                        bool& changed,
+                        std::string& error) {
+    changed = false;
+    if (sourceDirectory.empty()) {
+        return true;
+    }
+    std::error_code ec;
+    const fs::path source(sourceDirectory);
+    if (!fs::is_directory(source, ec)) {
+        return true;
+    }
+    const fs::path destination = fs::path(writableRootPath) / "home" /
+        "username" / ".wine" / "drive_c" / "dxvk";
+    fs::create_directories(destination, ec);
+    if (ec) {
+        error = "Could not create the DXVK directory: " + ec.message();
+        return false;
+    }
+
+    for (const fs::directory_entry& entry : fs::directory_iterator(source, ec)) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const fs::path& from = entry.path();
+        if (from.extension() != ".dll") {
+            continue;
+        }
+        const fs::path to = destination / from.filename();
+
+        // Always overwrite. An earlier version skipped files whose size
+        // already matched, which silently kept a stale module: rebuilding DXVK
+        // with a one-line feature change produced a byte-identical size, so the
+        // device kept running the previous build and reported the very error
+        // the change fixed. Copying roughly eight megabytes per launch is
+        // irrelevant next to Wine's cold start, and correctness here is not
+        // worth trading for it.
+        std::error_code copyEc;
+        fs::copy_file(from, to, fs::copy_options::overwrite_existing, copyEc);
+        if (copyEc) {
+            error = "Could not install " + from.filename().string() + ": " +
+                    copyEc.message();
+            return false;
+        }
+        changed = true;
+    }
+    return true;
+}
+
+WinePrefixPreparationResult prepareWinePrefix(
+    const std::string& rootFilesystemZipPath,
+    const std::string& writableRootPath,
+    WineRenderer renderer) {
+    WinePrefixPreparationResult result;
+    const fs::path wineDirectory =
+        fs::path(writableRootPath) / "home" / "username" / ".wine";
+    const fs::path userRegistry = wineDirectory / "user.reg";
+    const fs::path systemRegistry = wineDirectory / "system.reg";
+
+    bool extracted = false;
+    if (!ensureRegistry(rootFilesystemZipPath, kUserRegistryEntry, userRegistry,
+                        extracted, result.error) ||
+        !ensureRegistry(rootFilesystemZipPath, kSystemRegistryEntry, systemRegistry,
+                        extracted, result.error)) {
+        return result;
+    }
+    result.changed = extracted;
+
+    if (renderer != WineRenderer::Default) {
+        std::string contents;
+        if (!readFile(userRegistry, contents, result.error)) {
+            return result;
+        }
+        const char* rendererValue = renderer == WineRenderer::Vulkan
+            ? "\"vulkan\""
+            : "\"gdi\"";
+        bool direct3DChanged = setWineRegistryValue(
+            contents, "Software\\Wine\\Direct3D", "renderer", rendererValue);
+
+        if (renderer == WineRenderer::Vulkan) {
+            // Metal has no geometry shader stage, so MoltenVK reports
+            // geometryShader = false on every device, and it always will.
+            // Direct3D 10 requires geometry shaders, so wined3d's Vulkan
+            // adapter can never reach shader model 4. Its DXBC reader then
+            // skips every SM4+ code chunk ("Skipping SM4+ shader"), and a
+            // shader with nothing left to read fails with E_INVALIDARG.
+            //
+            // Saya's device log shows both halves of this. Shaders carrying an
+            // Aon9 feature-level-9 chunk are read as ps_2_1/vs_2_0 and created
+            // successfully; SM4-only shaders fail, and every draw with them
+            // fails behind it.
+            //
+            // Capping the reported shader model makes the device honestly
+            // feature level 9_3 instead of advertising a capability the
+            // backend will not honour. A game that ships _level_9_x shaders -
+            // as this one does - then selects the set that actually works.
+            // This cannot raise a capability, only stop one being claimed, so
+            // it cannot break a title that already renders.
+            for (const char* stage : {"MaxShaderModelVS", "MaxShaderModelPS"}) {
+                direct3DChanged |= setWineRegistryValue(
+                    contents, "Software\\Wine\\Direct3D", stage,
+                    "dword:00000003");
+            }
+            direct3DChanged |= setWineRegistryValue(
+                contents, "Software\\Wine\\Direct3D", "MaxShaderModelGS",
+                "dword:00000000");
+        }
+
+        if (direct3DChanged) {
+            if (!atomicWrite(userRegistry, contents, result.error)) {
+                return result;
+            }
+            result.changed = true;
+        }
+    }
+
+    std::string contents;
+    if (!readFile(systemRegistry, contents, result.error)) {
+        return result;
+    }
+    if (setWineRegistryValue(contents,
+                             "System\\ControlSet001\\Services\\winebth",
+                             "Start", "dword:00000004")) {
+        result.changed = true;
+    }
+    if (setWineRegistryValue(contents,
+                             "System\\ControlSet001\\Services\\winebus",
+                             "Start", "dword:00000003")) {
+        result.changed = true;
+    }
+
+    // Wine 10's services.exe starts root PnP drivers even when their service
+    // Start value is SERVICE_DISABLED.  wineboot also leaves an existing root
+    // device untouched, so keeping the device but clearing its associated
+    // service prevents winebth from being selected by the root-device scan on
+    // this and subsequent launches.  Bluetooth is not exposed by Boxedwine on
+    // iOS; attempting to start the driver only adds a roughly one-minute
+    // timeout before any Wine window can appear.
+    if (setWineRegistryValue(
+            contents,
+            "System\\ControlSet001\\Enum\\ROOT\\WINE\\WINEBTH",
+            "Service", "\"\"")) {
+        result.changed = true;
+    }
+
+    // Build 24 tested disconnecting winebus because the timestamped trace
+    // resumed near Winedevice2. Physical-device timing remained unchanged:
+    // the same 57-61 second cold-start gap occurred, while a second guest in
+    // the same Boxedwine process started quickly. Restore Wine's HID bus so a
+    // disproven optimization does not disable future raw-HID/controllers.
+    if (setWineRegistryValue(
+            contents,
+            "System\\ControlSet001\\Enum\\ROOT\\WINE\\WINEBUS",
+            "Service", "\"winebus\"")) {
+        result.changed = true;
+    }
+
+    if (result.changed && !atomicWrite(systemRegistry, contents, result.error)) {
+        return result;
+    }
+
+    result.ok = true;
+    return result;
+}
+
+}  // namespace boxedvn

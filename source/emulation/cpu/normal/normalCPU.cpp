@@ -30,19 +30,49 @@
 thread_local U32 normalWaitCallCount = 0;
 #endif
 
+#ifdef BOXEDWINE_IOS
+static inline void normalCompatibilityHeartbeat(CPU* cpu) {
+    if (KSystem::interpreterRanges.empty()) {
+        return;
+    }
+    const U32 eip = cpu->eip.u32;
+    bool insideProfile = false;
+    for (const auto& range : KSystem::interpreterRanges) {
+        if (eip >= range.first && eip < range.second) {
+            insideProfile = true;
+            break;
+        }
+    }
+    if (!insideProfile) {
+        return;
+    }
+    thread_local U64 profiledInstructions = 0;
+    ++profiledInstructions;
+    constexpr U64 kHeartbeatInterval = 25000000;
+    if (profiledInstructions == 1 ||
+        profiledInstructions % kHeartbeatInterval == 0) {
+        klog_fmt("Compatibility interpreter heartbeat: %llu profiled "
+                 "instruction(s), current EIP %.8X",
+                 (unsigned long long)profiledInstructions, eip);
+    }
+}
+#else
+static inline void normalCompatibilityHeartbeat(CPU*) {}
+#endif
+
 #ifdef BOXEDWINE_MULTI_THREADED
 #ifdef _DEBUG
 //#define START_OP(cpu, op) op->log(cpu)
-#define START_OP(cpu, op)
+#define START_OP(cpu, op) normalCompatibilityHeartbeat(cpu)
 #else
-#define START_OP(cpu, op)
+#define START_OP(cpu, op) normalCompatibilityHeartbeat(cpu)
 #endif
 #else
 #ifdef _DEBUG
-#define START_OP(cpu, op) cpu->blockInstructionCount++; op->log(cpu)
+#define START_OP(cpu, op) cpu->blockInstructionCount++; normalCompatibilityHeartbeat(cpu); op->log(cpu)
  //#define START_OP(cpu, op)
 #else
-#define START_OP(cpu, op) cpu->blockInstructionCount++
+#define START_OP(cpu, op) cpu->blockInstructionCount++; normalCompatibilityHeartbeat(cpu)
 #endif
 #endif
 
@@ -366,6 +396,33 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
 
     DecodedOp* op = memory->getDecodedOp(startIp);
     if (!op) {
+#ifdef BOXEDWINE_JIT
+        // Resolve the backing module before taking KMemory::mutex. File-map
+        // mutation takes the process mapping lock and memory lock in its own
+        // order, so nesting getModuleName() under the memory lock could
+        // deadlock a concurrent loader thread.
+        bool forceInterpreter = false;
+        BString mappedModule;
+        U32 matchedRangeStart = 0;
+        U32 matchedRangeEnd = 0;
+        for (const auto& range : KSystem::interpreterRanges) {
+            if (startIp >= range.first && startIp < range.second) {
+                forceInterpreter = true;
+                matchedRangeStart = range.first;
+                matchedRangeEnd = range.second;
+                break;
+            }
+        }
+        if (!forceInterpreter && !KSystem::interpreterModules.empty()) {
+            mappedModule = this->thread->process->getModuleName(startIp);
+            for (const auto& requestedModule : KSystem::interpreterModules) {
+                if (mappedModule.contains(requestedModule, true)) {
+                    forceInterpreter = true;
+                    break;
+                }
+            }
+        }
+#endif
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(memory->mutex);
         op = memory->getDecodedOp(startIp);
         if (!op) {
@@ -379,11 +436,32 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
             }
             DecodedOp* nextOp = op;
 
+#ifdef BOXEDWINE_JIT
+            if (forceInterpreter &&
+                !this->thread->process->interpreterCompatibilityActivated
+                     .exchange(true, std::memory_order_acq_rel)) {
+                if (matchedRangeEnd) {
+                    klog_fmt("Compatibility CPU activated for guest range "
+                             "%.8X-%.8X at %.8X; using the interpreter only "
+                             "inside that range", matchedRangeStart,
+                             matchedRangeEnd, startIp);
+                } else {
+                    klog_fmt("Compatibility CPU activated for %s at %.8X; "
+                             "using the interpreter for this module only",
+                             mappedModule.c_str(), startIp);
+                }
+            }
+#endif
+
             while (nextOp) {
                 if (!nextOp->pfn) {
                     nextOp->pfn = getFunctionForOp(nextOp);
                 }
-                if (memory->isAddressDynamic(address, nextOp->len)) {
+                if (
+#ifdef BOXEDWINE_JIT
+                    forceInterpreter ||
+#endif
+                    memory->isAddressDynamic(address, nextOp->len)) {
                     nextOp->flags |= OP_FLAG_NO_JIT;
 #ifdef BOXEDWINE_JIT
                     nextOp->runCount = JIT_RUN_COUNT + 1;
@@ -405,6 +483,15 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
 }
 
 void NormalCPU::run() {
+#ifdef BOXEDWINE_MULTI_THREADED
+    // Publish a coherent-enough, read-only heartbeat for the iOS first-frame
+    // watchdog. These fields deliberately do not expose live CPU storage to a
+    // diagnostic thread.
+    thread->diagnosticEip.store(getEipAddress(), std::memory_order_relaxed);
+    thread->diagnosticEsp.store(reg[4].u32, std::memory_order_relaxed);
+    thread->diagnosticEbp.store(reg[5].u32, std::memory_order_relaxed);
+    thread->diagnosticDispatchCount.fetch_add(1, std::memory_order_relaxed);
+#endif
 #ifdef BOXEDWINE_MULTI_THREADED
     U32 decodedOpEpoch = decodedOpCacheGlobalEpoch->load(std::memory_order_acquire);
     if (decodedOpCacheEpoch.load(std::memory_order_relaxed) != decodedOpEpoch) {

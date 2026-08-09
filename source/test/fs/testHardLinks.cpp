@@ -66,14 +66,13 @@ constexpr U32 UTIME_OMIT = 0x3ffffffe;
 constexpr U32 TEST_CLONE_VM = 0x00000100;
 
 struct NoThrowCodeWriteTestContext {
-    U8* address;
     U32 value;
 };
 
-void writeNoThrowCodeForTest(void* context) noexcept {
+void writeNoThrowCodeForTest(void* writableAddress, void* context) noexcept {
     NoThrowCodeWriteTestContext* writeContext =
         static_cast<NoThrowCodeWriteTestContext*>(context);
-    memcpy(writeContext->address, &writeContext->value,
+    memcpy(writableAddress, &writeContext->value,
         sizeof(writeContext->value));
 }
 
@@ -4143,7 +4142,7 @@ void testWindowsNoThrowCodeWriteFlushesInstructionCache() {
     return;
 #else
     U8* code = Platform::alloc64kBlock(1, true);
-    NoThrowCodeWriteTestContext context{code, 0x12345678};
+    NoThrowCodeWriteTestContext context{0x12345678};
     Platform::resetTestInstructionCacheClearCount();
     Platform::writeCodeToMemory(code, sizeof(context.value),
         writeNoThrowCodeForTest, &context);

@@ -170,11 +170,18 @@ void Jit::movsr(JitWidth valueWidth, U32 size, JitWidth regWidth) {
         mov(regWidth, delta, esi);
         subReg(regWidth, delta, edi);
         IfLessThan(regWidth, ComparisonType::Unsigned, delta, bytesPerIter); {
-            U32 label = MarkJumpLocation();
-            If(regWidth, delta); {
+            // A short overlap cannot use wide loads/stores without changing
+            // x86 MOVS propagation semantics. Copy the entire remainder one
+            // element at a time. This loop must be controlled by ECX: delta
+            // is invariant, so testing delta here never terminates and lets
+            // ECX underflow after the requested copy has completed.
+            U32 label = LoopBegin();
+            hintLikelyStringLoopContinue();
+            If(regWidth, ecx); {
                 copyOneBackward();
                 Goto(label);
             } EndIf();
+            LoopEnd();
         } EndIf();
 
         U32 label1 = MarkJumpLocation();
@@ -212,11 +219,16 @@ void Jit::movsr(JitWidth valueWidth, U32 size, JitWidth regWidth) {
         mov(regWidth, delta, edi);
         subReg(regWidth, delta, esi);
         IfLessThan(regWidth, ComparisonType::Unsigned, delta, bytesPerIter); {
-            U32 label = MarkJumpLocation();
-            If(regWidth, delta); {
+            // See the backward case above. In particular, Saya performs a
+            // forward REP MOVSB with EDI == ESI + 4. Looping on the constant
+            // delta copied forever, underflowed ECX and eventually faulted.
+            U32 label = LoopBegin();
+            hintLikelyStringLoopContinue();
+            If(regWidth, ecx); {
                 copyOneForward();
                 Goto(label);
             } EndIf();
+            LoopEnd();
         } EndIf();
 
         U32 label1 = MarkJumpLocation();

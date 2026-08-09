@@ -19,6 +19,8 @@
 #ifndef __KTHREAD_H__
 #define __KTHREAD_H__
 
+#include "getrusagefairness.h"
+
 #define MAX_POLL_DATA 256
 
 #define TLS_ENTRIES 10
@@ -145,6 +147,38 @@ public:
 
     U64 kernelTime = 0;
     U32 inSysCall = 0;
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    GetrusageFairness getrusageFairness;
+    GetrusageFairness schedYieldFairness;
+#endif
+    // Cross-thread hang diagnostics read only these atomics, never the live
+    // CPU register file. The emulation thread refreshes them at each dispatch
+    // boundary, making snapshots safe even while that thread is host-blocked.
+    std::atomic<U32> diagnosticEip{0};
+    std::atomic<U32> diagnosticEsp{0};
+    std::atomic<U32> diagnosticEbp{0};
+    std::atomic<U64> diagnosticDispatchCount{0};
+    // Dispatch index of the host Vulkan function this thread is currently
+    // executing, biased by one so that zero means "not inside a Vulkan call".
+    // A host fault raised inside a Vulkan call does not crash cleanly:
+    // Boxedwine's guest SIGSEGV handler receives it, cannot map it to guest
+    // memory, and the thread wedges RUNNABLE with no further dispatches. The
+    // guest EIP then names only the caller, so record the callee too. An index
+    // is stored rather than a string because the watchdog reads this from
+    // another thread, and a shared name buffer would be a data race.
+    std::atomic<U32> diagnosticVulkanCall{0};
+    // Guest memory faults serviced for this thread. A fault that cannot be
+    // resolved is retried on the same instruction, so the thread stays
+    // RUNNABLE, executes no new dispatches, and never updates its EIP - the
+    // exact signature of a wedge. Only this counter separates that from a
+    // thread that is genuinely blocked, because both look identical otherwise.
+    std::atomic<U64> diagnosticFaultCount{0};
+    // Guest syscall this thread is currently servicing, biased by one so zero
+    // means "not in a syscall". Boxedwine runs syscalls on the emulation
+    // thread itself, so one that blocks leaves the thread RUNNABLE with no
+    // dispatch progress and no waiting condition - indistinguishable from a
+    // spin until the syscall is named.
+    std::atomic<U32> diagnosticSyscall{0};
     BOXEDWINE_CONDITION waitingForSignalToEndCond;
     BOXEDWINE_CONDITION sigWaitCond;
     U64 sigWaitMask = 0;
@@ -211,6 +245,7 @@ public:
 #endif
 
     U32 condStartWaitTime = 0;
+    static void logFutexSnapshot();
 private:
     bool isOnAlternateSignalStack(U32 stackAddress) const;
     void internalCleanup();

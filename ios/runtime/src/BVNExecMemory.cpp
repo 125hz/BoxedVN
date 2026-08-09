@@ -7,14 +7,19 @@
  *  the Free Software Foundation; either version 2 of the License, or
  *  (at your option) any later version.  See license.txt.
  *
- *  See BVNExecMemory.h for why this file exists.
+ *  See BVNExecMemory.h for the iOS 26/27 StikDebug and TXM contract.
  */
 
 #include "BVNExecMemory.h"
+#include "BVNRangeAllocator.h"
 
 #include <errno.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#include <mutex>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -24,34 +29,56 @@
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Reading what the kernel ACTUALLY did
-// ---------------------------------------------------------------------------
+struct DualMapping {
+    uint8_t* executable = nullptr;
+    uint8_t* writable = nullptr;
+    size_t length = 0;
+};
 
-// Every return code in this file has been observed to lie at least once:
-// mmap returns a valid pointer for a mapping it silently downgraded, and
-// mprotect returns 0 for a change it silently refused.  vm_region_64 is the
-// only source of truth here, and it reports the same numbers the crash
-// reporter prints, so its output can be compared against a .ips directly.
+// Preparing executable memory requires stopping at StikDebug's universal
+// breakpoint. Doing that for every 64 KiB Boxedwine code block makes Wine
+// startup spend nearly all its time stopped in debugserver (and fails once
+// StikDebug is background-suspended). Prepare one modest arena during the
+// explicit startup probe, then service live JIT allocations without another
+// external handshake.
+// Wine's debugger pushed the Song of Saya launch beyond the original 64 MiB
+// arena on-device.  Prepare one larger region up front: requesting another
+// StikDebug breakpoint while the guest is running is not safe.
+constexpr size_t kJitArenaSize = 128u * 1024u * 1024u;
+
+std::mutex gArenaMutex;
+DualMapping gArena;
+BVNRangeAllocator gArenaAllocator;
+size_t gAllocationCount = 0;
+bool gProbed = false;
+bool gExecutionConfirmed = false;
+char gReport[1600] = "not probed yet";
+
+size_t pageSize() { return static_cast<size_t>(getpagesize()); }
+
+void reportLine(const char* line) {
+    BVNLogWrite(BVNLogLevelInfo, "jit", line);
+    const size_t used = strlen(gReport);
+    if (used >= sizeof(gReport) - 1) {
+        return;
+    }
+    snprintf(gReport + used, sizeof(gReport) - used, "%s%s",
+             used > 0 ? "\n" : "", line);
+}
+
 bool queryProtection(void* address, vm_prot_t* current, vm_prot_t* maximum) {
     vm_address_t regionAddress = reinterpret_cast<vm_address_t>(address);
     vm_size_t regionSize = 0;
-    vm_region_basic_info_data_64_t info;
+    vm_region_basic_info_data_64_t info{};
     mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t objectName = MACH_PORT_NULL;
 
-    const kern_return_t result =
-        vm_region_64(mach_task_self(), &regionAddress, &regionSize,
-                     VM_REGION_BASIC_INFO_64,
-                     reinterpret_cast<vm_region_info_t>(&info), &infoCount,
-                     &objectName);
-    if (result != KERN_SUCCESS) {
-        return false;
-    }
-    // vm_region_64 returns the first region at OR AFTER the address it is
-    // given.  If it walked past our page, the answer describes something else
-    // entirely and must not be reported as ours.
-    if (regionAddress > reinterpret_cast<vm_address_t>(address)) {
+    const kern_return_t result = vm_region_64(
+        mach_task_self(), &regionAddress, &regionSize,
+        VM_REGION_BASIC_INFO_64,
+        reinterpret_cast<vm_region_info_t>(&info), &infoCount, &objectName);
+    if (result != KERN_SUCCESS ||
+        regionAddress > reinterpret_cast<vm_address_t>(address)) {
         return false;
     }
     *current = info.protection;
@@ -59,7 +86,6 @@ bool queryProtection(void* address, vm_prot_t* current, vm_prot_t* maximum) {
     return true;
 }
 
-// "rw-/rwx", matching how the crash reporter and vmmap present a region.
 void protectionText(void* address, char out[9]) {
     vm_prot_t current = 0;
     vm_prot_t maximum = 0;
@@ -76,439 +102,410 @@ void protectionText(void* address, char out[9]) {
              (maximum & VM_PROT_EXECUTE) ? 'x' : '-');
 }
 
-bool isExecutable(void* address) {
+#if defined(__aarch64__)
+bool hasProtection(void* address, vm_prot_t required,
+                   vm_prot_t forbidden) {
     vm_prot_t current = 0;
     vm_prot_t maximum = 0;
     return queryProtection(address, &current, &maximum) &&
-           (current & VM_PROT_EXECUTE) != 0;
+           (current & required) == required &&
+           (current & forbidden) == 0;
 }
 
-bool isWritable(void* address) {
+// StikDebug's universal JIT script treats brk #0xf00d as a syscall and x16=1
+// as "prepare this executable region". x0/x1 are already the first two C ABI
+// arguments, and the script returns the prepared address in x0.
+__attribute__((noinline, optnone, naked))
+void* stikDebugPrepareRegion(void* address, size_t length) {
+    __asm__ volatile(
+        "mov x16, #1\n"
+        "brk #0xf00d\n"
+        "ret\n");
+}
+
+// A reinstall or re-sign creates a new StikDebug target. CS_DEBUGGED can
+// still be present even when universal.js is no longer assigned to that new
+// target. In that state the deliberate brk above becomes an ordinary SIGTRAP
+// and iOS terminates the whole app before the six-second timeout can help.
+// Recover only while this thread is executing the one expected handshake;
+// an active universal.js consumes the Mach exception before POSIX signal
+// delivery, prepares the region and resumes normally.
+thread_local sigjmp_buf* gStikDebugTrapRecovery = nullptr;
+
+void stikDebugTrapHandler(int signalNumber) {
+    if (signalNumber == SIGTRAP && gStikDebugTrapRecovery != nullptr) {
+        siglongjmp(*gStikDebugTrapRecovery, 1);
+    }
+
+    // This handler is installed for only the synchronous handshake call. An
+    // unrelated trap must retain the platform's normal fatal behavior.
+    signal(signalNumber, SIG_DFL);
+    raise(signalNumber);
+}
+
+bool safelyPrepareWithStikDebug(void* address, size_t length,
+                               void** prepared, char* error,
+                               size_t errorSize) {
+    struct sigaction action{};
+    struct sigaction previous{};
+    action.sa_handler = stikDebugTrapHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    if (sigaction(SIGTRAP, &action, &previous) != 0) {
+        snprintf(error, errorSize,
+                 "Could not install the guarded StikDebug handshake: %s",
+                 strerror(errno));
+        return false;
+    }
+
+    sigjmp_buf recovery;
+    gStikDebugTrapRecovery = &recovery;
+    const int trapped = sigsetjmp(recovery, 1);
+    if (trapped == 0) {
+        *prepared = stikDebugPrepareRegion(address, length);
+    }
+    gStikDebugTrapRecovery = nullptr;
+
+    const int restoreResult = sigaction(SIGTRAP, &previous, nullptr);
+    if (trapped != 0) {
+        snprintf(error, errorSize,
+                 "StikDebug did not handle BoxedVN's universal JIT "
+                 "breakpoint. After reinstalling or re-signing BoxedVN, "
+                 "assign universal.js to the newly installed app, launch "
+                 "through StikDebug, and keep its script session running.");
+        return false;
+    }
+    if (restoreResult != 0) {
+        snprintf(error, errorSize,
+                 "Could not restore the SIGTRAP handler after the StikDebug "
+                 "handshake: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+#endif
+
+DualMapping allocatePrepared(size_t length, char* error, size_t errorSize) {
+    DualMapping mapping;
+
+#if !defined(__aarch64__)
+    snprintf(error, errorSize,
+             "StikDebug executable-memory preparation requires ARM64");
+    return mapping;
+#else
+    if (length == 0 || length % pageSize() != 0) {
+        snprintf(error, errorSize,
+                 "length %zu is not aligned to the %zu-byte iOS page size",
+                 length, pageSize());
+        return mapping;
+    }
+
+    void* rx = mmap(nullptr, length, PROT_READ | PROT_EXEC,
+                    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (rx == MAP_FAILED) {
+        snprintf(error, errorSize, "mmap(r-x) failed: %s", strerror(errno));
+        return mapping;
+    }
+
+    // On iOS 26/27 this is the operation that makes the page executable.
+    // CS_DEBUGGED alone is insufficient. StikDebug must be running its
+    // universal script and will write each 16 KiB page through debugserver.
+    void* prepared = nullptr;
+    if (!safelyPrepareWithStikDebug(rx, length, &prepared, error,
+                                   errorSize)) {
+        munmap(rx, length);
+        return mapping;
+    }
+    if (prepared != rx) {
+        snprintf(error, errorSize,
+                 "StikDebug did not prepare the requested region (returned "
+                 "%p for %p). Assign and run StikDebug's universal JIT "
+                 "script for BoxedVN.", prepared, rx);
+        munmap(rx, length);
+        return mapping;
+    }
+
+    vm_address_t rwAddress = 0;
     vm_prot_t current = 0;
     vm_prot_t maximum = 0;
-    return queryProtection(address, &current, &maximum) &&
-           (current & VM_PROT_WRITE) != 0;
+    const kern_return_t remapResult = vm_remap(
+        mach_task_self(), &rwAddress, length, 0, VM_FLAGS_ANYWHERE,
+        mach_task_self(), reinterpret_cast<vm_address_t>(rx), FALSE,
+        &current, &maximum, VM_INHERIT_DEFAULT);
+    if (remapResult != KERN_SUCCESS) {
+        snprintf(error, errorSize, "vm_remap failed: kern_return_t %d",
+                 remapResult);
+        munmap(rx, length);
+        return mapping;
+    }
+
+    void* rw = reinterpret_cast<void*>(rwAddress);
+    if (mprotect(rw, length, PROT_READ | PROT_WRITE) != 0) {
+        snprintf(error, errorSize, "mprotect(rw alias) failed: %s",
+                 strerror(errno));
+        vm_deallocate(mach_task_self(), rwAddress, length);
+        munmap(rx, length);
+        return mapping;
+    }
+
+    if (!hasProtection(rx, VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_WRITE) ||
+        !hasProtection(rw, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_EXECUTE)) {
+        char rxProtection[9];
+        char rwProtection[9];
+        protectionText(rx, rxProtection);
+        protectionText(rw, rwProtection);
+        snprintf(error, errorSize,
+                 "dual mapping has unsafe protections (rx %s, rw %s)",
+                 rxProtection, rwProtection);
+        vm_deallocate(mach_task_self(), rwAddress, length);
+        munmap(rx, length);
+        return mapping;
+    }
+
+    mapping.executable = static_cast<uint8_t*>(rx);
+    mapping.writable = static_cast<uint8_t*>(rw);
+    mapping.length = length;
+    return mapping;
+#endif
 }
 
-size_t pageSize() { return static_cast<size_t>(getpagesize()); }
+void releaseMapping(const DualMapping& mapping) {
+    if (mapping.writable) {
+        vm_deallocate(
+            mach_task_self(),
+            reinterpret_cast<vm_address_t>(mapping.writable),
+            mapping.length);
+    }
+    if (mapping.executable) {
+        munmap(mapping.executable, mapping.length);
+    }
+}
 
-// ---------------------------------------------------------------------------
-// The strategies
-// ---------------------------------------------------------------------------
+bool containsRange(const DualMapping& mapping, void* address, size_t length) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mapping.executable);
+    if (start < base || length > mapping.length) {
+        return false;
+    }
+    const uintptr_t offset = start - base;
+    return offset <= mapping.length - length;
+}
 
-struct StrategyResult {
-    void* address;   // NULL if the allocation itself failed
-    char note[96];   // what each call returned, for the report
+bool startsInArena(void* address) {
+    if (!gArena.executable || !address) {
+        return false;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(gArena.executable);
+    return start >= base && start - base < gArena.length;
+}
+
+constexpr uint32_t kProbeExpectedValue = 0x4258;
+
+constexpr uint32_t encodeMovzX(uint8_t destination, uint16_t immediate) {
+    return 0xD2800000u | (static_cast<uint32_t>(immediate) << 5) |
+           destination;
+}
+
+constexpr uint32_t kProbeCode[] = {
+    encodeMovzX(8, kProbeExpectedValue),  // movz x8, #0x4258
+    0xAA0803E0,  // mov x0, x8
+    0xD65F03C0,  // ret
 };
 
-// Allocates one candidate region using `strategy`, leaving it in exactly the
-// state the live allocator would leave it in.  Deliberately NOT parameterised
-// by "should I flip" - each strategy has one fixed meaning, so the probe and
-// the live path cannot drift apart.
-StrategyResult allocate(BVNExecMemStrategy strategy, size_t length) {
-    StrategyResult result;
-    result.address = nullptr;
-    result.note[0] = '\0';
-
-    const int rwx = PROT_READ | PROT_WRITE | PROT_EXEC;
-    const int commonFlags = MAP_PRIVATE | MAP_ANONYMOUS;
-
-    switch (strategy) {
-        case BVNExecMemStrategyMmapRWX:
-        case BVNExecMemStrategyMprotectRWX:
-        case BVNExecMemStrategyMprotectFlip: {
-            // PROT_EXEC is requested even where iOS will not honour it: the
-            // mmap prot argument fixes the region's MAXIMUM protection, and
-            // mprotect can never raise a region above its maximum.  Leaving it
-            // out is what produced "actual r-- (max rw-)" on device.
-            void* page = mmap(nullptr, length, rwx, commonFlags, -1, 0);
-            if (page == MAP_FAILED) {
-                snprintf(result.note, sizeof(result.note), "mmap failed: %s",
-                         strerror(errno));
-                return result;
-            }
-            result.address = page;
-            if (strategy == BVNExecMemStrategyMmapRWX) {
-                snprintf(result.note, sizeof(result.note), "mmap only");
-            } else {
-                const int wanted = (strategy == BVNExecMemStrategyMprotectRWX)
-                                       ? rwx
-                                       : (PROT_READ | PROT_EXEC);
-                const bool ok = mprotect(page, length, wanted) == 0;
-                snprintf(result.note, sizeof(result.note), "mprotect(%s) %s",
-                         (wanted == rwx) ? "rwx" : "r-x",
-                         ok ? "ok" : strerror(errno));
-            }
-            return result;
-        }
-
-        case BVNExecMemStrategyMapJitRWX:
-        case BVNExecMemStrategyMapJitFlip: {
-            // MAP_JIT normally requires the "dynamic-codesigning" entitlement,
-            // which is browser-engine-only. It is tried anyway because the
-            // rules for a CS_DEBUGGED process are not the rules for a normal
-            // one, and an EPERM here is a one-line answer rather than a guess.
-            void* page = mmap(nullptr, length, rwx, commonFlags | MAP_JIT, -1, 0);
-            if (page == MAP_FAILED) {
-                snprintf(result.note, sizeof(result.note),
-                         "mmap(MAP_JIT) failed: %s", strerror(errno));
-                return result;
-            }
-            result.address = page;
-            if (strategy == BVNExecMemStrategyMapJitRWX) {
-                snprintf(result.note, sizeof(result.note), "mmap(MAP_JIT) only");
-            } else {
-                const bool ok =
-                    mprotect(page, length, PROT_READ | PROT_EXEC) == 0;
-                snprintf(result.note, sizeof(result.note),
-                         "mmap(MAP_JIT)+mprotect(r-x) %s",
-                         ok ? "ok" : strerror(errno));
-            }
-            return result;
-        }
-
-        case BVNExecMemStrategyMachFlip: {
-            // The Mach interface is not just a different spelling of mmap: it
-            // can set a region's MAXIMUM protection explicitly, which the BSD
-            // layer cannot do after the fact.  If iOS is capping the maximum,
-            // this is the call that would get past it.
-            vm_address_t address = 0;
-            kern_return_t kr = vm_allocate(mach_task_self(), &address, length,
-                                           VM_FLAGS_ANYWHERE);
-            if (kr != KERN_SUCCESS) {
-                snprintf(result.note, sizeof(result.note),
-                         "vm_allocate failed (kr %d)", kr);
-                return result;
-            }
-            result.address = reinterpret_cast<void*>(address);
-            const kern_return_t krMax =
-                vm_protect(mach_task_self(), address, length, TRUE,
-                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            const kern_return_t krCur =
-                vm_protect(mach_task_self(), address, length, FALSE,
-                           VM_PROT_READ | VM_PROT_EXECUTE);
-            snprintf(result.note, sizeof(result.note),
-                     "vm_protect max kr %d, cur kr %d", krMax, krCur);
-            return result;
-        }
-
-        case BVNExecMemStrategyNone:
-            break;
-    }
-
-    snprintf(result.note, sizeof(result.note), "no such strategy");
-    return result;
-}
-
-void release(BVNExecMemStrategy strategy, void* address, size_t length) {
-    if (address == nullptr) {
-        return;
-    }
-    if (strategy == BVNExecMemStrategyMachFlip) {
-        vm_deallocate(mach_task_self(),
-                      reinterpret_cast<vm_address_t>(address), length);
-    } else {
-        munmap(address, length);
-    }
-}
-
-// Whether a strategy leaves pages non-writable, so writes have to flip them.
-bool strategyNeedsFlip(BVNExecMemStrategy strategy) {
-    switch (strategy) {
-        case BVNExecMemStrategyMapJitFlip:
-        case BVNExecMemStrategyMprotectFlip:
-        case BVNExecMemStrategyMachFlip:
-            return true;
-        default:
-            return false;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Probe state
-// ---------------------------------------------------------------------------
-
-// Tried in this order deliberately: every strategy that leaves pages both
-// writable and executable comes before every strategy that has to flip
-// protection around each write.  Flipping works, but it is process-wide where
-// macOS's equivalent is per-thread, so it opens a window in which one thread
-// can execute a page another thread just made writable.  Avoiding that
-// entirely is worth more than any of these being marginally faster.
-const BVNExecMemStrategy kStrategyOrder[] = {
-    BVNExecMemStrategyMmapRWX,
-    BVNExecMemStrategyMprotectRWX,
-    BVNExecMemStrategyMapJitRWX,
-    BVNExecMemStrategyMapJitFlip,
-    BVNExecMemStrategyMprotectFlip,
-    BVNExecMemStrategyMachFlip,
-};
-const int kStrategyCount =
-    static_cast<int>(sizeof(kStrategyOrder) / sizeof(kStrategyOrder[0]));
-
-//   d2808b08   mov  x8, #0x4258
-//   aa0803e0   mov  x0, x8
-//   d65f03c0   ret
-//
-// Written as bytes so the encoding is auditable here and no assembler is
-// needed at build time.  0x4258 is arbitrary but distinctive: a page that
-// executes and returns something else means the instruction cache was not
-// flushed properly, which is a silent-wrong-answer bug rather than a crash.
-const uint32_t kProbeCode[] = {
-    0xD2808B08,
-    0xAA0803E0,
-    0xD65F03C0,
-};
-
-BVNExecMemStrategy gStrategy = BVNExecMemStrategyNone;
-bool gProbed = false;
-bool gProbedWithExecute = false;
-bool gExecutionConfirmed = false;
-char gReport[1600] = "not probed yet";
-
-void reportLine(const char* line) {
-    // Logged as it is produced, not at the end: if the execution step kills
-    // the process, the lines already written are the entire diagnosis.
-    BVNLogWrite(BVNLogLevelInfo, "jit", line);
-    const size_t used = strlen(gReport);
-    snprintf(gReport + used, sizeof(gReport) - used, "%s%s",
-             used > 0 ? "\n" : "", line);
-}
-
-void writeProbeCode(void* page, size_t length) {
-    const bool flip = !isWritable(page);
-    if (flip) {
-        BVNExecMemSetWritable(page, length, true);
-    }
-    memcpy(page, kProbeCode, sizeof(kProbeCode));
-    if (flip) {
-        BVNExecMemSetWritable(page, length, false);
-    }
-}
+static_assert(kProbeCode[0] == 0xD2884B08,
+              "ARM64 probe MOVZ encoding must return 0x4258");
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// Public interface
-// ---------------------------------------------------------------------------
-
 extern "C" const char* BVNExecMemStrategyName(BVNExecMemStrategy strategy) {
     switch (strategy) {
-        case BVNExecMemStrategyMmapRWX:      return "mmap(rwx)";
-        case BVNExecMemStrategyMprotectRWX:  return "mmap+mprotect(rwx)";
-        case BVNExecMemStrategyMapJitRWX:    return "mmap(MAP_JIT,rwx)";
-        case BVNExecMemStrategyMapJitFlip:   return "mmap(MAP_JIT)+mprotect(r-x)";
-        case BVNExecMemStrategyMprotectFlip: return "mmap+mprotect(r-x)";
-        case BVNExecMemStrategyMachFlip:     return "vm_allocate+vm_protect(r-x)";
-        case BVNExecMemStrategyNone:         return "none";
+        case BVNExecMemStrategyStikDebugDualMap:
+            return "StikDebug universal + dual-map RX/RW";
+        case BVNExecMemStrategyMmapRWX: return "mmap(rwx) [retired unsafe]";
+        case BVNExecMemStrategyMprotectRWX:
+            return "mmap+mprotect(rwx) [retired unsafe]";
+        case BVNExecMemStrategyMapJitRWX:
+            return "mmap(MAP_JIT,rwx) [retired unsupported]";
+        case BVNExecMemStrategyMapJitFlip:
+            return "mmap(MAP_JIT)+mprotect(r-x) [retired unsupported]";
+        case BVNExecMemStrategyMprotectFlip:
+            return "mmap+mprotect(r-x) [retired unsafe]";
+        case BVNExecMemStrategyMachFlip:
+            return "vm_allocate+vm_protect(r-x) [retired unsafe]";
+        case BVNExecMemStrategyNone: return "none";
     }
     return "unknown";
 }
 
 extern "C" const char* BVNExecMemReport(void) { return gReport; }
 
-extern "C" bool BVNExecMemExecutionConfirmed(void) { return gExecutionConfirmed; }
-
-extern "C" bool BVNExecMemNeedsWriteFlip(void) {
-    return strategyNeedsFlip(gStrategy);
+extern "C" bool BVNExecMemExecutionConfirmed(void) {
+    return gExecutionConfirmed;
 }
 
+extern "C" bool BVNExecMemNeedsWriteFlip(void) { return false; }
+
 extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
-    // A probe that already ran WITH execution is final.  A probe that ran
-    // without it still has something left to prove, so a later caller willing
-    // to take the risk gets to run the execution step.
-    if (gProbed && (gProbedWithExecute || !allowExecute)) {
-        return gStrategy;
+    if (gProbed) {
+        return gExecutionConfirmed ? BVNExecMemStrategyStikDebugDualMap
+                                   : BVNExecMemStrategyNone;
+    }
+    if (!allowExecute) {
+        return BVNExecMemStrategyNone;
     }
 
-    const size_t length = pageSize();
+    gReport[0] = '\0';
+    char error[512] = {};
+    char line[256];
+    snprintf(line, sizeof(line),
+             "Requesting one %zu MiB executable arena from StikDebug; live "
+             "Wine JIT allocations will be suballocated without more "
+             "debugger breakpoints.",
+             kJitArenaSize / (1024u * 1024u));
+    reportLine(line);
 
-    if (!gProbed) {
-        gReport[0] = '\0';
-        gStrategy = BVNExecMemStrategyNone;
-
-        void* chosenPage = nullptr;
-        for (int i = 0; i < kStrategyCount; ++i) {
-            const BVNExecMemStrategy strategy = kStrategyOrder[i];
-            StrategyResult attempt = allocate(strategy, length);
-
-            char line[220];
-            if (attempt.address == nullptr) {
-                snprintf(line, sizeof(line), "%d %s: %s", i + 1,
-                         BVNExecMemStrategyName(strategy), attempt.note);
-                reportLine(line);
-                continue;
-            }
-
-            char protection[9];
-            protectionText(attempt.address, protection);
-            const bool executable = isExecutable(attempt.address);
-            snprintf(line, sizeof(line), "%d %s: %s -> %s%s", i + 1,
-                     BVNExecMemStrategyName(strategy), attempt.note,
-                     protection, executable ? "  EXECUTABLE" : "");
-            reportLine(line);
-
-            // Keep the first winner mapped so the execution step below can use
-            // the very page that was just measured, rather than a fresh one
-            // that might differ.
-            if (executable && gStrategy == BVNExecMemStrategyNone) {
-                gStrategy = strategy;
-                chosenPage = attempt.address;
-            } else {
-                release(strategy, attempt.address, length);
-            }
-        }
-
+    DualMapping mapping =
+        allocatePrepared(kJitArenaSize, error, sizeof(error));
+    if (!mapping.executable) {
+        reportLine(error);
         gProbed = true;
-
-        if (gStrategy == BVNExecMemStrategyNone) {
-            reportLine("No strategy produced an executable page. The JIT "
-                       "cannot run on this device in its current state.");
-            return gStrategy;
-        }
-
-        char line[220];
-        snprintf(line, sizeof(line),
-                 "Selected %s; writes %s a protection flip.",
-                 BVNExecMemStrategyName(gStrategy),
-                 strategyNeedsFlip(gStrategy) ? "need" : "do not need");
-        reportLine(line);
-
-        if (!allowExecute) {
-            release(gStrategy, chosenPage, length);
-            reportLine("Execution not attempted here (the caller asked for the "
-                       "safe path); the page is executable per the kernel but "
-                       "that is not yet proof.");
-            return gStrategy;
-        }
-
-        // Fall through with the winning page still mapped.
-        writeProbeCode(chosenPage, length);
-        sys_icache_invalidate(chosenPage, sizeof(kProbeCode));
-
-        // THE UNSAFE STEP, and the reason every line above is logged before
-        // reaching it: if this call faults, it faults synchronously with
-        // nothing to catch it, and the log is all that survives.
-        reportLine("About to execute the probe page.");
-        gProbedWithExecute = true;
-
-        using ProbeFunction = uint32_t (*)(void);
-        ProbeFunction probe = reinterpret_cast<ProbeFunction>(chosenPage);
-        const uint32_t value = probe();
-
-        release(gStrategy, chosenPage, length);
-
-        if (value == 0x4258) {
-            gExecutionConfirmed = true;
-            reportLine("Executed successfully and returned the expected value.");
-        } else {
-            gStrategy = BVNExecMemStrategyNone;
-            snprintf(line, sizeof(line),
-                     "Executed but returned 0x%08X instead of 0x00004258 - the "
-                     "mapping or the cache flush is not behaving, so the JIT "
-                     "would produce wrong results.", value);
-            reportLine(line);
-        }
-        return gStrategy;
+        return BVNExecMemStrategyNone;
     }
 
-    // Already probed without execution, and a caller now wants the proof.
-    gProbedWithExecute = true;
-    if (gStrategy == BVNExecMemStrategyNone) {
-        return gStrategy;
-    }
+    char rxProtection[9];
+    char rwProtection[9];
+    protectionText(mapping.executable, rxProtection);
+    protectionText(mapping.writable, rwProtection);
+    snprintf(line, sizeof(line),
+             "StikDebug prepared the %zu MiB arena; dual mapping is rx %s, "
+             "rw %s.",
+             kJitArenaSize / (1024u * 1024u), rxProtection, rwProtection);
+    reportLine(line);
 
-    void* page = BVNExecMemAlloc(length);
-    if (page == nullptr) {
-        gStrategy = BVNExecMemStrategyNone;
-        reportLine("The selected strategy stopped working on a second "
-                   "allocation.");
-        return gStrategy;
-    }
-    if (!isExecutable(page)) {
-        BVNExecMemFree(page, length);
-        gStrategy = BVNExecMemStrategyNone;
-        reportLine("A second allocation came back non-executable even though "
-                   "the first did not.");
-        return gStrategy;
-    }
+    memcpy(mapping.writable, kProbeCode, sizeof(kProbeCode));
+    sys_icache_invalidate(mapping.executable, sizeof(kProbeCode));
+    reportLine("About to execute through the r-x mapping after writing only "
+               "through its r-w alias.");
 
-    writeProbeCode(page, length);
-    sys_icache_invalidate(page, sizeof(kProbeCode));
-    reportLine("About to execute the probe page.");
-
+#if defined(__aarch64__)
     using ProbeFunction = uint32_t (*)(void);
-    ProbeFunction probe = reinterpret_cast<ProbeFunction>(page);
-    const uint32_t value = probe();
-    BVNExecMemFree(page, length);
+    const uint32_t value =
+        reinterpret_cast<ProbeFunction>(mapping.executable)();
+#else
+    const uint32_t value = 0;
+#endif
+    gProbed = true;
 
-    if (value == 0x4258) {
-        gExecutionConfirmed = true;
-        reportLine("Executed successfully and returned the expected value.");
-    } else {
-        gStrategy = BVNExecMemStrategyNone;
-        char line[220];
+    if (value != kProbeExpectedValue) {
         snprintf(line, sizeof(line),
-                 "Executed but returned 0x%08X instead of 0x00004258.", value);
+                 "Probe returned 0x%08X instead of 0x%08X.", value,
+                 kProbeExpectedValue);
         reportLine(line);
+        releaseMapping(mapping);
+        return BVNExecMemStrategyNone;
     }
-    return gStrategy;
+
+    {
+        std::lock_guard<std::mutex> lock(gArenaMutex);
+        gArena = mapping;
+        gArenaAllocator.reset(mapping.length);
+        gAllocationCount = 0;
+    }
+    gExecutionConfirmed = true;
+    reportLine("Probe executed successfully. The prepared arena is retained "
+               "for Wine and no further StikDebug stops are required.");
+    return BVNExecMemStrategyStikDebugDualMap;
 }
 
 extern "C" void* BVNExecMemAlloc(size_t length) {
-    if (!gProbed) {
-        // Probing without execution: an allocation must never be the thing
-        // that risks the process.
-        BVNExecMemProbe(false);
-    }
-    if (gStrategy == BVNExecMemStrategyNone) {
+    if (!gExecutionConfirmed) {
         return nullptr;
     }
 
-    StrategyResult result = allocate(gStrategy, length);
-    if (result.address == nullptr) {
+    if (length == 0 || length % pageSize() != 0) {
+        char error[256];
+        snprintf(error, sizeof(error),
+                 "JIT arena allocation length %zu is not aligned to the "
+                 "%zu-byte iOS page size",
+                 length, pageSize());
+        BVNLogWrite(BVNLogLevelError, "jit", error);
         return nullptr;
     }
-    // The strategy was chosen from a one-page probe.  Larger allocations go
-    // through the identical calls, but "identical calls" has not been a
-    // reliable predictor of "identical outcome" anywhere else in this file.
-    if (!isExecutable(result.address)) {
-        char line[220];
-        char protection[9];
-        protectionText(result.address, protection);
+
+    std::lock_guard<std::mutex> lock(gArenaMutex);
+    size_t offset = 0;
+    if (!gArena.executable ||
+        !gArenaAllocator.allocate(length, pageSize(), &offset)) {
+        char error[320];
+        snprintf(error, sizeof(error),
+                 "JIT arena exhausted: requested %zu bytes with %zu of %zu "
+                 "bytes free. Refusing to issue another debugger breakpoint "
+                 "during guest execution.",
+                 length, gArenaAllocator.available(),
+                 gArenaAllocator.capacity());
+        BVNLogWrite(BVNLogLevelError, "jit", error);
+        return nullptr;
+    }
+
+    gAllocationCount++;
+    if (gAllocationCount <= 8 || gAllocationCount % 64 == 0) {
+        char line[256];
         snprintf(line, sizeof(line),
-                 "%s produced a non-executable region (%s) for %zu bytes even "
-                 "though it worked for one page.",
-                 BVNExecMemStrategyName(gStrategy), protection, length);
-        BVNLogWrite(BVNLogLevelError, "jit", line);
-        release(gStrategy, result.address, length);
+                 "JIT arena allocation #%zu: %zu bytes, %zu bytes remain; "
+                 "no StikDebug breakpoint issued.",
+                 gAllocationCount, length, gArenaAllocator.available());
+        BVNLogWrite(BVNLogLevelInfo, "jit", line);
+        BVNGuestLoadingUpdateJITProgress(gAllocationCount);
+    }
+    return gArena.executable + offset;
+}
+
+extern "C" void* BVNExecMemWritableAddress(void* address, size_t length) {
+    std::lock_guard<std::mutex> lock(gArenaMutex);
+    if (!containsRange(gArena, address, length)) {
         return nullptr;
     }
-    return result.address;
+    const size_t offset = reinterpret_cast<uintptr_t>(address) -
+                          reinterpret_cast<uintptr_t>(gArena.executable);
+    if (!gArenaAllocator.contains(offset, length)) {
+        return nullptr;
+    }
+    return gArena.writable + offset;
+}
+
+extern "C" bool BVNExecMemReleaseIfOwned(void* address, size_t length) {
+    std::lock_guard<std::mutex> lock(gArenaMutex);
+    if (!startsInArena(address)) {
+        return false;
+    }
+
+    const size_t offset = reinterpret_cast<uintptr_t>(address) -
+                          reinterpret_cast<uintptr_t>(gArena.executable);
+    if (!gArenaAllocator.release(offset, length)) {
+        // The pointer still belongs to the arena. Report the caller bug but
+        // claim ownership so Platform::releaseNativeMemory does not munmap a
+        // slice out of the shared executable mapping.
+        char error[256];
+        snprintf(error, sizeof(error),
+                 "Invalid JIT arena release at offset %zu with length %zu; "
+                 "the shared arena was left mapped.",
+                 offset, length);
+        BVNLogWrite(BVNLogLevelError, "jit", error);
+    }
+    return true;
 }
 
 extern "C" void BVNExecMemFree(void* address, size_t length) {
-    release(gStrategy, address, length);
+    if (!BVNExecMemReleaseIfOwned(address, length) && address) {
+        BVNLogWrite(BVNLogLevelWarning, "jit",
+                    "BVNExecMemFree received an unknown executable mapping");
+    }
 }
 
 extern "C" void BVNExecMemSetWritable(void* address, size_t length,
                                       bool writable) {
-    if (!strategyNeedsFlip(gStrategy)) {
-        return;
-    }
-
-    const uintptr_t mask = static_cast<uintptr_t>(pageSize()) - 1;
-    const uintptr_t start = reinterpret_cast<uintptr_t>(address) & ~mask;
-    const uintptr_t end =
-        (reinterpret_cast<uintptr_t>(address) + length + mask) & ~mask;
-
-    if (gStrategy == BVNExecMemStrategyMachFlip) {
-        vm_protect(mach_task_self(), static_cast<vm_address_t>(start),
-                   end - start, FALSE,
-                   writable ? (VM_PROT_READ | VM_PROT_WRITE)
-                            : (VM_PROT_READ | VM_PROT_EXECUTE));
-        return;
-    }
-
-    mprotect(reinterpret_cast<void*>(start), end - start,
-             writable ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC));
+    (void)address;
+    (void)length;
+    (void)writable;
 }

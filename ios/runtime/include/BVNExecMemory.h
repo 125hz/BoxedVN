@@ -8,8 +8,7 @@
  *  (at your option) any later version.  See license.txt.
  *
  *  ---------------------------------------------------------------------
- *  Executable memory for the JIT, on a platform that will not say how to
- *  get it.
+ *  Executable memory for the JIT on iOS 26 and newer.
  *
  *  Three separate attempts at this have now failed on device, each for a
  *  different reason, and each failure was only discoverable by shipping a
@@ -23,11 +22,13 @@
  *       *maximum* protection at rw-, after which no mprotect can ever add
  *       execute.
  *
- *  Guessing a fourth time is not a strategy.  This module instead probes
- *  several allocation strategies in one pass, records what the kernel
- *  actually did for each - read back with vm_region_64, not assumed from
- *  return codes, all of which have lied at least once - and then uses
- *  whichever one genuinely produced an executable page.
+ *  The missing step was outside the process.  On iOS 26/27, CS_DEBUGGED is
+ *  necessary but does not make a page executable by itself.  The app must
+ *  issue StikDebug's universal JIT-region request (x16=1, brk #0xf00d), and
+ *  StikDebug/debugserver must prepare every 16 KiB page.  Code is then
+ *  written through a separate rw- alias of the same physical pages while the
+ *  address returned to Boxedwine remains r-x.  This is the same TXM-aware
+ *  design used by current iOS emulator ports.
  *
  *  Both the diagnostic (BVNJITProbeExecute) and the live allocator
  *  (Platform::alloc64kBlock on iOS) go through here, so the thing that gets
@@ -51,60 +52,62 @@ extern "C" {
 typedef enum {
     /// Nothing worked; the JIT cannot run.
     BVNExecMemStrategyNone = 0,
-    /// mmap(rwx) came back executable as asked.  No W^X dance needed.
+    /// Retired unsafe strategy value retained for old logs.
     BVNExecMemStrategyMmapRWX = 1,
-    /// mmap(rwx) then mprotect(rwx); the page stays writable AND executable.
+    /// Retired unsafe strategy value retained for old logs.
     BVNExecMemStrategyMprotectRWX = 2,
-    /// mmap(rwx, MAP_JIT) came back executable.  No W^X dance needed.
+    /// Retired unsupported strategy value retained for old logs.
     BVNExecMemStrategyMapJitRWX = 3,
-    /// mmap(rwx, MAP_JIT) then mprotect(r-x); writes need a flip to rw-.
+    /// Retired unsupported strategy value retained for old logs.
     BVNExecMemStrategyMapJitFlip = 4,
-    /// mmap(rwx) then mprotect(r-x); writes need a flip to rw-.
+    /// Retired unsafe strategy value retained for old logs.
     BVNExecMemStrategyMprotectFlip = 5,
-    /// vm_allocate + vm_protect(r-x); writes need a flip to rw-.
+    /// vm_allocate + vm_protect(r-x); retained for log compatibility only.
     BVNExecMemStrategyMachFlip = 6,
+    /// StikDebug prepares an r-x mapping; BoxedVN writes through an rw- alias.
+    BVNExecMemStrategyStikDebugDualMap = 7,
 } BVNExecMemStrategy;
 
-/// Runs the strategy matrix once and caches the result; later calls are free.
+/// Runs the StikDebug/TXM handshake once and caches the result; later calls
+/// are free.
 ///
 /// `allowExecute` controls the one step that cannot be made safe: actually
-/// calling into a page that the kernel *claims* is executable.  Every
-/// protection check happens either way.  Pass false from anywhere that must
-/// not risk the process (app launch, a status refresh); pass true only where
-/// a caller has accepted that risk on purpose - see BVNRuntime.h.
+/// calling into the newly prepared arena. Pass false from anywhere that must not
+/// issue StikDebug's breakpoint request (app launch, a status refresh); pass
+/// true only from the deliberate guest-launch path - see BVNRuntime.h.
 ///
 /// Returns the strategy in use, or BVNExecMemStrategyNone.
 BVNExecMemStrategy BVNExecMemProbe(bool allowExecute);
 
-/// The result of the probe, one line per strategy, in the form
-/// "name: cur/max -> action -> cur/max EXECUTABLE".  Written to the session
-/// log as it is produced, so it survives even if a later step kills the
-/// process.  Never NULL; reads "not probed yet" before the first probe.
+/// A detailed result of the handshake, dual mapping, write and execution
+/// test. Written to the session log as it is produced. Never NULL.
 const char* BVNExecMemReport(void);
 
-/// True once a page has been mapped, written, made executable, called, and
-/// seen to return the expected value.  Anything less than that is not proof.
+/// True once the arena has been mapped, written, made executable, called, and
+/// seen to return the expected value. Anything less than that is not proof.
 bool BVNExecMemExecutionConfirmed(void);
 
-/// Allocates `length` bytes (must be page-aligned) of memory the JIT can
-/// execute from, using the strategy the probe selected.  Returns NULL if no
-/// strategy works or the allocation fails; the caller decides how loudly to
-/// fail.  Probes first if that has not happened yet, without executing.
+/// Suballocates `length` bytes (must be page-aligned) from the executable
+/// arena prepared and retained by the probe. No debugger breakpoint is issued
+/// here. Returns NULL if the probe failed or the bounded arena is exhausted.
 void* BVNExecMemAlloc(size_t length);
 
 void BVNExecMemFree(void* address, size_t length);
 
-/// Makes a range temporarily writable, then executable again.
-///
-/// A no-op for strategies whose pages are writable and executable at the same
-/// time.  Where it is not a no-op, note that this changes protection for the
-/// whole process, unlike macOS's per-thread pthread_jit_write_protect_np: a
-/// thread executing from these pages while another thread writes to them can
-/// fault.  See docs/KNOWN_LIMITATIONS_IOS.md.
+/// Returns the writable alias for an executable range.  `address` remains
+/// the r-x pointer used for calls and instruction-cache invalidation; all
+/// generated-code writes must target the pointer returned here.
+void* BVNExecMemWritableAddress(void* address, size_t length);
+
+/// Returns an allocation to the retained arena when `address` belongs to this
+/// allocator. The arena's dual mapping remains alive for the process.
+bool BVNExecMemReleaseIfOwned(void* address, size_t length);
+
+/// Legacy compatibility entry point. The dual-mapping implementation never
+/// changes the executable mapping's protection, so this is now a no-op.
 void BVNExecMemSetWritable(void* address, size_t length, bool writable);
 
-/// Whether BVNExecMemSetWritable does anything, i.e. whether the process-wide
-/// W^X window above is a live concern for this device.
+/// Always false for the dual-mapping implementation.
 bool BVNExecMemNeedsWriteFlip(void);
 
 /// Human-readable name of a strategy, for logs and the UI.

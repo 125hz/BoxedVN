@@ -9,9 +9,12 @@ endif()
 
 add_library(boxedvn_runtime STATIC
     src/BVNRuntime.mm
+    src/BVNLaunchArguments.cpp
     src/BVNLog.mm
     src/BVNJIT.mm
+    src/BVNMemory.mm
     src/BVNExecMemory.cpp
+    src/BVNRangeAllocator.cpp
     src/BVNPaths.mm
     src/BVNImport.mm
     src/BVNMacPlatformShim.mm
@@ -65,7 +68,9 @@ find_library(COREMOTION_FRAMEWORK CoreMotion REQUIRED)
 find_library(COREHAPTICS_FRAMEWORK CoreHaptics REQUIRED)
 find_library(OPENGLES_FRAMEWORK OpenGLES REQUIRED)
 find_library(IMAGEIO_FRAMEWORK ImageIO REQUIRED)
+find_library(IOSURFACE_FRAMEWORK IOSurface REQUIRED)
 find_library(UNIFORMTYPE_FRAMEWORK UniformTypeIdentifiers REQUIRED)
+find_library(SECURITY_FRAMEWORK Security REQUIRED)
 
 target_link_libraries(boxedvn_runtime PUBLIC
     ${UIKIT_FRAMEWORK}
@@ -78,7 +83,9 @@ target_link_libraries(boxedvn_runtime PUBLIC
     ${COREHAPTICS_FRAMEWORK}
     ${OPENGLES_FRAMEWORK}
     ${IMAGEIO_FRAMEWORK}
+    ${IOSURFACE_FRAMEWORK}
     ${UNIFORMTYPE_FRAMEWORK}
+    ${SECURITY_FRAMEWORK}
 )
 
 target_compile_options(boxedvn_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -107,6 +114,7 @@ add_custom_command(
             $<TARGET_FILE:boxedwine_asmjit>
             $<TARGET_FILE:boxedwine_pugixml>
             "${BOXEDVN_SDL2_LIBRARY}"
+            "${BOXEDVN_MOLTENVK_LIBRARY}"
     DEPENDS boxedvn_runtime boxedwine_core boxedvn_support
             boxedwine_zlib boxedwine_softfloat boxedwine_asmjit
             boxedwine_pugixml

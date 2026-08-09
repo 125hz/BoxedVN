@@ -54,10 +54,23 @@ U32 sdlDispatch(std::function<U32()> p) {
     }
     SdlCallback* callback = allocSdlCallback();
     callback->pfn = p;
+    callback->completed = false;
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(callback->cond);
-        SDL_PushEvent(&callback->sdlEvent);
-        BOXEDWINE_CONDITION_WAIT(callback->cond);
+        if (SDL_PushEvent(&callback->sdlEvent) != 1) {
+            klog_fmt("SDL_PushEvent failed for a main-thread callback: %s",
+                     SDL_GetError());
+            callback->pfn = nullptr;
+            freeSdlCallback(callback);
+            return 0;
+        }
+        // std::condition_variable is allowed to wake spuriously. Without a
+        // predicate, the callback was cleared and recycled while its SDL
+        // event was still queued; processEvents then invoked an empty
+        // std::function and aborted. Wait until this exact event completes.
+        while (!callback->completed) {
+            BOXEDWINE_CONDITION_WAIT(callback->cond);
+        }
     }
     U32 result = callback->result;
     callback->pfn = nullptr;

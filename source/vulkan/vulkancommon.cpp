@@ -27,6 +27,28 @@
 
 static PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr = nullptr;
 
+// MoltenVK advertises promoted KHR extensions but, depending on the Vulkan
+// version requested by Wine, may return only the promoted core symbol from
+// vkGetInstanceProcAddr. Guest WineD3D deliberately requests Vulkan 1.0 plus
+// VK_KHR_get_physical_device_properties2, so refusing the KHR spelling makes
+// every queried feature appear unavailable. Vulkan guarantees identical
+// signatures for promoted aliases; try the core spelling before declaring an
+// entry point missing.
+static PFN_vkVoidFunction loadInstanceProcWithPromotedKHRFallback(
+        VkInstance instance, const char* name) {
+    PFN_vkVoidFunction result = pvkGetInstanceProcAddr(instance, name);
+    const size_t length = strlen(name);
+    if (!result && length > 3 && !strcmp(name + length - 3, "KHR")) {
+        std::string coreName(name, length - 3);
+        result = pvkGetInstanceProcAddr(instance, coreName.c_str());
+        if (result) {
+            klog_fmt("Boxedwine: resolved promoted Vulkan alias %s through %s",
+                     name, coreName.c_str());
+        }
+    }
+    return result;
+}
+
 static U32 vulkanPtrCount;
 static U32 vulkanPtrHighMark;
 
@@ -73,7 +95,7 @@ U32 createVulkanPtr(KMemory* memory, void* value, BoxedVulkanInfo* info) {
         }
 #undef VKFUNC
 #undef VKFUNC_INSTANCE
-#define VKFUNC_INSTANCE(f) info->pvk##f = (PFN_vk##f)pvkGetInstanceProcAddr((VkInstance)value, "vk"#f); if (!info->pvk##f) {kwarn("Boxedwine: Failed to load vk"#f);} else {info->functionAddressByName[B("vk"#f)]=1;}
+#define VKFUNC_INSTANCE(f) info->pvk##f = (PFN_vk##f)loadInstanceProcWithPromotedKHRFallback((VkInstance)value, "vk"#f); if (!info->pvk##f) {kwarn("Boxedwine: Failed to load vk"#f);} else {info->functionAddressByName[B("vk"#f)]=1;}
 #define VKFUNC(f)
 #include "vkfuncs.h" 
         info->instance = (VkInstance)value;
@@ -144,12 +166,65 @@ class VMemory {
 public:
     VkDeviceMemory memory;
     VkDeviceSize size;
+    VkDeviceSize mappedOffset;
     VkDeviceSize mappedLen;
     U32 mappedAddress;
+    U32 processId;
+    void* hostAddress;
+};
+
+class RecentVulkanMapping {
+public:
+    VkDeviceMemory memory;
+    VkDeviceSize allocationSize;
+    VkDeviceSize offset;
+    VkDeviceSize length;
+    U32 guestAddress;
+    U32 processId;
+    void* hostAddress;
 };
 
 std::unordered_map<VkDeviceMemory, std::shared_ptr<VMemory>> vmemory;
+static std::vector<RecentVulkanMapping> recentVulkanMappings;
+static std::vector<U64> reportedVulkanFaults;
+static constexpr size_t kRecentVulkanMappingLimit = 32;
+static constexpr size_t kReportedVulkanFaultLimit = 64;
 BOXEDWINE_MUTEX vmemoryMutex;
+
+static U64 mappingPageEnd(U32 guestAddress, VkDeviceSize length) {
+    const U64 dataStart = (U64)guestAddress & ~(U64)K_PAGE_MASK;
+    const U64 dataBytes = (guestAddress & K_PAGE_MASK) + length;
+    return dataStart + ((dataBytes + K_PAGE_MASK) & ~(U64)K_PAGE_MASK);
+}
+
+static const char* classifyVulkanMappingAddress(
+        U32 address, U32 guestAddress, VkDeviceSize length) {
+    const U64 fault = address;
+    const U64 start = guestAddress;
+    const U64 end = start + length;
+    const U64 pageStart = start & ~(U64)K_PAGE_MASK;
+    const U64 pageEnd = mappingPageEnd(guestAddress, length);
+    if (fault >= start && fault < end) {
+        return "mapped data";
+    }
+    if (pageStart >= K_PAGE_SIZE && fault >= pageStart - K_PAGE_SIZE &&
+        fault < pageStart) {
+        return "leading guard page";
+    }
+    if (fault >= pageEnd && fault < pageEnd + K_PAGE_SIZE) {
+        return "trailing guard page";
+    }
+    return nullptr;
+}
+
+static void rememberVulkanMapping(const std::shared_ptr<VMemory>& mapping) {
+    recentVulkanMappings.push_back({mapping->memory, mapping->size,
+        mapping->mappedOffset, mapping->mappedLen, mapping->mappedAddress,
+        mapping->processId, mapping->hostAddress});
+    if (recentVulkanMappings.size() > kRecentVulkanMappingLimit) {
+        recentVulkanMappings.erase(recentVulkanMappings.begin());
+    }
+}
 
 std::shared_ptr<VMemory> getVMemory(VkDeviceMemory memory) {
     if (vmemory.count(memory))
@@ -159,11 +234,21 @@ std::shared_ptr<VMemory> getVMemory(VkDeviceMemory memory) {
 
 void registerVkMemoryAllocation(VkDeviceMemory memory, VkDeviceSize size) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(vmemoryMutex);
+    if (vmemory.empty()) {
+        // A later guest commonly reuses the same small process IDs and 32-bit
+        // ranges. Do not suppress or misclassify its first fault using the
+        // preceding Vulkan device's bounded diagnostic history.
+        recentVulkanMappings.clear();
+        reportedVulkanFaults.clear();
+    }
     std::shared_ptr<VMemory> m = std::make_shared<VMemory>();
     m->memory = memory;
     m->size = size;
+    m->mappedOffset = 0;
     m->mappedLen = 0;
     m->mappedAddress = 0;
+    m->processId = 0;
+    m->hostAddress = nullptr;
     vmemory[memory] = m;
 }
 
@@ -171,6 +256,13 @@ void unregisterVkMemoryAllocation(VkDeviceMemory memory) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(vmemoryMutex);
     std::shared_ptr<VMemory> m = getVMemory(memory);
     if (m) {
+        if (m->mappedAddress) {
+            rememberVulkanMapping(m);
+            kwarn_fmt("Freeing still-mapped Vulkan memory %p: pid %x guest "
+                      "%.8X length %llu",
+                      (void*)memory, m->processId, m->mappedAddress,
+                      (unsigned long long)m->mappedLen);
+        }
         vmemory.erase(memory);
     }
 }
@@ -193,8 +285,19 @@ U32 mapVkMemory(VkDeviceMemory memory, void* pData, VkDeviceSize offset, VkDevic
     if (len > m->size - offset) {
         kpanic("mapVkMemory range exceeds allocation size");
     }
+    if (len > std::numeric_limits<U32>::max()) {
+        kpanic("mapVkMemory range exceeds the 32-bit guest address space");
+    }
+    m->mappedOffset = offset;
     m->mappedLen = len;
+    m->processId = KThread::currentThread()->process->id;
+    m->hostAddress = pData;
     m->mappedAddress = KThread::currentThread()->memory->mapNativeMemory(pData, (U32)len);
+    if (!m->mappedAddress) {
+        kwarn_fmt("Failed to reserve a 32-bit guest range for Vulkan memory "
+                  "%p (pid %x, length %llu)", (void*)memory, m->processId,
+                  (unsigned long long)len);
+    }
     return m->mappedAddress;
 }
 
@@ -206,10 +309,82 @@ void unmapVkMemory(VkDeviceMemory memory) {
     }
     if (!m->mappedAddress) {
         klog("unmapVkMemory called, but no record of being mapped");
+        return;
     }
+    rememberVulkanMapping(m);
     KThread::currentThread()->memory->unmapNativeMemory(m->mappedAddress, (U32)m->mappedLen);
     m->mappedAddress = 0;
+    m->mappedOffset = 0;
     m->mappedLen = 0;
+    m->processId = 0;
+    m->hostAddress = nullptr;
+}
+
+void logVkMemoryFaultContext(U32 processId, U32 address, bool writeFault) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(vmemoryMutex);
+    if (vmemory.empty() && recentVulkanMappings.empty()) {
+        return;
+    }
+
+    const U64 faultKey = ((U64)processId << 33) | ((U64)address << 1) |
+        (writeFault ? 1 : 0);
+    if (std::find(reportedVulkanFaults.begin(), reportedVulkanFaults.end(),
+                  faultKey) != reportedVulkanFaults.end()) {
+        return;
+    }
+    reportedVulkanFaults.push_back(faultKey);
+    if (reportedVulkanFaults.size() > kReportedVulkanFaultLimit) {
+        reportedVulkanFaults.erase(reportedVulkanFaults.begin());
+    }
+
+    for (const auto& item : vmemory) {
+        const auto& mapping = item.second;
+        if (!mapping->mappedAddress || mapping->processId != processId) {
+            continue;
+        }
+        const char* classification = classifyVulkanMappingAddress(
+            address, mapping->mappedAddress, mapping->mappedLen);
+        if (classification) {
+            klog_fmt("Guest %s fault %.8X is in Vulkan %s: memory %p "
+                     "allocation %llu offset %llu host %p guest "
+                     "[%.8X, %.8llX)",
+                     writeFault ? "write" : "read", address,
+                     classification, (void*)mapping->memory,
+                     (unsigned long long)mapping->size,
+                     (unsigned long long)mapping->mappedOffset,
+                     mapping->hostAddress,
+                     mapping->mappedAddress,
+                     (unsigned long long)((U64)mapping->mappedAddress +
+                                          mapping->mappedLen));
+            return;
+        }
+    }
+    for (auto iterator = recentVulkanMappings.rbegin();
+         iterator != recentVulkanMappings.rend(); ++iterator) {
+        if (iterator->processId != processId) {
+            continue;
+        }
+        const char* classification = classifyVulkanMappingAddress(
+            address, iterator->guestAddress, iterator->length);
+        if (classification) {
+            klog_fmt("Guest %s fault %.8X is in a recently unmapped Vulkan "
+                     "%s: memory %p allocation %llu offset %llu host %p "
+                     "guest [%.8X, %.8llX)",
+                     writeFault ? "write" : "read", address,
+                     classification, (void*)iterator->memory,
+                     (unsigned long long)iterator->allocationSize,
+                     (unsigned long long)iterator->offset,
+                     iterator->hostAddress,
+                     iterator->guestAddress,
+                     (unsigned long long)((U64)iterator->guestAddress +
+                                          iterator->length));
+            return;
+        }
+    }
+    klog_fmt("Guest %s fault %.8X (pid %x) is outside all live and the last "
+             "%zu unmapped Vulkan guest ranges",
+             writeFault ? "write" : "read", address, processId,
+             recentVulkanMappings.size());
 }
 
 #define ARG1 cpu->peek32(1)
@@ -247,7 +422,13 @@ static void BOXED_vkCreateXlibSurfaceKHR(CPU* cpu) {
         EAX = VK_SUCCESS;
         // VK_DEFINE_NON_DISPATCHABLE_HANDLE (always 64 bit)
         cpu->memory->writeq(cpu->peek32(4), (U64)surface);
-        XServer::getServer()->setFakeFullScreenWindow(xWindow);
+        // Wine also creates tiny Vulkan surfaces solely to probe Direct3D
+        // capabilities. The native backend keeps those surfaces alive but
+        // offscreen; only a real presentation surface may replace X11 as the
+        // fake-fullscreen input/rendering target.
+        if (vulkanWnd->isPresentationSurface(surface)) {
+            XServer::getServer()->setFakeFullScreenWindow(xWindow);
+        }
     }
 }
 
@@ -267,7 +448,13 @@ void vk_CreateInstance(CPU* cpu) {
             containsDebug = true;
         } else if (strstr(pCreateInfo->ppEnabledExtensionNames[i], "VK_KHR_xlib_surface")) {
             delete[] pCreateInfo->ppEnabledExtensionNames[i];
-#ifdef __MACH__
+#ifdef BOXEDWINE_IOS
+            // SDL's UIKit Vulkan backend creates a CAMetalLayer-backed
+            // VkSurfaceKHR through VK_EXT_metal_surface. The upstream
+            // __MACH__ branch assumes AppKit/macOS and requests
+            // VK_MVK_macos_surface, which MoltenVK cannot use on iOS.
+            const char* platformSurface = "VK_EXT_metal_surface";
+#elif defined(__MACH__)
             const char* platformSurface = "VK_MVK_macos_surface";
 #else
             const char* platformSurface = "VK_KHR_win32_surface";
@@ -494,7 +681,16 @@ void callVulkan(CPU* cpu, U32 index) {
 #ifdef BOXEDWINE_VULKAN
     if (index < int9ACallbackSize) {
         if (int9ACallback[index]) {
+            KThread* thread = cpu->thread;
+            if (thread) {
+                thread->diagnosticVulkanCall.store(index + 1,
+                                                   std::memory_order_relaxed);
+            }
             int9ACallback[index](cpu);
+            if (thread) {
+                thread->diagnosticVulkanCall.store(0,
+                                                   std::memory_order_relaxed);
+            }
         } else {
             kpanic_fmt("Vulkan tried to call missing function: %d", index);
         }

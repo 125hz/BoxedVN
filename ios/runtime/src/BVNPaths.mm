@@ -164,3 +164,27 @@ extern "C" const char* BVNPathBundledRootFilesystemZip(void) {
     gBundledRootfs.value = path.UTF8String;
     return gBundledRootfs.value.c_str();
 }
+
+extern "C" const char* BVNPathBundledDxvkDirectory(void) {
+    static CachedPath gBundledDxvk;
+    if (gBundledDxvk.resolved) {
+        return gBundledDxvk.value.empty() ? nullptr
+                                          : gBundledDxvk.value.c_str();
+    }
+    gBundledDxvk.resolved = true;
+
+    // ios/app/Dxvk is a folder reference, so the DLLs keep their subdirectory
+    // inside the bundle. Resolve the directory rather than a single file: the
+    // prefix installer copies whatever is present, so adding another DXVK
+    // module later needs no code change here.
+    NSString* path = [NSBundle.mainBundle.resourcePath
+                      stringByAppendingPathComponent:@"Dxvk"];
+    BOOL isDirectory = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:path
+                                           isDirectory:&isDirectory]
+        || !isDirectory) {
+        return nullptr;
+    }
+    gBundledDxvk.value = path.UTF8String;
+    return gBundledDxvk.value.c_str();
+}

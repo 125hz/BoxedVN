@@ -29,6 +29,7 @@ public:
     BOXEDWINE_CONDITION cond;
     std::function<U32()> pfn;
     U32 result = 0;
+    bool completed = false;
     SdlCallback* next = nullptr;
 };
 

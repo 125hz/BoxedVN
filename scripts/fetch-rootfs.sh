@@ -17,7 +17,10 @@
 # hundred megabytes.  Without --bundle the archive stays under third_party/ and
 # is imported on the device through Settings -> Import root filesystem ZIP.
 #
-# The contents of these archives have not been reviewed for redistribution.
+# Wine 11 is the default because Wine 10.11 fixed Wine bug 50577, Song of
+# Saya's RtlpWaitForCriticalSection hang; the available Wine 10 archive is
+# 10.0 and predates that fix. The contents of these archives have not been
+# reviewed for redistribution.
 # Do not ship a bundled root filesystem in a public release until they have.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"

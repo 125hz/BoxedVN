@@ -6,9 +6,12 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-07 (session: fixed a full-app freeze on "Run Wine
-Notepad" by adding a timeout around the JIT probe; root cause of the freeze
-itself is still unidentified - see section 1j)
+**Last updated:** 2026-08-08 (build 35 fixes the optimized `REP MOVS` defect
+and no longer faults, but still stops after final-surface creation and PNG
+loading. The installed root is Wine 10.0; WineHQ records Song of Saya's
+`RtlpWaitForCriticalSection` hang as fixed in Wine 10.11. Build 36 migrates to
+the pinned Wine 11.0 root containing that fix—see section 1ao. The main menu
+is the next physical-device proof.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
 `379bf2414a67fc6509d506a6eefdf6ffa7ebf82d` (2026-08-05, "build fix"),
@@ -23,14 +26,17 @@ is inferred.
 
 | # | Milestone | Status | Evidence |
 |---|-----------|--------|----------|
-| 1 | Host-independent support library builds and passes tests | **done** | 59/59 tests pass via `ctest --preset tests-only` |
+| 1 | Host-independent support library builds and passes tests | **done** | 74/74 tests pass in `build/tests-only/ios/tests/boxedvn_tests` |
 | 2 | Boxedwine emulator core compiles for iOS arm64 | **done** | `libboxedwine_core.a`, arm64, 577 `JitArmV8CodeGen` symbols |
 | 3 | Objective-C++ runtime bridge compiles and links | **done** | `libboxedvn.a`, 12 MB, arm64, exports `_main` |
 | 4 | SwiftUI app shell links against the core | **done** | `BoxedVN.app`, arm64, `LC_BUILD_VERSION` platform 2 (iOS), minos 17.0 |
 | 5 | Unsigned IPA produced and smoke tested | **done** | `BoxedVN-unsigned.ipa`, 1.9 MB, unzips to `Payload/BoxedVN.app` |
 | 6 | Reproducible scripts for every step | **done** | `scripts/*.sh`, all run clean from a fresh clone |
 | 7 | GitHub Actions workflow | **written, not yet run** | `.github/workflows/build-ios.yml` |
-| 8 | **App launches and renders real UI on-device** | **done, on simulator; fix applied to device build** | see section 1a |
+| 8 | **App launches and renders real UI on-device** | **done** | build 5 device session logs show frontend window creation and user-initiated Notepad launch |
+| 9 | Wine 10 root filesystem imported on device | **done** | device container shows `Application Support/rootfs/boxedwine.zip`, 149.3 MB |
+| 10 | StikDebug/TXM executable page preparation and RX/RW execution | **done** | build 6 returned from generated ARM64 code on the physical iPhone; see section 1l |
+| 11 | Wine 10 boots and renders Notepad on hardware | **done** | build 9 first rendered; build 15 is high-resolution and interactive; see sections 1o and 1u |
 
 ### 1a. The black-screen bug: found, fixed, verified on simulator
 
@@ -119,24 +125,25 @@ This is a legitimate, reusable debugging path for any future UI/lifecycle bug
 that doesn't require JIT — worth reaching for before assuming something is
 device-specific.
 
-## 2. What has NOT been tried
+## 2. What has NOT been proven yet
 
-Be explicit about this when reporting status. None of the following has been
-observed, and no claim should be made about them until it has:
+Be explicit about this when reporting status. No claim should be made about
+the following until it has been observed:
 
-- **The app has never been launched on a physical device.** It was launched
-  once on a physical iPhone 17 by the user and showed a black screen — that
-  bug is now understood, fixed, and verified on the simulator (section 1a),
-  but the fixed build has not yet gone back onto the physical device.
-- **JIT has never been probed on real hardware.** `BVNJITProbe` is written,
-  compiles, and was confirmed to correctly report "unavailable, not ARM64" on
-  the x86_64 simulator — but no ARM64 device has executed it yet.
-- **The root filesystem has never been mounted.** No guest has started.
-- **Wine has never booted.** Notepad has not run.
-- **No game has been imported on a device.** The importer is unit tested
-  against synthetic archives on the host only.
-- **Audio, input and rendering are untested at runtime.** They are wired
-  through SDL2 but nothing has ever produced a frame or a sample.
+- Build 23's 128 MiB JIT arena and full WineDbg attachment are device-proven.
+  Build 24 proves removing winebus does not improve cold startup and that a
+  second guest in the same Boxedwine process starts quickly. Build 25 proves
+  MoltenVK and the Apple A19 GPU initialize, but DXVK 2.5.2 rejects the
+  available Vulkan features. Build 26's WineD3D Vulkan replacement is locally
+  built and tested but not yet device-proven.
+- A game launcher runs on-device, but **no game title screen, audio, save, or
+  load is proven yet**.
+- Build 19's software keyboard is device-proven in Notepad. Hardware keyboard,
+  native IME/Japanese composition, GameController and audio remain untested.
+- The guest landscape lock needs an explicit physical rotate-both-directions
+  acceptance test after the later keyboard/prefix changes.
+- Guest exit, return to the library, and a second session in one app process
+  remain untested.
 
 ## 3. Environment note that shapes everything
 
@@ -229,7 +236,11 @@ which is Metal-backed on iOS.
 This is the right call for classic 2D visual novels, which use GDI/DirectDraw.
 It means **any guest program that requires OpenGL will fail**, and
 `KNativeSystem::getOpenGL()` logs "Failed to load OpenGL, will probably crash".
-`BOXEDWINE_ES` + `source/opengl/es` is the natural next step, not OSMesa.
+Build 22 selects Wine 10's `renderer=gdi` no-3D backend for imported 2D games;
+this is locally verified but not yet device-proven. The repository's
+`BOXEDWINE_ES` + `source/opengl/es` experiment is old
+and incomplete; accelerated graphics needs a deliberate translator plan, not
+just a compile definition. The macOS OSMesa binaries remain unusable on iOS.
 
 ### 4.5 Audio goes through SDL, not Wine's CoreAudio driver
 
@@ -281,7 +292,7 @@ cmake/BoxedwineSources.cmake  the emulator source list, with provenance
 ios/support/                host-independent logic, no Boxedwine/SDL/UIKit
   include/boxedvn/          architecture, pe_inspector, path_safety,
                             zip_import, manifest, json, game_import
-ios/tests/                  59 tests, dependency-free harness
+ios/tests/                  74 tests, dependency-free harness
 ios/runtime/                the C ABI + Objective-C++ bridge
   include/BVNRuntime.h      runtime, JIT, paths, logging  (Swift sees this)
   include/BVNImport.h       import, manifests, backends   (Swift sees this)
@@ -565,6 +576,34 @@ New IPA: `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
 which does not fix the actually-reported symptom and was never sent to the
 user).
 
+**Round 3 — device evidence disproved round 2.** The normal window level and
+AppDelegate `window` fallback shipped, but builds through 17 still present a
+picker whose row highlights and never completes. The problem is deeper:
+BoxedVN had no `UIApplicationSceneManifest`, created the library window by
+manually borrowing a connected scene, and let pinned SDL 2.32.10 create its
+guest window with deprecated `initWithFrame:`. Current iOS can render those
+windows while refusing scene-owned services. This same malformed ownership
+also explains why build 17's attached field reached `firstResponder=yes` but
+never produced a keyboard scene.
+
+Build 18 declares `BVNSceneDelegate`, creates the library with
+`initWithWindowScene:`, and attaches SDL's guest window to the exact same
+scene immediately after `SDL_CreateWindow`, before renderer creation or show.
+Picker callbacks are now logged. Because physical-device remote-view behavior
+still needs validation, build 18 also removes the picker as a single point of
+failure: game ZIPs copied into **On My iPhone → BoxedVN** are listed on the
+Library screen, matching the direct rootfs route in Settings.
+
+**Round 4 — build 18 disproved scene ownership as the final picker fix.** The
+device logged both scene connection markers and later attached SDL to that
+scene, yet the SwiftUI `.fileImporter` still highlighted files without
+completing. Build 19 replaces it for ZIPs and folders with an explicit
+`UIDocumentPickerViewController(forOpeningContentTypes:asCopy: true)`, a real
+delegate and forced file-extension display. Unlike `.fileImporter`, this asks
+Files to import a sandbox-local copy rather than handing BoxedVN an
+open-in-place security-scoped URL. The direct Documents lists remain the
+picker-independent guarantee.
+
 ## 1g. W^X: the two-part JIT memory bug (2026-08-07)
 
 Two separate mistakes, found one after the other because the first fix's
@@ -807,33 +846,1930 @@ saw.
 3. Only after JIT is confirmed non-hanging and either working or cleanly
    failing: continue with the milestones below.
 
+## 1k. Device crash reports reveal the iOS 26/27 JIT contract (2026-08-07)
+
+The paired iPhone's system crash-log domain contained five BoxedVN `.ips`
+reports from the earlier launch/probe attempts. They resolve section 1j's open
+question without guessing:
+
+- three reports are `SIGBUS` instruction-abort permission faults with `pc`
+  equal to the first byte of a newly mapped anonymous region;
+- two are `SIGKILL` / `CODESIGNING` / `Invalid Page` at the same first
+  instruction fetch;
+- `vm_region_64` and the crash reporter showed mappings such as `rw-/rwx` or
+  `r-x/rwx`, but that apparent execute permission did **not** mean TXM had
+  authorized instruction fetch.
+
+The missing operation is external to BoxedVN. Current StikDebug's
+`universal.js` defines a prepare-region call as `x16 = 1`, `brk #0xf00d`.
+StikDebug catches that stop and writes through debugserver to every 16 KiB page
+so iOS 26/27 TXM will accept it as executable. `CS_DEBUGGED` is a prerequisite
+for this interaction, not a substitute for it. Current emulator ports then
+create separate RX and RW mappings of the prepared physical pages rather than
+flipping one mapping between protections.
+
+**Implemented:**
+
+- `BVNExecMemory` now performs exactly that universal handshake, `vm_remap`s a
+  writable alias, validates permanent `r-x`/`rw-` protections, writes the
+  probe through RW, and executes only through RX. All six speculative
+  mmap/mprotect/MAP_JIT strategies are retired.
+- The live Boxedwine allocator uses the same implementation. Both
+  `Platform::writeCodeToMemory` callback forms now receive the writable alias;
+  generated code pointers, calls, and cache invalidation retain the RX address.
+  This also removes section 1g's process-wide `mprotect` race.
+- Dual mappings are tracked and both aliases are released together.
+- The six-second wrapper remains. Its timeout now diagnoses a missing or
+  inactive StikDebug universal script—the only expected reason to remain
+  stopped at this deliberate breakpoint—instead of talking about the retired
+  strategy matrix.
+- Runtime and setup text now say explicitly: enable StikDebug Advanced
+  Options, long-press BoxedVN, assign `universal.js`, launch through StikDebug,
+  and leave the script active.
+
+**Verified locally:** 59 support tests and 26 pin checks pass; the complete
+arm64 Debug device app builds and validates; the x86_64 simulator compile-only
+target builds. Build 6 Release also builds, validates, and packages into a
+smoke-tested unsigned IPA.
+
+**Additional device evidence recovered after implementation:** build 5's
+session log shows the retired matrix completed, selected
+`mmap+mprotect(r-x)`, logged `About to execute the probe page`, then timed out
+exactly six seconds later and returned the runtime to `failed`. That proves the
+reported freeze was the first instruction fetch and proves section 1j's
+timeout works on the phone. The same container confirms the 149.3 MB Wine 10
+rootfs is already installed. **Build 6 itself is not verified on the phone
+yet**; section 1l records that subsequent result.
+
+## 1l. Build 6 proves JIT execution; probe immediate was encoded incorrectly (2026-08-07)
+
+The build 6 device log proves every previously uncertain JIT step works:
+
+- StikDebug serviced `brk #0xf00d` and prepared the requested page;
+- the mappings read back as RX `r-x/rwx` and RW `rw-/rwx`;
+- BoxedVN wrote through RW, invalidated the RX instruction cache, called RX,
+  and returned normally—no crash and no timeout.
+
+The probe returned `0x00000458` while BoxedVN expected `0x00004258`. This was
+not a JIT failure. The hand-written first instruction was `0xD2808B08`, which
+is `movz x8, #0x0458`; the intended `movz x8, #0x4258` is `0xD2884B08`.
+
+**Fix for build 7:** the instruction is no longer a copied magic number.
+`encodeMovzX()` derives it from the same `kProbeExpectedValue` used by the
+comparison, and a compile-time assertion pins the resulting opcode to
+`0xD2884B08`. This prevents the test code and expected value from drifting
+apart again. The next device run should pass the probe and enter
+`boxedmain()` for the first time.
+
+## 1m. Build 7 reaches Boxedwine; `-nozip` was given a stray value (2026-08-07)
+
+Build 7 passed the corrected JIT probe, entered `boxedmain()`, and loaded the
+149.3 MB Wine 10 rootfs in 178 ms. That proves the complete path through JIT,
+rootfs lookup, ZIP integrity, and Boxedwine startup on the physical iPhone.
+
+The next failure was entirely in BoxedVN's synthesized argv. It passed
+`-nozip 1`, but upstream `StartUpArgs::parseStartupArgs` treats `-nozip` as a
+valueless switch. The unconsumed `1` therefore became the first positional
+argument, producing:
+
+```
+Launching "1" ...
+Could not find 1
+```
+
+**Fix for build 8:** remove the `1`. Command construction now lives in the
+pure C++ `BVNLaunchArguments.cpp`, shared by the iOS runtime and host test
+target. Two new tests pin the complete Wine Notepad argv and a game launch
+with mount, environment, working directory, sound, and guest arguments. The
+suite now has 61 C++ tests, all passing.
+
+## 1n. Build 8 reaches Wine, then parks on its first live JIT allocation (2026-08-08)
+
+The complete paired-device logs confirm build 8 fixed argv and crossed every
+earlier boundary:
+
+```
+Loaded .../boxedwine.zip in 132 ms
+Launching "/bin/wine" "notepad"
+```
+
+Two attempts remained alive on a black SDL screen with no later output. The
+current live allocator explained that exact boundary: every Boxedwine 64 KiB
+code block called `allocatePrepared()`, which issued another StikDebug
+`brk #0xf00d`. The probe only proved one breakpoint. Wine startup immediately
+introduced a potentially unbounded series of debugger stops, vulnerable to
+StikDebug being background-suspended and expensive even while it remained
+active.
+
+**Fix for build 9:** the deliberate startup probe now prepares one bounded
+128 MiB RX arena, creates one RW alias, executes the probe inside it, and
+retains the proven mapping. `BVNExecMemAlloc` suballocates live blocks from the
+arena without another debugger breakpoint. Frees are validated and coalesced;
+writable-address translation only accepts active allocations; exhaustion is
+logged explicitly rather than silently starting a mid-guest debugger stop.
+The dependency-free `BVNRangeAllocator` has regression coverage for alignment,
+reuse, coalescing, containment, exhaustion, and invalid/duplicate release.
+
+The device logs also exposed why all JIT diagnostics disappeared before the
+quoted lines: BoxedVN passed its already-open session path to Boxedwine's
+`-log`, whose parser calls `createNew()` and truncates the file. Build 9 omits
+that duplicate logger and relies on the existing stdout/stderr capture, so one
+continuous file now retains frontend, probe, allocator, Boxedwine, and Wine
+output.
+
+**Verified locally:** 65 C++ tests and dependency pin checks pass; the complete
+arm64 Release app builds and validates as build 9. Packaged unsigned IPA:
+`build/ios-Release/DerivedData/Build/Products/Release-iphoneos/BoxedVN-unsigned.ipa`,
+SHA-256 `a02a5932485b57b0068f49df457335d500b6e2631d97b428893a973b62ff636f`.
+**Not yet device-verified.**
+
+## 1o. Build 9 renders Notepad; build 10 preserves its aspect ratio (2026-08-08)
+
+The user left build 9 on its black startup screen and Wine Notepad eventually
+appeared. This is the first complete on-device proof of the retained JIT arena,
+Boxedwine ARM64 execution, the Wine 10 prefix, Wine GUI startup and SDL frame
+presentation. Build 9 logs show continuing JIT allocations rather than a
+deadlock: the arena was ready in roughly 0.24 seconds, while Wine continued
+allocating translated blocks for more than 40 seconds before the first useful
+window appeared.
+
+The resulting 800x600 desktop was stretched independently across the iPhone's
+portrait width and height, making Notepad extremely tall and narrow. SDL's
+UIKit backend intentionally ignores the requested SDL window size and creates
+a full-screen native window. Boxedwine had not set a renderer logical size, so
+the native surface scaled the guest non-uniformly.
+
+**Fix for build 10:** on iOS, `KNativeScreenSDL` now sets the SDL renderer's
+logical size to the guest resolution after renderer creation and after every
+guest mode change. SDL letterboxes that logical image into the actual window,
+updates the mapping when the device geometry changes, and applies the same
+transform to mouse/touch events. Other platforms and Boxedwine's existing
+fullscreen scaling are unchanged. The runtime log records the logical and
+output sizes when the mapping is installed.
+
+**Verified locally:** 65 C++ tests and 26 dependency pin checks pass; the iOS
+Simulator compile-check passes; the complete arm64 Release app builds and
+validates as build 10. The unsigned IPA passes its unpack/revalidation smoke
+test at
+`build/ios-Release/DerivedData/Build/Products/Release-iphoneos/BoxedVN-unsigned.ipa`,
+SHA-256 `d0489357d5a9fb9e8b3c81f8cd05351669a46a3e53d77e0f2512c4919288c918`.
+The aspect-ratio and input behavior still require the physical-device check.
+
+## 1p. Build 10 exposed double-scaling, rotation and keyboard gaps (2026-08-08)
+
+Build 10 reduced the severe portrait distortion but remained visibly
+stretched, would not rotate even with device orientation lock off, provided no
+feedback over the black Wine-startup surface, and offered no way to summon the
+iOS software keyboard.
+
+The remaining stretch had a concrete second cause. On iOS, SDL ignores the
+requested 800x600 native window size and fills the UIKit window. Before the
+new renderer logical-size mapping ran, Boxedwine's desktop code compared that
+request with the portrait display-mode dimensions and independently set X and
+Y scales to fit. Build 10 then correctly letterboxed an image whose draw
+coordinates had already been distorted. Build 11 makes SDL's logical-size
+mapping the sole iOS presentation transform: the legacy desktop scaling and
+mode-change resize path are skipped, and input scale/offset remain 100%/zero.
+
+Build 11 also sets SDL's iOS orientation hint to portrait plus both landscape
+orientations, asks the new guest controller to refresh its supported
+orientations, and uses the iOS 16+ UIWindowScene geometry preference to start
+the guest in landscape when a scene is available. The guest continues to
+adapt to the actual window geometry rather than using device-orientation
+values for layout.
+
+A passthrough UIKit overlay was attached to SDL's final Metal view. It was
+intended to show a small **Starting Wine** card whose text updated with live
+JIT allocation counts
+(`Translated 64 code blocks`, etc.), making forward progress visible without
+intercepting guest taps outside the card. The card was dismissible. A persistent
+**Keyboard** button was intended to toggle SDL's real iOS text-input path;
+SDL's UIKit backend
+turns software-keyboard Unicode input into text events that Boxedwine's
+existing X11 input path was assumed to consume. On hardware this design failed:
+UIKit could not service it while `boxedmain()` owned the main thread, and the
+software-keyboard event type was not actually handled. Section 1q records the
+build 12 replacement.
+
+**Verified locally:** 65 C++ tests and 26 pin checks pass; the x86_64 iOS
+Simulator core compile-check passes; build 11's full simulator app builds,
+installs, launches and renders the library; the complete arm64 Release app
+builds and validates. The unsigned IPA passes its unpack/revalidation smoke
+test at
+`build/ios-Release/DerivedData/Build/Products/Release-iphoneos/BoxedVN-unsigned.ipa`,
+SHA-256 `0b0ea9e462202906db5dadbc0c878fa3987f61555471669d5a658cfb3a316faf`.
+Guest-only behavior still requires the hardware run.
+
+## 1q. Build 11's UIKit overlay arrived late and blocked the guest (2026-08-08)
+
+The physical-device build 11 run narrowed the problem precisely: Wine still
+took roughly 1.5–2 minutes and Notepad rendered successfully, but the UIKit
+**Starting Wine** overlay did not appear until *after* Notepad was already on
+screen. It then spun forever and accepted neither its close action nor other
+touches, leaving the guest unusable.
+
+That behavior follows the runtime contract. `boxedmain()` owns the main thread
+for the guest session and pumps SDL events itself; UIKit's normal run loop is
+not available to commit a newly attached view hierarchy or deliver `UIButton`
+actions. Queueing progress changes back to the main dispatch queue made the
+problem worse because those blocks could not run until SDL yielded. A UIKit
+overlay can therefore be visually late, logically stale, and input-blocking
+even when its view code is otherwise valid.
+
+Build 12 removes UIKit from guest controls. `KNativeScreenSDL` now:
+
+- draws and presents a full **STARTING WINE** screen before SDL's window is
+  shown, including an activity glyph, explicit Wine-loading status,
+  and an honest first-start timing message;
+- ends loading automatically on the first `putBitsOnWnd` call, which XServer
+  makes only for a mapped visible `InputOutput` descendant of its root;
+- draws a persistent **KEYBOARD** button after loading and hit-tests it in
+  SDL's 800x600 logical coordinate space, so the visual and touch mappings are
+  identical and no guest touch-blocking view exists;
+- starts/stops SDL's UIKit software keyboard from the SDL mouse event itself;
+  and
+- consumes iOS `SDL_TEXTINPUT` commits and synthesizes the corresponding ASCII
+  X11 key transitions. The previous code handled physical key down/up events
+  but ignored the event type used for ordinary software-keyboard characters.
+
+UIKit retains only its scene-orientation request; it creates no guest overlay
+or button. Build 12 also preserves build 11's single logical-size presentation
+mapping and rotation hints.
+
+**Verified locally:** 65 C++ tests and 26 dependency pin checks pass; the
+x86_64 iOS Simulator core compile-check passes; build 12's full simulator app
+builds, installs, launches and renders the library; the complete arm64 Release
+app builds and validates with `CFBundleVersion` 12. The final executable
+exports the presentation, SDL loading-progress and control-hit-test hooks. The
+unsigned IPA passes unpack/revalidation at
+`build/ios-Release/DerivedData/Build/Products/Release-iphoneos/BoxedVN-unsigned.ipa`,
+SHA-256 `06b81703c501f5093d5586685b9e3cd80faaaa0be27c35f88d1a5bde9dcc2cc5`.
+Guest behavior still requires the hardware run.
+
+## 1r. Build 12 loading timer exposed an SDL callback lifetime race (2026-08-08)
+
+Build 12 reached the physical device with the correct JIT handshake and SDL
+logical surface, then aborted on the loading screen just as Wine began its
+first native translations. The exported log ends after JIT allocations 1–8 at
+01:14:22; no `putBitsOnWnd` completion line exists, so no Wine window had been
+mapped and loading was correct to remain visible.
+
+The `.ips` report is conclusive and matches the locally retained build exactly:
+
+- app UUID `B1DF1C33-DC9C-345A-AAE7-E53D1830E318` matches the build 12 binary
+  and dSYM;
+- `EXC_CRASH / SIGABRT`, not a code-signing, JIT, watchdog or memory kill;
+- main-thread stack: `std::__throw_bad_function_call` →
+  `KNativeInputSDL::processEvents()+236` → `doMainLoop()`; and
+- the disassembly at the crash site is the unchecked `callback->pfn()` call.
+
+Two conditions combined. Build 12's 250 ms SDL timer queued roughly 360 custom
+events during Wine's 90-second pre-main-loop startup, because the main thread
+could not service them yet. Separately, Boxedwine's `sdlDispatch` waited on a
+`std::condition_variable` without a completion predicate. A permitted spurious
+wake could clear and recycle the callback while its SDL event remained queued;
+when `processEvents` eventually reached that event it invoked an empty
+`std::function` and terminated the app.
+
+Build 13 fixes both sides:
+
+- removes the loading timer and all of its queued custom events;
+- makes the loading screen explicitly static during the pre-main-loop phase;
+- shows SDL's UIWindow before presenting the loading frame, because iOS Metal
+  may discard a drawable committed while the window is still hidden;
+- adds a per-callback `completed` predicate and loops across spurious wakes;
+- validates callback events before invocation, so a malformed or stale event
+  is logged rather than becoming an uncaught C++ exception; and
+- preserves automatic loading dismissal on the first mapped Wine window,
+  aspect-correct presentation, SDL keyboard control and ASCII text input.
+
+**Verified locally:** 65 C++ tests and 26 dependency checks pass; the x86_64
+iOS Simulator core compile-check passes; build 13's full simulator app builds,
+installs, launches and renders the library; the complete arm64 Release app
+builds and validates as `CFBundleVersion` 13. The unsigned IPA passes unpack
+and revalidation at
+`build/ios-Release/DerivedData/Build/Products/Release-iphoneos/BoxedVN-unsigned.ipa`,
+SHA-256 `16661a649fe1e2757c1ca475687961f90d9067016b26ffd4984a5b64233ce79c`.
+The crash fix still requires the hardware run.
+
+## 1s. Build 13 exposed a pre-event-loop SDL dispatch deadlock (2026-08-08)
+
+Build 13 remained on a black screen for more than three minutes and never
+launched Wine. Its exported log ends immediately after
+`iOS guest presentation: logical 800x600 in 874x402 output`; it contains
+neither `iOS guest loading screen presented` nor the `/bin/wine notepad`
+launch line. The matching `.ips` is a foreground `0x8BADF00D` process-exit
+watchdog report: the app did not terminate within five seconds after the hung
+session was closed. It is not a new JIT crash.
+
+The symbolicated main-thread stack is conclusive:
+`BoxedWineCondition::wait` → `sdlDispatch` →
+`KNativeScreenSDL::showWindow` → `recreateMainWindow`. Build 13 showed the SDL
+window before presenting the loading frame, but `showWindow()` judged this
+pre-loop call to be off SDL's recorded main thread and synchronously dispatched
+an event. The SDL event loop had not started yet, so no code could service the
+event and complete the wait. Build 12's unsafe condition-variable wait could
+escape spuriously; build 13's correct completion predicate exposed the latent
+startup ordering bug instead of corrupting the callback lifetime.
+
+Build 14 keeps the callback safety fix and changes only the known startup
+phase: `recreateMainWindow()` is already running on UIKit's main queue, so it
+directly shows and raises SDL's native window, records it as visible, and then
+presents the static loading frame. Later window operations continue to use
+normal SDL dispatch. A new
+`iOS guest window shown directly for pre-loop startup` log marker makes this
+boundary explicit.
+
+**Verified locally:** 65 C++ tests and 26 dependency checks pass; the x86_64
+iOS Simulator core compile-check passes; the complete arm64 Release app builds
+and validates as `CFBundleVersion` 14. The unsigned IPA passes unpack and
+revalidation at
+`build/ios-Release/DerivedData/Build/Products/Release-iphoneos/BoxedVN-unsigned.ipa`,
+SHA-256 `2deacd59c752ea03b49d2f1ea9aa1aecd31dbab001e8c9c4f2406a62140fd734`.
+The fix requires a hardware run.
+
+## 1t. Build 14 boots Notepad; drawable scale and rotation were stale (2026-08-08)
+
+Build 14 proves the pre-loop deadlock is fixed: its loading screen appeared,
+Wine completed startup, and the device log reached
+`iOS guest startup complete: first mapped X11 window 0x1005e`. Notepad rendered,
+but it looked blurry, the loading screen had been stretched horizontally after
+rotation, and neither guest taps nor the SDL **KEYBOARD** button responded.
+
+The log and screenshot identify one shared presentation/input fault rather than
+a new Wine failure. SDL created its Metal renderer in portrait and reported an
+output of only `402x874` on a 3x device whose landscape screenshot is
+`2622x1206` pixels (`874x402` points). The SDL window lacked
+`SDL_WINDOW_ALLOW_HIGHDPI`, so its drawable was one pixel per point. The phone
+then changed from portrait to landscape after renderer creation, leaving both
+the logical viewport and SDL's corresponding mouse-coordinate transform at
+risk of using the old geometry. The log contains no crash or guest-exit line.
+
+Build 15:
+
+- creates the UIKit SDL window with `SDL_WINDOW_ALLOW_HIGHDPI` and
+  `SDL_WINDOW_RESIZABLE`, producing a native-scale Metal drawable;
+- checks the actual renderer output before each presentation and reapplies the
+  800x600 logical size whenever the drawable changes, keeping pixels and input
+  on the same aspect-preserving transform; and
+- logs resize/size-change events plus mouse down/up coordinates at the SDL
+  boundary. If input still fails, the next device log now distinguishes an
+  absent UIKit touch from a wrong guest coordinate.
+
+**Verified locally:** 65 C++ tests and 26 dependency checks pass; the x86_64
+iOS Simulator core compile-check passes; the complete arm64 Release app builds
+and validates as `CFBundleVersion` 15. The unsigned IPA passes unpack and
+revalidation at
+`build/ios-Release/DerivedData/Build/Products/Release-iphoneos/BoxedVN-unsigned.ipa`,
+SHA-256 `a528e3714dcad6e4c21956eae7d68894554a47b9c1109653a13087030f5538dd`.
+The fix requires a hardware run.
+
+## 1u. Build 15 device result and build 16 lifecycle fix (2026-08-08)
+
+The user confirmed that build 15 restores a clear, usable Notepad. Its
+native-scale renderer is visibly sharper and Notepad can be interacted with in
+the initial landscape session. The device report narrowed the remaining faults
+to three related presentation/focus transitions:
+
+- launching **Run Wine Notepad** while the library was portrait created SDL's
+  Metal drawable first and asked UIKit to rotate afterwards, so the loading
+  screen was temporarily stretched;
+- turning the device while Wine was running replaced/resized that drawable and
+  first-responder hierarchy during Boxedwine's blocking event loop, freezing
+  the session; and
+- the SDL-rendered **KEYBOARD** button reached `SDL_StartTextInput`, but that
+  API depends on SDL still having a focus window. The disrupted presentation
+  could leave it without one, so no UIKit keyboard appeared.
+
+Build 16 treats this as one lifecycle problem:
+
+- `BVNRuntimeRequestLaunch` now asks `BVNAppDelegate` to request landscape and
+  waits asynchronously for both scene orientation and window bounds to settle
+  before enabling SDL's event pump or entering `boxedmain()`;
+- the delegate and SDL orientation hint advertise landscape only for the guest
+  lifetime, preventing live portrait/landscape drawable replacement; the
+  library remains rotatable and its previous orientation is requested again
+  after guest exit or a failed startup;
+- the **KEYBOARD** button still calls `SDL_StartTextInput`, then explicitly
+  invokes `showKeyboard` on SDL's own UIKit view controller. It does not add a
+  second overlay or text field, so SDL remains the sole producer of key and
+  text events; and
+- startup/focus boundaries now log `Landscape guest geometry settled before
+  SDL startup`, `SDL UIKit software keyboard shown`, and `iOS guest software
+  keyboard requested through UIKit bridge` for a decisive device diagnosis.
+
+The reported unused blue width is not a crop introduced by the Retina fix. The
+guest desktop is fixed at 800x600 (4:3) and aspect-fit on a much wider phone.
+That is acceptable for the Notepad milestone, but per-game resolution/display
+profiles are now explicitly tracked for visual novels rather than solving it
+by distorting the framebuffer.
+
+**Verified locally:** 65 C++ tests and 26 dependency checks pass; the x86_64
+iOS Simulator core compile-check passes; the complete arm64 Release app builds
+and validates as `CFBundleVersion` 16. The packaged unsigned IPA is
+`build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`1597dd91d5224177b5b02fc64a306aff7f61fb4453da1ed41e7d09908dff6497`.
+Hardware validation is still required.
+
+## 1v. Build 16 proves presentation; build 17 fixes the real keyboard responder (2026-08-08)
+
+The build 16 device log `boxedvn-20260808-022637.log` resolves the remaining
+ambiguity:
+
+- `Landscape guest geometry settled before SDL startup` precedes `boxedmain`;
+- SDL is created directly at landscape `874x402` points / `2622x1206` pixels,
+  with an aspect-fit 800x600 viewport, so the portrait drawable race is fixed;
+- Notepad maps, receives many correctly transformed mouse events and remains
+  interactive;
+- each **KEYBOARD** tap reaches the control and logs both the Objective-C bridge
+  and C++ success path; but no keyboard appears; and
+- `Boxedwine shutdown`, exit code 1 and state `stopped` prove that this
+  `boxedmain()` invocation returned instead of killing the host process.
+
+The build 16 message `SDL UIKit software keyboard shown` was therefore a
+false-positive: it was emitted after calling SDL's void `showKeyboard` method,
+not after observing a first responder or UIKit keyboard notification. Reading
+pinned SDL 2.32.10 shows its private keyboard `UITextField` is both hidden and
+created with `CGRectZero`; `showKeyboard` silently ignores the result of
+`becomeFirstResponder`.
+
+Build 17 keeps SDL's own field and event pipeline, but makes the field usable
+as a responder on the current device OS:
+
+- retrieves SDL 2.32.10's pinned `textField` ivar with the Objective-C runtime;
+- attaches it to the active SDL controller, sets a 1x1 frame, `hidden = NO`
+  and `alpha = 0.01`, and makes the SDL guest window key;
+- invokes SDL's normal controller bookkeeping, then directly retries and
+  verifies `textField.isFirstResponder`;
+- treats a failed responder transition as a real bridge failure instead of
+  logging success; and
+- separately logs `UIKeyboardDidShowNotification` / did-hide, distinguishing
+  focus acceptance from the asynchronous keyboard actually appearing.
+
+No proxy text field was added. SDL still owns composition, Backspace, Return
+and `SDL_TEXTINPUT`, avoiding a temporary ASCII-only path that would have to be
+discarded for Japanese visual novels.
+
+**Verified locally:** device Release and simulator compile-check pass; 65 C++
+tests and 26 dependency checks pass; the validated `CFBundleVersion` 17 IPA is
+`build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`3c6b2e820f89879fb8c7ff2de6aea3a22566d1b5add03debd3bf63a4d1227e6f`.
+Hardware validation is required.
+
+## 1w. Build 17 proves focus was not enough; build 18 repairs scene ownership (2026-08-08)
+
+The build 17 device log `boxedvn-20260808-024410.log` is decisive. Notepad
+runs, and a keyboard tap reports
+`SDL keyboard show: keyWindow=yes attached=yes hidden=no firstResponder=yes`,
+but never reports `UIKit confirmed software keyboard did show`. Later taps can
+resign the responder and receive did-hide notifications. The field, button,
+SDL bridge, key window and synchronous focus transition therefore all work;
+the absent asynchronous presentation belongs to UIKit's scene layer.
+
+Source inspection against the iOS 26 SDK found the common cause shared with
+the still-broken physical-device document picker:
+
+- `Info.plist` explicitly omitted `UIApplicationSceneManifest`;
+- the app delegate manually created a SwiftUI window rather than using
+  `UIWindowSceneDelegate`; and
+- SDL 2.32.10 creates its guest `UIWindow` using `initWithFrame:`, deprecated
+  on iOS 26, leaving it outside the library window's scene.
+
+Build 18 makes one coherent lifecycle:
+
+- `BVNSceneDelegate` owns the library window and creates it with
+  `initWithWindowScene:`;
+- after `SDL_CreateWindow`, `BVNAttachGuestWindowToScene` assigns SDL's native
+  window to that same active scene before Metal renderer creation;
+- the existing focusable SDL text field remains the sole text-input pipeline;
+- picker completion/failure callbacks are logged; and
+- a Library section imports game ZIPs already copied to BoxedVN Documents,
+  bypassing the remote document picker entirely.
+
+**Verified locally:** the arm64 Release app builds and validates as build 18;
+the scene delegate and bridge symbols survive static-link dead stripping; the
+built plist contains the single-scene configuration; 65 C++ tests and 26
+dependency checks pass. An iOS 26.3 Simulator launch rendered the Library and
+logged both scene markers (`scene-owned library window created` and
+`UIWindowScene connected to BoxedVN library`); the new direct game-ZIP section
+is visible.
+The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`82fc503fc6cf56c6007adba7838f6efdd5347809d6cc9fcabd05753b26a67cc3`.
+Hardware validation is still required for keyboard appearance and
+system-picker completion.
+
+## 1x. Build 18 proves UIKit still fails; build 19 guarantees input and import (2026-08-08)
+
+The build 18 device log `boxedvn-20260808-030652.log` proves all intended scene
+work happened: the library scene connected, SDL attached its window to the
+same scene before renderer creation, Wine started, and Notepad remained
+interactive. Nevertheless, every keyboard request reached
+`keyWindow=yes attached=yes hidden=no firstResponder=yes` without a single
+keyboard did-show notification. The system picker also still would not
+complete any selection. Scene ownership was real and necessary, but not the
+last cause of either device-only UIKit failure.
+
+Build 19 stops making progress depend on those services:
+
+- **Guest typing:** the SDL-rendered **KEYBOARD** button now opens a five-row
+  touch QWERTY overlay rendered and hit-tested in the same 800x600 coordinate
+  space as Wine. It sends X11 key transitions directly for letters, digits,
+  Shift, Space, Backspace, Enter and arrows. The native keyboard is still
+  requested using a normal-sized, alpha-1 SDL text field for future IME input,
+  but it is no longer required to type.
+- **File import:** SwiftUI's open-in-place `.fileImporter` is replaced with a
+  `UIDocumentPickerViewController` configured with `asCopy: true` and an
+  explicit delegate. Files now performs an import copy and returns a local URL
+  rather than attempting the security-scoped hand-off that never completed.
+- **Guaranteed fallback:** rootfs and game ZIPs copied to **On My iPhone →
+  BoxedVN** remain selectable directly inside the app without any picker.
+
+**Verified locally:** build 19 compiles and validates for arm64; the full iOS
+26.3 Simulator app builds, installs, launches and renders the Library; 65 C++
+tests and 26 pin checks pass. Wine and the built-in guest keyboard still
+require the physical ARM64/JIT test. The validated and smoke-tested unsigned
+IPA is `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`e851315c47126363d7fe60e41fb453f0a9429c3965b905ee5947cbb563a99979`.
+
+## 1y. Build 19 proves typing and reaches Saya; build 20 fixes launch context and attempts the startup timeout (2026-08-08)
+
+The user confirmed that build 19's SDL QWERTY overlay types into Notepad. This
+closes basic software input as a blocker, although the compact overlay still
+needs polish and does not provide Japanese IME composition.
+
+The first imported-game test launched the English `Saya_en.exe` and reached a
+Wine error dialog. This is meaningful progress: the game ZIP, PE32 discovery,
+D: mount, x86 translation and Windows application entry point all worked. The
+build 19 log also exposed two concrete problems rather than a generic graphics
+failure:
+
+- the command launched `d:\Saya_en.exe` with no `-w`, so the process inherited
+  Boxedwine's Linux working directory instead of the folder containing its
+  data; and
+- after JIT allocation #320, startup stopped for 94.6 seconds immediately
+  before Wine reported that `Services\\winebth` could not create its optional
+  Bluetooth driver. Rootfs ZIP loading took only 172 ms and the StikDebug
+  handshake about 200 ms, so neither was responsible for the two-minute wait.
+
+Build 20 addresses both across all games:
+
+- an empty manifest working-directory setting now means the selected
+  executable's parent. Root-level executables use the mounted D: root, while
+  nested executables infer their subdirectory. An explicit setting still wins;
+- Wine launches default to
+  `WINEDLLOVERRIDES=winebth=;ddraw=n,b`. This was intended to disable the
+  unsupported driver while preserving native-then-builtin DirectDraw fallback;
+  section 1z records that the device disproved this part; and
+- opening the working SDL keyboard no longer also starts SDL/UIKit text input.
+  The direct X11 overlay does not need it, and the redundant hidden responder
+  caused the glitchy double show/hide transitions seen on the device.
+
+**Verified locally:** 66 C++ tests and 26 dependency/pin checks pass. The
+complete arm64 Release app builds and validates as `CFBundleVersion` 20. Its
+packaged unsigned IPA is `build/artifacts/BoxedVN-unsigned.ipa`, SHA-256
+`281d73152a3bec95b60f31754e0ca3eda4132894ca35244fcec7375a30553ca9`, and
+passes unpack/revalidation. The physical startup/Saya result is still pending;
+do not claim the 95-second reduction or game fix until build 20's log proves
+them. The garbled dialog also records a separate compatibility gap: the Wine
+10 root defaults to English ACP 1252 and contains no CJK font, so a future
+Japanese locale/font profile will be required even when an English translation
+can otherwise run.
+
+## 1z. Build 20 identifies Saya's GLX boundary; build 21 adds a software 2D prefix profile (2026-08-08)
+
+The build 20 device log proves the working-directory fix: Saya launched as
+`d:\\Saya_en.exe` with `-w /home/username/.wine/dosdevices/d:/`. It translated
+past JIT block 768 and entered WineD3D graphics initialisation. The final line,
+`Uknown int 99 call: 2897`, is not a JIT allocation failure. In the generated
+Boxedwine GL table, `LAST_EXT` is 2896 and index 2897 is `kXChooseVisual`, so
+Wine made its first `glXChooseVisual` request against an iOS core compiled with
+no GL callback table. The static loading renderer remained visible, making the
+fatal graphics boundary look like a translation hang.
+
+The same log disproves build 20's Bluetooth workaround. Despite
+`WINEDLLOVERRIDES=winebth=;ddraw=n,b`, Wine still attempted the kernel service,
+paused about 58 seconds between JIT blocks 320 and 384, and logged the same
+`Services\\winebth` failure. A DLL load-order environment variable is not the
+right control for a service-manager timeout.
+
+Build 21 prepares the writable Wine prefix before the JIT probe and guest
+launch. On first use it extracts only `user.reg` and `system.reg` from the
+read-only rootfs ZIP into the game's existing overlay. It atomically and
+idempotently applies:
+
+- `Software\\Wine\\Direct3D / DirectDrawRenderer = "gdi"` for imported games,
+  routing classic DirectDraw output through Wine's CPU/GDI framebuffer instead
+  of WineD3D's unavailable GLX path; and
+- `System\\ControlSet001\\Services\\winebth / Start = 4` for every Wine
+  prefix, disabling the unsupported Bluetooth service at its real startup
+  policy rather than relying on a DLL override.
+
+This is a compatibility profile for 2D games, not an accelerated renderer.
+Direct3D/OpenGL titles can still reach the missing GL boundary. The repository's
+old `source/opengl/es` translator is explicitly experimental and incomplete;
+the next accelerated-graphics step needs a deliberate GLES/Metal translation
+plan rather than a build flag alone.
+
+**Verified locally:** 70 C++ tests and 26 dependency/pin checks pass, including
+an end-to-end synthetic rootfs ZIP extraction/registry test and idempotent
+second preparation. The complete arm64 Release app builds and validates as
+`CFBundleVersion` 21. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build21-unsigned.ipa`, SHA-256
+`5a7446474fb08c645ea0d7d3c48235577150a501736ee36c242087c41a9a177c`.
+The GDI result and actual startup-time reduction still require the physical
+device; do not claim Saya runs until that evidence exists.
+
+## 1aa. Build 21 device evidence; build 22 fixes the actual Wine 10 policies (2026-08-08)
+
+The build 21 device log (`boxedvn-20260808-041129.log`) is decisive. Prefix
+preparation completed before launch, but Saya again stopped after JIT block
+768 with the GLX function table and `Uknown int 99 call: 2897`. Wine also
+attempted `winebth` and paused 55.5 seconds between JIT blocks 384 and 448.
+This was not a registry-overlay precedence failure: the log proved the policy
+ran, and source inspection of the exact upstream Wine 10.0 tag explains why
+each value was ineffective.
+
+- Wine 10 no longer reads `DirectDrawRenderer`. Its `wined3d` configuration
+  reads `Software\\Wine\\Direct3D / renderer`; values `gdi` and `no3d` both
+  select `WINED3D_RENDERER_NO3D`. Build 22 writes `renderer="gdi"` for
+  imported games, so classic DirectDraw can use the CPU-backed path without
+  asking Boxedwine for GLX.
+- Wine 10's service manager auto-starts a service when any enumerated root PnP
+  device names it, regardless of the service `Start` value. `wineboot`
+  creates `ROOT\\WINE\\WINEBTH`, and its device `Service="winebth"` made
+  build 21's `Start=4` irrelevant. Build 22 retains `Start=4` and clears that
+  root device's `Service` association before wineserver starts. Wineboot sees
+  the existing device and does not reinstall it.
+
+Build 22 also updates Boxedwine's own `BoxedContainer::isGDI/setGDI` helpers to
+use the current `renderer` key, preventing later settings UI work from writing
+the obsolete value again. The prefix changes remain atomic and idempotent and
+apply to an existing Saya import; no re-import is required.
+
+**Verified locally:** the full `tests-only` suite passes, including extraction,
+both registry mutations, and an idempotent second preparation. The complete
+arm64 Release app builds and validates as `CFBundleVersion` 22. The
+smoke-tested IPA is `build/artifacts/BoxedVN-build22-unsigned.ipa`, SHA-256
+`4c16d9fbfc15cf8804e752b177052911462548e13c9ba10ae6092d8d5422241c`.
+This was the pre-device evidence boundary; section 1ab records the subsequent
+Build 22 device result and supersedes it.
+
+## 1ab. Build 22 reaches Saya's launcher; build 23 removes the next JIT ceiling (2026-08-08)
+
+The two build 22 device logs (`boxedvn-20260808-134757.log` and
+`boxedvn-20260808-135059.log`) prove the corrected prefix policy works:
+`winebth` no longer errors, Wine selects its no-3D renderer, and Song of
+Saya's launcher renders and accepts the Start Game click. They also correct an
+earlier diagnosis: the generic startup pause remains even without winebth.
+The measured gaps between JIT allocations 384 and 448 are 55.089 and 56.752
+seconds, so that time cannot honestly be credited to the removed Bluetooth
+failure.
+
+Start Game reaches the engine's D3D9 initialization. Wine reports that none of
+the requested feature levels is supported by the current no-3D backend, the
+engine then reads through null at `0x7F3D1CD6`, and Wine opens its debugger.
+While starting that debugger BoxedVN reaches JIT allocation 1088 and exhausts
+the original 64 MiB arena. The apparent debugger freeze therefore combines a
+real guest fault with a separate host-code-capacity failure.
+
+Build 23 raises the single StikDebug-prepared dual-mapped arena to 128 MiB.
+Preparing another region after the guest begins would require an unsafe live
+debugger stop, so one larger up-front arena is the correct bounded design. It
+also adds `WINEDEBUG=+timestamp,+service` by default (without overriding a
+per-game value) so the next exported logs can identify the remaining fixed
+startup delay. This build does **not** claim to make Saya render: the D3D9
+engine still needs an accelerated graphics translation backend.
+
+A compile experiment also tested the dormant 2016 `source/opengl/es` shim.
+It is not compatible with Boxedwine 26R2: the current GL marshaler requires a
+desktop extension/constant surface the old shim does not define, and its
+`GL_FUNC` rewrite generates nonexistent ES extension symbols. Those trial
+changes were removed. Source inspection found a substantially better maintained
+route already in Boxedwine 26R2: generated guest Vulkan forwarding,
+`KVulkanSDL`, built-in DXVK DLL selection, and an upstream macOS target that
+uses MoltenVK. The next accelerated proof should port that path to a statically
+linked iOS MoltenVK and SDL's UIKit Vulkan surface, not revive the dead GL shim.
+
+**Verified locally:** 71 C++ tests and both CTest entries pass. The complete
+arm64 Release app builds and validates as `CFBundleVersion` 23. The
+smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build23-unsigned.ipa`, SHA-256
+`9bcb54e3ed300fb4af5f108677924fd0fb85a3094c6ff771667d3892cb368389`.
+This was the pre-device evidence boundary; section 1ac records the subsequent
+build 23 device result and supersedes it. No Saya gameplay claim is made.
+
+## 1ac. Build 23 proves the larger arena and isolates the startup stall; build 24 removes it (2026-08-08)
+
+The build 23 device logs (`boxedvn-20260808-141343.log` and
+`boxedvn-20260808-141627.log`) prove the 128 MiB arena fixes the second,
+host-side failure. Saya continues beyond allocation 1088, WineDbg fully
+attaches, and Program Error Details displays the guest backtrace. The fault is
+a null read in `mvware` reached from `saya_en` after WineD3D reports that the
+no-3D adapter supports none of the requested D3D feature levels. This is now a
+clean accelerated-graphics boundary, not a frozen debugger or exhausted JIT
+arena.
+
+The same logs precisely identify the generic launch delay. Both Notepad and
+Saya finish NDIS startup at Wine timestamp ~42, then remain idle until
+`Winedevice2` starts at ~98 and queries the service whose display name is
+`Wine HID bus`: a repeatable 56–57 second root PnP/HID enumeration gap.
+Boxedwine supplies iOS touch and the overlay keyboard independently through
+SDL and X11, so build 24 disables `Services\\winebus` and clears the
+`Enum\\ROOT\\WINE\\WINEBUS` service association. Wine 10 requires both
+changes because its root-device scan ignores `Start=SERVICE_DISABLED`.
+Windows raw-HID/game-controller support is intentionally unavailable under
+this policy; it can become a per-game compatibility option when controllers
+are implemented. Standard pointer and keyboard input should be unchanged.
+
+Build 24 also removes the temporary `WINEDEBUG=+timestamp,+service` default.
+An explicitly configured per-game `WINEDEBUG` value is still preserved. The
+prefix patch runs before every Wine launch and is idempotent, so existing
+rootfs and game imports require no reimport.
+
+**Verified locally:** 71 C++ tests and both CTest entries pass. The arm64
+Release app validates as `CFBundleVersion` 24. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build24-unsigned.ipa`, SHA-256
+`3901e651e95973b959ac7165617422d52bed9dbbb146085a919eb2df413712b0`.
+The startup-time reduction still requires physical-device confirmation; it is
+not recorded as proven until that result arrives.
+
+## 1ad. Build 24 falsifies the HID diagnosis; build 25 implements DXVK over Metal (2026-08-08)
+
+Build 24 device logs (`boxedvn-20260808-144238.log` and
+`boxedvn-20260808-144533.log`) show the same cold-start gap after winebus was
+disconnected: Notepad pauses 57.508 seconds between JIT allocations 384 and
+448, and cold Saya pauses 61.283 seconds. The first log then proves an
+important distinction: after Notepad exits, launching Saya in the same app and
+Boxedwine process reaches allocation 1024 in 0.321 seconds and its launcher in
+seconds. The expensive work is reusable process-wide Wine/Boxedwine cold
+initialization, not the removed HID root association. Build 25 repairs existing
+prefixes to `winebus Start=3` and `Service=winebus`, preserving future
+raw-HID/controller support.
+
+Build 25 implements the first accelerated game path end to end:
+
+- pins Khronos MoltenVK 1.4.2's official iOS arm64 static package by URL and
+  SHA-256 and records its Apache-2.0 notice;
+- enables Boxedwine 26R2's generated Vulkan marshaler and `KVulkanSDL` with
+  `BOXEDWINE_VULKAN`;
+- links MoltenVK into the app archive, force-loads `vkGetInstanceProcAddr` for
+  SDL's loader, and links IOSurface;
+- maps iOS surfaces to `VK_EXT_metal_surface`, not macOS's surface extension;
+- starts imported games with `-dxvk 1`, using rootfs DXVK 2.5.2.
+
+The intended route is D3D9 → DXVK → guest winevulkan → Boxedwine's Vulkan ABI
+→ SDL UIKit `CAMetalLayer` → MoltenVK → Metal. The device binary exports
+`vkGetInstanceProcAddr` and contains MoltenVK and `KVulkanSDL`; device behavior
+is the remaining evidence boundary.
+
+**Verified locally:** 71 C++ tests and both CTest entries pass. The arm64
+Release app validates as `CFBundleVersion` 25. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build25-unsigned.ipa`, SHA-256
+`42d0057f1875992dd9d16bfff302779c64850ce334f082780f1c5fc817c25d6e`.
+
+## 1ae. Build 25 reaches Metal but DXVK rejects it; build 26 uses WineD3D Vulkan (2026-08-08)
+
+The build 25 device log `boxedvn-20260808-150904.log` turns the previous
+graphics hypothesis into concrete evidence. MoltenVK 1.4.2 initializes,
+enumerates the Apple A19 GPU and reports 5461 MiB of GPU memory. Boxedwine's
+guest Vulkan bridge is therefore live through Metal. DXVK 2.5.2 then reports
+`Minimum required feature level D3D_FEATURE_LEVEL_9_1 not supported`.
+Upstream DXVK's device-feature gate requires geometry shaders and
+`VK_EXT_transform_feedback`; MoltenVK exposes neither on this device. This is
+an API capability mismatch, not a RAM shortage and not a JIT failure.
+
+The same log then exposes a second, independent blocker:
+`wined3d_dll_init Disabling 3D support.` Builds 22–24 wrote
+`Software\\Wine\\Direct3D / renderer="gdi"` into the persistent Saya prefix.
+Build 25 enabled DXVK but did not remove that saved Wine policy, so when DXVK
+failed, WineD3D deliberately selected its no-3D adapter and the game repeated
+the null feature-level fault.
+
+Build 26 changes the accelerated game route rather than repeatedly tuning an
+incompatible DXVK build:
+
+- imported games no longer receive `-dxvk 1`;
+- prefix preparation idempotently repairs existing games to Wine 10's
+  `renderer="vulkan"`, so no reimport is required;
+- D3D9 uses WineD3D → guest winevulkan → Boxedwine's Vulkan marshaler →
+  MoltenVK → Metal;
+- the pinned Wine 10 rootfs was inspected directly and contains builtin
+  `d3d9.dll`, `wined3d.dll`, `winevulkan.dll` and their Unix-side modules;
+  its WineD3D binary contains the `Using the Vulkan renderer.` path;
+- Boxedwine's Vulkan resolver retries promoted `...KHR` instance procedures
+  under their Vulkan core names, which WineD3D needs when it requests Vulkan
+  1.0 plus the KHR physical-device property/feature extensions;
+- the home screen now reads the entitlement from the running signed process,
+  not from the source plist, and shows both its signed state and the current
+  `os_proc_available_memory()` headroom. It queries Security.framework first
+  and falls back to the signed entitlement blob returned by `csops`.
+
+**Verified locally:** 72 C++ tests and both CTest entries pass. The arm64
+Release app validates as `CFBundleVersion` 26. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build26-unsigned.ipa`, SHA-256
+`f1eab7d49846b85de2180f64b3ac80c2ab8eeb194872acac52e3ab2a0710eb37`.
+The WineD3D Vulkan frame still requires physical-device evidence. Build 26's
+first post-GetMoreRam signature result is recorded in section 1af.
+
+## 1af. Build 26 proves the signing and reinstall boundaries; build 27 guards the JIT trap (2026-08-08)
+
+The build 26 device logs and crashes are conclusive:
+
+- all three sessions report `Standard limit; 3.29 GB available before process
+  limit` and `The installed app's signed entitlement is not enabled` after the
+  user applied GetMoreRam;
+- the installed identifier is the signer-generated
+  `org.boxedwine.boxedvn.FMHU3Z2423`, so reinstalling/re-signing produced a new
+  StikDebug target;
+- both `.ips` files are `EXC_BREAKPOINT / SIGTRAP` at
+  `stikDebugPrepareRegion`, specifically the deliberate `brk #0xf00d` with
+  immediate 61453. Saya and Notepad both stop immediately after the log says
+  the 128 MiB arena is being requested. Neither Wine nor Vulkan starts.
+
+This is not jetsam, memory exhaustion, WineD3D or a game crash. `CS_DEBUGGED`
+survived, but StikDebug's `universal.js` was not servicing the newly installed
+app's handshake. The increased-memory entitlement also did not survive the
+final provisioning/signing step; changing the source entitlement alone cannot
+override the profile authorized by iOS.
+
+Build 27 wraps only the synchronous universal handshake with a temporary
+SIGTRAP recovery point. When StikDebug handles the Mach exception, execution
+continues exactly as before. When an unassigned/stopped script lets the trap
+fall through to the app, BoxedVN now unmaps the unused arena and presents a JIT
+setup error instructing the user to reassign the newly installed app instead
+of allowing iOS to terminate the process. Unrelated traps retain fatal default
+behavior.
+
+**Verified locally:** 72 C++ tests, both CTest entries and 30 dependency-pin
+checks pass. The arm64 Release app validates as `CFBundleVersion` 27. The
+smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build27-unsigned.ipa`, SHA-256
+`a571f856253ed72a61ac7c8b327f630ad24aecf454362854f182d2f0360037c5`.
+The recovery branch itself needs the physical-device negative test described
+below because the Intel host and simulator cannot execute ARM64 `brk`.
+
+## 1ag. Build 27 proves WineD3D/MoltenVK; build 28 repairs destroyed iOS surface views (2026-08-08)
+
+After `universal.js` was assigned to the reinstalled app, device logs
+`boxedvn-20260808-154940.log` and `boxedvn-20260808-155231.log` prove the build
+27 JIT path is healthy again. Notepad maps its first X11 window, renders and
+shuts down normally. Saya is no longer stuck at a JIT allocation count:
+
+- Wine logs `Using the Vulkan renderer.`;
+- Boxedwine resolves the promoted Vulkan KHR aliases;
+- MoltenVK enumerates the Apple A19 GPU and creates a `VkDevice` with eight
+  extensions;
+- WineD3D creates swapchains sized 113x2 and 794x568;
+- the latter device, physical device and instance are then destroyed without
+  a Wine exception or process crash, while the phone remains black.
+
+Wine 10's `validate_state_table` messages are diagnostics only:
+`compile_state_table()` returns success after validation. They do not explain
+the presentation loss. Inspection of the pinned SDL2 2.32.10 UIKit source
+does. Every `SDL_Vulkan_CreateSurface()` allocates an
+`SDL_uikitmetalview`, pushes it into the SDL window's private `views` stack and
+replaces the controller's visible view. SDL explicitly documents that it has
+no public Vulkan surface-destroy hook, so destroying the host
+`VkSurfaceKHR` never removes that UIKit view. Wine's dead probe layer therefore
+continues covering Boxedwine's live X11 renderer.
+
+Build 28 adds the missing lifecycle at Boxedwine's Vulkan boundary:
+
+- `KVulkan` receives a destroy callback paired with surface creation;
+- `KVulkanSDL` keeps surfaces in creation order with their X11 windows;
+- the Objective-C++ bridge associates each surface with the exact UIKit view
+  SDL just installed and detaches it through SDL's pinned
+  `setSDLWindow:nil` bookkeeping when Wine calls `vkDestroySurfaceKHR`;
+- the preceding live Vulkan view/fake-fullscreen window is restored when one
+  remains; when none remain, Boxedwine recreates its normal SDL renderer and
+  X11 compositor;
+- tiny Wine helper surfaces below 320x200 no longer replace the configured
+  800x600 global display and input coordinate space;
+- surface IDs, X11 sizes, UIKit view registration/detachment and compositor
+  restoration are logged for the next device run.
+
+**Verified locally:** the arm64 Release app validates as `CFBundleVersion` 28;
+72 C++ tests, both CTest entries and 30 dependency-pin checks pass. The
+smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build28-unsigned.ipa`, SHA-256
+`5871674259ba76531ee60cb684aea909a008fa6b719be768e191506e3df7e811`.
+UIKit/Vulkan surface destruction still requires physical-device validation
+because the simulator cannot run Boxedwine's ARM64 JIT or MoltenVK guest path.
+
+## 1ah. Build 28 proves teardown but restores a live 113x2 probe; build 29 makes probes offscreen (2026-08-08)
+
+The build 28 log `boxedvn-20260808-162043.log` removes the remaining
+ambiguity. WineD3D successfully creates the Apple A19 Vulkan device. At first
+X11 mapping it creates a 113x2 surface, and BoxedVN registers that surface as
+the first visible `SDL_uikitmetalview`. Wine then creates a 794x568 surface,
+destroys it immediately, and build 28 correctly detaches its exact UIKit view.
+The log says one surface remains, however: the 113x2 view. Restoring that live
+but non-display probe over X11 is the black screen. No Wine exception, JIT
+stall, memory failure or MoltenVK failure appears.
+
+Build 29 separates Vulkan existence from Vulkan presentation:
+
+- X11 windows below 320x200 receive a retained, unattached `CAMetalLayer` and
+  a real `VK_EXT_metal_surface`, so Wine can create its probe swapchain without
+  changing SDL's visible controller view;
+- only display-sized surfaces enter the UIKit view stack and become
+  Boxedwine's fake-fullscreen window/input target;
+- destroying the last display-sized surface restores the SDL X11 compositor
+  even when an offscreen helper surface remains alive;
+- helper destruction releases its retained Metal layer without touching SDL
+  or UIKit presentation;
+- native shutdown now drops `KVulkanSDL` before the session's SDL screen, so a
+  later accelerated guest cannot target the prior guest window; abandoned
+  helper layers and UIKit diagnostic associations are released;
+- new logs explicitly say `offscreen helper` and report whether X11 was
+  restored while helpers remain.
+
+This is locally compiled and packaged, not device-proven. The design avoids a
+second hidden SDL window because SDL UIKit supports only one window and clears
+`SDL_WINDOW_HIDDEN`; using one would risk replacing SDL's key-window and
+keyboard bookkeeping.
+
+**Verified locally:** the arm64 Release app validates as `CFBundleVersion` 29;
+72 C++ tests, both CTest entries and 30 dependency-pin checks pass. Physical
+device acceptance is the visible launcher/main menu and the Build 29 markers
+in `docs/TESTING_IOS.md`. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build29-unsigned.ipa`, SHA-256
+`87aa8e8eeec8d9119a0531458415fd469e6160c7188d853522b15ca763972462`.
+
+## 1ai. Build 29 exposes the real first-frame fault; build 30 makes it actionable (2026-08-08)
+
+The build 29 device log `boxedvn-20260808-164144.log` proves the offscreen
+helper design. Saya's blue X11 desktop and launcher return after the 113x2
+capability surface remains alive. Pressing Start Game gets substantially
+farther: WineD3D performs D3D11 format checks and shader parsing, SDL opens
+stereo audio (44.1 kHz requested, 48 kHz obtained), and MoltenVK creates three
+successive 1280x960 swapchains. The first two presentation views are detached
+and X11 is restored correctly. The third remains live when Wine reports an
+unhandled write fault at `0x03BE0000`, EIP `0x7F444DDF`, thread `0024`.
+Consequently the final Metal view is black and obscures WineDbg. This is no
+longer the helper-surface regression or a JIT stall.
+
+MoltenVK logs `VK_ERROR_FEATURE_NOT_PRESENT: Metal does not support disabling
+primitive restart` immediately beforehand. Its 1.4.2 source documents this as
+a warning because Metal always enables primitive restart; it is not a failed
+pipeline result and is not patched speculatively.
+
+Build 30 adds two bounded diagnostics instead:
+
+- when a mapped X11 window is titled `Wine Debugger` or `Program Error`,
+  `KVulkanSDL` detaches every visible iOS presentation layer newest-first,
+  restores the SDL X11 compositor, and leaves the Vulkan objects valid for
+  Wine's normal teardown; both X11 title-property write paths retrigger the
+  check when Wine sets its title after mapping;
+- Vulkan mappings retain allocation size, offset, host pointer, owner process,
+  guest address and mapped length. The final 32 unmapped ranges are retained,
+  and each unique guest fault is classified against live data, guard pages and
+  recent mappings. This determines whether `0x03BE0000` is an overrun, stale
+  device-memory pointer, or unrelated Mware/game-engine address without
+  changing memory semantics.
+
+**Verified locally:** the new native sources compile for iOS arm64; all 72 C++
+tests, both CTest entries and all 30 dependency-pin checks pass. The validated
+arm64 app is `CFBundleVersion` 30. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build30-unsigned.ipa`, SHA-256
+`8fad2260e5dd4bf887ba6c8fdd4896628404556e1e81ce305a0bdbec1353490e`.
+Physical-device validation is required for WineDbg visibility and the address
+classification.
+
+## 1aj. Build 30 rules out resolution/Vulkan mappings; build 31 isolates mvware (2026-08-08)
+
+The two build 30 device logs `boxedvn-20260808-170551.log` and
+`boxedvn-20260808-170843.log` are deterministic despite different launcher
+resolutions. Both reach the visible launcher, create WineD3D/MoltenVK devices,
+parse D3D11 shaders, open audio and cycle their first two presentation
+surfaces correctly. Both then fail before a game frame with a write to
+`0x03BD0000` at guest EIP `0x7F444DDF` on thread `0024`. The new tracker says
+that address is outside all live Vulkan mappings and all retained recently
+unmapped ranges. Wine prints its unhandled-page-fault line, then WineDbg
+immediately suffers a nested read fault (`0xE4860004`/`0xE48C0004`) before it
+maps `Wine Debugger` or `Program Error`. That explains why build 30's
+title-based reveal never fires. It also rules out game resolution and the
+known Vulkan mapped-memory lifetime/guard-page classes.
+
+An earlier complete WineDbg backtrace names `mvware` at the top of the same
+Saya failure. Build 31 introduces a repeatable, narrow compatibility profile:
+
+- `BVNLaunchArguments` recognises `Saya_en.exe` case-insensitively in either
+  the requested executable or a wrapper argument and emits
+  `-interpreterModule mvware` before the guest command;
+- `StartUpArgs` carries repeated module fragments into `KSystem`;
+- `NormalCPU` resolves a decoded block's mapped module before taking the code
+  cache lock and marks only matching blocks `OP_FLAG_NO_JIT`. Wine startup,
+  WineD3D and all other game modules keep the ARM64 JIT, avoiding a global
+  interpreter's cold-start cost;
+- the first matching block logs `Compatibility CPU activated` so the device
+  run proves the profile actually matched;
+- Wine's TTY `Unhandled page fault` line now reveals X11 even if WineDbg fails
+  before creating a window; and
+- Saya-profile faults record a bounded snapshot with PID/thread, access kind,
+  EIP, mapped module/offset, general registers and 16 instruction bytes. The
+  limit is 64 and the logger is inactive for Notepad/ordinary launches.
+
+This is a compatibility experiment backed by the current evidence, not a
+claim that Saya reaches its menu. If build 31 still faults but never logs
+`Compatibility CPU activated`, the snapshot's module name supplies the exact
+fragment to use. If it activates and the same failure remains, the interpreter
+has ruled out ARM64 code generation and the snapshot becomes the next engine/
+WineD3D debugging target.
+
+**Verified locally:** the complete native core/runtime and Release app compile
+for iOS arm64; all 74 C++ tests, both CTest entries and all 30 dependency-pin
+checks pass. The validated app is `CFBundleVersion` 31. The smoke-tested
+unsigned IPA is `build/artifacts/BoxedVN-build31-unsigned.ipa`, SHA-256
+`c307b60ff3be4503912d221270869f2bbbb53e86c1c0b8aeb3b9b3edd50fb976`.
+Physical-device execution remains required.
+
+## 1ak. Build 31 restores an interactive X11 failure screen; build 32 targets the real PE range (2026-08-08)
+
+The build 31 device log `boxedvn-20260808-173247.log` proves the recovery path
+works. When Saya faults, BoxedVN detaches the live 800x600 Metal presentation
+surface and restores the SDL X11 compositor. The screenshot consequently has
+blue side areas and a black 4:3 guest viewport instead of a full-screen black
+layer. The built-in keyboard remains interactive and its key events continue
+to be logged. This is a failed game process on a functioning frontend/input
+loop, not an app or renderer hang.
+
+The CPU experiment did not actually run. The command correctly contained
+`-interpreterModule mvware`, but there is no `Compatibility CPU activated`
+marker. The fatal snapshot resolves EIP `0x7F444DDF` as `Unknown`, because
+Wine's anonymously mapped PE image does not appear in Boxedwine's Linux
+file-mapping names. The snapshot also gives the exact failing instruction and
+state: `F3 A4` (`REP MOVSB`), destination `EDI=0x03BD0000`, source
+`ESI=0x03BCFFFC`, and invalid count `ECX=0xFFE1D4F0`. The same write fault and
+nested WineDbg fault then occur. Build 31 therefore tested recovery and
+diagnostics, but did not rule the ARM64 translator in or out.
+
+Build 32 adds repeated `-interpreterRange START-END` support through
+`BVNLaunchArguments`, `StartUpArgs`, `KSystem` and `NormalCPU`. Saya selects
+the inclusive-start/exclusive-end range `0x7F300000–0x7F500000`, which covers
+both observed WineDbg/mvware EIPs (`0x7F3D1CD6` and `0x7F444DDF`). Range checks
+run before module-name resolution, and Saya no longer supplies the ineffective
+name selector, so ordinary Wine startup has no added mapped-file lookup. Only
+blocks decoded inside those 2 MiB receive `OP_FLAG_NO_JIT`; Wine, WineD3D and
+all code outside it keep ARM64 JIT. The first hit logs the exact range and EIP.
+
+This remains an evidence-bounded compatibility test. If build 32 reaches a
+frame/menu, the JIT translation of preceding mvware code caused the corrupt
+copy state. If the identical `REP MOVSB` state survives after the activation
+marker, the decoded interpreter has ruled that out and the investigation moves
+to the guest engine/WineD3D call state rather than widening interpreter use.
+
+**Verified locally:** the complete iOS arm64 native core and Release app
+compile; all 74 C++ tests, both CTest entries and all 30 dependency-pin checks
+pass. The validated app is `CFBundleVersion` 32. The smoke-tested unsigned IPA
+is `build/artifacts/BoxedVN-build32-unsigned.ipa`, SHA-256
+`5f3144495fa64aa72a8a09b07595c51bbc566390a55588bad5deb8885055a61e`.
+Physical-device execution remains required.
+
+## 1al. Build 32 passes the engine fault; build 33 exposes the real frame boundary (2026-08-08)
+
+The two build 32 logs `boxedvn-20260808-174955.log` and
+`boxedvn-20260808-175203.log` are deterministic and show forward progress, not
+a return of the old black-screen bug:
+
+- `-interpreterRange 7f300000-7f500000` is present and activates at
+  `7F444018` in both runs;
+- the former fatal `REP MOVSB` at `7F444DDF` does not recur;
+- the 113x2 capability surface remains offscreen, the launcher surface is
+  destroyed cleanly, and the X11 compositor is restored;
+- Start Game initializes D3D11 shaders, opens 44.1/48 kHz stereo audio, creates
+  two transient game swapchains and a final 1024x768 or 800x600 swapchain;
+- the final log line is PNG loading after that final surface. There is no
+  WineDbg window or unhandled engine exception.
+
+The full black picture came from SDL installing the final opaque
+`SDL_uikitmetalview` at surface creation. Build 32 had no observation at the
+actual `vkQueuePresentKHR` boundary, so it could not distinguish a healthy
+engine still preparing its first frame from a successful presentation whose
+contents were black.
+
+Build 33 adds that missing boundary and fixes the misleading UI state:
+
+- `vkCreateSwapchainKHR` records each host swapchain's owning surface in
+  `KVulkanSDL`; destroy removes the mapping;
+- the first queue submission is logged once, and each surface's first present
+  attempt (plus any failed attempt) records its Vulkan result;
+- a presentation Metal view starts with the Wine blue background and a native
+  animated `STARTING GAME / WAITING FOR THE FIRST VIDEO FRAME` overlay;
+- the first successful or suboptimal queue present dispatches one main-thread
+  callback that removes the overlay. Later frames have no UIKit callback or
+  added steady-state work.
+
+This is both a user-facing correction and the next high-value diagnostic. If
+the indicator remains, the guest never presented. If it disappears and black
+remains, UIKit/surface selection is exonerated and the next work is guest
+rendered content, shader output or multimedia playback.
+
+**Verified locally:** the full iOS arm64 native core and Release application
+compile and validate as `CFBundleVersion` 33; all 74 C++ tests, both CTest
+entries and all 30 dependency-pin checks pass. The smoke-tested unsigned IPA
+is `build/artifacts/BoxedVN-build33-unsigned.ipa`, SHA-256
+`c1b29ac654c1745512a99968d24ed1c123c41843cb19ba4e45d0a832d80755dd`.
+Physical-device presentation evidence remains required.
+
+## 1am. Build 33 isolates the final pre-render stop; build 34 restores engine JIT (2026-08-08)
+
+The build 33 device log `boxedvn-20260808-180757.log` proves the first-frame
+indicator worked and, crucially, separates successive game surfaces:
+
+- surface `0x15afbbe80` creates swapchain `0x158f47000`, submits one workload,
+  and presents successfully with `VK_SUBOPTIMAL_KHR`; the native indicator is
+  removed, then Wine destroys that transient surface normally;
+- Wine immediately creates final 800x600 surface `0x160dd8e00` and swapchain
+  `0x158f44c00`;
+- that final surface reaches one primitive-restart warning and PNG loading,
+  but never calls queue present. Its indicator therefore correctly remains;
+- there is no unhandled exception or recurrence of the old `REP MOVSB` fault.
+
+The broad `0x7F300000–0x7F500000` profile had achieved its diagnostic purpose:
+it proved interpreting the mvware engine removes the corrupt-copy fault. It
+also left the entire 2 MiB engine span on the decoded interpreter, including
+post-launch asset/render preparation. That is unsuitable for an interactive
+game and is now the strongest actionable cause of the silent pre-render stop.
+
+Build 34 keeps only two 64 KiB interpreter windows:
+`0x7F3D0000–0x7F3E0000` and `0x7F440000–0x7F450000`. They contain the two
+device-observed mvware failure sites while returning the other 1.875 MiB—93.75
+percent of the former compatibility span—to ARM64 JIT. A lightweight
+interpreter heartbeat logs every 25 million profiled instructions if either
+window is actively consuming CPU.
+
+Presentation diagnostics are now per surface rather than per Vulkan instance.
+Both `vkAcquireNextImageKHR` variants report the first acquire and failures;
+all three queue-submit entry points report the first submission for the newest
+live presentation surface; queue present remains tied to its exact swapchain.
+The next log can therefore distinguish engine/interpreter work, first-image
+acquisition, GPU submission and display without confusing a destroyed setup
+surface with the final game surface.
+
+**Verified locally:** the iOS arm64 native core and Release application compile
+and validate as `CFBundleVersion` 34; all 74 C++ tests, both CTest entries and
+all 30 dependency-pin checks pass. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build34-unsigned.ipa`, SHA-256
+`16af19b0fcbc0981352e668ffaa312e66b3d2d36bc169ffc7c4c4ec1c34c17f1`.
+Physical-device execution remains required.
+
+## 1an. Build 35 fixes the underlying REP MOVS JIT defect (2026-08-08)
+
+The build 34 device log `boxedvn-20260808-182111.log` closes the diagnostic
+gap. The transient surface acquires, submits and presents successfully. Wine
+then destroys it, creates the final 800x600 surface and swapchain, and executes
+25,000,000 compatibility-interpreter instructions at `0x7F444BDE` without
+ever reaching that surface's first acquire. The first-frame indicator was
+therefore accurate. The renderer and UIKit layer were waiting for guest CPU
+work; they were not the stall.
+
+Source inspection found the exact defect in `Jit::movsr`. Its optimized
+eight-byte copy path has a scalar fallback when source and destination overlap
+by fewer than eight bytes. Both forward and backward fallbacks branched while
+the invariant address-distance register was nonzero. Saya's captured
+instruction was `F3 A4` (`REP MOVSB`) with `EDI == ESI + 4`, so the condition
+could never become false. The loop continued after the requested count,
+underflowed `ECX`, and eventually produced build 31's
+`ECX=0xFFE1D4F0`/unmapped-write fault. Interpreting a surrounding range avoided
+that JIT loop, but build 34 proved the engine code around it is too hot to
+interpret.
+
+Build 35 makes both overlap fallbacks loop on `ECX`, preserving bytewise x86
+overlap propagation and terminating exactly at count zero. The Saya launch
+profile now installs no module or address-range interpreter selector: Wine,
+WineD3D and the entire game engine remain on ARM64 JIT. The CPU overlap test
+also runs twice so its second pass enters the optimized JIT path; previously it
+only verified the decoded-interpreter pass and could not catch this bug.
+
+**Local verification:** the 74-test BoxedVN support suite and both CTest
+entries pass. The full emulator test target and corrected JIT source compile
+for macOS x86_64. Its isolated `Test Movsb 0a4` and `Test Movsb 2a4` cases pass
+with the overlap regression executing a second, optimized-JIT pass; the 32-bit
+MOVSD overlap stage also returns before that test reaches its separate existing
+page-boundary coverage. The complete iOS arm64 native core and Release app
+compile and validate as `CFBundleVersion` 35. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build35-unsigned.ipa`, SHA-256
+`ec52ffa9e2e44001cab33947427a7f19bad528c33186a57526377c850a69fb76`.
+Physical-device main-menu evidence remains required; local macOS cannot
+reproduce the iOS Wine/MoltenVK stack.
+
+## 1ao. Build 35 reaches the final engine wait; build 36 upgrades Wine (2026-08-08)
+
+The build 35 device log `boxedvn-20260808-194648.log` confirms the JIT repair:
+there is no interpreter selector, compatibility heartbeat, underflowed `ECX`,
+or WineDbg fault. WineD3D initializes against the Apple A19 GPU. A transient
+800x600 game surface acquires, submits and presents successfully, then closes
+normally. The game creates its final 800x600 surface and swapchain, reaches
+shader setup and PNG asset loading, but never calls the first final-surface
+acquire. The first-frame indicator is therefore truthful; UIKit and Metal are
+waiting for guest-side engine or synchronization work.
+
+The root filesystem pin explains why another renderer patch is the wrong next
+move. BoxedVN was running Wine 10.0. WineHQ bug 50577 is specifically **Saya
+no Uta: hangs on RtlpWaitForCriticalSection**, with one thread waiting on a
+critical section held by thread `0024`; WineHQ lists it among the bugs fixed in
+[Wine 10.11](https://list.winehq.org/hyperkitty/list/wine-announce%40list.winehq.org/2025/6/).
+The device log's game/D3D work also runs on Wine thread `0024`. This is strong
+upstream evidence, not yet physical-device proof that the same lock is the
+only remaining stop.
+
+Build 36 changes the pinned default from Wine 10.0 to Boxedwine's checksummed
+Wine 11.0 root, which contains the 10.11 fix. A deliberately bundled runtime
+now takes precedence over an older imported archive, preventing an existing
+`Application Support/rootfs/boxedwine.zip` from silently keeping the test on
+Wine 10. Normal unbundled builds still use a user-imported root. Wine 10.0
+remains pinned as an explicit legacy fallback. Existing game content and the
+writable prefix are preserved so Wine can perform its normal prefix upgrade.
+
+The Wine 11 archive is the exact 162,748,254-byte upstream artifact and
+matches pinned SHA-256
+`41835c49ce0e582a1d7a610243a8e4a95bc59996fb780c09705dc476bb9b6493`.
+Its `wine.inf` identifies Wine 11.0 and its registry contains the entries
+BoxedVN's idempotent renderer/Bluetooth policy patches. All 74 support tests,
+both CTest entries and all 30 dependency-pin checks pass. The complete arm64
+iOS application builds and validates as `CFBundleVersion` 36 with the root
+present. The smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build36-wine11-unsigned.ipa`, SHA-256
+`27f01f41468b356b47d193dbd99f188b7c766e4327738e51fee780f8db03c415`.
+The embedded 162,748,254-byte `boxedwine.zip` hashes to the exact Wine 11 pin.
+
+## 1ap. Build 36 rules out Wine 10; build 37 fixes X11 raster ops and captures the wait (2026-08-08)
+
+The build 36 device log `boxedvn-20260808-203901.log` proves the bundled Wine
+11 runtime is active. Saya creates the launcher, destroys a transient 800x600
+presentation surface after a successful frame, then creates the final 800x600
+surface and swapchain. It reaches the same PNG-loading boundary as Wine 10,
+allocating roughly 2,432 JIT blocks without the old `REP MOVS` fault,
+interpreter range or WineDbg crash. The final surface still never attempts its
+first acquire. Wine 11 therefore controls the Wine-version variable and rules
+the Wine 10.0/10.11 critical-section bug out as the sole remaining cause.
+
+Immediately before the final stop, Boxedwine reports that X11 image raster
+functions 1 and 6 are unsupported. Those are `GXand` and `GXxor`; classic
+Win32/X11 masked drawing commonly composes those two operations. The old
+implementation silently skipped the AND operation and only had a special-case
+XOR path. Build 37 implements the complete 16-function X11 boolean raster set
+for `PutImage`, including correct plane-mask merging, and retains the direct
+copy fast path. A regression test covers every function plus masked `GXand`.
+
+Build 37 also makes a failed device run useful without another speculative
+patch. Each presentation surface owns a cancellable first-frame watchdog. If
+no successful present arrives, snapshots at 12 and 30 seconds enumerate every
+guest process/thread using atomically published dispatch-boundary EIP, stack
+pointers and dispatch counts. Active futex records include the guest address,
+operation, expected value, PID/TID and wait age. Comparing the two samples
+distinguishes active guest execution, a host-blocked emulation thread and a
+guest lock wait, while avoiding unsafe cross-thread reads of the live CPU
+register file.
+
+The 74-test support suite, both CTest entries and all 30 dependency-pin checks
+pass. The macOS emulator test target compiles, and its final 78-test fast slice
+passes with the new all-raster-operations regression included. The complete
+arm64 iOS core and Release application compile and validate as
+`CFBundleVersion` 37 with the exact pinned Wine 11 root bundled. The
+smoke-tested unsigned IPA is
+`build/artifacts/BoxedVN-build37-x11-watchdog-unsigned.ipa`, SHA-256
+`9a851016616a5aeead597064311a9b2d966b82e1801677a8f9bbeb522a46aae2`.
+Physical-device proof remains required because local macOS cannot reproduce
+the iOS Wine/MoltenVK presentation stack.
+
+## 1aq. Build 37's watchdog names the stall: MoltenVK pipeline compilation, starved by a guest getrusage spin; build 38 bounds both (2026-08-08)
+
+The build 37 device log `boxedvn-20260808-220230.log` is the first run that
+answers the question instead of restating it. Both automatic snapshots fired,
+at 12 and 30 seconds, and the comparison between them is decisive.
+
+In `Saya_en.exe` (pid `000A`, 16 threads), thread `0060` sits at guest EIP
+`12FDDE77` with dispatch count `67187` — **identical in both samples**. Zero
+dispatch-boundary progress across 18 seconds means the emulation thread is
+blocked inside a host call, not executing guest code. Resolving that address
+against the bundled 32-bit `lib/libvulkan.so.1` places it four instructions
+into `vkCreateGraphicsPipelines` (entry `0x9E6C`), on the block boundary
+created by its `__x86.get_pc_thunk` return, immediately before the `int $0x9A`
+host trap. Saya is blocked in graphics-pipeline creation.
+
+Meanwhile seven threads (`0065`–`006B`, minus `0069` at the 12-second sample)
+sit at `1051ACF5`, which resolves inside `__getrusage64` at the instruction
+following `int $0x80` with `EAX=0x4D` — `__NR_getrusage`. Each advanced by
+roughly 21.8 million dispatches over those 18 seconds, about 1.2 M/s per
+thread. Seven guest threads were spinning on a timing syscall, saturating the
+phone's cores, while one thread waited on a native Metal compile.
+
+Two independent defects, and build 38 addresses both:
+
+- **The wait was unbounded.** MoltenVK's `metalCompileTimeout` defaults to
+  effectively infinite, so a Metal compile that never calls back hangs the
+  caller forever rather than failing. `configureMoltenVKForWineD3D()` now sets
+  `MVK_CONFIG_METAL_COMPILE_TIMEOUT` to 20 s and disables
+  `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS`; WineD3D's D3D11 compatibility path
+  does not need bindless descriptor capacity. Both names and value types were
+  checked against the bundled MoltenVK 1.4.2 headers, where
+  `useMetalArgumentBuffers` is a `VkBool32` and `metalCompileTimeout` is
+  nanoseconds. The call runs before `boxedmain()`, which is required: MoltenVK
+  latches its configuration during first Vulkan initialization.
+- **The spin was uncontested.** On a real kernel every `getrusage` is also a
+  scheduling boundary; Boxedwine services it entirely in-process, so nothing
+  ever yields. `GetrusageFairness` (`include/getrusagefairness.h`) watches for
+  32 consecutive calls each within 5 ms of the previous, and only then inserts
+  a 1 ms host scheduling point per call. Normal `getrusage` use and Wine's
+  cold start pay nothing. The detector is a pure state machine, deliberately
+  separated from sleeping and logging so `ios/tests/test_getrusage_fairness.cpp`
+  can cover its transitions on the host. Activation is logged with PID/TID.
+
+`vk_CreateGraphicsPipelines` now logs an enter/exit pair per call with a
+monotonic call id, create-info count, per-info stage mask, topology,
+`primitiveRestart`, `rasterizerDiscard`, render pass and subpass, plus the
+measured duration. That converts the next run's outcome into a fact: either a
+call id enters and never exits, or it exits with a duration and a result. The
+same run already surfaced `VK_ERROR_FEATURE_NOT_PRESENT: Metal does not
+support disabling primitive restart` from MoltenVK, so the logged
+`primitiveRestart` field is the value to read first. The generated Vulkan
+bridge's pipeline marshalling was also given proper ownership and cleanup
+rather than leaking its nested create-info allocations per call.
+
+The 77-test support suite, both CTest entries and all dependency-pin checks
+pass. The complete arm64 iOS core and Release application compile and validate
+as `CFBundleVersion` 38 with the pinned Wine 11 root bundled. The smoke-tested
+unsigned IPA is `build/artifacts/BoxedVN-build38-unsigned.ipa`, SHA-256
+`215b14304202dd223e423fd1c5f44d8ab05cf78d08474ddf9a932b5bc55d907d`.
+
+Build 38 is a **diagnostic build as much as a fix**. Neither change is yet
+proven to produce a frame: if Metal compilation was merely starved, freeing
+seven cores may be sufficient; if it was genuinely wedged, the 20 s ceiling
+converts an indefinite hang into a logged error with a duration. Both outcomes
+are progress, and the enter/exit log distinguishes them. Physical-device proof
+remains required because local macOS cannot reproduce the iOS Wine/MoltenVK
+presentation stack.
+
+## 1ar. Build 38 clears the starvation and names the real defect: MoltenVK faults on a stage-less pipeline; build 39 refuses it and adds slim IPAs (2026-08-08)
+
+Build 38's device log `boxedvn-20260808-223549.log` separated the two variables
+cleanly, and one of them was a dead end.
+
+**The fairness throttle worked exactly as designed.** The seven spinning
+threads fell from roughly 21.8 million dispatches per 18 seconds to about
+88,000, and pipeline compilation immediately became healthy: call #1 took
+190.684 ms and calls #2, #3 and #4 took 0.230, 0.124 and 0.133 ms. So CPU
+starvation was real and is now fixed — but it was **not** the terminal hang.
+
+**The terminal hang is unchanged and now precisely located.** Thread `0054`
+sits in `vkCreateGraphicsPipelines` with dispatch count `66766`, identical in
+both snapshots, at `esp=0179E7F0 ebp=0179E7F8` — byte-for-byte the same stack
+as build 37's thread `0060`. Same guest location, both builds. The new
+per-call log names it: `call #5 enter: … info[0]: stages=0 mask=0x0
+topology=3 primitiveRestart=0 rasterDiscard=0 renderPass=0x152679E00`, with no
+matching exit. **A graphics pipeline with zero shader stages.**
+
+That was settled locally rather than with another device cycle. A 40-line host
+program built against the project's own `lib/mac/vulkan/lib/libMoltenVK.dylib`,
+submitting exactly that pipeline shape, dies with **`EXIT=139` — SIGSEGV**.
+MoltenVK does not validate `stageCount`; it builds a
+`MTLRenderPipelineDescriptor` with a nil vertex function and dereferences it.
+
+That also explains the two things that had not fit. First, why iOS *hangs*
+where macOS crashes: Boxedwine installs a `SIGSEGV` handler to service guest
+page faults, so a **host** fault raised inside a Vulkan call is delivered to a
+handler that cannot map it to guest memory, and the emulation thread wedges —
+`state=RUNNING`, zero dispatch progress, forever. Second, why build 38's 20 s
+`metalCompileTimeout` never fired: the thread never reached the shader
+compiler. Both symptoms follow from one cause.
+
+Build 39 therefore refuses the call rather than forwarding it.
+`include/vkpipelineguard.h` holds the decision as a pure, testable function:
+a non-library graphics pipeline with `stageCount == 0`, or a null `pStages`
+with a non-zero count, is rejected with `VK_ERROR_INITIALIZATION_FAILED`,
+every output handle is set to `VK_NULL_HANDLE`, and nothing is handed to
+MoltenVK. `VK_PIPELINE_CREATE_LIBRARY_BIT_KHR` is excluded, since a pipeline
+library may legitimately carry no stages. A rejected pipeline is a visible,
+recoverable guest error; a forwarded one freezes the process.
+
+The refusal also dumps the guest's 88-byte `VkGraphicsPipelineCreateInfo`
+verbatim. The decoded fields cannot distinguish "WineD3D really asked for a
+stage-less pipeline" from "the generated bridge mis-read the struct", and that
+distinction decides where the next fix belongs. The 32-bit layout and the
+`i * 88` stride were both re-derived by hand and match; calls #1–#4 decoding
+correctly is further evidence the reader is sound, which tilts toward WineD3D
+genuinely emitting it — most likely after an upstream shader-generation
+failure. The dump settles it either way.
+
+**Iteration cost.** `scripts/build-ios.sh --no-bundled-rootfs` omits the
+160 MB root filesystem, since `ios/app/Bundled` is already an optional
+resource directory and `Storage.activeRootFilesystem` already falls back to a
+user-imported archive. The result is a **3.7 MB IPA instead of 161 MB**. The
+stash is restored from an `EXIT` trap, so an interrupted build cannot lose the
+archive. Both forms of build 39 are packaged:
+`BoxedVN-build39-slim-unsigned.ipa` (3.7 MB) and
+`BoxedVN-build39-unsigned.ipa` (161 MB, SHA-256
+`2e3d0b3ff852ab35884c6a9d85a793866002d119ca5088ea258f770fa821717b`).
+
+81 host tests and all dependency-pin checks pass, including four new cases
+covering the guard's accept, both refusals and the pipeline-library exemption.
+
+What build 39 does **not** claim: refusing the pipeline removes the freeze, it
+does not by itself draw Saya's menu. If WineD3D needed that pipeline, the next
+symptom will be a missing or wrong frame rather than a hang — which is a
+better failure, and a legible one.
+
+## 1as. Build 39 removes the freeze and proves the bridge is innocent; the defect is WineD3D's shader translation (2026-08-08)
+
+Build 39's log `boxedvn-20260808-233036.log` did what it was built to do. The
+guard fired, the emulation thread never wedged, and the app stayed alive.
+
+**The byte dump settles the marshalling question.** The refused struct at guest
+address `0179E884` decodes exactly as written: `sType=0x1C`
+(`VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO`), `pNext=0`, `flags=0`,
+`stageCount=0`, `pStages=NULL`, then valid non-null pointers for every
+fixed-function state (`pVertexInputState=0x0179E8DC`,
+`pInputAssemblyState=0x0179E8FC`, viewport, raster, multisample, depth-stencil,
+colour blend, dynamic), a real `layout=0x1507A9700`, a real
+`renderPass=0x1507C2C80`, `subpass=0` and `basePipelineIndex=-1`. Nothing is
+garbage. **The generated Vulkan bridge reads the struct correctly; WineD3D
+genuinely emits a graphics pipeline with no shader stages.**
+
+The guest agrees, immediately after each refusal:
+`err:d3d:wined3d_context_vk_apply_draw_state Failed to get graphics pipeline.`
+and `err:d3d:adapter_vk_draw_primitive Failed to apply draw state.`
+
+**The stage histogram localises the defect precisely.** Across the run, 5
+pipelines carried `stages=2` and succeeded; 3,199 carried `stages=0` and were
+refused. The five that work are WineD3D's own internal blit/clear pipelines,
+whose SPIR-V ships pre-compiled inside wined3d. Every pipeline that needs a
+*game* shader — DXBC translated to SPIR-V by vkd3d-shader — arrives with
+nothing attached. Saya is a D3D11 title (`d3d11_device_CheckFormatSupport`
+stubs confirm it), so this is the whole rendering path.
+
+That also explains the reported flicker and eventual death: with every draw
+failing, the guest tore down and rebuilt its swapchain **489 times**, which is
+the loading-screen/black-screen oscillation, and the log carries 3,199 copies
+of a 264-character hex dump — write volume that competes with the frame loop
+it is measuring.
+
+Build 40 is therefore an instrumentation build, narrowly aimed:
+
+- `vkCreateShaderModule` now logs the first 32 calls and every failure with
+  code size, result and handle. This separates two very different defects that
+  look identical from outside: shader modules that never reach Vulkan at all
+  (translation failed inside the guest) versus modules Vulkan itself rejected.
+- The pipeline refusal, enter/info and exit logging are all rate-limited. The
+  first 32 calls and the first 8 refusals are traced in full; after that only
+  failures, compiles slower than 50 ms, and a refusal count every 512.
+- Games on the accelerated path launch with
+  `WINEDEBUG=warn+d3d_shader,err+d3d_shader,err+d3d`, because at Wine's default
+  verbosity the translation failure is silent and only its downstream symptom
+  is visible. A caller-supplied `WINEDEBUG` still wins, and plain Wine apps
+  such as the Notepad regression check are deliberately left unchanged.
+
+84 host tests and all 30 dependency-pin checks pass.
+
+**Honest status: Saya does not render, and build 40 does not claim to fix
+that.** It converts a silent failure into a named one. The freeze is gone and
+the process survives, but the cause — why vkd3d-shader produces no SPIR-V for
+this game's shaders — is not yet known, and is the one thing that stands
+between here and a menu.
+
+## 1at. Build 40 names the failure: WineD3D cannot parse the game's DXBC at all (2026-08-09)
+
+Build 40's log `boxedvn-20260809003044.log` isolated the defect to a single
+guest function, and the slim IPA path worked (the command line shows the
+imported `Library/Application Support/rootfs/boxedwine.zip`).
+
+The `d3d_shader` channel is unambiguous:
+
+```
+warn:d3d_shader:wined3d_shader_extract_from_dxbc Failed to parse DXBC, hr 0x80070057.   (335x)
+warn:d3d_shader:wined3d_shader_create_ps Failed to initialize pixel shader,  hr 0x80070057. (328x)
+warn:d3d_shader:wined3d_shader_create_vs Failed to initialize vertex shader, hr 0x80070057. (7x)
+```
+
+`0x80070057` is `E_INVALIDARG`. The failure is in **`extract_from_dxbc`** —
+container parsing — which happens *before* any SPIR-V translation. Every one of
+the game's 335 shaders is rejected. Only two shader modules ever reached
+Vulkan at all (`codeSize=504` and `codeSize=3320`), and those are wined3d's own
+pre-compiled internal blits, exactly matching the 5 successful `stages=2`
+pipelines from build 39. **No game shader ever becomes a Vulkan object.**
+
+Two hypotheses were tested locally and **both falsified**, which is worth
+recording so they are not revisited:
+
+- *Missing shader-compiler DLLs.* The rootfs's
+  `windows/system32/d3dcompiler_47.dll` is 3072 bytes, which looks like a stub.
+  It is not: modern Wine splits every module into a thin PE and a Unix
+  counterpart, and `opt/wine/lib/wine/i386-unix/d3dcompiler_47.dll.so` is
+  304,380 bytes with `wined3d.dll.so` at 3,574,668. The D3D stack is complete.
+- *A malformed container header.* Wine's tag check emits its own warning before
+  returning, and at `warn+d3d_shader` no such message appears. The blob is
+  reaching a working parser that rejects it for some other reason.
+
+So `E_INVALIDARG` is being produced inside vkd3d-shader, which reports on its
+own channel that build 40 did not capture. That single HRESULT covers several
+faults needing entirely different fixes — a blob that is not DXBC, a container
+whose checksum does not match its contents (which would indicate the bytes are
+corrupted in flight, and this port has already found one CPU defect of exactly
+that kind in build 35's `REP MOVS`), or an unsupported shader version.
+
+Build 41 therefore adds `warn+vkd3d,fixme+vkd3d,err+vkd3d` to the accelerated
+path's `WINEDEBUG`. These fire per shader rather than per draw, so the volume
+stays bounded. 84 host tests and all 30 pin checks pass.
+
+**Status: Saya still does not render.** Builds 38–41 have removed a CPU
+starvation stall, a MoltenVK fault that froze the process, and a false lead
+about the Vulkan bridge, and have narrowed a blank screen down to one guest
+function with a known HRESULT. The remaining question — why vkd3d-shader
+rejects every DXBC blob — is the last one between here and a menu, and build 41
+is built to answer it rather than guess at it.
+
+## 1au. Root cause found: Metal has no geometry shaders, so wined3d can never reach SM4; build 43 claims feature level 9_3 honestly (2026-08-09)
+
+Build 42's trace ends the search. Two adjacent shaders in
+`boxedvn-20260809005857.log` show the whole mechanism:
+
+```
+shader_dxbc_process_section Feature level 9 shader version 0ffff0200, 0ffff0201.
+shader_trace     ps_2_1
+shader_sm1_init Version: 0xffff0201.
+wined3d_shader_create_ps Created pixel shader 001EB9C0.        <- succeeds
+...
+shader_dxbc_process_section Skipping chunk 'RDEF'.
+shader_dxbc_process_section Skipping SM4+ shader.               <- refused
+shader_dxbc_process_section Skipping chunk 'STAT'.
+wined3d_shader_extract_from_dxbc Failed to parse DXBC, hr 0x80070057.
+```
+
+`0xffff0200`/`0xfffe0201` are `ps_2_0`/`vs_2_1`: these are `Aon9` chunks, the
+feature-level-9 fallback bytecode that `d3dcompiler` embeds in a
+`ps_4_0_level_9_x` shader. **Shaders carrying an Aon9 chunk are read and
+created successfully. Shaders with only an SM4 chunk have that chunk skipped,
+leaving nothing to parse, and fail with E_INVALIDARG.** wined3d is refusing
+shader model 4 outright, which the `float_const_count 256`/`224` values in the
+same trace corroborate - those are D3D9-era constant limits.
+
+The reason was confirmed locally, not inferred. A feature probe built against
+the project's own `libMoltenVK.dylib` reports:
+
+```
+geometryShader                         no
+tessellationShader                     YES
+```
+
+This is not a property of one GPU and not a MoltenVK defect: **Metal has no
+geometry shader stage at all**, so MoltenVK reports `geometryShader = false`
+on every device and always will. Direct3D 10 mandates geometry shaders, so
+wined3d's Vulkan adapter can never advertise shader model 4, and its DXBC
+reader therefore skips every SM4+ code chunk. This is the same wall that
+stopped DXVK in build 25, reached from the other side.
+
+So SM4 cannot be made to work here. What can be fixed is the **inconsistency**:
+the adapter was letting the game believe it had a capability the backend then
+refused. Build 43 writes `MaxShaderModelVS=3`, `MaxShaderModelPS=3` and
+`MaxShaderModelGS=0` under `Software\Wine\Direct3D` whenever the Vulkan
+renderer is selected, making the device honestly feature level 9_3. A title
+that ships `_level_9_x` shaders - as this one demonstrably does, since those
+are exactly the ones already succeeding - should then select the set that
+works. These keys can only lower a claimed capability, never raise one, so
+they cannot break a title that already renders. The cap is not applied to the
+software/GDI prefix, which has no reason to carry it.
+
+85 host tests and all 30 pin checks pass, including a check that the cap is
+written for the Vulkan path and absent from the GDI path.
+
+**This is the first change since build 38 that can plausibly produce a
+picture rather than a better error message.** It is still a hypothesis about
+the game's behaviour: it assumes Saya honours the reported feature level when
+choosing shaders. If it does, the draws that have been failing 3,199 times per
+run should start succeeding. If it ignores the feature level and asks for SM4
+regardless, the same shaders will fail and the answer is that this engine
+cannot run on Metal through wined3d at all - at which point the question
+becomes which renderer can, not how to fix this one.
+
+## 1av. Build 44 closes the fallback question: the engine links Direct3D 11 statically; build 45 reverts the probe (2026-08-09)
+
+Build 43's shader-model cap changed nothing. Both logs show identical counts to
+build 42 - 335 DXBC failures, 4 feature-level-9 shaders, 339 SM4 skips - and
+across an entire run **exactly four shaders are ever created, all shader model
+2** (2x `ps_2_1`, 2x `vs_2_1`). The cap was inert because wined3d had already
+computed SM3 on its own, and the game does not adapt to the feature level it is
+handed. That hypothesis is falsified; the four working shaders are incidental,
+almost certainly a video or blit helper, not evidence of a 9_x path.
+
+Build 44 disabled `d3d11`/`dxgi` to ask whether the engine has any other
+renderer. The answer is final:
+
+```
+err:module:import_dll Library d3d11.dll (which is needed by L"D:\Mware.dll") not found
+err:module:import_dll Library Mware.dll (which is needed by L"D:\Saya_en.exe") not found
+err:module:loader_init Importing dlls for L"D:\Saya_en.exe" failed, status c0000135
+```
+
+`Mware.dll` - the engine - imports `d3d11.dll` in its **PE import table**, so
+the loader resolves it before any game code runs. There is no software path and
+no DirectDraw path to fall back to. Build 45 reverts the override, since it can
+only prevent the game launching, and adds a regression test so it is not
+reintroduced. The full `d3d_shader` trace is also dialled back to `warn`, its
+job done.
+
+### Where this leaves the title
+
+The constraint is now fully characterised and none of it is a BoxedVN defect:
+
+1. `Mware.dll` links `d3d11.dll` statically - some Direct3D 11 implementation
+   must exist or the process will not start.
+2. The engine's rendering is 331 shader-model-4 shaders and it will not use
+   anything else.
+3. wined3d gates SM4 on Direct3D feature level 10, which mandates geometry
+   shaders.
+4. Metal has no geometry shader stage, so MoltenVK reports
+   `geometryShader = false` on every device, permanently. Verified locally
+   against the project's own `libMoltenVK.dylib`.
+
+So wined3d can never run this game on Metal, and no registry or prefix setting
+changes that. The remaining route is a **Direct3D 11 implementation that
+compiles SM4 without a geometry shader stage**, which is exactly what DXVK is:
+it translates DXBC to SPIR-V itself, and a vertex or pixel shader needs no GS
+stage to compile. The only blocker is that stock DXVK *requires* the
+`geometryShader` feature at device creation - the wall build 25 hit - which is
+precisely the requirement CodeWeavers relaxed to ship DXVK on macOS.
+
+That makes the next step concrete rather than exploratory: a 32-bit DXVK built
+with the geometry-shader requirement relaxed and its reported feature level
+decoupled from it, dropped in as `d3d11.dll`/`dxgi.dll` for this prefix. It
+needs a mingw-w64 + meson cross-build and a pinned dependency, and it is the
+one path that can put this engine on screen.
+
+## 1aw. DXVK patched for MoltenVK and cross-built; build 46 routes Direct3D 11 through it (2026-08-09)
+
+wined3d is out of the picture for this title, so build 46 replaces it. DXVK is
+architecturally different in the one way that matters: it translates DXBC to
+SPIR-V itself, and a vertex or pixel shader needs no geometry stage to compile.
+wined3d instead gates SM4 on Direct3D feature level 10, which mandates geometry
+shaders - a rule Metal can never satisfy.
+
+Reading DXVK 2.5.2's source made the patch far smaller than build 25 implied.
+`D3D11DeviceFeatures::GetMaxFeatureLevel()` never consults `geometryShader` at
+all; its lowest return is `D3D_FEATURE_LEVEL_10_1`, which already accepts
+shader model 4. The only blocker is `D3D11Device::GetDeviceFeatures()`, where
+DXVK's convention is that `= VK_TRUE` means *required* (and fails
+`checkFeatureSupport`) while `= supported.X` means *use if present*. Four
+requirements are unsatisfiable on Metal and all four are relaxed to optional:
+
+- `geometryShader` - no Metal stage exists;
+- `shaderCullDistance` - not exposed by MoltenVK;
+- `textureCompressionBC` - varies by Apple GPU family, so let DXVK fall back
+  per format rather than refuse a device;
+- `extTransformFeedback.transformFeedback` / `.geometryStreams` - backs D3D11
+  stream-output, which a 2D title never issues.
+
+Nothing else in `GetDeviceFeatures` is a hard requirement: everything above
+feature level 10_1 already uses `supported.`.
+
+The result is cross-built with mingw-w64 for i686. D3D9 and D3D8 are disabled
+because current mingw headers already define `_D3DDEVINFO_RESOURCEMANAGER`,
+which collides with DXVK's own copy - and the engine imports only `d3d11.dll`.
+Stripped, the modules land at 4.7 MB, 3.0 MB and 135 KB, essentially matching
+the stock builds, and ship in the app as a `Dxvk/` folder reference.
+
+Wiring reuses machinery Boxedwine already has. `installBundledDxvk()` copies
+the patched modules into the writable overlay at
+`/home/username/.wine/drive_c/dxvk`, skipping files whose size already matches
+so a relaunch does not recopy eight megabytes. Accelerated launches then pass
+`-dxvk 1`, and `StartUpArgs` maps that directory over system32 and sets
+`WINEDLLOVERRIDES=d3d11,d3d10core,d3d9,d3d8,dxgi=n,b` itself. Because only
+d3d11/dxgi/d3d10core are shadowed, d3d8 and d3d9 still resolve to the archive's
+stock DXVK.
+
+86 host tests and all 30 pin checks pass. The slim IPA is 6.5 MB.
+
+**Unproven on device.** MoltenVK previously rejected DXVK at the feature gate;
+these four relaxations are aimed exactly at that gate, but removing them can
+only reveal whatever DXVK asks for next. Boxedwine sets `DXVK_LOG_LEVEL=warn`,
+so if a requirement is still unmet the log will name it rather than fail
+silently - and if the gate is passed, DXVK compiles Saya's 331 SM4 shaders
+through a path that has never been reached before.
+
+## 1ax. Build 46 clears the DXVK feature gate; the next blocker is robustness2 (2026-08-09)
+
+Build 46's log is the first real forward step in the graphics stack since the
+problem was understood. The old refusal - `Minimum required feature level
+D3D_FEATURE_LEVEL_9_1 not supported`, which stopped build 25 - **is gone**.
+The prefix installer worked (`Installed the MoltenVK-compatible DXVK modules
+into drive_c/dxvk`), Boxedwine's `-dxvk 1` mapped them over system32, and DXVK
+got as far as calling `vkCreateDevice`. The four relaxed requirements were the
+right ones.
+
+It then failed one step later, and MoltenVK named the cause exactly:
+
+```
+[mvk-error] vkCreateDevice(): Requested physical device feature specified by the
+            1st flag in VkPhysicalDeviceRobustness2FeaturesKHR is not available
+[mvk-error] ... the 3rd flag in VkPhysicalDeviceRobustness2FeaturesKHR ...
+err:   D3D11InternalCreateDevice: Failed to create D3D11 device
+```
+
+The 1st and 3rd flags are `robustBufferAccess2` and `nullDescriptor`. MoltenVK
+advertises `VK_EXT_robustness2` but implements only the 2nd,
+`robustImageAccess2` - which is why the extension is present while two of its
+three features are not. DXVK requires both unconditionally.
+
+The downstream consequence is the crash in the screenshot. With no D3D11
+device, Wine fell back to wined3d (`wined3d_dll_init Using the Vulkan
+renderer`) and `mware+0x81cd6` dereferenced the null it was handed:
+`movl (%eax,%edx,4), %eax` with `EAX = 0`. The engine does not check the
+result of device creation.
+
+Build 47 relaxes both to optional. This one is a genuinely riskier change than
+the previous four, and upstream says so in the code: DXVK requires
+`nullDescriptor` because *"we no longer have a fallback for those in the
+backend"*, and `robustBufferAccess2` because it uses the robustness alignment
+properties. Relaxing them trades a guaranteed hard failure for possible
+misbehaviour if the title actually binds null resources - a bet worth taking
+for a 2D visual novel, since a device that exists can be diagnosed further and
+one that is never created cannot.
+
+`DXVK_LOG_LEVEL` is also raised from `warn` to `info` in `StartUpArgs`, so the
+next run prints DXVK's complete device-feature table. Discovering blockers one
+per device cycle is the expensive way to do this; the table names all of them
+at once.
+
+86 host tests and all 30 pin checks pass. The slim IPA is 6.5 MB.
+
+## 1ay. Build 47 reaches feature level 11_0; a stale-DLL bug in BoxedVN's own installer masked the fix (2026-08-09)
+
+Build 47's log contains the single most important line the graphics work has
+produced:
+
+```
+info:  D3D11InternalCreateDevice: Maximum supported feature level: D3D_FEATURE_LEVEL_11_0
+info:  D3D11InternalCreateDevice: Using feature level D3D_FEATURE_LEVEL_11_0
+```
+
+DXVK computes **feature level 11_0** on MoltenVK. Shader model 4 and 5 are
+accepted. This is precisely what wined3d could never do, and it confirms the
+central premise of the DXVK route: the geometry-shader stage is required only
+to *advertise* Direct3D 10, never to compile a vertex or pixel shader.
+
+Device creation nevertheless failed with the identical robustness2 error, and
+the cause was BoxedVN's own code, not DXVK or MoltenVK. `installBundledDxvk()`
+skipped any file whose size already matched the destination, on the stated
+reasoning that these modules only change when the app is replaced. That
+reasoning was wrong in the one case that mattered: relaxing two feature flags
+changed no code size at all, so the rebuilt `d3d11.dll` was byte-for-byte the
+same length (4,698,112) as build 46's. The installer skipped it and the device
+kept running the previous build, reporting the very error the rebuild fixed.
+
+Build 48 always overwrites. Copying roughly eight megabytes per launch is
+irrelevant beside Wine's cold start, and no "is it already there" shortcut is
+worth pinning a stale module. Two regression tests cover it: a same-size source
+must replace the destination, and a build shipping no DXVK must not be treated
+as an error. 88 host tests and all 30 pin checks pass.
+
+The robustness2 relaxation from build 47 is therefore still **untested**. It
+was compiled, but never reached the device.
+
+## 1az. A runnable macOS host, so the guest stack can be debugged locally (2026-08-09)
+
+Device round trips cost roughly fifteen minutes each and give one snapshot pair
+per run. `BOXEDVN_BUILD_MACOS_HOST=ON` now produces `boxedvn_macos`, a
+development-only executable that runs the same emulator core, the same
+generated Vulkan bridge and the same patched DXVK against the Mac's own
+MoltenVK - where lldb can attach and a rebuild is seconds.
+
+**The iOS Simulator cannot serve this purpose**, which is worth recording so it
+is not proposed again. The pinned MoltenVK xcframework contains exactly one
+slice, `ios-arm64`; there is no simulator slice, and this development Mac is
+Intel, so its simulator is x86_64. No Vulkan implementation can link into a
+simulator build here. That is why the project's simulator preset is named
+`ios-simulator-compile-check`: SDL2 simulator libraries exist, MoltenVK does
+not. The macOS MoltenVK at `lib/mac/vulkan/lib/libMoltenVK.dylib` is universal
+and already proven on this machine by the zero-stage and feature probes.
+
+Six things were needed, each a small gap rather than a design problem:
+
+- `BOXEDWINE_VULKAN` was defined only for iOS; the host needs the same bridge.
+- `kvulkanSDL.cpp` included `vulkan_core.h` under `BOXEDWINE_IOS` rather than
+  `BOXEDWINE_VULKAN`, so the host saw no `VK_SUCCESS`.
+- SDL2's Cocoa backends need the AppKit/CoreGraphics framework set, plus
+  OpenGL for `platform/mac/pixelformat.cpp` and CoreMIDI for the audio backend.
+- `platform/linux/platform.cpp` calls three Cocoa helpers under `__MACH__`.
+  Upstream defines them in its Xcode project behind a Swift bridging header,
+  and the device shim is written against UIKit, so the host got its own
+  minimal `ios/support/src/macos_host_platform.mm`.
+- `main()` already exists in `platform/sdl/knativesystem.cpp` for non-iOS
+  builds, so the executable only needs `-force_load` to pull it from the
+  archive.
+
+Verified end to end: the host loads the pinned root filesystem in 297 ms and
+launches `/bin/wine notepad`, proving the emulator core, filesystem, JIT and
+SDL paths all work outside the app.
+
+**Caveat that bounds what this can prove.** This Mac is Intel, so the host
+exercises Boxedwine's **x64** JIT, not the ARM64 one the phone uses. This port
+has already found one ARM64-specific codegen defect (build 35's `REP MOVS`).
+If the DXVK wedge is another, it will not reproduce here - and that
+non-reproduction would itself be evidence, pointing at the ARM64 JIT rather
+than at DXVK.
+
+Still missing: the game itself is not on this Mac, so Saya cannot yet be run
+locally.
+
 ## 8. Next actions, in order
 
-The status below is accurate as of build 5 (`ios/project.yml`
-`CURRENT_PROJECT_VERSION "5"`). Everything before "Run Wine Notepad" is done;
-Run Wine Notepad itself is what section 1j is about - **start there, not
-here**, until that is resolved.
+Executable memory, rootfs loading, Wine execution and 2D rendering are now
+device-proven. Game compatibility is next.
 
-1. **Resolve the freeze in section 1j** (see "Immediate next step" above) -
-   this blocks everything after it.
-2. **Import a root filesystem** through Settings and confirm the file lands in
-   Application Support. (This step itself is not known to be broken; it is
-   listed in order.)
-3. **Run Wine Notepad and get a real result** - not a freeze, not a silent
-   nothing: either it runs, or it fails with a specific, loggable reason. This
-   is the first real end-to-end test of rootfs mount, Linux kernel emulation,
-   Wine start, and framebuffer presentation.
-4. **Verify the session can exit** without force-quitting, and that the
-   library window comes back (`BVNFrontendShowLibrary`).
-5. **Import one DRM-free 32-bit visual novel** and run it.
-6. Only then: input refinement, audio verification, and the GLES renderer.
+1. **Install the bundled-runtime build 38, then reassign `universal.js` to the
+   newly installed BoxedVN in StikDebug.** Reinstalling or re-signing can change the target
+   identity; `JIT ready`/`CS_DEBUGGED` alone is insufficient.
+2. Launch Notepad once as a short regression check; build 27 already proves
+   this path after the script was reassigned.
+3. **Launch Saya directly.** The command must not contain
+   `-dxvk 1`. Prefix preparation must say `stale GDI/no-3D policy repaired`.
+   Confirm the 113x2 probe is logged as an `offscreen helper` and the launcher
+   replaces the old black screen; build 29 already proves this path.
+4. Confirm Settings reports **Bundled runtime**, proving embedded Wine 11 won
+   over any earlier imported Wine 10 archive. When the launcher appears,
+   confirm the command contains **no**
+   `-interpreterRange` or `-interpreterModule`, then press Start Game once.
+   The log should say the corrected `REP MOVS` overlap path is active and the
+   entire engine retains JIT. Success is the first frame or menu. The
+   `STARTING GAME / WAITING FOR THE FIRST VIDEO FRAME` indicator must replace
+   unexplained black until the first successful present. Export the complete
+   If it remains, leave it visible for **at least 60 seconds** — long enough
+   for both automatic thread/futex snapshots (12 s, 30 s) *and* build 38's 20 s
+   Metal compile ceiling to expire — then export the log. Do not reintroduce
+   an interpreter range or change resolution without that evidence.
+5. **Read the build 38 log in this order.** It is designed to answer the
+   pipeline question in one run:
+   a. `MoltenVK WineD3D policy:` confirms the configuration was applied before
+      Vulkan initialization. Its absence invalidates the rest of the run.
+   b. `iOS getrusage fairness activated` names the spinning PID/TIDs. Its
+      absence means the spin did not recur and CPU starvation is not the
+      variable under test this run.
+   c. `Vulkan graphics pipeline call #N enter` / `exit`. An `enter` with no
+      matching `exit` after 20 s means the ceiling did not take effect —
+      re-check (a). An `exit` with a large duration means compilation was
+      merely starved and is now completing. An `exit` with a non-zero result
+      means MoltenVK rejected the pipeline, and the `primitiveRestart` and
+      `topology` fields logged with that call id name the reason.
+   d. Only if a pipeline is rejected for primitive restart: the fix belongs in
+      WineD3D's input-assembly state, not in another emulator-side guess.
+6. Do not block graphics work on the remaining cold-start delay. The warm
+   evidence supports a later persistent Wine prewarm/reuse design.
+7. Type in Notepad once to confirm the simplified keyboard still handles
+   Shift, Space, Backspace, Enter and **HIDE** without native-keyboard flicker.
+8. While Notepad is running, turn the phone both ways. The guest must remain
+   landscape and responsive; live guest rotation is deliberately disabled.
+9. **Launch Notepad a second time in the same app process.** Build 16 proves
+   one guest can return, but not that SDL/Boxedwine can initialize twice.
+10. Test its title screen, text rendering, touch input, audio, save and load.
+11. Only then: compatibility fixes required by the game and an accelerated
+   renderer for Direct3D/OpenGL titles. The old `source/opengl/es` shim is an
+   experimental 2018 path and must not be enabled blindly.
 
 ## 9. Known open questions
 
-- **What actually froze during "Run Wine Notepad"?** Section 1j fixes the
-  *symptom* (a hang can no longer block the whole app) without yet
-  identifying the *cause*. The most direct path to an answer is the session
-  log from the freeze itself - see section 1j's "Immediate next step".
+- **Was Saya's pipeline compile starved, or genuinely wedged?** Build 37's
+  snapshots prove thread `0060` made zero dispatch progress inside
+  `vkCreateGraphicsPipelines` for 18+ seconds while seven sibling threads
+  spun on `getrusage`. That is consistent with both CPU starvation of the
+  Metal compiler and an internal MoltenVK stall. Build 38 changes both
+  variables at once — deliberately, because each alone costs a device cycle —
+  so the enter/exit duration log, not the outcome, is what separates them.
+- **Does WineD3D request a pipeline Metal cannot express?** The same run shows
+  `VK_ERROR_FEATURE_NOT_PRESENT: Metal does not support disabling primitive
+  restart`. MoltenVK reports that during pipeline construction and continues,
+  so it is not proven to be the stall — but if build 38's logged
+  `primitiveRestart` field is `0` on the failing call id, this is a real
+  WineD3D/MoltenVK incompatibility and belongs in input-assembly state, not
+  in the emulator.
+- **Why do seven Wine threads poll `getrusage` at ~1.2 M dispatches/second?**
+  The fairness throttle is a mitigation, not an explanation. Identical
+  per-thread counts point at a worker pool spin-waiting on the loading thread.
+  If build 38 produces a frame, this stops mattering; if it does not, the
+  spin's origin is the next thing to name.
+- **Which cold initialization stage owns the 57–61 second pause?** Build 24
+  proves it is not removed by disconnecting winebus. A subsequent guest starts
+  in seconds inside the same process. Optimize with process reuse/prewarm or a
+  real profile after graphics works.
+- **Will GetMoreRam change the running signature and usable headroom?** Build
+  26 reports both the signed `increased-memory-limit` entitlement and
+  `os_proc_available_memory()` on the home/status screens. The first attempt
+  remained `Standard limit` with 3.29 GB headroom, proving that signing path
+  did not authorize the entitlement. Do not infer success from GetMoreRam's
+  UI; only the installed signature and changed headroom count.
+- **What Japanese profile does Saya need?** Build 19 uses an English ACP 1252
+  prefix and no CJK font, and its error dialog is mojibake. First retest the
+  corrected working directory. If needed after that, add a real per-game ACP
+  932/locale/font profile rather than globally changing every Wine prefix.
+- **Does import-as-copy complete where open-in-place failed?** Build 18 proved
+  scene ownership alone does not. The direct Documents route means the answer
+  cannot block game import.
+- **Does landscape remain locked through physical device turns?** Build 16
+  proves SDL starts with correct landscape geometry, but the latest report did
+  not explicitly confirm turning the phone during that session.
+- **What resolution does Fruit of Grisaia actually request?** The 800x600
+  Notepad profile is intentionally 4:3 and leaves blue side area. Choose a
+  per-game default from the executable's real behavior rather than stretching.
 - **Does `boxedmain()` survive being called twice?** The design returns to the
   library UI after a session and allows another launch. Boxedwine calls
   `SDL_Init`/`SDL_Quit` inside that span. If a second session breaks, the
@@ -842,9 +2778,11 @@ here**, until that is resolved.
   force-closing" criterion. **Untested.**
 - **Does SDL 2.32.10's UIKit backend cooperate with a second `UIWindow`?**
   The library window sits below SDL's. Untested on device.
-- **Memory.** Boxedwine reserves a large guest address space. The
-  `increased-memory-limit` entitlement is requested but free-Apple-ID signing
-  strips it. Whether the app survives on a 4 GB device is unknown.
+- **Memory.** Boxedwine reserves a large guest address space. Build 26 detects
+  whether `increased-memory-limit` survived signing and reports current
+  process headroom. The tested GetMoreRam/signing route did not preserve it;
+  another provisioning method would need to prove both a signed entitlement
+  and meaningfully greater headroom before BoxedVN treats it as enabled.
 - **`kpanic` kills the process.** `internal_kpanic` calls `exit(1)`. The log
   file captures the message first because stdout/stderr are redirected
   unbuffered, but the app does die. Acceptable for the MVP; noted in

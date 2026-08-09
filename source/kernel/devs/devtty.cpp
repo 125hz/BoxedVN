@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 
 #include "../../io/fsvirtualopennode.h"
+#include "knativesystem.h"
 
 #include UNISTD
 #include <stdio.h>
@@ -117,6 +118,19 @@ void DevTTY::writeTermios(KMemory* memory, U32 address) {
 
 U32 DevTTY::writeNative(U8* buffer, U32 len) {
     BString s = BString::copy((char*)buffer, len);
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_VULKAN)
+    if (s.contains("Unhandled page fault", true)) {
+        // Wine has already decided this exception is unhandled, but WineDbg
+        // can itself fault before mapping a window. Do not leave the failed
+        // application's still-live Metal layer permanently above X11.
+        KVulkanPtr vulkan = KNativeSystem::getVulkan();
+        if (vulkan) {
+            klog("Wine reported an unhandled page fault; revealing X11 while "
+                 "the debugger starts");
+            vulkan->revealX11ForDiagnostic(nullptr);
+        }
+    }
+#endif
     // winemenubuilder was removed because it is not necessary and this will speed up start time
     if (s.contains("winemenubuilder")) {
         return len;

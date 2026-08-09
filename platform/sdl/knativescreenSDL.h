@@ -92,6 +92,13 @@ public:
     void warpMouse(int x, int y) override;
     bool isVisible() override;
 
+#ifdef BOXEDWINE_IOS
+    // Guest controls are rendered and hit-tested in SDL's logical coordinate
+    // space. UIKit's run loop is not serviced while boxedmain owns the main
+    // thread, so UIKit views cannot safely own these controls.
+    bool handleGuestControlMouseButton(bool down, U32 button, int x, int y);
+#endif
+
     bool clipboardIsTextAvailable() override;
     BString clipboardGetText() override;
     void clipboardSetText(const char* text) override;
@@ -129,6 +136,23 @@ private:
     SDL_Window* window = nullptr;
     SDL_Renderer* renderer = nullptr;
     U32 additionalSDLWindowFlags = 0;
+
+#ifdef BOXEDWINE_IOS
+    bool guestLoadingVisible = false;
+    bool keyboardButtonPressed = false;
+    bool guestVirtualKeyboardVisible = false;
+    bool guestVirtualKeyboardShift = false;
+    bool guestVirtualKeyboardPressed = false;
+    int guestOutputWidth = 0;
+    int guestOutputHeight = 0;
+
+    SDL_Rect guestKeyboardButtonRect() const;
+    void drawIOSGuestLoading();
+    void drawIOSGuestKeyboardButton();
+    void drawIOSGuestVirtualKeyboard();
+    bool handleIOSGuestVirtualKeyboardTap(int x, int y);
+    void syncIOSGuestPresentation(const char* reason);
+#endif
 
     void recreateMainWindow();
     void destroyMainWindow();

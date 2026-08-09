@@ -7022,10 +7022,19 @@ void startNewJIT(CPU* cpu, U32 address, DecodedOp* op) {
     data.doJIT(address, op);
 }
 
-static void clearArmJitBlockEntries(void* opaque) noexcept {
-    const std::vector<void*>& jitOps = *static_cast<const std::vector<void*>*>(opaque);
+struct ClearArmJitBlockEntriesContext {
+    const std::vector<void*>* jitOps;
+    U8* executableStart;
+};
+
+static void clearArmJitBlockEntries(void* writableAddress, void* opaque) noexcept {
+    const ClearArmJitBlockEntriesContext& context =
+        *static_cast<const ClearArmJitBlockEntriesContext*>(opaque);
+    const std::vector<void*>& jitOps = *context.jitOps;
+    U8* writableStart = static_cast<U8*>(writableAddress);
     for (void* p : jitOps) {
-        ::memset(p, 0, 4);
+        const ptrdiff_t offset = static_cast<U8*>(p) - context.executableStart;
+        ::memset(writableStart + offset, 0, 4);
     }
 }
 
@@ -7033,7 +7042,8 @@ void clearJitBlock(const std::vector<void*>& jitOps) {
     U8* start = (U8*)jitOps[0];
     U8* end = (U8*)jitOps[jitOps.size() - 1];
     U32 len = static_cast<U32>(end - start) + 4;
-    Platform::writeCodeToMemory(start, len, clearArmJitBlockEntries, const_cast<std::vector<void*>*>(&jitOps));
+    ClearArmJitBlockEntriesContext context{&jitOps, start};
+    Platform::writeCodeToMemory(start, len, clearArmJitBlockEntries, &context);
 }
 
 #endif

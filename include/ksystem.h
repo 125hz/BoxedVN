@@ -155,6 +155,11 @@ public:
     static bool forceRelativeMouse;
     static bool cacheReads;
     static bool disableWasmJitForWrittenCode;
+    // Module-name fragments that must use the decoded interpreter while the
+    // rest of the guest continues through the native JIT. Used by bounded
+    // compatibility profiles for engines with a suspected translator fault.
+    static std::vector<BString> interpreterModules;
+    static std::vector<std::pair<U32, U32>> interpreterRanges;
     static bool useF64;
     static U32 pageSize;
     static bool canJitUse4KPage;
@@ -175,6 +180,7 @@ public:
     static U32 getRunningProcessCount();
     static U32 getProcessCount();
     static void printStacks();
+    static void logThreadSnapshot(const char* reason);
     static void wakeThreadsWaitingOnProcessStateChanged();    
 
     // syscalls

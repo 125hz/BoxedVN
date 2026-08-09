@@ -68,6 +68,50 @@ struct JITReport {
     }
 }
 
+// MARK: - Memory entitlement
+
+struct MemoryReport {
+    enum EntitlementStatus {
+        case unknown
+        case disabled
+        case enabled
+    }
+
+    var entitlement: EntitlementStatus
+    var availableBytes: UInt64
+    var physicalMemoryBytes: UInt64
+    var detail: String
+
+    var statusText: String {
+        switch entitlement {
+        case .enabled: return "Increased limit signed"
+        case .disabled: return "Standard limit"
+        case .unknown: return "Could not verify"
+        }
+    }
+
+    var availableText: String {
+        ByteCountFormatter.string(fromByteCount: Int64(availableBytes),
+                                  countStyle: .memory)
+    }
+
+    static func probe() -> MemoryReport {
+        let report = BVNMemoryProbe()
+        let status: EntitlementStatus
+        switch report.increasedMemoryLimit {
+        case BVNMemoryEntitlementEnabled: status = .enabled
+        case BVNMemoryEntitlementDisabled: status = .disabled
+        default: status = .unknown
+        }
+        return MemoryReport(
+            entitlement: status,
+            availableBytes: report.availableBytes,
+            physicalMemoryBytes: report.physicalMemoryBytes,
+            detail: report.detail.map(String.init(cString:)) ?? ""
+        )
+    }
+}
+
 // MARK: - Version
 
 /// Identifies exactly which build is installed.
@@ -124,11 +168,14 @@ enum Storage {
         directory(BVNPathBundledRootFilesystemZip())
     }
 
-    /// The root filesystem archive BoxedVN will actually use: an imported one
-    /// if present, otherwise the bundled one.
+    /// The root filesystem archive BoxedVN will actually use. A deliberately
+    /// bundled runtime is authoritative for that build; otherwise use the
+    /// archive imported by the user. This ordering is important for runtime
+    /// migrations: an older imported Wine 10 archive must not silently mask a
+    /// Wine 11 archive included to fix a known guest compatibility failure.
     static var activeRootFilesystem: URL? {
-        if let imported = importedRootFilesystem { return imported }
-        return bundledRootFilesystem
+        if let bundled = bundledRootFilesystem { return bundled }
+        return importedRootFilesystem
     }
 
     static var importedRootFilesystem: URL? {

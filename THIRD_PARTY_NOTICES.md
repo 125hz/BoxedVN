@@ -1,8 +1,10 @@
 # Third-party notices
 
-BoxedVN is a port of [Boxedwine](https://github.com/danoon2/Boxedwine) and is
-distributed under the **GNU General Public License, version 2** (see
-`license.txt`). Everything listed here is compatible with GPLv2 distribution.
+BoxedVN is a port of [Boxedwine](https://github.com/danoon2/Boxedwine). Its
+source headers grant the **GNU General Public License, version 2 or later**
+(the repository includes GPLv2 in `license.txt`). Builds that statically link
+Apache-2.0 MoltenVK must use the GPLv3 option for combined distribution;
+Apache-2.0 is not compatible with GPLv2-only distribution.
 
 Two groups: libraries **vendored in this repository** under `lib/`, inherited
 from upstream Boxedwine, and dependencies **downloaded at build time**, pinned
@@ -20,7 +22,7 @@ those are.
 |---|---|
 | Upstream | https://github.com/danoon2/Boxedwine |
 | Commit | `379bf2414a67fc6509d506a6eefdf6ffa7ebf82d` (2026-08-05), version `26R2` |
-| Licence | GNU General Public License v2 (`license.txt`) |
+| Licence | GNU General Public License v2 or later (`license.txt` contains v2) |
 | Copyright | © 2012-2026 The BoxedWine Team |
 | In the iOS build | **yes** — this is the emulator |
 
@@ -97,6 +99,21 @@ redeclared in `ios/runtime/src/BVNAppDelegate.mm`, pinned to this SDL version.
 Generates `ios/BoxedVN.xcodeproj` from `ios/project.yml`. Nothing from it ends
 up in the app.
 
+### MoltenVK 1.4.2
+
+| | |
+|---|---|
+| Source | https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar |
+| SHA-256 | `b5d947b1660e6e9fed40b9cd2387e160aaab9e80b775c0cef7e14059405178c1` |
+| Licence | Apache License 2.0 — combined static distribution uses Boxedwine's GPLv3 option |
+| Copyright | © 2015-2026 The Brenwill Workshop Ltd. and Khronos Group contributors |
+| In the iOS build | **yes**, statically linked; implements Vulkan over Metal |
+
+The official Khronos iOS arm64 static XCFramework is linked into BoxedVN. SDL
+creates its `CAMetalLayer` surface and Boxedwine forwards guest Vulkan calls to
+MoltenVK. No dynamic framework is embedded or separately signed. The official
+MoltenVK `LICENSE` and this notice file are copied into the app resources.
+
 ---
 
 ## Root filesystem archives
@@ -126,16 +143,19 @@ warning when used.
 ## Not used
 
 For the avoidance of doubt, BoxedVN contains no code from, and no dependency
-on: DXVK, VKD3D, MoltenVK, D3DMetal, Box64, FEX, Hangover, UTM, or the
+on: VKD3D, D3DMetal, Box64, FEX, Hangover, UTM, or the
 experimental `zaiahgaming/boxedwine-ios` repository. UTM's public
 documentation of iOS JIT behaviour informed the design of
 `ios/runtime/src/BVNJIT.mm` and the entitlement set; no UTM code was copied.
+DXVK is supplied by the separately downloaded Boxedwine Wine rootfs, not by
+the BoxedVN IPA; MoltenVK is the pinned static dependency documented above.
 
 ---
 
 ## Attribution requirements
 
-If you redistribute BoxedVN you must comply with GPLv2 (`license.txt`),
-including offering the complete corresponding source. The permissive licences
-above additionally require their copyright notices to be preserved; this file
-and the licence files under `lib/` satisfy that.
+If you redistribute a build without MoltenVK, comply with GPLv2 or a later
+version, including offering complete corresponding source. A build statically
+containing Apache-2.0 MoltenVK must use GPLv3 for the combined work. The
+permissive licences additionally require their notices to be preserved; the
+app bundles MoltenVK's license and this notice file.

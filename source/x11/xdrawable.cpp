@@ -19,6 +19,35 @@
 #include "boxedwine.h"
 #include "x11.h"
 
+U32 x11ApplyRasterOperation(U32 source, U32 destination, S32 function,
+	U32 planeMask) {
+	U32 result;
+	switch (function) {
+	case GXclear: result = 0; break;
+	case GXand: result = source & destination; break;
+	case GXandReverse: result = source & ~destination; break;
+	case GXcopy: result = source; break;
+	case GXandInverted: result = ~source & destination; break;
+	case GXnoop: result = destination; break;
+	case GXxor: result = source ^ destination; break;
+	case GXor: result = source | destination; break;
+	case GXnor: result = ~(source | destination); break;
+	case GXequiv: result = ~(source ^ destination); break;
+	case GXinvert: result = ~destination; break;
+	case GXorReverse: result = source | ~destination; break;
+	case GXcopyInverted: result = ~source; break;
+	case GXorInverted: result = ~source | destination; break;
+	case GXnand: result = ~(source & destination); break;
+	case GXset: result = 0xffffffff; break;
+	default:
+		// XChangeGC rejects values outside the protocol range. Preserve the
+		// drawable if a malformed client nevertheless reaches this path.
+		result = destination;
+		break;
+	}
+	return (destination & ~planeMask) | (result & planeMask);
+}
+
 XDrawable::XDrawable(U32 width, U32 height, U32 depth, const VisualPtr& visual, bool isWindow, bool isPBuffer) : id(XServer::getNextId()), isWindow(isWindow), isPBuffer(isPBuffer), depth(depth), visual(visual), w(width), h(height) {
 	data = nullptr;
 	setSize(width, height);
@@ -88,9 +117,6 @@ void XDrawable::setSize(U32 width, U32 height) {
 }
 
 int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage* image, S32 src_x, S32 src_y, S32 dest_x, S32 dest_y, U32 width, U32 height) {
-	if (gc->values.function != GXcopy) {
-		kwarn_fmt("XPixmap::putImage function not supported %d", gc->values.function);
-	}
 	return copyImageData(thread, gc, image->data, image->bytes_per_line, image->bits_per_pixel, src_x, src_y, dest_x, dest_y, width, height);
 }
 
@@ -119,7 +145,9 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 	}
 	U32 copyPerLine = (bits_per_pixel * width + 7) / 8;
 
-	if (!gc || gc->values.function == GXcopy) {
+	const S32 rasterFunction = gc ? gc->values.function : GXcopy;
+	const U32 planeMask = gc ? gc->values.plane_mask : 0xffffffff;
+	if (rasterFunction == GXcopy && planeMask == 0xffffffff) {
 		for (U32 y = 0; y < height; y++) {
 			if (!memory->canRead(src, copyPerLine)) {
 				return BadValue;
@@ -128,15 +156,44 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 			src += bytes_per_line;
 			dst += this->bytes_per_line;
 		}
-	} else if (gc->values.function == GXxor && bits_per_pixel == 32) {
+	} else if (bits_per_pixel == 32) {
 		for (U32 y = 0; y < height; y++) {
 			if (!memory->canRead(src, copyPerLine)) {
 				return BadValue;
 			}
 			U32* dstPixel = (U32*)dst;
 			for (U32 x = 0; x < width; x++) {
-				dstPixel[x] ^= memory->readd(src + x * 4);
+				dstPixel[x] = x11ApplyRasterOperation(
+					memory->readd(src + x * 4), dstPixel[x],
+					rasterFunction, planeMask);
 			}			
+			src += bytes_per_line;
+			dst += this->bytes_per_line;
+		}
+	} else {
+		// Boxedwine's current X11 visual is 32-bit, but keep the operation
+		// correct for byte-aligned fallback visuals as well. Applying the
+		// boolean operation bytewise is equivalent to applying it per pixel.
+		const U32 bytesPerPixel = (U32)bits_per_pixel / 8;
+		if (!bytesPerPixel || bits_per_pixel % 8) {
+			return BadMatch;
+		}
+		for (U32 y = 0; y < height; y++) {
+			if (!memory->canRead(src, copyPerLine)) {
+				return BadValue;
+			}
+			for (U32 x = 0; x < width; x++) {
+				for (U32 byte = 0; byte < bytesPerPixel; byte++) {
+					const U32 shift = byte * 8;
+					const U8 sourceByte = memory->readb(
+						src + x * bytesPerPixel + byte);
+					const U8 maskByte = (U8)(planeMask >> shift);
+					dst[x * bytesPerPixel + byte] = (U8)
+						x11ApplyRasterOperation(sourceByte,
+							dst[x * bytesPerPixel + byte],
+							rasterFunction, maskByte);
+				}
+			}
 			src += bytes_per_line;
 			dst += this->bytes_per_line;
 		}

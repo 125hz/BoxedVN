@@ -25,6 +25,14 @@ BOXEDVN_XCODEGEN_VERSION="2.46.0"
 BOXEDVN_XCODEGEN_URL="https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
 BOXEDVN_XCODEGEN_SHA256="4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
 
+# --- MoltenVK ---------------------------------------------------------------
+# Boxedwine forwards guest Vulkan to the host. MoltenVK implements that host
+# Vulkan API over Metal on iOS. Use Khronos's official static arm64 package so
+# no dynamic framework needs to be embedded or separately signed.
+BOXEDVN_MOLTENVK_VERSION="1.4.2"
+BOXEDVN_MOLTENVK_URL="https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar"
+BOXEDVN_MOLTENVK_SHA256="b5d947b1660e6e9fed40b9cd2387e160aaab9e80b775c0cef7e14059405178c1"
+
 # --- Boxedwine root filesystems ---------------------------------------------
 # Boxedwine runs a real 32-bit Wine inside an emulated Linux and needs a root
 # filesystem to do it.  These are upstream Boxedwine's own TinyCore + Wine
@@ -37,9 +45,9 @@ BOXEDVN_XCODEGEN_SHA256="4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368be
 # been licence-reviewed; see docs/BUILD_IOS.md.
 #
 # Each entry is "<id>|<url>|<sha256>|<bytes>|<description>".
-BOXEDVN_ROOTFS_DEFAULT="wine10"
+BOXEDVN_ROOTFS_DEFAULT="wine11"
 
 BOXEDVN_ROOTFS_ENTRIES=(
-  "wine10|https://boxedwine.org/v2/5/TinyCore15Wine10.0.zip|f0ed13eaf0c11bc95b229e2a747f04167c4e63445dc274d122758bd7e84b5572|156582181|TinyCore 15 with Wine 10.0 (default; the version BoxedVN is tested against)"
-  "wine11|https://boxedwine.org/v2/7/TinyCore15Wine11.0.zip|41835c49ce0e582a1d7a610243a8e4a95bc59996fb780c09705dc476bb9b6493|162748254|TinyCore 15 with Wine 11.0 (newest upstream build)"
+  "wine10|https://boxedwine.org/v2/5/TinyCore15Wine10.0.zip|f0ed13eaf0c11bc95b229e2a747f04167c4e63445dc274d122758bd7e84b5572|156582181|TinyCore 15 with Wine 10.0 (legacy fallback; Song of Saya hangs on this Wine release)"
+  "wine11|https://boxedwine.org/v2/7/TinyCore15Wine11.0.zip|41835c49ce0e582a1d7a610243a8e4a95bc59996fb780c09705dc476bb9b6493|162748254|TinyCore 15 with Wine 11.0 (default; includes Wine's Song of Saya critical-section fix)"
 )

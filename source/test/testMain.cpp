@@ -148,6 +148,7 @@ void testInotifyPollReportsChildDirectoryDelete();
 void testInotifyAsyncSignalsSigioOnDelete();
 void testStartupArgsDefaultUtf8LocaleEnvironment();
 void testTerminatingThreadDoesNotEnterFutexWait();
+void testX11RasterOperationsAndPlaneMask();
 void testUnixSocketPollOutClearsPeerCondition();
 void testUnixSocketSendmsgStreamPayloadCanBeRead();
 void testUnixSocketWritevInvalidSecondIovAfterZeroLengthFirstReturnsEfault();
@@ -955,6 +956,7 @@ const TestEntry TEST_ENTRIES[] = {
 #ifdef BOXEDWINE_MULTI_THREADED
     {testTerminatingThreadDoesNotEnterFutexWait, "Test terminating thread does not enter futex wait"},
 #endif
+    {testX11RasterOperationsAndPlaneMask, "Test all X11 raster operations and plane masks"},
     {testUnixSocketPollOutClearsPeerCondition, "Test Unix socket POLLOUT poll cleanup removes peer condition"},
     {testUnixSocketSendmsgStreamPayloadCanBeRead, "Test Unix socket stream sendmsg payload can be read"},
     {testUnixSocketWritevInvalidSecondIovAfterZeroLengthFirstReturnsEfault, "Test Unix socket writev invalid second iov after zero-length first returns EFAULT"},

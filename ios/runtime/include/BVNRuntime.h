@@ -145,6 +145,30 @@ BVNJITReport BVNJITProbeStatus(void);
 BVNJITReport BVNJITProbeExecute(void);
 
 // ---------------------------------------------------------------------------
+// Signed memory entitlement and current process budget
+// ---------------------------------------------------------------------------
+
+typedef enum {
+    BVNMemoryEntitlementUnknown = 0,
+    BVNMemoryEntitlementDisabled = 1,
+    BVNMemoryEntitlementEnabled = 2,
+} BVNMemoryEntitlementStatus;
+
+typedef struct {
+    // Read from this running process's kernel-validated code-signature blob,
+    // not from the source .entitlements file in the repository.
+    BVNMemoryEntitlementStatus increasedMemoryLimit;
+    // Current dirty-memory headroom reported by os_proc_available_memory().
+    // It is a changing snapshot, not the device's total RAM.
+    uint64_t availableBytes;
+    uint64_t physicalMemoryBytes;
+    const char* detail;
+} BVNMemoryReport;
+
+// Safe and side-effect free. Suitable for the library screen and its timer.
+BVNMemoryReport BVNMemoryProbe(void);
+
+// ---------------------------------------------------------------------------
 // Storage layout
 //
 // Every accessor returns an absolute path to a directory that has already been
@@ -168,6 +192,10 @@ const char* BVNPathCaches(void);
 // when the build was made without one (see scripts/fetch-rootfs.sh and the
 // BOXEDVN_BUNDLE_ROOTFS build option).
 const char* BVNPathBundledRootFilesystemZip(void);
+
+// Directory holding the patched 32-bit DXVK modules shipped with the app, or
+// NULL when the build did not include them.
+const char* BVNPathBundledDxvkDirectory(void);
 
 // ---------------------------------------------------------------------------
 // Launching a guest
@@ -282,6 +310,9 @@ int BVNGuestMain(int argc, char* argv[]);
 // this is called, an accepted launch request will not actually start a
 // session.
 void BVNRuntimeNotifyFrontendReady(void);
+
+// Thread-safe progress signal consumed by SDL's native loading screen.
+void BVNGuestLoadingUpdateJITProgress(size_t allocationCount);
 
 #ifdef __cplusplus
 }  // extern "C"

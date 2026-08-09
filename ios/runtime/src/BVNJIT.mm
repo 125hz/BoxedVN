@@ -22,19 +22,12 @@
  *  CS_DEBUGGED unlocked MAP_JIT; that trick existed pre-iOS 14 and Apple
  *  patched it.)
  *
- *  What a legitimate third-party debugger attach - StikDebug or equivalent,
- *  over the real Developer Disk Image / debugserver channel - does is get the
- *  kernel to flag the process CS_DEBUGGED. What CS_DEBUGGED actually buys a
- *  getting executable memory is a TWO step operation, and the first step lies
- *  about failing.
- *
- *  process is executable memory, and getting it is where three separate
- *  attempts have now failed on device - mmap lying about PROT_EXEC, iOS
- *  enforcing W^X silently, and the region maximum being fixed at mmap time.
- *  Rather than encode a fourth guess, the mechanics live in BVNExecMemory,
- *  which tries several strategies, reads back what the kernel ACTUALLY did
- *  with vm_region_64, and uses whichever one works.  Read that header for the
- *  full history; this file only decides what to tell the user.
+ *  On iOS 26/27 CS_DEBUGGED is only step one. The target must also issue
+ *  StikDebug's universal JIT-region breakpoint request; StikDebug prepares
+ *  each 16 KiB page through debugserver/TXM. BVNExecMemory then creates a
+ *  separate writable alias of those executable pages. Three device crash
+ *  reports proved that trusting mmap/mprotect/vm_region without that external
+ *  preparation ends in an instruction-abort permission fault.
  *
  *  Platform::alloc64kBlock on iOS goes through the same module, so a probe
  *  that passes is evidence about the code that really runs the guest.  It was
@@ -143,12 +136,11 @@ extern "C" BVNJITReport BVNJITProbeStatus(void) {
 #else
     if (report.debuggerAttached) {
         report.status = BVNJITStatusLikelyAvailable;
-        setDetail("The kernel has this process flagged CS_DEBUGGED, so a JIT "
-                  "enabler has genuinely attached. Executable memory has not "
-                  "been tested here - actually attempting it can crash the "
-                  "process on some iOS versions if it turns out not to work, "
-                  "so that is deferred to the moment a guest actually starts. "
-                  "Boxedwine's JIT is expected to work.");
+        setDetail("The kernel has this process flagged CS_DEBUGGED. On iOS "
+                  "26/27 that is necessary but not sufficient: StikDebug "
+                  "must also be running its universal JIT script for BoxedVN "
+                  "so it can prepare the executable arena. The handshake "
+                  "and execution test are deferred until a guest starts.");
     } else {
         report.status = BVNJITStatusUnavailable;
         setDetail("The kernel does not have this process flagged as debugged "
@@ -177,6 +169,15 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
               "not present. BoxedVN only supports ARM64 devices.");
     return report;
 #else
+    if (!report.debuggerAttached) {
+        report.status = BVNJITStatusUnavailable;
+        setDetail("CS_DEBUGGED is not set, so BoxedVN will not issue the "
+                  "StikDebug executable-region request. Attach StikDebug to "
+                  "BoxedVN and assign/run its universal JIT script, then try "
+                  "again.");
+        return report;
+    }
+
     // Everything below is delegated to BVNExecMemory, which is also what
     // Platform::alloc64kBlock uses on iOS. That is the point: three separate
     // bugs in this file came from the probe and the live allocator being two
@@ -197,10 +198,10 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
                       "again; BoxedVN cannot enable JIT by itself.\n\n%s",
                       BVNExecMemReport());
         } else {
-            setDetail("A JIT enabler IS attached (CS_DEBUGGED is set), but no "
-                      "way of obtaining executable memory works on this "
-                      "device. Every allocation strategy and what the kernel "
-                      "actually did with it:\n\n%s",
+            setDetail("CS_DEBUGGED is set, but the StikDebug universal "
+                      "JIT-region handshake or the RX/RW dual mapping failed. "
+                      "Confirm the universal script is assigned to BoxedVN "
+                      "and left running.\n\n%s",
                       BVNExecMemReport());
         }
         return report;
@@ -226,14 +227,10 @@ extern "C" BVNJITReport BVNJITProbeExecute(void) {
     }
 
     report.status = BVNJITStatusAvailable;
-    setDetail("Executable memory obtained with %s, written, cache-flushed and "
-              "executed successfully%s. Boxedwine's ARM64 JIT can run.\n\n%s",
+    setDetail("Executable memory obtained with %s, written through its RW "
+              "alias, cache-flushed and executed through its RX mapping. "
+              "Boxedwine's ARM64 JIT can run.\n\n%s",
               BVNExecMemStrategyName(strategy),
-              BVNExecMemNeedsWriteFlip()
-                  ? " (writes need a process-wide protection flip, which is a "
-                    "known multithreading hazard - see "
-                    "docs/KNOWN_LIMITATIONS_IOS.md)"
-                  : "",
               BVNExecMemReport());
     return report;
 #endif

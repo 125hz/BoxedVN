@@ -24,6 +24,10 @@
 #include "bufferaccess.h"
 #include "kstat.h"
 
+#ifdef BOXEDWINE_VULKAN
+void logVkMemoryFaultContext(U32 processId, U32 address, bool writeFault);
+#endif
+
 static bool signalIsIgnoredByDefault(U32 signal) {
     return signal == K_SIGURG || signal == K_SIGCONT || signal == K_SIGCHLD || signal == K_SIGWINCH;
 }
@@ -94,6 +98,10 @@ void KThread::reset() {
     this->updateDebugTrapActive();
     this->alternateStack = 0;
     this->alternateStackSize = 0;
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    this->getrusageFairness.reset();
+    this->schedYieldFairness.reset();
+#endif
     this->setupStack();    
 }
 
@@ -302,7 +310,11 @@ public:
 
     // these 5 fields are only updated when cond is held
     KThread* thread = nullptr;
-    U64 address = 0;  
+    U64 address = 0;
+    U32 guestAddress = 0;
+    U32 expectedValue = 0;
+    U32 operation = 0;
+    U32 waitStartedAt = 0;
     U32 expireTimeInMillies = 0;    
     bool wake = false;
     bool waiting = false;
@@ -324,9 +336,15 @@ public:
     }
 };
 
-static void initFutex(struct futex* f, KThread* thread, U64 address, U32 millies) {
+static void initFutex(struct futex* f, KThread* thread, U64 address,
+                      U32 guestAddress, U32 expectedValue, U32 operation,
+                      U32 millies) {
     f->thread = thread;
     f->address = address;
+    f->guestAddress = guestAddress;
+    f->expectedValue = expectedValue;
+    f->operation = operation;
+    f->waitStartedAt = KSystem::getMilliesSinceStart();
     f->expireTimeInMillies = millies;
     f->wake = false;
     f->mask = 0;
@@ -346,7 +364,8 @@ struct futex* getFutex(KThread* thread, U64 address) {
     return nullptr;
 }
 
-struct futex* allocFutex(KThread* thread, U64 address, U32 millies) {
+struct futex* allocFutex(KThread* thread, U64 address, U32 guestAddress,
+                         U32 expectedValue, U32 operation, U32 millies) {
     SystemFutexesLock futexesLock;
 
     for (auto& entry : systemFutexes) {
@@ -355,7 +374,8 @@ struct futex* allocFutex(KThread* thread, U64 address, U32 millies) {
         if (f->thread != nullptr) {
             continue;
         }
-        initFutex(f, thread, address, millies);
+        initFutex(f, thread, address, guestAddress, expectedValue, operation,
+                  millies);
         return f;
     }
 
@@ -364,7 +384,8 @@ struct futex* allocFutex(KThread* thread, U64 address, U32 millies) {
     systemFutexes.push_back(std::move(entry));
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(f->cond);
-        initFutex(f, thread, address, millies);
+        initFutex(f, thread, address, guestAddress, expectedValue, operation,
+                  millies);
     }
     return f;
 }
@@ -372,6 +393,34 @@ struct futex* allocFutex(KThread* thread, U64 address, U32 millies) {
 void freeFutex(struct futex* f) {
     f->thread = nullptr;
     f->address = 0;
+    f->guestAddress = 0;
+    f->expectedValue = 0;
+    f->operation = 0;
+    f->waitStartedAt = 0;
+}
+
+void KThread::logFutexSnapshot() {
+    SystemFutexesLock futexesLock;
+    U32 active = 0;
+    const U32 now = KSystem::getMilliesSinceStart();
+    for (auto& entry : systemFutexes) {
+        struct futex* f = entry.get();
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(f->cond);
+        if (!f->thread) {
+            continue;
+        }
+        ++active;
+        klog_fmt("  futex pid=%04X tid=%04X guest=%08X host=%llX "
+                 "op=%u expected=%08X waiting=%u wake=%u mask=%08X "
+                 "age=%ums expires=%08X",
+                 f->thread->process ? f->thread->process->id : 0,
+                 f->thread->id, f->guestAddress,
+                 (unsigned long long)f->address, f->operation,
+                 f->expectedValue, f->waiting ? 1 : 0, f->wake ? 1 : 0,
+                 f->mask, now - f->waitStartedAt,
+                 f->expireTimeInMillies);
+    }
+    klog_fmt("Guest futex snapshot complete: %u active waiter(s)", active);
 }
 
 void KThread::clearFutexes() {
@@ -438,7 +487,7 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
         f = getFutex(this, ramAddress);
 
         if (!f) {            
-            f = allocFutex(this, ramAddress, expireTime);
+            f = allocFutex(this, ramAddress, addr, value, cmd, expireTime);
             if (cmd == FUTEX_WAIT_BITSET) {
                 f->mask = val3;
             }
@@ -1581,9 +1630,62 @@ U32 pageFaultError(bool protectionFault, bool writeFault, bool executeFault) {
     return error;
 }
 
+void logGuestFaultSnapshot(KThread* thread, U32 address, bool readFault,
+                           bool writeFault, bool executeFault,
+                           bool protectionFault) {
+    // Guest applications can deliberately use faults for control flow. Keep
+    // the detailed register dump bounded, and only enable it for an explicit
+    // compatibility profile so normal Wine starts do not gain log overhead.
+    // Previously this only ran under an explicit interpreter profile, which
+    // meant the detail was unavailable for exactly the configuration now under
+    // investigation. The 64-entry cap already bounds the cost, so gate on the
+    // cap alone.
+    static std::atomic<U32> loggedFaultCount{0};
+    if (loggedFaultCount.fetch_add(1, std::memory_order_relaxed) >= 64) {
+        return;
+    }
+
+    CPU* cpu = thread->cpu;
+    const U32 eip = cpu->seg[CS].address + cpu->eip.u32;
+    const BString module = thread->process->getModuleName(eip);
+    const U32 moduleOffset = thread->process->getModuleEip(eip);
+
+    char instructionBytes[16 * 3 + 1] = {};
+    if (thread->memory->canRead(eip, 16)) {
+        U8 bytes[16];
+        thread->memory->memcpy(bytes, eip, sizeof(bytes));
+        for (size_t index = 0; index < sizeof(bytes); ++index) {
+            snprintf(instructionBytes + index * 3,
+                     sizeof(instructionBytes) - index * 3,
+                     "%02X%s", bytes[index],
+                     index + 1 == sizeof(bytes) ? "" : " ");
+        }
+    } else {
+        safe_strcpy(instructionBytes, "unreadable", sizeof(instructionBytes));
+    }
+
+    klog_fmt("Guest fault snapshot: pid %x thread %x %s%s%s %s at %.8X; "
+             "EIP %.8X %s+%.8X inSignal %u; EAX %.8X ECX %.8X EDX %.8X "
+             "EBX %.8X ESP %.8X EBP %.8X ESI %.8X EDI %.8X; bytes %s",
+             thread->process->id, thread->id,
+             readFault ? "read" : "", writeFault ? "write" : "",
+             executeFault ? "execute" : "",
+             protectionFault ? "protection fault" : "mapping fault", address,
+             eip, module.c_str(), moduleOffset, thread->inSignal,
+             cpu->reg[0].u32, cpu->reg[1].u32, cpu->reg[2].u32,
+             cpu->reg[3].u32, cpu->reg[4].u32, cpu->reg[5].u32,
+             cpu->reg[6].u32, cpu->reg[7].u32, instructionBytes);
+}
+
 }
 
 void KThread::seg_mapper(U32 address, bool readFault, bool writeFault, bool throwException, bool executeFault) {
+    this->diagnosticFaultCount.fetch_add(1, std::memory_order_relaxed);
+    logGuestFaultSnapshot(this, address, readFault, writeFault, executeFault,
+                          false);
+#ifdef BOXEDWINE_VULKAN
+    logVkMemoryFaultContext(this->process->id, address, writeFault);
+#endif
     if (this->process->sigActions[K_SIGSEGV].handlerAndSigAction!=K_SIG_IGN && this->process->sigActions[K_SIGSEGV].handlerAndSigAction!=K_SIG_DFL) {
         this->process->sigActions[K_SIGSEGV].sigInfo[0] = K_SIGSEGV;
         this->process->sigActions[K_SIGSEGV].sigInfo[1] = 0;
@@ -1600,6 +1702,12 @@ void KThread::seg_mapper(U32 address, bool readFault, bool writeFault, bool thro
 
 // motorhead demo installer, tomb raider 3 demo will trigger this
 void KThread::seg_access(U32 address, bool readFault, bool writeFault, bool throwException, bool executeFault) {
+    this->diagnosticFaultCount.fetch_add(1, std::memory_order_relaxed);
+    logGuestFaultSnapshot(this, address, readFault, writeFault, executeFault,
+                          true);
+#ifdef BOXEDWINE_VULKAN
+    logVkMemoryFaultContext(this->process->id, address, writeFault);
+#endif
     if (this->process->sigActions[K_SIGSEGV].handlerAndSigAction!=K_SIG_IGN && this->process->sigActions[K_SIGSEGV].handlerAndSigAction!=K_SIG_DFL) {
 
         this->process->sigActions[K_SIGSEGV].sigInfo[0] = K_SIGSEGV;

@@ -138,9 +138,38 @@ void KNativeSystem::moveWindow(const XWindowPtr& wnd) {
 }
 
 void KNativeSystem::showWindow(const XWindowPtr & wnd, bool bShow) {
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_VULKAN)
+    if (!bShow || !wnd || !vulkan) {
+        return;
+    }
+
+    XPropertyPtr titleProperty = wnd->getProperty(_NET_WM_NAME);
+    if (!titleProperty) {
+        titleProperty = wnd->getProperty(XA_WM_NAME);
+    }
+    if (!titleProperty || titleProperty->format != 8 ||
+        !titleProperty->value || !titleProperty->length) {
+        return;
+    }
+    BString title;
+    title.append((const char*)titleProperty->value, titleProperty->length);
+    if (title.contains("Wine Debugger", true) ||
+        title.contains("Program Error", true)) {
+        klog_fmt("Mapped Wine diagnostic window '%s' (X11 0x%x)",
+                 title.c_str(), wnd->id);
+        vulkan->revealX11ForDiagnostic(wnd);
+    }
+#else
+    (void)wnd;
+    (void)bShow;
+#endif
 }
 
 void KNativeSystem::shutdown() {
+    // KVulkanSDL retains the KNativeScreenSDL for the session and tracks its
+    // host surfaces. Keeping it here would send a later accelerated guest to
+    // the prior session's SDL window and preserve any abandoned probe layer.
+    vulkan = nullptr;
     screen = nullptr;
     opengl = nullptr;
 }

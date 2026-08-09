@@ -449,6 +449,13 @@ void XWindow::setProperty(U32 atom, U32 type, U32 format, U32 length, const U8* 
 	for (auto& callback : onPropertyChanged) {
 		callback(atom);
 	}
+	// Wine commonly maps its debugger window before setting WM_NAME.  Notify
+	// the native backend again when the title arrives so iOS can remove a
+	// faulting application's still-live Metal view and expose WineDbg.
+	if ((atom == XA_WM_NAME || atom == _NET_WM_NAME) &&
+		isThisAndAncestorsMapped()) {
+		KNativeSystem::showWindow(shared_from_this(), true);
+	}
 }
 
 void XWindow::setProperty(U32 atom, U32 type, U32 format, U32 length, U32 value, bool trace) {
@@ -499,6 +506,10 @@ void XWindow::setProperty(U32 atom, U32 type, U32 format, U32 length, U32 value,
 		});
 	for (auto& callback : onPropertyChanged) {
 		callback(atom);
+	}
+	if ((atom == XA_WM_NAME || atom == _NET_WM_NAME) &&
+		isThisAndAncestorsMapped()) {
+		KNativeSystem::showWindow(shared_from_this(), true);
 	}
 }
 

@@ -25,7 +25,35 @@
 #include "knativesystem.h"
 #include "kdspaudio.h"
 
+#ifdef BOXEDWINE_IOS
+extern "C" bool BVNGuestControlsHandleMouseButton(bool down, U32 button,
+                                                    int x, int y);
+#endif
+
 U32 sdlCustomEvent;
+
+#ifdef BOXEDWINE_MULTI_THREADED
+static bool handleSdlCallbackEvent(SDL_Event* event) {
+    if (event->type != sdlCustomEvent) {
+        return false;
+    }
+
+    SdlCallback* callback = (SdlCallback*)event->user.data1;
+    if (!callback || !callback->pfn) {
+        // A malformed/stale callback event must never turn into an uncaught
+        // std::bad_function_call on the application's main thread.
+        klog("Ignored an empty SDL main-thread callback event");
+        return true;
+    }
+
+    const U32 result = (U32)callback->pfn();
+    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(callback->cond);
+    callback->result = result;
+    callback->completed = true;
+    BOXEDWINE_CONDITION_SIGNAL(callback->cond);
+    return true;
+}
+#endif
 
 KNativeInputSDL::KNativeInputSDL(U32 cx, U32 cy, int scaleX, int scaleY) {
     if (!sdlCustomEvent) {
@@ -272,13 +300,7 @@ bool KNativeInputSDL::waitForEvent(U32 ms) {
     SDL_Event e = { 0 };
     if (SDL_WaitEventTimeout(&e, ms) == 1) {
 #ifdef BOXEDWINE_MULTI_THREADED
-        if (e.type == sdlCustomEvent) {
-            SdlCallback* callback = (SdlCallback*)e.user.data1;
-            if (callback->pfn) {
-                callback->result = (U32)callback->pfn();
-            }
-            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(callback->cond);
-            BOXEDWINE_CONDITION_SIGNAL(callback->cond);
+        if (handleSdlCallbackEvent(&e)) {
             return true;
         }
 #endif
@@ -293,11 +315,8 @@ bool KNativeInputSDL::processEvents() {
 
     while (SDL_PollEvent(&e) == 1) {
 #ifdef BOXEDWINE_MULTI_THREADED
-        if (e.type == sdlCustomEvent) {
-            SdlCallback* callback = (SdlCallback*)e.user.data1;
-            callback->result = (U32)callback->pfn();
-            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(callback->cond);
-            BOXEDWINE_CONDITION_SIGNAL(callback->cond);
+        if (handleSdlCallbackEvent(&e)) {
+            continue;
         } else
 #endif
             if (!handlSdlEvent(&e)) {
@@ -501,6 +520,63 @@ static int getMouseButtonFromEvent(SDL_Event* e) {
     return 0;
 }
 
+#ifdef BOXEDWINE_IOS
+static bool bvnIOSCharacterKey(char character, SDL_Keycode& keycode,
+                               bool& shift) {
+    shift = false;
+    if (character >= 'a' && character <= 'z') {
+        keycode = (SDL_Keycode)character;
+        return true;
+    }
+    if (character >= 'A' && character <= 'Z') {
+        keycode = (SDL_Keycode)(character - 'A' + 'a');
+        shift = true;
+        return true;
+    }
+    if (character >= '0' && character <= '9') {
+        keycode = (SDL_Keycode)character;
+        return true;
+    }
+
+    switch (character) {
+    case ' ': keycode = SDLK_SPACE; return true;
+    case '-': keycode = SDLK_MINUS; return true;
+    case '_': keycode = SDLK_MINUS; shift = true; return true;
+    case '=': keycode = SDLK_EQUALS; return true;
+    case '+': keycode = SDLK_EQUALS; shift = true; return true;
+    case '[': keycode = SDLK_LEFTBRACKET; return true;
+    case '{': keycode = SDLK_LEFTBRACKET; shift = true; return true;
+    case ']': keycode = SDLK_RIGHTBRACKET; return true;
+    case '}': keycode = SDLK_RIGHTBRACKET; shift = true; return true;
+    case '\\': keycode = SDLK_BACKSLASH; return true;
+    case '|': keycode = SDLK_BACKSLASH; shift = true; return true;
+    case ';': keycode = SDLK_SEMICOLON; return true;
+    case ':': keycode = SDLK_SEMICOLON; shift = true; return true;
+    case '\'': keycode = SDLK_QUOTE; return true;
+    case '"': keycode = SDLK_QUOTE; shift = true; return true;
+    case ',': keycode = SDLK_COMMA; return true;
+    case '<': keycode = SDLK_COMMA; shift = true; return true;
+    case '.': keycode = SDLK_PERIOD; return true;
+    case '>': keycode = SDLK_PERIOD; shift = true; return true;
+    case '/': keycode = SDLK_SLASH; return true;
+    case '?': keycode = SDLK_SLASH; shift = true; return true;
+    case '`': keycode = SDLK_BACKQUOTE; return true;
+    case '~': keycode = SDLK_BACKQUOTE; shift = true; return true;
+    case '!': keycode = SDLK_1; shift = true; return true;
+    case '@': keycode = SDLK_2; shift = true; return true;
+    case '#': keycode = SDLK_3; shift = true; return true;
+    case '$': keycode = SDLK_4; shift = true; return true;
+    case '%': keycode = SDLK_5; shift = true; return true;
+    case '^': keycode = SDLK_6; shift = true; return true;
+    case '&': keycode = SDLK_7; shift = true; return true;
+    case '*': keycode = SDLK_8; shift = true; return true;
+    case '(': keycode = SDLK_9; shift = true; return true;
+    case ')': keycode = SDLK_0; shift = true; return true;
+    default: return false;
+    }
+}
+#endif
+
 // return true to continue processing for custom handlers
 //
 // should only call on main thread
@@ -532,10 +608,7 @@ void KNativeInputSDL::processCustomEvents(std::function<bool(bool isKeyDown, int
         }
 #ifdef BOXEDWINE_MULTI_THREADED
         else if (e.type == sdlCustomEvent) {
-            SdlCallback* callback = (SdlCallback*)e.user.data1;
-            callback->result = (U32)callback->pfn();
-            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(callback->cond);
-            BOXEDWINE_CONDITION_SIGNAL(callback->cond);
+            handleSdlCallbackEvent(&e);
         }
 #endif
     }
@@ -566,12 +639,28 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
         }
     } else if (e->type == SDL_MOUSEBUTTONDOWN) {    
         U32 button = getMouseButtonFromEvent(e);
+#ifdef BOXEDWINE_IOS
+        klog_fmt("iOS SDL mouse down: button %u at logical %d,%d",
+                 button, e->button.x, e->button.y);
+        if (BVNGuestControlsHandleMouseButton(true, button, e->button.x,
+                                              e->button.y)) {
+            return true;
+        }
+#endif
         BOXEDWINE_RECORDER_HANDLE_MOUSE_BUTTON_DOWN(button, e->motion.x, e->motion.y);
         if (!mouseButton(1, button, e->motion.x, e->motion.y)) {
             onMouseButtonDown(button);
         }
     } else if (e->type == SDL_MOUSEBUTTONUP) {      
         U32 button = getMouseButtonFromEvent(e);
+#ifdef BOXEDWINE_IOS
+        klog_fmt("iOS SDL mouse up: button %u at logical %d,%d",
+                 button, e->button.x, e->button.y);
+        if (BVNGuestControlsHandleMouseButton(false, button, e->button.x,
+                                              e->button.y)) {
+            return true;
+        }
+#endif
         BOXEDWINE_RECORDER_HANDLE_MOUSE_BUTTON_UP(button, e->motion.x, e->motion.y);
         if (!mouseButton(0, button, e->motion.x, e->motion.y)) {
             onMouseButtonUp(button);
@@ -597,7 +686,43 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
                 onKeyUp(translate(e->key.keysym.sym));
             }
         }
+#ifdef BOXEDWINE_IOS
+    } else if (e->type == SDL_TEXTINPUT &&
+               SDL_IsTextInputActive() == SDL_TRUE) {
+        // SDL's UIKit software keyboard emits committed characters as
+        // SDL_TEXTINPUT, whereas Boxedwine historically consumed only
+        // physical SDL_KEYDOWN/UP events. Synthesize the matching X11 key
+        // transitions for the ASCII input used by Notepad and game launchers.
+        for (const char* cursor = e->text.text; *cursor; ++cursor) {
+            SDL_Keycode keycode = SDLK_UNKNOWN;
+            bool shift = false;
+            if (!bvnIOSCharacterKey(*cursor, keycode, shift)) {
+                continue;
+            }
+            const SDL_Scancode scancode = SDL_GetScancodeFromKey(keycode);
+            if (scancode == SDL_SCANCODE_UNKNOWN) {
+                continue;
+            }
+            if (shift) {
+                key(SDL_SCANCODE_LSHIFT, SDLK_LSHIFT, 1);
+            }
+            key(scancode, keycode, 1);
+            key(scancode, keycode, 0);
+            if (shift) {
+                key(SDL_SCANCODE_LSHIFT, SDLK_LSHIFT, 0);
+            }
+        }
+#endif
     } else if (e->type == SDL_WINDOWEVENT) {
+#ifdef BOXEDWINE_IOS
+        if (e->window.event == SDL_WINDOWEVENT_RESIZED ||
+            e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+            klog_fmt("iOS SDL window %s: %dx%d",
+                     e->window.event == SDL_WINDOWEVENT_RESIZED
+                         ? "resized" : "size changed",
+                     e->window.data1, e->window.data2);
+        }
+#endif
         if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
             for (auto& callback : onFocusGained) {
                 callback();

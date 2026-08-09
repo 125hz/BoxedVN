@@ -21,6 +21,12 @@
 
 class XGC;
 
+// Applies one of the sixteen X11 GC raster operations and then merges the
+// result through planeMask. Kept separate from XDrawable so the compatibility
+// behavior can be regression-tested without constructing an X server.
+U32 x11ApplyRasterOperation(U32 source, U32 destination, S32 function,
+	U32 planeMask);
+
 class XDrawable {
 public:
 	XDrawable(U32 width, U32 height, U32 depth, const VisualPtr& visual, bool isWindow, bool isPBuffer = false);

@@ -8,6 +8,11 @@
 #                        [--output-dir DIR]
 #                        [--sign]
 #                        [--skip-dependencies]
+#                        [--no-bundled-rootfs]
+#
+# --no-bundled-rootfs omits the ~160 MB root filesystem archive, producing a
+# small IPA for fast sign/install iterations.  The app then asks the user to
+# import a runtime ZIP once; that imported copy persists across reinstalls.
 #
 # Two stages:
 #   1. CMake builds every C/C++/Objective-C++ target into one static archive.
@@ -25,9 +30,10 @@ CONFIGURATION="Release"
 OUTPUT_DIR=""
 SIGN=0
 SKIP_DEPENDENCIES=0
+NO_BUNDLED_ROOTFS=0
 
 usage() {
-    sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -38,6 +44,7 @@ while [[ $# -gt 0 ]]; do
                          OUTPUT_DIR="$2"; shift 2 ;;
         --sign)          SIGN=1; shift ;;
         --skip-dependencies) SKIP_DEPENDENCIES=1; shift ;;
+        --no-bundled-rootfs) NO_BUNDLED_ROOTFS=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "Unknown argument '$1'. Run with --help." ;;
     esac
@@ -49,6 +56,8 @@ case "${CONFIGURATION}" in
 esac
 
 OUTPUT_DIR="${OUTPUT_DIR:-${BOXEDVN_ROOT}/build/ios-${CONFIGURATION}}"
+mkdir -p "${OUTPUT_DIR}"
+OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 
 require_macos
 require_command cmake "Install with 'brew install cmake'."
@@ -75,6 +84,7 @@ fi
 # 1. Dependencies
 # ---------------------------------------------------------------------------
 SDL2_PREFIX="${BOXEDVN_THIRD_PARTY}/prefix/ios"
+MOLTENVK_ROOT="${BOXEDVN_THIRD_PARTY}/src/MoltenVK-ios-${BOXEDVN_MOLTENVK_VERSION}"
 XCODEGEN="${BOXEDVN_THIRD_PARTY}/xcodegen-${BOXEDVN_XCODEGEN_VERSION}/bin/xcodegen"
 
 if [[ ${SKIP_DEPENDENCIES} -eq 0 ]]; then
@@ -84,6 +94,8 @@ if [[ ${SKIP_DEPENDENCIES} -eq 0 ]]; then
 fi
 
 require_file "${SDL2_PREFIX}/lib/libSDL2.a" \
+    "Run scripts/fetch-dependencies.sh --platform ios first."
+require_file "${MOLTENVK_ROOT}/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a" \
     "Run scripts/fetch-dependencies.sh --platform ios first."
 [[ -x "${XCODEGEN}" ]] \
     || die "XcodeGen is missing at '${XCODEGEN}'. Run scripts/fetch-dependencies.sh."
@@ -102,6 +114,7 @@ cmake -S "${BOXEDVN_ROOT}" -B "${CMAKE_BUILD_DIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE="${CONFIGURATION}" \
     -DBOXEDVN_BUILD_TESTS=OFF \
     -DBOXEDVN_SDL2_ROOT="${SDL2_PREFIX}" \
+    -DBOXEDVN_MOLTENVK_ROOT="${MOLTENVK_ROOT}" \
     || die "CMake configure failed."
 
 log "Building the native targets"
@@ -121,6 +134,29 @@ ok "libboxedvn.a: $(lipo -info "${MERGED_LIBRARY}")"
 # ---------------------------------------------------------------------------
 # 3. XcodeGen + xcodebuild: the Swift application shell
 # ---------------------------------------------------------------------------
+# ios/app/Bundled is an optional resource directory, so a slim build only has
+# to make the archive invisible for the duration of the build. The app already
+# falls back to a user-imported archive when no bundled one is present
+# (Storage.activeRootFilesystem), which is what makes ~6 MB iterations possible
+# on device: sign and install the shell, import the runtime ZIP once, and every
+# later build reuses it. The stash is restored unconditionally on exit so an
+# interrupted build can never lose a 160 MB download.
+BUNDLED_ROOTFS="${BOXEDVN_ROOT}/ios/app/Bundled/boxedwine.zip"
+STASHED_ROOTFS=""
+restore_bundled_rootfs() {
+    if [[ -n "${STASHED_ROOTFS}" && -f "${STASHED_ROOTFS}" ]]; then
+        mv "${STASHED_ROOTFS}" "${BUNDLED_ROOTFS}"
+        STASHED_ROOTFS=""
+    fi
+}
+trap restore_bundled_rootfs EXIT
+if [[ ${NO_BUNDLED_ROOTFS} -eq 1 && -f "${BUNDLED_ROOTFS}" ]]; then
+    STASHED_ROOTFS="${BOXEDVN_ROOT}/build/boxedwine.zip.stashed"
+    mkdir -p "$(dirname "${STASHED_ROOTFS}")"
+    mv "${BUNDLED_ROOTFS}" "${STASHED_ROOTFS}"
+    log "Building without the bundled root filesystem; the app will require an imported runtime ZIP"
+fi
+
 log "Generating the application project"
 (
     cd "${BOXEDVN_ROOT}/ios"

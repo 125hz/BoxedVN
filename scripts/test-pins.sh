@@ -51,6 +51,12 @@ check "XcodeGen SHA-256 is well formed" is_sha256 "${BOXEDVN_XCODEGEN_SHA256}"
 check "XcodeGen URL contains its pinned version" \
     grep -q "${BOXEDVN_XCODEGEN_VERSION}" <<<"${BOXEDVN_XCODEGEN_URL}"
 
+check "MoltenVK version is set"        test -n "${BOXEDVN_MOLTENVK_VERSION}"
+check "MoltenVK URL is https"          is_https_url "${BOXEDVN_MOLTENVK_URL}"
+check "MoltenVK SHA-256 is well formed" is_sha256 "${BOXEDVN_MOLTENVK_SHA256}"
+check "MoltenVK URL contains its pinned version" \
+    grep -q "${BOXEDVN_MOLTENVK_VERSION}" <<<"${BOXEDVN_MOLTENVK_URL}"
+
 # --- Root filesystems -------------------------------------------------------
 check "at least one root filesystem is pinned" \
     test "${#BOXEDVN_ROOTFS_ENTRIES[@]}" -ge 1

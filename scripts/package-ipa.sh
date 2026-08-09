@@ -119,5 +119,5 @@ printf '  checksum : %s\n' "${IPA_PATH}.sha256"
 printf '\n'
 printf 'This IPA is unsigned. Sign it with SideStore, Sideloadly, AltStore or\n'
 printf 'an equivalent tool before installing. Signing does NOT enable JIT:\n'
-printf 'attach StikDebug or another JIT enabler afterwards, or Boxedwine will\n'
-printf 'refuse to start a guest and say so in the log.\n'
+printf 'on iOS 26/27, assign StikDebug universal.js to BoxedVN, launch through\n'
+printf 'StikDebug, and keep the script active while the guest runs.\n'

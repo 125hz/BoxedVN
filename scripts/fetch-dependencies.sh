@@ -169,6 +169,27 @@ for platform in ${PLATFORMS}; do
 done
 
 # ---------------------------------------------------------------------------
+# MoltenVK (prebuilt static iOS arm64 XCFramework from Khronos)
+# ---------------------------------------------------------------------------
+MOLTENVK_ARCHIVE="${DOWNLOADS}/MoltenVK-ios-${BOXEDVN_MOLTENVK_VERSION}.tar"
+MOLTENVK_SOURCE="${SOURCES}/MoltenVK-ios-${BOXEDVN_MOLTENVK_VERSION}"
+MOLTENVK_LIBRARY="${MOLTENVK_SOURCE}/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+
+download_pinned "${BOXEDVN_MOLTENVK_URL}" "${MOLTENVK_ARCHIVE}" \
+                "${BOXEDVN_MOLTENVK_SHA256}"
+
+if [[ ! -f "${MOLTENVK_LIBRARY}" ]]; then
+    log "Extracting MoltenVK ${BOXEDVN_MOLTENVK_VERSION} for iOS"
+    rm -rf "${MOLTENVK_SOURCE}"
+    mkdir -p "${MOLTENVK_SOURCE}"
+    tar -xf "${MOLTENVK_ARCHIVE}" -C "${MOLTENVK_SOURCE}" \
+        --strip-components=1
+fi
+require_file "${MOLTENVK_LIBRARY}" \
+    "The MoltenVK archive layout changed; expected its static iOS arm64 library."
+ok "MoltenVK ${BOXEDVN_MOLTENVK_VERSION} -> ${MOLTENVK_SOURCE}"
+
+# ---------------------------------------------------------------------------
 # XcodeGen (only needed when generating the application shell)
 # ---------------------------------------------------------------------------
 XCODEGEN_ZIP="${DOWNLOADS}/xcodegen-${BOXEDVN_XCODEGEN_VERSION}.zip"
@@ -195,3 +216,4 @@ log "Dependencies ready under ${BOXEDVN_THIRD_PARTY}"
 for platform in ${PLATFORMS}; do
     printf '  SDL2 (%s): %s\n' "${platform}" "${PREFIXES}/${platform}"
 done
+printf '  MoltenVK (ios): %s\n' "${MOLTENVK_SOURCE}"

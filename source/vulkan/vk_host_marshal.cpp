@@ -1547,7 +1547,11 @@ void MarshalVkPipelineShaderStageCreateInfo::write(BoxedVulkanInfo* pBoxedInfo, 
 MarshalVkPipelineShaderStageCreateInfo::~MarshalVkPipelineShaderStageCreateInfo() {
     vulkanDeleteNextPtr(s.pNext);
     KThread::currentThread()->memory->unlockMemory((U8*)s.pName);
-    delete s.pSpecializationInfo;
+    if (s.pSpecializationInfo) {
+        MarshalVkSpecializationInfo specialization;
+        specialization.s = *s.pSpecializationInfo;
+        delete s.pSpecializationInfo;
+    }
 }
 void MarshalVkComputePipelineCreateInfo::read(BoxedVulkanInfo* pBoxedInfo, KMemory* memory, U32 address, VkComputePipelineCreateInfo* s) {
     s->sType = (VkStructureType)memory->readd(address);address+=4;
@@ -1577,6 +1581,8 @@ void MarshalVkComputePipelineCreateInfo::write(BoxedVulkanInfo* pBoxedInfo, KMem
 }
 MarshalVkComputePipelineCreateInfo::~MarshalVkComputePipelineCreateInfo() {
     vulkanDeleteNextPtr(s.pNext);
+    MarshalVkPipelineShaderStageCreateInfo stage;
+    stage.s = s.stage;
 }
 void MarshalVkComputePipelineIndirectBufferInfoNV::read(BoxedVulkanInfo* pBoxedInfo, KMemory* memory, U32 address, VkComputePipelineIndirectBufferInfoNV* s) {
     s->sType = (VkStructureType)memory->readd(address);address+=4;
@@ -2224,16 +2230,56 @@ void MarshalVkGraphicsPipelineCreateInfo::write(BoxedVulkanInfo* pBoxedInfo, KMe
 }
 MarshalVkGraphicsPipelineCreateInfo::~MarshalVkGraphicsPipelineCreateInfo() {
     vulkanDeleteNextPtr(s.pNext);
+    for (U32 i = 0; i < s.stageCount; ++i) {
+        MarshalVkPipelineShaderStageCreateInfo stage;
+        stage.s = s.pStages[i];
+    }
     delete[] s.pStages;
-    delete s.pVertexInputState;
-    delete s.pInputAssemblyState;
-    delete s.pTessellationState;
-    delete s.pViewportState;
-    delete s.pRasterizationState;
-    delete s.pMultisampleState;
-    delete s.pDepthStencilState;
-    delete s.pColorBlendState;
-    delete s.pDynamicState;
+    if (s.pVertexInputState) {
+        MarshalVkPipelineVertexInputStateCreateInfo state;
+        state.s = *s.pVertexInputState;
+        delete s.pVertexInputState;
+    }
+    if (s.pInputAssemblyState) {
+        MarshalVkPipelineInputAssemblyStateCreateInfo state;
+        state.s = *s.pInputAssemblyState;
+        delete s.pInputAssemblyState;
+    }
+    if (s.pTessellationState) {
+        MarshalVkPipelineTessellationStateCreateInfo state;
+        state.s = *s.pTessellationState;
+        delete s.pTessellationState;
+    }
+    if (s.pViewportState) {
+        MarshalVkPipelineViewportStateCreateInfo state;
+        state.s = *s.pViewportState;
+        delete s.pViewportState;
+    }
+    if (s.pRasterizationState) {
+        MarshalVkPipelineRasterizationStateCreateInfo state;
+        state.s = *s.pRasterizationState;
+        delete s.pRasterizationState;
+    }
+    if (s.pMultisampleState) {
+        MarshalVkPipelineMultisampleStateCreateInfo state;
+        state.s = *s.pMultisampleState;
+        delete s.pMultisampleState;
+    }
+    if (s.pDepthStencilState) {
+        MarshalVkPipelineDepthStencilStateCreateInfo state;
+        state.s = *s.pDepthStencilState;
+        delete s.pDepthStencilState;
+    }
+    if (s.pColorBlendState) {
+        MarshalVkPipelineColorBlendStateCreateInfo state;
+        state.s = *s.pColorBlendState;
+        delete s.pColorBlendState;
+    }
+    if (s.pDynamicState) {
+        MarshalVkPipelineDynamicStateCreateInfo state;
+        state.s = *s.pDynamicState;
+        delete s.pDynamicState;
+    }
 }
 void MarshalVkPipelineCacheCreateInfo::read(BoxedVulkanInfo* pBoxedInfo, KMemory* memory, U32 address, VkPipelineCacheCreateInfo* s) {
     s->sType = (VkStructureType)memory->readd(address);address+=4;
@@ -28972,4 +29018,3 @@ void MarshalVkDisplayModeParametersKHR::write(BoxedVulkanInfo* pBoxedInfo, KMemo
     memory->writed(address, s->refreshRate);address+=4;
 }
 #endif
-

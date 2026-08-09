@@ -280,8 +280,8 @@ void Platform::clearInstructionCache(void* address, U32 len) {
 #endif
 }
 
-void Platform::writeCodeToMemory(void* address, U32 len, std::function<void()> callback) {
-    callback();
+void Platform::writeCodeToMemory(void* address, U32 len, std::function<void(void*)> callback) {
+    callback(address);
 }
 
 void Platform::writeCodeToMemory(void* address, U32 len, WriteCodeCallback callback, void* context) noexcept {
@@ -291,14 +291,14 @@ void Platform::writeCodeToMemory(void* address, U32 len, WriteCodeCallback callb
         reportCodeWriteFailure("VirtualProtect(PAGE_EXECUTE_READWRITE)", GetLastError());
         return;
     }
-    callback(context);
+    callback(address, context);
     DWORD ignoredProtect = 0;
     if (!VirtualProtect(address, len, oldProtect, &ignoredProtect)) {
         reportCodeWriteFailure("VirtualProtect(restore)", GetLastError());
     }
     clearInstructionCache(address, len);
 #else
-    callback(context);
+    callback(address, context);
 #ifdef __TEST
     clearInstructionCache(address, len);
 #endif

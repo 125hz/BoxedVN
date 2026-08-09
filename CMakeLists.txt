@@ -47,11 +47,20 @@ include(cmake/BoxedwineSources.cmake)
 option(BOXEDVN_BUILD_TESTS      "Build the host-independent unit tests"        ON)
 option(BOXEDVN_BUILD_CORE       "Build the Boxedwine emulator core"            ON)
 option(BOXEDVN_BUILD_RUNTIME    "Build the Objective-C++ runtime bridge (iOS)"  ON)
+# A runnable macOS host for the emulator. This exists to debug the guest stack
+# on the development machine, where lldb can attach and a rebuild is seconds
+# rather than a sign-and-install cycle. It is not a shipping product: the Swift
+# frontend, the StikDebug JIT handshake and the UIKit presentation path are all
+# iOS-only. Note also that an Intel Mac exercises Boxedwine's x64 JIT, so an
+# ARM64 codegen defect will not reproduce here.
+option(BOXEDVN_BUILD_MACOS_HOST "Build a runnable macOS emulator host"          OFF)
 option(BOXEDVN_ENABLE_UI        "Build Boxedwine's built-in Dear ImGui launcher" OFF)
 option(BOXEDVN_ENABLE_MIDI      "Build CoreMIDI support"                       OFF)
 
 set(BOXEDVN_SDL2_ROOT "" CACHE PATH
     "Root of a prebuilt SDL2 for the target platform (contains include/ and lib/)")
+set(BOXEDVN_MOLTENVK_ROOT "" CACHE PATH
+    "Root of Khronos's extracted MoltenVK iOS package")
 
 # ---------------------------------------------------------------------------
 # Platform identification
@@ -213,6 +222,18 @@ if(BOXEDVN_TARGET_IOS)
     target_include_directories(boxedwine_core PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/ios/runtime/include"
     )
+
+    if(NOT BOXEDVN_MOLTENVK_ROOT)
+        message(FATAL_ERROR
+            "BOXEDVN_MOLTENVK_ROOT is not set. Run fetch-dependencies.sh first.")
+    endif()
+    set(BOXEDVN_MOLTENVK_LIBRARY
+        "${BOXEDVN_MOLTENVK_ROOT}/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a")
+    if(NOT EXISTS "${BOXEDVN_MOLTENVK_LIBRARY}")
+        message(FATAL_ERROR
+            "MoltenVK static iOS library not found at ${BOXEDVN_MOLTENVK_LIBRARY}")
+    endif()
+    message(STATUS "BoxedVN: MoltenVK    = ${BOXEDVN_MOLTENVK_LIBRARY}")
 endif()
 
 # Flags mirrored from the macOS Release configuration of the upstream Xcode
@@ -249,6 +270,13 @@ if(BOXEDVN_TARGET_IOS)
     # delegate can be subclassed; suppress the one in platform/sdl.
     target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_EXTERNAL_MAIN)
     target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_IOS)
+    target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_VULKAN)
+elseif(BOXEDVN_BUILD_MACOS_HOST)
+    # The macOS host needs the same generated Vulkan bridge as the device so
+    # that DXVK reaches MoltenVK by the identical path. The bundled macOS
+    # MoltenVK is universal (x86_64 + arm64), unlike the iOS package which is
+    # arm64-only - which is also why the iOS Simulator cannot run this stack.
+    target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_VULKAN)
 endif()
 
 target_compile_options(boxedwine_core PRIVATE
@@ -272,6 +300,9 @@ target_link_libraries(boxedwine_core PUBLIC
     boxedwine_pugixml
     "${BOXEDVN_SDL2_LIBRARY}"
 )
+if(BOXEDVN_TARGET_IOS)
+    target_link_libraries(boxedwine_core PUBLIC "${BOXEDVN_MOLTENVK_LIBRARY}")
+endif()
 
 find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
 find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
@@ -292,4 +323,49 @@ endif()
 # ---------------------------------------------------------------------------
 if(BOXEDVN_BUILD_RUNTIME)
     add_subdirectory(ios/runtime)
+endif()
+
+# ---------------------------------------------------------------------------
+# boxedvn_macos : development-only host so the guest can be debugged locally
+# ---------------------------------------------------------------------------
+if(BOXEDVN_BUILD_MACOS_HOST)
+    if(BOXEDVN_TARGET_IOS)
+        message(FATAL_ERROR "BOXEDVN_BUILD_MACOS_HOST cannot be combined with an iOS build.")
+    endif()
+    set(BOXEDVN_MACOS_HOST_STUB "${CMAKE_CURRENT_BINARY_DIR}/boxedvn_macos_host.cpp")
+    file(WRITE "${BOXEDVN_MACOS_HOST_STUB}"
+"// Generated. main() lives in platform/sdl/knativesystem.cpp; this file only\n"
+"// gives the executable a translation unit so that the linker pulls the core\n"
+"// archive in, with -force_load below because main() is otherwise unreferenced.\n")
+    # platform/linux/platform.cpp calls three Cocoa helpers under __MACH__.
+    # Upstream defines them in its Xcode project behind a Swift bridging
+    # header, and the device shim is written against UIKit, so neither builds
+    # here. The host gets its own minimal versions.
+    add_executable(boxedvn_macos
+        "${BOXEDVN_MACOS_HOST_STUB}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ios/support/src/macos_host_platform.mm")
+    target_link_libraries(boxedvn_macos PRIVATE
+        -Wl,-force_load $<TARGET_FILE:boxedwine_core>
+        boxedwine_core)
+    find_library(BOXEDVN_MACOS_MOLTENVK MoltenVK
+        PATHS "${CMAKE_CURRENT_SOURCE_DIR}/lib/mac/vulkan/lib" NO_DEFAULT_PATH)
+    if(NOT BOXEDVN_MACOS_MOLTENVK)
+        message(FATAL_ERROR
+            "BOXEDVN_BUILD_MACOS_HOST needs lib/mac/vulkan/lib/libMoltenVK.dylib.")
+    endif()
+    target_link_libraries(boxedvn_macos PRIVATE "${BOXEDVN_MACOS_MOLTENVK}")
+    # SDL2's Cocoa video/input/haptic backends. The iOS build pulls the UIKit
+    # equivalents in through the app target, so these are only needed here.
+    # OpenGL is needed by platform/mac/pixelformat.cpp and macOpenGL.mm, which
+    # are part of the non-iOS core sources.
+    foreach(framework Cocoa CoreGraphics Carbon IOKit ForceFeedback
+                      GameController CoreHaptics Metal QuartzCore CoreVideo
+                      OpenGL CoreMIDI AudioUnit UniformTypeIdentifiers)
+        find_library(BOXEDVN_MACOS_FW_${framework} ${framework})
+        if(BOXEDVN_MACOS_FW_${framework})
+            target_link_libraries(boxedvn_macos PRIVATE
+                "${BOXEDVN_MACOS_FW_${framework}}")
+        endif()
+    endforeach()
+    message(STATUS "BoxedVN: macOS host enabled -> boxedvn_macos")
 endif()

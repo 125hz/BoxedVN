@@ -47,18 +47,10 @@ void Platform::init() {
 // macOS branch), which is per-thread either writable or executable, toggled
 // with pthread_jit_write_protect_np().
 //
-// iOS: pthread_jit_write_protect_np() is explicitly marked unavailable, and
-// MAP_JIT itself is the wrong tool entirely - it is gated behind Apple's
-// "dynamic-codesigning" entitlement, approved only for browser engines and
-// unobtainable by a sideloaded app regardless of debugger status.
-// MAP_BOXEDWINE is 0 on iOS (see include/boxedwine.h) - the allocation is a
-// plain mmap with PROT_EXEC and no MAP_JIT flag, requesting a normal RWX
-// mapping outright. What makes that mmap succeed at all is the kernel having
-// flagged this process CS_DEBUGGED, which happens only while a genuine
-// third-party debugger (StikDebug or an equivalent JIT enabler, attaching
-// over the real Developer Disk Image / debugserver channel) is attached.
-// Without that, the mmap fails outright, which is what BVNJITProbe checks for
-// at startup - there is no half-working state to toggle into.
+// iOS 26/27: StikDebug must prepare an r-x region through debugserver/TXM.
+// BoxedVN keeps a second rw- alias of the same physical pages. The executable
+// mapping never becomes writable and generated-code callbacks receive the
+// writable alias below. See BVNExecMemory.h for the protocol and lifetime.
 //
 // Both platforms still need an explicit instruction-cache flush after writing.
 #if defined(BOXEDWINE_MAC_JIT) && !TARGET_OS_IPHONE
@@ -78,32 +70,8 @@ static inline void boxedwineSetJitWriteProtect(bool enabled) {
 #if TARGET_OS_IPHONE
 #include "BVNExecMemory.h"
 
-// How executable memory is obtained on iOS is not knowable at compile time.
-// Every documented answer turned out to be wrong on device, in a different
-// way each time, and none of the failures reported an error - see the header
-// comment in ios/runtime/include/BVNExecMemory.h for the three of them.
-//
-// So the decision is made at runtime by BVNExecMemory, which tries each
-// strategy, reads back what the kernel ACTUALLY did with vm_region_64, and
-// uses whichever one produced a genuinely executable page.  This file just
-// asks it for memory.  Crucially the JIT probe in the UI asks the same module
-// the same question, so what the probe reports is what the emulator does -
-// they were two hand-synchronised copies before, and they drifted.
-//
-// Whether writes need a protection flip depends on the winning strategy: some
-// leave pages writable and executable at once, some enforce W^X and need the
-// flip.  BVNExecMemSetWritable is a no-op in the former case.
-//
-// KNOWN LIMITATION, only when a flipping strategy wins: unlike macOS's
-// pthread_jit_write_protect_np, which is per-thread, changing protection
-// affects the WHOLE PROCESS.  With BOXEDWINE_MULTI_THREADED a guest thread
-// executing from a page while another thread flips that page writable will
-// fault.  See docs/KNOWN_LIMITATIONS_IOS.md - the durable fix is a dual
-// mapping (the same physical pages at an rw- address for writing and an r-x
-// address for executing), which needs Boxedwine's write callbacks to target
-// the writable alias rather than the executable address.
-static void boxedwineSetCodeMemoryWritable(void* address, U32 len, bool writable) {
-    BVNExecMemSetWritable(address, (size_t)len, writable);
+static void* boxedwineWritableCodeAddress(void* address, U32 len) {
+    return BVNExecMemWritableAddress(address, (size_t)len);
 }
 #endif
 
@@ -132,28 +100,30 @@ static inline void boxedwineFlushInstructionCache(void* address, U32 len) {
 #endif
 }
 
-void Platform::writeCodeToMemory(void* address, U32 len, std::function<void()> callback) {
+void Platform::writeCodeToMemory(void* address, U32 len, std::function<void(void*)> callback) {
     boxedwineSetJitWriteProtect(false);
+    void* writableAddress = address;
 #if TARGET_OS_IPHONE
-    boxedwineSetCodeMemoryWritable(address, len, true);
+    writableAddress = boxedwineWritableCodeAddress(address, len);
+    if (!writableAddress) {
+        kpanic("writeCodeToMemory: executable address has no writable alias");
+    }
 #endif
-    callback();
-#if TARGET_OS_IPHONE
-    boxedwineSetCodeMemoryWritable(address, len, false);
-#endif
+    callback(writableAddress);
     boxedwineSetJitWriteProtect(true);
     boxedwineFlushInstructionCache(address, len);
 }
 
 void Platform::writeCodeToMemory(void* address, U32 len, WriteCodeCallback callback, void* context) noexcept {
     boxedwineSetJitWriteProtect(false);
+    void* writableAddress = address;
 #if TARGET_OS_IPHONE
-    boxedwineSetCodeMemoryWritable(address, len, true);
+    writableAddress = boxedwineWritableCodeAddress(address, len);
+    if (!writableAddress) {
+        kpanic("writeCodeToMemory: executable address has no writable alias");
+    }
 #endif
-    callback(context);
-#if TARGET_OS_IPHONE
-    boxedwineSetCodeMemoryWritable(address, len, false);
-#endif
+    callback(writableAddress, context);
     boxedwineSetJitWriteProtect(true);
     boxedwineFlushInstructionCache(address, len);
 }
@@ -369,6 +339,11 @@ U32 Platform::updateNativePermission(U64 address, U32 permission, U32 len) {
 }
 
 void Platform::releaseNativeMemory(void* address, U64 len) {
+#if TARGET_OS_IPHONE
+    if (BVNExecMemReleaseIfOwned(address, (size_t)len)) {
+        return;
+    }
+#endif
     munmap(address, len);
 }
 

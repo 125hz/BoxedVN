@@ -538,12 +538,13 @@ bool BoxedContainer::isGDI() {
     BoxedReg reg(this, false);
     BString value;
 
-    return (reg.readKey("Software\\Wine\\Direct3D", "DirectDrawRenderer", value) && value == "gdi");
+    return (reg.readKey("Software\\Wine\\Direct3D", "renderer", value) &&
+            (value == "gdi" || value == "no3d"));
 }
 
 void BoxedContainer::setGDI(bool gdi) {
     BoxedReg reg(this, false);
-    reg.writeKey("Software\\Wine\\Direct3D", "DirectDrawRenderer", (gdi ? "gdi" : "opengl"));
+    reg.writeKey("Software\\Wine\\Direct3D", "renderer", (gdi ? "gdi" : "gl"));
     reg.save();
 }
 

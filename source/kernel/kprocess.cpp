@@ -18,6 +18,13 @@
 
 #include "boxedwine.h"
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_act.h>
+#include <mach/thread_status.h>
+#include <pthread.h>
+#endif
+
 #include "kinotify.h"
 
 #include "kscheduler.h"
@@ -3755,6 +3762,214 @@ void KProcess::printMappedFiles() {
                 mappedFile->file->openFile->node->path.c_str());
         }
     }
+}
+
+#if defined(__APPLE__)
+// Build 56, observational only. Every guest-visible field we have -
+// state, cond, dispatch count, live EIP, fault count, syscall and Vulkan
+// breadcrumbs - is written by the emulation thread itself, so a thread that is
+// merely not being scheduled looks byte-for-byte identical to one blocked on a
+// host mutex. Only the kernel can tell those apart, so ask it directly.
+//
+// run_state is the authoritative discriminator, but note TH_STATE_RUNNING
+// means the TH_RUN bit is set, i.e. runnable, NOT necessarily executing on a
+// core. So it is the CPU-time delta across the burst, not run_state alone,
+// that separates "spinning" from "runnable but starved".
+struct NativeThreadSample {
+    bool ok = false;
+    int runState = 0;
+    int suspendCount = 0;
+    int cpuUsage = 0;
+    uint64_t cpuMicros = 0;
+    uint64_t pc = 0;
+    uint64_t lr = 0;
+    uint64_t sp = 0;
+};
+
+static const char* nativeRunStateName(int runState) {
+    switch (runState) {
+        case TH_STATE_RUNNING: return "RUNNABLE";
+        case TH_STATE_STOPPED: return "STOPPED";
+        case TH_STATE_WAITING: return "WAITING";
+        case TH_STATE_UNINTERRUPTIBLE: return "UNINTERRUPTIBLE";
+        case TH_STATE_HALTED: return "HALTED";
+        default: return "?";
+    }
+}
+
+static NativeThreadSample sampleNativePort(mach_port_t port) {
+    NativeThreadSample sample;
+    if (port == MACH_PORT_NULL) {
+        return sample;
+    }
+
+    thread_basic_info_data_t basic = {};
+    mach_msg_type_number_t basicCount = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&basic,
+                    &basicCount) != KERN_SUCCESS) {
+        return sample;
+    }
+    sample.runState = basic.run_state;
+    sample.suspendCount = basic.suspend_count;
+    sample.cpuUsage = basic.cpu_usage;
+    sample.cpuMicros =
+        (uint64_t)basic.user_time.seconds * 1000000ull +
+        (uint64_t)basic.user_time.microseconds +
+        (uint64_t)basic.system_time.seconds * 1000000ull +
+        (uint64_t)basic.system_time.microseconds;
+
+#if defined(__arm64__) || defined(__aarch64__)
+    arm_thread_state64_t state = {};
+    mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&state,
+                         &stateCount) == KERN_SUCCESS) {
+        sample.pc = arm_thread_state64_get_pc(state);
+        sample.lr = arm_thread_state64_get_lr(state);
+        sample.sp = arm_thread_state64_get_sp(state);
+    }
+#endif
+    sample.ok = true;
+    return sample;
+}
+
+static mach_port_t nativePortForThread(KThread* thread) {
+    if (!thread || !thread->cpu || !thread->cpu->nativeHandle) {
+        return MACH_PORT_NULL;
+    }
+    return pthread_mach_thread_np((pthread_t)thread->cpu->nativeHandle);
+}
+
+static NativeThreadSample sampleNativeThread(KThread* thread) {
+    return sampleNativePort(nativePortForThread(thread));
+}
+#endif
+
+void KProcess::logThreadSnapshot(const char* reason) {
+#if defined(__APPLE__)
+    struct BurstEntry { U32 id; mach_port_t port; uint64_t startCpu; };
+    std::vector<BurstEntry> burstEntries;
+#endif
+    {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
+    klog_fmt("Guest process snapshot pid=%04X name=%s threads=%zu reason=%s",
+             id, name.c_str(), threads.size(), reason ? reason : "unspecified");
+    for (auto& entry : threads) {
+        KThread* thread = entry.value;
+        BOXEDWINE_CONDITION waitingCond;
+#ifdef BOXEDWINE_MULTI_THREADED
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(thread->waitingCondSync);
+            waitingCond = thread->waitingCond;
+        }
+#else
+        waitingCond = thread->waitingCond;
+#endif
+        const U32 eip = thread->diagnosticEip.load(std::memory_order_relaxed);
+        const U32 esp = thread->diagnosticEsp.load(std::memory_order_relaxed);
+        const U32 ebp = thread->diagnosticEbp.load(std::memory_order_relaxed);
+        const U64 dispatches = thread->diagnosticDispatchCount.load(
+            std::memory_order_relaxed);
+        const BString module = eip ? getModuleName(eip) : BString();
+        const U32 moduleEip = eip ? getModuleEip(eip) : 0;
+        // The dispatch counter and the EIP above are only refreshed at
+        // dispatch boundaries, and Boxedwine's JIT chains blocks: a spin loop
+        // can execute entirely inside compiled code without ever returning to
+        // the dispatcher. Both therefore freeze for a thread that is spinning
+        // just as they do for one blocked in a host call, which are opposite
+        // problems. Sampling the live register file distinguishes them. This
+        // is a deliberately unsynchronised read of an aligned 32-bit value: it
+        // may be stale, but it cannot tear, and a diagnostic that is
+        // occasionally one instruction out is far better than one that cannot
+        // tell spinning from blocked at all.
+        const U32 liveEip = thread->cpu ? thread->cpu->eip.u32 : 0;
+        const U32 vulkanCall =
+            thread->diagnosticVulkanCall.load(std::memory_order_relaxed);
+        char liveText[64] = {};
+        snprintf(liveText, sizeof(liveText), " liveEip=%08X faults=%llu",
+                 liveEip,
+                 (unsigned long long)thread->diagnosticFaultCount.load(
+                     std::memory_order_relaxed));
+        const U32 syscallNumber =
+            thread->diagnosticSyscall.load(std::memory_order_relaxed);
+        char syscallText[32] = {};
+        if (syscallNumber) {
+            snprintf(syscallText, sizeof(syscallText), " inSyscall=%u",
+                     syscallNumber - 1);
+        }
+        char vulkanText[40] = {};
+        if (vulkanCall) {
+            snprintf(vulkanText, sizeof(vulkanText), " hostVulkanIndex=%u",
+                     vulkanCall - 1);
+        }
+        klog_fmt("  thread tid=%04X state=%s cond=%s eip=%08X "
+                 "module=%s+%08X esp=%08X ebp=%08X dispatches=%llu%s%s",
+                 thread->id, waitingCond ? "WAITING" : "RUNNING",
+                 waitingCond ? waitingCond->name.c_str() : "none", eip,
+                 module.length() ? module.c_str() : "unknown", moduleEip,
+                 esp, ebp, (unsigned long long)dispatches,
+                 vulkanText, liveText);
+        if (syscallText[0]) {
+            klog_fmt("    tid=%04X%s", thread->id, syscallText);
+        }
+#if defined(__APPLE__)
+        {
+            const mach_port_t port = nativePortForThread(thread);
+            const NativeThreadSample native = sampleNativePort(port);
+            if (native.ok) {
+                if (!waitingCond) {
+                    burstEntries.push_back({thread->id, port,
+                                            native.cpuMicros});
+                }
+                klog_fmt("    tid=%04X native=%s cpuUs=%llu cpuUsage=%d "
+                         "suspend=%d pc=%016llX lr=%016llX sp=%016llX",
+                         thread->id, nativeRunStateName(native.runState),
+                         (unsigned long long)native.cpuMicros,
+                         native.cpuUsage, native.suspendCount,
+                         (unsigned long long)native.pc,
+                         (unsigned long long)native.lr,
+                         (unsigned long long)native.sp);
+            }
+        }
+#endif
+    }
+    }
+
+#if defined(__APPLE__)
+    // The discriminator. run_state alone cannot settle this: TH_STATE_RUNNING
+    // means the TH_RUN bit is set, i.e. runnable, not necessarily executing on
+    // a core, so a starved thread and a spinning thread both report RUNNABLE.
+    // Only the CPU-time delta separates them, and only over a window long
+    // enough to be meaningful - a single short interval can be misread either
+    // way.
+    //
+    //   WAITING/UNINTERRUPTIBLE, no CPU  -> genuinely blocked; pc/lr name it
+    //   RUNNABLE, CPU rising             -> spinning (JIT or native)
+    //   RUNNABLE, CPU flat all window    -> runnable but starved of CPU
+    //
+    // Deliberately run with threadsMutex released. Sleeping a second while
+    // holding it would stall thread creation and exit across the whole
+    // process, which would perturb exactly the scheduling behaviour being
+    // measured. Only mach ports and counters are carried out of the lock; no
+    // KThread pointer is dereferenced here, so a thread exiting mid-burst just
+    // makes its resample fail.
+    if (!burstEntries.empty()) {
+        klog_fmt("  --- native CPU-time burst over 1000ms (%u runnable "
+                 "thread(s)) ---", (U32)burstEntries.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        for (const BurstEntry& item : burstEntries) {
+            const NativeThreadSample last = sampleNativePort(item.port);
+            if (!last.ok) {
+                continue;
+            }
+            klog_fmt("    tid=%04X burst native=%s cpuDeltaUs=%llu "
+                     "cpuUsage=%d pc=%016llX lr=%016llX",
+                     item.id, nativeRunStateName(last.runState),
+                     (unsigned long long)(last.cpuMicros - item.startCpu),
+                     last.cpuUsage, (unsigned long long)last.pc,
+                     (unsigned long long)last.lr);
+        }
+    }
+#endif
 }
 
 U32 KProcess::alloc(KThread* thread, U32 len) {

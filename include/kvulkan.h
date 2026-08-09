@@ -25,6 +25,23 @@ class KVulkan {
 public:
     virtual ~KVulkan() {}
     virtual void* createVulkanSurface(const std::shared_ptr<XWindow>& wnd, void* instance) = 0;
+    virtual void destroyVulkanSurface(void* surface) = 0;
+    virtual bool isPresentationSurface(void* surface) = 0;
+    // VkSurfaceKHR and VkSwapchainKHR are created by separate generated
+    // bridge calls. Keep their relationship in the native presentation
+    // backend so iOS can distinguish "a Metal view exists" from "the guest
+    // actually presented a frame" without making UIKit understand Vulkan.
+    virtual void registerVulkanSwapchain(void* swapchain, void* surface) = 0;
+    virtual void destroyVulkanSwapchain(void* swapchain) = 0;
+    virtual void acquireVulkanSwapchain(void* swapchain, int result,
+                                        U32 imageIndex) = 0;
+    virtual void submitVulkanWorkload(int result, U32 submitCount,
+                                      const char* api) = 0;
+    virtual void presentVulkanSwapchain(void* swapchain, int result) = 0;
+    // An unhandled guest exception may leave its still-live Metal surface
+    // above WineDbg's X11 window.  iOS backends can temporarily detach the
+    // presentation layer so the diagnostic remains visible and interactive.
+    virtual void revealX11ForDiagnostic(const std::shared_ptr<XWindow>& wnd) = 0;
 };
 
 typedef std::shared_ptr<KVulkan> KVulkanPtr;

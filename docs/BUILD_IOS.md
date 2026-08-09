@@ -21,7 +21,7 @@ It builds from a clean clone with no hand-editing of Xcode settings: the
 | macOS with Xcode (full install, not just Command Line Tools) | the iPhoneOS SDK |
 | CMake 3.24 or newer | `CMakePresets.json` uses schema version 6 |
 | Ninja | the generator every preset uses |
-| ~10 GB free disk | SDL2 source and build, Xcode DerivedData, the emulator objects |
+| ~10 GB free disk | SDL2/MoltenVK downloads, Xcode DerivedData, emulator objects |
 | A sideloading tool | SideStore, Sideloadly, AltStore or equivalent |
 | A JIT enabler | StikDebug or equivalent |
 
@@ -71,6 +71,10 @@ that is not listed there.
   SDL 2.0.12 headers in `lib/sdl2` and upstream's macOS build links a prebuilt
   SDL2 2.0.14 framework, but 2.0.12's UIKit backend predates the modern Metal
   renderer and is not a reasonable base for iOS 17+.
+- **MoltenVK 1.4.2**, Khronos's official static iOS arm64 package. Boxedwine's
+  Vulkan bridge and WineD3D Vulkan use it to translate guest Direct3D to
+  Metal. Rootfs DXVK 2.5.2 is present, but its geometry-shader and
+  transform-feedback baseline is incompatible with current MoltenVK.
 - **XcodeGen 2.46.0**, which generates the application project.
 
 **`scripts/build-ios.sh`** — two stages. CMake builds every C/C++/Objective-C++
@@ -78,7 +82,9 @@ target and merges them into one `libboxedvn.a`; XcodeGen regenerates
 `ios/BoxedVN.xcodeproj` from `ios/project.yml` and `xcodebuild` links the Swift
 shell against that archive for `generic/platform=iOS`. Code signing is disabled
 by default so the same command works on a CI runner with no Apple ID; pass
-`--sign` to use a locally configured identity.
+`--sign` to use a locally configured identity. A relative `--output-dir` is
+canonicalized before it is passed to Xcode, so library search paths do not
+depend on Xcode's `/ios` working directory.
 
 **`scripts/package-ipa.sh`** — validates the bundle, stages it as
 `Payload/BoxedVN.app`, archives it as an IPA, writes a SHA-256, then unzips the
@@ -130,11 +136,17 @@ The archives are Boxedwine's own TinyCore + Wine builds, pinned by exact
 version, URL and SHA-256 in `scripts/dependencies.lock.sh`. There is no
 "latest" URL and there will not be one.
 
+Wine 11.0 is the default. The older Wine 10.0 archive predates Wine 10.11's
+upstream fix for Song of Saya's `RtlpWaitForCriticalSection` hang and is kept
+only as an explicit compatibility fallback.
+
 **Two ways to get it onto the device:**
 
 1. **Bundled.** Run `scripts/fetch-rootfs.sh --bundle` before
    `scripts/build-ios.sh`. The archive is copied into `ios/app/Bundled/` and
    ends up inside the `.app`. This makes the IPA several hundred megabytes.
+   A bundled root is authoritative and takes precedence over an older archive
+   already imported into Application Support.
 2. **Imported.** Build without `--bundle` (the default). The app starts with no
    root filesystem, says so, and offers **Settings → Import root filesystem
    ZIP…**. Copy the archive to the device through Files first. This keeps the
@@ -158,7 +170,7 @@ inline in that file:
 
 | Key | Purpose | Can a signing tool change it? |
 |-----|---------|-------------------------------|
-| `get-task-allow` | lets a debugger attach at all — a successful attach gets the kernel to flag the process `CS_DEBUGGED`, which relaxes code-signing enforcement for plain `mmap`/`mprotect` `PROT_EXEC` (see `docs/ARCHITECTURE_IOS.md` §4 for why this is *not* the same thing as macOS's `MAP_JIT`) | Tools normally **set** this themselves. It must end up present, or no debugger can attach and JIT cannot work. |
+| `get-task-allow` | lets StikDebug attach and get the kernel to flag the process `CS_DEBUGGED`; on iOS 26/27 its active universal script must then prepare BoxedVN's executable arena through debugserver/TXM (see `docs/ARCHITECTURE_IOS.md` §4) | Tools normally **set** this themselves. It must end up present, or no debugger can attach and JIT cannot work. |
 | `com.apple.developer.kernel.increased-memory-limit` | raises the jetsam limit for the emulated guest address space | **Frequently stripped.** Free Apple IDs are not entitled to it. BoxedVN works without it on devices with plenty of RAM. |
 
 Nothing else is requested. In particular there are no macOS Hardened Runtime
@@ -166,18 +178,38 @@ keys (`com.apple.security.cs.*` mean nothing on iOS), no `com.apple.private.*`
 keys, and no hypervisor, USB or jailbreak entitlements — BoxedVN emulates
 entirely in userspace.
 
+Build 26 and later report what actually survived signing. The home screen's **Memory**
+row reads `com.apple.developer.kernel.increased-memory-limit` from the running
+process with Security.framework (falling back to the kernel-supplied signed
+entitlement blob) and displays `os_proc_available_memory()` as a headroom
+snapshot. Use that row before and after a signing/GetMoreRam change; inspecting
+the source entitlement file alone does not prove the installed signature has
+the entitlement.
+
+The first GetMoreRam device attempt still reported `Standard limit` with 3.29
+GB available before the process limit. That means the final signer/profile did
+not authorize the entitlement. Also reassign StikDebug's `universal.js` after
+reinstalling: a new signer-generated application identifier is a new target,
+even when `CS_DEBUGGED` is visible.
+
 ### Signing does not enable JIT
 
 This trips people up, so it is worth stating plainly: **signing the IPA does
-not give the app JIT.** After installing, you must attach StikDebug or an
-equivalent JIT enabler. Until you do:
+not give the app JIT.** On iOS 26/27, use current StikDebug as follows:
 
-- `mmap(PROT_EXEC)` fails with `EPERM`,
-- `BVNJITProbe` reports **Unavailable**, includes the `errno`, and separately
-  reports whether the kernel has the process flagged `CS_DEBUGGED` at all —
-  telling apart "no JIT enabler has attached" from "one attached, but
-  executable memory is still unavailable" (usually a stripped
-  `get-task-allow` entitlement; see the table above),
+1. Enable **Advanced Options** in StikDebug.
+2. Long-press BoxedVN, choose **Assign Script**, and select `universal.js`.
+3. Launch BoxedVN through StikDebug and leave the script session active while
+   the guest runs.
+
+Until you do:
+
+- the safe status probe reports whether `CS_DEBUGGED` is set but does not issue
+  the breakpoint handshake,
+- a launch with no debugger is refused immediately,
+- a debugger attach without the assigned, active universal script can leave
+  the target stopped at the JIT breakpoint; BoxedVN reports a six-second
+  timeout instead of blocking the UI forever,
 - the app refuses to start a guest and says why.
 
 BoxedVN cannot enable JIT by itself and does not pretend it can. Runtime
@@ -185,9 +217,10 @@ status in the app re-checks this automatically every half second — there is
 no need to manually re-check after attaching a JIT enabler, though the button
 is still there for an immediate, deliberate read.
 
-To check: open **Runtime status** in the app. It shows whether the ARM64 JIT
-is compiled in, whether executable memory could be obtained, and the exact
-reason if not. Press **Re-check** after attaching the JIT enabler.
+To check: open **Runtime status** in the app. It shows whether the ARM64 JIT is
+compiled in and whether `CS_DEBUGGED` is present. Press **Re-check** after
+attaching. The definitive prepare/map/write/execute test runs only when you
+start a guest, because servicing it requires the external script.
 
 ---
 

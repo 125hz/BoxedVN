@@ -26,6 +26,245 @@
 #include "knativescreenSDL.h"
 #include "../../source/x11/x11.h"
 
+#ifdef BOXEDWINE_IOS
+extern "C" void BVNAttachGuestWindowToScene(void);
+
+namespace {
+
+std::atomic<size_t> gIOSJITAllocationCount{0};
+KNativeScreenSDL* gIOSActiveScreen = nullptr;
+
+struct BVNPixelGlyph {
+    char character;
+    U8 rows[7];
+};
+
+// A deliberately tiny font keeps the startup/status UI inside SDL, where it
+// is rendered by the same Metal-backed renderer as Wine. This is the subset
+// needed by the guest loading screen and keyboard button.
+constexpr BVNPixelGlyph kBVNPixelGlyphs[] = {
+    {'A', {14, 17, 17, 31, 17, 17, 17}},
+    {'B', {30, 17, 17, 30, 17, 17, 30}},
+    {'C', {14, 17, 16, 16, 16, 17, 14}},
+    {'D', {30, 17, 17, 17, 17, 17, 30}},
+    {'E', {31, 16, 16, 30, 16, 16, 31}},
+    {'F', {31, 16, 16, 30, 16, 16, 16}},
+    {'G', {14, 17, 16, 23, 17, 17, 15}},
+    {'H', {17, 17, 17, 31, 17, 17, 17}},
+    {'I', {31, 4, 4, 4, 4, 4, 31}},
+    {'J', {7, 2, 2, 2, 18, 18, 12}},
+    {'K', {17, 18, 20, 24, 20, 18, 17}},
+    {'L', {16, 16, 16, 16, 16, 16, 31}},
+    {'M', {17, 27, 21, 21, 17, 17, 17}},
+    {'N', {17, 25, 21, 19, 17, 17, 17}},
+    {'O', {14, 17, 17, 17, 17, 17, 14}},
+    {'P', {30, 17, 17, 30, 16, 16, 16}},
+    {'Q', {14, 17, 17, 17, 21, 18, 13}},
+    {'R', {30, 17, 17, 30, 20, 18, 17}},
+    {'S', {15, 16, 16, 14, 1, 1, 30}},
+    {'T', {31, 4, 4, 4, 4, 4, 4}},
+    {'U', {17, 17, 17, 17, 17, 17, 14}},
+    {'V', {17, 17, 17, 17, 17, 10, 4}},
+    {'W', {17, 17, 17, 21, 21, 21, 10}},
+    {'X', {17, 17, 10, 4, 10, 17, 17}},
+    {'Y', {17, 17, 10, 4, 4, 4, 4}},
+    {'Z', {31, 1, 2, 4, 8, 16, 31}},
+    {'0', {14, 17, 19, 21, 25, 17, 14}},
+    {'1', {4, 12, 4, 4, 4, 4, 14}},
+    {'2', {14, 17, 1, 2, 4, 8, 31}},
+    {'3', {30, 1, 1, 14, 1, 1, 30}},
+    {'4', {2, 6, 10, 18, 31, 2, 2}},
+    {'5', {31, 16, 16, 30, 1, 1, 30}},
+    {'6', {14, 16, 16, 30, 17, 17, 14}},
+    {'7', {31, 1, 2, 4, 8, 8, 8}},
+    {'8', {14, 17, 17, 14, 17, 17, 14}},
+    {'9', {14, 17, 17, 15, 1, 1, 14}},
+    {'.', {0, 0, 0, 0, 0, 12, 12}},
+};
+
+const U8* bvnGlyphRows(char character) {
+    for (const BVNPixelGlyph& glyph : kBVNPixelGlyphs) {
+        if (glyph.character == character) {
+            return glyph.rows;
+        }
+    }
+    return nullptr;
+}
+
+int bvnPixelTextWidth(const char* text, int scale) {
+    return text && text[0] ? ((int)strlen(text) * 6 - 1) * scale : 0;
+}
+
+void bvnDrawPixelText(SDL_Renderer* renderer, const char* text, int x, int y,
+                      int scale, U8 red, U8 green, U8 blue) {
+    SDL_SetRenderDrawColor(renderer, red, green, blue, 255);
+    for (const char* cursor = text; cursor && *cursor; ++cursor, x += 6 * scale) {
+        const U8* rows = bvnGlyphRows(*cursor);
+        if (!rows) {
+            continue;
+        }
+        for (int row = 0; row < 7; ++row) {
+            for (int column = 0; column < 5; ++column) {
+                if (rows[row] & (1 << (4 - column))) {
+                    SDL_Rect pixel = {x + column * scale, y + row * scale,
+                                      scale, scale};
+                    SDL_RenderFillRect(renderer, &pixel);
+                }
+            }
+        }
+    }
+}
+
+void bvnDrawCenteredPixelText(SDL_Renderer* renderer, const char* text, int y,
+                              int scale, int width, U8 red, U8 green, U8 blue) {
+    bvnDrawPixelText(renderer, text,
+                     (width - bvnPixelTextWidth(text, scale)) / 2, y, scale,
+                     red, green, blue);
+}
+
+enum class BVNVirtualKeyAction {
+    key,
+    shift,
+    hide,
+};
+
+struct BVNVirtualKey {
+    const char* label;
+    SDL_Scancode scancode;
+    SDL_Keycode keycode;
+    BVNVirtualKeyAction action;
+    int weight;
+};
+
+#define BVN_KEY(label, scan, code) \
+    {label, scan, code, BVNVirtualKeyAction::key, 2}
+
+constexpr BVNVirtualKey kBVNKeyboardRow0[] = {
+    BVN_KEY("1", SDL_SCANCODE_1, SDLK_1),
+    BVN_KEY("2", SDL_SCANCODE_2, SDLK_2),
+    BVN_KEY("3", SDL_SCANCODE_3, SDLK_3),
+    BVN_KEY("4", SDL_SCANCODE_4, SDLK_4),
+    BVN_KEY("5", SDL_SCANCODE_5, SDLK_5),
+    BVN_KEY("6", SDL_SCANCODE_6, SDLK_6),
+    BVN_KEY("7", SDL_SCANCODE_7, SDLK_7),
+    BVN_KEY("8", SDL_SCANCODE_8, SDLK_8),
+    BVN_KEY("9", SDL_SCANCODE_9, SDLK_9),
+    BVN_KEY("0", SDL_SCANCODE_0, SDLK_0),
+};
+constexpr BVNVirtualKey kBVNKeyboardRow1[] = {
+    BVN_KEY("Q", SDL_SCANCODE_Q, SDLK_q),
+    BVN_KEY("W", SDL_SCANCODE_W, SDLK_w),
+    BVN_KEY("E", SDL_SCANCODE_E, SDLK_e),
+    BVN_KEY("R", SDL_SCANCODE_R, SDLK_r),
+    BVN_KEY("T", SDL_SCANCODE_T, SDLK_t),
+    BVN_KEY("Y", SDL_SCANCODE_Y, SDLK_y),
+    BVN_KEY("U", SDL_SCANCODE_U, SDLK_u),
+    BVN_KEY("I", SDL_SCANCODE_I, SDLK_i),
+    BVN_KEY("O", SDL_SCANCODE_O, SDLK_o),
+    BVN_KEY("P", SDL_SCANCODE_P, SDLK_p),
+};
+constexpr BVNVirtualKey kBVNKeyboardRow2[] = {
+    BVN_KEY("A", SDL_SCANCODE_A, SDLK_a),
+    BVN_KEY("S", SDL_SCANCODE_S, SDLK_s),
+    BVN_KEY("D", SDL_SCANCODE_D, SDLK_d),
+    BVN_KEY("F", SDL_SCANCODE_F, SDLK_f),
+    BVN_KEY("G", SDL_SCANCODE_G, SDLK_g),
+    BVN_KEY("H", SDL_SCANCODE_H, SDLK_h),
+    BVN_KEY("J", SDL_SCANCODE_J, SDLK_j),
+    BVN_KEY("K", SDL_SCANCODE_K, SDLK_k),
+    BVN_KEY("L", SDL_SCANCODE_L, SDLK_l),
+    {"BACK", SDL_SCANCODE_BACKSPACE, SDLK_BACKSPACE,
+     BVNVirtualKeyAction::key, 3},
+};
+constexpr BVNVirtualKey kBVNKeyboardRow3[] = {
+    {"SHIFT", SDL_SCANCODE_UNKNOWN, SDLK_UNKNOWN,
+     BVNVirtualKeyAction::shift, 3},
+    BVN_KEY("Z", SDL_SCANCODE_Z, SDLK_z),
+    BVN_KEY("X", SDL_SCANCODE_X, SDLK_x),
+    BVN_KEY("C", SDL_SCANCODE_C, SDLK_c),
+    BVN_KEY("V", SDL_SCANCODE_V, SDLK_v),
+    BVN_KEY("B", SDL_SCANCODE_B, SDLK_b),
+    BVN_KEY("N", SDL_SCANCODE_N, SDLK_n),
+    BVN_KEY("M", SDL_SCANCODE_M, SDLK_m),
+    {"ENTER", SDL_SCANCODE_RETURN, SDLK_RETURN,
+     BVNVirtualKeyAction::key, 3},
+};
+constexpr BVNVirtualKey kBVNKeyboardRow4[] = {
+    {"HIDE", SDL_SCANCODE_UNKNOWN, SDLK_UNKNOWN,
+     BVNVirtualKeyAction::hide, 3},
+    {"SPACE", SDL_SCANCODE_SPACE, SDLK_SPACE,
+     BVNVirtualKeyAction::key, 10},
+    {"LEFT", SDL_SCANCODE_LEFT, SDLK_LEFT,
+     BVNVirtualKeyAction::key, 2},
+    {"RIGHT", SDL_SCANCODE_RIGHT, SDLK_RIGHT,
+     BVNVirtualKeyAction::key, 2},
+    {"ENTER", SDL_SCANCODE_RETURN, SDLK_RETURN,
+     BVNVirtualKeyAction::key, 3},
+};
+
+#undef BVN_KEY
+
+template <typename Callback>
+bool bvnForEachVirtualKey(int width, int height, Callback callback) {
+    struct Row {
+        const BVNVirtualKey* keys;
+        size_t count;
+    };
+    constexpr Row rows[] = {
+        {kBVNKeyboardRow0, sizeof(kBVNKeyboardRow0) / sizeof(BVNVirtualKey)},
+        {kBVNKeyboardRow1, sizeof(kBVNKeyboardRow1) / sizeof(BVNVirtualKey)},
+        {kBVNKeyboardRow2, sizeof(kBVNKeyboardRow2) / sizeof(BVNVirtualKey)},
+        {kBVNKeyboardRow3, sizeof(kBVNKeyboardRow3) / sizeof(BVNVirtualKey)},
+        {kBVNKeyboardRow4, sizeof(kBVNKeyboardRow4) / sizeof(BVNVirtualKey)},
+    };
+    constexpr int margin = 8;
+    constexpr int gap = 4;
+    constexpr int keyHeight = 44;
+    const int keyboardHeight = margin * 2 +
+        (int)(sizeof(rows) / sizeof(Row)) * keyHeight +
+        ((int)(sizeof(rows) / sizeof(Row)) - 1) * gap;
+    int rowY = height - keyboardHeight;
+
+    for (const Row& row : rows) {
+        int totalWeight = 0;
+        for (size_t index = 0; index < row.count; ++index) {
+            totalWeight += row.keys[index].weight;
+        }
+        const int usableWidth = width - margin * 2 -
+            ((int)row.count - 1) * gap;
+        int keyX = margin;
+        int consumedWeight = 0;
+        for (size_t index = 0; index < row.count; ++index) {
+            consumedWeight += row.keys[index].weight;
+            const int nextX = margin +
+                usableWidth * consumedWeight / totalWeight +
+                (int)index * gap;
+            SDL_Rect rect = {keyX, rowY,
+                             nextX - keyX, keyHeight};
+            if (callback(row.keys[index], rect)) {
+                return true;
+            }
+            keyX = nextX + gap;
+        }
+        rowY += keyHeight + gap;
+    }
+    return false;
+}
+
+} // namespace
+
+extern "C" void BVNGuestLoadingUpdateJITProgress(size_t allocationCount) {
+    gIOSJITAllocationCount.store(allocationCount, std::memory_order_relaxed);
+}
+
+extern "C" bool BVNGuestControlsHandleMouseButton(bool down, U32 button,
+                                                    int x, int y) {
+    return gIOSActiveScreen &&
+           gIOSActiveScreen->handleGuestControlMouseButton(down, button, x, y);
+}
+
+#endif
+
 KNativeScreenSDL::KNativeScreenSDL(U32 cx, U32 cy, U32 bpp, int scaleX, int scaleY, const BString& scaleQuality, U32 fullScreen, U32 vsync) {
     input = std::make_shared<KNativeInputSDL>(cx, cy, scaleX, scaleY);
     this->bpp = bpp;
@@ -37,11 +276,19 @@ KNativeScreenSDL::KNativeScreenSDL(U32 cx, U32 cy, U32 bpp, int scaleX, int scal
     this->defaultScreenHeight = cy;
     this->defaultScreenBpp = bpp;
 
+#ifdef BOXEDWINE_IOS
+    gIOSActiveScreen = this;
+#endif
     recreateMainWindow();
 }
 
 KNativeScreenSDL::~KNativeScreenSDL() {
     destroyMainWindow();
+#ifdef BOXEDWINE_IOS
+    if (gIOSActiveScreen == this) {
+        gIOSActiveScreen = nullptr;
+    }
+#endif
 }
 
 KNativeInputPtr KNativeScreenSDL::getInput() {
@@ -50,6 +297,30 @@ KNativeInputPtr KNativeScreenSDL::getInput() {
 
 void KNativeScreenSDL::setScreenSize(U32 cx, U32 cy) {
     input->setScreenSize(cx, cy);
+
+#ifdef BOXEDWINE_IOS
+    // UIKit always expands an SDL window to the device's full bounds, even
+    // when SDL_CreateWindow was given the guest resolution. Keep the guest
+    // coordinate space logical so SDL letterboxes it instead of independently
+    // stretching X and Y to a portrait (or otherwise differently shaped)
+    // device. SDL also applies this transform to pointer events, keeping taps
+    // aligned with the image.
+    if (renderer && SDL_RenderSetLogicalSize(renderer, cx, cy) != 0) {
+        klog_fmt("SDL_RenderSetLogicalSize failed after a mode change: %s",
+                 SDL_GetError());
+    }
+
+    // SDL's UIKit window is always the actual device/window geometry. Do not
+    // run Boxedwine's desktop-window scaling below as well: that would first
+    // squash 800x600 into the portrait point size with unrelated X/Y scales,
+    // then feed the already-distorted coordinates through SDL's logical-size
+    // transform. The renderer alone owns presentation scaling on iOS.
+    input->scaleX = 100;
+    input->scaleY = 100;
+    input->scaleXOffset = 0;
+    input->scaleYOffset = 0;
+    return;
+#endif
 
     // If full screen, then we just have to change the scale
     if (fullScreen != FULLSCREEN_NOTSET) {
@@ -192,6 +463,16 @@ void KNativeScreenSDL::putBitsOnWnd(U32 id, U8* bits, U32 bitsPerPixel, U32 srcP
     if (!bitsPerPixel || !srcPitch) {
         return;
     }
+#ifdef BOXEDWINE_IOS
+    // XServer draws only mapped InputOutput descendants of its root through
+    // this method. The first call is therefore a real visible Wine window,
+    // which is the deterministic point at which startup has completed.
+    if (guestLoadingVisible) {
+        guestLoadingVisible = false;
+        klog_fmt("iOS guest startup complete: first mapped X11 window 0x%x",
+                 id);
+    }
+#endif
     WndCachePtr wnd;
     
     {
@@ -309,9 +590,26 @@ void KNativeScreenSDL::putBitsOnWnd(U32 id, U8* bits, U32 bitsPerPixel, U32 srcP
 
 void KNativeScreenSDL::present() {
     if (KSystem::videoOption != VIDEO_NO_WINDOW) {
+#ifdef BOXEDWINE_IOS
+        // UIKit can rotate or resize the Metal view after this renderer was
+        // created. SDL normally updates logical presentation from a window
+        // event, but the guest owns UIKit's main thread and the drawable can
+        // change before that queued event is consumed. Polling the drawable
+        // here makes rendering and SDL's input transform agree immediately.
+        syncIOSGuestPresentation("present");
+#endif
         if (showOnDraw) {
             showWindow(true);
         }
+#ifdef BOXEDWINE_IOS
+        if (guestLoadingVisible) {
+            drawIOSGuestLoading();
+        } else if (guestVirtualKeyboardVisible) {
+            drawIOSGuestVirtualKeyboard();
+        } else {
+            drawIOSGuestKeyboardButton();
+        }
+#endif
         SDL_RenderPresent(renderer);
     }
     presented = true;
@@ -348,6 +646,255 @@ void KNativeScreenSDL::warpMouse(int x, int y) {
 bool KNativeScreenSDL::isVisible() {
     return visible;
 }
+
+#ifdef BOXEDWINE_IOS
+void KNativeScreenSDL::syncIOSGuestPresentation(const char* reason) {
+    if (!window || !renderer) {
+        return;
+    }
+
+    int outputWidth = 0;
+    int outputHeight = 0;
+    if (SDL_GetRendererOutputSize(renderer, &outputWidth, &outputHeight) != 0) {
+        klog_fmt("SDL_GetRendererOutputSize failed: %s", SDL_GetError());
+        return;
+    }
+    if (outputWidth <= 0 || outputHeight <= 0 ||
+        (outputWidth == guestOutputWidth &&
+         outputHeight == guestOutputHeight)) {
+        return;
+    }
+
+    if (SDL_RenderSetLogicalSize(renderer, input->width, input->height) != 0) {
+        klog_fmt("SDL_RenderSetLogicalSize failed: %s", SDL_GetError());
+        return;
+    }
+
+    guestOutputWidth = outputWidth;
+    guestOutputHeight = outputHeight;
+
+    int windowWidth = 0;
+    int windowHeight = 0;
+    SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+    SDL_Rect viewport = {};
+    SDL_RenderGetViewport(renderer, &viewport);
+    float scaleX = 0.0f;
+    float scaleY = 0.0f;
+    SDL_RenderGetScale(renderer, &scaleX, &scaleY);
+    klog_fmt("iOS guest presentation updated (%s): window %dx%d, output "
+             "%dx%d, viewport %d,%d %dx%d, scale %.3fx%.3f",
+             reason ? reason : "unknown", windowWidth, windowHeight,
+             outputWidth, outputHeight, viewport.x, viewport.y, viewport.w,
+             viewport.h, scaleX, scaleY);
+}
+
+SDL_Rect KNativeScreenSDL::guestKeyboardButtonRect() const {
+    const int margin = 12;
+    const int height = 48;
+    const int width = 170;
+    return {(int)input->width - width - margin,
+            (int)input->height - height - margin, width, height};
+}
+
+void KNativeScreenSDL::drawIOSGuestLoading() {
+    if (!renderer) {
+        return;
+    }
+
+    const int width = (int)input->width;
+    const int height = (int)input->height;
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(renderer, 14, 19, 29, 255);
+    SDL_RenderClear(renderer);
+
+    const int centerY = height / 2;
+    bvnDrawCenteredPixelText(renderer, "STARTING WINE", centerY - 116, 5,
+                             width, 245, 247, 250);
+
+    // This activity glyph makes the surface clearly intentional. Wine's
+    // pre-main-loop startup blocks SDL event processing, so it must not imply
+    // smooth animation during that phase.
+    const int phase = (SDL_GetTicks() / 160) % 8;
+    static const int spinnerX[8] = {0, 18, 26, 18, 0, -18, -26, -18};
+    static const int spinnerY[8] = {-26, -18, 0, 18, 26, 18, 0, -18};
+    for (int index = 0; index < 8; ++index) {
+        const U8 brightness = index == phase ? 245 : 78;
+        SDL_SetRenderDrawColor(renderer, 56, 132, brightness, 255);
+        SDL_Rect dot = {width / 2 + spinnerX[index] - 5,
+                        centerY - 23 + spinnerY[index] - 5, 10, 10};
+        SDL_RenderFillRect(renderer, &dot);
+    }
+
+    bvnDrawCenteredPixelText(renderer, "THE APP IS WORKING", centerY + 40, 3,
+                             width, 185, 196, 214);
+    bvnDrawCenteredPixelText(renderer,
+                             "TRANSLATING X86 CODE PLEASE WAIT",
+                             centerY + 78, 2, width, 134, 148, 170);
+
+    char progress[64];
+    const size_t allocationCount =
+        gIOSJITAllocationCount.load(std::memory_order_relaxed);
+    if (allocationCount) {
+        snprintf(progress, sizeof(progress), "JIT CODE BLOCKS %zu",
+                 allocationCount);
+    } else {
+        snprintf(progress, sizeof(progress), "WINE IS LOADING");
+    }
+    bvnDrawCenteredPixelText(renderer, progress, centerY + 112, 2, width,
+                             80, 190, 112);
+}
+
+void KNativeScreenSDL::drawIOSGuestKeyboardButton() {
+    if (!renderer) {
+        return;
+    }
+
+    const SDL_Rect button = guestKeyboardButtonRect();
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 16, 25, 39, 222);
+    SDL_RenderFillRect(renderer, &button);
+    SDL_SetRenderDrawColor(renderer, 94, 234, 146, 255);
+    SDL_RenderDrawRect(renderer, &button);
+    bvnDrawPixelText(renderer, "KEYBOARD",
+                     button.x + (button.w - bvnPixelTextWidth("KEYBOARD", 3)) / 2,
+                     button.y + 14, 3, 238, 245, 255);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+}
+
+void KNativeScreenSDL::drawIOSGuestVirtualKeyboard() {
+    if (!renderer) {
+        return;
+    }
+
+    const int width = (int)input->width;
+    const int height = (int)input->height;
+    const int top = height - 252;
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 8, 13, 22, 242);
+    SDL_Rect background = {0, top, width, height - top};
+    SDL_RenderFillRect(renderer, &background);
+
+    bvnForEachVirtualKey(width, height,
+        [this](const BVNVirtualKey& key, const SDL_Rect& rect) {
+            const bool activeShift =
+                key.action == BVNVirtualKeyAction::shift &&
+                guestVirtualKeyboardShift;
+            SDL_SetRenderDrawColor(renderer,
+                                   activeShift ? 31 : 28,
+                                   activeShift ? 108 : 42,
+                                   activeShift ? 65 : 60,
+                                   255);
+            SDL_RenderFillRect(renderer, &rect);
+            SDL_SetRenderDrawColor(renderer,
+                                   activeShift ? 120 : 88,
+                                   activeShift ? 255 : 105,
+                                   activeShift ? 164 : 128,
+                                   255);
+            SDL_RenderDrawRect(renderer, &rect);
+            const int textScale = strlen(key.label) <= 2 ? 3 : 2;
+            bvnDrawPixelText(
+                renderer, key.label,
+                rect.x + (rect.w - bvnPixelTextWidth(key.label, textScale)) / 2,
+                rect.y + (rect.h - 7 * textScale) / 2,
+                textScale, 238, 245, 255);
+            return false;
+        });
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+}
+
+bool KNativeScreenSDL::handleIOSGuestVirtualKeyboardTap(int x, int y) {
+    bool handled = false;
+    bvnForEachVirtualKey((int)input->width, (int)input->height,
+        [this, x, y, &handled](const BVNVirtualKey& key,
+                              const SDL_Rect& rect) {
+            if (x < rect.x || y < rect.y ||
+                x >= rect.x + rect.w || y >= rect.y + rect.h) {
+                return false;
+            }
+
+            handled = true;
+            if (key.action == BVNVirtualKeyAction::hide) {
+                guestVirtualKeyboardVisible = false;
+                guestVirtualKeyboardShift = false;
+                klog("iOS guest built-in keyboard hidden");
+                return true;
+            }
+            if (key.action == BVNVirtualKeyAction::shift) {
+                guestVirtualKeyboardShift = !guestVirtualKeyboardShift;
+                klog_fmt("iOS guest built-in keyboard shift %s",
+                         guestVirtualKeyboardShift ? "on" : "off");
+                return true;
+            }
+
+            if (guestVirtualKeyboardShift) {
+                input->key(SDL_SCANCODE_LSHIFT, SDLK_LSHIFT, 1);
+            }
+            input->key(key.scancode, key.keycode, 1);
+            input->key(key.scancode, key.keycode, 0);
+            if (guestVirtualKeyboardShift) {
+                input->key(SDL_SCANCODE_LSHIFT, SDLK_LSHIFT, 0);
+                guestVirtualKeyboardShift = false;
+            }
+            klog_fmt("iOS guest built-in keyboard key %s", key.label);
+            return true;
+        });
+    return handled;
+}
+
+bool KNativeScreenSDL::handleGuestControlMouseButton(bool down, U32 button,
+                                                      int x, int y) {
+    if (guestLoadingVisible || button != 0 || !window) {
+        return false;
+    }
+
+    if (guestVirtualKeyboardVisible) {
+        // The keyboard occupies the bottom 252 logical pixels. Consume both
+        // halves of the click so a key never also clicks the Wine window.
+        const bool inKeyboard = y >= (int)input->height - 252;
+        if (down) {
+            guestVirtualKeyboardPressed = inKeyboard;
+            return inKeyboard;
+        }
+        if (guestVirtualKeyboardPressed) {
+            guestVirtualKeyboardPressed = false;
+            if (inKeyboard) {
+                handleIOSGuestVirtualKeyboardTap(x, y);
+            }
+            if (guestVirtualKeyboardVisible) {
+                drawIOSGuestVirtualKeyboard();
+                SDL_RenderPresent(renderer);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    const SDL_Rect rect = guestKeyboardButtonRect();
+    const bool inside = x >= rect.x && y >= rect.y &&
+                        x < rect.x + rect.w && y < rect.y + rect.h;
+    if (down) {
+        keyboardButtonPressed = inside;
+        return inside;
+    }
+    if (!keyboardButtonPressed) {
+        return false;
+    }
+
+    keyboardButtonPressed = false;
+    if (inside) {
+        guestVirtualKeyboardVisible = true;
+        guestVirtualKeyboardShift = false;
+        // This keyboard sends X11 key events directly. Starting SDL text
+        // input also asks UIKit for its software keyboard; doing both made
+        // the guest view resize/hide twice and caused the visible glitches.
+        klog("iOS guest built-in keyboard shown");
+        drawIOSGuestVirtualKeyboard();
+        SDL_RenderPresent(renderer);
+    }
+    return true;
+}
+
+#endif
 
 bool KNativeScreenSDL::clipboardIsTextAvailable() {
     return SDL_HasClipboardText() != SDL_FALSE;
@@ -701,6 +1248,15 @@ void KNativeScreenSDL::destroyTextureCache() {
 }
 
 void KNativeScreenSDL::destroyMainWindow() {
+#ifdef BOXEDWINE_IOS
+    guestLoadingVisible = false;
+    keyboardButtonPressed = false;
+    guestOutputWidth = 0;
+    guestOutputHeight = 0;
+    if (SDL_IsTextInputActive() == SDL_TRUE) {
+        SDL_StopTextInput();
+    }
+#endif
     destroyTextureCache();
 
     if (renderer) {
@@ -718,14 +1274,34 @@ void KNativeScreenSDL::recreateMainWindow() {
         destroyMainWindow();
         SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, scaleQuality.c_str());
 
+#ifdef BOXEDWINE_IOS
+        // UIKit settles the scene in landscape before this SDL window exists,
+        // and keeps it landscape for the session. Matching that policy in
+        // SDL prevents its view controller from advertising a live portrait
+        // transition that Boxedwine cannot safely service while boxedmain
+        // owns the main thread.
+        SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+        input->scaleX = 100;
+        input->scaleY = 100;
+        input->scaleXOffset = 0;
+        input->scaleYOffset = 0;
+#endif
+
         int cx = input->width * input->scaleX / 100;
         int cy = input->height * input->scaleY / 100;
         int flags = SDL_WINDOW_HIDDEN | additionalSDLWindowFlags;
+#ifdef BOXEDWINE_IOS
+        // UIKit otherwise creates a one-pixel-per-point Metal drawable
+        // (402x874 on this 3x phone), which is visibly blurry when expanded
+        // to the physical display. RESIZABLE ensures orientation-driven view
+        // geometry is treated as a live window-size change by SDL.
+        flags |= SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
+#endif
         
         visible = false;
 
+#ifndef BOXEDWINE_IOS
         SDL_DisplayMode dm;
-
         if (SDL_GetDesktopDisplayMode(0, &dm) != 0) {
             SDL_Log("SDL_GetDesktopDisplayMode failed: %s", SDL_GetError());
             fullScreen = FULLSCREEN_NOTSET;
@@ -765,11 +1341,21 @@ void KNativeScreenSDL::recreateMainWindow() {
                 flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
             }
         }
+#endif
 
         window = SDL_CreateWindow("BoxedWine", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, cx, cy, flags);
         if (!window) {
             klog_fmt("SDL_CreateWindow failed: %s", SDL_GetError());
         }
+#ifdef BOXEDWINE_IOS
+        if (window) {
+            // SDL 2.32 still creates its UIWindow with the legacy
+            // initWithFrame: path. On scene-based iOS that window has no
+            // UIWindowScene, which is enough to render Metal content but not
+            // enough for UIKit-owned services such as the software keyboard.
+            BVNAttachGuestWindowToScene();
+        }
+#endif
         if (!(flags & SDL_WINDOW_VULKAN)) {
 #if defined(BOXEDWINE_LINUX) || defined(__EMSCRIPTEN__)
             // NVidia drivers need this
@@ -787,6 +1373,48 @@ void KNativeScreenSDL::recreateMainWindow() {
                 flags |= SDL_RENDERER_SOFTWARE;
                 renderer = SDL_CreateRenderer(window, -1, flags);
             }
+#ifdef BOXEDWINE_IOS
+            if (renderer) {
+                // SDL's UIKit backend intentionally ignores the requested
+                // window size and fills the screen. Without a logical size,
+                // its native view stretches (for example) an 800x600 guest to
+                // the whole portrait phone, which is the tall, narrow output
+                // seen on device. Logical-size letterboxing preserves aspect
+                // ratio and installs SDL's matching input-coordinate mapping.
+                syncIOSGuestPresentation("create");
+            }
+#endif
         }
+#ifdef BOXEDWINE_IOS
+        if (window && renderer) {
+            guestLoadingVisible = true;
+            keyboardButtonPressed = false;
+            guestVirtualKeyboardVisible = false;
+            guestVirtualKeyboardShift = false;
+            guestVirtualKeyboardPressed = false;
+            gIOSJITAllocationCount.store(0, std::memory_order_relaxed);
+
+            // recreateMainWindow runs before SDL's event loop begins. Calling
+            // showWindow() here can enter sdlDispatch() when Boxedwine's SDL
+            // main-thread identity has not been established yet, then wait
+            // forever for an event loop that cannot service the callback.
+            // This path is already executing on UIKit's main queue, so show
+            // the native SDL window directly for this one pre-loop operation.
+            if (KSystem::videoOption == VIDEO_NORMAL) {
+                SDL_ShowWindow(window);
+                SDL_RaiseWindow(window);
+            }
+            visible = true;
+            showOnDraw = false;
+            klog("iOS guest window shown directly for pre-loop startup");
+
+            // A Metal drawable presented while SDL's UIWindow is hidden may
+            // be discarded. Commit the labeled loading frame after showing
+            // the window so Wine startup is not an unexplained black surface.
+            drawIOSGuestLoading();
+            SDL_RenderPresent(renderer);
+            klog("iOS guest loading screen presented");
+        }
+#endif
     }
 }

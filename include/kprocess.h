@@ -250,6 +250,7 @@ public:
     void signalCHLD(U32 code, U32 childPid, U32 sendingUID, S32 exitCode);
     void signalALRM();
     void printStack();
+    void logThreadSnapshot(const char* reason);
     U32 signal(U32 signal);
     void signalFd(KThread* thread, U32 signal);
     bool isSystemProcess() {return this->systemProcess;}
@@ -382,6 +383,7 @@ public:
     U32 numberOfExtensions = 0;
 #ifdef BOXEDWINE_JIT
     OpCallback startJITOp = nullptr;
+    std::atomic<bool> interpreterCompatibilityActivated{false};
     void* emulateSingleOp = nullptr;
 #ifdef BOXEDWINE_POSIX
     void* signalHandler = nullptr;

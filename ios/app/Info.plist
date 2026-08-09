@@ -33,10 +33,27 @@
 	<key>MinimumOSVersion</key>
 	<string>$(IPHONEOS_DEPLOYMENT_TARGET)</string>
 
-	<!-- BoxedVN does not use SwiftUI's @main: SDL owns UIApplicationMain and
-	     installs BVNAppDelegate, a subclass of SDLUIKitDelegate.  There is
-	     therefore no UIApplicationSceneManifest; SDL creates its own window
-	     and BVNAppDelegate creates the library window beside it. -->
+	<!-- SDL still owns UIApplicationMain and installs BVNAppDelegate, while a
+	     scene delegate owns the library UIWindow. SDL's guest UIWindow is
+	     attached to that same scene immediately after creation. Current iOS
+	     requires this ownership for remote controllers and keyboard scenes. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+					<key>UISceneDelegateClassName</key>
+					<string>BVNSceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 
 	<key>UILaunchScreen</key>
 	<dict>

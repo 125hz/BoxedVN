@@ -33,14 +33,13 @@ static int powerOf2(U32 requestedSize) {
 
 namespace {
 struct NativeHeapFreeTimestamp {
-    U32* address;
     U32 timestamp;
 };
 
-void writeNativeHeapFreeTimestamp(void* opaque) noexcept {
+void writeNativeHeapFreeTimestamp(void* writableAddress, void* opaque) noexcept {
     NativeHeapFreeTimestamp* context =
         static_cast<NativeHeapFreeTimestamp*>(opaque);
-    *context->address = context->timestamp;
+    *static_cast<U32*>(writableAddress) = context->timestamp;
 }
 }
 
@@ -107,8 +106,9 @@ void* BNativeHeap::alloc(U32 len, U32* blockSize) {
 		
 		U8* result = Platform::alloc64kBlock(count, isCodeMemory);
         if (isCodeMemory) {
-            Platform::writeCodeToMemory(result, 4, [result, count]() {
-                *((U32*)result) = count * BNATIVEHEAD_64K_BLOCK_SIZE;
+            Platform::writeCodeToMemory(result, 4, [count](void* writable) {
+                *static_cast<U32*>(writable) =
+                    count * BNATIVEHEAD_64K_BLOCK_SIZE;
             });
         } else {
             *((U32*)result) = count * BNATIVEHEAD_64K_BLOCK_SIZE;
@@ -132,9 +132,10 @@ void* BNativeHeap::alloc(U32 len, U32* blockSize) {
 
 			buckets[index].pop_back();
             if (isCodeMemory) {
-                Platform::writeCodeToMemory(pInfo, len + 4, [index, pInfo, result, len]() {
-                    memset(result, 0, len);
-                    *pInfo = index;
+                Platform::writeCodeToMemory(pInfo, len + 4, [index, len](void* writable) {
+                    U8* writableInfo = static_cast<U8*>(writable);
+                    memset(writableInfo + 4, 0, len);
+                    *reinterpret_cast<U32*>(writableInfo) = index;
                 });
             } else {
                 memset(result, 0, len);
@@ -142,8 +143,8 @@ void* BNativeHeap::alloc(U32 len, U32* blockSize) {
             }
             U32* address = ((U32*)result) - 1;
             if (isCodeMemory) {
-                Platform::writeCodeToMemory(address, 4, [address, index]() {
-                    *address = index;
+                Platform::writeCodeToMemory(address, 4, [index](void* writable) {
+                    *static_cast<U32*>(writable) = index;
                 });
             } else {
                 *address = index;
@@ -161,8 +162,9 @@ void* BNativeHeap::alloc(U32 len, U32* blockSize) {
 	for (U8* start = address; start < address + BNATIVEHEAD_64K_BLOCK_SIZE; start += size) {
         // on mac, you can't write to mmap'd memory that was allocated for a JIT without unprotecting it
         if (isCodeMemory) {
-            Platform::writeCodeToMemory(start, 4, [start, index, this]() {
-                *((U32*)start) = delayedFree ? 0 : index;
+            const bool hasDelayedFree = delayedFree != 0;
+            Platform::writeCodeToMemory(start, 4, [index, hasDelayedFree](void* writable) {
+                *static_cast<U32*>(writable) = hasDelayedFree ? 0 : index;
             });
         } else {
             *((U32*)start) = delayedFree ? 0 : index;
@@ -200,7 +202,7 @@ void BNativeHeap::free(void* address) {
 		pTime--;
         U32 timestamp = KSystem::getMilliesSinceStart();
         if (isCodeMemory) {
-            NativeHeapFreeTimestamp context = {pTime, timestamp};
+            NativeHeapFreeTimestamp context = {timestamp};
             Platform::writeCodeToMemory(pTime, 4,
                 writeNativeHeapFreeTimestamp, &context);
         } else {

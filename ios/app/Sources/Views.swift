@@ -13,6 +13,7 @@
  */
 
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 /// `[.zip]` alone leaves real ZIP files greyed out and unselectable in the
@@ -28,6 +29,80 @@ import UniformTypeIdentifiers
 /// AppModel.importRootFilesystem), so a non-ZIP selection is still caught
 /// and reported clearly rather than silently accepted.
 let zipImportContentTypes: [UTType] = [.zip, .data]
+
+/// A UIKit import-mode picker rather than SwiftUI's `.fileImporter`.
+///
+/// `.fileImporter` opens the original URL and returns a security-scoped
+/// reference. On the physical test device its Files row highlights but that
+/// open-in-place hand-off never completes. `asCopy: true` asks Files to copy
+/// the selection into BoxedVN's sandbox and uses an explicit delegate, which
+/// is the modern equivalent of the old UIDocumentPickerModeImport contract.
+struct DocumentImportPicker: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
+    let onResult: (Result<URL, Error>) -> Void
+    let onCancel: () -> Void
+
+    init(contentTypes: [UTType],
+         onResult: @escaping (Result<URL, Error>) -> Void,
+         onCancel: @escaping () -> Void) {
+        self.contentTypes = contentTypes
+        self.onResult = onResult
+        self.onCancel = onCancel
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onResult: onResult, onCancel: onCancel)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let identifiers = contentTypes.map(\.identifier).joined(separator: ", ")
+        Log.write("Presenting UIKit import-copy picker for \(identifiers)",
+                  category: "import")
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: contentTypes,
+            asCopy: true)
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController,
+                                context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onResult: (Result<URL, Error>) -> Void
+        let onCancel: () -> Void
+
+        init(onResult: @escaping (Result<URL, Error>) -> Void,
+             onCancel: @escaping () -> Void) {
+            self.onResult = onResult
+            self.onCancel = onCancel
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController,
+                            didPickDocumentsAt urls: [URL]) {
+            guard let url = urls.first else {
+                onResult(.failure(DocumentImportError.emptySelection))
+                return
+            }
+            onResult(.success(url))
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            Log.write("Document import picker cancelled", category: "import")
+            onCancel()
+        }
+    }
+}
+
+enum DocumentImportError: LocalizedError {
+    case emptySelection
+
+    var errorDescription: String? {
+        "The Files picker returned without a selected file."
+    }
+}
 
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
@@ -54,6 +129,7 @@ struct LibraryView: View {
     @State private var pendingImportURL: URL?
     @State private var pendingTitle = ""
     @State private var showingTitlePrompt = false
+    @State private var documentsZips: [URL] = []
 
     var body: some View {
         List {
@@ -68,6 +144,15 @@ struct LibraryView: View {
                                 .frame(width: 8, height: 8)
                             Text(model.jit.isUsable ? "JIT ready" : "JIT unavailable")
                         }
+                    }
+                }
+                LabeledContent("Memory") {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(model.memory.entitlement == .enabled
+                                  ? Color.green : Color.secondary)
+                            .frame(width: 8, height: 8)
+                        Text(model.memory.statusText)
                     }
                 }
                 LabeledContent("Session", value: model.runtimeState.rawValue)
@@ -131,19 +216,65 @@ struct LibraryView: View {
                 }
             }
 
+            // This path is deliberately independent of the system document
+            // picker. Files copied into the app's Documents folder are
+            // already inside the sandbox, so selecting one here needs no
+            // remote view controller or security-scoped hand-off.
+            Section {
+                if documentsZips.isEmpty {
+                    Text("No ZIP files found in BoxedVN's Documents folder.")
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                } else {
+                    ForEach(documentsZips, id: \.path) { url in
+                        Button {
+                            prepareImport(url)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(url.lastPathComponent)
+                                Text(fileSizeDescription(url))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .disabled(model.isImporting)
+                    }
+                }
+                Button("Refresh") {
+                    documentsZips = Storage.documentsZipCandidates()
+                }
+            } header: {
+                Text("Games copied to BoxedVN Documents")
+            } footer: {
+                Text("If the file picker will not complete a selection, open "
+                     + "Files, copy the game ZIP to On My iPhone > BoxedVN, "
+                     + "return here, and tap Refresh. Then select it above.")
+            }
+
             Section {
                 NavigationLink("Settings") { SettingsView() }
                 NavigationLink("Logs") { LogView() }
             }
         }
-        .fileImporter(isPresented: $showingGameImporter,
-                      allowedContentTypes: zipImportContentTypes) { result in
-            handleImport(result)
+        .sheet(isPresented: $showingGameImporter) {
+            DocumentImportPicker(
+                contentTypes: zipImportContentTypes,
+                onResult: { result in
+                    showingGameImporter = false
+                    handleImport(result)
+                },
+                onCancel: { showingGameImporter = false })
         }
-        .fileImporter(isPresented: $showingFolderImporter,
-                      allowedContentTypes: [.folder]) { result in
-            handleImport(result)
+        .sheet(isPresented: $showingFolderImporter) {
+            DocumentImportPicker(
+                contentTypes: [.folder],
+                onResult: { result in
+                    showingFolderImporter = false
+                    handleImport(result)
+                },
+                onCancel: { showingFolderImporter = false })
         }
+        .onAppear { documentsZips = Storage.documentsZipCandidates() }
         .alert("Name this game", isPresented: $showingTitlePrompt) {
             TextField("Title", text: $pendingTitle)
             Button("Import") {
@@ -159,12 +290,27 @@ struct LibraryView: View {
     private func handleImport(_ result: Result<URL, Error>) {
         switch result {
         case .success(let url):
-            pendingImportURL = url
-            pendingTitle = url.deletingPathExtension().lastPathComponent
-            showingTitlePrompt = true
+            Log.write("System document picker selected \(url.lastPathComponent)",
+                      category: "import")
+            prepareImport(url)
         case .failure(let error):
+            Log.write("System document picker failed: \(error.localizedDescription)",
+                      category: "import", level: BVNLogLevelError)
             model.alertMessage = error.localizedDescription
         }
+    }
+
+    private func prepareImport(_ url: URL) {
+        pendingImportURL = url
+        pendingTitle = url.deletingPathExtension().lastPathComponent
+        showingTitlePrompt = true
+    }
+
+    private func fileSizeDescription(_ url: URL) -> String {
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            return "unknown size"
+        }
+        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
     }
 }
 
@@ -343,13 +489,12 @@ private struct JITDebuggerRow: View {
 
 private struct JITFooter: View {
     var body: some View {
-        Text("This check never risks crashing the app: it reads the kernel's "
-             + "debugged-process flag but never actually executes generated "
-             + "code. iOS does not allow testing real execution safely - the "
-             + "only way to know for certain is to actually launch a guest, "
-             + "at which point Boxedwine's own JIT hits the identical risk. "
-             + "\"Likely available\" means a debugger is attached and JIT is "
-             + "expected to work, but has not been proven yet.")
+        Text("This safe check only reads the kernel's debugged-process flag; "
+             + "it never issues StikDebug's breakpoint request or executes "
+             + "generated code. On iOS 26/27, \"Likely available\" means "
+             + "CS_DEBUGGED is set, but StikDebug's assigned universal script "
+             + "still has to prepare each executable region when a guest "
+             + "starts.")
     }
 }
 
@@ -383,9 +528,10 @@ private struct JITHintSection: View {
             // "Re-check" - the button above exists for an immediate,
             // deliberate read, not because the badge is otherwise stale.
             if !model.jit.debuggerAttached {
-                Text("BoxedVN cannot enable JIT itself. Attach StikDebug or "
-                     + "another JIT enabler to this app while it is "
-                     + "running; the status above updates automatically.")
+                Text("BoxedVN cannot enable JIT itself. In current StikDebug, "
+                     + "enable Advanced Options, long-press BoxedVN, assign "
+                     + "universal.js, and launch BoxedVN with that script "
+                     + "kept active. The status above updates automatically.")
                     .font(.caption)
             }
         }
@@ -399,6 +545,23 @@ struct StatusView: View {
         List {
             JITStatusSection()
             JITHintSection()
+
+            Section {
+                LabeledContent("Increased-memory entitlement",
+                               value: model.memory.statusText)
+                LabeledContent("Available before memory limit",
+                               value: model.memory.availableText)
+                Text(model.memory.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Memory")
+            } footer: {
+                Text("The entitlement value is read from this installed app's "
+                     + "signed code signature. Available memory is a live "
+                     + "dirty-memory headroom snapshot, so compare it soon "
+                     + "after launch before and after applying GetMoreRam.")
+            }
 
             Section("Runtime") {
                 LabeledContent("BoxedVN build", value: AppVersion.display)
@@ -525,12 +688,24 @@ struct SettingsView: View {
         .onChange(of: model.isInstallingRootFilesystem) { _, installing in
             if !installing { documentsZips = Storage.documentsZipCandidates() }
         }
-        .fileImporter(isPresented: $showingRootFilesystemImporter,
-                      allowedContentTypes: zipImportContentTypes) { result in
-            switch result {
-            case .success(let url): model.importRootFilesystem(from: url)
-            case .failure(let error): model.alertMessage = error.localizedDescription
-            }
+        .sheet(isPresented: $showingRootFilesystemImporter) {
+            DocumentImportPicker(
+                contentTypes: zipImportContentTypes,
+                onResult: { result in
+                    showingRootFilesystemImporter = false
+                    switch result {
+                    case .success(let url):
+                        Log.write("Root filesystem import-copy picker selected "
+                                  + url.lastPathComponent, category: "rootfs")
+                        model.importRootFilesystem(from: url)
+                    case .failure(let error):
+                        Log.write("Root filesystem import-copy picker failed: "
+                                  + error.localizedDescription,
+                                  category: "rootfs", level: BVNLogLevelError)
+                        model.alertMessage = error.localizedDescription
+                    }
+                },
+                onCancel: { showingRootFilesystemImporter = false })
         }
     }
 

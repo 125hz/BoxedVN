@@ -31,6 +31,7 @@
 
 #include <dispatch/dispatch.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -41,6 +42,8 @@
 
 #include <SDL.h>
 
+#include "BVNLaunchArguments.h"
+#include "boxedvn/wine_prefix.h"
 #include "BVNRuntime.h"
 
 // Boxedwine's own entry point, from source/sdl/main.cpp.  Declared with C++
@@ -53,30 +56,15 @@ extern "C" bool BVNLogStartSessionFile(void);
 // Implemented in BVNAppDelegate.mm.
 extern "C" void BVNFrontendShowLibrary(void);
 extern "C" void BVNFrontendHideLibrary(void);
+extern "C" void BVNPrepareGuestPresentation(dispatch_block_t completion);
+extern "C" void BVNFinishGuestPresentation(void);
 
 namespace {
-
-// A launch request, deep-copied out of the caller's BVNLaunchRequest so the
-// frontend may free its strings the moment the call returns.
-struct PendingLaunch {
-    std::string rootFilesystemZipPath;
-    std::string writableRootPath;
-    std::string gameDirectoryHostPath;
-    std::string executablePath;
-    std::vector<std::string> arguments;
-    std::vector<std::string> environment;
-    std::string workingDirectory;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t bitsPerPixel = 0;
-    bool soundEnabled = true;
-    bool runThroughWine = true;
-};
 
 pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
 BVNRuntimeState gState = BVNRuntimeStateIdle;
 bool gHasPendingLaunch = false;
-PendingLaunch gPendingLaunch;
+BVNLaunchConfiguration gPendingLaunch;
 int32_t gLastExitCode = INT32_MIN;
 std::string gLastError;
 bool gFrontendReady = false;
@@ -137,69 +125,6 @@ void copyString(char* buffer, size_t bufferSize, const std::string& text) {
     buffer[copied] = '\0';
 }
 
-// Builds the argv Boxedwine is started with.  Documented in commandLine.txt;
-// every flag here corresponds to a real emulator option.
-std::vector<std::string> buildArguments(const PendingLaunch& launch,
-                                        const char* logPath) {
-    std::vector<std::string> argv;
-    argv.push_back("boxedvn");
-
-    // Writable overlay for the emulated Linux filesystem.
-    argv.push_back("-root");
-    argv.push_back(launch.writableRootPath);
-
-    // Read-only ZIP mounted at '/'.
-    argv.push_back("-zip");
-    argv.push_back(launch.rootFilesystemZipPath);
-
-    // Boxedwine otherwise scans the working directory for a *Wine*.zip.
-    argv.push_back("-nozip");
-    argv.push_back("1");
-
-    if (logPath != nullptr && logPath[0] != '\0') {
-        argv.push_back("-log");
-        argv.push_back(logPath);
-    }
-
-    if (!launch.gameDirectoryHostPath.empty()) {
-        // The imported game directory appears as drive D: inside Wine.
-        argv.push_back("-mount_drive");
-        argv.push_back(launch.gameDirectoryHostPath);
-        argv.push_back("d");
-    }
-
-    if (launch.width > 0 && launch.height > 0) {
-        argv.push_back("-resolution");
-        argv.push_back(std::to_string(launch.width) + "x" +
-                       std::to_string(launch.height));
-    }
-    if (launch.bitsPerPixel == 16 || launch.bitsPerPixel == 32) {
-        argv.push_back("-bpp");
-        argv.push_back(std::to_string(launch.bitsPerPixel));
-    }
-    if (!launch.soundEnabled) {
-        argv.push_back("-nosound");
-    }
-    if (!launch.workingDirectory.empty()) {
-        argv.push_back("-w");
-        argv.push_back(launch.workingDirectory);
-    }
-    for (const std::string& entry : launch.environment) {
-        argv.push_back("-env");
-        argv.push_back(entry);
-    }
-
-    // Everything from here on is the guest program and its arguments.
-    if (launch.runThroughWine) {
-        argv.push_back("/bin/wine");
-    }
-    argv.push_back(launch.executablePath);
-    for (const std::string& argument : launch.arguments) {
-        argv.push_back(argument);
-    }
-    return argv;
-}
-
 void logLaunch(const std::vector<std::string>& argv) {
     std::string joined;
     for (const std::string& argument : argv) {
@@ -236,7 +161,7 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         return false;
     }
 
-    PendingLaunch launch;
+    BVNLaunchConfiguration launch;
     if (request->rootFilesystemZipPath == nullptr ||
         request->rootFilesystemZipPath[0] == '\0') {
         error = "No root filesystem archive was given. BoxedVN needs "
@@ -283,6 +208,17 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
             launch.arguments.emplace_back(request->arguments[i]);
         }
     }
+
+    // Inspect both the requested executable and wrapper arguments so the
+    // profile remains correct if a future launcher delegates through Wine.
+    if (BVNApplyKnownCompatibilityProfile(launch)) {
+        // Builds 31-34 reduced the stable first-frame failure to the optimized
+        // REP MOVS overlap loop. That translator bug is fixed globally; the
+        // engine no longer needs a prohibitively slow interpreter window.
+        BVNLogWrite(BVNLogLevelInfo, "compatibility",
+                    "Song of Saya profile enabled: corrected ARM64 REP MOVS "
+                    "overlap path active; the entire engine retains JIT.");
+    }
     for (size_t i = 0; i < request->environmentCount; ++i) {
         if (request->environment != nullptr &&
             request->environment[i] != nullptr) {
@@ -294,6 +230,7 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     launch.bitsPerPixel = request->bitsPerPixel;
     launch.soundEnabled = request->soundEnabled;
     launch.runThroughWine = request->runThroughWine;
+    launch.enableWineD3DVulkan = !launch.gameDirectoryHostPath.empty();
 
     gPendingLaunch = std::move(launch);
     gHasPendingLaunch = true;
@@ -308,18 +245,13 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
 // no alert, nothing but a dead UI, because the call sat directly in the path
 // SDL and UIKit both depend on.
 //
-// A hang here is a real possibility, not a defensive nicety: on iOS, a
-// hardware permission fault delivered to a process that has CS_DEBUGGED set
-// WITHOUT an actively listening debugger on the other end of its Mach
-// exception ports can leave the faulting thread parked forever instead of
-// terminating the process. Some external JIT enablers set CS_DEBUGGED and
-// then detach, which is exactly that situation. (Two earlier crash reports
-// for this app WERE terminations - SIGKILL, then SIGBUS - so a plain fault
-// evidently does still crash the process in at least some cases; a genuine
-// hang would be a different, previously unseen failure mode, and this
-// wrapper cannot tell the two apart from the caller's side. It does not need
-// to: either way, the fix is the same - stop waiting, report what is known,
-// and keep the UI alive.)
+// A hang here is a real possibility, not a defensive nicety: on iOS 26/27
+// the target intentionally stops at StikDebug's universal JIT breakpoint so
+// the external script can prepare the requested pages. If the debugger is
+// attached but the script is absent, stopped, or incompatible, that request
+// may never be serviced. The wrapper cannot repair the external session, but
+// it can stop the main thread from waiting forever and report the setup that
+// needs attention.
 //
 // The worker thread is deliberately abandoned on timeout, not joined or
 // cancelled: a thread parked in a kernel trap servicing (or failing to get an
@@ -374,9 +306,8 @@ BVNJITReport probeJitWithTimeout() {
                     "The executable-memory probe did not return within the "
                     "timeout. Treating JIT as unavailable and abandoning the "
                     "stuck probe thread rather than blocking the main thread "
-                    "indefinitely. Check the log above this line for the "
-                    "last allocation strategy that was attempted - that is "
-                    "the one that hung.");
+                    "indefinitely. Confirm StikDebug's universal script is "
+                    "assigned to BoxedVN and still running.");
         BVNJITReport report{};
         report.status = BVNJITStatusUnavailable;
         report.executableMemoryAvailable = false;
@@ -385,12 +316,11 @@ BVNJITReport probeJitWithTimeout() {
         static char detail[640];
         snprintf(detail, sizeof(detail),
                  "The executable-memory probe did not return within %lld "
-                 "seconds - this looks like a HANG, not a crash. See the "
-                 "'jit' log lines just above this message for the last "
-                 "allocation strategy that was attempted before it stalled; "
-                 "that strategy is the one to rule out next. BoxedVN is "
-                 "treating JIT as unavailable rather than let the app stay "
-                 "frozen.",
+                 "seconds. StikDebug did not service BoxedVN's universal JIT "
+                 "breakpoint request. In StikDebug, enable Advanced Options, "
+                 "long-press BoxedVN, assign universal.js, then launch it "
+                 "with that script kept active. BoxedVN is treating JIT as "
+                 "unavailable rather than let the app stay frozen.",
                  (long long)kJitProbeTimeoutSeconds);
         report.detail = detail;
         return report;
@@ -399,11 +329,119 @@ BVNJITReport probeJitWithTimeout() {
     return probeResult;
 }
 
+bool configureMoltenVKForWineD3D(std::string& error) {
+    // WineD3D's D3D11 compatibility path does not need the very large bindless
+    // descriptor capacity supplied by Metal argument buffers. On this device,
+    // the final Saya pipeline stopped forever while MoltenVK was compiling it
+    // with argument buffers enabled. Use the simpler descriptor path and put
+    // a hard ceiling around an internal Metal compiler failure. MoltenVK reads
+    // these variables during its first Vulkan initialization, so this must run
+    // before boxedmain() loads the guest Vulkan driver.
+    struct EnvironmentSetting {
+        const char* name;
+        const char* value;
+    };
+    constexpr EnvironmentSetting settings[] = {
+        {"MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0"},
+        {"MVK_CONFIG_METAL_COMPILE_TIMEOUT", "20000000000"},
+    };
+    for (const EnvironmentSetting& setting : settings) {
+        if (setenv(setting.name, setting.value, 1) != 0) {
+            error = std::string("Could not configure MoltenVK setting ") +
+                setting.name + ".";
+            return false;
+        }
+    }
+    BVNLogWrite(BVNLogLevelInfo, "vulkan",
+                "MoltenVK WineD3D policy: Metal argument buffers disabled; "
+                "Metal library/function/pipeline compilation bounded at 20 "
+                "seconds.");
+    return true;
+}
+
 // Runs one guest session on the main thread.  Returns when the guest exits.
-void runSession(const PendingLaunch& launch) {
+void runSession(const BVNLaunchConfiguration& launch) {
     std::string error;
     if (!createDirectories(launch.writableRootPath, error)) {
         setLastError(error);
+        setState(BVNRuntimeStateFailed);
+        return;
+    }
+
+    // The base Wine prefix lives inside the read-only rootfs ZIP. Copy only
+    // its registry files into this game's writable overlay, then apply the
+    // iOS compatibility policy before wineserver reads them. Imported games
+    // use WineD3D's Vulkan backend. That reaches Boxedwine's generated Vulkan
+    // bridge and iOS MoltenVK/Metal without requiring the unavailable GLX
+    // backend. Do not overlay the rootfs's upstream DXVK 2.5.2 D3D9 DLL: its
+    // baseline requires geometry shaders and transform feedback, which
+    // MoltenVK does not expose. The unsupported Bluetooth root device is
+    // disconnected for every prefix. Winebus remains enabled: build 24 proved
+    // removing it did not reduce the cold-start gap and it will be needed for
+    // future controllers.
+    // Setting a service to disabled alone is insufficient because Wine 10
+    // auto-starts associated root PnP services regardless of Start.
+    if (launch.runThroughWine) {
+        const boxedvn::WineRenderer renderer = launch.enableWineD3DVulkan
+            ? boxedvn::WineRenderer::Vulkan
+            : boxedvn::WineRenderer::Default;
+        const boxedvn::WinePrefixPreparationResult prefix =
+            boxedvn::prepareWinePrefix(launch.rootFilesystemZipPath,
+                                       launch.writableRootPath,
+                                       renderer);
+        if (!prefix.ok) {
+            setLastError("Could not prepare the writable Wine prefix: " +
+                         prefix.error);
+            BVNLogWrite(BVNLogLevelError, "prefix", prefix.error.c_str());
+            setState(BVNRuntimeStateFailed);
+            return;
+        }
+        const char* prefixMessage =
+            launch.enableWineD3DVulkan
+                ? "Wine prefix ready: stale GDI/no-3D policy repaired; "
+                  "imported game uses DXVK through Boxedwine and iOS "
+                  "MoltenVK/Metal."
+                : "Wine prefix ready: unsupported Bluetooth root device "
+                  "disconnected; Wine HID bus available.";
+        BVNLogWrite(BVNLogLevelInfo, "prefix", prefixMessage);
+
+        // Shadow the rootfs's stock DXVK with the MoltenVK-compatible build.
+        // Upstream DXVK requires geometryShader and VK_EXT_transform_feedback
+        // and therefore refuses to create a device on Metal at all; the
+        // bundled modules treat those as optional. Only d3d11/dxgi/d3d10core
+        // are replaced, so d3d8/d3d9 continue to come from the archive.
+        if (launch.enableWineD3DVulkan) {
+            const char* bundledDxvk = BVNPathBundledDxvkDirectory();
+            if (bundledDxvk == nullptr) {
+                BVNLogWrite(BVNLogLevelError, "prefix",
+                            "This build ships no patched DXVK, so Direct3D 11 "
+                            "titles cannot render. Rebuild with ios/app/Dxvk "
+                            "populated.");
+            } else {
+                bool installed = false;
+                std::string dxvkError;
+                if (!boxedvn::installBundledDxvk(bundledDxvk,
+                                                 launch.writableRootPath,
+                                                 installed, dxvkError)) {
+                    setLastError("Could not install DXVK: " + dxvkError);
+                    BVNLogWrite(BVNLogLevelError, "prefix", dxvkError.c_str());
+                    setState(BVNRuntimeStateFailed);
+                    return;
+                }
+                BVNLogWrite(BVNLogLevelInfo, "prefix",
+                            installed
+                                ? "Installed the MoltenVK-compatible DXVK "
+                                  "modules into drive_c/dxvk."
+                                : "MoltenVK-compatible DXVK already present in "
+                                  "drive_c/dxvk.");
+            }
+        }
+    }
+
+    if (launch.enableWineD3DVulkan &&
+        !configureMoltenVKForWineD3D(error)) {
+        setLastError(error);
+        BVNLogWrite(BVNLogLevelError, "vulkan", error.c_str());
         setState(BVNRuntimeStateFailed);
         return;
     }
@@ -429,7 +467,7 @@ void runSession(const PendingLaunch& launch) {
     }
 
     const std::vector<std::string> argumentStrings =
-        buildArguments(launch, BVNLogCurrentFilePath());
+        BVNBuildLaunchArguments(launch);
     logLaunch(argumentStrings);
 
     std::vector<const char*> argv;
@@ -529,13 +567,13 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
     // the main thread inside a SwiftUI button handler - that handler unwinds
     // first, and boxedmain() then takes over the main thread cleanly.
     dispatch_async(dispatch_get_main_queue(), ^{
-        PendingLaunch launch;
+        BVNLaunchConfiguration launch;
         bool shouldLaunch = false;
 
         pthread_mutex_lock(&gMutex);
         if (gHasPendingLaunch && gFrontendReady) {
             launch = std::move(gPendingLaunch);
-            gPendingLaunch = PendingLaunch();
+            gPendingLaunch = BVNLaunchConfiguration();
             gHasPendingLaunch = false;
             shouldLaunch = true;
         }
@@ -545,16 +583,24 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
             return;
         }
 
-        // SDL disables its UIKit event pump when the function it was given
-        // (BVNGuestMain) returns - see -[SDLUIKitDelegate postFinishLaunch],
-        // which brackets that call with SDL_iPhoneSetEventPump TRUE/FALSE.
-        // Since BVNGuestMain now returns immediately so the real UIKit run
-        // loop can service the library UI, the pump has to be turned back on
-        // here or SDL_PumpEvents would be a no-op for the whole session and
-        // the guest would receive no input.
-        SDL_iPhoneSetEventPump(SDL_TRUE);
-        runSession(launch);
-        SDL_iPhoneSetEventPump(SDL_FALSE);
+        // Rotate the UIKit scene *before* SDL creates its UIWindow/CAMetalLayer.
+        // Creating the guest while the portrait-to-landscape transition was
+        // still in flight produced a portrait first drawable, then replaced
+        // it underneath Boxedwine's blocking main-thread loop. The visible
+        // results were a stretched loading screen, frozen input after a
+        // rotation, and a missing software keyboard.
+        BVNPrepareGuestPresentation(^{
+            // SDL disables its UIKit event pump when the function it was given
+            // (BVNGuestMain) returns - see -[SDLUIKitDelegate postFinishLaunch],
+            // which brackets that call with SDL_iPhoneSetEventPump TRUE/FALSE.
+            // Since BVNGuestMain now returns immediately so the real UIKit run
+            // loop can service the library UI, the pump has to be turned back
+            // on here or SDL_PumpEvents would be a no-op for the whole session.
+            SDL_iPhoneSetEventPump(SDL_TRUE);
+            runSession(launch);
+            SDL_iPhoneSetEventPump(SDL_FALSE);
+            BVNFinishGuestPresentation();
+        });
     });
     return true;
 }

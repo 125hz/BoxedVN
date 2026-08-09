@@ -33,11 +33,26 @@ struct Game: Identifiable, Hashable {
         "d:\\" + selectedExecutable.replacingOccurrences(of: "/", with: "\\")
     }
 
-    var guestWorkingDirectory: String? {
-        guard !workingDirectory.isEmpty else { return nil }
-        // -w takes an emulated *Linux* path; mount_drive links d: to
-        // ~/.wine/dosdevices/d:
-        return "/home/username/.wine/dosdevices/d:/" + workingDirectory
+    var guestWorkingDirectory: String {
+        // Older Windows games commonly open data files relative to their
+        // process working directory. An empty manifest value means "use the
+        // executable's folder", not Boxedwine's unrelated Linux default.
+        let normalizedExecutable = selectedExecutable
+            .replacingOccurrences(of: "\\", with: "/")
+        let executableParts = normalizedExecutable.split(separator: "/")
+        let inferredDirectory = executableParts.dropLast().joined(separator: "/")
+        let relativeDirectory = workingDirectory.isEmpty
+            ? inferredDirectory
+            : workingDirectory.replacingOccurrences(of: "\\", with: "/")
+        let trimmedDirectory = relativeDirectory.trimmingCharacters(
+            in: CharacterSet(charactersIn: "/"))
+
+        // -w takes an emulated Linux path; mount_drive links d: to the
+        // imported content directory at ~/.wine/dosdevices/d:.
+        let driveRoot = "/home/username/.wine/dosdevices/d:/"
+        return trimmedDirectory.isEmpty
+            ? driveRoot
+            : driveRoot + trimmedDirectory
     }
 }
 

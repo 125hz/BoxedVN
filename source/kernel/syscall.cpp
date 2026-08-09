@@ -762,9 +762,26 @@ static U32 syscall_setrlimit(CPU* cpu, U32 eipCount) {
     return result;
 }
 
-static U32 syscall_getrusuage(CPU* cpu, U32 eipCount) {	
+static U32 syscall_getrusuage(CPU* cpu, U32 eipCount) {
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "getrusage: who=%d usuage=%X", ARG1, ARG2);
     U32 result = cpu->thread->process->getrusuage(cpu->thread, ARG1, ARG2);
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    const GetrusageFairnessDecision fairness =
+        cpu->thread->getrusageFairness.observe(KSystem::getMicroCounter());
+    if (fairness.activated) {
+        klog_fmt("iOS getrusage fairness activated for pid=%04X tid=%04X; "
+                 "a 1 ms host scheduling point will replace this guest's "
+                 "tight in-process syscall spin",
+                 cpu->thread->process->id, cpu->thread->id);
+    }
+    if (fairness.throttle) {
+        // A real syscall crosses into the kernel and gives other runnable
+        // threads a scheduling opportunity. Recreate that property only once
+        // this thread proves it is polling pathologically; normal getrusage
+        // calls and Wine's cold-start path pay no delay.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#endif
     SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
     return result;
 }
@@ -1187,6 +1204,25 @@ static U32 syscall_sched_yield(CPU* cpu, U32 eipCount) {
 #endif
     U32 result = 0;
     std::this_thread::yield();
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    // std::this_thread::yield() maps to Darwin's sched_yield(), which is a
+    // hint the scheduler may ignore outright when other threads of equal
+    // priority are runnable. A guest thread spinning on it therefore keeps its
+    // core, and DXVK's worker threads spin exactly this way while the command
+    // stream they feed is starved. Once the rate proves pathological, replace
+    // the hint with a real scheduling point.
+    const GetrusageFairnessDecision fairness =
+        cpu->thread->schedYieldFairness.observe(KSystem::getMicroCounter());
+    if (fairness.activated) {
+        klog_fmt("iOS sched_yield fairness activated for pid=%04X tid=%04X; "
+                 "a 1 ms host scheduling point will replace this guest's "
+                 "ignored yield hint",
+                 cpu->thread->process->id, cpu->thread->id);
+    }
+    if (fairness.throttle) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#endif
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "yield: result=%d(0x%X)\n", result, result);
     return result;
 }
@@ -2705,7 +2741,10 @@ void ksyscall(CPU* cpu, U32 eipCount) {
 #ifndef BOXEDWINE_MULTI_THREADED
         U64 startTime = KSystem::getMicroCounter();
 #endif
+        cpu->thread->diagnosticSyscall.store(EAX + 1,
+                                             std::memory_order_relaxed);
         result = syscallFunc[EAX](cpu, eipCount);
+        cpu->thread->diagnosticSyscall.store(0, std::memory_order_relaxed);
 #ifndef BOXEDWINE_MULTI_THREADED
         U64 diff = KSystem::getMicroCounter()-startTime;
         sysCallTime+=diff;  

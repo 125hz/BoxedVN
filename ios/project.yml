@@ -24,7 +24,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "5"
+    CURRENT_PROJECT_VERSION: "59"
     # Overridden by scripts/build-ios.sh with the real git commit.  The
     # default is deliberately "unknown" so a build produced any other way
     # says so instead of claiming a revision it does not have.
@@ -57,6 +57,17 @@ targets:
       - path: app/Bundled
         optional: true
         buildPhase: resources
+      # Patched DXVK, kept as a folder reference so the DLLs stay inside a
+      # Dxvk/ subdirectory in the bundle rather than being flattened into the
+      # bundle root next to unrelated resources.
+      - path: app/Dxvk
+        optional: true
+        type: folder
+        buildPhase: resources
+      - path: ../THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+      - path: ../third_party/src/MoltenVK-ios-1.4.2/LICENSE
+        buildPhase: resources
     # No `info:` or `entitlements:` blocks here on purpose.  Those make
     # XcodeGen *generate* the files at those paths, silently overwriting the
     # hand-written ones on every run.  Pointing the build settings at the
@@ -85,6 +96,9 @@ targets:
           # otherwise drop it.  ObjC keeps every Objective-C class; all_load
           # is not needed and would bloat the binary.
           - -ObjC
+          # MoltenVK is discovered by SDL with dlsym(RTLD_DEFAULT), so force
+          # its loader entry point out of the merged static archive.
+          - -Wl,-u,_vkGetInstanceProcAddr
         CLANG_ENABLE_MODULES: YES
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         # Sideloading tools re-sign the IPA, so CI produces it unsigned.
@@ -114,9 +128,11 @@ targets:
       - sdk: Foundation.framework
       - sdk: GameController.framework
       - sdk: ImageIO.framework
+      - sdk: IOSurface.framework
       - sdk: Metal.framework
       - sdk: OpenGLES.framework
       - sdk: QuartzCore.framework
+      - sdk: Security.framework
       - sdk: UIKit.framework
       - sdk: UniformTypeIdentifiers.framework
       - sdk: libc++.tbd

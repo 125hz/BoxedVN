@@ -371,6 +371,17 @@ std::vector<BString> StartUpArgs::buildArgs() {
     if (this->disableWasmJitForWrittenCode) {
         args.push_back(B("-disableWasmJitForWrittenCode"));
     }
+    for (const auto& module : this->interpreterModules) {
+        args.push_back(B("-interpreterModule"));
+        args.push_back(module);
+    }
+    for (const auto& range : this->interpreterRanges) {
+        char encodedRange[18];
+        snprintf(encodedRange, sizeof(encodedRange), "%08x-%08x",
+                 range.first, range.second);
+        args.push_back(B("-interpreterRange"));
+        args.push_back(BString::copy(encodedRange));
+    }
     for (auto& a : this->args) {
         args.push_back(a);
     }
@@ -389,6 +400,18 @@ bool StartUpArgs::apply() {
     KSystem::forceRelativeMouse = this->forceRelativeMouse;
     KSystem::cacheReads = this->cacheReads;
     KSystem::disableWasmJitForWrittenCode = this->disableWasmJitForWrittenCode;
+    KSystem::interpreterModules = this->interpreterModules;
+    KSystem::interpreterRanges = this->interpreterRanges;
+    for (const auto& module : KSystem::interpreterModules) {
+        klog_fmt("Compatibility CPU profile: interpret modules matching '%s'; "
+                 "JIT remains enabled for all other guest code",
+                 module.c_str());
+    }
+    for (const auto& range : KSystem::interpreterRanges) {
+        klog_fmt("Compatibility CPU profile: interpret guest range "
+                 "%.8X-%.8X; JIT remains enabled outside it",
+                 range.first, range.second);
+    }
     KSystem::pentiumLevel = this->pentiumLevel;
     KSystem::pollRate = this->pollRate;
     if (KSystem::pollRate < 0) {
@@ -954,6 +977,20 @@ bool StartUpArgs::parseStartupArgs(int argc, const char **argv) {
             this->cacheReads = true;
         }  else if (!strcmp(argv[i], "-disableWasmJitForWrittenCode")) {
             this->disableWasmJitForWrittenCode = true;
+        } else if (!strcmp(argv[i], "-interpreterModule") && i + 1 < argc) {
+            this->interpreterModules.push_back(BString::copy(argv[i + 1]));
+            i++;
+        } else if (!strcmp(argv[i], "-interpreterRange") && i + 1 < argc) {
+            U32 start = 0;
+            U32 end = 0;
+            if (sscanf(argv[i + 1], "%x-%x", &start, &end) != 2 ||
+                start >= end) {
+                klog_fmt("Invalid -interpreterRange '%s'; expected "
+                         "START-END with START below END", argv[i + 1]);
+                return false;
+            }
+            this->interpreterRanges.emplace_back(start, end);
+            i++;
         }
         else if (!strcmp(argv[i], "-dxvk")) {
             BString dxvk;

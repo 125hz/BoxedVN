@@ -12,6 +12,7 @@
 #ifdef __TEST
 
 #include "../cpu/testCPU.h"
+#include "../../x11/x11.h"
 
 #include <atomic>
 #include <chrono>
@@ -70,6 +71,49 @@ void testTerminatingThreadDoesNotEnterFutexWait() {
 
     context.process->deleteThread(waiter);
 #endif
+}
+
+void testX11RasterOperationsAndPlaneMask() {
+    constexpr U32 source = 0x5a0ff00f;
+    constexpr U32 destination = 0xa55aa55a;
+    const U32 expected[] = {
+        0,
+        source & destination,
+        source & ~destination,
+        source,
+        ~source & destination,
+        destination,
+        source ^ destination,
+        source | destination,
+        ~(source | destination),
+        ~(source ^ destination),
+        ~destination,
+        source | ~destination,
+        ~source,
+        ~source | destination,
+        ~(source & destination),
+        0xffffffff,
+    };
+
+    for (S32 function = GXclear; function <= GXset; ++function) {
+        const U32 actual = x11ApplyRasterOperation(
+            source, destination, function, 0xffffffff);
+        if (actual != expected[function]) {
+            testFail("X11 raster function %d expected %08X, got %08X",
+                     function, expected[function], actual);
+        }
+    }
+
+    constexpr U32 planeMask = 0x00ff00ff;
+    const U32 fullAnd = source & destination;
+    const U32 maskedAnd = (destination & ~planeMask) |
+        (fullAnd & planeMask);
+    const U32 actualAnd = x11ApplyRasterOperation(
+        source, destination, GXand, planeMask);
+    if (actualAnd != maskedAnd) {
+        testFail("X11 GXand plane mask expected %08X, got %08X",
+                 maskedAnd, actualAnd);
+    }
 }
 
 #endif

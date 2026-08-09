@@ -65,6 +65,8 @@ bool KSystem::disableHideCursor = false;
 bool KSystem::forceRelativeMouse = false;
 bool KSystem::cacheReads = false;
 bool KSystem::disableWasmJitForWrittenCode = false;
+std::vector<BString> KSystem::interpreterModules;
+std::vector<std::pair<U32, U32>> KSystem::interpreterRanges;
 BString KSystem::showWindowTimestamp;
 U32 KSystem::pageSize = 4096;
 bool KSystem::canJitUse4KPage = false;
@@ -82,6 +84,8 @@ void KSystem::init() {
     KSystem::nextThreadId=10;
     KSystem::processes.clear();
     KSystem::pentiumLevel = 4;
+	KSystem::interpreterModules.clear();
+	KSystem::interpreterRanges.clear();
 	KSystem::shutingDown = false;
     KSystem::startTimeTicks = KNativeSystem::getTicks();
     KSystem::startTimeMicroCounter = Platform::getMicroCounter();
@@ -366,6 +370,23 @@ U32 KSystem::kill(S32 pid, U32 signal) {
 
 void KSystem::wakeThreadsWaitingOnProcessStateChanged() {
     BOXEDWINE_CONDITION_SIGNAL_ALL(processesCond);
+}
+
+void KSystem::logThreadSnapshot(const char* reason) {
+    std::vector<KProcessPtr> processSnapshot;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(processesCond);
+        for (auto& entry : KSystem::processes) {
+            processSnapshot.push_back(entry.value);
+        }
+    }
+    klog_fmt("=== Guest first-frame hang snapshot: %s (%zu process(es)) ===",
+             reason ? reason : "unspecified", processSnapshot.size());
+    for (const auto& process : processSnapshot) {
+        process->logThreadSnapshot(reason);
+    }
+    KThread::logFutexSnapshot();
+    klog("=== End guest first-frame hang snapshot ===");
 }
 
 namespace {

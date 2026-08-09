@@ -119,6 +119,8 @@ public:
     bool forceRelativeMouse = false;
     bool cacheReads = false;
     bool disableWasmJitForWrittenCode = false;
+    std::vector<BString> interpreterModules;
+    std::vector<std::pair<U32, U32>> interpreterRanges;
 
 private:
     bool workingDirSet = false;

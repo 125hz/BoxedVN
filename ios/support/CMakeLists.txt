@@ -9,6 +9,7 @@ add_library(boxedvn_support STATIC
     src/pe_inspector.cpp
     src/zip_import.cpp
     src/game_import.cpp
+    src/wine_prefix.cpp
 )
 
 target_include_directories(boxedvn_support PUBLIC

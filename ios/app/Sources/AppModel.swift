@@ -18,6 +18,7 @@ final class AppModel: ObservableObject {
     // before the user has done anything, and the unsafe probe can crash the
     // process with no recovery possible. See Runtime.swift / BVNRuntime.h.
     @Published private(set) var jit: JITReport = .probeStatus()
+    @Published private(set) var memory: MemoryReport = .probe()
     @Published private(set) var runtimeState: RuntimeState = .idle
     @Published private(set) var isImporting = false
     @Published var importProgressMessage = ""
@@ -25,12 +26,24 @@ final class AppModel: ObservableObject {
     @Published var alertMessage: String?
 
     private var pollTimer: Timer?
+    private var pollCount = 0
 
     init() {
         reloadGames()
         startPolling()
         Log.write("BoxedVN \(AppVersion.display) initialised; Boxedwine core "
                   + Session.boxedwineVersion, category: "app")
+        Log.write("Memory status: \(memory.statusText); "
+                  + "\(memory.availableText) available before process limit. "
+                  + memory.detail, category: "memory")
+        if Storage.bundledRootFilesystem != nil {
+            let ignoredImport = Storage.importedRootFilesystem == nil
+                ? ""
+                : " An older imported archive is present but intentionally ignored."
+            Log.write("Bundled root filesystem selected as the authoritative "
+                      + "runtime for this build." + ignoredImport,
+                      category: "rootfs")
+        }
     }
 
     deinit {
@@ -111,7 +124,10 @@ final class AppModel: ObservableObject {
         let sizeText = size.map {
             ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file)
         } ?? "unknown size"
-        return "\(url.lastPathComponent) (\(sizeText))"
+        let source = Storage.bundledRootFilesystem == nil
+            ? "Imported runtime"
+            : "Bundled runtime"
+        return "\(source) · \(url.lastPathComponent) (\(sizeText))"
     }
 
     /// - Parameter movingSource: true when `url` is already inside the app's
@@ -266,8 +282,8 @@ final class AppModel: ObservableObject {
         // cold launch shows "unavailable" forever even once JIT genuinely
         // becomes available - the user has to know to dig into Runtime
         // status and tap "Re-check" for the badge to ever catch up. The probe
-        // itself is one mmap+munmap of a single page: cheap enough to just
-        // keep it live rather than rely on the user noticing it's stale.
+        // itself only reads csops/CS_DEBUGGED: cheap and safe enough to keep
+        // live rather than rely on the user noticing it's stale.
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
             [weak self] _ in
             Task { @MainActor in
@@ -283,6 +299,10 @@ final class AppModel: ObservableObject {
                     }
                 }
                 self.refreshJIT()
+                self.pollCount += 1
+                if self.pollCount % 10 == 0 {
+                    self.memory = .probe()
+                }
             }
         }
     }

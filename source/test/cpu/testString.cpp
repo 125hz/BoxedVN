@@ -475,12 +475,14 @@ void runHotMovsCase(int width, bool address32, U32 count, bool backward, const c
     cpu->thread->process->hasSetSeg[ES] = savedHasEs;
 }
 
-void simulateOverlapMovs(U8* expected, int width, bool address32, U32 count, bool backward, U32& esi, U32& edi, U32& ecx) {
+void simulateOverlapMovs(U8* expected, int width, bool address32, U32 overlapBase,
+                         U32 count, bool backward, U32& esi, U32& edi,
+                         U32& ecx) {
     S32 delta = backward ? -width : width;
     U32 remaining = countValue(ecx, address32);
     while (remaining) {
-        U32 srcOffset = indexOffset(esi, address32) - OVERLAP_BASE;
-        U32 dstOffset = indexOffset(edi, address32) - OVERLAP_BASE;
+        U32 srcOffset = indexOffset(esi, address32) - overlapBase;
+        U32 dstOffset = indexOffset(edi, address32) - overlapBase;
         U32 value = readCaseValue(expected, srcOffset, width);
         writeCaseValue(expected, dstOffset, width, value);
         esi = updateIndex(esi, delta, address32);
@@ -493,17 +495,38 @@ void simulateOverlapMovs(U8* expected, int width, bool address32, U32 count, boo
 void runOverlapMovsCase(int width, bool address32, U32 count, bool backward, const char* name) {
     newInstruction(backward ? DF : 0);
     cpu->big = address32 ? 1 : 0;
-    cpu->seg[ES].address = TEST_HEAP_ADDRESS;
-    cpu->seg[ES].value = TEST_HEAP_SEG;
-    cpu->thread->process->hasSetSeg[ES] = true;
+    Seg savedDs = cpu->seg[DS];
+    Seg savedEs = cpu->seg[ES];
+    bool savedHasDs = cpu->thread->process->hasSetSeg[DS];
+    bool savedHasEs = cpu->thread->process->hasSetSeg[ES];
+    U32 overlapBase = OVERLAP_BASE;
+    if (address32) {
+        // No explicit segment bases: this selects Jit::movsr, including its
+        // optimized eight-byte path, on the second pass below.
+        cpu->seg[DS].address = 0;
+        cpu->seg[DS].value = 0;
+        cpu->seg[ES].address = 0;
+        cpu->seg[ES].value = 0;
+        cpu->thread->process->hasSetSeg[DS] = false;
+        cpu->thread->process->hasSetSeg[ES] = false;
+        overlapBase = TEST_HEAP_ADDRESS + OVERLAP_BASE;
+    } else {
+        cpu->seg[ES].address = TEST_HEAP_ADDRESS;
+        cpu->seg[ES].value = TEST_HEAP_SEG;
+        cpu->thread->process->hasSetSeg[ES] = true;
+    }
 
     U32 overlapDelta = width;
-    U32 srcStart = OVERLAP_BASE + (backward ? overlapDelta + (count - 1) * width : 0);
-    U32 dstStart = OVERLAP_BASE + (backward ? (count - 1) * width : overlapDelta);
+    U32 srcStart = overlapBase + (backward ? overlapDelta + (count - 1) * width : 0);
+    U32 dstStart = overlapBase + (backward ? (count - 1) * width : overlapDelta);
     U32 ecx = count;
     size_t dataSize = count * width + overlapDelta;
     if (dataSize > OVERLAP_SIZE) {
         failed("%s overlap data size", name);
+        cpu->seg[DS] = savedDs;
+        cpu->seg[ES] = savedEs;
+        cpu->thread->process->hasSetSeg[DS] = savedHasDs;
+        cpu->thread->process->hasSetSeg[ES] = savedHasEs;
         return;
     }
 
@@ -511,20 +534,47 @@ void runOverlapMovsCase(int width, bool address32, U32 count, bool backward, con
     U8 expected[OVERLAP_SIZE];
     initOverlapBytes(initial, dataSize);
     copyBytes(expected, initial, dataSize);
-    writeOverlapBytes(initial, dataSize);
-
     U32 expectedRegs[8];
     initRegisters(expectedRegs, 0x89abcdef, srcStart, dstStart, ecx);
-    simulateOverlapMovs(expected, width, address32, count, backward, expectedRegs[R_SI], expectedRegs[R_DI], expectedRegs[R_CX]);
+    simulateOverlapMovs(expected, width, address32, overlapBase, count,
+                        backward, expectedRegs[R_SI], expectedRegs[R_DI],
+                        expectedRegs[R_CX]);
 
     emitCode(STRING_MOVS, width, PREFIX_REPE);
-    runTestCPU();
+
+    writeOverlapBytes(initial, dataSize);
+    if (!address32) {
+        // The 16-bit-address REP path deliberately remains interpreter-only.
+        runTestCPU();
+    } else {
+        // The first pass profiles the decoded instruction; the second
+        // exercises optimized Jit::movsr. The old test stopped after the
+        // interpreter pass and missed the invariant-delta loop Saya exposed.
+        for (int pass = 0; pass < 2; ++pass) {
+            cpu->eip.u32 = 0;
+            cpu->big = 1;
+            cpu->setFlags(backward ? DF : 0, FMASK_ALL);
+            for (int i = 0; i < 8; ++i) {
+                cpu->reg[i].u32 = REG_GUARD | (0x0100 + i);
+            }
+            cpu->reg[R_AX].u32 = 0x89abcdef;
+            cpu->reg[R_CX].u32 = ecx;
+            cpu->reg[R_SI].u32 = srcStart;
+            cpu->reg[R_DI].u32 = dstStart;
+            writeOverlapBytes(initial, dataSize);
+            runTestCPU();
+        }
+    }
 
     verifyRegisters(cpu, expectedRegs, name);
     verifyOverlapBytes(expected, dataSize, name);
     if ((actualFlags(cpu, true) & FLAG_MASK) != (backward ? DF : 0)) {
         failed("%s overlap flags", name);
     }
+    cpu->seg[DS] = savedDs;
+    cpu->seg[ES] = savedEs;
+    cpu->thread->process->hasSetSeg[DS] = savedHasDs;
+    cpu->thread->process->hasSetSeg[ES] = savedHasEs;
 }
 
 void runOverlapMovsCases(int width, bool address32) {

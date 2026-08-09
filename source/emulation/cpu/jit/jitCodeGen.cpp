@@ -1036,8 +1036,8 @@ U8* JitCodeGen::createDynamicExecutableMemory(U32* pSize) {
     }
     U8* begin = (U8*)cpu->memory->allocCodeMemory(size);
 
-    Platform::writeCodeToMemory(begin, size, [begin, size, this]() {
-        copyBuffer(begin, size);
+    Platform::writeCodeToMemory(begin, size, [size, this](void* writable) {
+        copyBuffer(static_cast<U8*>(writable), size);
     });
     Platform::clearInstructionCache(begin, size);
 
