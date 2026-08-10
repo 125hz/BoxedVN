@@ -209,16 +209,6 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         }
     }
 
-    // Inspect both the requested executable and wrapper arguments so the
-    // profile remains correct if a future launcher delegates through Wine.
-    if (BVNApplyKnownCompatibilityProfile(launch)) {
-        // Builds 31-34 reduced the stable first-frame failure to the optimized
-        // REP MOVS overlap loop. That translator bug is fixed globally; the
-        // engine no longer needs a prohibitively slow interpreter window.
-        BVNLogWrite(BVNLogLevelInfo, "compatibility",
-                    "Song of Saya profile enabled: corrected ARM64 REP MOVS "
-                    "overlap path active; the entire engine retains JIT.");
-    }
     for (size_t i = 0; i < request->environmentCount; ++i) {
         if (request->environment != nullptr &&
             request->environment[i] != nullptr) {
@@ -231,6 +221,20 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     launch.soundEnabled = request->soundEnabled;
     launch.runThroughWine = request->runThroughWine;
     launch.enableWineD3DVulkan = !launch.gameDirectoryHostPath.empty();
+
+    // LAST, so a profile can override any default above it. Build 66 called
+    // this before enableWineD3DVulkan was assigned, so its Grisaia profile -
+    // whose whole point was to turn DXVK off - was silently overwritten two
+    // lines later and the experiment never ran: the device log still shows
+    // "-dxvk 1" and the same six DXVK device failures.
+    //
+    // Inspect both the requested executable and wrapper arguments so a profile
+    // remains correct if a future launcher delegates through Wine.
+    if (BVNApplyKnownCompatibilityProfile(launch)) {
+        BVNLogWrite(BVNLogLevelInfo, "compatibility",
+                    "A per-title compatibility profile was applied; see the "
+                    "boxedmain command line below for what it changed.");
+    }
 
     gPendingLaunch = std::move(launch);
     gHasPendingLaunch = true;

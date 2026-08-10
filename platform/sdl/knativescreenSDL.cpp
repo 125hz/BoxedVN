@@ -160,6 +160,23 @@ extern "C" void BVNGuestControlsSendKey(U32 scancode, bool down) {
     gIOSActiveScreen->input->key(scancode, 0, down ? 1 : 0);
 }
 
+// A right click, from the overlay's two-finger tap. The coordinates are in
+// the Metal view's bounds, which since build 65 are the guest resolution, so
+// they go through the same transform as a real pointer event.
+//
+// Boxedwine numbers its buttons 0 = left, 1 = right, 2 = middle (see
+// getMouseButtonFromEvent), which is not SDL's numbering.
+extern "C" void BVNGuestControlsSendRightClick(int x, int y) {
+    if (!gIOSActiveScreen) {
+        return;
+    }
+    const KNativeInputSDLPtr& input = gIOSActiveScreen->input;
+    klog_fmt("iOS overlay right click at window %d,%d -> guest %d,%d",
+             x, y, input->xFromScreen(x), input->yFromScreen(y));
+    input->mouseButton(1, 1, x, y);
+    input->mouseButton(0, 1, x, y);
+}
+
 // The window changed shape (rotation, or the presenter re-letterboxed). The
 // pointer transform is re-derived from the presenter's measured rectangle;
 // it is never predicted. See refreshIOSGuestPointerTransform.
@@ -1135,7 +1152,15 @@ void KNativeScreenSDL::recreateMainWindow() {
         // (402x874 on this 3x phone), which is visibly blurry when expanded
         // to the physical display. RESIZABLE ensures orientation-driven view
         // geometry is treated as a live window-size change by SDL.
-        flags |= SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
+        //
+        // BORDERLESS is how SDL is told this is a full-screen game surface:
+        // SDL_uikitviewcontroller answers -prefersStatusBarHidden and
+        // -preferredScreenEdgesDeferringSystemGestures from exactly these two
+        // flags. Without it the clock and the "< StikDebug" return breadcrumb
+        // are drawn over the top of the picture, which is what they were doing
+        // once the letterbox made the guest fill the screen's full height.
+        flags |= SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE |
+                 SDL_WINDOW_BORDERLESS;
 #endif
         
         visible = false;

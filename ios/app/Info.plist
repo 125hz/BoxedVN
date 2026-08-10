@@ -73,7 +73,14 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<!-- The guest's view controller must own this. UIStatusBarHidden below is
+	     a launch-time value that modern iOS does not keep honouring, and with
+	     controller-based appearance off there is no way for SDL's view
+	     controller to answer prefersStatusBarHidden at all - which is why the
+	     clock and the return-to-StikDebug breadcrumb were drawn over the
+	     game. SDL answers YES for a BORDERLESS window; the SwiftUI library
+	     keeps its status bar, which is what you want there. -->
 	<key>UIViewControllerBasedStatusBarAppearance</key>
-	<false/>
+	<true/>
 </dict>
 </plist>

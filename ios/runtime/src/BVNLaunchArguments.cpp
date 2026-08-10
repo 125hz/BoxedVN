@@ -70,6 +70,13 @@ bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
     // This is an experiment with a clear falsifier: if the DirectX dialog
     // still appears, DXVK was not the cause and this profile should be
     // removed rather than elaborated.
+    //
+    // NOT YET TESTED. Build 66 shipped this profile but BVNRuntime called
+    // BVNApplyKnownCompatibilityProfile *before* it assigned
+    // enableWineD3DVulkan, so the flag was overwritten two lines later and the
+    // device log still shows "-dxvk 1" with the same six DXVK failures. The
+    // ordering is fixed in build 67; the falsifier above applies to that run,
+    // not to build 66's.
     if (launchesAnyOf(launch, {"bootmenu.exe", "grisaia.exe"})) {
         launch.enableWineD3DVulkan = false;
         return true;

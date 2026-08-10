@@ -313,6 +313,21 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self addSubview:menu];
     self.menuButton = menu;
 
+    // Two-finger tap = right click. A gesture recogniser on the overlay sees
+    // the touch before SDL's view does, but only claims it once two fingers
+    // land, so single-finger tapping - which is the whole of a visual novel -
+    // is untouched.
+    UITapGestureRecognizer* rightClick = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(handleTwoFingerTap:)];
+    rightClick.numberOfTouchesRequired = 2;
+    rightClick.numberOfTapsRequired = 1;
+    // Do not let it swallow the first finger from the game while it waits to
+    // see whether a second one arrives.
+    rightClick.cancelsTouchesInView = NO;
+    rightClick.delaysTouchesBegan = NO;
+    rightClick.delaysTouchesEnded = NO;
+    [self addGestureRecognizer:rightClick];
+
     UIView* scrim = [[UIView alloc] initWithFrame:self.bounds];
     scrim.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
     scrim.hidden = YES;
@@ -421,7 +436,31 @@ static BVNGuestOverlayView* gOverlay = nil;
 
 - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
     UIView* hit = [super hitTest:point withEvent:event];
-    return hit == self ? nil : hit;
+    if (hit == self) {
+        hit = nil;
+    }
+
+    // Name whoever claims a touch, at most once a second.
+    //
+    // Build 66 lost touch entirely for the guest while the overlay's own menu
+    // kept working, which narrows the fault to this hand-off but does not
+    // identify it - and reasoning about UIKit's private view hierarchy from a
+    // log is how the last two builds went wrong. One line per second says
+    // whether the overlay is passing the touch down or swallowing it, and if
+    // it is swallowing it, which control did.
+    static NSTimeInterval lastReport = 0.0;
+    const NSTimeInterval now = CACurrentMediaTime();
+    if (now - lastReport >= 1.0) {
+        lastReport = now;
+        NSString* message = [NSString stringWithFormat:
+            @"Overlay hit test at %.0f,%.0f in bounds %.0fx%.0f -> %@%@",
+            point.x, point.y, self.bounds.size.width, self.bounds.size.height,
+            hit == nil ? @"passed through to the game"
+                       : NSStringFromClass(hit.class),
+            hit == nil ? @"" : @" (swallowed)"];
+        BVNLogWrite(BVNLogLevelInfo, "input", message.UTF8String);
+    }
+    return hit;
 }
 
 // UIKit reports the safe area separately from, and sometimes later than, the
@@ -458,20 +497,12 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self layoutMenuPanelWithSafeArea:safe];
     [self layoutKeyboardPanelWithSafeArea:safe];
 
-    // Opportunistically re-fit the guest picture when the window has changed
-    // shape. This is a convenience, not the mechanism: the reliable path is
-    // BVNSyncGuestPresentationGeometry, polled from Boxedwine's own main loop,
-    // because on build 65 this callback stopped arriving after the first
-    // rotation and the picture was left with its portrait geometry.
-    //
-    // BVNSyncGuestPresentationGeometry does nothing when the window has not
-    // moved, so calling it from a layout pass is cheap and cannot loop.
-    // Nothing here forces layout on another subtree - doing that from inside
-    // -layoutSubviews is what wedged UIKit in build 65.
-    if (BVNSyncGuestPresentationGeometry()) {
-        BVNGuestPresentationGeometryChanged();
-    }
-
+    // Deliberately does NOT re-fit the guest picture. That belongs to the poll
+    // in KNativeInputSDL::processEvents, which runs outside any UIKit layout
+    // pass. Re-fitting from here means running the presenter - which flushes
+    // the Metal view's layout - from inside this layout pass, on a view in a
+    // sibling subtree. Build 65 did that and UIKit stopped laying the subtree
+    // out at all after the first rotation.
     self.layingOut = NO;
 }
 
@@ -552,6 +583,26 @@ static BVNGuestOverlayView* gOverlay = nil;
         }
         rowY += rowHeight + kBVNKeyGap;
     }
+}
+
+- (void)handleTwoFingerTap:(UITapGestureRecognizer*)recognizer {
+    if (self.menuOpen || !self.keyboardPanel.hidden) {
+        // The overlay's own UI is up; a two-finger tap there is not aimed at
+        // the game.
+        return;
+    }
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation == nil) {
+        return;
+    }
+    // Midpoint of the two fingers, in the presenting view's bounds - which are
+    // the guest resolution, and which -locationInView: resolves through the
+    // view's scale transform for us.
+    const CGPoint point = [recognizer locationInView:presentation];
+    if (!CGRectContainsPoint(presentation.bounds, point)) {
+        return;
+    }
+    BVNGuestControlsSendRightClick((int)lround(point.x), (int)lround(point.y));
 }
 
 // ---------------------------------------------------------------------------

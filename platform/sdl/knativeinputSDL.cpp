@@ -739,6 +739,14 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
                      e->window.event == SDL_WINDOWEVENT_RESIZED
                          ? "resized" : "size changed",
                      e->window.data1, e->window.data2);
+            // SDL reports its window size as the Metal view's bounds, so this
+            // event IS the presentation surface changing shape - and the
+            // pointer transform is derived from that size. Build 66 computed
+            // the transform immediately after the fit, before SDL had seen
+            // the resize, and then never recomputed it: the log shows the
+            // guest still mapping taps at 109%x67% while SDL was delivering
+            // 800x600 coordinates.
+            BVNGuestPresentationGeometryChanged();
         }
 #endif
         if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {

@@ -6,15 +6,13 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 66. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 67. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
-Build 65 fixed landscape touch and **killed the swapchain storm** (8,244
-rebuilds a minute down to two creations a session, confirmed on device), but
-rotation left the picture off-centre and untappable; build 66 fixes that by
-polling window geometry from the emulator's own loop instead of a UIKit layout
-callback, and adds a no-DXVK profile for The Fruit of Grisaia. **Build 66 is
-not device-tested yet.** The newest detail is at the end of the session log, section 10; the
+Build 65 killed the **swapchain storm** (8,244 rebuilds a minute down to two
+creations a session) and build 66 fixed rotation, but 66 lost touch entirely.
+Build 67 restores the one thing 66 removed that touch depended on and fixes
+three more defects the same log named. **Build 67 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -2951,6 +2949,57 @@ finding and fixing it needs the DXVK source and a mingw rebuild, neither of
 which is available on this Mac. wined3d created a Vulkan device fine in the
 same session and the engine is Direct3D 9, so build 66 launches Grisaia
 without `-dxvk` as a workaround with a clean falsifier.
+
+Verified locally: build succeeds, app validates, 89/89 tests pass.
+**Untested on device.**
+
+### 2026-08-09 — build 67: touch again, the status bar, and a right click
+
+Build 66 on device: rotation re-fits correctly in both directions now (the poll
+works), and the swapchain storm stayed dead. But touch was gone entirely — and
+the log narrows it sharply, because the overlay's own menu kept working while
+SDL received **zero** mouse events after the fit.
+
+Two defects, both traceable to removing `-layoutIfNeeded` from the fit:
+
+- **The pointer transform went stale.** SDL reports its window size as the
+  Metal view's `bounds`, and it does so from `-viewDidLayoutSubviews`. Without
+  the forced layout, `refreshIOSGuestPointerTransform` ran *before* SDL had
+  seen the resize and locked in `scale 109%x67%`; SDL then started delivering
+  0..800 x 0..600 coordinates and nothing recomputed. The transform is now
+  recomputed from the SDL resize event itself, which is the authoritative
+  signal.
+- The layout flush is restored, but only on the paths that are **not** inside a
+  UIKit layout pass — surface creation and the `processEvents` poll. The
+  overlay no longer re-fits from `-layoutSubviews` at all; that was what wedged
+  UIKit in build 65 and the poll makes it unnecessary.
+
+**The safe-area insets were read from the wrong view.** Build 66 switched to
+`UIWindow.safeAreaInsets`; the log shows it reporting *portrait* insets
+(l0 r0 t62 b34) while its bounds were landscape 874x402, and the
+`UIDropShadowView` reporting the correct landscape ones (l62 r62 t0 b20) in the
+same session. SDL's window is created with the legacy `-initWithFrame:` path
+and attached to the scene afterwards, so its own safe area lags. Reverted to
+the view hierarchy UIKit actually laid out — which is also why the overlay's
+menu was sitting under the Dynamic Island.
+
+**The status bar was never actually hidden.** `UIStatusBarHidden` with
+`UIViewControllerBasedStatusBarAppearance=false` is a launch-time value modern
+iOS stops honouring, and with controller-based appearance off SDL's view
+controller could not answer `prefersStatusBarHidden` at all. Controller-based
+appearance is now on and the guest window carries `SDL_WINDOW_BORDERLESS`,
+which is the flag SDL answers from. That should take the clock and the
+"< StikDebug" breadcrumb off the artwork.
+
+**The Grisaia profile never ran.** `BVNRuntimeRequestLaunch` applied the
+compatibility profile *before* assigning `enableWineD3DVulkan`, so the one
+thing the profile did was overwritten two lines later — the device log still
+shows `-dxvk 1` and the same six DXVK device failures. The profile is applied
+last now, so the no-DXVK hypothesis gets its first real test in build 67.
+
+Also added: **two-finger tap = right click**, and a throttled hit-test log in
+the overlay that names whatever claims a touch, so if touch is still wrong the
+next log identifies the swallower instead of another round of inference.
 
 Verified locally: build succeeds, app validates, 89/89 tests pass.
 **Untested on device.**

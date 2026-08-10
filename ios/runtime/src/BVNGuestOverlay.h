@@ -81,6 +81,14 @@ uint32_t BVNGuestControlsScancodeForName(const char* name);
 
 void BVNGuestControlsSendKey(uint32_t scancode, bool down);
 
+// A right click at a point in the Metal view's bounds, which since build 65
+// are the guest resolution.  Used by the overlay's two-finger tap.
+void BVNGuestControlsSendRightClick(int x, int y);
+
+// The Metal view the guest is presenting through, so the overlay can convert a
+// touch into its coordinate space.  nil when no guest surface exists.
+UIView* BVNGuestPresentationView(void);
+
 // Re-derives the window-to-guest pointer transform from the rectangle the
 // presenter measured.  Presentation and input are never derived independently:
 // build 62 broke every tap by assuming a letterbox that had not happened.
