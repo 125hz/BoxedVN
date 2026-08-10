@@ -2,8 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BVNBuildRevision</key>
+	<string>$(BVN_BUILD_REVISION)</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>BoxedVN</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -12,31 +16,20 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
-	<key>CFBundleDisplayName</key>
-	<string>BoxedVN</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-
-	<!-- The git commit the IPA was built from.  Sideloaded builds carry no
-	     App Store version history, so a marketing version alone cannot tell
-	     you whether an installed IPA is the newest one; the commit can.
-	     scripts/build-ios.sh passes the real value, so a build made any other
-	     way is honestly reported as "unknown" rather than silently wrong. -->
-	<key>BVNBuildRevision</key>
-	<string>$(BVN_BUILD_REVISION)</string>
+	<key>GCSupportsGameMode</key>
+	<true/>
 	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>MinimumOSVersion</key>
 	<string>$(IPHONEOS_DEPLOYMENT_TARGET)</string>
-
-	<!-- SDL still owns UIApplicationMain and installs BVNAppDelegate, while a
-	     scene delegate owns the library UIWindow. SDL's guest UIWindow is
-	     attached to that same scene immediately after creation. Current iOS
-	     requires this ownership for remote controllers and keyboard scenes. -->
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -54,14 +47,19 @@
 			</array>
 		</dict>
 	</dict>
-
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>
 		<string></string>
 	</dict>
-
-	<!-- Games run in landscape; the library is usable in any orientation. -->
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UIStatusBarHidden</key>
+	<true/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
@@ -75,25 +73,7 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-
-	<!-- Games and logs live in Documents so users can back them up, copy
-	     saves out, and drop a root filesystem archive in without the app. -->
-	<key>UIFileSharingEnabled</key>
-	<true/>
-	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<true/>
-
-	<key>UIRequiredDeviceCapabilities</key>
-	<array>
-		<string>arm64</string>
-	</array>
-
-	<key>UIStatusBarHidden</key>
-	<true/>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<false/>
-
-	<!-- No background execution: BoxedVN suspends the guest when the app
-	     leaves the foreground.  See docs/KNOWN_LIMITATIONS_IOS.md. -->
 </dict>
 </plist>

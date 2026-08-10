@@ -682,6 +682,25 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface) {
 //
 // KNativeScreenSDL computes the matching inverse for pointer events. The two
 // must agree; if one changes the other has to change with it.
+static CGRect gGuestPresentationContentRect = CGRectZero;
+static bool gGuestPresentationIsLetterboxed = false;
+
+// Reports the rectangle the guest picture is actually being shown in. Returns
+// false while it fills the window, so the pointer transform can never assume a
+// letterbox that did not take effect - which is exactly what broke tapping in
+// build 62.
+extern "C" bool BVNGuestPresentationContentRect(int* x, int* y, int* w,
+                                                int* h) {
+    if (!gGuestPresentationIsLetterboxed) {
+        return false;
+    }
+    if (x) { *x = (int)gGuestPresentationContentRect.origin.x; }
+    if (y) { *y = (int)gGuestPresentationContentRect.origin.y; }
+    if (w) { *w = (int)gGuestPresentationContentRect.size.width; }
+    if (h) { *h = (int)gGuestPresentationContentRect.size.height; }
+    return true;
+}
+
 extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                                                 uint32_t guestWidth,
                                                 uint32_t guestHeight,
@@ -694,11 +713,23 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
         return;
     }
     if (surface == nullptr || guestWidth == 0 || guestHeight == 0) {
+        BVNLogWrite(BVNLogLevelWarning, "graphics",
+                    "Presentation aspect skipped: no surface or zero guest "
+                    "size.");
         return;
     }
     NSValue* key = [NSValue valueWithPointer:surface];
     UIView* view = gGuestVulkanSurfaceViews[key];
-    if (view == nil || view.superview == nil) {
+    if (view == nil) {
+        BVNLogWrite(BVNLogLevelWarning, "graphics",
+                    "Presentation aspect skipped: no registered view for this "
+                    "surface.");
+        return;
+    }
+    if (view.superview == nil) {
+        BVNLogWrite(BVNLogLevelWarning, "graphics",
+                    "Presentation aspect skipped: the Metal view has no "
+                    "superview to measure against.");
         return;
     }
 
@@ -721,7 +752,17 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                             width, height);
     }
 
+    // UIKit owns this view's layout, so pin the frame and stop it being
+    // resized back to the full window on the next layout pass.
+    view.autoresizingMask = UIViewAutoresizingNone;
+    view.translatesAutoresizingMaskIntoConstraints = YES;
     view.frame = target;
+    // Letterbox bars read as part of the device, not as Wine's desktop.
+    view.superview.backgroundColor = UIColor.blackColor;
+
+    gGuestPresentationContentRect = target;
+    gGuestPresentationIsLetterboxed =
+        !stretchToFill && !CGRectEqualToRect(target, available);
 
     NSString* message = [NSString stringWithFormat:
         @"Guest presentation %@: guest %ux%u into %.0fx%.0f at %.0f,%.0f "

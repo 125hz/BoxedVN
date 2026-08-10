@@ -28,6 +28,10 @@
 
 #ifdef BOXEDWINE_IOS
 extern "C" void BVNAttachGuestWindowToScene(void);
+// Reports the rectangle the presenter actually placed the guest picture in, in
+// window points. Returns false when it is filling the window, so a caller can
+// never assume a letterbox that did not happen.
+extern "C" bool BVNGuestPresentationContentRect(int* x, int* y, int* w, int* h);
 
 namespace {
 
@@ -340,25 +344,33 @@ void KNativeScreenSDL::setScreenSize(U32 cx, U32 cy) {
     int windowHeight = 0;
     SDL_GetWindowSize(window, &windowWidth, &windowHeight);
     if (windowWidth > 0 && windowHeight > 0 && cx > 0 && cy > 0) {
-        if (KSystem::stretchGuestToFill) {
+        // Derive this from what the presenter REPORTS it did, never from what
+        // it was asked to do. Build 62 assumed aspect-fit while the layer
+        // resize silently failed, so the picture stayed stretched and every
+        // tap was wrong by the letterbox offset. Trust only a measured rect.
+        int contentX = 0;
+        int contentY = 0;
+        int contentWidth = 0;
+        int contentHeight = 0;
+        const bool letterboxed =
+            BVNGuestPresentationContentRect(&contentX, &contentY,
+                                            &contentWidth, &contentHeight) &&
+            contentWidth > 0 && contentHeight > 0;
+        if (letterboxed) {
+            input->scaleX = (U32)(contentWidth * 100 / (int)cx);
+            input->scaleY = (U32)(contentHeight * 100 / (int)cy);
+            input->scaleXOffset = (U32)contentX;
+            input->scaleYOffset = (U32)contentY;
+        } else {
             input->scaleX = (U32)(windowWidth * 100 / (int)cx);
             input->scaleY = (U32)(windowHeight * 100 / (int)cy);
             input->scaleXOffset = 0;
             input->scaleYOffset = 0;
-        } else {
-            const int scale = std::min(windowWidth * 100 / (int)cx,
-                                       windowHeight * 100 / (int)cy);
-            input->scaleX = (U32)scale;
-            input->scaleY = (U32)scale;
-            input->scaleXOffset =
-                (U32)((windowWidth - (int)cx * scale / 100) / 2);
-            input->scaleYOffset =
-                (U32)((windowHeight - (int)cy * scale / 100) / 2);
         }
         klog_fmt("iOS Vulkan presentation owns input mapping: window %dx%d, "
                  "guest %ux%u, %s, scale %u%%x%u%%, offset %u,%u",
                  windowWidth, windowHeight, cx, cy,
-                 KSystem::stretchGuestToFill ? "stretch" : "aspect-fit",
+                 letterboxed ? "aspect-fit" : "stretch",
                  input->scaleX, input->scaleY, input->scaleXOffset,
                  input->scaleYOffset);
     } else {
