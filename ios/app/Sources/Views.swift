@@ -174,9 +174,9 @@ struct LibraryView: View {
                 } label: {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Windows desktop")
-                            Text("Explorer, Start menu and the Wine control "
-                                 + "panel, at 1280x720")
+                            Text("Browse the PC")
+                            Text("Wine's file manager over the shared prefix, "
+                                 + "at 1280x720")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -411,7 +411,9 @@ struct GameDetailView: View {
 
             Section("Storage") {
                 LabeledContent("Content", value: game.contentDirectory.lastPathComponent)
-                LabeledContent("Wine prefix", value: game.winePrefix)
+                LabeledContent("Wine prefix",
+                               value: "\(Storage.sharedWinePrefixName) "
+                                    + "(shared with every app)")
                 LabeledContent("Imported", value: game.importedAt.formatted(date: .abbreviated,
                                                                             time: .shortened))
             }

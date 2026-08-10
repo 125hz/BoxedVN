@@ -206,7 +206,7 @@ final class AppModel: ObservableObject {
                          + "Boxedwine's root filesystem archive in Settings first."
             return
         }
-        guard let prefixes = Storage.winePrefixes else {
+        guard let writableRoot = Storage.sharedWinePrefix else {
             alertMessage = "Could not create the Wine prefix directory."
             return
         }
@@ -215,7 +215,6 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let writableRoot = prefixes.appendingPathComponent(game.winePrefix)
         do {
             try Session.launch(
                 rootFilesystem: rootFilesystem,
@@ -235,20 +234,33 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Runs Wine's desktop shell: a real Windows desktop with a taskbar, a
-    /// Start menu and Explorer, in the same emulated environment a game gets.
+    /// Browse the emulated PC: Wine's file manager, in the same environment
+    /// and the same prefix a game gets.
     ///
     /// 1280x720 rather than the 800x600 a game defaults to. 16:9 matches the
-    /// phone closely enough that the letterbox is thin, which keeps the
-    /// desktop's own edges - where a taskbar and window controls live - away
-    /// from the Dynamic Island instead of underneath it.
+    /// phone closely enough that the letterbox is thin, which keeps window
+    /// edges away from the Dynamic Island instead of underneath it.
+    ///
+    /// Two builds tried to run this inside Wine's virtual desktop
+    /// (`explorer /desktop=shell,1280x720`) so it would look like Windows.
+    /// Both produced a white rectangle behind the file manager, and the log
+    /// says why: `NtUserChangeDisplaySettings ... returned -2` followed by
+    /// `Failed to set primary display settings`. Wine's explorer cannot resize
+    /// the emulated display, so its shell - taskbar, Start menu, icons - never
+    /// starts and all that is left of the desktop is its blank window, sized
+    /// to something other than the 1280x720 that was asked for. That is the
+    /// white box.
+    ///
+    /// Without `/desktop` the file manager is a normal window on the X root,
+    /// which is the same dark background the letterbox uses, and browsing
+    /// files - the point of this mode - is unaffected.
     func launchWineDesktop() {
         guard let rootFilesystem else {
             alertMessage = "No root filesystem is installed. Import "
                          + "Boxedwine's root filesystem archive in Settings first."
             return
         }
-        guard let prefixes = Storage.winePrefixes else {
+        guard let writableRoot = Storage.sharedWinePrefix else {
             alertMessage = "Could not create the Wine prefix directory."
             return
         }
@@ -256,25 +268,10 @@ final class AppModel: ObservableObject {
         do {
             try Session.launch(
                 rootFilesystem: rootFilesystem,
-                writableRoot: prefixes.appendingPathComponent("desktop"),
+                writableRoot: writableRoot,
                 gameDirectory: nil,
-                executablePath: "explorer",
-                // Wine's own switch for "give me a desktop window with a
-                // shell in it" rather than rootless windows on the X root.
-                // The desktop must be called "shell": that is the name Wine's
-                // explorer treats as "run the shell in here", which is what
-                // puts a taskbar, a Start menu and desktop icons on it. Any
-                // other name gives a bare desktop window - which is the white
-                // rectangle and nothing else that build 70 produced.
-                // Run winefile *inside* the desktop rather than relying on
-                // the shell alone. Build 71 gave a bare white rectangle: Wine's
-                // explorer logged "NtUserChangeDisplaySettings ... returned -2"
-                // and "Failed to set primary display settings", so its shell -
-                // taskbar, Start menu, icons - never came up and the desktop
-                // window was all that was left. A file manager launched into
-                // the same desktop does not depend on that, and browsing files
-                // is the point of this mode.
-                arguments: ["/desktop=shell,1280x720", "winefile"],
+                executablePath: "winefile",
+                arguments: [],
                 environment: [],
                 workingDirectory: nil,
                 width: 1280,
@@ -294,7 +291,7 @@ final class AppModel: ObservableObject {
             alertMessage = "No root filesystem is installed."
             return
         }
-        guard let prefixes = Storage.winePrefixes else {
+        guard let writableRoot = Storage.sharedWinePrefix else {
             alertMessage = "Could not create the Wine prefix directory."
             return
         }
@@ -302,7 +299,7 @@ final class AppModel: ObservableObject {
         do {
             try Session.launch(
                 rootFilesystem: rootFilesystem,
-                writableRoot: prefixes.appendingPathComponent("default"),
+                writableRoot: writableRoot,
                 gameDirectory: nil,
                 executablePath: "notepad",
                 arguments: [],

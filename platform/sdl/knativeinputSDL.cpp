@@ -654,6 +654,36 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
 #endif    
     if (e->type == SDL_QUIT) {
         KThread::setCurrentThread(nullptr);
+#ifdef BOXEDWINE_IOS
+        // Upstream kills pid 10 - the first process the session created - and
+        // returns true, letting that death cascade through the rest.
+        //
+        // On iOS pid 10 is whatever the launcher chain left behind, and by the
+        // time the player taps "Quit to library" it is normally an empty husk:
+        // build 72's thread snapshot shows `pid=000A name=BootMenu.exe
+        // threads=0` for Grisaia, and desktop mode's pid 10 is the /bin/wine
+        // stub that exits as soon as it has spawned explorer. Killing a
+        // process with no threads succeeds, so this returned true, the loop
+        // kept running, and quitting did nothing at all - the desktop log has
+        // "shutdown requested; posting SDL_QUIT" at 00:17:42 followed by the
+        // player still tapping around the guest at 00:18:11.
+        //
+        // Quit means quit. Tear down every process that still has threads and
+        // then end the loop whatever happened.
+        if (!KSystem::shutingDown) {
+            const std::vector<U32> ids = KSystem::getProcessIdsWithThreads();
+            klog_fmt("iOS quit requested: terminating %u guest process(es)",
+                     (U32)ids.size());
+            for (U32 id : ids) {
+                KProcessPtr process = KSystem::getProcess(id);
+                if (process) {
+                    process->killAllThreads();
+                    KSystem::eraseProcess(id);
+                }
+            }
+        }
+        return false;
+#else
         KProcessPtr p = KSystem::getProcess(10);
         if (p && !KSystem::shutingDown) {
             p->killAllThreads();
@@ -661,6 +691,7 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
             return true;
         }
         return false;
+#endif
     } else if (e->type == SDL_MOUSEMOTION) {
         BOXEDWINE_RECORDER_HANDLE_MOUSE_MOVE(e->motion.x, e->motion.y);
         if (!mouseMove(e->motion.x, e->motion.y, false)) {

@@ -4,6 +4,11 @@
 <dict>
 	<key>BVNBuildRevision</key>
 	<string>$(BVN_BUILD_REVISION)</string>
+	<!-- Without this iOS caps every frame-rate request at 60 Hz, including the
+	     session-long CADisplayLink in BVNAppDelegate.mm that keeps the panel
+	     from winding down and starving vkQueuePresentKHR of drawables. -->
+	<key>CADisableMinimumFrameDuration</key>
+	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>

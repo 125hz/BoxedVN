@@ -157,6 +157,19 @@ enum AppVersion {
 enum Storage {
     static var rootFilesystems: URL? { directory(BVNPathRootFilesystems()) }
     static var winePrefixes: URL? { directory(BVNPathWinePrefixes()) }
+
+    /// The one Wine prefix every game, the desktop and Notepad all share.
+    ///
+    /// Each game used to get its own prefix, which made them independent but
+    /// also meant a text file saved from Notepad was invisible to the desktop,
+    /// and a font or runtime installed for one game did nothing for the next.
+    /// One prefix behaves like one PC, which is what a Wine prefix is for.
+    /// Prefixes written by earlier builds are left on disk untouched.
+    static var sharedWinePrefix: URL? {
+        winePrefixes?.appendingPathComponent(sharedWinePrefixName)
+    }
+
+    static let sharedWinePrefixName = "shared"
     static var games: URL? { directory(BVNPathGames()) }
     static var logs: URL? { directory(BVNPathLogs()) }
     static var caches: URL? { directory(BVNPathCaches()) }

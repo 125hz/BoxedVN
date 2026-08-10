@@ -227,6 +227,7 @@ Support and is deleted with the game. Save export is not implemented yet.
 | | |
 |---|---|
 | [PROGRESS.md](PROGRESS.md) | current status, what is proven, what is untried, what is next |
+| [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) | picking the project up on a Windows PC: CI builds the IPA, what to read, what is open |
 | [docs/BUILD_IOS.md](docs/BUILD_IOS.md) | building locally and in CI, signing, entitlements |
 | [docs/ARCHITECTURE_IOS.md](docs/ARCHITECTURE_IOS.md) | lifecycle, threading, JIT, rendering, the backend seam |
 | [docs/TESTING_IOS.md](docs/TESTING_IOS.md) | the automated suite and the on-device checklist |

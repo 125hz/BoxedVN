@@ -24,6 +24,43 @@
 #include "vkdef.h"
 #include "kvulkan.h"
 #include <SDL_vulkan.h>
+#ifdef BOXEDWINE_IOS
+#include "bvnhostpresent.h"
+#include <chrono>
+
+namespace bvnHostPresent {
+std::atomic<std::uint64_t> presentCalls{0};
+std::atomic<std::uint64_t> presentMicroseconds{0};
+std::atomic<std::uint64_t> presentWorstMicroseconds{0};
+std::atomic<std::uint64_t> acquireCalls{0};
+std::atomic<std::uint64_t> acquireMicroseconds{0};
+std::atomic<std::uint64_t> acquireWorstMicroseconds{0};
+
+static void record(std::atomic<std::uint64_t>& calls,
+                   std::atomic<std::uint64_t>& total,
+                   std::atomic<std::uint64_t>& worst,
+                   std::uint64_t microseconds) {
+    calls.fetch_add(1, std::memory_order_relaxed);
+    total.fetch_add(microseconds, std::memory_order_relaxed);
+    std::uint64_t previous = worst.load(std::memory_order_relaxed);
+    while (microseconds > previous &&
+           !worst.compare_exchange_weak(previous, microseconds,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+    }
+}
+
+void recordPresent(std::uint64_t microseconds) {
+    record(presentCalls, presentMicroseconds, presentWorstMicroseconds,
+           microseconds);
+}
+
+void recordAcquire(std::uint64_t microseconds) {
+    record(acquireCalls, acquireMicroseconds, acquireWorstMicroseconds,
+           microseconds);
+}
+}
+#endif
 
 static PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr = nullptr;
 
@@ -686,7 +723,29 @@ void callVulkan(CPU* cpu, U32 index) {
                 thread->diagnosticVulkanCall.store(index + 1,
                                                    std::memory_order_relaxed);
             }
+#ifdef BOXEDWINE_IOS
+            // Only the two calls that can block on the compositor are timed,
+            // so this costs two clock reads per presented frame rather than
+            // two per Vulkan call.
+            const bool timed = (index == QueuePresentKHR ||
+                                index == AcquireNextImageKHR);
+            const auto started = timed
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point();
+#endif
             int9ACallback[index](cpu);
+#ifdef BOXEDWINE_IOS
+            if (timed) {
+                const std::uint64_t us = (std::uint64_t)
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - started).count();
+                if (index == QueuePresentKHR) {
+                    bvnHostPresent::recordPresent(us);
+                } else {
+                    bvnHostPresent::recordAcquire(us);
+                }
+            }
+#endif
             if (thread) {
                 thread->diagnosticVulkanCall.store(0,
                                                    std::memory_order_relaxed);

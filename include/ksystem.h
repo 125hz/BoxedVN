@@ -184,6 +184,9 @@ public:
     static KThread* getThreadById(U32 threadId);
     static U32 getRunningProcessCount();
     static U32 getProcessCount();
+    // Every process that still has at least one thread, so a caller can tear
+    // them all down without reaching into the private table.
+    static std::vector<U32> getProcessIdsWithThreads();
     static void printStacks();
     static void logThreadSnapshot(const char* reason);
     static void wakeThreadsWaitingOnProcessStateChanged();    

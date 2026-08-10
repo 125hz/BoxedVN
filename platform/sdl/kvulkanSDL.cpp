@@ -34,6 +34,7 @@
 #ifdef BOXEDWINE_IOS
 #include <sys/resource.h>
 #include "getrusagefairness.h"
+#include "bvnhostpresent.h"
 #endif
 
 #ifdef BOXEDWINE_IOS
@@ -594,6 +595,39 @@ void bvnReportPresentRate(void) {
              (unsigned long long)(throttleCount - lastThrottleCount),
              (unsigned long long)(getrusage - lastGetrusage),
              (unsigned long long)(schedYield - lastSchedYield));
+
+    // What the guest spent inside the host's present path over the same
+    // window. Build 72's thread snapshot showed the whole guest parked on the
+    // X11 socket behind one thread inside vkQueuePresentKHR; this says how
+    // much of the wall clock that call actually consumed, which separates
+    // "the GPU is slow" from "the compositor is not returning a drawable".
+    static U64 lastPresentUs = 0;
+    static U64 lastPresentCalls = 0;
+    static U64 lastAcquireUs = 0;
+    const U64 presentUs =
+        bvnHostPresent::presentMicroseconds.load(std::memory_order_relaxed);
+    const U64 presentCalls =
+        bvnHostPresent::presentCalls.load(std::memory_order_relaxed);
+    const U64 acquireUs =
+        bvnHostPresent::acquireMicroseconds.load(std::memory_order_relaxed);
+    const U64 worstPresentUs =
+        bvnHostPresent::presentWorstMicroseconds.exchange(
+            0, std::memory_order_relaxed);
+    const U64 worstAcquireUs =
+        bvnHostPresent::acquireWorstMicroseconds.exchange(
+            0, std::memory_order_relaxed);
+    const U64 presentDeltaUs = presentUs - lastPresentUs;
+    klog_fmt("iOS guest present path: %llu ms of %u ms inside "
+             "vkQueuePresentKHR across %llu call(s), worst single call "
+             "%llu ms; vkAcquireNextImageKHR %llu ms, worst %llu ms",
+             (unsigned long long)(presentDeltaUs / 1000), elapsed,
+             (unsigned long long)(presentCalls - lastPresentCalls),
+             (unsigned long long)(worstPresentUs / 1000),
+             (unsigned long long)((acquireUs - lastAcquireUs) / 1000),
+             (unsigned long long)(worstAcquireUs / 1000));
+    lastPresentUs = presentUs;
+    lastPresentCalls = presentCalls;
+    lastAcquireUs = acquireUs;
 
     // Grisaia is bimodal: 30 fps at 0.90 cores with 740,000 getrusage calls a
     // second while a sprite animates, then 0.4 fps at 0.46 cores with 37,000 -

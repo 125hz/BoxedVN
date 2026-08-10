@@ -233,6 +233,14 @@ static const CGFloat kBVNTrackpadSensitivity = 1.4;
 @property (nonatomic, assign) CGPoint trackpadTouchStart;
 @property (nonatomic, assign) NSTimeInterval trackpadTouchStartTime;
 @property (nonatomic, assign) BOOL trackpadTouchMoved;
+// Where the finger was on the previous -touchesMoved, in the presenting
+// view's coordinates. UIKit's own -previousLocationInView: cannot be used for
+// this: UITouch objects are recycled between gestures, and on the first move
+// of a new gesture it can still report the last point of the *previous* one -
+// which is the reported "let go, wait a second, nudge the finger, and the
+// cursor jumps once before behaving" bug. Tracking the point ourselves makes
+// the first delta of every gesture exactly zero.
+@property (nonatomic, assign) CGPoint trackpadLastPoint;
 
 // The startup notice shown while Wine boots.
 @property (nonatomic, strong) UIView* startupNotice;
@@ -268,17 +276,40 @@ static BVNGuestOverlayView* gOverlay = nil;
 - (void)buildCursor {
     // A ring rather than an arrow: it reads at any size, needs no asset, and
     // stays visible over both the bright and dark artwork a visual novel uses.
+    //
+    // A white ring on white artwork still disappeared - a menu screen or a
+    // fade to white is exactly where a trackpad cursor is needed most. It now
+    // carries a dark drop shadow, and a dark ring under the white one, so the
+    // silhouette survives on any background without tinting the cursor itself.
     UIView* cursor = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 22, 22)];
     cursor.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.22];
     cursor.layer.cornerRadius = 11.0;
     cursor.layer.borderWidth = 2.0;
     cursor.layer.borderColor = UIColor.whiteColor.CGColor;
+    cursor.layer.shadowColor = UIColor.blackColor.CGColor;
+    cursor.layer.shadowOpacity = 0.85f;
+    cursor.layer.shadowRadius = 3.0;
+    cursor.layer.shadowOffset = CGSizeMake(0.0, 1.0);
     cursor.userInteractionEnabled = NO;
     cursor.hidden = YES;
+
+    // Drawn outside the white ring, so on a bright background the cursor is a
+    // dark outline and on a dark one it is invisible behind the white.
+    UIView* halo = [[UIView alloc] initWithFrame:CGRectMake(-2, -2, 26, 26)];
+    halo.backgroundColor = UIColor.clearColor;
+    halo.layer.cornerRadius = 13.0;
+    halo.layer.borderWidth = 1.5;
+    halo.layer.borderColor = [UIColor colorWithWhite:0.0 alpha:0.55].CGColor;
+    halo.userInteractionEnabled = NO;
+    [cursor addSubview:halo];
 
     UIView* dot = [[UIView alloc] initWithFrame:CGRectMake(9, 9, 4, 4)];
     dot.backgroundColor = UIColor.whiteColor;
     dot.layer.cornerRadius = 2.0;
+    dot.layer.shadowColor = UIColor.blackColor.CGColor;
+    dot.layer.shadowOpacity = 0.9f;
+    dot.layer.shadowRadius = 1.5;
+    dot.layer.shadowOffset = CGSizeZero;
     [cursor addSubview:dot];
 
     [self addSubview:cursor];
@@ -651,6 +682,10 @@ static BVNGuestOverlayView* gOverlay = nil;
         self.trackpadTouchStart = [touch locationInView:self];
         self.trackpadTouchStartTime = touch.timestamp;
         self.trackpadTouchMoved = NO;
+        UIView* presentation = BVNGuestPresentationView();
+        self.trackpadLastPoint = presentation != nil
+            ? [touch locationInView:presentation]
+            : CGPointZero;
         return;
     }
     [self sendGuestPointer:touch phase:1];
@@ -674,7 +709,8 @@ static BVNGuestOverlayView* gOverlay = nil;
     // movement covers the same fraction of the picture whatever the letterbox
     // is doing.
     const CGPoint now = [touch locationInView:presentation];
-    const CGPoint before = [touch previousLocationInView:presentation];
+    const CGPoint before = self.trackpadLastPoint;
+    self.trackpadLastPoint = now;
     const CGFloat dx = now.x - before.x;
     const CGFloat dy = now.y - before.y;
     if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
@@ -799,8 +835,7 @@ static BVNGuestOverlayView* gOverlay = nil;
                                         kBVNMenuButtonSize);
     const CGRect travel = [self menuButtonTravel];
     if (self.menuButtonFraction.x < 0.0) {
-        self.menuButton.center = CGPointMake(CGRectGetMinX(travel),
-                                             CGRectGetMinY(travel));
+        self.menuButton.center = [self defaultMenuButtonCentre];
     } else {
         self.menuButton.center = CGPointMake(
             CGRectGetMinX(travel) + travel.size.width * self.menuButtonFraction.x,
@@ -922,16 +957,34 @@ static BVNGuestOverlayView* gOverlay = nil;
 
 // The rectangle the menu button's centre may occupy: the safe area, inset by
 // half the button so it can never be dragged half off the screen.
+// Where the menu button's centre is allowed to go.
+//
+// This used to be the safe area inset by the button's radius plus a margin,
+// which in landscape stops it roughly where the 4:3 picture starts - the
+// button could not be parked on the black bar or against the bezel. The travel
+// is now the whole overlay, inset only by the radius so the button always
+// stays fully on screen. The safe area only decides where it *starts*: see
+// -defaultMenuButtonCentre.
 - (CGRect)menuButtonTravel {
-    const UIEdgeInsets safe = self.safeAreaInsets;
     const CGFloat half = kBVNMenuButtonSize / 2.0;
-    CGRect travel = UIEdgeInsetsInsetRect(self.bounds, safe);
-    travel = CGRectInset(travel, half + kBVNOverlayMargin,
-                         half + kBVNOverlayMargin);
+    CGRect travel = CGRectInset(self.bounds, half, half);
     if (travel.size.width < 0.0 || travel.size.height < 0.0) {
         travel = self.bounds;
     }
     return travel;
+}
+
+// The resting place before the player has ever dragged it: inside the safe
+// area, clear of the Dynamic Island and the home indicator.
+- (CGPoint)defaultMenuButtonCentre {
+    const UIEdgeInsets safe = self.safeAreaInsets;
+    const CGRect travel = [self menuButtonTravel];
+    const CGFloat half = kBVNMenuButtonSize / 2.0;
+    CGPoint centre = CGPointMake(safe.left + kBVNOverlayMargin + half,
+                                 safe.top + kBVNOverlayMargin + half);
+    centre.x = MIN(MAX(centre.x, CGRectGetMinX(travel)), CGRectGetMaxX(travel));
+    centre.y = MIN(MAX(centre.y, CGRectGetMinY(travel)), CGRectGetMaxY(travel));
+    return centre;
 }
 
 - (void)dragMenuButton:(UIPanGestureRecognizer*)recognizer {

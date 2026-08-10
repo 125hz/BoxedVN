@@ -140,6 +140,18 @@ U32 KSystem::getProcessCount() {
     return (U32)KSystem::processes.size();
 }
 
+std::vector<U32> KSystem::getProcessIdsWithThreads() {
+    std::vector<U32> ids;
+    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(processesCond);
+    for (auto& n : KSystem::processes) {
+        const KProcessPtr& process = n.value;
+        if (process && process->getThreadCount()) {
+            ids.push_back(process->id);
+        }
+    }
+    return ids;
+}
+
 U32 KSystem::uname(KThread* thread, U32 address) {
     char name[65] = {};
     strcpy(name, "Boxedwine");

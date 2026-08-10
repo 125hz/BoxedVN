@@ -490,8 +490,86 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 
 @end
 
+// ---------------------------------------------------------------------------
+// Holding the display's refresh rate up for the length of a guest session
+//
+// Build 72's automatic thread snapshot caught the Grisaia stall in the act.
+// Every sample looks the same: nine of Grisaia's ten threads parked on
+// KUnixSocketObject::lockCond - the X11 socket - behind one thread that is
+// inside host Vulkan call 170, vkQueuePresentKHR, sitting in a Mach trap and
+// consuming 73 to 143 microseconds of CPU per *second*. The guest is not
+// computing slowly; it is stopped dead waiting for the compositor, which is
+// also why the whole process drops to 0.45 cores while doing nothing.
+//
+// MoltenVK fetches the CAMetalDrawable lazily, inside the present rather than
+// inside vkAcquireNextImageKHR, so a present that blocks is a drawable the
+// render server has not handed back. On a ProMotion display the rate at which
+// drawables come back is the display's current refresh rate, and that rate is
+// adaptive: present rarely and iOS winds the panel down, which makes the next
+// present wait longer, which winds it down further. That hysteresis is exactly
+// the reported behaviour - a visual-novel engine that only redraws on demand
+// falls into the trap and stays there, and the moment an animated overlay
+// forces a burst of continuous redraws the panel winds back up and the game
+// runs at a pinned 30.0 fps until the animation ends.
+//
+// A live CADisplayLink is the supported way to tell iOS what refresh rate the
+// app wants, independent of what the Metal layer happens to be doing. It is
+// paired with CADisableMinimumFrameDuration in Info.plist, without which iOS
+// caps the request at 60 Hz. The callback deliberately does nothing: the
+// request is made by the display link existing and being scheduled, not by any
+// work done in it.
+//
+// This is a strong hypothesis, not a proof, so build 73 also times every
+// vkQueuePresentKHR (see include/bvnhostpresent.h). The "iOS guest present
+// path" line in the next log settles it either way.
+@interface BVNRefreshRateHold : NSObject
+@property (nonatomic, strong) CADisplayLink* link;
+@end
+
+@implementation BVNRefreshRateHold
+- (void)tick:(CADisplayLink*)link {
+    (void)link;
+}
+@end
+
+static BVNRefreshRateHold* gRefreshRateHold = nil;
+
+static void BVNStartRefreshRateHold(void) {
+    if (gRefreshRateHold != nil) {
+        return;
+    }
+    gRefreshRateHold = [[BVNRefreshRateHold alloc] init];
+    CADisplayLink* link =
+        [CADisplayLink displayLinkWithTarget:gRefreshRateHold
+                                    selector:@selector(tick:)];
+    if (@available(iOS 15.0, *)) {
+        link.preferredFrameRateRange = CAFrameRateRangeMake(60.0f, 120.0f,
+                                                            120.0f);
+    }
+    // Common modes, so it keeps firing while UIKit is tracking a touch. The
+    // guest owns the main thread, but SDL's UIKit_PumpEvents cycles the main
+    // run loop on every SDL_PollEvent, which is often enough to keep this
+    // scheduled.
+    [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    gRefreshRateHold.link = link;
+    BVNLogWrite(BVNLogLevelInfo, "frontend",
+                "Holding the display at 60-120 Hz for the guest session so "
+                "adaptive refresh cannot starve vkQueuePresentKHR of "
+                "drawables.");
+}
+
+static void BVNStopRefreshRateHold(void) {
+    if (gRefreshRateHold == nil) {
+        return;
+    }
+    [gRefreshRateHold.link invalidate];
+    gRefreshRateHold.link = nil;
+    gRefreshRateHold = nil;
+}
+
 extern "C" void BVNPrepareGuestPresentation(dispatch_block_t completion) {
     NSCAssert(NSThread.isMainThread, @"Guest startup must run on main");
+    BVNStartRefreshRateHold();
     [gAppDelegate prepareGuestPresentationWithCompletion:completion];
 }
 
@@ -500,6 +578,7 @@ extern "C" void BVNFinishGuestPresentation(void) {
     // SDL owns the actual guest window/view teardown. Drop any diagnostic
     // associations left by a forced Wine exit so they cannot retain UIKit
     // views or be mistaken for surfaces in the next session.
+    BVNStopRefreshRateHold();
     BVNGuestOverlayRemove();
     [gGuestVulkanSurfaceViews removeAllObjects];
     [gGuestVulkanWaitingOverlays removeAllObjects];
@@ -993,6 +1072,13 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
         metalLayer.drawableSize = CGSizeMake((CGFloat)guestWidth,
                                              (CGFloat)guestHeight);
         drawable = metalLayer.drawableSize;
+        // Three is the maximum Metal allows and the most frames that can be in
+        // flight before a present has to wait for the compositor. MoltenVK
+        // derives this from the swapchain's image count, which wined3d asks
+        // for as two; with only two drawables a single late compositor frame
+        // stalls the guest, and the guest stalling is the whole Grisaia
+        // symptom. See BVNStartRefreshRateHold above.
+        metalLayer.maximumDrawableCount = 3;
     }
 
     // Flush the layout this frame change implies, so SDL's
