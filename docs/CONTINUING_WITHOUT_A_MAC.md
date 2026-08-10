@@ -102,68 +102,84 @@ Two details of the fit worth keeping:
 - The rectangle is snapped so `bounds x contentsScale` is a whole number of
   pixels. See section 4 for why one pixel matters.
 
-### 3. Touch input: FIXED, and it must stay derived from the measured rect
+### 3. Touch input: SDL's window IS the presentation surface
 
-Taps always reached the guest - the log showed all 32 of them. They were raw
-**window** coordinates, because the Vulkan path has no SDL renderer and
-therefore no `SDL_RenderSetLogicalSize` translation.
+Taps always reached the guest. What was wrong was the coordinate space, and
+build 64 got it wrong in a new way that is worth writing down, because the
+mistake is easy to make twice.
 
-`KNativeScreenSDL::refreshIOSGuestPointerTransform` now inverts the rectangle
-the presenter reports it applied (`BVNGuestPresentationContentRect`), never a
-rectangle predicted from the window size. Build 62 predicted one, the layer
-resize silently failed, and every tap was wrong by the letterbox offset.
-
-It is called from three places, and all three matter: after the surface is
-created and fitted, from `setScreenSize`, and from the overlay's
-`layoutSubviews` after a rotation. For 874x402 with an 800x600 guest it yields
-scale 67%, content 536x402 at x=169.
-
-The percentage is whole-number (`KNativeInput`'s existing API) and is rounded to
-nearest rather than truncated; truncation biased the scale down and the error
-accumulated towards the far edge of the picture, which is where a visual novel
-puts its menu.
-
-### 4. UNANSWERED: the swapchain recreation storm
-
-Counted in the build-63 log: **17,879 presentation swapchains created in a
-150-second session**, about 119 per second, every one of them 800x600. Acquire
-and present both return `1000001003` = `VK_SUBOPTIMAL_KHR`.
-
-MoltenVK raises `VK_SUBOPTIMAL_KHR` when the presenting layer's *natural*
-drawable size (`bounds x contentsScale`, which is what
-`SDL_uikitmetalview.layoutSubviews` assigns) differs from the extent the
-swapchain was actually created at. With the Metal view filling the window
-(2622x1206 pixels) and DXVK creating an 800x600 swapchain, those could never
-agree, so DXVK rebuilt the swapchain on essentially every frame.
-
-Build 64 makes the view exactly the letterbox rectangle in whole pixels, which
-*may* be enough - but only if DXVK adopts `VkSurfaceCapabilitiesKHR::currentExtent`
-rather than re-requesting the guest resolution. **That is not verified.** The
-evidence cuts against it: the swapchain was created at 794x568 and then 800x600,
-i.e. at the X11 window sizes, never at the device size, which is what a
-presenter that ignores `currentExtent` would do. MoltenVK ships here as a binary
-and DXVK as prebuilt DLLs, so neither could be read to settle it offline.
-
-Build 64 therefore replaces the per-creation log line (which was most of the
-4.5 MB log) with a once-per-second rate report naming the layer's natural
-drawable size:
+`SDL_uikitviewcontroller.viewDidLayoutSubviews` reports the SDL window size as
+`self.view.bounds.size`, and `SDL_uikitview` delivers touches as
+`-[UITouch locationInView:self]`. So **whatever is done to SDL's Metal view,
+SDL's whole coordinate space follows it.** When build 64 shrank that view to the
+letterbox rectangle, SDL's window became 536x402 and its touches became
+content-relative — and the pointer transform then subtracted the letterbox
+offset a *second* time:
 
 ```
-Vulkan presentation swapchain created N time(s) in M ms; the presenting
-layer's natural drawable size is WxH - compare it with the extent MoltenVK
-logs on the next "Created N swapchain images with size" line
+iOS Vulkan presentation owns input mapping: window 536x402, guest 800x600,
+    aspect-fit, content 536x402 at 169,0, scale 67%x67%
+iOS SDL mouse down: button 0 at logical 65,121      -> guest x = -155
+iOS SDL mouse down: button 0 at logical 395,256     -> guest x = 337, not 589
 ```
 
-**One device run answers this.** If the two sizes now match and N drops to
-roughly 1, the storm is gone. If they still differ, the remaining fix is to set
-`view.layer.contentsScale = guestWidth / boundsWidth` so that
-`bounds x contentsScale` equals the guest resolution exactly - the aspect-fit
-rectangle has the guest's aspect ratio by construction, so one scale satisfies
-both axes. That renders at 800x600 and lets Core Animation upscale, which is
-what the app effectively does today anyway, minus the 119 rebuilds a second.
+The `window 536x402` in that line is the tell: SDL's window had become the
+content rect. A tap on the left third of the picture mapped to a negative guest
+x and did nothing at all.
 
-This is worth chasing regardless of the JIT work: it is pure waste on the
-render path.
+**The offset in this transform is always zero.** A letterbox offset lives in
+where the view sits on screen, and UIKit has already removed it by the time SDL
+sees a touch. Since build 65 the presenter also sets the view's *bounds* to the
+guest resolution (see below), so the transform is normally a straight 1:1.
+
+`BVNGuestPresentationContentRect` is still consulted, but only as a cross-check
+that gets logged — never as a source of truth for input.
+
+### 4. The swapchain recreation storm: ANSWERED, and fixed in build 65
+
+Build 64's rate report settled it in one line:
+
+```
+Vulkan presentation swapchain rebuilt 113 time(s) in 1001 ms (8244 total);
+layer natural drawable 834x625.
+[mvk-info] Created 3 swapchain images with size (800, 600)
+```
+
+Natural drawable 834x625, swapchain 800x600. They disagree, permanently, so
+every acquire and present returns `VK_SUBOPTIMAL_KHR` and DXVK rebuilds. Two
+things are now established rather than assumed:
+
+- MoltenVK's suboptimal test is `bounds x contentsScale` versus the extent the
+  swapchain was created at.
+- **DXVK does not adopt `currentExtent`.** It kept asking for 800x600 while the
+  natural size was 1608x1206 and then 834x625. Sizing the view in points was
+  therefore never going to fix this on its own.
+
+The fix is to make `bounds x contentsScale` equal the guest resolution exactly,
+and the way to do that without shrinking the picture is to stop scaling with the
+frame:
+
+```objc
+view.bounds = CGRectMake(0, 0, guestWidth, guestHeight);  // 800x600
+view.layer.contentsScale = 1.0;                           // natural == 800x600
+view.transform = CGAffineTransformMakeScale(k, k);        // display size
+view.center = <centre of the letterbox rectangle>;
+```
+
+`bounds x contentsScale` is now an integer with no rounding to get wrong, and
+Core Animation scales the 800x600 drawable up to the display rect — which is
+what was already happening, since the swapchain was never larger than the guest
+resolution anyway.
+
+It also fixes touch for free, and that is the point worth keeping: because SDL
+reports its window as the view's bounds, **SDL's window is now the guest
+resolution**, and `-[UITouch locationInView:]` is transform-aware, so SDL hands
+Boxedwine coordinates that are already guest pixels. Presentation and input stop
+being two things that have to be kept in agreement and become one thing.
+
+Watch the same rate line in the next log. If the storm is gone it will not
+appear at all; only the first few `Vulkan presentation swapchain ... created`
+lines will, and their natural drawable should read 800x600.
 
 ## The in-game overlay
 
@@ -196,9 +212,23 @@ Four things about it are load-bearing:
   the UIKit side where it could drift. Unresolved names are logged once at
   install time instead of shipping as buttons that do nothing.
 - **`-layoutSubviews` is where geometry changes are handled.** It re-applies the
-  guest aspect fit and then re-derives the pointer transform from the rectangle
-  that was actually applied. Presentation and input are never computed
-  independently - that is what broke tapping in build 62.
+  guest aspect fit and then re-derives the pointer transform. Presentation and
+  input are never computed independently - that is what broke tapping in builds
+  62 and 64. `-safeAreaInsetsDidChange` re-fits too: UIKit reports the new safe
+  area separately from, and sometimes later than, the bounds change during a
+  rotation, and build 64 fitted a portrait window using the landscape insets,
+  producing a 278pt-wide picture in a 402pt-wide window. The fit also discards
+  a horizontal inset when the window is taller than it is wide, because an
+  iPhone in portrait never has one and a non-zero value is stale by definition.
+- **The overlay is pinned to the window with constraints, and its panel rows
+  are `UIButtonTypeCustom`.** Both are build-64 bug fixes rather than taste. A
+  direct window subview has no view controller laying it out, so an
+  autoresized frame is not guaranteed to survive a rotation - and a stale frame
+  means controls that are drawn in one place and hit-tested in another, which
+  looks exactly like "the menu does not respond". And on iOS 15+ a
+  `UIButtonTypeSystem` button carries a `UIButtonConfiguration`, after which a
+  later `-setTitle:forState:` is not reflected; that is why the two rows whose
+  titles change at runtime rendered blank while "Quit to library" did not.
 
 Quit is confirmed inside the overlay's own panel rather than with a
 `UIAlertController`, because presenting a view controller hands UIKit a modal

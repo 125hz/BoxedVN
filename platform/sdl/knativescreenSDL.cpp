@@ -613,19 +613,29 @@ void KNativeScreenSDL::syncIOSGuestPresentation(const char* reason) {
              viewport.h, scaleX, scaleY);
 }
 
-// Invert whatever the presenter actually did to the guest picture, so a tap
-// lands where the user touched.
+// Map window coordinates into guest coordinates.
 //
-// Taps arrive as raw window coordinates. On an 874x402 window driving an
-// 800x600 guest, untransformed coordinates land in the wrong place and
-// everything below y=402 cannot be reached at all - that was exactly what
-// "tapping does nothing" looked like on device even while the log showed the
-// events being delivered.
+// SDL's window IS the presentation surface, and that is the whole basis of
+// this function. SDL_uikitviewcontroller.viewDidLayoutSubviews reports the SDL
+// window size as its view's `bounds.size`, and touches arrive as
+// -[UITouch locationInView:] against those same bounds. So whatever
+// BVNApplyGuestPresentationAspect does to the Metal view, SDL's coordinate
+// space follows it automatically, and the offset is ALWAYS zero: a letterbox
+// offset lives in the view's position on screen, which UIKit has already
+// removed by the time SDL sees a touch.
 //
-// The rectangle comes from what the presenter REPORTS it applied, never from
-// what it was asked to apply. Build 62 assumed an aspect-fit while the layer
-// resize had silently failed, so the picture stayed stretched and every tap
-// was wrong by the letterbox offset. Trust only a measured rect.
+// Build 64 got this wrong in the most instructive way. It subtracted the
+// measured letterbox offset from coordinates SDL had already made
+// content-relative, so a tap on the left edge of an 800x600 picture letterboxed
+// at x=169 mapped to guest x = (0 - 169) * 100/67 = -252. The left third of the
+// picture was dead and everything else was displaced. The log said
+// "window 536x402" - SDL's window really had become the content rect, and that
+// was the tell.
+//
+// Since build 65 the presenter also sets the view's bounds to the guest
+// resolution and does its scaling with a transform, so this normally resolves
+// to a straight 100% identity. The arithmetic is kept rather than hard-coded
+// because a guest that never got a fit applied still has to map correctly.
 void KNativeScreenSDL::refreshIOSGuestPointerTransform() {
     if (!window || renderer) {
         // With a renderer, SDL's logical size owns the transform instead.
@@ -645,36 +655,36 @@ void KNativeScreenSDL::refreshIOSGuestPointerTransform() {
         return;
     }
 
+    // KNativeInput's transform is a whole-number percentage, so it cannot
+    // express every ratio exactly. Round to nearest rather than truncating:
+    // truncation biases the scale down, and the error accumulates towards the
+    // far edge of the picture, which is where a visual novel puts its menu.
+    input->scaleX = (U32)((windowWidth * 100 + cx / 2) / cx);
+    input->scaleY = (U32)((windowHeight * 100 + cy / 2) / cy);
+    input->scaleXOffset = 0;
+    input->scaleYOffset = 0;
+
+    // Cross-check, never a source of truth: the presenter's measured on-screen
+    // rectangle. Its SIZE should match SDL's window once the view's bounds are
+    // the guest resolution; its ORIGIN is the letterbox offset on screen, which
+    // must not appear in this transform. A mismatch means SDL and the presenter
+    // have diverged, which is the failure mode worth naming out loud.
     int contentX = 0;
     int contentY = 0;
     int contentWidth = 0;
     int contentHeight = 0;
     const bool letterboxed =
         BVNGuestPresentationContentRect(&contentX, &contentY,
-                                        &contentWidth, &contentHeight) &&
-        contentWidth > 0 && contentHeight > 0;
-    if (!letterboxed) {
-        contentX = 0;
-        contentY = 0;
-        contentWidth = windowWidth;
-        contentHeight = windowHeight;
-    }
+                                        &contentWidth, &contentHeight);
 
-    // KNativeInput's transform is a whole-number percentage, so it cannot
-    // express every ratio exactly. Round to nearest rather than truncating:
-    // truncation biases the scale down, and the error accumulates towards the
-    // far edge of the picture, which is where a visual novel puts its menu.
-    input->scaleX = (U32)((contentWidth * 100 + cx / 2) / cx);
-    input->scaleY = (U32)((contentHeight * 100 + cy / 2) / cy);
-    input->scaleXOffset = (U32)contentX;
-    input->scaleYOffset = (U32)contentY;
-
-    klog_fmt("iOS Vulkan presentation owns input mapping: window %dx%d, "
-             "guest %dx%d, %s, content %dx%d at %d,%d, scale %u%%x%u%%",
-             windowWidth, windowHeight, cx, cy,
-             letterboxed ? "aspect-fit" : "stretch",
-             contentWidth, contentHeight, contentX, contentY,
-             input->scaleX, input->scaleY);
+    klog_fmt("iOS Vulkan pointer mapping: SDL window %dx%d, guest %dx%d, "
+             "scale %u%%x%u%%, offset 0,0%s; presenter shows it at %dx%d "
+             "on screen at %d,%d",
+             windowWidth, windowHeight, cx, cy, input->scaleX, input->scaleY,
+             windowWidth == cx && windowHeight == cy ? " (1:1)" : "",
+             letterboxed ? contentWidth : windowWidth,
+             letterboxed ? contentHeight : windowHeight,
+             letterboxed ? contentX : 0, letterboxed ? contentY : 0);
 }
 
 void KNativeScreenSDL::drawIOSGuestLoading() {

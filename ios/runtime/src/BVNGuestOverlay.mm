@@ -264,7 +264,14 @@ static BVNGuestOverlayView* gOverlay = nil;
 - (UIButton*)makePanelItemWithTitle:(NSString*)title
                              action:(SEL)action
                         destructive:(BOOL)destructive {
-    UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
+    // UIButtonTypeCustom, not UIButtonTypeSystem. On iOS 15+ a system button
+    // carries a UIButtonConfiguration, and once it does, a later
+    // -setTitle:forState: is not reflected until the configuration is
+    // refreshed. On build 64 that made the two rows whose titles change at
+    // runtime - "Show/Hide keyboard" and "Rotation: locked/free" - render as
+    // blank rows, while "Quit to library", whose title is only ever set here,
+    // looked fine. A custom button has no configuration and no such rule.
+    UIButton* button = [UIButton buttonWithType:UIButtonTypeCustom];
     [button setTitle:title forState:UIControlStateNormal];
     [button setTitleColor:(destructive ? [UIColor colorWithRed:1.0
                                                           green:0.42
@@ -415,6 +422,16 @@ static BVNGuestOverlayView* gOverlay = nil;
 - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
     UIView* hit = [super hitTest:point withEvent:event];
     return hit == self ? nil : hit;
+}
+
+// UIKit reports the safe area separately from, and sometimes later than, the
+// bounds change that accompanies a rotation. Build 64 fitted the guest picture
+// during a portrait layout pass that was still reporting the landscape insets,
+// producing a 278pt-wide picture in a 402pt-wide window. Re-fit when the insets
+// settle.
+- (void)safeAreaInsetsDidChange {
+    [super safeAreaInsetsDidChange];
+    [self setNeedsLayout];
 }
 
 // ---------------------------------------------------------------------------
@@ -723,11 +740,23 @@ extern "C" void BVNGuestOverlayInstall(void) {
     // A direct subview of the UIWindow, not of SDL's view. Adding it to SDL's
     // view would put it inside the letterboxed Metal view and clip it to the
     // picture; the overlay has to be able to use the black bars.
+    //
+    // Pinned with constraints rather than an autoresizing mask. A direct
+    // window subview is not laid out by a view controller, so nothing
+    // guarantees an autoresized frame survives an orientation change intact -
+    // and if the overlay's frame is stale, its controls are drawn in one place
+    // and hit-tested in another, which is indistinguishable from "the menu
+    // does not respond".
     [gOverlay removeFromSuperview];
     gOverlay.frame = window.bounds;
-    gOverlay.autoresizingMask =
-        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    gOverlay.translatesAutoresizingMaskIntoConstraints = NO;
     [window addSubview:gOverlay];
+    [NSLayoutConstraint activateConstraints:@[
+        [gOverlay.leadingAnchor constraintEqualToAnchor:window.leadingAnchor],
+        [gOverlay.trailingAnchor constraintEqualToAnchor:window.trailingAnchor],
+        [gOverlay.topAnchor constraintEqualToAnchor:window.topAnchor],
+        [gOverlay.bottomAnchor constraintEqualToAnchor:window.bottomAnchor],
+    ]];
     [gOverlay setNeedsLayout];
 
     BVNLogWrite(BVNLogLevelInfo, "frontend",

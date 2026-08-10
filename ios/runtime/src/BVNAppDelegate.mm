@@ -872,10 +872,22 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
     // Horizontal safe-area insets only. In landscape the Dynamic Island is an
     // opaque cut-out at one end, so content must stay clear of it; the bottom
     // inset is the translucent home indicator, and giving up 5% of the picture
-    // height to a line that is drawn over it anyway is the worse trade. In
-    // portrait the fitted band is centred vertically and never reaches the
-    // island regardless.
-    const UIEdgeInsets insets = container.safeAreaInsets;
+    // height to a line that is drawn over it anyway is the worse trade.
+    //
+    // A horizontal inset while the container is taller than it is wide is
+    // discarded. On build 64 the portrait fit came out 278pt wide instead of
+    // 402 because UIKit was still reporting the LANDSCAPE insets (62pt each
+    // side) during the rotation's layout pass - the log's "at 62.0" is exactly
+    // insets.left. iPhone portrait never has a horizontal safe inset, so a
+    // non-zero one here is stale by definition. -safeAreaInsetsDidChange
+    // re-fits as well, but only after the wrong frame has already been shown.
+    UIEdgeInsets insets = container.safeAreaInsets;
+    const bool containerIsPortrait =
+        container.bounds.size.height > container.bounds.size.width;
+    if (containerIsPortrait && (insets.left > 0.0 || insets.right > 0.0)) {
+        insets.left = 0.0;
+        insets.right = 0.0;
+    }
     const CGRect available = UIEdgeInsetsInsetRect(
         container.bounds,
         UIEdgeInsetsMake(0.0, insets.left, 0.0, insets.right));
@@ -889,75 +901,86 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
         return;
     }
 
-    // updateDrawableSize multiplies bounds by exactly this, so it is the value
-    // the snap has to be expressed in - not the screen's scale, which SDL only
-    // adopts for a high-DPI window.
-    CGFloat contentsScale = view.layer.contentsScale;
-    if (contentsScale <= 0.0) {
-        contentsScale = 1.0;
-    }
-    const bool snapToWholePixels =
-        fabs(contentsScale - floor(contentsScale + 0.5)) < 0.001;
-    const CGFloat step = snapToWholePixels ? 1.0 / contentsScale : 0.0;
-
-    CGRect target = available;
+    // The letterbox is applied as bounds + transform, NOT by resizing the view.
+    //
+    // Resizing it (build 64) broke two things at once, and both were the same
+    // mistake: SDL_uikitviewcontroller.viewDidLayoutSubviews reports the SDL
+    // window size as `self.view.bounds.size`, and SDL_uikitmetalview derives
+    // the CAMetalLayer's drawableSize from bounds x contentsScale. So shrinking
+    // the view to 536x402 told SDL its window was 536x402 - after which SDL
+    // delivered touches in content-rect coordinates and the pointer transform
+    // subtracted the letterbox offset a second time (a tap at the picture's
+    // left edge mapped to guest x = -252, which is why the left third of the
+    // screen went dead) - and it left the natural drawable at 1608x1206 while
+    // DXVK kept creating 800x600 swapchains, which is the VK_SUBOPTIMAL_KHR
+    // storm: 8,244 rebuilds, 113 per second, measured on build 64.
+    //
+    // Setting bounds to the GUEST resolution with contentsScale 1.0 and doing
+    // the scaling with an affine transform fixes both by construction:
+    //
+    //   * bounds x contentsScale is exactly 800x600, an integer, with no
+    //     rounding to get wrong - so the natural drawable finally equals the
+    //     extent DXVK asks for.
+    //   * SDL's window becomes 800x600, i.e. the guest resolution, so
+    //     -[UITouch locationInView:] (which is transform-aware) hands SDL
+    //     coordinates that are already guest pixels. The pointer transform
+    //     becomes the identity rather than something that has to be kept in
+    //     agreement with the presenter.
+    //
+    // Core Animation scales the 800x600 drawable up to the display rect, which
+    // is what was already happening - the swapchain was never bigger than the
+    // guest resolution.
+    CGFloat scaleX = available.size.width / (CGFloat)guestWidth;
+    CGFloat scaleY = available.size.height / (CGFloat)guestHeight;
     if (!stretchToFill) {
-        const CGFloat fit = MIN(available.size.width / (CGFloat)guestWidth,
-                                available.size.height / (CGFloat)guestHeight);
-        CGFloat width = (CGFloat)guestWidth * fit;
-        CGFloat height = (CGFloat)guestHeight * fit;
-        if (step > 0.0) {
-            // Round down so the picture can never exceed the space it was
-            // fitted into, then express it as a whole number of pixels.
-            width = floor(width / step) * step;
-            height = floor(height / step) * step;
-        }
-        CGFloat x = available.origin.x + (available.size.width - width) / 2.0;
-        CGFloat y = available.origin.y + (available.size.height - height) / 2.0;
-        if (step > 0.0) {
-            x = floor(x / step + 0.5) * step;
-            y = floor(y / step + 0.5) * step;
-        }
-        target = CGRectMake(x, y, width, height);
-    } else if (step > 0.0) {
-        target.size.width = floor(target.size.width / step) * step;
-        target.size.height = floor(target.size.height / step) * step;
+        scaleX = scaleY = MIN(scaleX, scaleY);
     }
+    const CGRect target = CGRectMake(
+        available.origin.x +
+            (available.size.width - (CGFloat)guestWidth * scaleX) / 2.0,
+        available.origin.y +
+            (available.size.height - (CGFloat)guestHeight * scaleY) / 2.0,
+        (CGFloat)guestWidth * scaleX, (CGFloat)guestHeight * scaleY);
 
-    // UIKit owns this view's layout, so pin the frame and stop it being
-    // resized back to the full window on the next layout pass.
     view.autoresizingMask = UIViewAutoresizingNone;
     view.translatesAutoresizingMaskIntoConstraints = YES;
-    view.frame = target;
+    view.transform = CGAffineTransformIdentity;
+    view.bounds = CGRectMake(0.0, 0.0, (CGFloat)guestWidth,
+                             (CGFloat)guestHeight);
+    view.layer.contentsScale = 1.0;
+    view.transform = CGAffineTransformMakeScale(scaleX, scaleY);
+    view.center = CGPointMake(CGRectGetMidX(target), CGRectGetMidY(target));
     // Letterbox bars read as part of the device, not as Wine's desktop.
     container.backgroundColor = UIColor.blackColor;
     // Run layoutSubviews now rather than at some unpredictable later point, so
-    // the drawableSize below is the real one and the rectangle handed to the
-    // pointer transform describes a layout that has already happened.
+    // the drawableSize logged below is the real one.
     [view layoutIfNeeded];
 
-    gGuestPresentationContentRect = target;
+    gGuestPresentationContentRect = view.frame;
     gGuestPresentationIsLetterboxed =
-        !CGRectEqualToRect(target, container.bounds);
+        !CGRectEqualToRect(view.frame, container.bounds);
 
     CGSize drawable = CGSizeZero;
     if ([view.layer isKindOfClass:CAMetalLayer.class]) {
         drawable = ((CAMetalLayer*)view.layer).drawableSize;
     }
-    gGuestNaturalDrawableWidth.store(
-        (int)lround(target.size.width * contentsScale),
-        std::memory_order_relaxed);
-    gGuestNaturalDrawableHeight.store(
-        (int)lround(target.size.height * contentsScale),
-        std::memory_order_relaxed);
+    gGuestNaturalDrawableWidth.store((int)lround(view.bounds.size.width),
+                                     std::memory_order_relaxed);
+    gGuestNaturalDrawableHeight.store((int)lround(view.bounds.size.height),
+                                      std::memory_order_relaxed);
     NSString* message = [NSString stringWithFormat:
-        @"Guest presentation %@: guest %ux%u into %.1fx%.1f at %.1f,%.1f of "
-         "%.0fx%.0f; drawable %.0fx%.0f at scale %.1f.",
+        @"Guest presentation %@: guest %ux%u shown as %.1fx%.1f at %.1f,%.1f "
+         "of %.0fx%.0f (%@, insets l%.0f r%.0f t%.0f b%.0f); view bounds "
+         "%.0fx%.0f, drawable %.0fx%.0f, contentsScale %.2f. SDL will now "
+         "report its window as the view's bounds, so pointer coordinates are "
+         "guest pixels.",
         stretchToFill ? @"stretched to fill" : @"aspect-fitted",
         guestWidth, guestHeight, target.size.width, target.size.height,
         target.origin.x, target.origin.y, container.bounds.size.width,
-        container.bounds.size.height, drawable.width, drawable.height,
-        contentsScale];
+        container.bounds.size.height, NSStringFromClass(container.class),
+        insets.left, insets.right, insets.top, insets.bottom,
+        view.bounds.size.width, view.bounds.size.height,
+        drawable.width, drawable.height, view.layer.contentsScale];
     BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
 }
 

@@ -6,14 +6,14 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 64. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 65. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
-Build 64 makes the aspect fit actually run, replaces the SDL-drawn keyboard
-with a UIKit in-game overlay (keyboard with Ctrl/Alt/Shift, rotation lock,
-quit), and adds an app icon; **none of it is device-tested yet**. It also
-records an unanswered finding: 17,879 swapchain recreations in a 150-second
-session. The newest detail is at the end of the session log, section 10; the
+Build 64 made the aspect fit actually run (correct in landscape on device) and
+added a UIKit in-game overlay and an app icon, but broke touch; build 65 fixes
+that and two smaller overlay defects, and answers the swapchain-storm question
+— DXVK ignores `currentExtent`, so the presenting view's *bounds* must be the
+guest resolution. **Build 65 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -2855,3 +2855,61 @@ opaque binary.
 
 Verified locally: full `scripts/build-ios.sh` succeeds, `BoxedVN.app` validates,
 88/88 unit tests pass. **Nothing in this entry has been tested on device.**
+
+### 2026-08-09 — build 65: three build-64 regressions, all from one wrong assumption
+
+Device test of build 64 (log `boxedvn20260809195114.log`): the landscape aspect
+ratio was correct, and touch had stopped working entirely.
+
+**The assumption:** that resizing SDL's Metal view changes only what is drawn.
+It does not. `SDL_uikitviewcontroller.viewDidLayoutSubviews` reports the SDL
+window size as `self.view.bounds.size`, and `SDL_uikitview` delivers touches as
+`-[UITouch locationInView:]`. Shrinking that view to the letterbox rectangle
+therefore moved SDL's entire coordinate space with it, and the pointer
+transform subtracted the letterbox offset a second time:
+
+```
+iOS Vulkan presentation owns input mapping: window 536x402, ... at 169,0, 67%
+iOS SDL mouse down: button 0 at logical 65,121      -> guest x = -155
+```
+
+The left third of the picture was dead. Fixed by making the offset
+unconditionally zero — a letterbox offset lives in the view's position on
+screen, which UIKit removes before SDL ever sees the touch.
+
+**The swapchain storm is answered, and the answer changes the design.** Build
+64's rate report: `rebuilt 113 time(s) in 1001 ms (8244 total); layer natural
+drawable 834x625` against MoltenVK's `Created 3 swapchain images with size
+(800, 600)`. So MoltenVK's suboptimal test really is `bounds x contentsScale`
+versus the swapchain extent, and **DXVK does not adopt `currentExtent`** — it
+kept asking for 800x600 regardless. Sizing the view in points could never have
+fixed it.
+
+Build 65 sets the view's `bounds` to the guest resolution with
+`contentsScale = 1.0` and does the scaling with a `CGAffineTransform`. The
+natural drawable becomes exactly 800x600, an integer with no rounding to get
+wrong — and because SDL reports its window as the view's bounds, SDL's window
+becomes the guest resolution and touches arrive as guest pixels. Presentation
+and input stop being two things that must be kept in agreement.
+
+**Two smaller build-64 defects, both visible in the user's screenshot:**
+
+- The menu rows whose titles change at runtime rendered blank. On iOS 15+ a
+  `UIButtonTypeSystem` button carries a `UIButtonConfiguration`, after which
+  `-setTitle:forState:` is not reflected. Panel rows are now
+  `UIButtonTypeCustom`. "Quit to library", whose title is only set at creation,
+  was unaffected — which is what made the pattern obvious.
+- Portrait fitted the picture 278pt wide in a 402pt window, using the
+  *landscape* safe-area insets (the log's `at 62.0` is exactly `insets.left`).
+  UIKit reports the new safe area separately from the bounds change. The
+  overlay now re-fits on `-safeAreaInsetsDidChange`, and the fit discards a
+  horizontal inset when the window is taller than it is wide, since an iPhone
+  in portrait never has one.
+
+The overlay is also pinned to the window with constraints instead of an
+autoresizing mask: a direct window subview has no view controller laying it
+out, and a stale frame draws controls in one place while hit-testing them in
+another — the most likely explanation for "Quit to library" not responding
+after rotating.
+
+Verified locally: build succeeds, app validates. **Untested on device.**
