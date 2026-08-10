@@ -203,10 +203,13 @@ The following remains unproven or deliberately constrained:
   design returns to the library UI after a session and allows another launch,
   but Boxedwine calls `SDL_Init`/`SDL_Quit` inside that span. If a second
   session fails, the fallback is to require an app restart between sessions.
-- **Guest sessions are landscape-only in build 16 and later.** The library can use
-  portrait or landscape, but BoxedVN finishes the UIKit landscape transition
-  before SDL creates its Metal drawable and holds that orientation until the
-  guest exits. Live guest rotation previously froze rendering and input.
+- **Guest sessions start landscape-locked, and rotation is opt-in from build
+  64.** BoxedVN still finishes the UIKit landscape transition before SDL
+  creates its Metal drawable. The in-game overlay can unlock rotation for the
+  rest of the session; the presenter then re-fits the picture and the pointer
+  transform on every layout pass, so a new drawable is expected rather than
+  fatal. Live guest rotation froze rendering and input on build 15, before any
+  of that existed; whether it is now clean is **untested on device**.
 - Build 16 proved that the **KEYBOARD** button and UIKit bridge execute, but
   SDL 2.32.10's hidden zero-sized `UITextField` did not display a keyboard on
   the current device OS. Build 17 makes the pinned SDL field a 1x1 nearly
@@ -221,10 +224,16 @@ The following remains unproven or deliberately constrained:
   Backspace, Enter and arrows therefore no longer depend on UIKit keyboard
   presentation and are device-proven in Notepad. Build 20 stops simultaneously
   requesting UIKit's invisible keyboard, which caused redundant responder and
-  layout transitions. Native IME/Japanese composition remains unimplemented.
+  layout transitions. **Build 64 replaces all of this with a UIKit overlay**
+  (`BVNGuestOverlay.mm`): the SDL-drawn keyboard only existed while SDL owned a
+  renderer, so it was invisible for every Vulkan guest - which is every Direct3D
+  game. The overlay adds a function row and latching Ctrl/Alt/Shift.
+  Native IME/Japanese composition remains unimplemented.
 - The default desktop is still **800x600 (4:3)**. It is aspect-fit into the
-  wider phone display, so blue side area is expected and Windows cannot use
-  the full phone width. Per-game guest resolution/display profiles are the
+  wider phone display with black bars, so side bars are expected and Windows
+  cannot use the full phone width. (Before build 64 the Vulkan path stretched
+  it instead: the fit was scheduled on the main dispatch queue, which is not
+  drained while the emulator owns the main thread, so it never ran.) Per-game guest resolution/display profiles are the
   planned fix; do not reintroduce independent X/Y stretching.
 - Whether the app survives its intended game workloads without the
   `increased-memory-limit` entitlement. Build 26's first GetMoreRam attempt
@@ -233,9 +242,10 @@ The following remains unproven or deliberately constrained:
 - Audio: latency, underruns, interruption and route-change handling. **No
   claim is made about latency.** Underruns and initialisation failures are
   logged when they happen; nobody has seen one yet.
-- Input: touch-as-mouse and build 19's built-in touch keyboard are
-  device-proven for basic ASCII entry. Hardware keyboards, native IME and
-  GameController mapping still require device tests.
+- Input: touch-as-mouse is device-proven, and build 19's SDL-drawn keyboard was
+  device-proven for basic ASCII entry before build 64 replaced it. **The build
+  64 UIKit overlay keyboard is untested on device.** Hardware keyboards, native
+  IME and GameController mapping still require device tests.
 - Japanese locale/font profiles are not implemented. The Wine 10 root has
   CP932 NLS data but defaults to an English (ACP 1252) prefix and lacks a CJK
   font. A Japanese game's error text may therefore appear as mojibake even

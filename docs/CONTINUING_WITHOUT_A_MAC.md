@@ -29,7 +29,7 @@ and the assignment must be redone after every reinstall.
   interpreter, not the ARM64 JIT**. That is a diagnostic workaround, not a fix,
   and it is the dominant cause of the low frame rate.
 
-## The three open problems, in priority order
+## The open problems, in priority order
 
 ### 1. The ARM64 JIT miscompiles DXVK (biggest win)
 
@@ -57,59 +57,159 @@ documents it must not ship.
 Precedent: build 35 fixed a real ARMv8 `REP MOVS` miscompilation in this same
 backend, so a second codegen defect is plausible.
 
-### 2. Aspect ratio and safe area
+### 2. Aspect ratio and safe area: FIXED in build 64
 
-The SDL renderer path letterboxes correctly (`viewport 252,0 800x600,
-scale 2.010`), but the Vulkan path registers `SDL_uikitmetalview` at the full
-window (`874x402`), so DXVK's swapchain blit stretches 4:3 content across the
-whole 2.2:1 display, including under the Dynamic Island. Size that view to the
-guest aspect within the safe-area insets; that also makes touch coordinates
-1:1 for free.
+The picture was stretched because the aspect fit **never ran**, not because it
+ran and got the wrong answer.
 
-### 3. Touch input: DIAGNOSED. Coordinates are untransformed on the Vulkan path.
-
-Taps **do** reach the guest. The menu session logged 32 events:
-```
-iOS SDL mouse down: button 0 at logical 455,119
-iOS SDL mouse up:   button 0 at logical 467,113
-```
-So UIKit -> SDL -> Boxedwine delivery all work, and `button 0` is Boxedwine's
-internal left-click number, not an error. Two earlier theories are dead:
-`SDL_uikitmetalview` is not swallowing touches (it *is* SDL's touch view -
-`SDL_uikitmetalview : SDL_uikitview`, and `SDL_uikitview.m:227` implements
-`touchesBegan`), and nothing needs `userInteractionEnabled` changed.
-
-The real fault is that those are raw **window** coordinates. The window is
-874x402; the guest is 800x600.
-
-On the SDL renderer path `SDL_RenderSetLogicalSize`
-(`knativescreenSDL.cpp:308,668`) makes SDL translate mouse coordinates
-automatically - which is why the log says "logical". **The Vulkan path has no
-SDL renderer, so no translation happens.** Clicks therefore land at the wrong
-guest position, and everything below y=402 is unreachable at all.
-
-This is the same root cause as the stretching in (2): there is no shared
-presentation transform. Fix both together:
+`BVNApplyGuestPresentationAspect` was called from the guest thread and forwarded
+itself with `dispatch_async(dispatch_get_main_queue())`. The build-63 device log
+proves those blocks never executed during the session: both of them (one per
+presentation surface) were still queued when Wine exited 2.5 minutes later, and
+ran only after `Boxedwine shutdown`, by which point their surfaces had been
+unregistered:
 
 ```
-scale   = min(windowW / guestW, windowH / guestH)      // aspect-fit
-content = { x: (windowW - guestW*scale)/2,             // inside safe area
-            y: (windowH - guestH*scale)/2,
-            w: guestW*scale, h: guestH*scale }
-
-guestX  = (winX - content.x) / scale
-guestY  = (winY - content.y) / scale                    // ignore taps outside
+18:42:29.831  Registered Vulkan surface 0x12235bc80 ... at 874x402
+              (no "Guest presentation aspect-fitted" line, the whole session)
+18:45:08.836  guest exited with code 1
+18:45:08.856  Presentation aspect skipped: no registered view for this surface.
+18:45:08.867  Presentation aspect skipped: no registered view for this surface.
 ```
-Use the same `content` rect for the Vulkan present (DXVK's
-`DxvkSwapchainBlitter` already accepts a non-empty dst `VkRect2D` and clears
-outside it; D3D11 currently passes empty rects) and for the input inverse. Do
-not simply shrink the CAMetalLayer - keeping the surface full-size and
-letterboxing via the blitter dst rect is more flexible for rotation, overlays
-and resolution changes.
 
-For 874x402 with an 800x600 guest this yields scale 0.67, content 536x402 at
-x=169 - i.e. pillarboxed, which is also the correct fix for the content
-currently running under the Dynamic Island.
+**While `boxedmain` owns the main thread the main dispatch queue is not
+drained.** SDL's `UIKit_PumpEvents` runs the main run loop from inside
+`SDL_PollEvent`, which is why UIKit touches, layout and the native spinner all
+keep working - but GCD blocks submitted to the main queue do not run until the
+guest gives the thread back. Every other UIKit call on this path already used
+`DISPATCH_MAIN_THREAD_BLOCK` (an SDL user event, serviced by Boxedwine's own
+event loop); this one did not.
+
+The fix: the aspect call moved inside the existing `DISPATCH_MAIN_THREAD_BLOCK`
+in `KVulkdanSDLImpl::createVulkanSurface`, immediately after
+`BVNRegisterGuestVulkanSurface`, and `BVNApplyGuestPresentationAspect` now
+refuses an off-main call with a warning instead of quietly deferring it forever.
+
+**Do not reintroduce `dispatch_async(dispatch_get_main_queue())` anywhere that
+can run during a guest session.** It is not slow, it is silent.
+
+Two details of the fit worth keeping:
+
+- Only the **horizontal** safe-area insets are applied. In landscape the
+  Dynamic Island is an opaque cut-out at one end and content must clear it; the
+  bottom inset is the translucent home indicator, and surrendering 5% of the
+  picture height to a line drawn over it anyway is the worse trade.
+- The rectangle is snapped so `bounds x contentsScale` is a whole number of
+  pixels. See section 4 for why one pixel matters.
+
+### 3. Touch input: FIXED, and it must stay derived from the measured rect
+
+Taps always reached the guest - the log showed all 32 of them. They were raw
+**window** coordinates, because the Vulkan path has no SDL renderer and
+therefore no `SDL_RenderSetLogicalSize` translation.
+
+`KNativeScreenSDL::refreshIOSGuestPointerTransform` now inverts the rectangle
+the presenter reports it applied (`BVNGuestPresentationContentRect`), never a
+rectangle predicted from the window size. Build 62 predicted one, the layer
+resize silently failed, and every tap was wrong by the letterbox offset.
+
+It is called from three places, and all three matter: after the surface is
+created and fitted, from `setScreenSize`, and from the overlay's
+`layoutSubviews` after a rotation. For 874x402 with an 800x600 guest it yields
+scale 67%, content 536x402 at x=169.
+
+The percentage is whole-number (`KNativeInput`'s existing API) and is rounded to
+nearest rather than truncated; truncation biased the scale down and the error
+accumulated towards the far edge of the picture, which is where a visual novel
+puts its menu.
+
+### 4. UNANSWERED: the swapchain recreation storm
+
+Counted in the build-63 log: **17,879 presentation swapchains created in a
+150-second session**, about 119 per second, every one of them 800x600. Acquire
+and present both return `1000001003` = `VK_SUBOPTIMAL_KHR`.
+
+MoltenVK raises `VK_SUBOPTIMAL_KHR` when the presenting layer's *natural*
+drawable size (`bounds x contentsScale`, which is what
+`SDL_uikitmetalview.layoutSubviews` assigns) differs from the extent the
+swapchain was actually created at. With the Metal view filling the window
+(2622x1206 pixels) and DXVK creating an 800x600 swapchain, those could never
+agree, so DXVK rebuilt the swapchain on essentially every frame.
+
+Build 64 makes the view exactly the letterbox rectangle in whole pixels, which
+*may* be enough - but only if DXVK adopts `VkSurfaceCapabilitiesKHR::currentExtent`
+rather than re-requesting the guest resolution. **That is not verified.** The
+evidence cuts against it: the swapchain was created at 794x568 and then 800x600,
+i.e. at the X11 window sizes, never at the device size, which is what a
+presenter that ignores `currentExtent` would do. MoltenVK ships here as a binary
+and DXVK as prebuilt DLLs, so neither could be read to settle it offline.
+
+Build 64 therefore replaces the per-creation log line (which was most of the
+4.5 MB log) with a once-per-second rate report naming the layer's natural
+drawable size:
+
+```
+Vulkan presentation swapchain created N time(s) in M ms; the presenting
+layer's natural drawable size is WxH - compare it with the extent MoltenVK
+logs on the next "Created N swapchain images with size" line
+```
+
+**One device run answers this.** If the two sizes now match and N drops to
+roughly 1, the storm is gone. If they still differ, the remaining fix is to set
+`view.layer.contentsScale = guestWidth / boundsWidth` so that
+`bounds x contentsScale` equals the guest resolution exactly - the aspect-fit
+rectangle has the guest's aspect ratio by construction, so one scale satisfies
+both axes. That renders at 800x600 and lets Core Animation upscale, which is
+what the app effectively does today anyway, minus the 119 rebuilds a second.
+
+This is worth chasing regardless of the JIT work: it is pure waste on the
+render path.
+
+## The in-game overlay
+
+`ios/runtime/src/BVNGuestOverlay.mm` is a UIKit view added directly to SDL's
+guest `UIWindow`: a floating menu button with an on-screen keyboard, a rotation
+lock and a quit control behind it.
+
+It replaced the on-canvas keyboard that `KNativeScreenSDL` used to draw, which
+was deleted in build 64. That keyboard was drawn with the SDL renderer, and a
+guest presenting through Vulkan has **no SDL renderer at all** - so it existed
+only during the Wine loading screen and was invisible for the entire session it
+mattered in. A UIKit view sits above SDL's Metal view no matter how the guest
+draws.
+
+Four things about it are load-bearing:
+
+- **Touch passthrough.** `-hitTest:withEvent:` returns nil for any point that
+  does not land on one of the overlay's own controls, so the game still gets
+  every tap. This is also why the menu is a button and not a gesture: a visual
+  novel is nothing but taps, and a three-finger tap or edge swipe would fight
+  the game for input.
+- **Modifiers latch and really hold.** Ctrl, Alt and Shift send key-down when
+  latched and key-up when unlatched, rather than applying to just the next
+  keystroke. Visual novels skip read text while Ctrl is *held*; a one-shot
+  prefix cannot express that. They are force-released whenever the keyboard is
+  hidden or the overlay is removed, so a latched Ctrl cannot outlive its button.
+- **Keys are named, not numbered.** The overlay resolves SDL's own scancode
+  names ("Escape", "Left Ctrl", "PageUp") through
+  `BVNGuestControlsScancodeForName`, so no scancode constant is duplicated on
+  the UIKit side where it could drift. Unresolved names are logged once at
+  install time instead of shipping as buttons that do nothing.
+- **`-layoutSubviews` is where geometry changes are handled.** It re-applies the
+  guest aspect fit and then re-derives the pointer transform from the rectangle
+  that was actually applied. Presentation and input are never computed
+  independently - that is what broke tapping in build 62.
+
+Quit is confirmed inside the overlay's own panel rather than with a
+`UIAlertController`, because presenting a view controller hands UIKit a modal
+transition to drive while the emulator owns the main thread and the run loop is
+pumped in microsecond slices.
+
+Rotation defaults to landscape-locked and is opt-in per session. Unlocking has
+to change **two** masks: the app delegate's
+`application:supportedInterfaceOrientationsForWindow:` and SDL's, which answers
+from `SDL_HINT_ORIENTATIONS` and otherwise derives landscape-only from the
+guest window being wider than it is tall. UIKit intersects the two.
 
 ## The DXVK fork
 

@@ -20,6 +20,7 @@ add_library(boxedvn_runtime STATIC
     src/BVNMacPlatformShim.mm
     src/BVNMain.mm
     src/BVNAppDelegate.mm
+    src/BVNGuestOverlay.mm
 )
 
 # Read BOXEDWINE_VERSION_STR straight out of the upstream header so the value

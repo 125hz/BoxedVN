@@ -251,17 +251,42 @@ printed.
 
 ### 3.6 Input
 
-With Notepad running: tap to position the caret, tap BoxedVN's SDL-rendered
-**KEYBOARD** button, and type on the software keyboard. Tap it again or dismiss
-the keyboard normally. A hardware keyboard should work without the button.
+With a guest running, tap the floating **menu button** at the top-left of the
+screen and choose **Show keyboard**. A hardware keyboard should work without it.
 
-**Expected in build 20:** an SDL-rendered five-row keyboard appears immediately
-on the first button tap, regardless of whether the native iOS keyboard appears.
-Tap letters, Space, Backspace and Enter and verify they affect Notepad; Shift
-is sticky for one following key. **HIDE** closes it. The log records
-`iOS guest built-in keyboard shown` followed by one `iOS guest built-in
-keyboard key ...` line per tap. It must not request or wait for UIKit's native
-keyboard; Japanese IME is not part of this overlay yet.
+**Expected in build 64 and later:** a UIKit keyboard panel slides in along the
+bottom, with a function row (F1-F12), a full QWERTY layout and latching `ctrl`,
+`alt` and `shift` keys. Verify all of:
+
+- Letters, digits, Space, Backspace and Enter affect the guest.
+- A latched modifier stays lit and **stays held**: latch `ctrl` in a visual
+  novel and the text should keep skipping for as long as it is lit, not for one
+  keystroke. Tap it again to release.
+- Hiding the keyboard releases every latched modifier - nothing should behave
+  as if a key is stuck down afterwards.
+- Tapping the game *outside* the panel still reaches the guest. The overlay
+  passes through every touch that is not on one of its own controls.
+
+The log records `Guest overlay keyboard shown` / `hidden`. At install time it
+records either `SDL resolved every key` or a warning naming any key SDL did not
+recognise - a key in that list would be a button that does nothing, and is a
+bug in the layout table, not in the guest.
+
+This overlay replaces the SDL-drawn **KEYBOARD** button used up to build 63.
+That one was drawn by the SDL renderer and therefore did not exist at all once
+a guest switched to Vulkan. Japanese IME is still not part of it.
+
+### 3.6a Menu, rotation and quit
+
+From the same menu button:
+
+- **Rotation: locked / free.** Unlock, turn the device to portrait, and check
+  that the guest is drawn as a correctly proportioned band centred in the
+  screen with black above and below - *not* stretched to the portrait window.
+  Taps must still land where you touch after rotating; that is the part most
+  likely to regress. Re-lock and confirm the device returns to landscape.
+- **Quit to library.** It asks for confirmation inside the same panel. Confirm,
+  and the library UI should return exactly as in section 3.7.
 
 ### 3.7 Exit
 

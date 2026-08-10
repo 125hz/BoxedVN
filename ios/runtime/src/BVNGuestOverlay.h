@@ -1,0 +1,97 @@
+/*
+ *  BoxedVN - iOS/iPadOS port of Boxedwine
+ *  Copyright (C) 2026  The BoxedWine Team
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.  See license.txt.
+ *
+ *  ---------------------------------------------------------------------
+ *  The in-game overlay: a floating menu button and the on-screen keyboard,
+ *  rotation lock and quit control behind it.
+ *
+ *  This is the interface BVNGuestOverlay.mm needs from the rest of the
+ *  runtime, and the interface the rest of the runtime needs from it.  It is
+ *  private to ios/runtime/src; nothing in ios/runtime/include exposes it,
+ *  because the Swift frontend has no business driving in-game controls.
+ *
+ *  Threading, in one line: every function here must be called on the main
+ *  thread, and during a guest session "on the main thread" means from inside
+ *  a DISPATCH_MAIN_THREAD_BLOCK or a UIKit callback - NOT from a block
+ *  submitted to the main dispatch queue, which is not drained while boxedmain
+ *  owns the main thread.
+ *  ---------------------------------------------------------------------
+ */
+
+#ifndef BVN_GUEST_OVERLAY_H
+#define BVN_GUEST_OVERLAY_H
+
+#import <UIKit/UIKit.h>
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---------------------------------------------------------------------------
+// Implemented by BVNGuestOverlay.mm
+// ---------------------------------------------------------------------------
+
+// Attaches the overlay to SDL's guest window, or moves it to the current one
+// if SDL has recreated its window.  Idempotent.
+void BVNGuestOverlayInstall(void);
+
+// Detaches the overlay and releases any keys it was holding down.
+void BVNGuestOverlayRemove(void);
+
+// ---------------------------------------------------------------------------
+// Implemented by BVNAppDelegate.mm
+// ---------------------------------------------------------------------------
+
+// SDL's own UIWindow for the running guest, bypassing the library-window
+// fallback in -[BVNAppDelegate window].  nil when no session is running.
+UIWindow* BVNGuestUIWindow(void);
+
+bool BVNGuestRotationIsUnlocked(void);
+void BVNGuestSetRotationUnlocked(bool unlocked);
+
+// Re-applies the recorded aspect fit after the window changed shape.  Returns
+// false when there is no guest surface to re-fit.
+bool BVNReapplyGuestPresentationAspect(void);
+
+// ---------------------------------------------------------------------------
+// Implemented by platform/sdl/knativescreenSDL.cpp
+//
+// The overlay must not include SDL or Boxedwine headers, and the scancode
+// numbers must not be duplicated on the UIKit side where they could silently
+// drift from SDL's.  So keys are named the way SDL names them
+// (SDL_scancode_names in SDL_keyboard.c: "Escape", "Left Ctrl", "PageUp", …)
+// and resolved through SDL here.
+// ---------------------------------------------------------------------------
+
+// SDL_SCANCODE_UNKNOWN (0) for a name SDL does not know.  The overlay logs
+// those once at install time rather than shipping a dead key.
+uint32_t BVNGuestControlsScancodeForName(const char* name);
+
+void BVNGuestControlsSendKey(uint32_t scancode, bool down);
+
+// Re-derives the window-to-guest pointer transform from the rectangle the
+// presenter measured.  Presentation and input are never derived independently:
+// build 62 broke every tap by assuming a letterbox that had not happened.
+void BVNGuestPresentationGeometryChanged(void);
+
+// ---------------------------------------------------------------------------
+// Implemented by BVNRuntime.mm (declared in BVNRuntime.h, repeated here so the
+// overlay does not have to pull in the whole frontend ABI).
+// ---------------------------------------------------------------------------
+
+bool BVNRuntimeRequestShutdown(void);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
+
+#endif  // BVN_GUEST_OVERLAY_H

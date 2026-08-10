@@ -6,12 +6,15 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-08 (build 35 fixes the optimized `REP MOVS` defect
-and no longer faults, but still stops after final-surface creation and PNG
-loading. The installed root is Wine 10.0; WineHQ records Song of Saya's
-`RtlpWaitForCriticalSection` hang as fixed in Wine 10.11. Build 36 migrates to
-the pinned Wine 11.0 root containing that fix—see section 1ao. The main menu
-is the next physical-device proof.)
+**Last updated:** 2026-08-09 (build 64. Song of Saya is **playable on device**
+— main menu, dialogue, working touch — but only with `-interpreterModule
+d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
+Build 64 makes the aspect fit actually run, replaces the SDL-drawn keyboard
+with a UIKit in-game overlay (keyboard with Ctrl/Alt/Shift, rotation lock,
+quit), and adds an app icon; **none of it is device-tested yet**. It also
+records an unanswered finding: 17,879 swapchain recreations in a 150-second
+session. The newest detail is at the end of the session log, section 10; the
+open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
 `379bf2414a67fc6509d506a6eefdf6ffa7ebf82d` (2026-08-05, "build fix"),
@@ -2802,3 +2805,53 @@ device-proven. Game compatibility is next.
   (`___clear_cache`, CoreBluetooth).
 - Produced a validated 1.9 MB unsigned IPA.
 - Wrote the build scripts, presets, CI workflow and docs.
+
+### 2026-08-09 — build 64: presentation, the in-game overlay, and an app icon
+
+Worked from the exported build-63 device log (`boxedvn-20260809-183633.log`,
+38,221 lines) rather than a live pull.
+
+**The aspect fit never ran.** Not "ran and got it wrong" — never ran.
+`BVNApplyGuestPresentationAspect` was called from the guest thread and
+forwarded itself with `dispatch_async(dispatch_get_main_queue())`. Both queued
+blocks (one per presentation surface) executed only *after*
+`Boxedwine shutdown`, 2.5 minutes later, by which point their surfaces had been
+unregistered — the log's only trace is two `Presentation aspect skipped: no
+registered view for this surface` warnings at 18:45:08. While `boxedmain` owns
+the main thread the main dispatch queue is not drained; SDL's pump services
+UIKit events, not GCD. The call moved inside the existing
+`DISPATCH_MAIN_THREAD_BLOCK` in `createVulkanSurface`, and the function now
+refuses an off-main call loudly instead of deferring it silently forever.
+
+**A second finding from the same log: 17,879 swapchain creations in 150
+seconds**, ~119/second, every one 800x600, with acquire and present both
+returning `VK_SUBOPTIMAL_KHR`. MoltenVK raises that whenever the layer's
+natural drawable size differs from the swapchain extent, and a full-window
+Metal view (2622x1206) driving an 800x600 swapchain can never satisfy it. The
+letterbox may fix this as a side effect; it is **not verified**, because it
+depends on whether DXVK adopts `currentExtent`, and both DXVK and MoltenVK are
+binaries here. The per-creation log line (most of the 4.5 MB log) is now a
+once-per-second rate report that names the layer's natural drawable size, so
+one device run settles it. See section 4 of
+`docs/CONTINUING_WITHOUT_A_MAC.md`.
+
+**The in-game overlay** (`ios/runtime/src/BVNGuestOverlay.mm`) is new: a
+floating menu button over SDL's window with an on-screen keyboard (function
+row, full QWERTY, and latching Ctrl/Alt/Shift that genuinely hold the key
+down), a rotation lock, and quit-to-library with in-panel confirmation. It
+replaces the SDL-drawn keyboard, which was deleted — that one was drawn by the
+SDL renderer, and a Vulkan guest has no SDL renderer, so it was invisible for
+the whole session it mattered in.
+
+**Rotation** is now unlockable per session, defaulting to landscape as before.
+Unlocking changes both the app delegate's orientation mask and
+`SDL_HINT_ORIENTATIONS`; UIKit intersects them, and SDL derives landscape-only
+from the guest window's shape without the hint. In portrait the guest is
+aspect-fitted into a centred band rather than stretched.
+
+**An app icon**, drawn by `scripts/make-app-icon.swift` (a visual-novel text
+box over a 4:3 screen) so the artwork is a reviewable diff rather than an
+opaque binary.
+
+Verified locally: full `scripts/build-ios.sh` succeeds, `BoxedVN.app` validates,
+88/88 unit tests pass. **Nothing in this entry has been tested on device.**

@@ -38,6 +38,8 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                                                 U32 guestHeight,
                                                 bool stretchToFill);
 extern "C" void BVNUnregisterGuestVulkanSurface(void* surface);
+extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
+                                                        int* height);
 extern "C" void BVNGuestVulkanSurfaceDidPresent(void* surface);
 extern "C" void* BVNCreateOffscreenMetalLayer(U32 width, U32 height);
 extern "C" void BVNDestroyOffscreenMetalLayer(void* layer);
@@ -218,6 +220,31 @@ void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,
 #ifdef BOXEDWINE_IOS
         if (result) {
             BVNRegisterGuestVulkanSurface((void*)result);
+            if (presentation) {
+                // Letterbox rather than stretch, and do it HERE, inside the
+                // main-thread block, rather than after it.
+                //
+                // This used to be called from the guest thread further down,
+                // and BVNApplyGuestPresentationAspect forwarded itself to the
+                // main *dispatch queue*. The build-63 device log proves those
+                // blocks never ran: both were still queued when the session
+                // ended 2.5 minutes later, and executed only after "Boxedwine
+                // shutdown", by which point their surfaces had already been
+                // unregistered ("no registered view for this surface"). While
+                // boxedmain owns the main thread, SDL's pump services UIKit
+                // events but the main dispatch queue is not drained.
+                // DISPATCH_MAIN_THREAD_BLOCK is an SDL user event, which is,
+                // and it is what every other UIKit call on this path uses.
+                //
+                // KNativeScreenSDL then re-derives the pointer transform from
+                // the rectangle the presenter measured, so the picture and the
+                // touch target cannot disagree. setScreenSize above ran before
+                // the surface existed and could only see a stretched window.
+                BVNApplyGuestPresentationAspect((void*)result, wnd->width(),
+                                                wnd->height(),
+                                                KSystem::stretchGuestToFill);
+                screen->refreshIOSGuestPointerTransform();
+            }
         }
 #endif
     }
@@ -257,14 +284,9 @@ void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,
                      surfaces.size());
         }
 #ifdef BOXEDWINE_IOS
-        if (presentation) {
-            // Letterbox rather than stretch. KNativeScreenSDL derives the
-            // matching pointer transform from the same guest size, so the
-            // picture and the touch target stay in agreement.
-            BVNApplyGuestPresentationAspect((void*)result, wnd->width(),
-                                            wnd->height(),
-                                            KSystem::stretchGuestToFill);
-        }
+        // The aspect fit is applied at surface creation, inside the
+        // main-thread block above - see the comment there for why it cannot
+        // be done from this thread.
         if (watch) {
             startFirstFrameWatchdog(watch, (void*)result, wnd->id,
                                     wnd->width(), wnd->height());
@@ -379,10 +401,65 @@ void KVulkdanSDLImpl::registerVulkanSwapchain(void* swapchain,
     swapchainSurfaces[swapchain] = surface;
     auto found = std::find_if(surfaces.begin(), surfaces.end(),
         [surface](const auto& item) { return item.surface == surface; });
+    const bool isPresentation =
+        found != surfaces.end() && found->presentation;
+
+#ifdef BOXEDWINE_IOS
+    // This used to log one line per call. The build-63 device session produced
+    // 17,879 of them in 150 seconds - DXVK was recreating the presentation
+    // swapchain on essentially every frame, because acquire and present kept
+    // returning VK_SUBOPTIMAL_KHR. MoltenVK raises that whenever the layer's
+    // natural drawable size (bounds x contentsScale) differs from the extent
+    // the swapchain was actually created at, and with SDL's Metal view filling
+    // the window while the guest renders at 800x600 they could never agree.
+    //
+    // The first few are logged individually, because a healthy session creates
+    // one or two and those are worth seeing. After that the log reports the
+    // rate instead of the event, so the next device log answers in one line
+    // what took counting 17,879 of them to see.
+    static constexpr U32 kIndividuallyLogged = 4;
+    static U32 totalCreations = 0;
+    static U32 windowStart = 0;
+    static U32 windowCount = 0;
+    if (isPresentation) {
+        const U32 now = SDL_GetTicks();
+        ++totalCreations;
+        if (totalCreations <= kIndividuallyLogged) {
+            int naturalWidth = 0;
+            int naturalHeight = 0;
+            BVNGuestPresentationNaturalDrawableSize(&naturalWidth,
+                                                    &naturalHeight);
+            klog_fmt("Vulkan presentation swapchain %p created (#%u); the "
+                     "presenting layer's natural drawable size is %dx%d. If "
+                     "MoltenVK's next \"Created N swapchain images with size\" "
+                     "line disagrees with that, every acquire will return "
+                     "VK_SUBOPTIMAL_KHR and DXVK will rebuild this swapchain "
+                     "on every frame",
+                     swapchain, totalCreations, naturalWidth, naturalHeight);
+            windowStart = now;
+            windowCount = 0;
+            return;
+        }
+        ++windowCount;
+        if (now - windowStart >= 1000) {
+            int naturalWidth = 0;
+            int naturalHeight = 0;
+            BVNGuestPresentationNaturalDrawableSize(&naturalWidth,
+                                                    &naturalHeight);
+            klog_fmt("Vulkan presentation swapchain rebuilt %u time(s) in "
+                     "%u ms (%u total); layer natural drawable %dx%d. This is "
+                     "the VK_SUBOPTIMAL_KHR recreation storm, not real work",
+                     windowCount, now - windowStart, totalCreations,
+                     naturalWidth, naturalHeight);
+            windowStart = now;
+            windowCount = 0;
+        }
+        return;
+    }
+#endif
+
     klog_fmt("Vulkan swapchain %p registered to %s surface %p",
-             swapchain,
-             found != surfaces.end() && found->presentation
-                 ? "presentation" : "helper/unknown",
+             swapchain, isPresentation ? "presentation" : "helper/unknown",
              surface);
 }
 

@@ -35,9 +35,12 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#include <atomic>
+#include <cmath>
 #include <dispatch/dispatch.h>
 
 #include "BVNRuntime.h"
+#import "BVNGuestOverlay.h"
 
 // Implemented in BVNLog.mm.  BVNGuestMain also calls this, but not until
 // after -postFinishLaunch fires, which is *after* this delegate has already
@@ -62,6 +65,9 @@ extern "C" bool BVNLogStartSessionFile(void);
 @interface BVNAppDelegate : SDLUIKitDelegate
 @property (nonatomic, strong) UIWindow* libraryWindow;
 @property (nonatomic, assign) BOOL guestOrientationLocked;
+// Set from the in-game overlay's rotation control. Only meaningful while
+// guestOrientationLocked is YES, i.e. while a guest session is running.
+@property (nonatomic, assign) BOOL guestRotationUnlocked;
 @property (nonatomic, assign) UIInterfaceOrientation orientationBeforeGuest;
 - (void)createLibraryWindowForScene:(UIWindowScene*)scene;
 - (UIWindow*)superWindowForGuest;
@@ -98,6 +104,10 @@ extern "C" bool BVNLogStartSessionFile(void);
 static __weak BVNAppDelegate* gAppDelegate = nil;
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanSurfaceViews = nil;
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanWaitingOverlays = nil;
+
+// Defined at the bottom of this file, alongside the presentation geometry it
+// describes. Declared here because the surface-teardown path above it needs it.
+extern "C" void BVNForgetGuestPresentationAspect(void* surface);
 
 // SDL 2.32.10 deliberately keeps its keyboard UITextField hidden and at a
 // zero-sized frame. That worked on earlier iOS releases, but current iOS can
@@ -186,14 +196,21 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 
 - (UIInterfaceOrientationMask)application:(UIApplication*)application
     supportedInterfaceOrientationsForWindow:(UIWindow*)window {
-    // Wine/Boxedwine sessions are deliberately landscape-only. Allowing a
-    // live portrait/landscape transition while boxedmain owns the main
-    // thread makes UIKit replace SDL's Metal drawable and first responder in
-    // the middle of the emulator's event loop. On device that presented as a
-    // frozen guest and a permanently unresponsive software-keyboard button.
-    // The SwiftUI library remains freely rotatable before and after a guest.
+    // Guest sessions start landscape-locked, and stay that way unless the
+    // player unlocks rotation from the in-game overlay. The lock exists
+    // because a live orientation change while boxedmain owns the main thread
+    // makes UIKit replace SDL's Metal drawable and first responder in the
+    // middle of the emulator's event loop; on build 15 that presented as a
+    // frozen guest and a permanently unresponsive keyboard button. What is
+    // different now is that the presenter re-fits the picture and the pointer
+    // transform on every layout pass (BVNGuestOverlayView.layoutSubviews), so
+    // a new drawable is expected rather than fatal - but it is still opt-in,
+    // and locked remains the default. The SwiftUI library is freely rotatable
+    // before and after a guest.
     if (self.guestOrientationLocked) {
-        return UIInterfaceOrientationMaskLandscape;
+        return self.guestRotationUnlocked
+                   ? UIInterfaceOrientationMaskAllButUpsideDown
+                   : UIInterfaceOrientationMaskLandscape;
     }
     return UIInterfaceOrientationMaskAllButUpsideDown;
 }
@@ -308,6 +325,7 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
                 : UIInterfaceOrientationPortrait;
     }
     self.guestOrientationLocked = YES;
+    self.guestRotationUnlocked = NO;
     [self.libraryWindow.rootViewController
         setNeedsUpdateOfSupportedInterfaceOrientations];
 
@@ -338,6 +356,7 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 - (void)finishGuestPresentation {
     NSAssert(NSThread.isMainThread, @"Guest presentation must finish on main");
     self.guestOrientationLocked = NO;
+    self.guestRotationUnlocked = NO;
     [self.libraryWindow.rootViewController
         setNeedsUpdateOfSupportedInterfaceOrientations];
 
@@ -481,9 +500,68 @@ extern "C" void BVNFinishGuestPresentation(void) {
     // SDL owns the actual guest window/view teardown. Drop any diagnostic
     // associations left by a forced Wine exit so they cannot retain UIKit
     // views or be mistaken for surfaces in the next session.
+    BVNGuestOverlayRemove();
     [gGuestVulkanSurfaceViews removeAllObjects];
     [gGuestVulkanWaitingOverlays removeAllObjects];
+    BVNForgetGuestPresentationAspect(nullptr);
     [gAppDelegate finishGuestPresentation];
+}
+
+// Implemented in platform/sdl/knativescreenSDL.cpp. SDL asks its own view
+// controller for the orientation mask too, and answers landscape-only for a
+// window that is wider than it is tall unless SDL_HINT_ORIENTATIONS says
+// otherwise. UIKit intersects that with the app delegate's mask, so both have
+// to be changed together or nothing happens.
+extern "C" void BVNGuestControlsSetRotationHint(bool allowPortrait);
+
+extern "C" UIWindow* BVNGuestUIWindow(void) {
+    return [gAppDelegate superWindowForGuest];
+}
+
+extern "C" bool BVNGuestRotationIsUnlocked(void) {
+    return gAppDelegate.guestRotationUnlocked == YES;
+}
+
+extern "C" void BVNGuestSetRotationUnlocked(bool unlocked) {
+    if (!NSThread.isMainThread) {
+        BVNLogWrite(BVNLogLevelWarning, "frontend",
+                    "Ignored an off-main guest rotation request.");
+        return;
+    }
+    BVNAppDelegate* delegate = gAppDelegate;
+    if (delegate == nil) {
+        return;
+    }
+    delegate.guestRotationUnlocked = unlocked ? YES : NO;
+    BVNGuestControlsSetRotationHint(unlocked);
+
+    UIWindow* guestWindow = [delegate superWindowForGuest];
+    [guestWindow.rootViewController
+        setNeedsUpdateOfSupportedInterfaceOrientations];
+    [delegate.libraryWindow.rootViewController
+        setNeedsUpdateOfSupportedInterfaceOrientations];
+
+    // Re-locking has to actively put the device back into landscape; UIKit
+    // does not rotate on its own just because portrait stopped being allowed
+    // while the device is still held that way.
+    UIWindowScene* scene = guestWindow.windowScene
+                               ?: delegate.libraryWindow.windowScene;
+    if (!unlocked && scene != nil) {
+        UIWindowSceneGeometryPreferencesIOS* preferences =
+            [[UIWindowSceneGeometryPreferencesIOS alloc]
+                initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+        [scene requestGeometryUpdateWithPreferences:preferences
+                                       errorHandler:^(NSError* error) {
+            NSString* message = [NSString stringWithFormat:
+                @"UIKit did not return the guest to landscape: %@",
+                error.localizedDescription];
+            BVNLogWrite(BVNLogLevelWarning, "frontend", message.UTF8String);
+        }];
+    }
+
+    BVNLogWrite(BVNLogLevelInfo, "frontend",
+                unlocked ? "Guest rotation unlocked by the player."
+                         : "Guest rotation re-locked to landscape.");
 }
 
 extern "C" bool BVNGuestKeyboardSetVisible(bool visible) {
@@ -514,6 +592,11 @@ extern "C" void BVNAttachGuestWindowToScene(void) {
     guestWindow.windowScene = scene;
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "SDL guest window attached to the active UIWindowScene.");
+
+    // SDL recreates its window when the guest switches from the software
+    // renderer to Vulkan, and this runs for each one, so the overlay is
+    // (re)attached to whichever window is current. Install is idempotent.
+    BVNGuestOverlayInstall();
 }
 
 extern "C" void BVNRegisterGuestVulkanSurface(void* surface) {
@@ -601,6 +684,12 @@ extern "C" void BVNRegisterGuestVulkanSurface(void* surface) {
     }
     gGuestVulkanWaitingOverlays[key] = overlay;
 
+    // SDL installs each new SDL_uikitmetalview by assigning it as the root
+    // view controller's view, which appends it to the window and buries
+    // anything already there. Re-assert the overlay's place on top; the call
+    // is idempotent.
+    BVNGuestOverlayInstall();
+
     NSString* message = [NSString stringWithFormat:
         @"Registered Vulkan surface %p with %@ at %.0fx%.0f; %lu UIKit "
          "surface view(s) active.",
@@ -620,6 +709,12 @@ extern "C" void BVNGuestVulkanSurfaceDidPresent(void* surface) {
     }
     [overlay removeFromSuperview];
     [gGuestVulkanWaitingOverlays removeObjectForKey:key];
+    // The Wine-blue fill set at registration existed to distinguish "still
+    // building the first frame" from a freeze. That question is now answered,
+    // and blue showing through anywhere behind real content reads as a bug.
+    UIView* surfaceView = gGuestVulkanSurfaceViews[key];
+    surfaceView.backgroundColor = UIColor.blackColor;
+    surfaceView.layer.backgroundColor = UIColor.blackColor.CGColor;
     NSString* message = [NSString stringWithFormat:
         @"Vulkan surface %p completed its first successful queue present; "
          "removed the native first-frame indicator.", surface];
@@ -659,6 +754,7 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface) {
     UIView* overlay = gGuestVulkanWaitingOverlays[key];
     [overlay removeFromSuperview];
     [gGuestVulkanWaitingOverlays removeObjectForKey:key];
+    BVNForgetGuestPresentationAspect(surface);
 
     NSString* message = [NSString stringWithFormat:
         @"Detached UIKit view for Vulkan surface %p; %lu surface view(s) "
@@ -669,21 +765,46 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface) {
 
 // Letterbox the guest picture instead of stretching it across the display.
 //
-// MoltenVK creates the swapchain images at the guest resolution (the device log
-// shows "Created 2 swapchain images with size (800, 600)"), and SDL sizes the
-// Metal view to the whole window, so those images are scaled to fill a 2.2:1
-// screen - which is why 4:3 content spread edge to edge and ran under the
-// Dynamic Island.
+// SDL sizes its Metal view to the whole window, so a 4:3 guest was scaled to
+// fill a 2.2:1 screen: content spread edge to edge and ran under the Dynamic
+// Island. Shrinking the view to an aspect-fit rectangle fixes the shape.
 //
-// Shrinking the layer's frame to an aspect-fit rectangle while leaving
-// drawableSize at the guest resolution fixes it without touching DXVK or the
-// swapchain: Core Animation scales the same drawable into a correctly
-// proportioned rect. The safe-area insets keep it clear of the Dynamic Island.
+// It may also bear on something much more expensive, which was not obvious
+// until the build-63 device log was counted: 17,879 presentation swapchains
+// created in a 150-second session, every acquire and present returning
+// VK_SUBOPTIMAL_KHR. MoltenVK raises that whenever the layer's natural
+// drawable size (bounds * contentsScale, which SDL_uikitmetalview.layoutSubviews
+// assigns) differs from the extent the swapchain was created at, and a
+// full-window view (2622x1206) driving an 800x600 swapchain can never satisfy
+// it. Whether shrinking the view ends the storm depends on DXVK adopting
+// currentExtent, which is NOT verified here - see section 4 of
+// docs/CONTINUING_WITHOUT_A_MAC.md and the rate report in
+// KVulkdanSDLImpl::registerVulkanSwapchain, which is armed to answer it from
+// the next device log.
 //
-// KNativeScreenSDL computes the matching inverse for pointer events. The two
-// must agree; if one changes the other has to change with it.
+// The fit is computed in pixels and snapped to a whole number of points either
+// way: a fractional bounds width turns into a drawableSize that is one pixel
+// off, and one pixel off is enough to keep VK_SUBOPTIMAL_KHR coming forever.
+//
+// KNativeScreenSDL computes the matching inverse for pointer events from the
+// rectangle recorded here. The two must agree; if one changes the other has to
+// change with it.
 static CGRect gGuestPresentationContentRect = CGRectZero;
 static bool gGuestPresentationIsLetterboxed = false;
+// Remembered so a rotation - or any UIKit layout pass that resets the Metal
+// view to the full window - can re-apply the same fit without the emulator
+// having to create a new surface.
+static void* gGuestPresentationSurface = nullptr;
+static uint32_t gGuestPresentationGuestWidth = 0;
+static uint32_t gGuestPresentationGuestHeight = 0;
+static bool gGuestPresentationStretch = false;
+
+// The natural drawable size of the presenting layer (bounds x contentsScale)
+// as of the last fit. Cached rather than read live because swapchains are
+// created on a guest thread while CALayer geometry belongs to the main one;
+// it only changes where the fit is applied, so a snapshot there is accurate.
+static std::atomic<int> gGuestNaturalDrawableWidth{0};
+static std::atomic<int> gGuestNaturalDrawableHeight{0};
 
 // Reports the rectangle the guest picture is actually being shown in. Returns
 // false while it fills the window, so the pointer transform can never assume a
@@ -705,11 +826,20 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                                                 uint32_t guestWidth,
                                                 uint32_t guestHeight,
                                                 bool stretchToFill) {
+    // Deliberately NOT dispatch_async(dispatch_get_main_queue()) when called
+    // off-main. That is what build 63 did, and the device log proves the
+    // blocks never ran: both of them were still queued when the session ended
+    // 2.5 minutes later and only executed after "Boxedwine shutdown", by which
+    // point their surfaces had been unregistered. While boxedmain owns the
+    // main thread the main dispatch queue is not drained - SDL's pump services
+    // UIKit events, not GCD. Callers must already be on the main thread, which
+    // on this code path means inside a DISPATCH_MAIN_THREAD_BLOCK; that
+    // mechanism is an SDL user event and demonstrably does run.
     if (!NSThread.isMainThread) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            BVNApplyGuestPresentationAspect(surface, guestWidth, guestHeight,
-                                            stretchToFill);
-        });
+        BVNLogWrite(BVNLogLevelWarning, "graphics",
+                    "Presentation aspect refused off the main thread. The "
+                    "main dispatch queue is not serviced during a guest "
+                    "session; use DISPATCH_MAIN_THREAD_BLOCK instead.");
         return;
     }
     if (surface == nullptr || guestWidth == 0 || guestHeight == 0) {
@@ -726,30 +856,72 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                     "surface.");
         return;
     }
-    if (view.superview == nil) {
+    UIView* container = view.superview;
+    if (container == nil) {
         BVNLogWrite(BVNLogLevelWarning, "graphics",
                     "Presentation aspect skipped: the Metal view has no "
                     "superview to measure against.");
         return;
     }
 
-    const CGRect available = UIEdgeInsetsInsetRect(view.superview.bounds,
-                                                  view.superview.safeAreaInsets);
+    gGuestPresentationSurface = surface;
+    gGuestPresentationGuestWidth = guestWidth;
+    gGuestPresentationGuestHeight = guestHeight;
+    gGuestPresentationStretch = stretchToFill;
+
+    // Horizontal safe-area insets only. In landscape the Dynamic Island is an
+    // opaque cut-out at one end, so content must stay clear of it; the bottom
+    // inset is the translucent home indicator, and giving up 5% of the picture
+    // height to a line that is drawn over it anyway is the worse trade. In
+    // portrait the fitted band is centred vertically and never reaches the
+    // island regardless.
+    const UIEdgeInsets insets = container.safeAreaInsets;
+    const CGRect available = UIEdgeInsetsInsetRect(
+        container.bounds,
+        UIEdgeInsetsMake(0.0, insets.left, 0.0, insets.right));
     if (available.size.width <= 0.0 || available.size.height <= 0.0) {
+        NSString* message = [NSString stringWithFormat:
+            @"Presentation aspect skipped: nothing to fit into (window %.0fx%.0f, "
+             "insets l%.0f r%.0f).",
+            container.bounds.size.width, container.bounds.size.height,
+            insets.left, insets.right];
+        BVNLogWrite(BVNLogLevelWarning, "graphics", message.UTF8String);
         return;
     }
 
+    // updateDrawableSize multiplies bounds by exactly this, so it is the value
+    // the snap has to be expressed in - not the screen's scale, which SDL only
+    // adopts for a high-DPI window.
+    CGFloat contentsScale = view.layer.contentsScale;
+    if (contentsScale <= 0.0) {
+        contentsScale = 1.0;
+    }
+    const bool snapToWholePixels =
+        fabs(contentsScale - floor(contentsScale + 0.5)) < 0.001;
+    const CGFloat step = snapToWholePixels ? 1.0 / contentsScale : 0.0;
+
     CGRect target = available;
     if (!stretchToFill) {
-        const CGFloat scale = MIN(available.size.width / (CGFloat)guestWidth,
-                                  available.size.height / (CGFloat)guestHeight);
-        const CGFloat width = (CGFloat)guestWidth * scale;
-        const CGFloat height = (CGFloat)guestHeight * scale;
-        target = CGRectMake(available.origin.x +
-                                (available.size.width - width) / 2.0,
-                            available.origin.y +
-                                (available.size.height - height) / 2.0,
-                            width, height);
+        const CGFloat fit = MIN(available.size.width / (CGFloat)guestWidth,
+                                available.size.height / (CGFloat)guestHeight);
+        CGFloat width = (CGFloat)guestWidth * fit;
+        CGFloat height = (CGFloat)guestHeight * fit;
+        if (step > 0.0) {
+            // Round down so the picture can never exceed the space it was
+            // fitted into, then express it as a whole number of pixels.
+            width = floor(width / step) * step;
+            height = floor(height / step) * step;
+        }
+        CGFloat x = available.origin.x + (available.size.width - width) / 2.0;
+        CGFloat y = available.origin.y + (available.size.height - height) / 2.0;
+        if (step > 0.0) {
+            x = floor(x / step + 0.5) * step;
+            y = floor(y / step + 0.5) * step;
+        }
+        target = CGRectMake(x, y, width, height);
+    } else if (step > 0.0) {
+        target.size.width = floor(target.size.width / step) * step;
+        target.size.height = floor(target.size.height / step) * step;
     }
 
     // UIKit owns this view's layout, so pin the frame and stop it being
@@ -758,20 +930,86 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
     view.translatesAutoresizingMaskIntoConstraints = YES;
     view.frame = target;
     // Letterbox bars read as part of the device, not as Wine's desktop.
-    view.superview.backgroundColor = UIColor.blackColor;
+    container.backgroundColor = UIColor.blackColor;
+    // Run layoutSubviews now rather than at some unpredictable later point, so
+    // the drawableSize below is the real one and the rectangle handed to the
+    // pointer transform describes a layout that has already happened.
+    [view layoutIfNeeded];
 
     gGuestPresentationContentRect = target;
     gGuestPresentationIsLetterboxed =
-        !stretchToFill && !CGRectEqualToRect(target, available);
+        !CGRectEqualToRect(target, container.bounds);
 
+    CGSize drawable = CGSizeZero;
+    if ([view.layer isKindOfClass:CAMetalLayer.class]) {
+        drawable = ((CAMetalLayer*)view.layer).drawableSize;
+    }
+    gGuestNaturalDrawableWidth.store(
+        (int)lround(target.size.width * contentsScale),
+        std::memory_order_relaxed);
+    gGuestNaturalDrawableHeight.store(
+        (int)lround(target.size.height * contentsScale),
+        std::memory_order_relaxed);
     NSString* message = [NSString stringWithFormat:
-        @"Guest presentation %@: guest %ux%u into %.0fx%.0f at %.0f,%.0f "
-         "(safe area %.0fx%.0f).",
+        @"Guest presentation %@: guest %ux%u into %.1fx%.1f at %.1f,%.1f of "
+         "%.0fx%.0f; drawable %.0fx%.0f at scale %.1f.",
         stretchToFill ? @"stretched to fill" : @"aspect-fitted",
         guestWidth, guestHeight, target.size.width, target.size.height,
-        target.origin.x, target.origin.y, available.size.width,
-        available.size.height];
+        target.origin.x, target.origin.y, container.bounds.size.width,
+        container.bounds.size.height, drawable.width, drawable.height,
+        contentsScale];
     BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
+}
+
+// Re-applies the last fit after the window changed shape. Safe to call when no
+// guest surface exists; it does nothing then.
+extern "C" bool BVNReapplyGuestPresentationAspect(void) {
+    if (!NSThread.isMainThread || gGuestPresentationSurface == nullptr) {
+        return false;
+    }
+    NSValue* key = [NSValue valueWithPointer:gGuestPresentationSurface];
+    if (gGuestVulkanSurfaceViews[key] == nil) {
+        return false;
+    }
+    BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
+                                    gGuestPresentationGuestWidth,
+                                    gGuestPresentationGuestHeight,
+                                    gGuestPresentationStretch);
+    return true;
+}
+
+// Reports the layer's NATURAL drawable size - bounds x contentsScale, which is
+// what SDL_uikitmetalview.layoutSubviews assigns and what MoltenVK compares
+// against the extent a swapchain was actually created at. While those two
+// disagree, every acquire and present returns VK_SUBOPTIMAL_KHR and DXVK
+// rebuilds the swapchain, forever; that is the shape of the 17,879-swapchain
+// storm in the build-63 log.
+//
+extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
+                                                        int* height) {
+    if (width) {
+        *width = gGuestNaturalDrawableWidth.load(std::memory_order_relaxed);
+    }
+    if (height) {
+        *height = gGuestNaturalDrawableHeight.load(std::memory_order_relaxed);
+    }
+}
+
+// Forgets the recorded rectangle, so a stale letterbox from a surface that no
+// longer exists can never be handed to the next one's pointer transform. Pass
+// a surface to forget only that one; pass nullptr at session teardown.
+extern "C" void BVNForgetGuestPresentationAspect(void* surface) {
+    if (surface != nullptr && surface != gGuestPresentationSurface) {
+        return;
+    }
+    gGuestPresentationSurface = nullptr;
+    gGuestPresentationGuestWidth = 0;
+    gGuestPresentationGuestHeight = 0;
+    gGuestPresentationStretch = false;
+    gGuestPresentationContentRect = CGRectZero;
+    gGuestPresentationIsLetterboxed = false;
+    gGuestNaturalDrawableWidth.store(0, std::memory_order_relaxed);
+    gGuestNaturalDrawableHeight.store(0, std::memory_order_relaxed);
 }
 
 extern "C" void* BVNCreateOffscreenMetalLayer(uint32_t width,

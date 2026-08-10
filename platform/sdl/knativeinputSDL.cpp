@@ -25,11 +25,6 @@
 #include "knativesystem.h"
 #include "kdspaudio.h"
 
-#ifdef BOXEDWINE_IOS
-extern "C" bool BVNGuestControlsHandleMouseButton(bool down, U32 button,
-                                                    int x, int y);
-#endif
-
 U32 sdlCustomEvent;
 
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -640,12 +635,11 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
     } else if (e->type == SDL_MOUSEBUTTONDOWN) {    
         U32 button = getMouseButtonFromEvent(e);
 #ifdef BOXEDWINE_IOS
+        // The in-game menu and keyboard are UIKit views above SDL's, so
+        // UIKit hit-testing already claimed their touches before SDL saw
+        // them; there is nothing left here to intercept.
         klog_fmt("iOS SDL mouse down: button %u at logical %d,%d",
                  button, e->button.x, e->button.y);
-        if (BVNGuestControlsHandleMouseButton(true, button, e->button.x,
-                                              e->button.y)) {
-            return true;
-        }
 #endif
         BOXEDWINE_RECORDER_HANDLE_MOUSE_BUTTON_DOWN(button, e->motion.x, e->motion.y);
         if (!mouseButton(1, button, e->motion.x, e->motion.y)) {
@@ -656,10 +650,6 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
 #ifdef BOXEDWINE_IOS
         klog_fmt("iOS SDL mouse up: button %u at logical %d,%d",
                  button, e->button.x, e->button.y);
-        if (BVNGuestControlsHandleMouseButton(false, button, e->button.x,
-                                              e->button.y)) {
-            return true;
-        }
 #endif
         BOXEDWINE_RECORDER_HANDLE_MOUSE_BUTTON_UP(button, e->motion.x, e->motion.y);
         if (!mouseButton(0, button, e->motion.x, e->motion.y)) {
