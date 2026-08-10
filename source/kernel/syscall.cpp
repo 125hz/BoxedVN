@@ -762,24 +762,42 @@ static U32 syscall_setrlimit(CPU* cpu, U32 eipCount) {
     return result;
 }
 
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+namespace bvnFairness {
+std::atomic<std::uint64_t> throttleCount{0};
+std::atomic<std::uint64_t> throttleMicroseconds{0};
+}
+
+// One real scheduling point, accounted for. A syscall that crosses into the
+// kernel is what a spinning guest thread is missing; the sleep is deliberately
+// the shortest Darwin will honour rather than the 1 ms the first version used,
+// which cost more than the spin it was replacing.
+static void bvnApplyFairnessThrottle() {
+    bvnFairness::throttleCount.fetch_add(1, std::memory_order_relaxed);
+    bvnFairness::throttleMicroseconds.fetch_add(
+        GetrusageFairness::kThrottleSleepUs, std::memory_order_relaxed);
+    std::this_thread::sleep_for(
+        std::chrono::microseconds(GetrusageFairness::kThrottleSleepUs));
+}
+#endif
+
 static U32 syscall_getrusuage(CPU* cpu, U32 eipCount) {
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "getrusage: who=%d usuage=%X", ARG1, ARG2);
     U32 result = cpu->thread->process->getrusuage(cpu->thread, ARG1, ARG2);
 #if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
     const GetrusageFairnessDecision fairness =
         cpu->thread->getrusageFairness.observe(KSystem::getMicroCounter());
-    if (fairness.activated) {
+    if (fairness.firstActivation) {
         klog_fmt("iOS getrusage fairness activated for pid=%04X tid=%04X; "
-                 "a 1 ms host scheduling point will replace this guest's "
-                 "tight in-process syscall spin",
-                 cpu->thread->process->id, cpu->thread->id);
+                 "this guest's tight in-process syscall spin will now get a "
+                 "real scheduling point at most every %llu us. Further "
+                 "activations on this thread are counted, not logged; see the "
+                 "guest performance line for the total cost",
+                 cpu->thread->process->id, cpu->thread->id,
+                 (unsigned long long)GetrusageFairness::kThrottleIntervalUs);
     }
     if (fairness.throttle) {
-        // A real syscall crosses into the kernel and gives other runnable
-        // threads a scheduling opportunity. Recreate that property only once
-        // this thread proves it is polling pathologically; normal getrusage
-        // calls and Wine's cold-start path pay no delay.
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        bvnApplyFairnessThrottle();
     }
 #endif
     SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
@@ -1213,14 +1231,15 @@ static U32 syscall_sched_yield(CPU* cpu, U32 eipCount) {
     // the hint with a real scheduling point.
     const GetrusageFairnessDecision fairness =
         cpu->thread->schedYieldFairness.observe(KSystem::getMicroCounter());
-    if (fairness.activated) {
+    if (fairness.firstActivation) {
         klog_fmt("iOS sched_yield fairness activated for pid=%04X tid=%04X; "
-                 "a 1 ms host scheduling point will replace this guest's "
-                 "ignored yield hint",
-                 cpu->thread->process->id, cpu->thread->id);
+                 "this guest's ignored yield hint will now become a real "
+                 "scheduling point at most every %llu us",
+                 cpu->thread->process->id, cpu->thread->id,
+                 (unsigned long long)GetrusageFairness::kThrottleIntervalUs);
     }
     if (fairness.throttle) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        bvnApplyFairnessThrottle();
     }
 #endif
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "yield: result=%d(0x%X)\n", result, result);

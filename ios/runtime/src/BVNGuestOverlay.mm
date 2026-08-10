@@ -467,7 +467,31 @@ static BVNGuestOverlayView* gOverlay = nil;
     // Without a presenting view - the software-rendered Wine desktop, where
     // SDL owns a renderer and its own logical-size mapping - pass the touch
     // down as before.
-    return BVNGuestPresentationView() != nil ? self : nil;
+    UIView* presentation = BVNGuestPresentationView();
+
+    // Report what happened, at most once a second. Build 68 removed this line
+    // when the ownership change went in and immediately needed it back: the
+    // device report was that in portrait even the menu button stopped
+    // responding, which cannot be explained by anything in this method and
+    // means the overlay is not being hit-tested at all. Naming what UIKit
+    // asked and what was answered is the only way to tell those apart.
+    static NSTimeInterval lastReport = 0.0;
+    const NSTimeInterval now = CACurrentMediaTime();
+    if (now - lastReport >= 1.0) {
+        lastReport = now;
+        NSString* message = [NSString stringWithFormat:
+            @"Overlay hit test at %.0f,%.0f in bounds %.0fx%.0f (window %@, "
+             "presenting view %@ frame %.0f,%.0f %.0fx%.0f) -> %@",
+            point.x, point.y, self.bounds.size.width, self.bounds.size.height,
+            self.window == nil ? @"DETACHED" : @"attached",
+            presentation == nil ? @"none" : NSStringFromClass(presentation.class),
+            presentation.frame.origin.x, presentation.frame.origin.y,
+            presentation.frame.size.width, presentation.frame.size.height,
+            presentation == nil ? @"passed down to SDL"
+                                : @"claimed for the guest"];
+        BVNLogWrite(BVNLogLevelInfo, "input", message.UTF8String);
+    }
+    return presentation != nil ? self : nil;
 }
 
 // ---------------------------------------------------------------------------
@@ -916,6 +940,12 @@ extern "C" void BVNGuestOverlayInstall(void) {
     if (gOverlay.superview == window) {
         [window bringSubviewToFront:gOverlay];
         return;
+    }
+    if (gOverlay.superview != nil) {
+        BVNLogWrite(BVNLogLevelWarning, "frontend",
+                    "The guest overlay was attached to a window that is no "
+                    "longer SDL's; moving it. A stale attachment means no "
+                    "control on it responds, including the menu button.");
     }
 
     // A direct subview of the UIWindow, not of SDL's view. Adding it to SDL's

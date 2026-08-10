@@ -6,17 +6,17 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 68. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 69. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
 Build 65 killed the **swapchain storm** (8,244 rebuilds a minute down to two
 creations a session) and build 66 fixed rotation, but 66 lost touch entirely.
 Build 67 fixed landscape touch, the status bar and the menu placement, and got
 Grisaia running (the no-DXVK profile, which had never actually executed before).
-Build 68 takes ownership of guest pointer input in the overlay because portrait
-touch failed a fourth time, makes the menu button draggable, and adds the frame
-rate and CPU measurement that performance work needs. **Build 68 is not
-device-tested yet.** The newest detail is at the end of the session log, section 10; the
+Build 68's measurement did its job immediately: **Saya runs at 58 fps** and
+**Grisaia at 0.4 fps with only 0.65 host cores busy** - not CPU-bound,
+sleeping. Build 69 fixes the cause, which was BoxedVN's own fairness throttle.
+Portrait touch is still broken. **Build 69 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -3048,4 +3048,44 @@ Right clicks: the build-67 logs contain no `overlay right click` lines at all,
 so the two-finger tap either was not tried or did not fire. Untested.
 
 Verified locally: build succeeds, app validates, 89/89 tests pass.
+**Untested on device.**
+
+### 2026-08-09 — build 69: the fairness throttle was the bottleneck
+
+The frame-rate counter added in build 68 paid for itself on the first run:
+
+```
+Saya:    58.2 presented frames/sec; host CPU 0.50 cores busy
+Grisaia:  0.4 presented frames/sec; host CPU 0.65 cores busy
+```
+
+Saya is fine - 58 fps even while interpreting DXVK, because a visual novel
+asks almost nothing of the CPU. Grisaia at 0.4 fps with two thirds of one core
+busy is not slow emulation; it is a guest that is **asleep**.
+
+It was asleep in BoxedVN's own code. `GetrusageFairness` slept **1 ms on every
+getrusage call** once it decided a thread was spinning, and that is
+self-sustaining: a 1 ms sleep keeps the next call inside the 5 ms "rapid"
+window, so the thread never leaves the throttled state and is capped at about
+a thousand syscalls a second. The log carried 5,084 activation lines for one
+thread - each one also a file write from a hot syscall path.
+
+The mitigation was right that a spinning guest thread needs a real scheduling
+point. It was wrong about the price: a scheduling point costs microseconds, and
+it was spending a millisecond to buy one. The throttle is now **rate-limited in
+wall time** - at most one 100 us scheduling point per millisecond, so at most a
+tenth of the thread's time, while still delivering a thousand of them a second
+where the original livelock had none. Activation is logged once per thread
+instead of on every state flap, and the performance line now reports the
+throttle's own cost so the next log answers directly whether any remains.
+
+Portrait touch is still broken, and the new report is that in portrait even the
+overlay's menu button stops responding - which nothing in the touch path can
+explain and which suggests the overlay ends up on a window that is no longer on
+screen. Build 69 re-asserts the overlay's attachment whenever the window
+geometry changes, logs loudly if it ever finds it stale, and restores the
+hit-test diagnostic (removed in 68) with the window and presenting-view state
+included.
+
+Verified locally: build succeeds, app validates, 91/91 tests pass.
 **Untested on device.**

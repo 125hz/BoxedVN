@@ -1085,6 +1085,14 @@ extern "C" bool BVNSyncGuestPresentationGeometry(void) {
                                       gLastFittedInsets)) {
         return false;
     }
+    // The overlay must be on the window that is actually on screen. UIKit hosts
+    // this app inside a UIDropShadowView, and a rotation there is not a simple
+    // bounds change - if it ever hands the guest a different window, an overlay
+    // left behind on the old one goes silently dead, which is exactly what
+    // "in portrait I could not even press the menu button" describes. Cheap to
+    // assert, and a no-op when nothing moved.
+    BVNGuestOverlayInstall();
+
     BVNLogWrite(BVNLogLevelInfo, "graphics",
                 "Window geometry changed; re-fitting the guest picture.");
     BVNApplyGuestPresentationAspect(gGuestPresentationSurface,

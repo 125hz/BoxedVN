@@ -33,6 +33,7 @@
 
 #ifdef BOXEDWINE_IOS
 #include <sys/resource.h>
+#include "getrusagefairness.h"
 #endif
 
 #ifdef BOXEDWINE_IOS
@@ -567,10 +568,26 @@ void bvnReportPresentRate(void) {
     const double coresBusy = lastCpuSeconds > 0.0
         ? (cpuSeconds - lastCpuSeconds) / wallSeconds : 0.0;
 
-    klog_fmt("iOS guest performance: %.1f presented frames/sec over %u ms; "
-             "host CPU %.2f cores busy",
-             (double)frames / wallSeconds, elapsed, coresBusy);
+    // How much of that window the fairness throttle took from the guest. If
+    // this approaches the window length the mitigation is the bottleneck, not
+    // the emulation - which is exactly the question Grisaia's 0.4 frames/sec
+    // at 0.65 cores busy raised.
+    static U64 lastThrottleUs = 0;
+    static U64 lastThrottleCount = 0;
+    const U64 throttleUs =
+        bvnFairness::throttleMicroseconds.load(std::memory_order_relaxed);
+    const U64 throttleCount =
+        bvnFairness::throttleCount.load(std::memory_order_relaxed);
 
+    klog_fmt("iOS guest performance: %.1f presented frames/sec over %u ms; "
+             "host CPU %.2f cores busy; fairness throttle %llu ms across "
+             "%llu scheduling points",
+             (double)frames / wallSeconds, elapsed, coresBusy,
+             (unsigned long long)((throttleUs - lastThrottleUs) / 1000),
+             (unsigned long long)(throttleCount - lastThrottleCount));
+
+    lastThrottleUs = throttleUs;
+    lastThrottleCount = throttleCount;
     lastCpuSeconds = cpuSeconds;
     windowStart = now;
     frames = 0;
