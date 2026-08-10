@@ -5,6 +5,8 @@
 
 #include "BVNLaunchArguments.h"
 
+#include <initializer_list>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -22,16 +24,58 @@ bool endsWithIgnoringCase(std::string candidate, const char* suffix) {
                              normalizedSuffix.size(), normalizedSuffix) == 0;
 }
 
+bool launchesAnyOf(const BVNLaunchConfiguration& launch,
+                   std::initializer_list<const char*> executables) {
+    for (const char* executable : executables) {
+        if (endsWithIgnoringCase(launch.executablePath, executable)) {
+            return true;
+        }
+        for (const std::string& argument : launch.arguments) {
+            if (endsWithIgnoringCase(argument, executable)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
-    bool launchesSaya = endsWithIgnoringCase(launch.executablePath,
-                                             "saya_en.exe");
-    for (const std::string& argument : launch.arguments) {
-        launchesSaya = launchesSaya ||
-                       endsWithIgnoringCase(argument, "saya_en.exe");
+    // The Fruit of Grisaia: run it WITHOUT DXVK.
+    //
+    // Its build-65 device log shows DXVK failing to create a Vulkan device six
+    // times in a row, every attempt rejected by MoltenVK for the same four
+    // features:
+    //
+    //   VK_ERROR_FEATURE_NOT_PRESENT: ... the 5th flag in VkPhysicalDeviceFeatures
+    //       (geometryShader)
+    //   ... the 39th flag in VkPhysicalDeviceFeatures  (shaderCullDistance)
+    //   ... the 1st flag in VkPhysicalDeviceRobustness2FeaturesKHR
+    //       (robustBufferAccess2)
+    //   ... the 3rd flag  (nullDescriptor)
+    //   err:   DxvkAdapter: Failed to create device
+    //
+    // Those are exactly the four the MoltenVK patch relaxes, and Saya's DXVK
+    // device in the same build requests none of them - so this title reaches a
+    // DXVK path the patch does not cover. The game then shows its "DirectX
+    // failed" dialog and dereferences the interface pointer it never got
+    // (page fault reading 0x0000000F in grisaia+0x12a2bc).
+    //
+    // In the same session wined3d's Vulkan renderer created a device without
+    // complaint. This engine is Direct3D 9, which wined3d handles on Metal -
+    // the shader-model-4 wall that forces Saya through DXVK does not apply.
+    // So the cheapest correct thing is to keep DXVK out of its way.
+    //
+    // This is an experiment with a clear falsifier: if the DirectX dialog
+    // still appears, DXVK was not the cause and this profile should be
+    // removed rather than elaborated.
+    if (launchesAnyOf(launch, {"bootmenu.exe", "grisaia.exe"})) {
+        launch.enableWineD3DVulkan = false;
+        return true;
     }
-    if (!launchesSaya) {
+
+    if (!launchesAnyOf(launch, {"saya_en.exe"})) {
         return false;
     }
     // Builds 31-34 isolated the fault to Boxedwine's optimized REP MOVS JIT

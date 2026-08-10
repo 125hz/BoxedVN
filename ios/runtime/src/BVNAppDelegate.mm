@@ -806,6 +806,12 @@ static bool gGuestPresentationStretch = false;
 static std::atomic<int> gGuestNaturalDrawableWidth{0};
 static std::atomic<int> gGuestNaturalDrawableHeight{0};
 
+// The window geometry the current fit was computed for. The watcher below
+// compares against these rather than trusting a UIKit layout callback to
+// arrive.
+static CGRect gLastFittedWindowBounds = CGRectNull;
+static UIEdgeInsets gLastFittedWindowInsets = UIEdgeInsetsZero;
+
 // Reports the rectangle the guest picture is actually being shown in. Returns
 // false while it fills the window, so the pointer transform can never assume a
 // letterbox that did not take effect - which is exactly what broke tapping in
@@ -863,6 +869,12 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                     "superview to measure against.");
         return;
     }
+    // Measure against the WINDOW, not the Metal view's superview. On iOS 26/27
+    // that superview is a UIDropShadowView - UIKit's own hosting wrapper, as
+    // the build-65 log confirmed - and an intermediate view UIKit owns is not
+    // something to take geometry from. The window's bounds and safe-area
+    // insets are the authoritative description of the screen.
+    UIWindow* window = view.window ?: (UIWindow*)container;
 
     gGuestPresentationSurface = surface;
     gGuestPresentationGuestWidth = guestWidth;
@@ -881,25 +893,27 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
     // insets.left. iPhone portrait never has a horizontal safe inset, so a
     // non-zero one here is stale by definition. -safeAreaInsetsDidChange
     // re-fits as well, but only after the wrong frame has already been shown.
-    UIEdgeInsets insets = container.safeAreaInsets;
-    const bool containerIsPortrait =
-        container.bounds.size.height > container.bounds.size.width;
-    if (containerIsPortrait && (insets.left > 0.0 || insets.right > 0.0)) {
+    UIEdgeInsets insets = window.safeAreaInsets;
+    const CGRect windowBounds = window.bounds;
+    const bool windowIsPortrait =
+        windowBounds.size.height > windowBounds.size.width;
+    if (windowIsPortrait && (insets.left > 0.0 || insets.right > 0.0)) {
         insets.left = 0.0;
         insets.right = 0.0;
     }
     const CGRect available = UIEdgeInsetsInsetRect(
-        container.bounds,
-        UIEdgeInsetsMake(0.0, insets.left, 0.0, insets.right));
+        windowBounds, UIEdgeInsetsMake(0.0, insets.left, 0.0, insets.right));
     if (available.size.width <= 0.0 || available.size.height <= 0.0) {
         NSString* message = [NSString stringWithFormat:
             @"Presentation aspect skipped: nothing to fit into (window %.0fx%.0f, "
              "insets l%.0f r%.0f).",
-            container.bounds.size.width, container.bounds.size.height,
+            windowBounds.size.width, windowBounds.size.height,
             insets.left, insets.right];
         BVNLogWrite(BVNLogLevelWarning, "graphics", message.UTF8String);
         return;
     }
+    gLastFittedWindowBounds = windowBounds;
+    gLastFittedWindowInsets = window.safeAreaInsets;
 
     // The letterbox is applied as bounds + transform, NOT by resizing the view.
     //
@@ -949,21 +963,36 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                              (CGFloat)guestHeight);
     view.layer.contentsScale = 1.0;
     view.transform = CGAffineTransformMakeScale(scaleX, scaleY);
-    view.center = CGPointMake(CGRectGetMidX(target), CGRectGetMidY(target));
+    // `target` is in window coordinates; -center is in the superview's.
+    view.center = [container convertPoint:CGPointMake(CGRectGetMidX(target),
+                                                      CGRectGetMidY(target))
+                                 fromView:window];
     // Letterbox bars read as part of the device, not as Wine's desktop.
     container.backgroundColor = UIColor.blackColor;
-    // Run layoutSubviews now rather than at some unpredictable later point, so
-    // the drawableSize logged below is the real one.
-    [view layoutIfNeeded];
+    window.backgroundColor = UIColor.blackColor;
 
-    gGuestPresentationContentRect = view.frame;
-    gGuestPresentationIsLetterboxed =
-        !CGRectEqualToRect(view.frame, container.bounds);
-
+    // Assign the drawable size directly rather than forcing a layout pass to
+    // make SDL's -updateDrawableSize compute it. Build 65 called
+    // -layoutIfNeeded here, and this function runs from the overlay's own
+    // -layoutSubviews: that walks back up to the window and re-enters the
+    // layout of a sibling subtree from inside a layout pass, which UIKit does
+    // not support. After the first rotation the whole subtree stopped being
+    // laid out - the picture kept its portrait geometry when the device went
+    // back to landscape (no re-fit was even logged), and touches stopped
+    // arriving because the Metal view was sitting outside its ancestor's
+    // stale bounds. The value assigned here is exactly what
+    // -updateDrawableSize would compute, bounds x contentsScale, with
+    // contentsScale pinned to 1.
     CGSize drawable = CGSizeZero;
     if ([view.layer isKindOfClass:CAMetalLayer.class]) {
-        drawable = ((CAMetalLayer*)view.layer).drawableSize;
+        CAMetalLayer* metalLayer = (CAMetalLayer*)view.layer;
+        metalLayer.drawableSize = CGSizeMake((CGFloat)guestWidth,
+                                             (CGFloat)guestHeight);
+        drawable = metalLayer.drawableSize;
     }
+
+    gGuestPresentationContentRect = target;
+    gGuestPresentationIsLetterboxed = !CGRectEqualToRect(target, windowBounds);
     gGuestNaturalDrawableWidth.store((int)lround(view.bounds.size.width),
                                      std::memory_order_relaxed);
     gGuestNaturalDrawableHeight.store((int)lround(view.bounds.size.height),
@@ -976,38 +1005,21 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
          "guest pixels.",
         stretchToFill ? @"stretched to fill" : @"aspect-fitted",
         guestWidth, guestHeight, target.size.width, target.size.height,
-        target.origin.x, target.origin.y, container.bounds.size.width,
-        container.bounds.size.height, NSStringFromClass(container.class),
+        target.origin.x, target.origin.y, windowBounds.size.width,
+        windowBounds.size.height, NSStringFromClass(container.class),
         insets.left, insets.right, insets.top, insets.bottom,
         view.bounds.size.width, view.bounds.size.height,
         drawable.width, drawable.height, view.layer.contentsScale];
     BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
 }
 
-// Re-applies the last fit after the window changed shape. Safe to call when no
-// guest surface exists; it does nothing then.
-extern "C" bool BVNReapplyGuestPresentationAspect(void) {
-    if (!NSThread.isMainThread || gGuestPresentationSurface == nullptr) {
-        return false;
-    }
-    NSValue* key = [NSValue valueWithPointer:gGuestPresentationSurface];
-    if (gGuestVulkanSurfaceViews[key] == nil) {
-        return false;
-    }
-    BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
-                                    gGuestPresentationGuestWidth,
-                                    gGuestPresentationGuestHeight,
-                                    gGuestPresentationStretch);
-    return true;
-}
-
-// Reports the layer's NATURAL drawable size - bounds x contentsScale, which is
-// what SDL_uikitmetalview.layoutSubviews assigns and what MoltenVK compares
-// against the extent a swapchain was actually created at. While those two
-// disagree, every acquire and present returns VK_SUBOPTIMAL_KHR and DXVK
-// rebuilds the swapchain, forever; that is the shape of the 17,879-swapchain
-// storm in the build-63 log.
+// Reports the layer's NATURAL drawable size - bounds x contentsScale, which
+// MoltenVK compares against the extent a swapchain was created at. While those
+// two disagree, every acquire and present returns VK_SUBOPTIMAL_KHR and DXVK
+// rebuilds the swapchain forever; that was the 8,244-rebuild storm on build 64.
 //
+// Cached rather than read live, because swapchains are created on a guest
+// thread while CALayer geometry belongs to the main one.
 extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
                                                         int* height) {
     if (width) {
@@ -1016,6 +1028,43 @@ extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
     if (height) {
         *height = gGuestNaturalDrawableHeight.load(std::memory_order_relaxed);
     }
+}
+
+// Re-fits the guest picture when the window has changed shape, and reports
+// whether it did.
+//
+// This exists because a UIKit layout callback is not a reliable signal here.
+// On build 65 the overlay's -layoutSubviews fired for landscape -> portrait and
+// then never again: rotating back to landscape produced no re-fit at all (the
+// log has no further "Guest presentation" line), so the picture kept its
+// portrait geometry and ended up off-centre and partly off-screen. Polling the
+// window's own bounds and safe-area insets from Boxedwine's main loop cannot be
+// missed that way - that loop is the one thing guaranteed to keep running.
+//
+// Cheap by construction: two struct comparisons, and it only does work when
+// the answer has actually changed.
+extern "C" bool BVNSyncGuestPresentationGeometry(void) {
+    if (!NSThread.isMainThread || gGuestPresentationSurface == nullptr) {
+        return false;
+    }
+    NSValue* key = [NSValue valueWithPointer:gGuestPresentationSurface];
+    UIView* view = gGuestVulkanSurfaceViews[key];
+    UIWindow* window = view.window;
+    if (view == nil || window == nil) {
+        return false;
+    }
+    if (CGRectEqualToRect(window.bounds, gLastFittedWindowBounds) &&
+        UIEdgeInsetsEqualToEdgeInsets(window.safeAreaInsets,
+                                      gLastFittedWindowInsets)) {
+        return false;
+    }
+    BVNLogWrite(BVNLogLevelInfo, "graphics",
+                "Window geometry changed; re-fitting the guest picture.");
+    BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
+                                    gGuestPresentationGuestWidth,
+                                    gGuestPresentationGuestHeight,
+                                    gGuestPresentationStretch);
+    return true;
 }
 
 // Forgets the recorded rectangle, so a stale letterbox from a surface that no
@@ -1029,6 +1078,8 @@ extern "C" void BVNForgetGuestPresentationAspect(void* surface) {
     gGuestPresentationGuestWidth = 0;
     gGuestPresentationGuestHeight = 0;
     gGuestPresentationStretch = false;
+    gLastFittedWindowBounds = CGRectNull;
+    gLastFittedWindowInsets = UIEdgeInsetsZero;
     gGuestPresentationContentRect = CGRectZero;
     gGuestPresentationIsLetterboxed = false;
     gGuestNaturalDrawableWidth.store(0, std::memory_order_relaxed);

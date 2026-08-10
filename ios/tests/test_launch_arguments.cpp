@@ -204,6 +204,37 @@ BOXEDVN_TEST(song_of_saya_interprets_d3d11_as_a_jit_diagnostic) {
     CHECK(notepad.interpreterRanges.empty());
 }
 
+BOXEDVN_TEST(grisaia_profile_keeps_dxvk_out_of_a_direct3d9_engine) {
+    // Build 65 on device: DXVK failed vkCreateDevice six times, every attempt
+    // rejected by MoltenVK for geometryShader, shaderCullDistance,
+    // robustBufferAccess2 and nullDescriptor, and the game then dereferenced
+    // the interface pointer it never received. wined3d's Vulkan renderer built
+    // a device in the same session, and this engine is Direct3D 9, so DXVK has
+    // nothing to contribute here and is actively in the way.
+    for (const char* executable : {"D:\\BootMenu.exe", "d:\\grisaia.EXE"}) {
+        BVNLaunchConfiguration launch;
+        launch.executablePath = "/bin/wine";
+        launch.arguments = {executable};
+        launch.enableWineD3DVulkan = true;
+
+        CHECK(BVNApplyKnownCompatibilityProfile(launch));
+        CHECK(!launch.enableWineD3DVulkan);
+        // It must not pick up Saya's interpreter diagnostic by accident.
+        CHECK(launch.interpreterModules.empty());
+
+        const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+        CHECK(std::find(actual.begin(), actual.end(), "-dxvk") == actual.end());
+    }
+
+    // Saya still gets DXVK: it is the title that cannot run without it.
+    BVNLaunchConfiguration saya;
+    saya.executablePath = "/bin/wine";
+    saya.arguments = {"D:\\Games\\SAYA_EN.EXE"};
+    saya.enableWineD3DVulkan = true;
+    CHECK(BVNApplyKnownCompatibilityProfile(saya));
+    CHECK(saya.enableWineD3DVulkan);
+}
+
 BOXEDVN_TEST(command_does_not_let_boxedwine_truncate_frontend_log) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs.zip";

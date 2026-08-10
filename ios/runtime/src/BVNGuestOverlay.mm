@@ -458,20 +458,18 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self layoutMenuPanelWithSafeArea:safe];
     [self layoutKeyboardPanelWithSafeArea:safe];
 
-    // The window changed shape - a rotation, or a UIKit layout pass that reset
-    // SDL's Metal view to the full window. Re-fit the guest picture to it, then
-    // re-derive the pointer transform from the rectangle that was actually
-    // applied. These two must never be computed independently.
-    if (BVNReapplyGuestPresentationAspect()) {
+    // Opportunistically re-fit the guest picture when the window has changed
+    // shape. This is a convenience, not the mechanism: the reliable path is
+    // BVNSyncGuestPresentationGeometry, polled from Boxedwine's own main loop,
+    // because on build 65 this callback stopped arriving after the first
+    // rotation and the picture was left with its portrait geometry.
+    //
+    // BVNSyncGuestPresentationGeometry does nothing when the window has not
+    // moved, so calling it from a layout pass is cheap and cannot loop.
+    // Nothing here forces layout on another subtree - doing that from inside
+    // -layoutSubviews is what wedged UIKit in build 65.
+    if (BVNSyncGuestPresentationGeometry()) {
         BVNGuestPresentationGeometryChanged();
-    }
-
-    // SDL adds and removes its own views during a session (each
-    // SDL_Vulkan_CreateSurface pushes another SDL_uikitmetalview), which can
-    // bury the overlay.
-    UIView* parent = self.superview;
-    if (parent != nil && parent.subviews.lastObject != self) {
-        [parent bringSubviewToFront:self];
     }
 
     self.layingOut = NO;

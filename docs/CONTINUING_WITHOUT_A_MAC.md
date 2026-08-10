@@ -135,7 +135,7 @@ guest resolution (see below), so the transform is normally a straight 1:1.
 `BVNGuestPresentationContentRect` is still consulted, but only as a cross-check
 that gets logged — never as a source of truth for input.
 
-### 4. The swapchain recreation storm: ANSWERED, and fixed in build 65
+### 4. The swapchain recreation storm: FIXED, confirmed on device in build 65
 
 Build 64's rate report settled it in one line:
 
@@ -177,9 +177,74 @@ resolution**, and `-[UITouch locationInView:]` is transform-aware, so SDL hands
 Boxedwine coordinates that are already guest pixels. Presentation and input stop
 being two things that have to be kept in agreement and become one thing.
 
-Watch the same rate line in the next log. If the storm is gone it will not
-appear at all; only the first few `Vulkan presentation swapchain ... created`
-lines will, and their natural drawable should read 800x600.
+**Confirmed.** The build-65 device log contains zero
+`Vulkan presentation swapchain rebuilt` lines and two swapchain creations for
+the whole session, against 8,244 in a minute on build 64. The natural drawable
+reads 800x600 and MoltenVK creates 800x600. The storm is gone.
+
+### 5. Rotation: the geometry signal cannot be a UIKit layout callback
+
+Build 65 re-fitted the picture from the overlay's `-layoutSubviews`, and on
+device that callback fired for landscape -> portrait and then never again:
+rotating back produced no `Guest presentation` line at all, the Metal view kept
+its portrait geometry, and the picture ended up off-centre and half off-screen.
+Touch died in portrait at the same time, with the pointer transform reading a
+correct 1:1 - the view had been left outside its ancestor's stale bounds, so
+UIKit never delivered the touches for SDL to transform.
+
+The cause was self-inflicted: the fit called `-layoutIfNeeded` on the Metal
+view *from inside the overlay's own `-layoutSubviews`*. The Metal view lives
+under a `UIDropShadowView` — UIKit's own hosting wrapper, which the build-65
+log named — so that call walked up to the window and re-entered the layout of a
+sibling subtree mid-pass, which UIKit does not support.
+
+Two changes, and the second is the one to keep:
+
+- The fit no longer forces layout. It assigns `CAMetalLayer.drawableSize`
+  directly, which is exactly what SDL's `-updateDrawableSize` would compute
+  once `contentsScale` is pinned to 1.
+- **Geometry is polled from Boxedwine's own main loop**, in
+  `KNativeInputSDL::processEvents`, roughly every 200 ms:
+  `BVNSyncGuestPresentationGeometry` compares the window's bounds and safe-area
+  insets against the ones the current fit was computed for and re-fits when
+  they differ. That loop runs for as long as the guest does, so unlike a UIKit
+  callback it cannot quietly stop arriving.
+
+The fit also measures against the **window**, not the Metal view's superview,
+for the same reason the drop-shadow view should not be trusted: it is UIKit's,
+not ours.
+
+### 6. The Fruit of Grisaia: DXVK cannot create a device for it
+
+Its build-65 log shows DXVK failing `vkCreateDevice` six times, every attempt
+rejected for the same four features:
+
+```
+VK_ERROR_FEATURE_NOT_PRESENT: ... the 5th flag in VkPhysicalDeviceFeatures      (geometryShader)
+VK_ERROR_FEATURE_NOT_PRESENT: ... the 39th flag in VkPhysicalDeviceFeatures     (shaderCullDistance)
+VK_ERROR_FEATURE_NOT_PRESENT: ... the 1st flag in ...Robustness2Features        (robustBufferAccess2)
+VK_ERROR_FEATURE_NOT_PRESENT: ... the 3rd flag in ...Robustness2Features        (nullDescriptor)
+err:   DxvkAdapter: Failed to create device
+```
+
+Those are exactly the four `dxvk-2.5.2-moltenvk.patch` relaxes, and **Saya's
+DXVK device in the same build requests none of them** — so this title reaches a
+DXVK code path the patch does not cover. The patch touches
+`src/d3d11/d3d11_device.cpp` and `src/dxvk/dxvk_adapter.cpp`; whatever Grisaia
+calls builds its enabled-feature set somewhere else. Finding it needs the DXVK
+source tree, and fixing it needs a rebuild, which needs mingw on Linux or WSL —
+neither available on the Mac this was diagnosed from.
+
+The game does not handle the failure: it shows a mojibake "DirectX" dialog and
+then faults reading `0x0000000F` in `grisaia+0x12a2bc` (`mov (%eax),%eax` on an
+interface pointer it never received).
+
+Build 66 ships a workaround rather than a fix. In the same session wined3d's
+Vulkan renderer created a device without complaint, and this engine is
+Direct3D 9 — the shader-model-4 wall that forces Saya through DXVK does not
+apply — so `BVNApplyKnownCompatibilityProfile` now launches it **without**
+`-dxvk`. That has a clean falsifier: if the DirectX dialog still appears, DXVK
+was not the cause and the profile should be deleted rather than elaborated.
 
 ## The in-game overlay
 

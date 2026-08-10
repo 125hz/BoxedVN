@@ -6,14 +6,15 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 65. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 66. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
-Build 64 made the aspect fit actually run (correct in landscape on device) and
-added a UIKit in-game overlay and an app icon, but broke touch; build 65 fixes
-that and two smaller overlay defects, and answers the swapchain-storm question
-— DXVK ignores `currentExtent`, so the presenting view's *bounds* must be the
-guest resolution. **Build 65 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
+Build 65 fixed landscape touch and **killed the swapchain storm** (8,244
+rebuilds a minute down to two creations a session, confirmed on device), but
+rotation left the picture off-centre and untappable; build 66 fixes that by
+polling window geometry from the emulator's own loop instead of a UIKit layout
+callback, and adds a no-DXVK profile for The Fruit of Grisaia. **Build 66 is
+not device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -2913,3 +2914,43 @@ another — the most likely explanation for "Quit to library" not responding
 after rotating.
 
 Verified locally: build succeeds, app validates. **Untested on device.**
+
+### 2026-08-09 — build 66: rotation, and Grisaia's DirectX failure
+
+Device test of build 65: landscape touch correct and 1:1, portrait picture
+filling the width as asked, and **the swapchain storm gone** — zero
+`swapchain rebuilt` lines and two creations for the whole session, against
+8,244 in a minute on build 64. Confirmed: MoltenVK's suboptimal test is
+`bounds x contentsScale` versus the swapchain extent, and DXVK does not adopt
+`currentExtent`.
+
+**Rotation was still broken, and the cause was self-inflicted.** The fit called
+`-layoutIfNeeded` on the Metal view from inside the overlay's own
+`-layoutSubviews`. That view lives under a `UIDropShadowView` — UIKit's hosting
+wrapper, which the log named for the first time — so the call walked to the
+window and re-entered the layout of a sibling subtree mid-pass. After the first
+rotation the subtree stopped being laid out: turning back to landscape produced
+no re-fit at all, and in portrait the view sat outside its ancestor's stale
+bounds, so UIKit delivered no touches even though the pointer transform was a
+correct 1:1.
+
+Fixed by not forcing layout — `CAMetalLayer.drawableSize` is assigned directly,
+which is what `-updateDrawableSize` would compute anyway — and, more
+importantly, by **polling the window's geometry from
+`KNativeInputSDL::processEvents`** every 200 ms. The emulator's own loop runs
+for as long as the guest does; a UIKit layout callback demonstrably does not.
+The fit also measures against the window rather than the drop-shadow view.
+
+**The Fruit of Grisaia** shows a DirectX error and then faults reading
+`0x0000000F` in `grisaia+0x12a2bc`. Cause: DXVK fails `vkCreateDevice` six
+times, rejected for `geometryShader`, `shaderCullDistance`,
+`robustBufferAccess2` and `nullDescriptor` — exactly the four the MoltenVK
+patch relaxes, and exactly the four Saya's DXVK device does *not* request in
+the same build. So this title reaches a DXVK path the patch does not cover;
+finding and fixing it needs the DXVK source and a mingw rebuild, neither of
+which is available on this Mac. wined3d created a Vulkan device fine in the
+same session and the engine is Direct3D 9, so build 66 launches Grisaia
+without `-dxvk` as a workaround with a clean falsifier.
+
+Verified locally: build succeeds, app validates, 89/89 tests pass.
+**Untested on device.**

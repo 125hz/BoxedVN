@@ -25,6 +25,13 @@
 #include "knativesystem.h"
 #include "kdspaudio.h"
 
+#ifdef BOXEDWINE_IOS
+// Implemented in ios/runtime/src/BVNAppDelegate.mm and
+// platform/sdl/knativescreenSDL.cpp respectively.
+extern "C" bool BVNSyncGuestPresentationGeometry(void);
+extern "C" void BVNGuestPresentationGeometryChanged(void);
+#endif
+
 U32 sdlCustomEvent;
 
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -307,6 +314,27 @@ bool KNativeInputSDL::waitForEvent(U32 ms) {
 
 bool KNativeInputSDL::processEvents() {
     SDL_Event e = {};
+
+#ifdef BOXEDWINE_IOS
+    // Keep the guest picture matched to the window from the emulator's own
+    // loop rather than from a UIKit layout callback.
+    //
+    // Build 65 re-fitted only from the overlay's -layoutSubviews, and on
+    // device that callback stopped arriving after the first rotation: turning
+    // back to landscape produced no re-fit at all, leaving the picture with
+    // its portrait geometry, off-centre and untappable. This loop runs on the
+    // main thread for as long as the guest does, so it cannot be skipped the
+    // same way. Two struct comparisons every 200 ms, and it only does work
+    // when the window has genuinely changed shape.
+    static U32 lastGeometryPoll = 0;
+    const U32 nowTicks = SDL_GetTicks();
+    if (nowTicks - lastGeometryPoll >= 200) {
+        lastGeometryPoll = nowTicks;
+        if (BVNSyncGuestPresentationGeometry()) {
+            BVNGuestPresentationGeometryChanged();
+        }
+    }
+#endif
 
     while (SDL_PollEvent(&e) == 1) {
 #ifdef BOXEDWINE_MULTI_THREADED

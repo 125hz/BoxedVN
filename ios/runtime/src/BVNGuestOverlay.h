@@ -58,9 +58,12 @@ UIWindow* BVNGuestUIWindow(void);
 bool BVNGuestRotationIsUnlocked(void);
 void BVNGuestSetRotationUnlocked(bool unlocked);
 
-// Re-applies the recorded aspect fit after the window changed shape.  Returns
-// false when there is no guest surface to re-fit.
-bool BVNReapplyGuestPresentationAspect(void);
+// Re-fits the guest picture when the window has changed shape since the last
+// fit, and reports whether it did.  Cheap when nothing has moved.  This is the
+// reliable path: it is polled from Boxedwine's own main loop rather than
+// depending on a UIKit layout callback, which on build 65 stopped arriving
+// after the first rotation.
+bool BVNSyncGuestPresentationGeometry(void);
 
 // ---------------------------------------------------------------------------
 // Implemented by platform/sdl/knativescreenSDL.cpp
