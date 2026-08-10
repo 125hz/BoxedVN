@@ -66,12 +66,50 @@ whole 2.2:1 display, including under the Dynamic Island. Size that view to the
 guest aspect within the safe-area insets; that also makes touch coordinates
 1:1 for free.
 
-### 3. Touch input does not reach the guest
+### 3. Touch input: DIAGNOSED. Coordinates are untransformed on the Vulkan path.
 
-Only `SDL_MOUSEBUTTONDOWN` / `SDL_MOUSEBUTTONUP` are handled
-(`platform/sdl/knativeinputSDL.cpp`). SDL synthesises those from touches, but
-the Vulkan metal view is layered over SDL's view and is the prime suspect for
-consuming them. Fixing (2) first is likely to make this tractable.
+Taps **do** reach the guest. The menu session logged 32 events:
+```
+iOS SDL mouse down: button 0 at logical 455,119
+iOS SDL mouse up:   button 0 at logical 467,113
+```
+So UIKit -> SDL -> Boxedwine delivery all work, and `button 0` is Boxedwine's
+internal left-click number, not an error. Two earlier theories are dead:
+`SDL_uikitmetalview` is not swallowing touches (it *is* SDL's touch view -
+`SDL_uikitmetalview : SDL_uikitview`, and `SDL_uikitview.m:227` implements
+`touchesBegan`), and nothing needs `userInteractionEnabled` changed.
+
+The real fault is that those are raw **window** coordinates. The window is
+874x402; the guest is 800x600.
+
+On the SDL renderer path `SDL_RenderSetLogicalSize`
+(`knativescreenSDL.cpp:308,668`) makes SDL translate mouse coordinates
+automatically - which is why the log says "logical". **The Vulkan path has no
+SDL renderer, so no translation happens.** Clicks therefore land at the wrong
+guest position, and everything below y=402 is unreachable at all.
+
+This is the same root cause as the stretching in (2): there is no shared
+presentation transform. Fix both together:
+
+```
+scale   = min(windowW / guestW, windowH / guestH)      // aspect-fit
+content = { x: (windowW - guestW*scale)/2,             // inside safe area
+            y: (windowH - guestH*scale)/2,
+            w: guestW*scale, h: guestH*scale }
+
+guestX  = (winX - content.x) / scale
+guestY  = (winY - content.y) / scale                    // ignore taps outside
+```
+Use the same `content` rect for the Vulkan present (DXVK's
+`DxvkSwapchainBlitter` already accepts a non-empty dst `VkRect2D` and clears
+outside it; D3D11 currently passes empty rects) and for the input inverse. Do
+not simply shrink the CAMetalLayer - keeping the surface full-size and
+letterboxing via the blitter dst rect is more flexible for rotation, overlays
+and resolution changes.
+
+For 874x402 with an 800x600 guest this yields scale 0.67, content 536x402 at
+x=169 - i.e. pillarboxed, which is also the correct fix for the content
+currently running under the Dynamic Island.
 
 ## The DXVK fork
 
