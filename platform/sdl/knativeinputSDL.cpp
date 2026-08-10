@@ -97,6 +97,17 @@ bool KNativeInputSDL::mouseMove(int x, int y, bool relative) {
     x = xFromScreen(x);
     y = yFromScreen(y);
 
+#ifdef BOXEDWINE_IOS
+    // Remember where the pointer now is, so getMousePos can answer with it.
+    // See the field declaration in knativeinputSDL.h: SDL_GetMouseState is
+    // blind to the overlay's injected touches.
+    if (!relative) {
+        injectedX = x;
+        injectedY = y;
+        hasInjectedPointer = true;
+    }
+#endif
+
 #ifdef BOXEDWINE_RECORDER
     if (Player::instance) {
         lastX = x;
@@ -140,6 +151,12 @@ bool KNativeInputSDL::mouseButton(U32 down, U32 button, int x, int y) {
 
     checkMousePos(x, y, true);
 
+#ifdef BOXEDWINE_IOS
+    injectedX = x;
+    injectedY = y;
+    hasInjectedPointer = true;
+#endif
+
     XServer* server = XServer::getServer(true);
     if (server) {
         U32 btn = button + 1;
@@ -166,6 +183,18 @@ bool KNativeInputSDL::getMousePos(int* x, int* y, bool allowWarp) {
         return checkMousePos(*x, *y, false);
     }
 #endif
+#ifdef BOXEDWINE_IOS
+    // Already guest coordinates - mouseMove/mouseButton put them through
+    // xFromScreen on the way in, so they must not go through it again.
+    if (hasInjectedPointer) {
+        *x = injectedX;
+        *y = injectedY;
+        if (XServer::getServer(true) && XServer::getServer()->fakeFullScreenWnd) {
+            XServer::getServer()->fakeFullScreenWnd->screenToWindow(*x, *y);
+        }
+        return checkMousePos(*x, *y, false);
+    }
+#endif
     SDL_GetMouseState(x, y);
 
     *x = xFromScreen(*x);
@@ -184,6 +213,15 @@ void KNativeInputSDL::setMousePos(int x, int y) {
         lastY = y;
         return;
     }
+#endif
+
+#ifdef BOXEDWINE_IOS
+    // A guest that warps its own cursor - SetCursorPos, and every full-screen
+    // engine that recentres the pointer - must be believed afterwards, or
+    // getMousePos would keep answering with the last place the player touched.
+    injectedX = x;
+    injectedY = y;
+    hasInjectedPointer = true;
 #endif
 
     if (XServer::getServer(true) && XServer::getServer()->fakeFullScreenWnd) {

@@ -612,6 +612,27 @@ static BVNGuestOverlayView* gOverlay = nil;
     // down as before.
     UIView* presentation = BVNGuestPresentationView();
 
+    // A tap on the letterbox is not a tap on the game.
+    //
+    // A 4:3 guest on this phone is shown 536pt wide inside an 874pt window, so
+    // the black bars are 338pt - 39% of the screen - and until now every one of
+    // those taps was claimed, converted to a guest coordinate outside the
+    // screen, and clamped by KNativeInputSDL::checkMousePos onto the picture's
+    // edge. A finger resting near the bezel therefore clicked the left or right
+    // edge of the guest, which in a visual novel is a menu strip or a
+    // text-advance target. That is the "it selects things I did not tap".
+    //
+    // Trackpad mode is the exception and must stay one: there the whole screen
+    // is the trackpad surface and the finger's absolute position is not where
+    // the click goes.
+    const BOOL insidePicture =
+        presentation != nil &&
+        CGRectContainsPoint(presentation.frame,
+                            [self convertPoint:point
+                                         toView:presentation.superview]);
+    const BOOL claim =
+        presentation != nil && (self.trackpadMode || insidePicture);
+
     // Report what happened, at most once a second. Build 68 removed this line
     // when the ownership change went in and immediately needed it back: the
     // device report was that in portrait even the menu button stopped
@@ -634,10 +655,11 @@ static BVNGuestOverlayView* gOverlay = nil;
             presentation.frame.origin.x, presentation.frame.origin.y,
             presentation.frame.size.width, presentation.frame.size.height,
             presentation == nil ? @"passed down to SDL"
-                                : @"claimed for the guest"];
+                                : (claim ? @"claimed for the guest"
+                                         : @"ignored: outside the picture")];
         BVNLogWrite(BVNLogLevelInfo, "input", message.UTF8String);
     }
-    return presentation != nil ? self : nil;
+    return claim ? self : nil;
 }
 
 // ---------------------------------------------------------------------------

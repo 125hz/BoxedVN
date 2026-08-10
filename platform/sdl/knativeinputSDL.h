@@ -57,7 +57,24 @@ public:
     int lastX = 0;
     int lastY = 0;
     U32 width = 0;
-    U32 height = 0;           
+    U32 height = 0;
+
+#ifdef BOXEDWINE_IOS
+    // The last pointer position the UIKit overlay injected, in guest screen
+    // coordinates - i.e. already through xFromScreen/yFromScreen.
+    //
+    // There is no host mouse on iOS. Since build 68 the overlay claims touches
+    // itself and calls mouseMove/mouseButton directly, which reaches the X
+    // server but never reaches SDL, so SDL_GetMouseState keeps reporting 0,0
+    // for the whole session. getMousePos is not a diagnostic: XQueryPointer is
+    // built on it, and Wine's X11 driver answers GetCursorPos from
+    // XQueryPointer, so every Windows program that asks where the pointer is -
+    // which is how menus, hover states and most click hit-tests work - was
+    // being told 0,0 no matter where the player tapped.
+    int injectedX = 0;
+    int injectedY = 0;
+    bool hasInjectedPointer = false;
+#endif
 
     bool handlSdlEvent(SDL_Event* e);
 };

@@ -216,11 +216,11 @@ enum GameLibrary {
 
     static func delete(_ game: Game) throws {
         try FileManager.default.removeItem(at: game.directory)
-        // Only a per-game prefix left behind by a build before every app
-        // shared one. Deleting the shared prefix here would take every other
-        // game's registry and saved data with it.
+        // The game's own prefix, which holds its saves. Never the tools prefix
+        // or build 73's shared one: those belong to more than this game.
         if let prefixes = Storage.winePrefixes,
-           game.winePrefix != Storage.sharedWinePrefixName {
+           game.winePrefix != Storage.toolsWinePrefixName,
+           game.winePrefix != Storage.build73SharedWinePrefixName {
             let prefix = prefixes.appendingPathComponent(game.winePrefix)
             if FileManager.default.fileExists(atPath: prefix.path) {
                 try? FileManager.default.removeItem(at: prefix)

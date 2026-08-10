@@ -411,9 +411,7 @@ struct GameDetailView: View {
 
             Section("Storage") {
                 LabeledContent("Content", value: game.contentDirectory.lastPathComponent)
-                LabeledContent("Wine prefix",
-                               value: "\(Storage.sharedWinePrefixName) "
-                                    + "(shared with every app)")
+                LabeledContent("Wine prefix", value: game.winePrefix)
                 LabeledContent("Imported", value: game.importedAt.formatted(date: .abbreviated,
                                                                             time: .shortened))
             }

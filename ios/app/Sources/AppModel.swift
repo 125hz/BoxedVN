@@ -206,7 +206,7 @@ final class AppModel: ObservableObject {
                          + "Boxedwine's root filesystem archive in Settings first."
             return
         }
-        guard let writableRoot = Storage.sharedWinePrefix else {
+        guard let prefixes = Storage.winePrefixes else {
             alertMessage = "Could not create the Wine prefix directory."
             return
         }
@@ -215,6 +215,15 @@ final class AppModel: ObservableObject {
             return
         }
 
+        // The game's OWN prefix, not a shared one. A Windows game writes its
+        // saves inside the prefix - drive_c/users/username/... or beside the
+        // executable on the emulated C: drive - so the prefix a game launches
+        // into IS its save file. Build 73 moved every game onto one shared
+        // prefix to make Notepad and the file browser see each other's files,
+        // and the immediate consequence was that every existing save vanished:
+        // still on disk, in the per-game prefix, but not in the prefix the
+        // game was now booting from.
+        let writableRoot = prefixes.appendingPathComponent(game.winePrefix)
         do {
             try Session.launch(
                 rootFilesystem: rootFilesystem,
@@ -234,8 +243,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Browse the emulated PC: Wine's file manager, in the same environment
-    /// and the same prefix a game gets.
+    /// Browse the emulated PC: Wine's file manager, in the tools prefix that
+    /// Notepad also runs in, so a file saved from one is visible in the other.
+    /// Games keep their own prefixes - see `launch(_:)` for why.
     ///
     /// 1280x720 rather than the 800x600 a game defaults to. 16:9 matches the
     /// phone closely enough that the letterbox is thin, which keeps window
@@ -260,7 +270,7 @@ final class AppModel: ObservableObject {
                          + "Boxedwine's root filesystem archive in Settings first."
             return
         }
-        guard let writableRoot = Storage.sharedWinePrefix else {
+        guard let writableRoot = Storage.toolsWinePrefix else {
             alertMessage = "Could not create the Wine prefix directory."
             return
         }
@@ -291,7 +301,7 @@ final class AppModel: ObservableObject {
             alertMessage = "No root filesystem is installed."
             return
         }
-        guard let writableRoot = Storage.sharedWinePrefix else {
+        guard let writableRoot = Storage.toolsWinePrefix else {
             alertMessage = "Could not create the Wine prefix directory."
             return
         }

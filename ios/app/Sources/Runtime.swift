@@ -158,18 +158,26 @@ enum Storage {
     static var rootFilesystems: URL? { directory(BVNPathRootFilesystems()) }
     static var winePrefixes: URL? { directory(BVNPathWinePrefixes()) }
 
-    /// The one Wine prefix every game, the desktop and Notepad all share.
+    /// The prefix the built-in tools - the file browser and Notepad - run in.
     ///
-    /// Each game used to get its own prefix, which made them independent but
-    /// also meant a text file saved from Notepad was invisible to the desktop,
-    /// and a font or runtime installed for one game did nothing for the next.
-    /// One prefix behaves like one PC, which is what a Wine prefix is for.
-    /// Prefixes written by earlier builds are left on disk untouched.
-    static var sharedWinePrefix: URL? {
-        winePrefixes?.appendingPathComponent(sharedWinePrefixName)
+    /// Build 73 pointed *everything*, games included, at one shared prefix so
+    /// that a file saved from Notepad was visible to the file browser. That is
+    /// true of these two and worth keeping, but a game's saves live inside its
+    /// prefix under drive_c/users, so moving games onto a new prefix hid every
+    /// save the player had ever made. Games keep their own prefix - the one
+    /// their saves are already in - and only the tools share.
+    static var toolsWinePrefix: URL? {
+        winePrefixes?.appendingPathComponent(toolsWinePrefixName)
     }
 
-    static let sharedWinePrefixName = "shared"
+    /// Deliberately the name build 72 and earlier gave desktop mode, so the
+    /// file browser opens on the prefix it has always used.
+    static let toolsWinePrefixName = "desktop"
+
+    /// Build 73's shared prefix. Nothing launches into it any more, but a
+    /// player who saved during build 73 has that progress here and not in the
+    /// game's own prefix, so it is never deleted.
+    static let build73SharedWinePrefixName = "shared"
     static var games: URL? { directory(BVNPathGames()) }
     static var logs: URL? { directory(BVNPathLogs()) }
     static var caches: URL? { directory(BVNPathCaches()) }
