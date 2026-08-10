@@ -595,6 +595,27 @@ void bvnReportPresentRate(void) {
              (unsigned long long)(getrusage - lastGetrusage),
              (unsigned long long)(schedYield - lastSchedYield));
 
+    // Grisaia is bimodal: 30 fps at 0.90 cores with 740,000 getrusage calls a
+    // second while a sprite animates, then 0.4 fps at 0.46 cores with 37,000 -
+    // the *whole guest*, spin loop included, slows by twenty times rather than
+    // any one thing blocking. Less CPU used, not more, so it is waiting.
+    //
+    // Guessing at what it waits for has cost several builds. Take a thread
+    // snapshot instead, at the moment it is actually happening: per-thread
+    // run state and CPU time is what distinguishes a futex wait from a timer
+    // from a starved runnable thread. Once per 30 s so it cannot itself
+    // become the problem.
+    static U32 lastSnapshot = 0;
+    static bool previousWindowWasSlow = false;
+    const bool slow = (double)frames / wallSeconds < 2.0;
+    if (slow && previousWindowWasSlow &&
+        (lastSnapshot == 0 || now - lastSnapshot >= 30000)) {
+        lastSnapshot = now;
+        KSystem::logThreadSnapshot("guest presented under 2 frames/sec for "
+                                   "two consecutive windows");
+    }
+    previousWindowWasSlow = slow;
+
     lastThrottleUs = throttleUs;
     lastThrottleCount = throttleCount;
     lastGetrusage = getrusage;

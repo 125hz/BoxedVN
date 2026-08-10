@@ -266,7 +266,15 @@ final class AppModel: ObservableObject {
                 // puts a taskbar, a Start menu and desktop icons on it. Any
                 // other name gives a bare desktop window - which is the white
                 // rectangle and nothing else that build 70 produced.
-                arguments: ["/desktop=shell,1280x720"],
+                // Run winefile *inside* the desktop rather than relying on
+                // the shell alone. Build 71 gave a bare white rectangle: Wine's
+                // explorer logged "NtUserChangeDisplaySettings ... returned -2"
+                // and "Failed to set primary display settings", so its shell -
+                // taskbar, Start menu, icons - never came up and the desktop
+                // window was all that was left. A file manager launched into
+                // the same desktop does not depend on that, and browsing files
+                // is the point of this mode.
+                arguments: ["/desktop=shell,1280x720", "winefile"],
                 environment: [],
                 workingDirectory: nil,
                 width: 1280,

@@ -593,9 +593,12 @@ static BVNGuestOverlayView* gOverlay = nil;
         lastReport = now;
         NSString* message = [NSString stringWithFormat:
             @"Overlay hit test at %.0f,%.0f in bounds %.0fx%.0f (window %@, "
-             "presenting view %@ frame %.0f,%.0f %.0fx%.0f) -> %@",
+             "menu button %.0f,%.0f %.0fx%.0f, presenting view %@ frame "
+             "%.0f,%.0f %.0fx%.0f) -> %@",
             point.x, point.y, self.bounds.size.width, self.bounds.size.height,
             self.window == nil ? @"DETACHED" : @"attached",
+            self.menuButton.frame.origin.x, self.menuButton.frame.origin.y,
+            self.menuButton.frame.size.width, self.menuButton.frame.size.height,
             presentation == nil ? @"none" : NSStringFromClass(presentation.class),
             presentation.frame.origin.x, presentation.frame.origin.y,
             presentation.frame.size.width, presentation.frame.size.height,
@@ -765,6 +768,156 @@ static BVNGuestOverlayView* gOverlay = nil;
     BVNLogWrite(BVNLogLevelInfo, "input",
                 enabled ? "Pointer mode: trackpad (drag to move, tap to click)."
                         : "Pointer mode: direct (tap where you want to click).");
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+//
+// These four methods went missing in build 70: a block replacement that was
+// meant to rewrite the touch handlers spanned them as well, and nothing
+// noticed because the overlay still receives a frame from its constraints and
+// still hit-tests. Its *subviews* were simply never positioned, so every
+// control kept the zero frame it was created with - which is exactly the
+// reported symptom, a menu button that is gone in games and on the desktop
+// alike while touches still reach the guest.
+// ---------------------------------------------------------------------------
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    if (self.layingOut) {
+        return;
+    }
+    self.layingOut = YES;
+
+    const UIEdgeInsets safe = self.safeAreaInsets;
+    const CGRect bounds = self.bounds;
+
+    self.scrim.frame = bounds;
+    self.startupNotice.frame = bounds;
+
+    self.menuButton.bounds = CGRectMake(0.0, 0.0, kBVNMenuButtonSize,
+                                        kBVNMenuButtonSize);
+    const CGRect travel = [self menuButtonTravel];
+    if (self.menuButtonFraction.x < 0.0) {
+        self.menuButton.center = CGPointMake(CGRectGetMinX(travel),
+                                             CGRectGetMinY(travel));
+    } else {
+        self.menuButton.center = CGPointMake(
+            CGRectGetMinX(travel) + travel.size.width * self.menuButtonFraction.x,
+            CGRectGetMinY(travel) + travel.size.height * self.menuButtonFraction.y);
+    }
+
+    [self layoutMenuPanelWithSafeArea:safe];
+    [self layoutKeyboardPanelWithSafeArea:safe];
+    [self positionCursor];
+
+    // Deliberately does NOT re-fit the guest picture. That belongs to the poll
+    // in KNativeInputSDL::processEvents, which runs outside any UIKit layout
+    // pass. Running the presenter from here means flushing the Metal view's
+    // layout from inside this one, on a view in a sibling subtree; build 65
+    // did that and UIKit stopped laying the subtree out at all after the first
+    // rotation.
+    self.layingOut = NO;
+}
+
+// UIKit reports the safe area separately from, and sometimes later than, the
+// bounds change that accompanies a rotation. Build 64 fitted the guest picture
+// during a portrait layout pass that was still reporting the landscape insets.
+- (void)safeAreaInsetsDidChange {
+    [super safeAreaInsetsDidChange];
+    [self setNeedsLayout];
+}
+
+- (void)layoutMenuPanelWithSafeArea:(UIEdgeInsets)safe {
+    const CGFloat width = MIN(kBVNMenuWidth,
+                              self.bounds.size.width - safe.left - safe.right -
+                                  kBVNOverlayMargin * 2.0);
+    const CGFloat inset = 16.0;
+    CGFloat cursor = 0.0;
+    if (self.confirmingQuit) {
+        self.quitPrompt.frame = CGRectMake(inset, 12.0, width - inset * 2.0,
+                                           40.0);
+        cursor = 60.0;
+        for (UIButton* item in @[self.quitCancelItem, self.quitConfirmItem]) {
+            item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
+                                    kBVNMenuRowHeight);
+            cursor += kBVNMenuRowHeight;
+        }
+    } else {
+        for (UIButton* item in @[self.keyboardItem, self.rotationItem,
+                                 self.pointerItem, self.quitItem]) {
+            item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
+                                    kBVNMenuRowHeight);
+            cursor += kBVNMenuRowHeight;
+        }
+    }
+
+    // Follow the menu button, then clamp inside the safe area. The button is
+    // draggable, so the panel has to be able to open above it rather than
+    // always down-and-right off the screen - and it must clear the Dynamic
+    // Island.
+    CGFloat x = CGRectGetMinX(self.menuButton.frame);
+    CGFloat y = CGRectGetMaxY(self.menuButton.frame) + 8.0;
+    const CGFloat maxX = self.bounds.size.width - safe.right -
+                         kBVNOverlayMargin - width;
+    const CGFloat maxY = self.bounds.size.height - safe.bottom -
+                         kBVNOverlayMargin - cursor;
+    if (y > maxY) {
+        y = CGRectGetMinY(self.menuButton.frame) - 8.0 - cursor;
+    }
+    x = MIN(MAX(x, safe.left + kBVNOverlayMargin), MAX(maxX, safe.left));
+    y = MIN(MAX(y, safe.top + kBVNOverlayMargin), MAX(maxY, safe.top));
+    self.menuPanel.frame = CGRectMake(x, y, width, cursor);
+}
+
+- (void)layoutKeyboardPanelWithSafeArea:(UIEdgeInsets)safe {
+    const CGFloat width = self.bounds.size.width;
+    const NSUInteger rowCount = self.keyRows.count;
+    if (rowCount == 0 || width <= 0.0) {
+        return;
+    }
+
+    // Six rows have to fit a 402pt-tall landscape phone without eating the
+    // whole screen - at this fraction they take about 63% of it, and the
+    // keyboard is summoned deliberately and dismissed again - while still
+    // being tappable on a 402pt-wide portrait one, where the clamp takes over.
+    const CGFloat usableHeight = self.bounds.size.height - safe.top;
+    CGFloat rowHeight = floor(usableHeight * 0.085);
+    rowHeight = MAX(28.0, MIN(46.0, rowHeight));
+
+    const CGFloat contentHeight =
+        rowCount * rowHeight + (rowCount - 1) * kBVNKeyGap;
+    const CGFloat panelHeight = contentHeight + kBVNKeyGap * 2.0 + safe.bottom;
+    self.keyboardPanel.frame = CGRectMake(0.0,
+                                          self.bounds.size.height - panelHeight,
+                                          width, panelHeight);
+
+    const CGFloat left = safe.left + kBVNKeyGap;
+    const CGFloat right = width - safe.right - kBVNKeyGap;
+    CGFloat rowY = kBVNKeyGap;
+    for (NSArray<BVNOverlayKey*>* row in self.keyRows) {
+        CGFloat totalWeight = 0.0;
+        for (BVNOverlayKey* key in row) {
+            totalWeight += key.weight;
+        }
+        const CGFloat usableWidth =
+            (right - left) - ((CGFloat)row.count - 1.0) * kBVNKeyGap;
+        CGFloat consumed = 0.0;
+        CGFloat keyX = left;
+        for (NSUInteger index = 0; index < row.count; ++index) {
+            BVNOverlayKey* key = row[index];
+            consumed += key.weight;
+            const CGFloat nextX = left +
+                usableWidth * (consumed / totalWeight) +
+                (CGFloat)index * kBVNKeyGap;
+            key.button.frame = CGRectMake(keyX, rowY, nextX - keyX, rowHeight);
+            key.button.titleLabel.font =
+                [UIFont systemFontOfSize:MIN(17.0, rowHeight * 0.42)
+                                  weight:UIFontWeightMedium];
+            keyX = nextX + kBVNKeyGap;
+        }
+        rowY += rowHeight + kBVNKeyGap;
+    }
 }
 
 // The rectangle the menu button's centre may occupy: the safe area, inset by

@@ -6,7 +6,7 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 71. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 72. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
 Build 65 killed the **swapchain storm** (8,244 rebuilds a minute down to two
@@ -18,8 +18,11 @@ Build 68's measurement did its job immediately: **Saya runs at 58 fps** and
 sleeping. Build 69 bounded the fairness throttle, which was one cause but not the whole
 one: Grisaia is still at 0.4 fps with the machine 92% idle. Build 70's poll counter finished the Grisaia diagnosis: the guest makes
 **37,000 getrusage and 18,600 sched_yield calls a second**, and each getrusage
-took the process thread-table mutex and walked every thread. Build 71 caches
-it. **Build 71 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
+took the process thread-table mutex and walked every thread. Build 71 cached it, and the result disproved the theory: Grisaia is *bimodal*,
+running at 30 fps with 740,000 calls/sec and 0.4 fps with 37,000, so the poll
+rate follows the frame rate rather than causing it. Build 72 restores the
+overlay layout methods a bad edit deleted in build 70. **Build 72 is not
+device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -3177,6 +3180,57 @@ Also added: **session logging can be turned off in Settings**, persisted across
 launches. On by default, because every diagnosis in this port has come from an
 exported log, but the emulator writes from hot paths and a player who just
 wants to read a novel should not have to pay for evidence nobody will read.
+
+Verified locally: build succeeds, app validates, 91/91 tests pass.
+**Untested on device.**
+
+### 2026-08-09 — build 72: the overlay layout methods, deleted by my own edit
+
+**The menu button was missing because build 70 deleted `-layoutSubviews`.** A
+block replacement meant to rewrite the touch handlers spanned four layout
+methods as well - `-layoutSubviews`, `-safeAreaInsetsDidChange`,
+`-layoutMenuPanelWithSafeArea:` and `-layoutKeyboardPanelWithSafeArea:` - and
+nothing caught it, because the overlay still receives a frame from its
+constraints and still hit-tests. Only its *subviews* went unpositioned, so
+every control kept the zero frame it was created with. The build-71 log says
+so plainly in hindsight:
+
+```
+Overlay hit test at 656,146 in bounds 874x402 (window attached, ...) -> passed down to SDL
+```
+
+The overlay was alive the whole time. Restored, and the hit-test line now
+prints the menu button's frame so a zero one is visible immediately.
+
+**Grisaia is bimodal, and the getrusage theory is dead.** Build 71's cache
+worked, but the numbers invert the story:
+
+```
+30.0 fps; 0.90 cores busy; getrusage 3,709,991 per 5 s   (740,000/sec)
+ 0.4 fps; 0.46 cores busy; getrusage   186,619 per 5 s   ( 37,000/sec)
+```
+
+The *fast* state polls twenty times harder. So the spin rate follows the frame
+rate rather than causing it, and in the slow state the whole guest - spin loop
+included - is running twenty times slower while using *less* CPU. It is
+waiting for something, and which thing decides the fix: a futex, a timer, or a
+runnable thread that is not being scheduled all look identical from here.
+
+Rather than guess again, build 72 takes a **thread snapshot automatically when
+two consecutive windows report under 2 fps**, at most once every 30 seconds.
+Per-thread run state and CPU time at the moment it is happening is what
+separates those three.
+
+The 740,000 calls/sec in the *fast* state is worth noting on its own: at
+roughly a microsecond of emulator dispatch each, that is most of the 0.90 cores
+being spent on a spin loop, so there is headroom there even once the stall is
+understood.
+
+**Desktop mode ran nothing visible** because Wine's explorer could not start
+its shell - `NtUserChangeDisplaySettings ... returned -2`, `Failed to set
+primary display settings` - leaving a bare desktop window, the white rectangle.
+It now launches `winefile` into that desktop, which does not depend on the
+shell and is what "browse the files" actually needs.
 
 Verified locally: build succeeds, app validates, 91/91 tests pass.
 **Untested on device.**
