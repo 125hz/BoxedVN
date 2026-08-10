@@ -315,10 +315,46 @@ void KNativeScreenSDL::setScreenSize(U32 cx, U32 cy) {
     // squash 800x600 into the portrait point size with unrelated X/Y scales,
     // then feed the already-distorted coordinates through SDL's logical-size
     // transform. The renderer alone owns presentation scaling on iOS.
-    input->scaleX = 100;
-    input->scaleY = 100;
-    input->scaleXOffset = 0;
-    input->scaleYOffset = 0;
+    if (renderer) {
+        input->scaleX = 100;
+        input->scaleY = 100;
+        input->scaleXOffset = 0;
+        input->scaleYOffset = 0;
+        return;
+    }
+
+    // No renderer means the guest is presenting through Vulkan instead, and
+    // SDL_RenderSetLogicalSize above never ran - so nothing maps pointer
+    // events from window space into guest space. Taps then arrive as raw
+    // window coordinates: on an 874x402 window driving an 800x600 guest they
+    // land in the wrong place, and everything below y=402 cannot be reached at
+    // all. That is exactly what "tapping does nothing" looked like on device,
+    // even though the events were being delivered (the log shows them).
+    //
+    // Mirror whatever the presentation actually does. DXVK's swapchain blit
+    // currently fills the whole surface, stretching 4:3 across the display, so
+    // the matching inverse is an independent X and Y stretch with no offset.
+    // If the present is later letterboxed via the blitter's destination rect,
+    // this must switch to the same aspect-fit scale and centring offsets, or
+    // the picture and the touch target will disagree again.
+    int windowWidth = 0;
+    int windowHeight = 0;
+    SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+    if (windowWidth > 0 && windowHeight > 0 && cx > 0 && cy > 0) {
+        input->scaleX = (U32)(windowWidth * 100 / (int)cx);
+        input->scaleY = (U32)(windowHeight * 100 / (int)cy);
+        input->scaleXOffset = 0;
+        input->scaleYOffset = 0;
+        klog_fmt("iOS Vulkan presentation owns input mapping: window %dx%d, "
+                 "guest %ux%u, scale %u%%x%u%%",
+                 windowWidth, windowHeight, cx, cy, input->scaleX,
+                 input->scaleY);
+    } else {
+        input->scaleX = 100;
+        input->scaleY = 100;
+        input->scaleXOffset = 0;
+        input->scaleYOffset = 0;
+    }
     return;
 #endif
 
