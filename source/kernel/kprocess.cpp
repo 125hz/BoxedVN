@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 
 #if defined(__APPLE__)
+#include "../emulation/softmmu/kmemory_soft.h"
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach/thread_status.h>
@@ -3842,6 +3843,30 @@ static mach_port_t nativePortForThread(KThread* thread) {
 static NativeThreadSample sampleNativeThread(KThread* thread) {
     return sampleNativePort(nativePortForThread(thread));
 }
+
+// Boxedwine records, for every translated op, the native span its JIT code
+// occupies. That lets a raw host PC be mapped back to the guest instruction it
+// came from - which is the one thing the guest-side counters cannot tell us.
+// `diagnosticEip` and `diagnosticDispatchCount` only update at dispatch
+// boundaries, so a chained loop anywhere leaves them parked wherever they were
+// last written. Mapping the host PC says where execution actually is.
+static void describeNativePc(KProcess* process, uint64_t pc, char* out,
+                             size_t outSize) {
+    out[0] = '\0';
+    if (!pc || !process || !process->memory) {
+        return;
+    }
+    U32 guestEip = 0;
+    if (!getMemData(process->memory)->findOpFromJitAddress((U8*)(uintptr_t)pc,
+                                                           guestEip)) {
+        snprintf(out, outSize, " mappedGuest=none");
+        return;
+    }
+    const BString module = process->getModuleName(guestEip);
+    const U32 moduleEip = process->getModuleEip(guestEip);
+    snprintf(out, outSize, " mappedGuest=%08X %s+%08X", guestEip,
+             module.length() ? module.c_str() : "unknown", moduleEip);
+}
 #endif
 
 void KProcess::logThreadSnapshot(const char* reason) {
@@ -3920,14 +3945,16 @@ void KProcess::logThreadSnapshot(const char* reason) {
                     burstEntries.push_back({thread->id, port,
                                             native.cpuMicros});
                 }
+                char mapped[160];
+                describeNativePc(this, native.pc, mapped, sizeof(mapped));
                 klog_fmt("    tid=%04X native=%s cpuUs=%llu cpuUsage=%d "
-                         "suspend=%d pc=%016llX lr=%016llX sp=%016llX",
+                         "suspend=%d pc=%016llX lr=%016llX sp=%016llX%s",
                          thread->id, nativeRunStateName(native.runState),
                          (unsigned long long)native.cpuMicros,
                          native.cpuUsage, native.suspendCount,
                          (unsigned long long)native.pc,
                          (unsigned long long)native.lr,
-                         (unsigned long long)native.sp);
+                         (unsigned long long)native.sp, mapped);
             }
         }
 #endif
@@ -3961,12 +3988,14 @@ void KProcess::logThreadSnapshot(const char* reason) {
             if (!last.ok) {
                 continue;
             }
+            char mapped[160];
+            describeNativePc(this, last.pc, mapped, sizeof(mapped));
             klog_fmt("    tid=%04X burst native=%s cpuDeltaUs=%llu "
-                     "cpuUsage=%d pc=%016llX lr=%016llX",
+                     "cpuUsage=%d pc=%016llX lr=%016llX%s",
                      item.id, nativeRunStateName(last.runState),
                      (unsigned long long)(last.cpuMicros - item.startCpu),
                      last.cpuUsage, (unsigned long long)last.pc,
-                     (unsigned long long)last.lr);
+                     (unsigned long long)last.lr, mapped);
         }
     }
 #endif

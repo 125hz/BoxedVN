@@ -101,6 +101,32 @@ imports only `d3d11.dll`, so this costs nothing here.
 
 Copy the three stripped DLLs over `ios/app/Dxvk/` and commit.
 
+### Do not rebuild DXVK while the JIT defect is being narrowed
+
+Every rebuild shifts every offset in the binary. Build 59 removed 22 log calls
+and moved `BindFramebuffer` from RVA `0x259B8F` to `0x2109A0`, invalidating any
+recorded address. While hunting the ARM64 defect, treat the committed modules as
+frozen and express positions as module + RVA, which is ASLR-independent.
+
+Frozen module hashes (SHA-256):
+```
+d3d10core.dll  ad924849f3f9ca7c3405b6946565c22b7af5196e0943c8604b4e815693a2ccec
+d3d11.dll      03ec08cb2131ec40a36f8b149dca474895835b9d69994f7f3ca9f75ba61d9a35
+dxgi.dll       cb589a90b807499f995cf0a39d5a6d9fdc6c2ede8e2d211b87551ede4d379484
+```
+In this build, `D3D11CommonContext<D3D11ImmediateContext>::BindFramebuffer` is
+at RVA `0x2109A0`. The guest load base observed on device is `0x7BB70000`.
+
+### What the disassembly already rules out
+
+The render-target loop is **fully unrolled** - eight straight-line blocks, one
+per slot, and there is no backward branch anywhere in the region. Straight-line
+code cannot spin, so the 98%-CPU spin is either a native back-edge the JIT
+invented, a spinning helper/retry sequence emitted for a single x86 instruction,
+or execution that has chained elsewhere entirely while the guest EIP bookkeeping
+stayed parked. Build 60 maps the native PC back to a guest EIP
+(`findOpFromJitAddress`) to decide which.
+
 ## Things already ruled out, with evidence
 
 Recorded so they are not re-investigated:
