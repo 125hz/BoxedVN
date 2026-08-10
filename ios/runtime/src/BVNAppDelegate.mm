@@ -667,6 +667,72 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface) {
     BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
 }
 
+// Letterbox the guest picture instead of stretching it across the display.
+//
+// MoltenVK creates the swapchain images at the guest resolution (the device log
+// shows "Created 2 swapchain images with size (800, 600)"), and SDL sizes the
+// Metal view to the whole window, so those images are scaled to fill a 2.2:1
+// screen - which is why 4:3 content spread edge to edge and ran under the
+// Dynamic Island.
+//
+// Shrinking the layer's frame to an aspect-fit rectangle while leaving
+// drawableSize at the guest resolution fixes it without touching DXVK or the
+// swapchain: Core Animation scales the same drawable into a correctly
+// proportioned rect. The safe-area insets keep it clear of the Dynamic Island.
+//
+// KNativeScreenSDL computes the matching inverse for pointer events. The two
+// must agree; if one changes the other has to change with it.
+extern "C" void BVNApplyGuestPresentationAspect(void* surface,
+                                                uint32_t guestWidth,
+                                                uint32_t guestHeight,
+                                                bool stretchToFill) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BVNApplyGuestPresentationAspect(surface, guestWidth, guestHeight,
+                                            stretchToFill);
+        });
+        return;
+    }
+    if (surface == nullptr || guestWidth == 0 || guestHeight == 0) {
+        return;
+    }
+    NSValue* key = [NSValue valueWithPointer:surface];
+    UIView* view = gGuestVulkanSurfaceViews[key];
+    if (view == nil || view.superview == nil) {
+        return;
+    }
+
+    const CGRect available = UIEdgeInsetsInsetRect(view.superview.bounds,
+                                                  view.superview.safeAreaInsets);
+    if (available.size.width <= 0.0 || available.size.height <= 0.0) {
+        return;
+    }
+
+    CGRect target = available;
+    if (!stretchToFill) {
+        const CGFloat scale = MIN(available.size.width / (CGFloat)guestWidth,
+                                  available.size.height / (CGFloat)guestHeight);
+        const CGFloat width = (CGFloat)guestWidth * scale;
+        const CGFloat height = (CGFloat)guestHeight * scale;
+        target = CGRectMake(available.origin.x +
+                                (available.size.width - width) / 2.0,
+                            available.origin.y +
+                                (available.size.height - height) / 2.0,
+                            width, height);
+    }
+
+    view.frame = target;
+
+    NSString* message = [NSString stringWithFormat:
+        @"Guest presentation %@: guest %ux%u into %.0fx%.0f at %.0f,%.0f "
+         "(safe area %.0fx%.0f).",
+        stretchToFill ? @"stretched to fill" : @"aspect-fitted",
+        guestWidth, guestHeight, target.size.width, target.size.height,
+        target.origin.x, target.origin.y, available.size.width,
+        available.size.height];
+    BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
+}
+
 extern "C" void* BVNCreateOffscreenMetalLayer(uint32_t width,
                                                 uint32_t height) {
     NSCAssert(NSThread.isMainThread,

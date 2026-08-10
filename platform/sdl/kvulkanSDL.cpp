@@ -33,6 +33,10 @@
 
 #ifdef BOXEDWINE_IOS
 extern "C" void BVNRegisterGuestVulkanSurface(void* surface);
+extern "C" void BVNApplyGuestPresentationAspect(void* surface,
+                                                U32 guestWidth,
+                                                U32 guestHeight,
+                                                bool stretchToFill);
 extern "C" void BVNUnregisterGuestVulkanSurface(void* surface);
 extern "C" void BVNGuestVulkanSurfaceDidPresent(void* surface);
 extern "C" void* BVNCreateOffscreenMetalLayer(U32 width, U32 height);
@@ -253,6 +257,14 @@ void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,
                      surfaces.size());
         }
 #ifdef BOXEDWINE_IOS
+        if (presentation) {
+            // Letterbox rather than stretch. KNativeScreenSDL derives the
+            // matching pointer transform from the same guest size, so the
+            // picture and the touch target stay in agreement.
+            BVNApplyGuestPresentationAspect((void*)result, wnd->width(),
+                                            wnd->height(),
+                                            KSystem::stretchGuestToFill);
+        }
         if (watch) {
             startFirstFrameWatchdog(watch, (void*)result, wnd->id,
                                     wnd->width(), wnd->height());

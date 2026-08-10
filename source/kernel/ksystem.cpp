@@ -66,6 +66,7 @@ bool KSystem::forceRelativeMouse = false;
 bool KSystem::cacheReads = false;
 bool KSystem::disableWasmJitForWrittenCode = false;
 std::vector<BString> KSystem::interpreterModules;
+bool KSystem::stretchGuestToFill = false;
 std::vector<std::pair<U32, U32>> KSystem::interpreterRanges;
 BString KSystem::showWindowTimestamp;
 U32 KSystem::pageSize = 4096;

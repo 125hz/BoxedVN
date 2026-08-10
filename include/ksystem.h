@@ -159,6 +159,11 @@ public:
     // rest of the guest continues through the native JIT. Used by bounded
     // compatibility profiles for engines with a suspected translator fault.
     static std::vector<BString> interpreterModules;
+    // Presentation policy for the accelerated path. Aspect-fit by default:
+    // stretching 4:3 guests across a modern phone distorts them badly. Set
+    // true to fill the display instead. KNativeScreenSDL derives the pointer
+    // transform from the same flag, so the two cannot drift apart.
+    static bool stretchGuestToFill;
     static std::vector<std::pair<U32, U32>> interpreterRanges;
     static bool useF64;
     static U32 pageSize;

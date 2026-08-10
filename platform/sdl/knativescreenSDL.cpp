@@ -331,24 +331,36 @@ void KNativeScreenSDL::setScreenSize(U32 cx, U32 cy) {
     // all. That is exactly what "tapping does nothing" looked like on device,
     // even though the events were being delivered (the log shows them).
     //
-    // Mirror whatever the presentation actually does. DXVK's swapchain blit
-    // currently fills the whole surface, stretching 4:3 across the display, so
-    // the matching inverse is an independent X and Y stretch with no offset.
-    // If the present is later letterboxed via the blitter's destination rect,
-    // this must switch to the same aspect-fit scale and centring offsets, or
-    // the picture and the touch target will disagree again.
+    // Mirror whatever the presentation actually does, exactly. The Vulkan
+    // surface is aspect-fitted by BVNApplyGuestPresentationAspect unless
+    // stretchGuestToFill is set, so compute the same rectangle here and invert
+    // it. If these two ever disagree, taps land somewhere other than where the
+    // user touched.
     int windowWidth = 0;
     int windowHeight = 0;
     SDL_GetWindowSize(window, &windowWidth, &windowHeight);
     if (windowWidth > 0 && windowHeight > 0 && cx > 0 && cy > 0) {
-        input->scaleX = (U32)(windowWidth * 100 / (int)cx);
-        input->scaleY = (U32)(windowHeight * 100 / (int)cy);
-        input->scaleXOffset = 0;
-        input->scaleYOffset = 0;
+        if (KSystem::stretchGuestToFill) {
+            input->scaleX = (U32)(windowWidth * 100 / (int)cx);
+            input->scaleY = (U32)(windowHeight * 100 / (int)cy);
+            input->scaleXOffset = 0;
+            input->scaleYOffset = 0;
+        } else {
+            const int scale = std::min(windowWidth * 100 / (int)cx,
+                                       windowHeight * 100 / (int)cy);
+            input->scaleX = (U32)scale;
+            input->scaleY = (U32)scale;
+            input->scaleXOffset =
+                (U32)((windowWidth - (int)cx * scale / 100) / 2);
+            input->scaleYOffset =
+                (U32)((windowHeight - (int)cy * scale / 100) / 2);
+        }
         klog_fmt("iOS Vulkan presentation owns input mapping: window %dx%d, "
-                 "guest %ux%u, scale %u%%x%u%%",
-                 windowWidth, windowHeight, cx, cy, input->scaleX,
-                 input->scaleY);
+                 "guest %ux%u, %s, scale %u%%x%u%%, offset %u,%u",
+                 windowWidth, windowHeight, cx, cy,
+                 KSystem::stretchGuestToFill ? "stretch" : "aspect-fit",
+                 input->scaleX, input->scaleY, input->scaleXOffset,
+                 input->scaleYOffset);
     } else {
         input->scaleX = 100;
         input->scaleY = 100;
