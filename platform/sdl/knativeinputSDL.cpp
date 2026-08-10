@@ -30,6 +30,7 @@
 // platform/sdl/knativescreenSDL.cpp respectively.
 extern "C" bool BVNSyncGuestPresentationGeometry(void);
 extern "C" void BVNGuestPresentationGeometryChanged(void);
+extern "C" void BVNGuestOverlayApplyPendingState(void);
 #endif
 
 U32 sdlCustomEvent;
@@ -333,6 +334,11 @@ bool KNativeInputSDL::processEvents() {
         if (BVNSyncGuestPresentationGeometry()) {
             BVNGuestPresentationGeometryChanged();
         }
+        // Also keeps the overlay above SDL's views, and applies anything the
+        // X server's thread asked for. Unlike the geometry check this must run
+        // even with no Vulkan surface: the software-rendered Wine desktop is
+        // exactly where the overlay was being buried.
+        BVNGuestOverlayApplyPendingState();
     }
 #endif
 

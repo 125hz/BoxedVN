@@ -31,6 +31,9 @@ final class AppModel: ObservableObject {
     init() {
         reloadGames()
         startPolling()
+        // After the banner, so a session that starts with logging off still
+        // records which build turned it off.
+        defer { Log.applyStoredPreference() }
         Log.write("BoxedVN \(AppVersion.display) initialised; Boxedwine core "
                   + Session.boxedwineVersion, category: "app")
         Log.write("Memory status: \(memory.statusText); "
@@ -258,7 +261,12 @@ final class AppModel: ObservableObject {
                 executablePath: "explorer",
                 // Wine's own switch for "give me a desktop window with a
                 // shell in it" rather than rootless windows on the X root.
-                arguments: ["/desktop=BoxedVN,1280x720"],
+                // The desktop must be called "shell": that is the name Wine's
+                // explorer treats as "run the shell in here", which is what
+                // puts a taskbar, a Start menu and desktop icons on it. Any
+                // other name gives a bare desktop window - which is the white
+                // rectangle and nothing else that build 70 produced.
+                arguments: ["/desktop=shell,1280x720"],
                 environment: [],
                 workingDirectory: nil,
                 width: 1280,

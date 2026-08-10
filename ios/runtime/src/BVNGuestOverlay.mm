@@ -41,6 +41,8 @@
 
 #include "BVNRuntime.h"
 
+#include <atomic>
+
 // ---------------------------------------------------------------------------
 // The key table
 //
@@ -1048,28 +1050,66 @@ extern "C" void BVNGuestOverlayInstall(void) {
                 "Guest overlay attached to SDL's guest window.");
 }
 
-// The Wine startup notice. Called from KNativeScreenSDL on the main thread.
+// The Wine startup notice.
+//
+// Requested from either thread and applied on the main one. Build 70 required
+// the main thread and dropped the request otherwise, which meant the notice
+// was never hidden: the call that hides it lives in
+// KNativeScreenSDL::putBitsOnWnd, which runs on the X server's thread.
+static std::atomic<int> gStartupNoticeWanted{0};   // -1 hide, 0 unset, 1 show
+// Written by the JIT allocator's thread; rendered on the main one.
+static std::atomic<size_t> gStartupNoticeBlocks{0};
+extern "C" void BVNGuestOverlayApplyPendingState(void);
+
 extern "C" void BVNGuestStartupNoticeSetVisible(bool visible) {
-    if (!NSThread.isMainThread || gOverlay == nil) {
-        return;
-    }
-    gOverlay.startupNotice.hidden = !visible;
-    if (visible) {
-        gOverlay.startupProgress.text = @"Preparing…";
-        [gOverlay.superview bringSubviewToFront:gOverlay];
-        [gOverlay bringSubviewToFront:gOverlay.startupNotice];
+    gStartupNoticeWanted.store(visible ? 1 : -1, std::memory_order_relaxed);
+    if (NSThread.isMainThread) {
+        BVNGuestOverlayApplyPendingState();
     }
 }
 
-extern "C" void BVNGuestStartupNoticeSetProgress(size_t jitBlocks) {
-    if (!NSThread.isMainThread || gOverlay == nil ||
-        gOverlay.startupNotice.hidden) {
+// Applies anything requested off the main thread, and re-asserts the overlay's
+// place on top of SDL's views. Called from KNativeInputSDL::processEvents.
+//
+// Being on top is not something to assume. SDL adds its own view to the window
+// *after* BVNAttachGuestWindowToScene installs the overlay, so on the
+// software-rendered path - the Wine desktop, and the blue screen every game
+// boots through - the overlay was buried from the moment it was created. That
+// is why the menu button and the startup text were both invisible there while
+// working fine in a Vulkan game, where registering the surface happened to
+// re-front it.
+extern "C" void BVNGuestOverlayApplyPendingState(void) {
+    if (!NSThread.isMainThread || gOverlay == nil) {
         return;
     }
-    gOverlay.startupProgress.text = jitBlocks > 0
-        ? [NSString stringWithFormat:@"Translating x86 code — %lu blocks",
-                                     (unsigned long)jitBlocks]
-        : @"Preparing…";
+    const int wanted = gStartupNoticeWanted.exchange(0,
+                                                     std::memory_order_relaxed);
+    if (wanted != 0) {
+        const BOOL visible = wanted > 0;
+        gOverlay.startupNotice.hidden = !visible;
+        if (visible) {
+            gOverlay.startupProgress.text = @"Preparing…";
+            [gOverlay bringSubviewToFront:gOverlay.startupNotice];
+        }
+    }
+    if (!gOverlay.startupNotice.hidden) {
+        const size_t blocks =
+            gStartupNoticeBlocks.load(std::memory_order_relaxed);
+        gOverlay.startupProgress.text = blocks > 0
+            ? [NSString stringWithFormat:@"Translating x86 code — %lu blocks",
+                                         (unsigned long)blocks]
+            : @"Preparing…";
+    }
+    UIView* parent = gOverlay.superview;
+    if (parent != nil && parent.subviews.lastObject != gOverlay) {
+        [parent bringSubviewToFront:gOverlay];
+    }
+}
+
+// Called from the JIT's allocator, which is not the main thread. Recorded here
+// and rendered by BVNGuestOverlayApplyPendingState.
+extern "C" void BVNGuestStartupNoticeSetProgress(size_t jitBlocks) {
+    gStartupNoticeBlocks.store(jitBlocks, std::memory_order_relaxed);
 }
 
 extern "C" void BVNGuestOverlayRemove(void) {

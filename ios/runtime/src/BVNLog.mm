@@ -55,6 +55,14 @@ pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
 std::string gRing;
 std::string gLogPath;
 int gLogFileDescriptor = -1;
+
+// Session logging can be turned off from Settings.
+//
+// It is on by default and should stay that way: every diagnosis in this port
+// so far has come from a log the player exported. But the emulator writes from
+// hot paths - the Vulkan bridge, the syscall layer - and a player who is just
+// trying to read a novel is paying for evidence nobody is going to look at.
+std::atomic<bool> gLoggingEnabled{true};
 std::atomic<uint64_t> gGeneration{0};
 os_log_t gOSLog = nullptr;
 
@@ -84,6 +92,9 @@ void appendToRingLocked(const char* text, size_t length) {
 
 // Caller must NOT hold gMutex.
 void writeToSinks(const char* text, size_t length) {
+    if (!gLoggingEnabled.load(std::memory_order_relaxed)) {
+        return;
+    }
     pthread_mutex_lock(&gMutex);
     appendToRingLocked(text, length);
     if (gLogFileDescriptor >= 0) {
@@ -188,6 +199,29 @@ extern "C" bool BVNLogStartSessionFile(void) {
 
     pthread_mutex_unlock(&gMutex);
     return true;
+}
+
+extern "C" void BVNLogSetEnabled(bool enabled) {
+    const bool was = gLoggingEnabled.exchange(enabled,
+                                              std::memory_order_relaxed);
+    if (was == enabled) {
+        return;
+    }
+    if (enabled) {
+        // Say so through the sink that just came back, so a log that resumes
+        // mid-session explains its own gap.
+        BVNLogWrite(BVNLogLevelInfo, "app",
+                    "Session logging re-enabled from Settings.");
+    } else {
+        BVNLogWrite(BVNLogLevelInfo, "app",
+                    "Session logging disabled from Settings; nothing further "
+                    "will be recorded until it is turned back on.");
+        gLoggingEnabled.store(false, std::memory_order_relaxed);
+    }
+}
+
+extern "C" bool BVNLogIsEnabled(void) {
+    return gLoggingEnabled.load(std::memory_order_relaxed);
 }
 
 extern "C" void BVNLogWrite(BVNLogLevel level, const char* category,

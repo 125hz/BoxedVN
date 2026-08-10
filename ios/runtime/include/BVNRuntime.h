@@ -288,6 +288,12 @@ typedef enum {
 // Writes a structured entry to the session log.  Thread safe.
 void BVNLogWrite(BVNLogLevel level, const char* category, const char* message);
 
+// Session logging is on by default.  Turning it off stops all sinks - the file
+// and the in-memory tail - which matters because the emulator logs from hot
+// paths.  Thread safe.
+void BVNLogSetEnabled(bool enabled);
+bool BVNLogIsEnabled(void);
+
 // Absolute path of the current session log file, or NULL before logging has
 // been started.  The file lives under BVNPathLogs and is visible in Files.
 const char* BVNLogCurrentFilePath(void);

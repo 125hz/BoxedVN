@@ -565,6 +565,7 @@ private struct JITHintSection: View {
 
 struct StatusView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var loggingEnabled = Log.isEnabled
 
     var body: some View {
         List {
@@ -599,6 +600,18 @@ struct StatusView: View {
                 if !Session.lastError.isEmpty {
                     Text(Session.lastError).font(.caption).foregroundStyle(.red)
                 }
+            }
+
+            Section {
+                Toggle("Session logging", isOn: Binding(
+                    get: { loggingEnabled },
+                    set: { loggingEnabled = $0; Log.isEnabled = $0 }))
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("On by default. The emulator logs from hot paths, so "
+                     + "turning this off can help a slow game — but nothing "
+                     + "can be diagnosed from a session that was not recorded.")
             }
 
             Section("Backends") {

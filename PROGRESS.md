@@ -6,7 +6,7 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 70. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 71. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
 Build 65 killed the **swapchain storm** (8,244 rebuilds a minute down to two
@@ -16,10 +16,10 @@ Grisaia running (the no-DXVK profile, which had never actually executed before).
 Build 68's measurement did its job immediately: **Saya runs at 58 fps** and
 **Grisaia at 0.4 fps with only 0.65 host cores busy** - not CPU-bound,
 sleeping. Build 69 bounded the fairness throttle, which was one cause but not the whole
-one: Grisaia is still at 0.4 fps with the machine 92% idle. Build 70 adds a
-Windows desktop mode, a trackpad cursor mode, a readable startup screen, and
-the poll-rate counter that should finish the Grisaia diagnosis. **Build 70 is
-not device-tested yet.** The newest detail is at the end of the session log, section 10; the
+one: Grisaia is still at 0.4 fps with the machine 92% idle. Build 70's poll counter finished the Grisaia diagnosis: the guest makes
+**37,000 getrusage and 18,600 sched_yield calls a second**, and each getrusage
+took the process thread-table mutex and walked every thread. Build 71 caches
+it. **Build 71 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -3130,6 +3130,53 @@ Features this round:
   and that the app must stay open, which is the thing a player needs to know
   and could not previously read. The spinner is gone; the count of translated
   code blocks does the same job and also distinguishes progress from a hang.
+
+Verified locally: build succeeds, app validates, 91/91 tests pass.
+**Untested on device.**
+
+### 2026-08-09 — build 71: the getrusage spin, and an overlay nobody could see
+
+The poll counter added in build 70 named Grisaia's problem in one line:
+
+```
+0.4 presented frames/sec; host CPU 0.44 cores busy;
+guest polled getrusage 185,630 and sched_yield 92,815 times
+```
+
+Per 5 seconds: **37,000 getrusage/sec and 18,600 sched_yield/sec**, an exact
+2:1 ratio - a `getrusage; getrusage; sched_yield` spin loop. And
+`KProcess::getrusuage(RUSAGE_SELF)` takes `threadsMutex` and walks every thread
+in the process on each call, so that loop was ~37,000 lock acquisitions and
+~370,000 per-thread time computations a second, all of it contending with
+whatever else needed the thread table.
+
+Build 71 caches the RUSAGE_SELF answer **per thread** for one millisecond. No
+lock of its own, no shared state, and the result stays monotonic and accurate
+to a millisecond - far finer than anything can read from cumulative CPU time.
+The guest will still spin; the spin should now be nearly free.
+
+**The overlay was invisible on the software-rendered path, and had been since
+build 68.** `BVNAttachGuestWindowToScene` installs the overlay right after
+`SDL_CreateWindow` - *before* SDL creates its renderer view, which is then
+added to the same window and lands on top. A Vulkan game happened to survive
+this because registering the surface re-fronted the overlay; the Wine desktop
+and the blue boot screen never did. That is why the menu button was missing
+there, and why build 70's new startup text never appeared. The emulator's
+own event loop now re-asserts the overlay's place every 200 ms.
+
+The startup notice also could not be hidden: the call that hides it lives in
+`putBitsOnWnd`, which runs on the X server's thread, and the setter dropped
+off-main requests. Both the visibility and the progress count are now recorded
+atomically and applied on the main thread by the same 200 ms pass.
+
+**Desktop mode showed a white rectangle** because `/desktop=BoxedVN,1280x720`
+gives a bare desktop window: Wine's explorer only runs the shell - taskbar,
+Start menu, icons - when the desktop is named `shell`. Corrected.
+
+Also added: **session logging can be turned off in Settings**, persisted across
+launches. On by default, because every diagnosis in this port has come from an
+exported log, but the emulator writes from hot paths and a player who just
+wants to read a novel should not have to pay for evidence nobody will read.
 
 Verified locally: build succeeds, app validates, 91/91 tests pass.
 **Untested on device.**

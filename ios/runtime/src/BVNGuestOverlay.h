@@ -52,6 +52,10 @@ void BVNGuestOverlayRemove(void);
 void BVNGuestStartupNoticeSetVisible(bool visible);
 void BVNGuestStartupNoticeSetProgress(size_t jitBlocks);
 
+// Applies state requested off the main thread and keeps the overlay above
+// SDL's views.  Cheap; called from the emulator's own event loop.
+void BVNGuestOverlayApplyPendingState(void);
+
 // ---------------------------------------------------------------------------
 // Implemented by BVNAppDelegate.mm
 // ---------------------------------------------------------------------------

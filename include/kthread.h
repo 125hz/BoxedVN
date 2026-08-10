@@ -148,6 +148,22 @@ public:
     U64 kernelTime = 0;
     U32 inSysCall = 0;
 #if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    // A per-thread cache of getrusage(RUSAGE_SELF).
+    //
+    // Grisaia's guest makes 37,000 of those calls a second as a spin-loop
+    // clock, and each one takes KProcess::threadsMutex and walks every thread
+    // in the process. Caching it for a millisecond removes 37,000 lock
+    // acquisitions and ~370,000 per-thread time computations a second while
+    // leaving the answer monotonic and accurate to 1 ms - which is far finer
+    // than anything can reasonably read from cumulative CPU time. Per thread,
+    // so there is no shared state and no lock of its own.
+    U64 cachedSelfRusageMicroseconds = 0;
+    U32 cachedSelfUserSeconds = 0;
+    U32 cachedSelfUserMicroSeconds = 0;
+    U32 cachedSelfKernelSeconds = 0;
+    U32 cachedSelfKernelMicroSeconds = 0;
+    bool hasCachedSelfRusage = false;
+
     GetrusageFairness getrusageFairness;
     GetrusageFairness schedYieldFairness;
 #endif

@@ -487,6 +487,26 @@ enum Log {
 
     static var generation: UInt64 { BVNLogGeneration() }
 
+    /// Session logging, persisted so it survives a relaunch. On by default:
+    /// every diagnosis in this port has come from an exported log.
+    static var isEnabled: Bool {
+        get { BVNLogIsEnabled() }
+        set {
+            BVNLogSetEnabled(newValue)
+            UserDefaults.standard.set(newValue, forKey: enabledDefaultsKey)
+        }
+    }
+
+    static let enabledDefaultsKey = "BVNSessionLoggingEnabled"
+
+    /// Applies the stored preference. Called once at startup, after the log
+    /// file has been opened so that turning it off is itself recorded.
+    static func applyStoredPreference() {
+        guard UserDefaults.standard.object(forKey: enabledDefaultsKey) != nil
+        else { return }
+        BVNLogSetEnabled(UserDefaults.standard.bool(forKey: enabledDefaultsKey))
+    }
+
     static func recentText() -> String {
         let needed = BVNLogCopyRecent(nil, 0)
         guard needed > 0 else { return "" }

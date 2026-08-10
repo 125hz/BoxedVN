@@ -1974,16 +1974,37 @@ U32 KProcess::getrusuage(KThread* thread, U32 who, U32 usage) {
     U32 kernelMicroSeconds = 0;
 
     if (who==0) { // RUSAGE_SELF
-        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
-        for (auto& t : this->threads ) {
-            KThread* otherThread = t.value;
-            U64 userTime = otherThread->getThreadUserTime();
-            userSeconds += (U32)(userTime / 1000000l);
-            userMicroSeconds += (U32)(userTime % 1000000l);
-            kernelSeconds += (U32)(otherThread->kernelTime / 1000000l);
-            kernelMicroSeconds += (U32)(otherThread->kernelTime % 1000000l);
+        // Served from a per-thread cache for a millisecond at a time. Wine
+        // worker pools use this call as a spin-loop clock - measured at 37,000
+        // calls a second on device - and the uncached path takes threadsMutex
+        // and walks every thread in the process on each one. See KThread's
+        // cachedSelfRusage fields.
+        const U64 now = KSystem::getMicroCounter();
+        if (thread->hasCachedSelfRusage &&
+            now - thread->cachedSelfRusageMicroseconds < 1000) {
+            userSeconds = thread->cachedSelfUserSeconds;
+            userMicroSeconds = thread->cachedSelfUserMicroSeconds;
+            kernelSeconds = thread->cachedSelfKernelSeconds;
+            kernelMicroSeconds = thread->cachedSelfKernelMicroSeconds;
+        } else {
+            {
+                BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
+                for (auto& t : this->threads ) {
+                    KThread* otherThread = t.value;
+                    U64 userTime = otherThread->getThreadUserTime();
+                    userSeconds += (U32)(userTime / 1000000l);
+                    userMicroSeconds += (U32)(userTime % 1000000l);
+                    kernelSeconds += (U32)(otherThread->kernelTime / 1000000l);
+                    kernelMicroSeconds += (U32)(otherThread->kernelTime % 1000000l);
+                }
+            }
+            thread->cachedSelfRusageMicroseconds = now;
+            thread->cachedSelfUserSeconds = userSeconds;
+            thread->cachedSelfUserMicroSeconds = userMicroSeconds;
+            thread->cachedSelfKernelSeconds = kernelSeconds;
+            thread->cachedSelfKernelMicroSeconds = kernelMicroSeconds;
+            thread->hasCachedSelfRusage = true;
         }
-        
     } else if ((S32)who < 0) { // RUSAGE_CHILDREN
         klog("getrusuage: RUSAGE_CHILDREN not implemented");
     } else { // RUSAGE_THREAD
