@@ -25,6 +25,7 @@
 #include "knativeinputSDL.h"
 #include "knativescreenSDL.h"
 #include "../../source/x11/x11.h"
+#include "devinput.h"
 
 #ifdef BOXEDWINE_IOS
 extern "C" void BVNAttachGuestWindowToScene(void);
@@ -158,6 +159,41 @@ extern "C" void BVNGuestControlsSendKey(U32 scancode, bool down) {
         return;
     }
     gIOSActiveScreen->input->key(scancode, 0, down ? 1 : 0);
+}
+
+// Guest pointer input, forwarded by the overlay.
+//
+// The overlay owns this rather than letting SDL's view receive the touch,
+// because relying on UIKit to deliver a touch to a transformed view inside a
+// hierarchy UIKit itself owns has now failed in three different ways across
+// builds 62, 64 and 66 - most recently only in portrait, where the build-67
+// log shows the overlay passing a tap at 284,536 straight through and SDL
+// never seeing it. The overlay knows the presenting view's bounds and its
+// transform, so -[UITouch locationInView:] gives it guest pixels directly and
+// nothing about the intervening hierarchy can matter.
+//
+// Coordinates are in the presenting view's bounds, which is the same space
+// SDL would have reported, so KNativeInputSDL's transform still applies.
+extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
+    if (!gIOSActiveScreen) {
+        return;
+    }
+    const KNativeInputSDLPtr& input = gIOSActiveScreen->input;
+    // Position first, then the button, exactly as SDL's own touch-to-mouse
+    // synthesis does: X11 clients read the pointer position from the motion
+    // that precedes the press.
+    if (!input->mouseMove(x, y, false)) {
+        onMouseMove((U32)x, (U32)y, false);
+    }
+    if (phase == 1) {
+        if (!input->mouseButton(1, 0, x, y)) {
+            onMouseButtonDown(0);
+        }
+    } else if (phase == 2) {
+        if (!input->mouseButton(0, 0, x, y)) {
+            onMouseButtonUp(0);
+        }
+    }
 }
 
 // A right click, from the overlay's two-finger tap. The coordinates are in

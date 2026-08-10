@@ -6,13 +6,17 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 67. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 68. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
 Build 65 killed the **swapchain storm** (8,244 rebuilds a minute down to two
 creations a session) and build 66 fixed rotation, but 66 lost touch entirely.
-Build 67 restores the one thing 66 removed that touch depended on and fixes
-three more defects the same log named. **Build 67 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
+Build 67 fixed landscape touch, the status bar and the menu placement, and got
+Grisaia running (the no-DXVK profile, which had never actually executed before).
+Build 68 takes ownership of guest pointer input in the overlay because portrait
+touch failed a fourth time, makes the menu button draggable, and adds the frame
+rate and CPU measurement that performance work needs. **Build 68 is not
+device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -3000,6 +3004,48 @@ last now, so the no-DXVK hypothesis gets its first real test in build 67.
 Also added: **two-finger tap = right click**, and a throttled hit-test log in
 the overlay that names whatever claims a touch, so if touch is still wrong the
 next log identifies the swallower instead of another round of inference.
+
+Verified locally: build succeeds, app validates, 89/89 tests pass.
+**Untested on device.**
+
+### 2026-08-09 — build 68: the overlay owns pointer input; first performance numbers
+
+Build 67 on device: landscape touch correct, the status bar gone, Grisaia
+running for the first time (so DXVK really was what its DirectX check tripped
+over). Portrait touch still dead — the fourth build in a row to fail on it.
+
+The hit-test diagnostic added in 67 finally made it unambiguous:
+
+```
+Overlay hit test at 284,536 in bounds 402x874 -> passed through to the game
+```
+
+That point is inside the picture (y 286..587), the overlay declined it, and
+SDL received nothing. So the fault is entirely in UIKit's delivery to a
+transformed view inside its own hosting hierarchy, and three builds of
+reasoning about that hierarchy have now been wrong.
+
+**The overlay therefore delivers guest pointer input itself.** It knows the
+presenting view and `-[UITouch locationInView:]` resolves the scale transform,
+so a touch becomes guest pixels with nothing in between to get wrong. When
+there is no presenting view - the software-rendered Wine desktop, where SDL
+owns a renderer and its own logical-size mapping - touches pass through as
+before.
+
+**First performance instrumentation.** `bvnReportPresentRate` logs presented
+frames per second and host CPU cores busy every five seconds. Grisaia's
+build-67 log has nothing to measure against: no swapchain storm, no interpreter
+module, but 3,460 `getrusage fairness activated` transitions on a single Wine
+thread over 258 seconds. Whether that thread is the ceiling is exactly what the
+cores-busy figure will say - one core pinned means one guest thread to make
+faster, several means throughput.
+
+Also: the menu button is draggable and remembers its position as a fraction of
+the safe area, so it survives rotation; the menu panel follows it and flips
+above it near the bottom edge.
+
+Right clicks: the build-67 logs contain no `overlay right click` lines at all,
+so the two-finger tap either was not tried or did not fire. Untested.
 
 Verified locally: build succeeds, app validates, 89/89 tests pass.
 **Untested on device.**

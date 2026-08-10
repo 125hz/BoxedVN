@@ -207,6 +207,12 @@ static const CGFloat kBVNKeyGap = 4.0;
 @property (nonatomic, assign) BOOL menuOpen;
 @property (nonatomic, assign) BOOL confirmingQuit;
 @property (nonatomic, assign) BOOL layingOut;
+// The finger currently acting as the guest's mouse. A second finger belongs to
+// the two-finger right-click gesture, not to a second cursor.
+@property (nonatomic, weak) UITouch* guestTouch;
+// Where the player has dragged the menu button to, as a fraction of the safe
+// area, so it stays put across a rotation. Negative means "not moved yet".
+@property (nonatomic, assign) CGPoint menuButtonFraction;
 
 // A latched Ctrl that outlives the keyboard would leave the guest convinced a
 // key is held down with no way to release it.
@@ -310,8 +316,16 @@ static BVNGuestOverlayView* gOverlay = nil;
     [menu addTarget:self
              action:@selector(toggleMenu)
    forControlEvents:UIControlEventTouchUpInside];
+    // Drag it anywhere. A visual novel's own buttons move around the screen
+    // between scenes, so a fixed corner is eventually going to sit on top of
+    // something the player needs.
+    UIPanGestureRecognizer* drag = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(dragMenuButton:)];
+    [menu addGestureRecognizer:drag];
     [self addSubview:menu];
     self.menuButton = menu;
+    // Negative means "never dragged": the layout then uses the default corner.
+    self.menuButtonFraction = CGPointMake(-1.0, -1.0);
 
     // Two-finger tap = right click. A gesture recogniser on the overlay sees
     // the touch before SDL's view does, but only claims it once two fingers
@@ -436,31 +450,87 @@ static BVNGuestOverlayView* gOverlay = nil;
 
 - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
     UIView* hit = [super hitTest:point withEvent:event];
-    if (hit == self) {
-        hit = nil;
+    if (hit != self) {
+        return hit;  // one of the overlay's own controls
     }
 
-    // Name whoever claims a touch, at most once a second.
+    // Not a control, so it belongs to the guest - and the overlay delivers it
+    // itself rather than letting UIKit route it down to SDL's view.
     //
-    // Build 66 lost touch entirely for the guest while the overlay's own menu
-    // kept working, which narrows the fault to this hand-off but does not
-    // identify it - and reasoning about UIKit's private view hierarchy from a
-    // log is how the last two builds went wrong. One line per second says
-    // whether the overlay is passing the touch down or swallowing it, and if
-    // it is swallowing it, which control did.
-    static NSTimeInterval lastReport = 0.0;
-    const NSTimeInterval now = CACurrentMediaTime();
-    if (now - lastReport >= 1.0) {
-        lastReport = now;
-        NSString* message = [NSString stringWithFormat:
-            @"Overlay hit test at %.0f,%.0f in bounds %.0fx%.0f -> %@%@",
-            point.x, point.y, self.bounds.size.width, self.bounds.size.height,
-            hit == nil ? @"passed through to the game"
-                       : NSStringFromClass(hit.class),
-            hit == nil ? @"" : @" (swallowed)"];
-        BVNLogWrite(BVNLogLevelInfo, "input", message.UTF8String);
+    // The build-67 log is why. In portrait it shows this method passing a tap
+    // at 284,536 straight through, squarely inside the picture, and SDL
+    // receiving nothing at all. Whatever UIKit does with a transformed view
+    // inside its own hosting hierarchy, three builds have now failed to
+    // predict it. -[UITouch locationInView:] resolves that same transform for
+    // us, so taking delivery here removes the guesswork entirely.
+    //
+    // Without a presenting view - the software-rendered Wine desktop, where
+    // SDL owns a renderer and its own logical-size mapping - pass the touch
+    // down as before.
+    return BVNGuestPresentationView() != nil ? self : nil;
+}
+
+// ---------------------------------------------------------------------------
+// Guest pointer input
+// ---------------------------------------------------------------------------
+
+- (UITouch*)guestTouchIn:(NSSet<UITouch*>*)touches {
+    for (UITouch* touch in touches) {
+        if (touch == self.guestTouch) {
+            return touch;
+        }
     }
-    return hit;
+    return nil;
+}
+
+- (BOOL)sendGuestPointer:(UITouch*)touch phase:(int)phase {
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation == nil) {
+        return NO;
+    }
+    const CGPoint point = [touch locationInView:presentation];
+    BVNGuestControlsSendPointer((int)lround(point.x), (int)lround(point.y),
+                                phase);
+    return YES;
+}
+
+- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    if (self.guestTouch != nil) {
+        // A second finger is for the right-click gesture, not a second cursor.
+        return;
+    }
+    UITouch* touch = touches.anyObject;
+    if (touch == nil || ![self sendGuestPointer:touch phase:1]) {
+        [super touchesBegan:touches withEvent:event];
+        return;
+    }
+    self.guestTouch = touch;
+}
+
+- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    UITouch* touch = [self guestTouchIn:touches];
+    if (touch != nil) {
+        [self sendGuestPointer:touch phase:0];
+    }
+}
+
+- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    UITouch* touch = [self guestTouchIn:touches];
+    if (touch == nil) {
+        return;
+    }
+    [self sendGuestPointer:touch phase:2];
+    self.guestTouch = nil;
+}
+
+- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+    UITouch* touch = [self guestTouchIn:touches];
+    if (touch == nil) {
+        return;
+    }
+    // Release the button even on a cancel, or the guest is left with it held.
+    [self sendGuestPointer:touch phase:2];
+    self.guestTouch = nil;
 }
 
 // UIKit reports the safe area separately from, and sometimes later than, the
@@ -489,10 +559,17 @@ static BVNGuestOverlayView* gOverlay = nil;
 
     self.scrim.frame = bounds;
 
-    self.menuButton.frame = CGRectMake(safe.left + kBVNOverlayMargin,
-                                       safe.top + kBVNOverlayMargin,
-                                       kBVNMenuButtonSize,
-                                       kBVNMenuButtonSize);
+    self.menuButton.bounds = CGRectMake(0.0, 0.0, kBVNMenuButtonSize,
+                                        kBVNMenuButtonSize);
+    const CGRect travel = [self menuButtonTravel];
+    if (self.menuButtonFraction.x < 0.0) {
+        self.menuButton.center = CGPointMake(CGRectGetMinX(travel),
+                                             CGRectGetMinY(travel));
+    } else {
+        self.menuButton.center = CGPointMake(
+            CGRectGetMinX(travel) + travel.size.width * self.menuButtonFraction.x,
+            CGRectGetMinY(travel) + travel.size.height * self.menuButtonFraction.y);
+    }
 
     [self layoutMenuPanelWithSafeArea:safe];
     [self layoutKeyboardPanelWithSafeArea:safe];
@@ -510,8 +587,6 @@ static BVNGuestOverlayView* gOverlay = nil;
     const CGFloat width = MIN(kBVNMenuWidth,
                               self.bounds.size.width - safe.left - safe.right -
                                   kBVNOverlayMargin * 2.0);
-    const CGFloat x = safe.left + kBVNOverlayMargin;
-    const CGFloat y = CGRectGetMaxY(self.menuButton.frame) + 8.0;
 
     const CGFloat inset = 16.0;
     CGFloat cursor = 0.0;
@@ -532,6 +607,23 @@ static BVNGuestOverlayView* gOverlay = nil;
             cursor += kBVNMenuRowHeight;
         }
     }
+    // Follow the menu button, then clamp inside the safe area. The button is
+    // draggable, so the panel has to be able to open above it or to its left
+    // rather than always down-and-right off the screen - and it must clear the
+    // Dynamic Island, which it was not doing when the insets were read from
+    // the wrong view.
+    CGFloat x = CGRectGetMinX(self.menuButton.frame);
+    CGFloat y = CGRectGetMaxY(self.menuButton.frame) + 8.0;
+    const CGFloat maxX = self.bounds.size.width - safe.right -
+                         kBVNOverlayMargin - width;
+    const CGFloat maxY = self.bounds.size.height - safe.bottom -
+                         kBVNOverlayMargin - cursor;
+    if (y > maxY) {
+        // Not enough room below: open upwards from the button instead.
+        y = CGRectGetMinY(self.menuButton.frame) - 8.0 - cursor;
+    }
+    x = MIN(MAX(x, safe.left + kBVNOverlayMargin), MAX(maxX, safe.left));
+    y = MIN(MAX(y, safe.top + kBVNOverlayMargin), MAX(maxY, safe.top));
     self.menuPanel.frame = CGRectMake(x, y, width, cursor);
 }
 
@@ -582,6 +674,46 @@ static BVNGuestOverlayView* gOverlay = nil;
             keyX = nextX + kBVNKeyGap;
         }
         rowY += rowHeight + kBVNKeyGap;
+    }
+}
+
+// The draggable area the menu button's centre is allowed to occupy, in the
+// overlay's coordinates: the safe area, inset by half the button so it can
+// never be dragged half off the screen.
+- (CGRect)menuButtonTravel {
+    const UIEdgeInsets safe = self.safeAreaInsets;
+    const CGFloat half = kBVNMenuButtonSize / 2.0;
+    CGRect travel = UIEdgeInsetsInsetRect(self.bounds, safe);
+    travel = CGRectInset(travel, half + kBVNOverlayMargin,
+                         half + kBVNOverlayMargin);
+    if (travel.size.width < 0.0 || travel.size.height < 0.0) {
+        travel = self.bounds;
+    }
+    return travel;
+}
+
+- (void)dragMenuButton:(UIPanGestureRecognizer*)recognizer {
+    const CGPoint translation = [recognizer translationInView:self];
+    [recognizer setTranslation:CGPointZero inView:self];
+
+    const CGRect travel = [self menuButtonTravel];
+    CGPoint centre = self.menuButton.center;
+    centre.x = MIN(MAX(centre.x + translation.x, CGRectGetMinX(travel)),
+                   CGRectGetMaxX(travel));
+    centre.y = MIN(MAX(centre.y + translation.y, CGRectGetMinY(travel)),
+                   CGRectGetMaxY(travel));
+    self.menuButton.center = centre;
+
+    if (recognizer.state == UIGestureRecognizerStateEnded ||
+        recognizer.state == UIGestureRecognizerStateCancelled) {
+        // Store it as a fraction of the travel rectangle, so a rotation keeps
+        // it in the same relative place instead of clamping it to an edge.
+        self.menuButtonFraction = CGPointMake(
+            travel.size.width > 0.0
+                ? (centre.x - CGRectGetMinX(travel)) / travel.size.width : 0.0,
+            travel.size.height > 0.0
+                ? (centre.y - CGRectGetMinY(travel)) / travel.size.height : 0.0);
+        [self setNeedsLayout];
     }
 }
 

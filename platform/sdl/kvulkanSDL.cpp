@@ -32,6 +32,10 @@
 #include "sdlcallback.h"
 
 #ifdef BOXEDWINE_IOS
+#include <sys/resource.h>
+#endif
+
+#ifdef BOXEDWINE_IOS
 extern "C" void BVNRegisterGuestVulkanSurface(void* surface);
 extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                                                 U32 guestWidth,
@@ -524,6 +528,55 @@ void KVulkdanSDLImpl::submitVulkanWorkload(int result, U32 submitCount,
     }
 }
 
+#ifdef BOXEDWINE_IOS
+// Report the presented frame rate and how much host CPU produced it.
+//
+// "The frame rate is not good" cannot be acted on, and neither can any change
+// made in response to it, until there is a number. This is that number, and it
+// costs one getrusage and two comparisons every five seconds.
+//
+// Cores busy is the useful half. Emulating x86 on ARM is CPU-bound by nature,
+// so a low frame rate at ~1 core says one guest thread is the bottleneck and
+// the work is to make that thread's translated code faster; a low frame rate
+// at several cores says the work is spread and the ceiling is throughput.
+void bvnReportPresentRate(void) {
+    static U32 windowStart = 0;
+    static U32 frames = 0;
+    static double lastCpuSeconds = 0.0;
+
+    ++frames;
+    const U32 now = SDL_GetTicks();
+    if (windowStart == 0) {
+        windowStart = now;
+        return;
+    }
+    const U32 elapsed = now - windowStart;
+    if (elapsed < 5000) {
+        return;
+    }
+
+    rusage usage = {};
+    double cpuSeconds = 0.0;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        cpuSeconds = (double)usage.ru_utime.tv_sec +
+                     (double)usage.ru_utime.tv_usec / 1000000.0 +
+                     (double)usage.ru_stime.tv_sec +
+                     (double)usage.ru_stime.tv_usec / 1000000.0;
+    }
+    const double wallSeconds = (double)elapsed / 1000.0;
+    const double coresBusy = lastCpuSeconds > 0.0
+        ? (cpuSeconds - lastCpuSeconds) / wallSeconds : 0.0;
+
+    klog_fmt("iOS guest performance: %.1f presented frames/sec over %u ms; "
+             "host CPU %.2f cores busy",
+             (double)frames / wallSeconds, elapsed, coresBusy);
+
+    lastCpuSeconds = cpuSeconds;
+    windowStart = now;
+    frames = 0;
+}
+#endif
+
 void KVulkdanSDLImpl::presentVulkanSwapchain(void* swapchain, int result) {
     void* surface = nullptr;
     U64 attempt = 0;
@@ -561,6 +614,9 @@ void KVulkdanSDLImpl::presentVulkanSwapchain(void* swapchain, int result) {
     }
 
 #ifdef BOXEDWINE_IOS
+    if (presentation && (result == 0 || result == 1000001003)) {
+        bvnReportPresentRate();
+    }
     if (firstSuccessfulPresent) {
         // UIKit is main-thread-only. Dispatch just this first transition;
         // subsequent frames remain entirely on the Vulkan/Metal path.

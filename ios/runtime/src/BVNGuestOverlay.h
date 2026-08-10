@@ -81,8 +81,17 @@ uint32_t BVNGuestControlsScancodeForName(const char* name);
 
 void BVNGuestControlsSendKey(uint32_t scancode, bool down);
 
-// A right click at a point in the Metal view's bounds, which since build 65
-// are the guest resolution.  Used by the overlay's two-finger tap.
+// Guest pointer input, in the presenting view's bounds - which since build 65
+// are the guest resolution.  phase: 0 = move, 1 = press, 2 = release.
+//
+// The overlay owns this instead of letting SDL's view receive the touch.
+// Depending on UIKit to deliver a touch to a transformed view inside a
+// hierarchy UIKit itself owns broke in three different ways across builds 62,
+// 64 and 66; -[UITouch locationInView:] resolves the transform for us and
+// nothing about the intervening hierarchy can matter.
+void BVNGuestControlsSendPointer(int x, int y, int phase);
+
+// A right click at a point in the same space.  Used by the two-finger tap.
 void BVNGuestControlsSendRightClick(int x, int y);
 
 // The Metal view the guest is presenting through, so the overlay can convert a
