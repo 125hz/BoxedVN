@@ -165,6 +165,31 @@ struct LibraryView: View {
                     .textSelection(.enabled)
             }
 
+            // Above the games on purpose: it is the way in to everything the
+            // library cannot show - Explorer, a Wine control panel, whatever a
+            // game's own installer left on the desktop.
+            Section {
+                Button {
+                    model.launchWineDesktop()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Windows desktop")
+                            Text("Explorer, Start menu and the Wine control "
+                                 + "panel, at 1280x720")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "macwindow")
+                    }
+                }
+                .disabled(model.rootFilesystem == nil
+                          || model.runtimeState == .running)
+            } header: {
+                Text("Desktop")
+            }
+
             Section {
                 if model.games.isEmpty {
                     Text("No games imported yet.")

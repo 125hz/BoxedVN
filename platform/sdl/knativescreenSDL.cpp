@@ -33,104 +33,20 @@ extern "C" void BVNAttachGuestWindowToScene(void);
 // window points. Returns false when it is filling the window, so a caller can
 // never assume a letterbox that did not happen.
 extern "C" bool BVNGuestPresentationContentRect(int* x, int* y, int* w, int* h);
+// The startup notice is UIKit text over SDL's backdrop; see BVNGuestOverlay.mm.
+extern "C" void BVNGuestStartupNoticeSetVisible(bool visible);
+extern "C" void BVNGuestStartupNoticeSetProgress(size_t jitBlocks);
 
 namespace {
 
 std::atomic<size_t> gIOSJITAllocationCount{0};
 KNativeScreenSDL* gIOSActiveScreen = nullptr;
 
-struct BVNPixelGlyph {
-    char character;
-    U8 rows[7];
-};
-
-// A deliberately tiny font keeps the startup/status UI inside SDL, where it
-// is rendered by the same Metal-backed renderer as Wine. This is the subset
-// needed by the guest loading screen and keyboard button.
-constexpr BVNPixelGlyph kBVNPixelGlyphs[] = {
-    {'A', {14, 17, 17, 31, 17, 17, 17}},
-    {'B', {30, 17, 17, 30, 17, 17, 30}},
-    {'C', {14, 17, 16, 16, 16, 17, 14}},
-    {'D', {30, 17, 17, 17, 17, 17, 30}},
-    {'E', {31, 16, 16, 30, 16, 16, 31}},
-    {'F', {31, 16, 16, 30, 16, 16, 16}},
-    {'G', {14, 17, 16, 23, 17, 17, 15}},
-    {'H', {17, 17, 17, 31, 17, 17, 17}},
-    {'I', {31, 4, 4, 4, 4, 4, 31}},
-    {'J', {7, 2, 2, 2, 18, 18, 12}},
-    {'K', {17, 18, 20, 24, 20, 18, 17}},
-    {'L', {16, 16, 16, 16, 16, 16, 31}},
-    {'M', {17, 27, 21, 21, 17, 17, 17}},
-    {'N', {17, 25, 21, 19, 17, 17, 17}},
-    {'O', {14, 17, 17, 17, 17, 17, 14}},
-    {'P', {30, 17, 17, 30, 16, 16, 16}},
-    {'Q', {14, 17, 17, 17, 21, 18, 13}},
-    {'R', {30, 17, 17, 30, 20, 18, 17}},
-    {'S', {15, 16, 16, 14, 1, 1, 30}},
-    {'T', {31, 4, 4, 4, 4, 4, 4}},
-    {'U', {17, 17, 17, 17, 17, 17, 14}},
-    {'V', {17, 17, 17, 17, 17, 10, 4}},
-    {'W', {17, 17, 17, 21, 21, 21, 10}},
-    {'X', {17, 17, 10, 4, 10, 17, 17}},
-    {'Y', {17, 17, 10, 4, 4, 4, 4}},
-    {'Z', {31, 1, 2, 4, 8, 16, 31}},
-    {'0', {14, 17, 19, 21, 25, 17, 14}},
-    {'1', {4, 12, 4, 4, 4, 4, 14}},
-    {'2', {14, 17, 1, 2, 4, 8, 31}},
-    {'3', {30, 1, 1, 14, 1, 1, 30}},
-    {'4', {2, 6, 10, 18, 31, 2, 2}},
-    {'5', {31, 16, 16, 30, 1, 1, 30}},
-    {'6', {14, 16, 16, 30, 17, 17, 14}},
-    {'7', {31, 1, 2, 4, 8, 8, 8}},
-    {'8', {14, 17, 17, 14, 17, 17, 14}},
-    {'9', {14, 17, 17, 15, 1, 1, 14}},
-    {'.', {0, 0, 0, 0, 0, 12, 12}},
-};
-
-const U8* bvnGlyphRows(char character) {
-    for (const BVNPixelGlyph& glyph : kBVNPixelGlyphs) {
-        if (glyph.character == character) {
-            return glyph.rows;
-        }
-    }
-    return nullptr;
-}
-
-int bvnPixelTextWidth(const char* text, int scale) {
-    return text && text[0] ? ((int)strlen(text) * 6 - 1) * scale : 0;
-}
-
-void bvnDrawPixelText(SDL_Renderer* renderer, const char* text, int x, int y,
-                      int scale, U8 red, U8 green, U8 blue) {
-    SDL_SetRenderDrawColor(renderer, red, green, blue, 255);
-    for (const char* cursor = text; cursor && *cursor; ++cursor, x += 6 * scale) {
-        const U8* rows = bvnGlyphRows(*cursor);
-        if (!rows) {
-            continue;
-        }
-        for (int row = 0; row < 7; ++row) {
-            for (int column = 0; column < 5; ++column) {
-                if (rows[row] & (1 << (4 - column))) {
-                    SDL_Rect pixel = {x + column * scale, y + row * scale,
-                                      scale, scale};
-                    SDL_RenderFillRect(renderer, &pixel);
-                }
-            }
-        }
-    }
-}
-
-void bvnDrawCenteredPixelText(SDL_Renderer* renderer, const char* text, int y,
-                              int scale, int width, U8 red, U8 green, U8 blue) {
-    bvnDrawPixelText(renderer, text,
-                     (width - bvnPixelTextWidth(text, scale)) / 2, y, scale,
-                     red, green, blue);
-}
-
 } // namespace
 
 extern "C" void BVNGuestLoadingUpdateJITProgress(size_t allocationCount) {
     gIOSJITAllocationCount.store(allocationCount, std::memory_order_relaxed);
+    BVNGuestStartupNoticeSetProgress(allocationCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +364,7 @@ void KNativeScreenSDL::putBitsOnWnd(U32 id, U8* bits, U32 bitsPerPixel, U32 srcP
     // which is the deterministic point at which startup has completed.
     if (guestLoadingVisible) {
         guestLoadingVisible = false;
+        BVNGuestStartupNoticeSetVisible(false);
         klog_fmt("iOS guest startup complete: first mapped X11 window 0x%x",
                  id);
     }
@@ -744,48 +661,15 @@ void KNativeScreenSDL::drawIOSGuestLoading() {
     if (!renderer) {
         return;
     }
-
-    const int width = (int)input->width;
-    const int height = (int)input->height;
+    // Just the backdrop. The words are a UIKit view now
+    // (BVNGuestStartupNoticeSetVisible), because a bitmap font drawn one
+    // rectangle per pixel through SDL cannot say anything at a readable size -
+    // and what this screen has to say, that Wine can take three minutes and
+    // the app must stay open, is the difference between waiting and force
+    // quitting.
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
-    SDL_SetRenderDrawColor(renderer, 14, 19, 29, 255);
+    SDL_SetRenderDrawColor(renderer, 10, 12, 20, 255);
     SDL_RenderClear(renderer);
-
-    const int centerY = height / 2;
-    bvnDrawCenteredPixelText(renderer, "STARTING WINE", centerY - 116, 5,
-                             width, 245, 247, 250);
-
-    // This activity glyph makes the surface clearly intentional. Wine's
-    // pre-main-loop startup blocks SDL event processing, so it must not imply
-    // smooth animation during that phase.
-    const int phase = (SDL_GetTicks() / 160) % 8;
-    static const int spinnerX[8] = {0, 18, 26, 18, 0, -18, -26, -18};
-    static const int spinnerY[8] = {-26, -18, 0, 18, 26, 18, 0, -18};
-    for (int index = 0; index < 8; ++index) {
-        const U8 brightness = index == phase ? 245 : 78;
-        SDL_SetRenderDrawColor(renderer, 56, 132, brightness, 255);
-        SDL_Rect dot = {width / 2 + spinnerX[index] - 5,
-                        centerY - 23 + spinnerY[index] - 5, 10, 10};
-        SDL_RenderFillRect(renderer, &dot);
-    }
-
-    bvnDrawCenteredPixelText(renderer, "THE APP IS WORKING", centerY + 40, 3,
-                             width, 185, 196, 214);
-    bvnDrawCenteredPixelText(renderer,
-                             "TRANSLATING X86 CODE PLEASE WAIT",
-                             centerY + 78, 2, width, 134, 148, 170);
-
-    char progress[64];
-    const size_t allocationCount =
-        gIOSJITAllocationCount.load(std::memory_order_relaxed);
-    if (allocationCount) {
-        snprintf(progress, sizeof(progress), "JIT CODE BLOCKS %zu",
-                 allocationCount);
-    } else {
-        snprintf(progress, sizeof(progress), "WINE IS LOADING");
-    }
-    bvnDrawCenteredPixelText(renderer, progress, centerY + 112, 2, width,
-                             80, 190, 112);
 }
 
 #endif
@@ -1144,6 +1028,7 @@ void KNativeScreenSDL::destroyTextureCache() {
 void KNativeScreenSDL::destroyMainWindow() {
 #ifdef BOXEDWINE_IOS
     guestLoadingVisible = false;
+    BVNGuestStartupNoticeSetVisible(false);
     guestOutputWidth = 0;
     guestOutputHeight = 0;
     if (SDL_IsTextInputActive() == SDL_TRUE) {
@@ -1290,6 +1175,7 @@ void KNativeScreenSDL::recreateMainWindow() {
         if (window && renderer) {
             guestLoadingVisible = true;
             gIOSJITAllocationCount.store(0, std::memory_order_relaxed);
+            BVNGuestStartupNoticeSetVisible(true);
 
             // recreateMainWindow runs before SDL's event loop begins. Calling
             // showWindow() here can enter sdlDispatch() when Boxedwine's SDL

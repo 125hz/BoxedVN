@@ -232,6 +232,45 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Runs Wine's desktop shell: a real Windows desktop with a taskbar, a
+    /// Start menu and Explorer, in the same emulated environment a game gets.
+    ///
+    /// 1280x720 rather than the 800x600 a game defaults to. 16:9 matches the
+    /// phone closely enough that the letterbox is thin, which keeps the
+    /// desktop's own edges - where a taskbar and window controls live - away
+    /// from the Dynamic Island instead of underneath it.
+    func launchWineDesktop() {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed. Import "
+                         + "Boxedwine's root filesystem archive in Settings first."
+            return
+        }
+        guard let prefixes = Storage.winePrefixes else {
+            alertMessage = "Could not create the Wine prefix directory."
+            return
+        }
+
+        do {
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                writableRoot: prefixes.appendingPathComponent("desktop"),
+                gameDirectory: nil,
+                executablePath: "explorer",
+                // Wine's own switch for "give me a desktop window with a
+                // shell in it" rather than rootless windows on the X root.
+                arguments: ["/desktop=BoxedVN,1280x720"],
+                environment: [],
+                workingDirectory: nil,
+                width: 1280,
+                height: 720,
+                soundEnabled: true,
+                runThroughWine: true
+            )
+        } catch {
+            alertMessage = error.localizedDescription
+        }
+    }
+
     /// Runs Wine's own Notepad from the root filesystem, with no game mounted.
     /// This is the smoke test for "does the emulated environment boot at all".
     func launchWineNotepad() {

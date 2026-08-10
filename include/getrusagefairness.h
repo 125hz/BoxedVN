@@ -124,6 +124,13 @@ private:
 namespace bvnFairness {
 extern std::atomic<std::uint64_t> throttleCount;
 extern std::atomic<std::uint64_t> throttleMicroseconds;
+// How often the guest is making these calls at all. The throttle count only
+// says how many scheduling points were handed out - one per millisecond by
+// construction - so it cannot distinguish a thread polling a thousand times a
+// second from one polling a million times. That difference decides whether the
+// spin is worth attacking at the source.
+extern std::atomic<std::uint64_t> getrusageCalls;
+extern std::atomic<std::uint64_t> schedYieldCalls;
 }
 
 #endif

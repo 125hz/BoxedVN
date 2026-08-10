@@ -189,6 +189,10 @@ static const CGFloat kBVNMenuButtonSize = 46.0;
 static const CGFloat kBVNMenuRowHeight = 50.0;
 static const CGFloat kBVNMenuWidth = 268.0;
 static const CGFloat kBVNKeyGap = 4.0;
+// Slightly faster than 1:1 so a small finger movement crosses a Wine dialog,
+// but not so fast that a title-bar button is unhittable - which is the whole
+// reason trackpad mode exists.
+static const CGFloat kBVNTrackpadSensitivity = 1.4;
 
 @interface BVNGuestOverlayView : UIView
 
@@ -197,6 +201,7 @@ static const CGFloat kBVNKeyGap = 4.0;
 @property (nonatomic, strong) UIView* menuPanel;
 @property (nonatomic, strong) UIButton* keyboardItem;
 @property (nonatomic, strong) UIButton* rotationItem;
+@property (nonatomic, strong) UIButton* pointerItem;
 @property (nonatomic, strong) UIButton* quitItem;
 @property (nonatomic, strong) UILabel* quitPrompt;
 @property (nonatomic, strong) UIButton* quitConfirmItem;
@@ -213,6 +218,23 @@ static const CGFloat kBVNKeyGap = 4.0;
 // Where the player has dragged the menu button to, as a fraction of the safe
 // area, so it stays put across a rotation. Negative means "not moved yet".
 @property (nonatomic, assign) CGPoint menuButtonFraction;
+
+// Pointer mode. Direct is the default and must stay the default: a visual
+// novel is a full-screen tap target, and making the player drive a virtual
+// cursor to advance dialogue would be strictly worse. Trackpad exists for the
+// small Windows controls - a Wine title bar button, a file-manager row - that
+// a fingertip cannot hit accurately.
+@property (nonatomic, assign) BOOL trackpadMode;
+@property (nonatomic, strong) UIView* cursorView;
+// The cursor's position in the presenting view's bounds, i.e. guest pixels.
+@property (nonatomic, assign) CGPoint cursorGuestPoint;
+@property (nonatomic, assign) CGPoint trackpadTouchStart;
+@property (nonatomic, assign) NSTimeInterval trackpadTouchStartTime;
+@property (nonatomic, assign) BOOL trackpadTouchMoved;
+
+// The startup notice shown while Wine boots.
+@property (nonatomic, strong) UIView* startupNotice;
+@property (nonatomic, strong) UILabel* startupProgress;
 
 // A latched Ctrl that outlives the keyboard would leave the guest convinced a
 // key is held down with no way to release it.
@@ -235,8 +257,92 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.keyRows = BVNKeyboardRows();
     [self buildMenu];
     [self buildKeyboard];
+    [self buildCursor];
+    [self buildStartupNotice];
     [self reportUnresolvedKeys];
     return self;
+}
+
+- (void)buildCursor {
+    // A ring rather than an arrow: it reads at any size, needs no asset, and
+    // stays visible over both the bright and dark artwork a visual novel uses.
+    UIView* cursor = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 22, 22)];
+    cursor.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.22];
+    cursor.layer.cornerRadius = 11.0;
+    cursor.layer.borderWidth = 2.0;
+    cursor.layer.borderColor = UIColor.whiteColor.CGColor;
+    cursor.userInteractionEnabled = NO;
+    cursor.hidden = YES;
+
+    UIView* dot = [[UIView alloc] initWithFrame:CGRectMake(9, 9, 4, 4)];
+    dot.backgroundColor = UIColor.whiteColor;
+    dot.layer.cornerRadius = 2.0;
+    [cursor addSubview:dot];
+
+    [self addSubview:cursor];
+    self.cursorView = cursor;
+}
+
+- (void)buildStartupNotice {
+    UIView* notice = [[UIView alloc] initWithFrame:self.bounds];
+    notice.backgroundColor = [UIColor colorWithRed:10.0 / 255.0
+                                             green:12.0 / 255.0
+                                              blue:20.0 / 255.0
+                                             alpha:1.0];
+    notice.userInteractionEnabled = NO;
+    notice.hidden = YES;
+
+    UILabel* title = [[UILabel alloc] initWithFrame:CGRectZero];
+    title.text = @"Starting Wine";
+    title.textColor = UIColor.whiteColor;
+    title.font = [UIFont systemFontOfSize:28.0 weight:UIFontWeightSemibold];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel* body = [[UILabel alloc] initWithFrame:CGRectZero];
+    body.text = @"This can take up to 3 minutes.\n\n"
+                 "Keep BoxedVN open while it works — don't minimise the app "
+                 "or lock the screen, or Wine will have to start over.";
+    body.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+    body.font = [UIFont systemFontOfSize:16.0];
+    body.textAlignment = NSTextAlignmentCenter;
+    body.numberOfLines = 0;
+    body.translatesAutoresizingMaskIntoConstraints = NO;
+
+    // Deliberately not a spinner. An indeterminate spinner says "something is
+    // happening" and nothing more; a rising count of translated code blocks
+    // says the same thing and also lets a player tell progress from a hang.
+    UILabel* progress = [[UILabel alloc] initWithFrame:CGRectZero];
+    progress.text = @"Preparing…";
+    progress.textColor = [UIColor colorWithRed:0.35 green:0.78 blue:0.55
+                                         alpha:1.0];
+    progress.font = [UIFont monospacedDigitSystemFontOfSize:14.0
+                                                     weight:UIFontWeightRegular];
+    progress.textAlignment = NSTextAlignmentCenter;
+    progress.translatesAutoresizingMaskIntoConstraints = NO;
+
+    [notice addSubview:title];
+    [notice addSubview:body];
+    [notice addSubview:progress];
+    [NSLayoutConstraint activateConstraints:@[
+        [title.centerXAnchor constraintEqualToAnchor:notice.centerXAnchor],
+        [title.centerYAnchor constraintEqualToAnchor:notice.centerYAnchor
+                                            constant:-70.0],
+        [body.topAnchor constraintEqualToAnchor:title.bottomAnchor
+                                       constant:18.0],
+        [body.centerXAnchor constraintEqualToAnchor:notice.centerXAnchor],
+        [body.widthAnchor constraintLessThanOrEqualToConstant:420.0],
+        [body.leadingAnchor
+            constraintGreaterThanOrEqualToAnchor:notice.leadingAnchor
+                                        constant:24.0],
+        [progress.topAnchor constraintEqualToAnchor:body.bottomAnchor
+                                           constant:24.0],
+        [progress.centerXAnchor constraintEqualToAnchor:notice.centerXAnchor],
+    ]];
+
+    [self addSubview:notice];
+    self.startupNotice = notice;
+    self.startupProgress = progress;
 }
 
 // A key SDL does not recognise would otherwise be a button that silently does
@@ -367,11 +473,15 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.rotationItem = [self makePanelItemWithTitle:@"Rotation: locked"
                                               action:@selector(toggleRotation)
                                          destructive:NO];
+    self.pointerItem = [self makePanelItemWithTitle:@"Pointer: direct tap"
+                                             action:@selector(togglePointerMode)
+                                        destructive:NO];
     self.quitItem = [self makePanelItemWithTitle:@"Quit to library"
                                           action:@selector(askToQuit)
                                      destructive:YES];
     [panel addSubview:self.keyboardItem];
     [panel addSubview:self.rotationItem];
+    [panel addSubview:self.pointerItem];
     [panel addSubview:self.quitItem];
 
     // Confirmation is drawn inside this panel rather than presented as a
@@ -524,18 +634,51 @@ static BVNGuestOverlayView* gOverlay = nil;
         return;
     }
     UITouch* touch = touches.anyObject;
-    if (touch == nil || ![self sendGuestPointer:touch phase:1]) {
+    if (touch == nil || BVNGuestPresentationView() == nil) {
         [super touchesBegan:touches withEvent:event];
         return;
     }
     self.guestTouch = touch;
+
+    if (self.trackpadMode) {
+        // Nothing is pressed yet: a trackpad only clicks when the finger lifts
+        // without having travelled.
+        self.trackpadTouchStart = [touch locationInView:self];
+        self.trackpadTouchStartTime = touch.timestamp;
+        self.trackpadTouchMoved = NO;
+        return;
+    }
+    [self sendGuestPointer:touch phase:1];
 }
 
 - (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
     UITouch* touch = [self guestTouchIn:touches];
-    if (touch != nil) {
-        [self sendGuestPointer:touch phase:0];
+    if (touch == nil) {
+        return;
     }
+    if (!self.trackpadMode) {
+        [self sendGuestPointer:touch phase:0];
+        return;
+    }
+
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation == nil) {
+        return;
+    }
+    // Relative motion, in the presenting view's own scale so a given finger
+    // movement covers the same fraction of the picture whatever the letterbox
+    // is doing.
+    const CGPoint now = [touch locationInView:presentation];
+    const CGPoint before = [touch previousLocationInView:presentation];
+    const CGFloat dx = now.x - before.x;
+    const CGFloat dy = now.y - before.y;
+    if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
+        self.trackpadTouchMoved = YES;
+    }
+    [self moveCursorBy:CGPointMake(dx * kBVNTrackpadSensitivity,
+                                   dy * kBVNTrackpadSensitivity)];
+    BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
+                                (int)lround(self.cursorGuestPoint.y), 0);
 }
 
 - (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
@@ -543,8 +686,20 @@ static BVNGuestOverlayView* gOverlay = nil;
     if (touch == nil) {
         return;
     }
-    [self sendGuestPointer:touch phase:2];
     self.guestTouch = nil;
+
+    if (!self.trackpadMode) {
+        [self sendGuestPointer:touch phase:2];
+        return;
+    }
+    // A tap that did not travel is a click, wherever the cursor happens to be.
+    const NSTimeInterval held = touch.timestamp - self.trackpadTouchStartTime;
+    if (!self.trackpadTouchMoved && held < 0.4) {
+        const int x = (int)lround(self.cursorGuestPoint.x);
+        const int y = (int)lround(self.cursorGuestPoint.y);
+        BVNGuestControlsSendPointer(x, y, 1);
+        BVNGuestControlsSendPointer(x, y, 2);
+    }
 }
 
 - (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
@@ -552,158 +707,66 @@ static BVNGuestOverlayView* gOverlay = nil;
     if (touch == nil) {
         return;
     }
-    // Release the button even on a cancel, or the guest is left with it held.
-    [self sendGuestPointer:touch phase:2];
+    if (!self.trackpadMode) {
+        // Release the button even on a cancel, or the guest is left with it
+        // held.
+        [self sendGuestPointer:touch phase:2];
+    }
     self.guestTouch = nil;
 }
 
-// UIKit reports the safe area separately from, and sometimes later than, the
-// bounds change that accompanies a rotation. Build 64 fitted the guest picture
-// during a portrait layout pass that was still reporting the landscape insets,
-// producing a 278pt-wide picture in a 402pt-wide window. Re-fit when the insets
-// settle.
-- (void)safeAreaInsetsDidChange {
-    [super safeAreaInsetsDidChange];
-    [self setNeedsLayout];
-}
-
 // ---------------------------------------------------------------------------
-// Layout
+// The virtual cursor
 // ---------------------------------------------------------------------------
 
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    if (self.layingOut) {
+- (void)moveCursorBy:(CGPoint)delta {
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation == nil) {
         return;
     }
-    self.layingOut = YES;
-
-    const UIEdgeInsets safe = self.safeAreaInsets;
-    const CGRect bounds = self.bounds;
-
-    self.scrim.frame = bounds;
-
-    self.menuButton.bounds = CGRectMake(0.0, 0.0, kBVNMenuButtonSize,
-                                        kBVNMenuButtonSize);
-    const CGRect travel = [self menuButtonTravel];
-    if (self.menuButtonFraction.x < 0.0) {
-        self.menuButton.center = CGPointMake(CGRectGetMinX(travel),
-                                             CGRectGetMinY(travel));
-    } else {
-        self.menuButton.center = CGPointMake(
-            CGRectGetMinX(travel) + travel.size.width * self.menuButtonFraction.x,
-            CGRectGetMinY(travel) + travel.size.height * self.menuButtonFraction.y);
-    }
-
-    [self layoutMenuPanelWithSafeArea:safe];
-    [self layoutKeyboardPanelWithSafeArea:safe];
-
-    // Deliberately does NOT re-fit the guest picture. That belongs to the poll
-    // in KNativeInputSDL::processEvents, which runs outside any UIKit layout
-    // pass. Re-fitting from here means running the presenter - which flushes
-    // the Metal view's layout - from inside this layout pass, on a view in a
-    // sibling subtree. Build 65 did that and UIKit stopped laying the subtree
-    // out at all after the first rotation.
-    self.layingOut = NO;
+    const CGRect bounds = presentation.bounds;
+    CGPoint point = self.cursorGuestPoint;
+    point.x = MIN(MAX(point.x + delta.x, 0.0), bounds.size.width - 1.0);
+    point.y = MIN(MAX(point.y + delta.y, 0.0), bounds.size.height - 1.0);
+    self.cursorGuestPoint = point;
+    [self positionCursor];
 }
 
-- (void)layoutMenuPanelWithSafeArea:(UIEdgeInsets)safe {
-    const CGFloat width = MIN(kBVNMenuWidth,
-                              self.bounds.size.width - safe.left - safe.right -
-                                  kBVNOverlayMargin * 2.0);
-
-    const CGFloat inset = 16.0;
-    CGFloat cursor = 0.0;
-    if (self.confirmingQuit) {
-        self.quitPrompt.frame = CGRectMake(inset, 12.0, width - inset * 2.0,
-                                           40.0);
-        cursor = 60.0;
-        for (UIButton* item in @[self.quitCancelItem, self.quitConfirmItem]) {
-            item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
-                                    kBVNMenuRowHeight);
-            cursor += kBVNMenuRowHeight;
-        }
-    } else {
-        for (UIButton* item in @[self.keyboardItem, self.rotationItem,
-                                 self.quitItem]) {
-            item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
-                                    kBVNMenuRowHeight);
-            cursor += kBVNMenuRowHeight;
-        }
-    }
-    // Follow the menu button, then clamp inside the safe area. The button is
-    // draggable, so the panel has to be able to open above it or to its left
-    // rather than always down-and-right off the screen - and it must clear the
-    // Dynamic Island, which it was not doing when the insets were read from
-    // the wrong view.
-    CGFloat x = CGRectGetMinX(self.menuButton.frame);
-    CGFloat y = CGRectGetMaxY(self.menuButton.frame) + 8.0;
-    const CGFloat maxX = self.bounds.size.width - safe.right -
-                         kBVNOverlayMargin - width;
-    const CGFloat maxY = self.bounds.size.height - safe.bottom -
-                         kBVNOverlayMargin - cursor;
-    if (y > maxY) {
-        // Not enough room below: open upwards from the button instead.
-        y = CGRectGetMinY(self.menuButton.frame) - 8.0 - cursor;
-    }
-    x = MIN(MAX(x, safe.left + kBVNOverlayMargin), MAX(maxX, safe.left));
-    y = MIN(MAX(y, safe.top + kBVNOverlayMargin), MAX(maxY, safe.top));
-    self.menuPanel.frame = CGRectMake(x, y, width, cursor);
-}
-
-- (void)layoutKeyboardPanelWithSafeArea:(UIEdgeInsets)safe {
-    const CGFloat width = self.bounds.size.width;
-    const NSUInteger rowCount = self.keyRows.count;
-    if (rowCount == 0 || width <= 0.0) {
+- (void)positionCursor {
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation == nil || !self.trackpadMode) {
+        self.cursorView.hidden = YES;
         return;
     }
-
-    // Six rows have to fit a 402pt-tall landscape phone without eating the
-    // whole screen - at this fraction they take about 63% of it, and the
-    // keyboard is summoned deliberately and dismissed again - while still
-    // being tappable on a 402pt-wide portrait one, where the clamp takes over.
-    const CGFloat usableHeight = self.bounds.size.height - safe.top;
-    CGFloat rowHeight = floor(usableHeight * 0.085);
-    rowHeight = MAX(28.0, MIN(46.0, rowHeight));
-
-    const CGFloat contentHeight =
-        rowCount * rowHeight + (rowCount - 1) * kBVNKeyGap;
-    const CGFloat panelHeight = contentHeight + kBVNKeyGap * 2.0 + safe.bottom;
-    self.keyboardPanel.frame = CGRectMake(0.0,
-                                          self.bounds.size.height - panelHeight,
-                                          width, panelHeight);
-
-    const CGFloat left = safe.left + kBVNKeyGap;
-    const CGFloat right = width - safe.right - kBVNKeyGap;
-    CGFloat rowY = kBVNKeyGap;
-    for (NSArray<BVNOverlayKey*>* row in self.keyRows) {
-        CGFloat totalWeight = 0.0;
-        for (BVNOverlayKey* key in row) {
-            totalWeight += key.weight;
-        }
-        const CGFloat usableWidth =
-            (right - left) - ((CGFloat)row.count - 1.0) * kBVNKeyGap;
-        CGFloat consumed = 0.0;
-        CGFloat keyX = left;
-        for (NSUInteger index = 0; index < row.count; ++index) {
-            BVNOverlayKey* key = row[index];
-            consumed += key.weight;
-            const CGFloat nextX = left +
-                usableWidth * (consumed / totalWeight) +
-                (CGFloat)index * kBVNKeyGap;
-            key.button.frame = CGRectMake(keyX, rowY, nextX - keyX, rowHeight);
-            key.button.titleLabel.font =
-                [UIFont systemFontOfSize:MIN(17.0, rowHeight * 0.42)
-                                  weight:UIFontWeightMedium];
-            keyX = nextX + kBVNKeyGap;
-        }
-        rowY += rowHeight + kBVNKeyGap;
-    }
+    self.cursorView.hidden = NO;
+    self.cursorView.center = [presentation convertPoint:self.cursorGuestPoint
+                                                 toView:self];
+    [self bringSubviewToFront:self.cursorView];
 }
 
-// The draggable area the menu button's centre is allowed to occupy, in the
-// overlay's coordinates: the safe area, inset by half the button so it can
-// never be dragged half off the screen.
+- (void)setTrackpadModeEnabled:(BOOL)enabled {
+    if (self.trackpadMode == enabled) {
+        return;
+    }
+    self.trackpadMode = enabled;
+    if (enabled) {
+        // Start in the middle of the picture rather than at 0,0, which on a
+        // Wine desktop is behind the menu button.
+        UIView* presentation = BVNGuestPresentationView();
+        if (presentation != nil) {
+            self.cursorGuestPoint =
+                CGPointMake(presentation.bounds.size.width / 2.0,
+                            presentation.bounds.size.height / 2.0);
+        }
+    }
+    [self positionCursor];
+    BVNLogWrite(BVNLogLevelInfo, "input",
+                enabled ? "Pointer mode: trackpad (drag to move, tap to click)."
+                        : "Pointer mode: direct (tap where you want to click).");
+}
+
+// The rectangle the menu button's centre may occupy: the safe area, inset by
+// half the button so it can never be dragged half off the screen.
 - (CGRect)menuButtonTravel {
     const UIEdgeInsets safe = self.safeAreaInsets;
     const CGFloat half = kBVNMenuButtonSize / 2.0;
@@ -754,7 +817,9 @@ static BVNGuestOverlayView* gOverlay = nil;
     // Midpoint of the two fingers, in the presenting view's bounds - which are
     // the guest resolution, and which -locationInView: resolves through the
     // view's scale transform for us.
-    const CGPoint point = [recognizer locationInView:presentation];
+    CGPoint point = self.trackpadMode
+        ? self.cursorGuestPoint
+        : [recognizer locationInView:presentation];
     if (!CGRectContainsPoint(presentation.bounds, point)) {
         return;
     }
@@ -787,6 +852,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     const BOOL confirming = self.confirmingQuit;
     self.keyboardItem.hidden = confirming;
     self.rotationItem.hidden = confirming;
+    self.pointerItem.hidden = confirming;
     self.quitItem.hidden = confirming;
     self.quitPrompt.hidden = !confirming;
     self.quitCancelItem.hidden = !confirming;
@@ -799,6 +865,9 @@ static BVNGuestOverlayView* gOverlay = nil;
                                      ? @"Rotation: free"
                                      : @"Rotation: locked")
                        forState:UIControlStateNormal];
+    [self.pointerItem setTitle:(self.trackpadMode ? @"Pointer: trackpad"
+                                                  : @"Pointer: direct tap")
+                      forState:UIControlStateNormal];
     [self setNeedsLayout];
 }
 
@@ -812,6 +881,11 @@ static BVNGuestOverlayView* gOverlay = nil;
     BVNLogWrite(BVNLogLevelInfo, "input",
                 show ? "Guest overlay keyboard shown."
                      : "Guest overlay keyboard hidden.");
+}
+
+- (void)togglePointerMode {
+    [self setTrackpadModeEnabled:!self.trackpadMode];
+    [self applyMenuState];
 }
 
 - (void)toggleRotation {
@@ -972,6 +1046,30 @@ extern "C" void BVNGuestOverlayInstall(void) {
 
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "Guest overlay attached to SDL's guest window.");
+}
+
+// The Wine startup notice. Called from KNativeScreenSDL on the main thread.
+extern "C" void BVNGuestStartupNoticeSetVisible(bool visible) {
+    if (!NSThread.isMainThread || gOverlay == nil) {
+        return;
+    }
+    gOverlay.startupNotice.hidden = !visible;
+    if (visible) {
+        gOverlay.startupProgress.text = @"Preparing…";
+        [gOverlay.superview bringSubviewToFront:gOverlay];
+        [gOverlay bringSubviewToFront:gOverlay.startupNotice];
+    }
+}
+
+extern "C" void BVNGuestStartupNoticeSetProgress(size_t jitBlocks) {
+    if (!NSThread.isMainThread || gOverlay == nil ||
+        gOverlay.startupNotice.hidden) {
+        return;
+    }
+    gOverlay.startupProgress.text = jitBlocks > 0
+        ? [NSString stringWithFormat:@"Translating x86 code — %lu blocks",
+                                     (unsigned long)jitBlocks]
+        : @"Preparing…";
 }
 
 extern "C" void BVNGuestOverlayRemove(void) {

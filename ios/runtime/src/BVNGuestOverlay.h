@@ -47,6 +47,11 @@ void BVNGuestOverlayInstall(void);
 // Detaches the overlay and releases any keys it was holding down.
 void BVNGuestOverlayRemove(void);
 
+// The Wine startup notice: proper UIKit text over SDL's backdrop, replacing the
+// bitmap font that could not be read at a useful size.
+void BVNGuestStartupNoticeSetVisible(bool visible);
+void BVNGuestStartupNoticeSetProgress(size_t jitBlocks);
+
 // ---------------------------------------------------------------------------
 // Implemented by BVNAppDelegate.mm
 // ---------------------------------------------------------------------------

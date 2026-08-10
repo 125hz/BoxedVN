@@ -574,20 +574,31 @@ void bvnReportPresentRate(void) {
     // at 0.65 cores busy raised.
     static U64 lastThrottleUs = 0;
     static U64 lastThrottleCount = 0;
+    static U64 lastGetrusage = 0;
+    static U64 lastSchedYield = 0;
     const U64 throttleUs =
         bvnFairness::throttleMicroseconds.load(std::memory_order_relaxed);
     const U64 throttleCount =
         bvnFairness::throttleCount.load(std::memory_order_relaxed);
+    const U64 getrusage =
+        bvnFairness::getrusageCalls.load(std::memory_order_relaxed);
+    const U64 schedYield =
+        bvnFairness::schedYieldCalls.load(std::memory_order_relaxed);
 
     klog_fmt("iOS guest performance: %.1f presented frames/sec over %u ms; "
              "host CPU %.2f cores busy; fairness throttle %llu ms across "
-             "%llu scheduling points",
+             "%llu scheduling points; guest polled getrusage %llu and "
+             "sched_yield %llu times",
              (double)frames / wallSeconds, elapsed, coresBusy,
              (unsigned long long)((throttleUs - lastThrottleUs) / 1000),
-             (unsigned long long)(throttleCount - lastThrottleCount));
+             (unsigned long long)(throttleCount - lastThrottleCount),
+             (unsigned long long)(getrusage - lastGetrusage),
+             (unsigned long long)(schedYield - lastSchedYield));
 
     lastThrottleUs = throttleUs;
     lastThrottleCount = throttleCount;
+    lastGetrusage = getrusage;
+    lastSchedYield = schedYield;
     lastCpuSeconds = cpuSeconds;
     windowStart = now;
     frames = 0;

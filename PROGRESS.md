@@ -6,7 +6,7 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 69. Song of Saya is **playable on device**
+**Last updated:** 2026-08-09 (build 70. Song of Saya is **playable on device**
 — main menu, dialogue, working touch — but only with `-interpreterModule
 d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
 Build 65 killed the **swapchain storm** (8,244 rebuilds a minute down to two
@@ -15,8 +15,11 @@ Build 67 fixed landscape touch, the status bar and the menu placement, and got
 Grisaia running (the no-DXVK profile, which had never actually executed before).
 Build 68's measurement did its job immediately: **Saya runs at 58 fps** and
 **Grisaia at 0.4 fps with only 0.65 host cores busy** - not CPU-bound,
-sleeping. Build 69 fixes the cause, which was BoxedVN's own fairness throttle.
-Portrait touch is still broken. **Build 69 is not device-tested yet.** The newest detail is at the end of the session log, section 10; the
+sleeping. Build 69 bounded the fairness throttle, which was one cause but not the whole
+one: Grisaia is still at 0.4 fps with the machine 92% idle. Build 70 adds a
+Windows desktop mode, a trackpad cursor mode, a readable startup screen, and
+the poll-rate counter that should finish the Grisaia diagnosis. **Build 70 is
+not device-tested yet.** The newest detail is at the end of the session log, section 10; the
 open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
@@ -3086,6 +3089,47 @@ screen. Build 69 re-asserts the overlay's attachment whenever the window
 geometry changes, logs loudly if it ever finds it stale, and restores the
 hit-test diagnostic (removed in 68) with the window and presenting-view state
 included.
+
+Verified locally: build succeeds, app validates, 91/91 tests pass.
+**Untested on device.**
+
+### 2026-08-09 — build 70: desktop mode, trackpad cursor, and a readable startup screen
+
+Build 69's throttle change is measurably working and measurably *not* the whole
+answer:
+
+```
+0.4 presented frames/sec; host CPU 0.47 cores busy;
+fairness throttle 560 ms across 5,600 scheduling points
+```
+
+560 ms per 5,000 ms window is the designed 10% bound, so the mitigation is no
+longer the bottleneck - and Grisaia is still at 0.4 fps with the machine 92%
+idle. Something else is waiting. The one clue left is that 5,600 scheduling
+points a second means a thread is polling continuously, so build 70 counts the
+**calls** as well as the throttles: a thread polling a thousand times a second
+and one polling a million look identical in the throttle count and need
+completely different fixes. `getrusage(RUSAGE_SELF)` in particular takes the
+process thread-table mutex and walks every thread, so its call rate matters.
+
+Features this round:
+
+- **Windows desktop mode**, above the games in the library. Launches
+  `explorer /desktop=BoxedVN,1280x720` - a real desktop with a taskbar, Start
+  menu and Explorer. 16:9 rather than the games' 4:3, so the letterbox is thin
+  and the desktop's own edges stay clear of the Dynamic Island. The in-game
+  overlay works there unchanged, which also makes it the place to test the
+  keyboard against Notepad.
+- **Trackpad pointer mode**, in the overlay menu. Direct tap remains the
+  default and should: a visual novel is a full-screen tap target and a virtual
+  cursor would be strictly worse for it. Trackpad exists for the small Windows
+  controls a fingertip cannot hit - drag anywhere to move the cursor, tap to
+  click where it is, two fingers for a right click.
+- **The startup screen is UIKit text now**, not a bitmap font drawn one
+  rectangle per pixel through SDL. It says Wine can take up to three minutes
+  and that the app must stay open, which is the thing a player needs to know
+  and could not previously read. The spinner is gone; the count of translated
+  code blocks does the same job and also distinguishes progress from a hang.
 
 Verified locally: build succeeds, app validates, 91/91 tests pass.
 **Untested on device.**

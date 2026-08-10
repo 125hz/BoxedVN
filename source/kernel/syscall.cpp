@@ -766,6 +766,8 @@ static U32 syscall_setrlimit(CPU* cpu, U32 eipCount) {
 namespace bvnFairness {
 std::atomic<std::uint64_t> throttleCount{0};
 std::atomic<std::uint64_t> throttleMicroseconds{0};
+std::atomic<std::uint64_t> getrusageCalls{0};
+std::atomic<std::uint64_t> schedYieldCalls{0};
 }
 
 // One real scheduling point, accounted for. A syscall that crosses into the
@@ -785,6 +787,7 @@ static U32 syscall_getrusuage(CPU* cpu, U32 eipCount) {
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "getrusage: who=%d usuage=%X", ARG1, ARG2);
     U32 result = cpu->thread->process->getrusuage(cpu->thread, ARG1, ARG2);
 #if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    bvnFairness::getrusageCalls.fetch_add(1, std::memory_order_relaxed);
     const GetrusageFairnessDecision fairness =
         cpu->thread->getrusageFairness.observe(KSystem::getMicroCounter());
     if (fairness.firstActivation) {
@@ -1229,6 +1232,7 @@ static U32 syscall_sched_yield(CPU* cpu, U32 eipCount) {
     // core, and DXVK's worker threads spin exactly this way while the command
     // stream they feed is starved. Once the rate proves pathological, replace
     // the hint with a real scheduling point.
+    bvnFairness::schedYieldCalls.fetch_add(1, std::memory_order_relaxed);
     const GetrusageFairnessDecision fairness =
         cpu->thread->schedYieldFairness.observe(KSystem::getMicroCounter());
     if (fairness.firstActivation) {
