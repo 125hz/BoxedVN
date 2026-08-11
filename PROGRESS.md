@@ -15,8 +15,10 @@ converting the game-local point to root coordinates. Build 79 publishes a
 coherent full-window X11 snapshot, makes motion and button targeting use the
 same root-space point, and adds rotation/fill diagnostics. Trackpad gestures
 now reset their first-motion baseline, support hold-to-drag, and hide the
-cursor behind the Wine startup page. CI and fresh-device validation of build
-79 remain pending. Song of Saya remains device-proven playable with the
+cursor behind the Wine startup page. GitHub Actions run 31547397032 passed all
+92 tests, the iPhoneOS compile, entitlement packaging, and rolling Release
+upload. Fresh-device validation remains pending. Song of Saya remains
+device-proven playable with the
 interpreter workaround.
 The newest
 detail is at the end of the session log; the open-problem list lives in
@@ -3476,8 +3478,14 @@ down; subsequent movement drags, and release/cancel/rotation always sends the
 matching button up. The virtual cursor is hidden whenever the Wine startup
 notice is visible and restored after that notice leaves.
 
-**Local evidence:** `git diff --check` passes, the Windows support executable
-runs all 92 tests with zero failures, and CTest passes 1/1. This preset does not
-compile UIKit or the emulator core. iPhoneOS compilation, package inspection,
-and all physical input/render acceptance remain pending until build-79
-CI/device evidence is added.
+**Build evidence:** `git diff --check` passes, the Windows support executable
+runs all 92 tests with zero failures, and CTest passes 1/1. GitHub Actions run
+31547397032 then passed the same 92 tests plus the full iPhoneOS compile, app
+validation, increased-memory entitlement check, packaging, smoke test, and
+rolling Release upload in 3 minutes 14 seconds. The downloaded `BoxedVN.ipa`
+contains build 79, is 8,154,693 bytes, and matches both the runner and Release
+digest: SHA-256
+`e8f5ac822312507662bd9b8f8616b598c011890faa0035e1c0b64120f5c31679`.
+Its direct URL returned HTTP 200 with `Content-Disposition: attachment`.
+Physical Fit/Fill, portrait input, pointer targeting, trackpad dragging, and
+mixed-present rendering remain pending a fresh device test.
