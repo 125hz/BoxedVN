@@ -14,9 +14,11 @@ WineD3D-over-Vulkan policy from the per-title DXVK switch: every imported Wine
 game repairs its prefix to `renderer=vulkan`, while Grisaia still keeps DXVK
 disabled. The entitlement build is device-proven to have the increased-memory
 request in its installed signature: it reported 5.99 GB before the process
-limit, versus 3.29 GB for the normal IPA. CI and fresh-device validation of the
-build-77 renderer correction remain pending. Song of Saya remains device-proven
-playable with the interpreter workaround. The newest
+limit, versus 3.29 GB for the normal IPA. GitHub Actions run 31540593751 passed
+all host tests, the iPhoneOS compile, and both IPA packaging checks;
+fresh-device validation of the build-77 renderer correction remains pending.
+Song of Saya remains device-proven playable with the interpreter workaround.
+The newest
 detail is at the end of the session log; the open-problem list lives in
 `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
@@ -3355,3 +3357,12 @@ The entitlement log independently closes the packaging question: its installed
 signature reported `Increased limit signed; 5.99 GB available`, while the
 normal IPA reported `Standard limit; 3.29 GB available`. The renderer abort is
 identical in both logs and unrelated to the entitlement.
+
+GitHub Actions run 31540593751 passed the host tests in 19 seconds and the
+iPhoneOS build plus both packages in 2 minutes 37 seconds. The unsigned IPA is
+SHA-256
+`8b2375b4dcc595f64a16fee5762e42b22c3f9e0fb8ff2a015139f0ca0511ab38`;
+the entitlement-ready IPA is
+`a1cb5616ed4cb67b6e16d8499c9fac6f630727f624aa73af4a1d5fd2f2025117`.
+This proves compilation and packaging only; launcher recovery still needs the
+next physical-device log.
