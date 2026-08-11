@@ -105,6 +105,14 @@ extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
     // twice; in portrait, most taps collapsed onto a guest edge.
     const int screenX = input->xToScreen(x);
     const int screenY = input->yToScreen(y);
+    static U32 reportedButtonPhases = 0;
+    if (phase != 0 && reportedButtonPhases < 16) {
+        ++reportedButtonPhases;
+        klog_fmt("iOS overlay pointer %s at guest %d,%d -> SDL %d,%d "
+                 "(scale %u%%x%u%%)",
+                 phase == 1 ? "down" : "up", x, y, screenX, screenY,
+                 input->scaleX, input->scaleY);
+    }
     if (!input->mouseMove(screenX, screenY, false)) {
         onMouseMove((U32)x, (U32)y, false);
     }

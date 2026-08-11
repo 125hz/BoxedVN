@@ -924,12 +924,30 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         gGuestX11PatchView.contentMode = UIViewContentModeScaleToFill;
     }
 
-    const int32_t sourceLeft = MAX(0, dirtyX);
-    const int32_t sourceTop = MAX(0, dirtyY);
-    const int32_t sourceRight = MIN((int32_t)windowWidth,
-                                    dirtyX + (int32_t)dirtyWidth);
-    const int32_t sourceBottom = MIN((int32_t)windowHeight,
-                                     dirtyY + (int32_t)dirtyHeight);
+    // A full-screen WineD3D window can use a GDI COPY present for only part of
+    // a frame. Publishing only that dirty rectangle as an opaque UIImage over
+    // the Vulkan frame mixes two independently timed snapshots and produces a
+    // hard cut at the dirty edge (1280x720 Grisaia exposed it at guest x=720).
+    // Its XWindow backing store contains the whole current window, so publish
+    // a coherent full-window snapshot when it covers the presentation.
+    const bool coversPresentation =
+        screenX <= 0 && screenY <= 0 &&
+        screenX + (int32_t)windowWidth >= (int32_t)guestWidth &&
+        screenY + (int32_t)windowHeight >= (int32_t)guestHeight;
+    const uint64_t dirtyArea = (uint64_t)dirtyWidth * dirtyHeight;
+    const uint64_t guestArea = (uint64_t)guestWidth * guestHeight;
+    // Keep small dialogue/control updates cheap. The coherent snapshot is for
+    // broad COPY presents where the edge between render paths is visible.
+    const bool publishFullWindow = coversPresentation &&
+        dirtyArea * 4 >= guestArea;
+    const int32_t sourceLeft = publishFullWindow ? 0 : MAX(0, dirtyX);
+    const int32_t sourceTop = publishFullWindow ? 0 : MAX(0, dirtyY);
+    const int32_t sourceRight = publishFullWindow
+        ? (int32_t)windowWidth
+        : MIN((int32_t)windowWidth, dirtyX + (int32_t)dirtyWidth);
+    const int32_t sourceBottom = publishFullWindow
+        ? (int32_t)windowHeight
+        : MIN((int32_t)windowHeight, dirtyY + (int32_t)dirtyHeight);
     const int32_t destinationLeft = screenX + sourceLeft;
     const int32_t destinationTop = screenY + sourceTop;
     const int32_t clippedLeft = MAX(0, destinationLeft);
@@ -990,12 +1008,16 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
 
     static uint64_t patchCount = 0;
     ++patchCount;
-    if (patchCount == 1 || patchCount % 120 == 0) {
+    if (patchCount <= 12 || patchCount % 120 == 0) {
         NSString* message = [NSString stringWithFormat:
-            @"Composited X11 partial present #%llu at %d,%d %dx%d over "
-             "the Vulkan guest.",
-            (unsigned long long)patchCount, clippedLeft, clippedTop,
-            clippedRight - clippedLeft, clippedBottom - clippedTop];
+            @"Composited X11 %@ present #%llu: window %dx%d at %d,%d, "
+             "dirty %d,%d %dx%d, published %d,%d %dx%d over guest %dx%d.",
+            publishFullWindow ? @"full-window" : @"partial",
+            (unsigned long long)patchCount, (int)windowWidth,
+            (int)windowHeight, screenX, screenY, dirtyX, dirtyY,
+            (int)dirtyWidth, (int)dirtyHeight, clippedLeft, clippedTop,
+            clippedRight - clippedLeft, clippedBottom - clippedTop,
+            (int)guestWidth, (int)guestHeight];
         BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
     }
 }

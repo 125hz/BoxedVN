@@ -258,8 +258,10 @@ static NSString* const kBVNPointerInnerCircleKey =
 // The cursor's position in the presenting view's bounds, i.e. guest pixels.
 @property (nonatomic, assign) CGPoint cursorGuestPoint;
 @property (nonatomic, assign) CGPoint trackpadTouchStart;
-@property (nonatomic, assign) NSTimeInterval trackpadTouchStartTime;
 @property (nonatomic, assign) BOOL trackpadTouchMoved;
+@property (nonatomic, assign) BOOL trackpadHasMotionBaseline;
+@property (nonatomic, assign) BOOL trackpadButtonHeld;
+@property (nonatomic, strong) NSTimer* trackpadHoldTimer;
 // Where the finger was on the previous -touchesMoved, in the presenting
 // view's coordinates. UIKit's own -previousLocationInView: cannot be used for
 // this: UITouch objects are recycled between gestures, and on the first move
@@ -276,6 +278,7 @@ static NSString* const kBVNPointerInnerCircleKey =
 // A latched Ctrl that outlives the keyboard would leave the guest convinced a
 // key is held down with no way to release it.
 - (void)releaseHeldKeys;
+- (void)cancelTrackpadGesture;
 
 @end
 
@@ -917,6 +920,36 @@ static BVNGuestOverlayView* gOverlay = nil;
     return YES;
 }
 
+- (void)trackpadHoldTimerFired:(NSTimer*)timer {
+    if (timer != self.trackpadHoldTimer) {
+        return;
+    }
+    self.trackpadHoldTimer = nil;
+    if (!self.trackpadMode || self.guestTouch == nil ||
+        self.trackpadTouchMoved || self.trackpadButtonHeld) {
+        return;
+    }
+    BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
+                                (int)lround(self.cursorGuestPoint.y), 1);
+    self.trackpadButtonHeld = YES;
+}
+
+- (void)cancelTrackpadHoldTimer {
+    [self.trackpadHoldTimer invalidate];
+    self.trackpadHoldTimer = nil;
+}
+
+- (void)cancelTrackpadGesture {
+    [self cancelTrackpadHoldTimer];
+    if (self.trackpadButtonHeld) {
+        BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
+                                    (int)lround(self.cursorGuestPoint.y), 2);
+    }
+    self.trackpadButtonHeld = NO;
+    self.trackpadHasMotionBaseline = NO;
+    self.guestTouch = nil;
+}
+
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
     if (self.guestTouch != nil) {
         // A second finger is for the right-click gesture, not a second cursor.
@@ -932,12 +965,23 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.guestTouch = touch;
 
     if (self.trackpadMode) {
-        // Nothing is pressed yet: a trackpad only clicks when the finger lifts
-        // without having travelled.
+        // A stationary hold presses the left button after a short threshold;
+        // movement after that drags, while an ordinary quick tap still clicks
+        // on release.
         self.trackpadTouchStart = [touch locationInView:self];
-        self.trackpadTouchStartTime = touch.timestamp;
         self.trackpadTouchMoved = NO;
         self.trackpadLastPoint = [touch locationInView:self];
+        self.trackpadHasMotionBaseline = NO;
+        self.trackpadButtonHeld = NO;
+        [self cancelTrackpadHoldTimer];
+        self.trackpadHoldTimer = [NSTimer
+            timerWithTimeInterval:0.35
+                           target:self
+                         selector:@selector(trackpadHoldTimerFired:)
+                         userInfo:nil
+                          repeats:NO];
+        [[NSRunLoop mainRunLoop] addTimer:self.trackpadHoldTimer
+                                  forMode:NSRunLoopCommonModes];
         return;
     }
     [self sendGuestPointer:touch phase:1];
@@ -959,14 +1003,37 @@ static BVNGuestOverlayView* gOverlay = nil;
     // Measure on the stable overlay, then convert the delta into guest pixels.
     // This works for both the transformed Metal view and SDL's software path.
     const CGPoint now = [touch locationInView:self];
+    if (!self.trackpadHasMotionBaseline) {
+        self.trackpadHasMotionBaseline = YES;
+        // Establish a new baseline for every gesture. UIKit can report a tiny
+        // first displacement when the finger is lifted and put down again;
+        // treating that sample as motion is the visible cursor "jump". Once
+        // a deliberate hold already pressed the button, keep the delta so a
+        // title-bar drag begins with the first movement.
+        if (!self.trackpadButtonHeld) {
+            self.trackpadLastPoint = now;
+            const CGFloat totalX = now.x - self.trackpadTouchStart.x;
+            const CGFloat totalY = now.y - self.trackpadTouchStart.y;
+            if (hypot(totalX, totalY) > 4.0) {
+                self.trackpadTouchMoved = YES;
+                [self cancelTrackpadHoldTimer];
+            }
+            return;
+        }
+    }
     const CGPoint before = self.trackpadLastPoint;
     self.trackpadLastPoint = now;
     const CGFloat dx = (now.x - before.x) * guestWidth /
                        MAX(1.0, self.bounds.size.width);
     const CGFloat dy = (now.y - before.y) * guestHeight /
                        MAX(1.0, self.bounds.size.height);
-    if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
+    const CGFloat totalX = now.x - self.trackpadTouchStart.x;
+    const CGFloat totalY = now.y - self.trackpadTouchStart.y;
+    if (hypot(totalX, totalY) > 4.0) {
         self.trackpadTouchMoved = YES;
+        if (!self.trackpadButtonHeld) {
+            [self cancelTrackpadHoldTimer];
+        }
     }
     [self moveCursorBy:CGPointMake(dx * kBVNTrackpadSensitivity,
                                    dy * kBVNTrackpadSensitivity)];
@@ -985,11 +1052,15 @@ static BVNGuestOverlayView* gOverlay = nil;
         [self sendGuestPointer:touch phase:2];
         return;
     }
-    // A tap that did not travel is a click, wherever the cursor happens to be.
-    const NSTimeInterval held = touch.timestamp - self.trackpadTouchStartTime;
-    if (!self.trackpadTouchMoved && held < 0.4) {
-        const int x = (int)lround(self.cursorGuestPoint.x);
-        const int y = (int)lround(self.cursorGuestPoint.y);
+    [self cancelTrackpadHoldTimer];
+    const int x = (int)lround(self.cursorGuestPoint.x);
+    const int y = (int)lround(self.cursorGuestPoint.y);
+    if (self.trackpadButtonHeld) {
+        BVNGuestControlsSendPointer(x, y, 2);
+        self.trackpadButtonHeld = NO;
+    } else if (!self.trackpadTouchMoved) {
+        // Still click if the main run loop delayed the hold timer until after
+        // a stationary finger was released.
         BVNGuestControlsSendPointer(x, y, 1);
         BVNGuestControlsSendPointer(x, y, 2);
     }
@@ -1004,6 +1075,8 @@ static BVNGuestOverlayView* gOverlay = nil;
         // Release the button even on a cancel, or the guest is left with it
         // held.
         [self sendGuestPointer:touch phase:2];
+    } else {
+        [self cancelTrackpadGesture];
     }
     self.guestTouch = nil;
 }
@@ -1029,7 +1102,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     UIView* presentation = BVNGuestPresentationView();
     CGFloat guestWidth = 0.0;
     CGFloat guestHeight = 0.0;
-    if (!self.trackpadMode ||
+    if (!self.trackpadMode || !self.startupNotice.hidden ||
         ![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         self.cursorView.hidden = YES;
         return;
@@ -1052,6 +1125,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     if (self.trackpadMode == enabled) {
         return;
     }
+    [self cancelTrackpadGesture];
     self.trackpadMode = enabled;
     if (enabled) {
         // Start in the middle of the picture rather than at 0,0, which on a
@@ -1455,7 +1529,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     // handler initiates rotation is how a control can remain in tracking
     // state across the transition.
     [self closeMenu];
-    self.guestTouch = nil;
+    [self cancelTrackpadGesture];
     BVNGuestSetRotationUnlocked(unlocked);
 }
 
@@ -1543,6 +1617,7 @@ static BVNGuestOverlayView* gOverlay = nil;
 }
 
 - (void)releaseHeldKeys {
+    [self cancelTrackpadGesture];
     for (NSArray<BVNOverlayKey*>* row in self.keyRows) {
         for (BVNOverlayKey* key in row) {
             if (key.scancode != 0 &&
@@ -1655,6 +1730,12 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
             gOverlay.startupProgress.text = @"Preparing…";
             [gOverlay bringSubviewToFront:gOverlay.startupNotice];
         }
+    }
+    if (wanted != 0) {
+        // Trackpad mode may already be active from UserDefaults. Keep its
+        // cursor behind the opaque startup page and reveal it only after Wine
+        // has produced the desktop/game presentation.
+        [gOverlay positionCursor];
     }
     if (!gOverlay.startupNotice.hidden) {
         const size_t blocks =

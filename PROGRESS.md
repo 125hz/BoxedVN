@@ -6,19 +6,18 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-11 (build 78 prepared from build-77 device evidence.
-Build 77 is device-proven to restore Grisaia startup. The corrected Grisaia
-logs show the remaining static-dialogue slowdown is not JIT compilation or a
-blocked Vulkan present: hundreds of GDI/X11 partial updates occur while the
-guest sleeps and Vulkan remains at about 0.4 fps. Build 78 forces those UIKit
-patch layers to commit immediately, adds software-desktop pointer routing, and
-rebuilds the overlay responder chain after rotation. It also adds persistent
-pointer controls, live Fit/Fill presentation, a shared E: drive without
-merging game prefixes, JIT wording cleanup, and a rolling direct-download
-entitlement IPA release. GitHub Actions run 31544859678 passed all 92 host
-tests, the iPhoneOS compile, entitlement packaging and direct Release upload;
-fresh-device validation of build 78 remains pending. Song of Saya remains
-device-proven playable with the interpreter workaround.
+**Last updated:** 2026-08-11 (build 79 prepared from the first build-78 device
+log. Build 78 is device-proven to start Grisaia at 1280x720 and sustain about
+58 fps during active presentation, but it exposed two shared compositor/input
+defects: full-screen GDI dirty rectangles could form a visible seam over the
+Vulkan frame, and fake-fullscreen X11 motion chose its target window before
+converting the game-local point to root coordinates. Build 79 publishes a
+coherent full-window X11 snapshot, makes motion and button targeting use the
+same root-space point, and adds rotation/fill diagnostics. Trackpad gestures
+now reset their first-motion baseline, support hold-to-drag, and hide the
+cursor behind the Wine startup page. CI and fresh-device validation of build
+79 remain pending. Song of Saya remains device-proven playable with the
+interpreter workaround.
 The newest
 detail is at the end of the session log; the open-problem list lives in
 `docs/CONTINUING_WITHOUT_A_MAC.md`.)
@@ -3437,3 +3436,48 @@ suite and the macOS iPhoneOS build in 3 minutes 33 seconds. Its rolling
 `dc05e179d063e60bc973ef1c83a2e716328ab8b52e856edfd3a7a0794be542f9`), and a
 direct HTTP request returns that IPA as an attachment. Every new device
 behavior is pending a fresh build-78 log and physical-device test.
+
+### 2026-08-11 — build 79: coherent mixed presents and one X11 pointer space
+
+The build-78 device log reaches Grisaia's requested 1280x720 surface and
+confirms that presentation geometry itself is internally consistent: the Metal
+view has 1280x720 bounds and drawable size, SDL reports 1280x720, and the
+pointer transform is 1:1 in Fit, Fill, landscape, and portrait. Fit shows the
+surface at 714.7x402 points; Fill uses the full 750x402 safe-area width. The
+game also sustains about 58 Vulkan presents/sec once active. The earlier 0.4
+fps samples remain guest-selected static cadence—present/acquire consume at
+most 1 ms—and are not evidence of JIT translation or GPU back-pressure.
+
+The screenshot's vertical cut is exactly at guest x approximately 720 on the
+1280x720 surface. Build 78 made only each X11 dirty rectangle opaque above the
+Vulkan frame. A full-screen WineD3D GDI COPY update that dirtied 720 pixels of
+width therefore displayed one X11 snapshot to the left and a differently timed
+Vulkan snapshot to the right. Build 79 detects a broad update from an X11
+window that covers the presentation and publishes its complete backing store
+as one coherent image; small updates and real child windows remain bounded to
+their dirty rectangles. The first twelve
+updates now log window, dirty, published, and guest rectangles so the next
+device run can confirm the exact producer without flooding the log.
+
+The right/bottom pointer error was a separate Boxedwine core ordering bug.
+`XServer::mouseButton` converted fake-fullscreen game-local coordinates to X11
+root coordinates before choosing the target window. `XServer::mouseMove`
+chose an overlapping Wine window first and converted only afterward. Hover and
+click could consequently address different windows, matching the screenshot
+where the cursor is over Back while a save-data box highlights. Motion now
+converts before hit-testing, the same as button input. Because the overlay gets
+guest pixels directly from UIKit's transformed Metal view, this single X11
+fix applies to Fit, Fill, landscape, and portrait without a second display
+formula.
+
+Trackpad mode now discards the first movement sample of every new gesture so a
+lift/re-touch cannot nudge the cursor. A 350 ms stationary hold sends button
+down; subsequent movement drags, and release/cancel/rotation always sends the
+matching button up. The virtual cursor is hidden whenever the Wine startup
+notice is visible and restored after that notice leaves.
+
+**Local evidence:** `git diff --check` passes, the Windows support executable
+runs all 92 tests with zero failures, and CTest passes 1/1. This preset does not
+compile UIKit or the emulator core. iPhoneOS compilation, package inspection,
+and all physical input/render acceptance remain pending until build-79
+CI/device evidence is added.

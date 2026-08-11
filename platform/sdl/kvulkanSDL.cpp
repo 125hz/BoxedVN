@@ -286,11 +286,14 @@ void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,
             std::lock_guard<std::mutex> lock(surfacesMutex);
             surfaces.push_back({(void*)result, wnd, presentation, presentation,
                                 false, 0, 0, 0, offscreenMetalLayer, watch});
+            S32 rootX = 0;
+            S32 rootY = 0;
+            wnd->windowToScreen(rootX, rootY);
             klog_fmt("Vulkan %s surface %p registered for X11 window 0x%x "
-                     "(%ux%u); %zu surface(s) active",
+                     "(%ux%u at root %d,%d); %zu surface(s) active",
                      presentation ? "presentation" : "offscreen helper",
                      (void*)result, wnd->id, wnd->width(), wnd->height(),
-                     surfaces.size());
+                     rootX, rootY, surfaces.size());
         }
 #ifdef BOXEDWINE_IOS
         // The aspect fit is applied at surface creation, inside the

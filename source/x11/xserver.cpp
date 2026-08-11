@@ -991,12 +991,17 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 			ungrabPointer(0);
 		}
 	}
+	// A Vulkan window is presented as if its client area filled the native
+	// screen, but X11 still keeps the window at its real position in the root
+	// hierarchy. Button input converted this local point before hit-testing;
+	// motion input used to hit-test first and convert afterwards. The two paths
+	// could therefore target different overlapping Wine windows.
+	if (fakeFullScreenWnd) {
+		fakeFullScreenWnd->windowToScreen(x, y);
+	}
 	if (root) { // might not be set at the very start
 		XWindowPtr wnd = root->getWindowFromPoint(x, y);
 		if (wnd) {
-			if (fakeFullScreenWnd) {
-				fakeFullScreenWnd->windowToScreen(x, y);
-			}
 			if (wnd != pointerWindow) {
 				pointerMoved(pointerWindow, wnd, x, y, NotifyNormal);
 				pointerWindow = wnd;
