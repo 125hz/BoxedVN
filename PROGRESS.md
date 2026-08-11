@@ -15,9 +15,10 @@ patch layers to commit immediately, adds software-desktop pointer routing, and
 rebuilds the overlay responder chain after rotation. It also adds persistent
 pointer controls, live Fit/Fill presentation, a shared E: drive without
 merging game prefixes, JIT wording cleanup, and a rolling direct-download
-entitlement IPA release. GitHub Actions and fresh-device validation of build
-78 remain pending. Song of Saya remains device-proven playable with the
-interpreter workaround.
+entitlement IPA release. GitHub Actions run 31544859678 passed all 92 host
+tests, the iPhoneOS compile, entitlement packaging and direct Release upload;
+fresh-device validation of build 78 remains pending. Song of Saya remains
+device-proven playable with the interpreter workaround.
 The newest
 detail is at the end of the session log; the open-problem list lives in
 `docs/CONTINUING_WITHOUT_A_MAC.md`.)
@@ -3427,9 +3428,12 @@ currently have and is not safe to improvise in this batch. Selecting the final
 game executable instead of its launcher remains the only low-risk per-library
 way to skip launcher work when a title supports it.
 
-**Local evidence:** `git diff --check` passes. After loading Visual Studio's
+**Build evidence:** `git diff --check` passes. After loading Visual Studio's
 developer environment, the Windows preset rebuilt successfully: all 92 C++
 tests pass and CTest passes 1/1. The pin script needs Bash and was not run on
-this Windows host. Ubuntu CI remains the full host-suite authority and macOS CI
-remains the iPhoneOS compile/package authority. Every new device behavior is
-pending a fresh build-78 log and physical-device test.
+this Windows host. GitHub Actions run 31544859678 passed the full Ubuntu test
+suite and the macOS iPhoneOS build in 3 minutes 33 seconds. Its rolling
+`ios-latest` Release contains `BoxedVN.ipa` (8,152,639 bytes, SHA-256
+`dc05e179d063e60bc973ef1c83a2e716328ab8b52e856edfd3a7a0794be542f9`), and a
+direct HTTP request returns that IPA as an attachment. Every new device
+behavior is pending a fresh build-78 log and physical-device test.
