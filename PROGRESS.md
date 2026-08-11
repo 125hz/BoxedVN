@@ -13,8 +13,10 @@ gap from roughly 57 seconds to roughly 8. Build 76 replaces the title heartbeat
 with a shared X11-over-Vulkan partial-present compositor, resets UIKit touch
 tracking after rotation, defers the initial landscape request out of the
 launching touch transaction, and publishes a separately named entitlement-
-template IPA. CI and physical-device validation remain pending. Song of Saya
-remains device-proven playable with the interpreter workaround. The newest
+template IPA. GitHub Actions run 31536075940 passed the host tests, iPhoneOS
+compile, unsigned package, and entitlement-template package; physical-device
+validation remains pending. Song of Saya remains device-proven playable with
+the interpreter workaround. The newest
 detail is at the end of the session log; the open-problem list lives in
 `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
@@ -3318,5 +3320,9 @@ from BoxedVN's Memory row on device.
 The host-independent preset is now genuinely Windows-buildable: zlib no longer
 claims `<unistd.h>` on MSVC, test warning flags use MSVC spellings, and the two
 PID-based tests use `_getpid`. The complete Windows test executable builds and
-CTest passes 1/1. iPhoneOS compilation, IPA validation, and all device behavior
-remain pending CI/device evidence.
+CTest passes 1/1. GitHub Actions run 31536075940 then passed the iPhoneOS
+compile and validated both packages: unsigned SHA-256
+`5a4e8f395ca8dfac914844daca9683ab999b179e88462f715f49d36484314dc7`
+and entitlement-template SHA-256
+`4b57b2edaea6fd80a324f497c44d2c2696e1a50661ff44e249a33386504bbf25`.
+All physical-device behavior remains pending device evidence.
