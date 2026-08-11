@@ -1,0 +1,200 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+      xcode_version:
+        description: Xcode version installed on macos-15 (blank uses the runner default or BOXEDVN_XCODE_VERSION)
+        required: false
+        default: ""
+        type: string
+  push:
+    branches:
+      - ios
+      - main
+      - master
+    paths: &ios_build_paths
+      - .github/workflows/build-ios.yml
+      - CMakeLists.txt
+      - CMakePresets.json
+      - buildFlags.txt
+      - cmake/**
+      - include/**
+      - ios/**
+      - lib/**
+      - platform/**
+      - scripts/**
+      - source/**
+      - THIRD_PARTY_NOTICES.md
+  pull_request:
+    branches:
+      - ios
+      - main
+      - master
+    paths: *ios_build_paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+  REQUESTED_XCODE: ${{ inputs.xcode_version || vars.BOXEDVN_XCODE_VERSION || '' }}
+
+jobs:
+  tests:
+    name: Host-independent tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out BoxedVN
+        uses: actions/checkout@v6
+
+      - name: Report tool versions
+        shell: bash
+        run: |
+          cmake --version
+          ninja --version
+          c++ --version
+
+      - name: Configure tests
+        run: cmake --preset tests-only
+
+      - name: Build tests
+        run: cmake --build --preset tests-only --parallel
+
+      - name: Run tests
+        run: ctest --preset tests-only
+
+  ipa:
+    name: Unsigned IPA (${{ inputs.configuration || 'Release' }})
+    needs: tests
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out BoxedVN
+        uses: actions/checkout@v6
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Installed Xcode applications:"
+          find /Applications -maxdepth 1 -type d -name 'Xcode*.app' -print | sort
+
+          if [[ -n "${REQUESTED_XCODE}" ]]; then
+            if [[ "${REQUESTED_XCODE}" == /* ]]; then
+              xcode_app="${REQUESTED_XCODE%/Contents/Developer}"
+            elif [[ "${REQUESTED_XCODE}" == Xcode*.app ]]; then
+              xcode_app="/Applications/${REQUESTED_XCODE}"
+            else
+              xcode_app="/Applications/Xcode_${REQUESTED_XCODE}.app"
+            fi
+
+            if [[ ! -d "${xcode_app}/Contents/Developer" ]]; then
+              echo "::error::Xcode '${REQUESTED_XCODE}' is not installed on this runner."
+              echo "Choose one of the applications listed above, or clear the input/repository variable to use the runner default."
+              exit 1
+            fi
+
+            sudo xcode-select --switch "${xcode_app}/Contents/Developer"
+          fi
+
+          echo "Selected developer directory: $(xcode-select -p)"
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+          {
+            echo "## Build environment"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Configuration: \`${BUILD_CONFIGURATION}\`"
+            echo "- Runner: \`${RUNNER_OS} ${RUNNER_ARCH}\`"
+            echo "- Xcode: \`$(xcodebuild -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')\`"
+            echo "- iPhoneOS SDK: \`$(xcrun --sdk iphoneos --show-sdk-version)\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Check macOS build prerequisites
+        shell: bash
+        run: bash scripts/bootstrap-macos.sh
+
+      - name: Restore pinned third-party dependencies
+        uses: actions/cache@v5
+        with:
+          path: third_party
+          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh') }}
+
+      - name: Fetch pinned dependencies
+        shell: bash
+        run: scripts/fetch-dependencies.sh --platform ios --configuration Release
+
+      - name: Build unsigned app
+        shell: bash
+        run: >-
+          scripts/build-ios.sh
+          --configuration "${BUILD_CONFIGURATION}"
+          --output-dir build/ci
+          --skip-dependencies
+          --no-bundled-rootfs
+
+      - name: Package and validate unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="build/ci/DerivedData/Build/Products/${BUILD_CONFIGURATION}-iphoneos/BoxedVN.app"
+
+          if codesign --display "${app}" >/dev/null 2>&1; then
+            echo "::error::The CI app has a code signature; refusing to label it unsigned."
+            exit 1
+          fi
+          if [[ -e "${app}/_CodeSignature" || -e "${app}/embedded.mobileprovision" ]]; then
+            echo "::error::The CI app contains signing metadata; refusing to package it as unsigned."
+            exit 1
+          fi
+
+          scripts/package-ipa.sh --app "${app}" --output-dir build/artifacts
+
+          ipa="build/artifacts/BoxedVN-unsigned.ipa"
+          checksum="$(awk '{print $1}' "${ipa}.sha256")"
+          size="$(du -h "${ipa}" | awk '{print $1}')"
+          {
+            echo "## Unsigned IPA"
+            echo "- File: \`BoxedVN-unsigned.ipa\`"
+            echo "- Size: \`${size}\`"
+            echo "- SHA-256: \`${checksum}\`"
+            echo "- Signing: deliberately disabled; sign after download"
+            echo "- Root filesystem: slim build; import the runtime ZIP on-device"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: BoxedVN-unsigned-ipa-${{ inputs.configuration || 'Release' }}
+          path: |
+            build/artifacts/BoxedVN-unsigned.ipa
+            build/artifacts/BoxedVN-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-${{ inputs.configuration || 'Release' }}
+          path: |
+            build/ci/xcodebuild.log
+            build/ci/CMakeFiles/CMakeConfigureLog.yaml
+            third_party/build/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14

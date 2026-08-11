@@ -5,6 +5,11 @@
 tools/jenkins/*.py text eol=lf
 tools/jenkins/*.sh text eol=lf
 
+# These files are authored from Windows but executed by bash on GitHub's macOS
+# runner.  Keep their repository and working-tree line endings deterministic.
+scripts/*.sh text eol=lf
+.github/workflows/*.yml text eol=lf
+
 ###############################################################################
 # Set default behavior for command prompt diff.
 #

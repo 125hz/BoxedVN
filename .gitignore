@@ -46,6 +46,13 @@ lib/mac
 project/mac-xcode/Boxedwine/DerivedDataCoverage
 .*/
 
+# GitHub Actions is part of the Windows-first iOS build path.  The broad
+# dot-directory rule above is inherited from upstream Boxedwine; without these
+# exceptions it silently hides every workflow from git.
+!/.github/
+!/.github/workflows/
+!/.github/workflows/*.yml
+
 # BoxedVN
 /build/
 /third_party/
