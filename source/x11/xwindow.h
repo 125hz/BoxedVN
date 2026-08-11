@@ -203,6 +203,7 @@ public:
 
 	void draw();
 	void setDirty() override;
+	void setDirtyRect(S32 x, S32 y, U32 width, U32 height) override;
 	XWindowPtr getWindowFromPoint(S32 screenX, S32 screenY);
 
 	void focusOut();
@@ -227,6 +228,11 @@ private:
 	XSetWindowAttributes attributes;
 	bool isMapped = false;	
 	bool isFullScreen = false;
+	bool dirtyBoundsValid = false;
+	S32 dirtyLeft = 0;
+	S32 dirtyTop = 0;
+	S32 dirtyRight = 0;
+	S32 dirtyBottom = 0;
 	std::weak_ptr<XWindow> transientCached;
 	XRectangle restoreRect;
 

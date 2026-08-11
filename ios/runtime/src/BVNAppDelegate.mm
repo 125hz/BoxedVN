@@ -343,14 +343,20 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     UIWindowSceneGeometryPreferencesIOS* preferences =
         [[UIWindowSceneGeometryPreferencesIOS alloc]
             initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
-    [scene requestGeometryUpdateWithPreferences:preferences
-                                  errorHandler:^(NSError* error) {
-        NSString* message = [NSString stringWithFormat:
-            @"UIKit did not apply the preferred landscape guest geometry: %@",
-            error.localizedDescription];
-        BVNLogWrite(BVNLogLevelWarning, "frontend", message.UTF8String);
-    }];
-    [self waitForLandscapeWithAttempt:0 completion:completion];
+    // The launch request originates in a SwiftUI button action. Let that
+    // touch-up transaction finish before changing scene geometry; rotating
+    // inside it can leave UIKit's window-level touch delivery permanently in
+    // a cancelled/tracking state until the process restarts.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [scene requestGeometryUpdateWithPreferences:preferences
+                                      errorHandler:^(NSError* error) {
+            NSString* message = [NSString stringWithFormat:
+                @"UIKit did not apply the preferred landscape guest geometry: %@",
+                error.localizedDescription];
+            BVNLogWrite(BVNLogLevelWarning, "frontend", message.UTF8String);
+        }];
+        [self waitForLandscapeWithAttempt:0 completion:completion];
+    });
 }
 
 - (void)finishGuestPresentation {
@@ -844,6 +850,159 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface) {
 // rectangle recorded here. The two must agree; if one changes the other has to
 // change with it.
 static CGRect gGuestPresentationContentRect = CGRectZero;
+static UIImageView* gGuestX11PatchView = nil;
+static NSMutableData* gGuestX11PatchPixels = nil;
+static uint32_t gGuestX11PatchWidth = 0;
+static uint32_t gGuestX11PatchHeight = 0;
+static std::atomic<bool> gGuestX11PatchVisible{false};
+
+static void BVNRemoveGuestX11PatchView(void) {
+    [gGuestX11PatchView removeFromSuperview];
+    gGuestX11PatchView = nil;
+    gGuestX11PatchPixels = nil;
+    gGuestX11PatchWidth = 0;
+    gGuestX11PatchHeight = 0;
+    gGuestX11PatchVisible.store(false, std::memory_order_release);
+}
+
+static void BVNSyncGuestX11PatchGeometry(UIView* presentation) {
+    if (gGuestX11PatchView == nil || presentation == nil) {
+        return;
+    }
+    UIView* container = presentation.superview;
+    if (container == nil) {
+        return;
+    }
+    if (gGuestX11PatchView.superview != container) {
+        [gGuestX11PatchView removeFromSuperview];
+        [container addSubview:gGuestX11PatchView];
+    }
+    gGuestX11PatchView.bounds = presentation.bounds;
+    gGuestX11PatchView.center = presentation.center;
+    gGuestX11PatchView.transform = presentation.transform;
+    [container bringSubviewToFront:gGuestX11PatchView];
+}
+
+extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
+                                           uint32_t pitch,
+                                           int32_t bitsPerPixel,
+                                           int32_t screenX,
+                                           int32_t screenY,
+                                           uint32_t windowWidth,
+                                           uint32_t windowHeight,
+                                           int32_t dirtyX,
+                                           int32_t dirtyY,
+                                           uint32_t dirtyWidth,
+                                           uint32_t dirtyHeight) {
+    NSCAssert(NSThread.isMainThread,
+              @"X11 partial presentation must run on main");
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation == nil || pixels == nullptr || bitsPerPixel != 32 ||
+        pitch < windowWidth * 4 || dirtyWidth == 0 || dirtyHeight == 0) {
+        return;
+    }
+
+    const uint32_t guestWidth = (uint32_t)lround(presentation.bounds.size.width);
+    const uint32_t guestHeight =
+        (uint32_t)lround(presentation.bounds.size.height);
+    if (guestWidth == 0 || guestHeight == 0) {
+        return;
+    }
+    if (gGuestX11PatchPixels == nil || gGuestX11PatchWidth != guestWidth ||
+        gGuestX11PatchHeight != guestHeight) {
+        BVNRemoveGuestX11PatchView();
+        gGuestX11PatchWidth = guestWidth;
+        gGuestX11PatchHeight = guestHeight;
+        gGuestX11PatchPixels = [NSMutableData
+            dataWithLength:(NSUInteger)guestWidth * guestHeight * 4];
+        gGuestX11PatchView = [[UIImageView alloc]
+            initWithFrame:presentation.frame];
+        gGuestX11PatchView.backgroundColor = UIColor.clearColor;
+        gGuestX11PatchView.opaque = NO;
+        gGuestX11PatchView.userInteractionEnabled = NO;
+        gGuestX11PatchView.contentMode = UIViewContentModeScaleToFill;
+    }
+
+    const int32_t sourceLeft = MAX(0, dirtyX);
+    const int32_t sourceTop = MAX(0, dirtyY);
+    const int32_t sourceRight = MIN((int32_t)windowWidth,
+                                    dirtyX + (int32_t)dirtyWidth);
+    const int32_t sourceBottom = MIN((int32_t)windowHeight,
+                                     dirtyY + (int32_t)dirtyHeight);
+    const int32_t destinationLeft = screenX + sourceLeft;
+    const int32_t destinationTop = screenY + sourceTop;
+    const int32_t clippedLeft = MAX(0, destinationLeft);
+    const int32_t clippedTop = MAX(0, destinationTop);
+    const int32_t clippedRight = MIN((int32_t)guestWidth,
+                                     screenX + sourceRight);
+    const int32_t clippedBottom = MIN((int32_t)guestHeight,
+                                      screenY + sourceBottom);
+    if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) {
+        return;
+    }
+
+    uint32_t* destination =
+        reinterpret_cast<uint32_t*>(gGuestX11PatchPixels.mutableBytes);
+    const int32_t sourceOffsetX = clippedLeft - screenX;
+    const int32_t sourceOffsetY = clippedTop - screenY;
+    for (int32_t y = 0; y < clippedBottom - clippedTop; ++y) {
+        const uint32_t* sourceRow = reinterpret_cast<const uint32_t*>(
+            pixels + (sourceOffsetY + y) * pitch) + sourceOffsetX;
+        uint32_t* destinationRow = destination +
+            (clippedTop + y) * guestWidth + clippedLeft;
+        for (int32_t x = 0; x < clippedRight - clippedLeft; ++x) {
+            // Boxedwine's X11 visual is BGRX in little-endian memory. Core
+            // Graphics consumes BGRA here, so make only the updated rectangle
+            // opaque and leave the rest transparent over the Vulkan frame.
+            destinationRow[x] = sourceRow[x] | 0xff000000u;
+        }
+    }
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        gGuestX11PatchPixels.mutableBytes, guestWidth, guestHeight, 8,
+        guestWidth * 4, colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(colorSpace);
+    if (context == nullptr) {
+        return;
+    }
+    CGImageRef image = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    if (image == nullptr) {
+        return;
+    }
+    gGuestX11PatchView.image = [UIImage imageWithCGImage:image];
+    CGImageRelease(image);
+    BVNSyncGuestX11PatchGeometry(presentation);
+    gGuestX11PatchView.hidden = NO;
+    gGuestX11PatchVisible.store(true, std::memory_order_release);
+
+    static uint64_t patchCount = 0;
+    ++patchCount;
+    if (patchCount == 1 || patchCount % 120 == 0) {
+        NSString* message = [NSString stringWithFormat:
+            @"Composited X11 partial present #%llu at %d,%d %dx%d over "
+             "the Vulkan guest.",
+            (unsigned long long)patchCount, clippedLeft, clippedTop,
+            clippedRight - clippedLeft, clippedBottom - clippedTop];
+        BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
+    }
+}
+
+extern "C" bool BVNGuestTakeX11PatchClearRequest(void) {
+    return gGuestX11PatchVisible.exchange(false, std::memory_order_acq_rel);
+}
+
+extern "C" void BVNGuestClearX11Patches(void) {
+    NSCAssert(NSThread.isMainThread, @"X11 patch clearing must run on main");
+    if (gGuestX11PatchPixels != nil) {
+        memset(gGuestX11PatchPixels.mutableBytes, 0,
+               gGuestX11PatchPixels.length);
+    }
+    gGuestX11PatchView.image = nil;
+    gGuestX11PatchView.hidden = YES;
+}
 static bool gGuestPresentationIsLetterboxed = false;
 // Remembered so a rotation - or any UIKit layout pass that resets the Metal
 // view to the full window - can re-apply the same fit without the emulator
@@ -1067,6 +1226,7 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
     // -layoutSubviews, which re-entered the layout of a sibling subtree and
     // wedged it; the overlay no longer re-fits at all for exactly that reason.
     [view layoutIfNeeded];
+    BVNSyncGuestX11PatchGeometry(view);
 
     gGuestPresentationContentRect = target;
     gGuestPresentationIsLetterboxed =
@@ -1160,6 +1320,7 @@ extern "C" bool BVNSyncGuestPresentationGeometry(void) {
                                     gGuestPresentationGuestWidth,
                                     gGuestPresentationGuestHeight,
                                     gGuestPresentationStretch);
+    BVNGuestOverlayGeometryDidChange();
     return true;
 }
 
@@ -1180,6 +1341,7 @@ extern "C" void BVNForgetGuestPresentationAspect(void* surface) {
     gGuestPresentationIsLetterboxed = false;
     gGuestNaturalDrawableWidth.store(0, std::memory_order_relaxed);
     gGuestNaturalDrawableHeight.store(0, std::memory_order_relaxed);
+    BVNRemoveGuestX11PatchView();
 }
 
 extern "C" void* BVNCreateOffscreenMetalLayer(uint32_t width,

@@ -17,16 +17,17 @@
 	      include/boxedwine.h's MAP_BOXEDWINE and
 	      ios/runtime/src/BVNJIT.mm).  Without get-task-allow no debugger can
 	      attach at all, and Boxedwine's ARM64 JIT cannot run.  Sideloading
-	      tools normally set this themselves; it is declared here so an
-	      unsigned IPA carries the intent.
+	      tools normally set this themselves. An actually unsigned executable
+	      cannot carry entitlements, so CI also publishes an explicitly named
+	      ad-hoc entitlement template for a sideloader to re-sign.
 
 	  com.apple.developer.kernel.increased-memory-limit
 	      Boxedwine reserves a large contiguous region for the emulated guest
 	      address space.  Without the raised limit the app is jetsammed on
 	      devices with less RAM.  This entitlement is honoured only when the
-	      signing identity is allowed to use it; free Apple IDs are not, and
-	      signing tools strip it.  BoxedVN works without it on 6 GB+ devices,
-	      so it is safe to remove.
+	      final App ID and provisioning profile are allowed to use it; signing
+	      tools may strip it.  BoxedVN works without it on 6 GB+ devices, so it
+	      is safe to remove.
 
 	  Entitlements deliberately NOT present:
 	      com.apple.security.cs.allow-jit and friends are macOS Hardened

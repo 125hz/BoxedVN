@@ -371,9 +371,6 @@ std::vector<BString> StartUpArgs::buildArgs() {
     if (this->disableWasmJitForWrittenCode) {
         args.push_back(B("-disableWasmJitForWrittenCode"));
     }
-    if (this->x11MotionHeartbeat) {
-        args.push_back(B("-x11MotionHeartbeat"));
-    }
     for (const auto& module : this->interpreterModules) {
         args.push_back(B("-interpreterModule"));
         args.push_back(module);
@@ -403,7 +400,6 @@ bool StartUpArgs::apply() {
     KSystem::forceRelativeMouse = this->forceRelativeMouse;
     KSystem::cacheReads = this->cacheReads;
     KSystem::disableWasmJitForWrittenCode = this->disableWasmJitForWrittenCode;
-    KSystem::x11MotionHeartbeat = this->x11MotionHeartbeat;
     KSystem::interpreterModules = this->interpreterModules;
     KSystem::interpreterRanges = this->interpreterRanges;
     for (const auto& module : KSystem::interpreterModules) {
@@ -847,8 +843,6 @@ bool StartUpArgs::parseStartupArgs(int argc, const char **argv) {
 #else
             this->videoOption = VIDEO_NO_WINDOW;
 #endif
-        } else if (!strcmp(argv[i], "-x11MotionHeartbeat")) {
-            this->x11MotionHeartbeat = true;
         } else if (!strcmp(argv[i], "-env")) {
 			this->envValues.push_back(BString::copy(argv[i+1]));
             i++;

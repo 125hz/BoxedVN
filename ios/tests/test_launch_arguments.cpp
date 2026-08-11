@@ -219,14 +219,11 @@ BOXEDVN_TEST(grisaia_profile_keeps_dxvk_out_of_a_direct3d9_engine) {
 
         CHECK(BVNApplyKnownCompatibilityProfile(launch));
         CHECK(!launch.enableWineD3DVulkan);
-        CHECK(launch.x11MotionHeartbeat);
         // It must not pick up Saya's interpreter diagnostic by accident.
         CHECK(launch.interpreterModules.empty());
 
         const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
         CHECK(std::find(actual.begin(), actual.end(), "-dxvk") == actual.end());
-        CHECK(std::find(actual.begin(), actual.end(),
-                        "-x11MotionHeartbeat") != actual.end());
     }
 
     // Saya still gets DXVK: it is the title that cannot run without it.
@@ -236,7 +233,6 @@ BOXEDVN_TEST(grisaia_profile_keeps_dxvk_out_of_a_direct3d9_engine) {
     saya.enableWineD3DVulkan = true;
     CHECK(BVNApplyKnownCompatibilityProfile(saya));
     CHECK(saya.enableWineD3DVulkan);
-    CHECK(!saya.x11MotionHeartbeat);
 }
 
 BOXEDVN_TEST(command_does_not_let_boxedwine_truncate_frontend_log) {

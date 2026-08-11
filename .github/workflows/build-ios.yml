@@ -187,6 +187,41 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Package increased-memory entitlement template
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="build/ci/DerivedData/Build/Products/${BUILD_CONFIGURATION}-iphoneos/BoxedVN.app"
+          entitled_app="build/entitled/BoxedVN.app"
+
+          scripts/prepare-entitled-app.sh \
+            --app "${app}" \
+            --output "${entitled_app}"
+          scripts/package-ipa.sh \
+            --app "${entitled_app}" \
+            --output-dir build/artifacts \
+            --name BoxedVN-entitlements-ready.ipa
+
+          ipa="build/artifacts/BoxedVN-entitlements-ready.ipa"
+          checksum="$(awk '{print $1}' "${ipa}.sha256")"
+          {
+            echo "## Increased-memory signing template"
+            echo "- File: \`BoxedVN-entitlements-ready.ipa\`"
+            echo "- SHA-256: \`${checksum}\`"
+            echo "- Embedded request: \`com.apple.developer.kernel.increased-memory-limit = true\`"
+            echo "- Signing: ad hoc only; your sideloader must replace it after GetMoreRAM enables the same App ID"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload increased-memory entitlement template
+        uses: actions/upload-artifact@v7
+        with:
+          name: BoxedVN-entitlements-ready-ipa-${{ inputs.configuration || 'Release' }}
+          path: |
+            build/artifacts/BoxedVN-entitlements-ready.ipa
+            build/artifacts/BoxedVN-entitlements-ready.ipa.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v7

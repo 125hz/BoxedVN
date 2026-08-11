@@ -85,7 +85,10 @@ target_include_directories(boxedwine_zlib PUBLIC
     "${BOXEDWINE_ROOT}/lib/zlib"
     "${BOXEDWINE_ROOT}/lib/zlib/contrib/minizip"
 )
-target_compile_definitions(boxedwine_zlib PRIVATE HAVE_UNISTD_H=1 HAVE_STDARG_H=1)
+target_compile_definitions(boxedwine_zlib PRIVATE HAVE_STDARG_H=1)
+if(NOT WIN32)
+    target_compile_definitions(boxedwine_zlib PRIVATE HAVE_UNISTD_H=1)
+endif()
 # The vendored zlib predates the Apple SDK change that makes <sys/cdefs.h> pull
 # in <TargetConditionals.h>.  Its zutil.h sees TARGET_OS_MAC, assumes classic
 # Mac OS, and does `#ifndef fdopen / #define fdopen(fd,mode) NULL`, which then

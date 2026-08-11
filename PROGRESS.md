@@ -6,15 +6,17 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-11 (build 75 prepared from build-74 device evidence.
-Build 74 disproved compositor/adaptive-refresh starvation for Grisaia: the
-guest itself submits only two frames per five seconds in static scenes. Build
-75 gives that title a 30 Hz X11 motion heartbeat, corrects the portrait
-pointer's double coordinate transform, and disables the unsupported NDIS
-service that costs roughly 57 seconds at startup. CI and physical-device
-validation remain pending. Song of Saya remains device-proven playable with
-the interpreter workaround. The newest detail is at the end of the session
-log; the open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
+**Last updated:** 2026-08-11 (build 76 prepared from build-75 device evidence.
+Build 75 proved the title heartbeat ineffective, confirmed portrait hit tests
+continue while touch delivery stays wedged, and cut the measured NDIS startup
+gap from roughly 57 seconds to roughly 8. Build 76 replaces the title heartbeat
+with a shared X11-over-Vulkan partial-present compositor, resets UIKit touch
+tracking after rotation, defers the initial landscape request out of the
+launching touch transaction, and publishes a separately named entitlement-
+template IPA. CI and physical-device validation remain pending. Song of Saya
+remains device-proven playable with the interpreter workaround. The newest
+detail is at the end of the session log; the open-problem list lives in
+`docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
 `379bf2414a67fc6509d506a6eefdf6ffa7ebf82d` (2026-08-05, "build fix"),
@@ -3271,3 +3273,50 @@ vendored zlib configuration unconditionally declares `HAVE_UNISTD_H=1`, so
 MSVC fails before compiling the tests; Ubuntu CI remains the portable suite and
 macOS CI remains the iPhoneOS compiler/package gate. Build, unsigned IPA, and
 all physical-device behavior are pending CI/device validation.
+
+### 2026-08-11 — build 76: shared partial presents, rotation touch reset, and entitlement packaging
+
+The build-75 Grisaia log contains the expected `iOS X11 motion heartbeat
+active at 30 Hz` line while static dialogue remains at 0.2–0.6 fps. That
+falsifies the event-heartbeat workaround, which is now removed end to end.
+The same log switches immediately to 17–35 fps for animations while acquire
+and present calls remain near zero milliseconds, so a generally slow or broken
+JIT does not fit the observed boundary.
+
+Wine's upstream fix for Grisaia deliberately routes partial `COPY` presents
+through a GDI blit because a GL/Vulkan backbuffer is undefined after swap.
+Boxedwine's `XServer::draw`, however, returned immediately whenever the SDL
+window had `SDL_WINDOW_VULKAN`: it neither displayed nor consumed the X11
+dirty window. The dirty bit then stayed latched, so later writes could not even
+wake the compositor. Build 76 tracks the precise dirty rectangle for every
+X11 image/copy/fill, consumes it while Vulkan owns the window, and places only
+those opaque pixels in a transparent UIKit layer over the Metal frame. The
+next successful full Vulkan present clears the patch layer. This is shared
+Boxedwine presentation behavior; it contains no executable-name check or
+synthetic frame timer. Device acceptance requires the new `Composited X11
+partial present` log and visibly normal dialogue updates.
+
+The portrait log proves the overlay remains attached, correctly sized, and
+hit-tested after rotation, so build 75's coordinate change could not fix the
+remaining failure. Build 76 treats it as stale UIKit tracking: after every
+settled geometry change it clears the retained guest touch, cancels all
+`UIControl` tracking, resets gesture recognizers, releases held keys, and
+closes the menu. The initial portrait-to-landscape request is also deferred by
+one main-queue turn so the SwiftUI launch touch completes before scene geometry
+changes. Both live rotation and portrait launch remain device acceptance items.
+
+MeloNX and BoxedVN both request
+`com.apple.developer.kernel.increased-memory-limit`; the difference was the
+artifact. BoxedVN's CI explicitly removed code signing, and Apple entitlements
+live in the code signature, so GetMoreRAM had no request to preserve. CI now
+keeps `BoxedVN-unsigned.ipa` genuinely unsigned and separately creates
+`BoxedVN-entitlements-ready.ipa` with an ad-hoc signature containing
+`get-task-allow` and the increased-memory request. The latter must still be
+re-signed with the same App ID/Apple ID configured in GetMoreRAM, then verified
+from BoxedVN's Memory row on device.
+
+The host-independent preset is now genuinely Windows-buildable: zlib no longer
+claims `<unistd.h>` on MSVC, test warning flags use MSVC spellings, and the two
+PID-based tests use `_getpid`. The complete Windows test executable builds and
+CTest passes 1/1. iPhoneOS compilation, IPA validation, and all device behavior
+remain pending CI/device evidence.

@@ -384,6 +384,21 @@ void XServer::draw(bool drawNow) {
 
 	KNativeScreenPtr screen = KNativeSystem::getScreen();
 	if (!screen->canBltToScreen()) {
+#ifdef BOXEDWINE_IOS
+		// WineD3D deliberately falls back to GDI for partial COPY presents.
+		// A Vulkan SDL window has no SDL_Renderer, but those X11 writes still
+		// have to be consumed: XWindow::draw forwards their dirty rectangles to
+		// the native transparent compositor above the Metal view. Consuming
+		// them also clears XWindow::isDirty so the next write can wake us again.
+		screen->getInput()->runOnUiThread([this]() {
+			root->iterateMappedChildrenBackToFront([](XWindowPtr child) {
+				if (child->c_class == InputOutput) {
+					child->draw();
+				}
+				return true;
+			}, true);
+		});
+#endif
 		return;
 	}
 	screen->getInput()->runOnUiThread([screen, this]() {

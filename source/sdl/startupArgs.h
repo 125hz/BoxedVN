@@ -119,7 +119,6 @@ public:
     bool forceRelativeMouse = false;
     bool cacheReads = false;
     bool disableWasmJitForWrittenCode = false;
-    bool x11MotionHeartbeat = false;
     std::vector<BString> interpreterModules;
     std::vector<std::pair<U32, U32>> interpreterRanges;
 

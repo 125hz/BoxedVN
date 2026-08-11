@@ -198,7 +198,7 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 			dst += this->bytes_per_line;
 		}
 	}
-	setDirty();
+	setDirtyRect(dst_x, dst_y, width, height);
 	return Success;
 }
 
@@ -231,7 +231,7 @@ int XDrawable::copy(KThread* thread, const std::shared_ptr<XGC>& gc, const std::
 		src += srcDrawable->bytes_per_line;
 		dst += this->bytes_per_line;
 	}
-	setDirty();
+	setDirtyRect(dstX, dstY, width, height);
 	return Success;
 }
 
@@ -300,7 +300,7 @@ int XDrawable::fillRectangle(KThread* thread, const std::shared_ptr<XGC>& gc, S3
 	} else {
         kwarn_fmt("XDrawable::fillRectangle only %d-bit not handled", visual->bits_per_rgb);
 	}
-	setDirty();
+	setDirtyRect(x, y, width, height);
 	return Success;
 }
 

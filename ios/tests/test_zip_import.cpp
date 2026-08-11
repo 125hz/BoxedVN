@@ -9,7 +9,12 @@
  *  exercised end to end rather than only at the string level.
  */
 
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstring>

@@ -1122,8 +1122,14 @@ static BVNGuestOverlayView* gOverlay = nil;
 }
 
 - (void)toggleRotation {
-    BVNGuestSetRotationUnlocked(!BVNGuestRotationIsUnlocked());
-    [self applyMenuState];
+    const bool unlocked = !BVNGuestRotationIsUnlocked();
+    // End the UIControl transaction before UIKit begins replacing/resizing
+    // the scene hierarchy. Leaving this panel open while its own touch-up
+    // handler initiates rotation is how a control can remain in tracking
+    // state across the transition.
+    [self closeMenu];
+    self.guestTouch = nil;
+    BVNGuestSetRotationUnlocked(unlocked);
 }
 
 - (void)askToQuit {
@@ -1335,6 +1341,39 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
     if (parent != nil && parent.subviews.lastObject != gOverlay) {
         [parent bringSubviewToFront:gOverlay];
     }
+}
+
+static void BVNCancelTrackingInView(UIView* view) {
+    if ([view isKindOfClass:UIControl.class]) {
+        [(UIControl*)view cancelTrackingWithEvent:nil];
+    }
+    for (UIGestureRecognizer* recognizer in view.gestureRecognizers) {
+        recognizer.enabled = NO;
+        recognizer.enabled = YES;
+    }
+    for (UIView* child in view.subviews) {
+        BVNCancelTrackingInView(child);
+    }
+}
+
+extern "C" void BVNGuestOverlayGeometryDidChange(void) {
+    if (!NSThread.isMainThread || gOverlay == nil) {
+        return;
+    }
+    // A scene rotation can cancel the touch sequence at the hosting-window
+    // boundary without a matching -touchesCancelled: reaching this direct
+    // UIWindow child. Clear both our retained guest touch and UIKit's control
+    // / recognizer state; otherwise the same stale sequence blocks all later
+    // touches, even after rotating back.
+    gOverlay.guestTouch = nil;
+    [gOverlay releaseHeldKeys];
+    [gOverlay closeMenu];
+    BVNCancelTrackingInView(gOverlay);
+    gOverlay.userInteractionEnabled = NO;
+    gOverlay.userInteractionEnabled = YES;
+    [gOverlay setNeedsLayout];
+    BVNLogWrite(BVNLogLevelInfo, "input",
+                "Reset guest overlay touch tracking after geometry change.");
 }
 
 // Called from the JIT's allocator, which is not the main thread. Recorded here

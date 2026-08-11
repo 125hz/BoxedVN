@@ -45,6 +45,7 @@ require_macos
 require_command ditto
 require_command shasum
 require_command unzip
+require_command codesign
 
 # Never package something that failed validation.
 "${BOXEDVN_SCRIPT_DIR}/validate-app.sh" "${APP_PATH}"
@@ -111,13 +112,25 @@ $(cd "${SMOKE}" && find . -maxdepth 2 | head -20)"
 
 ok "smoke test passed"
 
+SIGNING_DESCRIPTION="unsigned"
+if codesign --display "${UNPACKED}" >/dev/null 2>&1; then
+    SIGNING_DESCRIPTION="ad-hoc entitlement template"
+fi
+
 printf '\n'
 log "Packaged"
 printf '  ipa      : %s (%s)\n' "${IPA_PATH}" \
     "$(du -h "${IPA_PATH}" | awk '{print $1}')"
 printf '  checksum : %s\n' "${IPA_PATH}.sha256"
+printf '  signing  : %s\n' "${SIGNING_DESCRIPTION}"
 printf '\n'
-printf 'This IPA is unsigned. Sign it with SideStore, Sideloadly, AltStore or\n'
-printf 'an equivalent tool before installing. Signing does NOT enable JIT:\n'
+if [[ "${SIGNING_DESCRIPTION}" == "unsigned" ]]; then
+    printf 'This IPA is unsigned. Sign it with SideStore, Sideloadly, AltStore or\n'
+    printf 'an equivalent tool before installing.\n'
+else
+    printf 'This IPA has only an ad-hoc entitlement-template signature. Replace it\n'
+    printf 'with a provisioning-profile-backed signature using your sideloader.\n'
+fi
+printf 'Signing does NOT enable JIT:\n'
 printf 'on iOS 26/27, assign StikDebug universal.js to BoxedVN, launch through\n'
 printf 'StikDebug, and keep the script active while the guest runs.\n'

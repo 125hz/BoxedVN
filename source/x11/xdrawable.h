@@ -59,6 +59,13 @@ public:
 	void unlockData();
 
 	virtual void setDirty() {};
+	virtual void setDirtyRect(S32 x, S32 y, U32 width, U32 height) {
+		(void)x;
+		(void)y;
+		(void)width;
+		(void)height;
+		setDirty();
+	}
 	bool isDirty = false;
 	const bool isWindow;
 	const bool isPBuffer;

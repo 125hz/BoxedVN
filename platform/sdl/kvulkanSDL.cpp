@@ -47,6 +47,8 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface);
 extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
                                                         int* height);
 extern "C" void BVNGuestVulkanSurfaceDidPresent(void* surface);
+extern "C" bool BVNGuestTakeX11PatchClearRequest(void);
+extern "C" void BVNGuestClearX11Patches(void);
 extern "C" void* BVNCreateOffscreenMetalLayer(U32 width, U32 height);
 extern "C" void BVNDestroyOffscreenMetalLayer(void* layer);
 
@@ -699,6 +701,14 @@ void KVulkdanSDLImpl::presentVulkanSwapchain(void* swapchain, int result) {
 #ifdef BOXEDWINE_IOS
     if (presentation && (result == 0 || result == 1000001003)) {
         bvnReportPresentRate();
+        // WineD3D uses X11/GDI for partial COPY presents. Those patches sit
+        // transparently above the last Vulkan frame; the next successful full
+        // Vulkan present supersedes them, so clear the overlay exactly once.
+        if (BVNGuestTakeX11PatchClearRequest()) {
+            DISPATCH_MAIN_THREAD_BLOCK_BEGIN
+            BVNGuestClearX11Patches();
+            DISPATCH_MAIN_THREAD_BLOCK_END
+        }
     }
     if (firstSuccessfulPresent) {
         // UIKit is main-thread-only. Dispatch just this first transition;

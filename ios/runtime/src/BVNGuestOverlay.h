@@ -56,6 +56,12 @@ void BVNGuestStartupNoticeSetProgress(size_t jitBlocks);
 // SDL's views.  Cheap; called from the emulator's own event loop.
 void BVNGuestOverlayApplyPendingState(void);
 
+// Cancels UIKit control/gesture tracking after a live scene-geometry change.
+// Rotation can cancel a touch without delivering the final callback to the
+// view that owned it; carrying that stale tracking state forward makes every
+// later touch appear dead until process restart.
+void BVNGuestOverlayGeometryDidChange(void);
+
 // ---------------------------------------------------------------------------
 // Implemented by BVNAppDelegate.mm
 // ---------------------------------------------------------------------------

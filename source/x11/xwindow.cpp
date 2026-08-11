@@ -18,6 +18,13 @@
 
 #include "boxedwine.h"
 #include "x11.h"
+
+#ifdef BOXEDWINE_IOS
+extern "C" void BVNGuestCompositeX11Patch(const U8* pixels, U32 pitch,
+	S32 bitsPerPixel, S32 screenX, S32 screenY, U32 windowWidth,
+	U32 windowHeight, S32 dirtyX, S32 dirtyY, U32 dirtyWidth,
+	U32 dirtyHeight);
+#endif
 #include "knativesystem.h"
 
 void XWindowChanges::read(KMemory* memory, U32 address) {
@@ -887,6 +894,32 @@ int XWindow::reparentWindow(const XWindowPtr& parent, S32 x, S32 y) {
 }
 
 void XWindow::setDirty() {
+	setDirtyRect(0, 0, width(), height());
+}
+
+void XWindow::setDirtyRect(S32 x, S32 y, U32 width, U32 height) {
+	if (!width || !height) {
+		return;
+	}
+	const S32 left = std::max<S32>(0, x);
+	const S32 top = std::max<S32>(0, y);
+	const S32 right = std::min<S32>((S32)this->width(), x + (S32)width);
+	const S32 bottom = std::min<S32>((S32)this->height(), y + (S32)height);
+	if (right <= left || bottom <= top) {
+		return;
+	}
+	if (!dirtyBoundsValid) {
+		dirtyLeft = left;
+		dirtyTop = top;
+		dirtyRight = right;
+		dirtyBottom = bottom;
+		dirtyBoundsValid = true;
+	} else {
+		dirtyLeft = std::min(dirtyLeft, left);
+		dirtyTop = std::min(dirtyTop, top);
+		dirtyRight = std::max(dirtyRight, right);
+		dirtyBottom = std::max(dirtyBottom, bottom);
+	}
 	if (!isDirty) {
 		isDirty = true;
 		XServer::getServer()->isDisplayDirty = true;
@@ -907,7 +940,22 @@ void XWindow::draw() {
 	S32 screenY = top;
 	//windowToScreen(screenX, screenY);
 	lockData();
+	const bool wasDirty = isDirty;
+#ifdef BOXEDWINE_IOS
+	if (wasDirty && dirtyBoundsValid &&
+		!KNativeSystem::getScreen()->canBltToScreen()) {
+		S32 absoluteX = 0;
+		S32 absoluteY = 0;
+		windowToScreen(absoluteX, absoluteY);
+		BVNGuestCompositeX11Patch(data, bytes_per_line,
+			visual ? visual->bits_per_rgb : 32, absoluteX, absoluteY,
+			width(), height(), dirtyLeft, dirtyTop,
+			(U32)(dirtyRight - dirtyLeft),
+			(U32)(dirtyBottom - dirtyTop));
+	}
+#endif
 	KNativeSystem::getScreen()->putBitsOnWnd(id, data, visual?visual->bits_per_rgb:32, bytes_per_line, screenX, screenY, width(), height(), palette, isDirty);
+	dirtyBoundsValid = false;
 	unlockData();
 	isDirty = false;
 

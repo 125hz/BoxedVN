@@ -228,12 +228,13 @@ Vulkan call — `hostVulkanIndex=N`, which indexes `source/vulkan/vkdef.h`
 
 ## 6. Open problems, in the order they matter
 
-1. **Grisaia frame-rate device acceptance.** Build 74 disproved the adaptive-
-   refresh theory: the guest made only two present calls per five seconds in
-   the slow state and both returned immediately. Build 75 enables a Grisaia-
-   only 30 Hz X11 motion heartbeat because the CatSystem2 render loop resumes
-   instantly for pointer activity or an animation. Confirm `iOS X11 motion
-   heartbeat active` and measure the following performance lines on device.
+1. **X11-over-Vulkan partial-present device acceptance.** Build 75 proved the
+   Grisaia motion heartbeat ran but did not change the 0.4 fps symptom. Wine's
+   upstream partial-COPY path sends incremental frames through GDI, while
+   Boxedwine had disabled and stopped consuming its X11 compositor after the
+   Vulkan window appeared. Build 76 composites only those dirty X11 rectangles
+   over the Metal view and removes the title-specific heartbeat. Confirm
+   `Composited X11 partial present` appears and dialogue updates normally.
 2. **The ARM64 JIT miscompiles DXVK.** Saya no Uta needs
    `-interpreterModule d3d11`, which is a workaround, not a fix. See
    `docs/CONTINUING_WITHOUT_A_MAC.md` for the register-level evidence and the
@@ -248,11 +249,11 @@ Vulkan call — `hostVulkanIndex=N`, which indexes `source/vulkan/vkdef.h`
    `shaderCullDistance`, `robustBufferAccess2` and `nullDescriptor`, none of
    which MoltenVK exposes. Grisaia works only because DXVK is disabled for it in
    `BVNLaunchArguments.cpp`.
-6. **`increased-memory-limit` is not surviving signing.** The log line
-   `Memory status: … The installed app's signed entitlement is not enabled.`
-   says so on every launch. iOS offers no way to request more CPU cores or GPU;
-   the memory entitlement is the only real lever, and the sideloading tool has
-   to preserve it.
+6. **`increased-memory-limit` device acceptance.** CI now publishes
+   `BoxedVN-entitlements-ready.ipa`, an ad-hoc template containing the request;
+   the ordinary unsigned IPA cannot carry entitlements. Enable the capability
+   on the sideloader's exact App ID with GetMoreRAM, then re-sign/reinstall the
+   template and confirm Settings reports `Increased limit`.
 
 ---
 

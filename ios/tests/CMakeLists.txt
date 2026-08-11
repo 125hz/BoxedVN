@@ -24,7 +24,12 @@ target_include_directories(boxedvn_tests PRIVATE
 # boxedwine_zlib is linked directly so the ZIP tests can build hostile archives
 # with minizip's writer rather than checking in binary fixtures.
 target_link_libraries(boxedvn_tests PRIVATE boxedvn_support boxedwine_zlib)
-target_compile_options(boxedvn_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+if(MSVC)
+    target_compile_options(boxedvn_tests PRIVATE /W4 /wd4100 /EHsc)
+else()
+    target_compile_options(boxedvn_tests PRIVATE
+        -Wall -Wextra -Wno-unused-parameter)
+endif()
 
 add_test(NAME boxedvn_support COMMAND boxedvn_tests)
 set_tests_properties(boxedvn_support PROPERTIES

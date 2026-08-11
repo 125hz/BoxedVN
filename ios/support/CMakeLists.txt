@@ -20,11 +20,15 @@ target_link_libraries(boxedvn_support PRIVATE boxedwine_zlib)
 
 target_compile_features(boxedvn_support PUBLIC cxx_std_20)
 
-target_compile_options(boxedvn_support PRIVATE
-    -Wall
-    -Wextra
-    -Wno-unused-parameter
-)
+if(MSVC)
+    target_compile_options(boxedvn_support PRIVATE /W4 /wd4100 /EHsc)
+else()
+    target_compile_options(boxedvn_support PRIVATE
+        -Wall
+        -Wextra
+        -Wno-unused-parameter
+    )
+endif()
 
 # Mirrors the JIT configuration of boxedwine_core so
 # boxedwineX86Capabilities() reports what was actually built.

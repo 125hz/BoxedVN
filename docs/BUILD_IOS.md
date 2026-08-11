@@ -160,8 +160,16 @@ should ship one.
 
 ## 5. Signing and installing
 
-The IPA is unsigned. Sign it with SideStore, Sideloadly, AltStore or an
-equivalent tool and install it on a physical ARM64 device.
+CI publishes two deliberately different IPAs:
+
+- `BoxedVN-unsigned.ipa` is genuinely unsigned. Sign it with SideStore,
+  Sideloadly, AltStore or an equivalent tool.
+- `BoxedVN-entitlements-ready.ipa` has only an ad-hoc template signature. It
+  embeds BoxedVN's entitlement request so a sideloader can carry those keys
+  into its real provisioning-profile-backed signature. It is not installable
+  until the sideloader replaces that signature.
+
+Install either final, re-signed result only on a physical ARM64 device.
 
 ### Entitlements
 
@@ -171,7 +179,7 @@ inline in that file:
 | Key | Purpose | Can a signing tool change it? |
 |-----|---------|-------------------------------|
 | `get-task-allow` | lets StikDebug attach and get the kernel to flag the process `CS_DEBUGGED`; on iOS 26/27 its active universal script must then prepare BoxedVN's executable arena through debugserver/TXM (see `docs/ARCHITECTURE_IOS.md` §4) | Tools normally **set** this themselves. It must end up present, or no debugger can attach and JIT cannot work. |
-| `com.apple.developer.kernel.increased-memory-limit` | raises the jetsam limit for the emulated guest address space | **Frequently stripped.** Free Apple IDs are not entitled to it. BoxedVN works without it on devices with plenty of RAM. |
+| `com.apple.developer.kernel.increased-memory-limit` | raises the jetsam limit for the emulated guest address space | **Frequently stripped.** The App ID and final provisioning profile must authorize it. BoxedVN works without it on devices with plenty of RAM. |
 
 Nothing else is requested. In particular there are no macOS Hardened Runtime
 keys (`com.apple.security.cs.*` mean nothing on iOS), no `com.apple.private.*`
@@ -186,11 +194,15 @@ snapshot. Use that row before and after a signing/GetMoreRam change; inspecting
 the source entitlement file alone does not prove the installed signature has
 the entitlement.
 
-The first GetMoreRam device attempt still reported `Standard limit` with 3.29
-GB available before the process limit. That means the final signer/profile did
-not authorize the entitlement. Also reassign StikDebug's `universal.js` after
-reinstalling: a new signer-generated application identifier is a new target,
-even when `CS_DEBUGGED` is visible.
+An unsigned Mach-O cannot carry an effective entitlement because iOS reads
+entitlements from its code signature. For GetMoreRAM, enable Increased Memory
+Limit on the exact App ID produced by the same Apple ID/sideloading tool, then
+delete the old installation and re-sign/reinstall
+`BoxedVN-entitlements-ready.ipa`. Confirm the app's Memory row says
+`Increased limit`; source plist contents and a successful upload are not
+proof. Also reassign StikDebug's `universal.js` after reinstalling: a new
+signer-generated application identifier is a new target, even when
+`CS_DEBUGGED` is visible.
 
 ### Signing does not enable JIT
 
