@@ -1066,6 +1066,9 @@ static BVNGuestOverlayView* gOverlay = nil;
         self.confirmingQuit = NO;
     }
     [self applyMenuState];
+    BVNLogWrite(BVNLogLevelInfo, "input",
+                self.menuOpen ? "Guest overlay menu opened."
+                              : "Guest overlay menu closed.");
 }
 
 - (void)closeMenu {

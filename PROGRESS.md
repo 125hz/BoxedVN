@@ -6,24 +6,15 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-09 (build 72. Song of Saya is **playable on device**
-— main menu, dialogue, working touch — but only with `-interpreterModule
-d3d11`, which is a diagnostic workaround for an ARM64 JIT defect, not a fix.
-Build 65 killed the **swapchain storm** (8,244 rebuilds a minute down to two
-creations a session) and build 66 fixed rotation, but 66 lost touch entirely.
-Build 67 fixed landscape touch, the status bar and the menu placement, and got
-Grisaia running (the no-DXVK profile, which had never actually executed before).
-Build 68's measurement did its job immediately: **Saya runs at 58 fps** and
-**Grisaia at 0.4 fps with only 0.65 host cores busy** - not CPU-bound,
-sleeping. Build 69 bounded the fairness throttle, which was one cause but not the whole
-one: Grisaia is still at 0.4 fps with the machine 92% idle. Build 70's poll counter finished the Grisaia diagnosis: the guest makes
-**37,000 getrusage and 18,600 sched_yield calls a second**, and each getrusage
-took the process thread-table mutex and walked every thread. Build 71 cached it, and the result disproved the theory: Grisaia is *bimodal*,
-running at 30 fps with 740,000 calls/sec and 0.4 fps with 37,000, so the poll
-rate follows the frame rate rather than causing it. Build 72 restores the
-overlay layout methods a bad edit deleted in build 70. **Build 72 is not
-device-tested yet.** The newest detail is at the end of the session log, section 10; the
-open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
+**Last updated:** 2026-08-11 (build 75 prepared from build-74 device evidence.
+Build 74 disproved compositor/adaptive-refresh starvation for Grisaia: the
+guest itself submits only two frames per five seconds in static scenes. Build
+75 gives that title a 30 Hz X11 motion heartbeat, corrects the portrait
+pointer's double coordinate transform, and disables the unsupported NDIS
+service that costs roughly 57 seconds at startup. CI and physical-device
+validation remain pending. Song of Saya remains device-proven playable with
+the interpreter workaround. The newest detail is at the end of the session
+log; the open-problem list lives in `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
 **Upstream base:** `danoon2/Boxedwine` commit
 `379bf2414a67fc6509d506a6eefdf6ffa7ebf82d` (2026-08-05, "build fix"),
@@ -3234,3 +3225,49 @@ shell and is what "browse the files" actually needs.
 
 Verified locally: build succeeds, app validates, 91/91 tests pass.
 **Untested on device.**
+
+### 2026-08-11 — build 75: Grisaia redraw heartbeat, portrait touch coordinates, and the NDIS timeout
+
+The build-74 Grisaia log kills the build-73 display-refresh theory. In the
+slow state the guest calls `vkQueuePresentKHR` only twice in five seconds, and
+those calls spend effectively zero milliseconds in present/acquire. During
+speed-line and fade animations it submits 19–30 frames/sec through the same
+path. The guest is deciding not to redraw; the compositor is not withholding a
+drawable. This matches the independently reported CatSystem2/Wine behavior
+where Grisaia falls to 0.2 fps until mouse movement generates window activity.
+
+Build 75 adds a title-scoped `-x11MotionHeartbeat` profile for `BootMenu.exe`
+and `Grisaia.exe`. The emulator main loop sends an unchanged X11
+`MotionNotify` every 33 ms. It does not move the pointer and no other title
+receives the pulse. The next device log must contain `iOS X11 motion heartbeat
+active at 30 Hz for this title`; only its measured FPS can establish success.
+
+Portrait input had a separate deterministic transform bug. UIKit's
+`locationInView:` already returns guest pixels because the presenting Metal
+view has guest-sized bounds. `BVNGuestControlsSendPointer` then passed those
+pixels to `KNativeInputSDL`, which treated them as host-window points and
+applied the letterbox transform a second time. In portrait that maps ordinary
+taps to an edge of the 800×600 guest. The bridge now applies the inverse before
+using the existing input API, for left click, motion, and two-finger right
+click. Overlay menu open/close is logged so the next report separates a UIKit
+control failure from guest-coordinate delivery.
+
+The rotation log does not show a rotation freeze: landscape settled in 84 ms
+and SDL created an 874×402 window. It shows the same cold-Wine gap as every
+other launch. In three logs JIT allocation progresses through block 320, Wine
+reports `Auto-start service NDIS failed to start: 1053`, and allocation 384
+arrives 57–59 seconds later. Boxedwine supplies Wine's interface data through
+`nsiproxy`/netlink and has no NDIS kernel driver, so prefix preparation now
+sets only `Services\\NDIS\\Start=4`; Wine services, `nsiproxy`, and `winebus`
+remain enabled. Existing prefixes are repaired before every launch.
+
+Also corrected the iOS plist key from the nonexistent
+`CADisableMinimumFrameDuration` spelling to Apple's
+`CADisableMinimumFrameDurationOnPhone`.
+
+**Local evidence:** `git diff --check` passes. The focused MSVC launch-profile
+test passes. The full Windows preset reaches the compiler but the repository's
+vendored zlib configuration unconditionally declares `HAVE_UNISTD_H=1`, so
+MSVC fails before compiling the tests; Ubuntu CI remains the portable suite and
+macOS CI remains the iPhoneOS compiler/package gate. Build, unsigned IPA, and
+all physical-device behavior are pending CI/device validation.

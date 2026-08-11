@@ -402,11 +402,12 @@ void runSession(const BVNLaunchConfiguration& launch) {
         }
         const char* prefixMessage =
             launch.enableWineD3DVulkan
-                ? "Wine prefix ready: stale GDI/no-3D policy repaired; "
+                ? "Wine prefix ready: unsupported NDIS and Bluetooth "
+                  "drivers disabled; stale GDI/no-3D policy repaired; "
                   "imported game uses DXVK through Boxedwine and iOS "
                   "MoltenVK/Metal."
-                : "Wine prefix ready: unsupported Bluetooth root device "
-                  "disconnected; Wine HID bus available.";
+                : "Wine prefix ready: unsupported NDIS and Bluetooth "
+                  "drivers disabled; Wine HID bus and nsiproxy available.";
         BVNLogWrite(BVNLogLevelInfo, "prefix", prefixMessage);
 
         // Shadow the rootfs's stock DXVK with the MoltenVK-compatible build.

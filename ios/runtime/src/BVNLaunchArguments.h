@@ -31,6 +31,10 @@ struct BVNLaunchConfiguration {
     // games on iOS. Upstream DXVK 2.5.2 requires Vulkan geometry shaders and
     // transform feedback, neither of which MoltenVK currently exposes.
     bool enableWineD3DVulkan = false;
+    // Some event-driven Windows engines only advance their render loop while
+    // receiving pointer/window activity. The compatibility profile may ask
+    // Boxedwine to emit an unchanged X11 motion event at 30 Hz.
+    bool x11MotionHeartbeat = false;
 };
 
 /// Adds a narrowly scoped engine workaround when the requested Windows

@@ -112,6 +112,8 @@ BOXEDVN_TEST(wine_prefix_is_extracted_and_patched_end_to_end) {
             "\"Start\"=dword:00000003\n\n"
             "[System\\\\ControlSet001\\\\Services\\\\winebus] 3\n"
             "\"Start\"=dword:00000004\n\n"
+            "[System\\\\ControlSet001\\\\Services\\\\NDIS] 31\n"
+            "\"Start\"=dword:00000003\n\n"
             "[System\\\\ControlSet001\\\\Enum\\\\ROOT\\\\WINE\\\\WINEBTH] 4\n"
             "\"Service\"=\"winebth\"\n\n"
             "[System\\\\ControlSet001\\\\Enum\\\\ROOT\\\\WINE\\\\WINEBUS] 5\n"
@@ -134,12 +136,14 @@ BOXEDVN_TEST(wine_prefix_is_extracted_and_patched_end_to_end) {
     CHECK_EQ(std::count(systemRegistry.begin(), systemRegistry.end(), '\n') > 0,
              true);
     CHECK_EQ(countSubstring(systemRegistry,
-                            "\"Start\"=dword:00000004"), 1U);
+                            "\"Start\"=dword:00000004"), 2U);
     CHECK_EQ(countSubstring(systemRegistry,
                             "\"Start\"=dword:00000003"), 1U);
     CHECK_EQ(countSubstring(systemRegistry, "\"Service\"=\"\""), 1U);
     CHECK_EQ(countSubstring(systemRegistry,
                             "\"Service\"=\"winebus\""), 1U);
+    CHECK_CONTAINS(systemRegistry,
+                   "[System\\\\ControlSet001\\\\Services\\\\NDIS]");
 
     const WinePrefixPreparationResult repeated =
         prepareWinePrefix(archive.string(), prefix.string(),

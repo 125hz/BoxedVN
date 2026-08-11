@@ -355,6 +355,30 @@ bool KNativeInputSDL::processEvents() {
     SDL_Event e = {};
 
 #ifdef BOXEDWINE_IOS
+    // CatSystem2 (The Fruit of Grisaia) stops advancing dialogue when its X11
+    // queue goes idle: device measurements fall to exactly 0.4 presents/sec,
+    // while any animation or pointer activity restores 30 fps immediately.
+    // The title profile enables this unchanged MotionNotify heartbeat. It is
+    // deliberately generated in the emulator loop, not a UIKit timer, so it
+    // remains alive while boxedmain owns the main thread.
+    static U32 lastMotionHeartbeat = 0;
+    static bool motionHeartbeatLogged = false;
+    const U32 heartbeatNow = SDL_GetTicks();
+    if (KSystem::x11MotionHeartbeat &&
+        heartbeatNow - lastMotionHeartbeat >= 33) {
+        lastMotionHeartbeat = heartbeatNow;
+        const int guestX = hasInjectedPointer ? injectedX : (int)width / 2;
+        const int guestY = hasInjectedPointer ? injectedY : (int)height / 2;
+        mouseMove(xToScreen(guestX), yToScreen(guestY), false);
+        if (!motionHeartbeatLogged) {
+            motionHeartbeatLogged = true;
+            klog("iOS X11 motion heartbeat active at 30 Hz for this title");
+        }
+    } else if (!KSystem::x11MotionHeartbeat) {
+        motionHeartbeatLogged = false;
+        lastMotionHeartbeat = 0;
+    }
+
     // Keep the guest picture matched to the window from the emulator's own
     // loop rather than from a UIKit layout callback.
     //
@@ -366,7 +390,7 @@ bool KNativeInputSDL::processEvents() {
     // same way. Two struct comparisons every 200 ms, and it only does work
     // when the window has genuinely changed shape.
     static U32 lastGeometryPoll = 0;
-    const U32 nowTicks = SDL_GetTicks();
+    const U32 nowTicks = heartbeatNow;
     if (nowTicks - lastGeometryPoll >= 200) {
         lastGeometryPoll = nowTicks;
         if (BVNSyncGuestPresentationGeometry()) {

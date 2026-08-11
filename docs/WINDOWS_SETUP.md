@@ -106,10 +106,10 @@ cannot be matched to a commit. On Windows, edit `ios/project.yml` directly
 (`scripts/bump-build.sh` is a shell script):
 
 ```yaml
-    CURRENT_PROJECT_VERSION: "74"   # was 73
+    CURRENT_PROJECT_VERSION: "75"   # was 74
 ```
 
-The app logs `BoxedVN 0.1.0 (74) · <git sha>` on its first line. That line is
+The app logs `BoxedVN 0.1.0 (75) · <git sha>` on its first line. That line is
 how you know which binary produced a log.
 
 ### 3c. Push, and let Actions build
@@ -228,22 +228,22 @@ Vulkan call — `hostVulkanIndex=N`, which indexes `source/vulkan/vkdef.h`
 
 ## 6. Open problems, in the order they matter
 
-1. **Grisaia frame rate.** Bimodal: a pinned 30.0 fps at ~0.9 cores while
-   something animates, then 0.4 fps at ~0.45 cores when the screen is static.
-   Build 72's thread snapshot found the cause shape: every other guest thread
-   is parked on the X11 socket behind one thread inside `vkQueuePresentKHR`,
-   in a Mach trap, using ~100 µs of CPU per second. Build 73 holds the display
-   at 60–120 Hz with a session-long `CADisplayLink` (plus
-   `CADisableMinimumFrameDuration`) on the theory that adaptive refresh is
-   starving the swapchain of drawables, and times every present so the next log
-   confirms or kills it.
+1. **Grisaia frame-rate device acceptance.** Build 74 disproved the adaptive-
+   refresh theory: the guest made only two present calls per five seconds in
+   the slow state and both returned immediately. Build 75 enables a Grisaia-
+   only 30 Hz X11 motion heartbeat because the CatSystem2 render loop resumes
+   instantly for pointer activity or an animation. Confirm `iOS X11 motion
+   heartbeat active` and measure the following performance lines on device.
 2. **The ARM64 JIT miscompiles DXVK.** Saya no Uta needs
    `-interpreterModule d3d11`, which is a workaround, not a fix. See
    `docs/CONTINUING_WITHOUT_A_MAC.md` for the register-level evidence and the
    file to audit (`source/emulation/cpu/armv8/jitArmV8CodeGen.cpp`).
 3. **Japanese text is mojibake.** Needs a CP932 locale plus a CJK font in the
    prefix. Not started.
-4. **Wine cold boot takes ~1.5 minutes.** Not investigated.
+4. **Wine cold-boot reduction device acceptance.** Build 74 measured a 57–59
+   second `NDIS` service-start timeout between JIT allocation 320 and 384 in
+   three independent launches. Build 75 disables that unsupported driver while
+   leaving Wine services and `nsiproxy` enabled. Confirm that gap disappears.
 5. **DXVK cannot run under MoltenVK** — it requests `geometryShader`,
    `shaderCullDistance`, `robustBufferAccess2` and `nullDescriptor`, none of
    which MoltenVK exposes. Grisaia works only because DXVK is disabled for it in

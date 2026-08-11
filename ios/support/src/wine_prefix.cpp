@@ -408,6 +408,16 @@ WinePrefixPreparationResult prepareWinePrefix(
                              "Start", "dword:00000003")) {
         result.changed = true;
     }
+    // Wine 11 auto-starts NDIS on every cold prefix, but Boxedwine exposes
+    // networking to Wine through nsiproxy/netlink rather than an NDIS kernel
+    // driver. The unsupported service waits for its start result for 57-59
+    // seconds before services.exe continues. Disable only that dead driver;
+    // Wine services and nsiproxy remain enabled.
+    if (setWineRegistryValue(contents,
+                             "System\\ControlSet001\\Services\\NDIS",
+                             "Start", "dword:00000004")) {
+        result.changed = true;
+    }
 
     // Wine 10's services.exe starts root PnP drivers even when their service
     // Start value is SERVICE_DISABLED.  wineboot also leaves an existing root

@@ -79,6 +79,13 @@ bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
     // not to build 66's.
     if (launchesAnyOf(launch, {"bootmenu.exe", "grisaia.exe"})) {
         launch.enableWineD3DVulkan = false;
+        // CatSystem2's idle path is event driven. On iOS the title presents
+        // exactly two frames per five seconds while dialogue is revealing,
+        // yet immediately returns to 30 fps for an animation or pointer
+        // activity. The same 0.2 fps / mouse-movement dependency is reported
+        // under other Wine-on-mobile runtimes. Keep a no-op X11 MotionNotify
+        // flowing for this title so its text/render clock keeps advancing.
+        launch.x11MotionHeartbeat = true;
         return true;
     }
 
@@ -180,6 +187,9 @@ std::vector<std::string> BVNBuildLaunchArguments(
     if (launch.enableWineD3DVulkan) {
         argv.push_back("-dxvk");
         argv.push_back("1");
+    }
+    if (launch.x11MotionHeartbeat) {
+        argv.push_back("-x11MotionHeartbeat");
     }
     if (!launch.workingDirectory.empty()) {
         argv.push_back("-w");

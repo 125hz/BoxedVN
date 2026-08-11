@@ -155,6 +155,8 @@ public:
     static bool forceRelativeMouse;
     static bool cacheReads;
     static bool disableWasmJitForWrittenCode;
+    // Title-scoped compatibility pulse for event-driven X11 render loops.
+    static bool x11MotionHeartbeat;
     // Module-name fragments that must use the decoded interpreter while the
     // rest of the guest continues through the native JIT. Used by bounded
     // compatibility profiles for engines with a suspected translator fault.

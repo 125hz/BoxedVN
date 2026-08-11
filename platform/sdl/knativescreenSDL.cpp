@@ -88,8 +88,8 @@ extern "C" void BVNGuestControlsSendKey(U32 scancode, bool down) {
 // transform, so -[UITouch locationInView:] gives it guest pixels directly and
 // nothing about the intervening hierarchy can matter.
 //
-// Coordinates are in the presenting view's bounds, which is the same space
-// SDL would have reported, so KNativeInputSDL's transform still applies.
+// Coordinates are already guest pixels. The bridge converts them back to the
+// host-window space expected by KNativeInputSDL's public pointer methods.
 extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
     if (!gIOSActiveScreen) {
         return;
@@ -98,23 +98,29 @@ extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
     // Position first, then the button, exactly as SDL's own touch-to-mouse
     // synthesis does: X11 clients read the pointer position from the motion
     // that precedes the press.
-    if (!input->mouseMove(x, y, false)) {
+    // UIKit already resolved the presentation view's scale/transform and gave
+    // us guest pixels. KNativeInputSDL's public pointer methods normally take
+    // host-window coordinates and apply that transform themselves, so feed
+    // the inverse here. Passing x/y directly applied the letterbox transform
+    // twice; in portrait, most taps collapsed onto a guest edge.
+    const int screenX = input->xToScreen(x);
+    const int screenY = input->yToScreen(y);
+    if (!input->mouseMove(screenX, screenY, false)) {
         onMouseMove((U32)x, (U32)y, false);
     }
     if (phase == 1) {
-        if (!input->mouseButton(1, 0, x, y)) {
+        if (!input->mouseButton(1, 0, screenX, screenY)) {
             onMouseButtonDown(0);
         }
     } else if (phase == 2) {
-        if (!input->mouseButton(0, 0, x, y)) {
+        if (!input->mouseButton(0, 0, screenX, screenY)) {
             onMouseButtonUp(0);
         }
     }
 }
 
-// A right click, from the overlay's two-finger tap. The coordinates are in
-// the Metal view's bounds, which since build 65 are the guest resolution, so
-// they go through the same transform as a real pointer event.
+// A right click, from the overlay's two-finger tap. The coordinates are guest
+// pixels for the same reason as BVNGuestControlsSendPointer above.
 //
 // Boxedwine numbers its buttons 0 = left, 1 = right, 2 = middle (see
 // getMouseButtonFromEvent), which is not SDL's numbering.
@@ -123,10 +129,11 @@ extern "C" void BVNGuestControlsSendRightClick(int x, int y) {
         return;
     }
     const KNativeInputSDLPtr& input = gIOSActiveScreen->input;
-    klog_fmt("iOS overlay right click at window %d,%d -> guest %d,%d",
-             x, y, input->xFromScreen(x), input->yFromScreen(y));
-    input->mouseButton(1, 1, x, y);
-    input->mouseButton(0, 1, x, y);
+    klog_fmt("iOS overlay right click at guest %d,%d", x, y);
+    const int screenX = input->xToScreen(x);
+    const int screenY = input->yToScreen(y);
+    input->mouseButton(1, 1, screenX, screenY);
+    input->mouseButton(0, 1, screenX, screenY);
 }
 
 // The window changed shape (rotation, or the presenter re-letterboxed). The
