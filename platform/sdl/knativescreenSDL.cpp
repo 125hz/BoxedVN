@@ -136,6 +136,20 @@ extern "C" void BVNGuestControlsSendRightClick(int x, int y) {
     input->mouseButton(0, 1, screenX, screenY);
 }
 
+extern "C" bool BVNGuestControlsScreenSize(int* width, int* height) {
+    if (!gIOSActiveScreen) {
+        return false;
+    }
+    if (width) {
+        *width = (int)gIOSActiveScreen->screenWidth();
+    }
+    if (height) {
+        *height = (int)gIOSActiveScreen->screenHeight();
+    }
+    return gIOSActiveScreen->screenWidth() > 0 &&
+           gIOSActiveScreen->screenHeight() > 0;
+}
+
 // The window changed shape (rotation, or the presenter re-letterboxed). The
 // pointer transform is re-derived from the presenter's measured rectangle;
 // it is never predicted. See refreshIOSGuestPointerTransform.

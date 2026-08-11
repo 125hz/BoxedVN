@@ -105,7 +105,7 @@ stops. It is a pure state machine with no sleeping or logging, so its
 transitions are testable on the host even though the behaviour it guards
 (yielding a core to the Metal shader compiler) only matters on device.
 
-Current count: **77 C++ tests + 30 pin checks, all passing.**
+Current count: **92 C++ tests + 30 pin checks, all passing in CI.**
 
 ### What is deliberately not covered
 

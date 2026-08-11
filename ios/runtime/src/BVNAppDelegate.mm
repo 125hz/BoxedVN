@@ -32,6 +32,7 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -978,6 +979,15 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
     gGuestX11PatchView.hidden = NO;
     gGuestX11PatchVisible.store(true, std::memory_order_release);
 
+    // UIImageView updates normally wait for the next Core Animation commit.
+    // That is not prompt enough here: event-driven visual novels may sleep in
+    // pselect for several seconds after drawing a line of text, and their next
+    // Vulkan present only arrives when a transition/animation begins. Commit
+    // the patch now so GDI/X11 text advances are visible independently of the
+    // game's Vulkan cadence. This is intentionally emulator-wide; it repairs
+    // every mixed Vulkan + GDI guest rather than naming a particular title.
+    [CATransaction flush];
+
     static uint64_t patchCount = 0;
     ++patchCount;
     if (patchCount == 1 || patchCount % 120 == 0) {
@@ -1018,6 +1028,11 @@ static bool gGuestPresentationStretch = false;
 // it only changes where the fit is applied, so a snapshot there is accurate.
 static std::atomic<int> gGuestNaturalDrawableWidth{0};
 static std::atomic<int> gGuestNaturalDrawableHeight{0};
+
+extern "C" bool BVNGuestPreferredPresentationStretch(void) {
+    return [[NSUserDefaults standardUserDefaults]
+        boolForKey:@"BoxedVN.presentation.stretch"] == YES;
+}
 
 // The geometry the current fit was computed for, measured on the Metal view's
 // superview. The watcher below compares against these rather than trusting a
@@ -1322,6 +1337,27 @@ extern "C" bool BVNSyncGuestPresentationGeometry(void) {
                                     gGuestPresentationStretch);
     BVNGuestOverlayGeometryDidChange();
     return true;
+}
+
+extern "C" bool BVNGuestPresentationIsStretched(void) {
+    return gGuestPresentationStretch;
+}
+
+extern "C" void BVNGuestSetPresentationStretched(bool stretched) {
+    if (!NSThread.isMainThread) {
+        return;
+    }
+    [[NSUserDefaults standardUserDefaults]
+        setBool:(stretched ? YES : NO)
+         forKey:@"BoxedVN.presentation.stretch"];
+    gGuestPresentationStretch = stretched;
+    if (gGuestPresentationSurface != nullptr) {
+        BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
+                                        gGuestPresentationGuestWidth,
+                                        gGuestPresentationGuestHeight,
+                                        stretched);
+        BVNGuestPresentationGeometryChanged();
+    }
 }
 
 // Forgets the recorded rectangle, so a stale letterbox from a surface that no

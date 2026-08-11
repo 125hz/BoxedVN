@@ -53,6 +53,7 @@ BOXEDVN_TEST(game_command_preserves_mount_environment_and_arguments) {
     launch.rootFilesystemZipPath = "/rootfs.zip";
     launch.writableRootPath = "/prefix";
     launch.gameDirectoryHostPath = "/games/example";
+    launch.sharedDirectoryHostPath = "/documents/shared";
     launch.executablePath = "d:\\game.exe";
     launch.arguments = {"--language", "ja"};
     launch.environment = {"LANG=ja_JP.UTF-8"};
@@ -65,7 +66,8 @@ BOXEDVN_TEST(game_command_preserves_mount_environment_and_arguments) {
         BVNBuildLaunchArguments(launch);
     const std::vector<std::string> expected = {
         "boxedvn", "-root", "/prefix", "-zip", "/rootfs.zip", "-nozip",
-        "-mount_drive", "/games/example", "d", "-nosound",
+        "-mount_drive", "/games/example", "d",
+        "-mount_drive", "/documents/shared", "e", "-nosound",
         "-dxvk", "1", "-w",
         "/home/username/.wine/dosdevices/d:/content",
         "-env", "WINEDEBUG=warn+d3d_shader,-d3d",

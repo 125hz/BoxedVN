@@ -106,12 +106,19 @@ void BVNGuestControlsSendKey(uint32_t scancode, bool down);
 // nothing about the intervening hierarchy can matter.
 void BVNGuestControlsSendPointer(int x, int y, int phase);
 
+// Returns the current emulated screen size for software-rendered sessions.
+// Vulkan sessions normally use BVNGuestPresentationView's guest-sized bounds.
+bool BVNGuestControlsScreenSize(int* width, int* height);
+
 // A right click at a point in the same space.  Used by the two-finger tap.
 void BVNGuestControlsSendRightClick(int x, int y);
 
 // The Metal view the guest is presenting through, so the overlay can convert a
 // touch into its coordinate space.  nil when no guest surface exists.
 UIView* BVNGuestPresentationView(void);
+
+bool BVNGuestPresentationIsStretched(void);
+void BVNGuestSetPresentationStretched(bool stretched);
 
 // Re-derives the window-to-guest pointer transform from the rectangle the
 // presenter measured.  Presentation and input are never derived independently:

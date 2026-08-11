@@ -129,7 +129,6 @@ struct LibraryView: View {
     @State private var pendingImportURL: URL?
     @State private var pendingTitle = ""
     @State private var showingTitlePrompt = false
-    @State private var documentsZips: [URL] = []
 
     var body: some View {
         List {
@@ -175,7 +174,7 @@ struct LibraryView: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Browse the PC")
-                            Text("Wine's file manager over the shared prefix, "
+                            Text("Wine's file manager opens the shared E: drive "
                                  + "at 1280x720")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -241,41 +240,6 @@ struct LibraryView: View {
                 }
             }
 
-            // This path is deliberately independent of the system document
-            // picker. Files copied into the app's Documents folder are
-            // already inside the sandbox, so selecting one here needs no
-            // remote view controller or security-scoped hand-off.
-            Section {
-                if documentsZips.isEmpty {
-                    Text("No ZIP files found in BoxedVN's Documents folder.")
-                        .foregroundStyle(.secondary)
-                        .font(.callout)
-                } else {
-                    ForEach(documentsZips, id: \.path) { url in
-                        Button {
-                            prepareImport(url)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(url.lastPathComponent)
-                                Text(fileSizeDescription(url))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .disabled(model.isImporting)
-                    }
-                }
-                Button("Refresh") {
-                    documentsZips = Storage.documentsZipCandidates()
-                }
-            } header: {
-                Text("Games copied to BoxedVN Documents")
-            } footer: {
-                Text("If the file picker will not complete a selection, open "
-                     + "Files, copy the game ZIP to On My iPhone > BoxedVN, "
-                     + "return here, and tap Refresh. Then select it above.")
-            }
-
             Section {
                 NavigationLink("Settings") { SettingsView() }
                 NavigationLink("Logs") { LogView() }
@@ -299,7 +263,6 @@ struct LibraryView: View {
                 },
                 onCancel: { showingFolderImporter = false })
         }
-        .onAppear { documentsZips = Storage.documentsZipCandidates() }
         .alert("Name this game", isPresented: $showingTitlePrompt) {
             TextField("Title", text: $pendingTitle)
             Button("Import") {
@@ -331,12 +294,6 @@ struct LibraryView: View {
         showingTitlePrompt = true
     }
 
-    private func fileSizeDescription(_ url: URL) -> String {
-        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
-            return "unknown size"
-        }
-        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-    }
 }
 
 // MARK: - Game detail
@@ -470,21 +427,12 @@ struct GameDetailView: View {
 /// own small helpers/view: a single large `body` mixing this many
 /// conditionals made the Swift type-checker time out in Release builds
 /// ("unable to type-check this expression in reasonable time").
-private func jitStatusText(_ status: JITReport.Status) -> String {
-    switch status {
-    case .available: return "Available (confirmed by launching)"
-    case .likelyAvailable: return "Likely available (not yet confirmed)"
-    case .unavailable: return "Unavailable"
-    case .unknown: return "Unknown"
-    }
+private func jitStatusText(_ jit: JITReport) -> String {
+    jit.debuggerAttached ? "Confirmed" : "Unavailable"
 }
 
-private func jitStatusColor(_ status: JITReport.Status) -> Color {
-    switch status {
-    case .available: return .green
-    case .likelyAvailable: return .yellow
-    case .unavailable, .unknown: return .orange
-    }
+private func jitStatusColor(_ jit: JITReport) -> Color {
+    jit.debuggerAttached ? .green : .orange
 }
 
 /// Every row and the footer are their own small views with an explicit
@@ -495,8 +443,8 @@ private struct JITStatusRow: View {
 
     var body: some View {
         LabeledContent("Status") {
-            Text(jitStatusText(jit.status))
-                .foregroundStyle(jitStatusColor(jit.status))
+            Text(jitStatusText(jit))
+                .foregroundStyle(jitStatusColor(jit))
         }
     }
 }
@@ -514,10 +462,9 @@ private struct JITDebuggerRow: View {
 
 private struct JITFooter: View {
     var body: some View {
-        Text("This safe check only reads the kernel's debugged-process flag; "
-             + "it never issues StikDebug's breakpoint request or executes "
-             + "generated code. On iOS 26/27, \"Likely available\" means "
-             + "CS_DEBUGGED is set, but StikDebug's assigned universal script "
+        Text("A debugger-attached (CS_DEBUGGED) process is shown as confirmed. "
+             + "This safe check never issues StikDebug's breakpoint request or "
+             + "executes generated code. StikDebug's assigned universal script "
              + "still has to prepare each executable region when a guest "
              + "starts.")
     }
@@ -532,8 +479,6 @@ private struct JITStatusSection: View {
             LabeledContent("ARM64 JIT compiled in",
                            value: model.jit.jitCompiledIn ? "yes" : "no")
             JITDebuggerRow(jit: model.jit)
-            LabeledContent("Confirmed by launching a guest",
-                           value: model.jit.executableMemoryAvailable ? "yes" : "not yet")
             Text(model.jit.detail).font(.caption).foregroundStyle(.secondary)
             Button("Re-check") { model.refreshJIT() }
         } header: {
@@ -644,7 +589,6 @@ struct StatusView: View {
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showingRootFilesystemImporter = false
-    @State private var documentsZips: [URL] = []
 
     var body: some View {
         List {
@@ -669,41 +613,6 @@ struct SettingsView: View {
                      + "is tested against.")
             }
 
-            // A route that does not involve UIDocumentPickerViewController at
-            // all. The picker is out-of-process and has failed on at least one
-            // physical device (rows highlight but selection never completes),
-            // so this exists as an independent way in rather than a nicety.
-            Section {
-                if documentsZips.isEmpty {
-                    Text("No ZIP files found in BoxedVN's Documents folder.")
-                        .foregroundStyle(.secondary)
-                        .font(.callout)
-                } else {
-                    ForEach(documentsZips, id: \.path) { url in
-                        Button {
-                            model.importRootFilesystem(from: url, movingSource: true)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(url.lastPathComponent)
-                                Text(fileSizeDescription(url))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .disabled(model.isInstallingRootFilesystem)
-                    }
-                }
-                Button("Refresh") { documentsZips = Storage.documentsZipCandidates() }
-            } header: {
-                Text("Install from BoxedVN's Documents folder")
-            } footer: {
-                Text("If the file picker above will not let you select a file, "
-                     + "use this instead. In the Files app go to On My iPhone > "
-                     + "BoxedVN and copy the ZIP there, then tap Refresh and "
-                     + "pick it from this list. The file is moved, not copied, "
-                     + "so it will not take up space twice.")
-            }
-
             Section("Storage") {
                 if let games = Storage.games {
                     LabeledContent("Games", value: games.path)
@@ -713,6 +622,10 @@ struct SettingsView: View {
                     LabeledContent("Wine prefixes", value: prefixes.path)
                         .font(.caption)
                 }
+                if let shared = Storage.sharedFiles {
+                    LabeledContent("Shared E: drive", value: shared.path)
+                        .font(.caption)
+                }
                 if let logs = Storage.logs {
                     LabeledContent("Logs", value: logs.path)
                         .font(.caption)
@@ -720,12 +633,6 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
-        .onAppear { documentsZips = Storage.documentsZipCandidates() }
-        // A successful install moves the file out of Documents, so the list
-        // has to be re-read once installing finishes.
-        .onChange(of: model.isInstallingRootFilesystem) { _, installing in
-            if !installing { documentsZips = Storage.documentsZipCandidates() }
-        }
         .sheet(isPresented: $showingRootFilesystemImporter) {
             DocumentImportPicker(
                 contentTypes: zipImportContentTypes,
@@ -747,12 +654,6 @@ struct SettingsView: View {
         }
     }
 
-    private func fileSizeDescription(_ url: URL) -> String {
-        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
-            return "unknown size"
-        }
-        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-    }
 }
 
 // MARK: - Logs

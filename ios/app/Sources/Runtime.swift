@@ -170,6 +170,22 @@ enum Storage {
         winePrefixes?.appendingPathComponent(toolsWinePrefixName)
     }
 
+    /// Files deliberately shared by all otherwise-isolated Wine prefixes.
+    /// Mounted as E: in games, Winefile and Notepad.
+    static var sharedFiles: URL? {
+        guard let documents else { return nil }
+        let shared = documents.appendingPathComponent("Shared", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: shared, withIntermediateDirectories: true)
+            return shared
+        } catch {
+            Log.write("Could not create shared files directory: \(error)",
+                      category: "storage", level: BVNLogLevelError)
+            return nil
+        }
+    }
+
     /// Deliberately the name build 72 and earlier gave desktop mode, so the
     /// file browser opens on the prefix it has always used.
     static let toolsWinePrefixName = "desktop"
@@ -402,6 +418,7 @@ enum Session {
         rootFilesystem: URL,
         writableRoot: URL,
         gameDirectory: URL?,
+        sharedDirectory: URL?,
         executablePath: String,
         arguments: [String],
         environment: [String],
@@ -432,11 +449,13 @@ enum Session {
             writableRoot.path.withCString { writablePath in
                 executablePath.withCString { exePath in
                     withOptionalCString(gameDirectory?.path) { gamePath in
-                        withOptionalCString(workingDirectory) { workPath in
+                        withOptionalCString(sharedDirectory?.path) { sharedPath in
+                          withOptionalCString(workingDirectory) { workPath in
                             var request = BVNLaunchRequest()
                             request.rootFilesystemZipPath = rootPath
                             request.writableRootPath = writablePath
                             request.gameDirectoryHostPath = gamePath
+                            request.sharedDirectoryHostPath = sharedPath
                             request.executablePath = exePath
                             request.workingDirectory = workPath
                             request.width = width
@@ -455,6 +474,7 @@ enum Session {
                                         &request, &errorBuffer, errorBuffer.count)
                                 }
                             }
+                          }
                         }
                     }
                 }

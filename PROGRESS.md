@@ -6,18 +6,18 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-11 (build 77 prepared from build-76 device evidence.
-Both build-76 Grisaia startup logs selected WineD3D's unavailable OpenGL host
-renderer and terminated at Boxedwine's fatal GLX thunk 2897 (`glXChooseVisual`)
-before creating any Vulkan presentation surface. Build 77 separates the generic
-WineD3D-over-Vulkan policy from the per-title DXVK switch: every imported Wine
-game repairs its prefix to `renderer=vulkan`, while Grisaia still keeps DXVK
-disabled. The entitlement build is device-proven to have the increased-memory
-request in its installed signature: it reported 5.99 GB before the process
-limit, versus 3.29 GB for the normal IPA. GitHub Actions run 31540593751 passed
-all host tests, the iPhoneOS compile, and both IPA packaging checks;
-fresh-device validation of the build-77 renderer correction remains pending.
-Song of Saya remains device-proven playable with the interpreter workaround.
+**Last updated:** 2026-08-11 (build 78 prepared from build-77 device evidence.
+Build 77 is device-proven to restore Grisaia startup. The corrected Grisaia
+logs show the remaining static-dialogue slowdown is not JIT compilation or a
+blocked Vulkan present: hundreds of GDI/X11 partial updates occur while the
+guest sleeps and Vulkan remains at about 0.4 fps. Build 78 forces those UIKit
+patch layers to commit immediately, adds software-desktop pointer routing, and
+rebuilds the overlay responder chain after rotation. It also adds persistent
+pointer controls, live Fit/Fill presentation, a shared E: drive without
+merging game prefixes, JIT wording cleanup, and a rolling direct-download
+entitlement IPA release. GitHub Actions and fresh-device validation of build
+78 remain pending. Song of Saya remains device-proven playable with the
+interpreter workaround.
 The newest
 detail is at the end of the session log; the open-problem list lives in
 `docs/CONTINUING_WITHOUT_A_MAC.md`.)
@@ -35,7 +35,7 @@ is inferred.
 
 | # | Milestone | Status | Evidence |
 |---|-----------|--------|----------|
-| 1 | Host-independent support library builds and passes tests | **done** | 74/74 tests pass in `build/tests-only/ios/tests/boxedvn_tests` |
+| 1 | Host-independent support library builds and passes tests | **done** | 92/92 tests pass in `build/tests-only/ios/tests/boxedvn_tests` |
 | 2 | Boxedwine emulator core compiles for iOS arm64 | **done** | `libboxedwine_core.a`, arm64, 577 `JitArmV8CodeGen` symbols |
 | 3 | Objective-C++ runtime bridge compiles and links | **done** | `libboxedvn.a`, 12 MB, arm64, exports `_main` |
 | 4 | SwiftUI app shell links against the core | **done** | `BoxedVN.app`, arm64, `LC_BUILD_VERSION` platform 2 (iOS), minos 17.0 |
@@ -3366,3 +3366,70 @@ the entitlement-ready IPA is
 `a1cb5616ed4cb67b6e16d8499c9fac6f630727f624aa73af4a1d5fd2f2025117`.
 This proves compilation and packaging only; launcher recovery still needs the
 next physical-device log.
+
+### 2026-08-11 â€” build 78: immediate partial presents and rotation-safe input
+
+The corrected Grisaia logs are `boxedvn-20260811-173422.log` and
+`boxedvn-20260811-174039.log`; the previously examined portrait log was Song
+of Saya. Both build-77 Grisaia sessions reach the same 1024x768 WineD3D/Vulkan
+surface. The first spends long periods at 0.2-0.8 Vulkan presents per second;
+the second has the same static cadence but jumps to 8-10 fps during animation.
+`vkQueuePresentKHR` normally consumes 0-1 ms, CPU use remains under one core,
+and the principal guest threads sleep in `pselect6_time64`. This excludes a
+slow ARM64 JIT translator and GPU back-pressure as the frame-time cause.
+
+During those same static periods Wine logs repeated `swapchain_blit_gdi` work
+and Boxedwine logs hundreds of `Composited X11 partial present` updates. Build
+76 copied each update into a transparent UIImage layer, but Core Animation
+could defer the transaction until the next UIKit/Vulkan-driven commit. Build
+78 explicitly flushes that transaction after each partial update. This is a
+shared mixed GDI/Vulkan presentation repair with no game-name check. A device
+test must verify that dialogue now becomes visible immediately; the Vulkan FPS
+counter may correctly remain low because these repaired updates are not Vulkan
+presents.
+
+The logs also show Grisaia itself creates a 1024x768 (4:3) surface, which is why
+the aspect-preserving presenter uses only 536 of the phone's 874 landscape
+points. The in-game menu now has a persistent `Display: fit aspect/fill screen`
+switch, providing the requested 16:9 fill without silently distorting every
+4:3 game. Pointer settings in the same menu persist opacity, size, outline and
+shadow opacity, thickness, and outer/inner-circle visibility.
+
+Trackpad/direct pointer routing no longer requires a Vulkan presentation view.
+For Wine's software-rendered blue desktop it maps the overlay's normalized
+coordinates to Boxedwine's current guest screen, so trackpad mode has a visible
+cursor and can click Winefile. All games and the built-in tools now mount
+`Documents/Shared` as E:, and Browse PC opens that drive. Per-game Wine prefixes
+remain separate because the build-73 shared-prefix experiment hid existing
+saves and would also share incompatible registry/DLL overrides between games.
+
+For rotation, cancelling recognizers and briefly toggling interaction was not
+enough to make UIKit abandon the pre-rotation delivery chain. Every settled
+geometry change now removes and reconstructs the lightweight overlay on the
+current SDL UIWindow, preserving the menu position, pointer preferences and
+startup notice. The software-path input fallback also keeps the overlay able
+to deliver touches while a Vulkan surface is temporarily absent. Both live
+rotation and launching from portrait remain device acceptance items.
+
+The JIT status screen now says `Confirmed` whenever CS_DEBUGGED reports a
+debugger attachment and removes the separate guest-launch confirmation row.
+The two Documents-folder import sections are removed. CI produces only
+`BoxedVN.ipa`, containing the increased-memory entitlement request, and uploads
+it to the rolling prerelease tag `ios-latest` so it can be downloaded directly
+instead of extracting an Actions artifact ZIP. Build logs remain Actions
+artifacts.
+
+The two corrected logs show virtually identical approximately 102-second cold
+startup gaps. The gap is dominated by Wine/.NET/process initialization around
+sleeping guest threads, not sustained JIT compilation; a reusable translated
+block cache would need relocation and invalidation machinery Boxedwine does not
+currently have and is not safe to improvise in this batch. Selecting the final
+game executable instead of its launcher remains the only low-risk per-library
+way to skip launcher work when a title supports it.
+
+**Local evidence:** `git diff --check` passes. After loading Visual Studio's
+developer environment, the Windows preset rebuilt successfully: all 92 C++
+tests pass and CTest passes 1/1. The pin script needs Bash and was not run on
+this Windows host. Ubuntu CI remains the full host-suite authority and macOS CI
+remains the iPhoneOS compile/package authority. Every new device behavior is
+pending a fresh build-78 log and physical-device test.

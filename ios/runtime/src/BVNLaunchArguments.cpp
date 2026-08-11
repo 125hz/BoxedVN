@@ -161,6 +161,11 @@ std::vector<std::string> BVNBuildLaunchArguments(
         argv.push_back(launch.gameDirectoryHostPath);
         argv.push_back("d");
     }
+    if (!launch.sharedDirectoryHostPath.empty()) {
+        argv.push_back("-mount_drive");
+        argv.push_back(launch.sharedDirectoryHostPath);
+        argv.push_back("e");
+    }
 
     if (launch.width > 0 && launch.height > 0) {
         argv.push_back("-resolution");

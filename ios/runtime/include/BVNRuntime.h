@@ -215,6 +215,10 @@ typedef struct {
     // the root filesystem, such as Wine's own notepad.
     const char* gameDirectoryHostPath;
 
+    // Absolute host path mounted as drive E: for every game and built-in Wine
+    // tool. May be NULL, although the app normally supplies Documents/Shared.
+    const char* sharedDirectoryHostPath;
+
     // The program to run, as a guest path.  Either a Windows path such as
     // "d:\\game.exe" or a Linux path such as "/bin/wine".  Required.
     const char* executablePath;

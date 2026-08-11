@@ -15,6 +15,10 @@ struct BVNLaunchConfiguration {
     std::string rootFilesystemZipPath;
     std::string writableRootPath;
     std::string gameDirectoryHostPath;
+    // One host directory mounted as E: in every Wine session. Games retain
+    // independent prefixes for save/registry compatibility while documents
+    // intentionally shared between games and the file browser live here.
+    std::string sharedDirectoryHostPath;
     std::string executablePath;
     std::vector<std::string> arguments;
     std::vector<std::string> environment;

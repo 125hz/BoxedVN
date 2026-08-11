@@ -42,7 +42,7 @@ on:
     paths: *ios_build_paths
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-ios-${{ github.workflow }}-${{ github.ref }}
@@ -148,7 +148,7 @@ jobs:
           --skip-dependencies
           --no-bundled-rootfs
 
-      - name: Package and validate unsigned IPA
+      - name: Validate unsigned app
         shell: bash
         run: |
           set -euo pipefail
@@ -163,30 +163,6 @@ jobs:
             exit 1
           fi
 
-          scripts/package-ipa.sh --app "${app}" --output-dir build/artifacts
-
-          ipa="build/artifacts/BoxedVN-unsigned.ipa"
-          checksum="$(awk '{print $1}' "${ipa}.sha256")"
-          size="$(du -h "${ipa}" | awk '{print $1}')"
-          {
-            echo "## Unsigned IPA"
-            echo "- File: \`BoxedVN-unsigned.ipa\`"
-            echo "- Size: \`${size}\`"
-            echo "- SHA-256: \`${checksum}\`"
-            echo "- Signing: deliberately disabled; sign after download"
-            echo "- Root filesystem: slim build; import the runtime ZIP on-device"
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-      - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v7
-        with:
-          name: BoxedVN-unsigned-ipa-${{ inputs.configuration || 'Release' }}
-          path: |
-            build/artifacts/BoxedVN-unsigned.ipa
-            build/artifacts/BoxedVN-unsigned.ipa.sha256
-          if-no-files-found: error
-          retention-days: 30
-
       - name: Package increased-memory entitlement template
         shell: bash
         run: |
@@ -200,27 +176,55 @@ jobs:
           scripts/package-ipa.sh \
             --app "${entitled_app}" \
             --output-dir build/artifacts \
-            --name BoxedVN-entitlements-ready.ipa
+            --name BoxedVN.ipa
 
-          ipa="build/artifacts/BoxedVN-entitlements-ready.ipa"
+          ipa="build/artifacts/BoxedVN.ipa"
           checksum="$(awk '{print $1}' "${ipa}.sha256")"
           {
             echo "## Increased-memory signing template"
-            echo "- File: \`BoxedVN-entitlements-ready.ipa\`"
+            echo "- File: \`BoxedVN.ipa\`"
             echo "- SHA-256: \`${checksum}\`"
             echo "- Embedded request: \`com.apple.developer.kernel.increased-memory-limit = true\`"
             echo "- Signing: ad hoc only; your sideloader must replace it after GetMoreRAM enables the same App ID"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Upload increased-memory entitlement template
-        uses: actions/upload-artifact@v7
-        with:
-          name: BoxedVN-entitlements-ready-ipa-${{ inputs.configuration || 'Release' }}
-          path: |
-            build/artifacts/BoxedVN-entitlements-ready.ipa
-            build/artifacts/BoxedVN-entitlements-ready.ipa.sha256
-          if-no-files-found: error
-          retention-days: 30
+      - name: Publish directly downloadable IPA
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_tag="ios-latest"
+          notes_file="${RUNNER_TEMP}/boxedvn-ios-release.md"
+          printf '%s\n' \
+            'Rolling unsigned iOS build from GitHub Actions.' \
+            '' \
+            "Commit: ${GITHUB_SHA}" \
+            "Configuration: ${BUILD_CONFIGURATION}" \
+            'The IPA includes the increased-memory entitlement request and must be signed by your sideloader.' \
+            > "${notes_file}"
+
+          if ! gh release view "${release_tag}" >/dev/null 2>&1; then
+            gh release create "${release_tag}" \
+              --prerelease \
+              --target "${GITHUB_SHA}" \
+              --title "Latest BoxedVN iOS build" \
+              --notes-file "${notes_file}"
+          else
+            gh release edit "${release_tag}" \
+              --prerelease \
+              --title "Latest BoxedVN iOS build" \
+              --notes-file "${notes_file}"
+          fi
+
+          gh release upload "${release_tag}" \
+            build/artifacts/BoxedVN.ipa \
+            build/artifacts/BoxedVN.ipa.sha256 \
+            --clobber
+
+          echo "- Direct IPA: https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/BoxedVN.ipa" \
+            >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload build logs
         if: always()

@@ -43,6 +43,7 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                                                 U32 guestWidth,
                                                 U32 guestHeight,
                                                 bool stretchToFill);
+extern "C" bool BVNGuestPreferredPresentationStretch(void);
 extern "C" void BVNUnregisterGuestVulkanSurface(void* surface);
 extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
                                                         int* height);
@@ -248,9 +249,9 @@ void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,
                 // the rectangle the presenter measured, so the picture and the
                 // touch target cannot disagree. setScreenSize above ran before
                 // the surface existed and could only see a stretched window.
-                BVNApplyGuestPresentationAspect((void*)result, wnd->width(),
-                                                wnd->height(),
-                                                KSystem::stretchGuestToFill);
+                BVNApplyGuestPresentationAspect(
+                    (void*)result, wnd->width(), wnd->height(),
+                    BVNGuestPreferredPresentationStretch());
                 screen->refreshIOSGuestPointerTransform();
             }
         }

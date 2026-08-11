@@ -195,6 +195,18 @@ static const CGFloat kBVNKeyGap = 4.0;
 // but not so fast that a title-bar button is unhittable - which is the whole
 // reason trackpad mode exists.
 static const CGFloat kBVNTrackpadSensitivity = 1.4;
+static NSString* const kBVNTrackpadModeKey = @"BoxedVN.pointer.trackpad";
+static NSString* const kBVNPointerOpacityKey = @"BoxedVN.pointer.opacity";
+static NSString* const kBVNPointerSizeKey = @"BoxedVN.pointer.size";
+static NSString* const kBVNPointerOutlineOpacityKey =
+    @"BoxedVN.pointer.outlineOpacity";
+static NSString* const kBVNPointerShadowOpacityKey =
+    @"BoxedVN.pointer.shadowOpacity";
+static NSString* const kBVNPointerThicknessKey = @"BoxedVN.pointer.thickness";
+static NSString* const kBVNPointerOuterCircleKey =
+    @"BoxedVN.pointer.outerCircle";
+static NSString* const kBVNPointerInnerCircleKey =
+    @"BoxedVN.pointer.innerCircle";
 
 @interface BVNGuestOverlayView : UIView
 
@@ -204,6 +216,8 @@ static const CGFloat kBVNTrackpadSensitivity = 1.4;
 @property (nonatomic, strong) UIButton* keyboardItem;
 @property (nonatomic, strong) UIButton* rotationItem;
 @property (nonatomic, strong) UIButton* pointerItem;
+@property (nonatomic, strong) UIButton* pointerSettingsItem;
+@property (nonatomic, strong) UIButton* displayItem;
 @property (nonatomic, strong) UIButton* quitItem;
 @property (nonatomic, strong) UILabel* quitPrompt;
 @property (nonatomic, strong) UIButton* quitConfirmItem;
@@ -213,6 +227,7 @@ static const CGFloat kBVNTrackpadSensitivity = 1.4;
 @property (nonatomic, strong) NSMutableSet<NSNumber*>* heldScancodes;
 @property (nonatomic, assign) BOOL menuOpen;
 @property (nonatomic, assign) BOOL confirmingQuit;
+@property (nonatomic, assign) BOOL pointerSettingsOpen;
 @property (nonatomic, assign) BOOL layingOut;
 // The finger currently acting as the guest's mouse. A second finger belongs to
 // the two-finger right-click gesture, not to a second cursor.
@@ -228,6 +243,18 @@ static const CGFloat kBVNTrackpadSensitivity = 1.4;
 // a fingertip cannot hit accurately.
 @property (nonatomic, assign) BOOL trackpadMode;
 @property (nonatomic, strong) UIView* cursorView;
+@property (nonatomic, strong) UIView* cursorHaloView;
+@property (nonatomic, strong) UIView* cursorDotView;
+@property (nonatomic, strong) UIView* pointerSettingsPanel;
+@property (nonatomic, strong) UIButton* pointerSettingsBackItem;
+@property (nonatomic, strong) NSArray<UILabel*>* pointerSettingLabels;
+@property (nonatomic, strong) UISlider* pointerOpacitySlider;
+@property (nonatomic, strong) UISlider* pointerSizeSlider;
+@property (nonatomic, strong) UISlider* pointerOutlineSlider;
+@property (nonatomic, strong) UISlider* pointerShadowSlider;
+@property (nonatomic, strong) UISlider* pointerThicknessSlider;
+@property (nonatomic, strong) UISwitch* pointerOuterSwitch;
+@property (nonatomic, strong) UISwitch* pointerInnerSwitch;
 // The cursor's position in the presenting view's bounds, i.e. guest pixels.
 @property (nonatomic, assign) CGPoint cursorGuestPoint;
 @property (nonatomic, assign) CGPoint trackpadTouchStart;
@@ -263,11 +290,23 @@ static BVNGuestOverlayView* gOverlay = nil;
     }
     self.backgroundColor = UIColor.clearColor;
     self.opaque = NO;
+    [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+        kBVNPointerOpacityKey: @1.0,
+        kBVNPointerSizeKey: @22.0,
+        kBVNPointerOutlineOpacityKey: @1.0,
+        kBVNPointerShadowOpacityKey: @0.85,
+        kBVNPointerThicknessKey: @2.0,
+        kBVNPointerOuterCircleKey: @YES,
+        kBVNPointerInnerCircleKey: @YES,
+    }];
     self.heldScancodes = [NSMutableSet set];
     self.keyRows = BVNKeyboardRows();
+    self.trackpadMode = [[NSUserDefaults standardUserDefaults]
+        boolForKey:kBVNTrackpadModeKey];
     [self buildMenu];
     [self buildKeyboard];
     [self buildCursor];
+    [self buildPointerSettings];
     [self buildStartupNotice];
     [self reportUnresolvedKeys];
     return self;
@@ -314,6 +353,150 @@ static BVNGuestOverlayView* gOverlay = nil;
 
     [self addSubview:cursor];
     self.cursorView = cursor;
+    self.cursorHaloView = halo;
+    self.cursorDotView = dot;
+    [self applyPointerAppearance];
+}
+
+- (UISlider*)makePointerSliderFrom:(float)minimum
+                                to:(float)maximum
+                               key:(NSString*)key {
+    UISlider* slider = [[UISlider alloc] initWithFrame:CGRectZero];
+    slider.minimumValue = minimum;
+    slider.maximumValue = maximum;
+    slider.value = [[NSUserDefaults standardUserDefaults] floatForKey:key];
+    [slider addTarget:self action:@selector(pointerSettingChanged:)
+       forControlEvents:UIControlEventValueChanged];
+    return slider;
+}
+
+- (void)buildPointerSettings {
+    UIView* panel = [[UIView alloc] initWithFrame:CGRectZero];
+    panel.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.98];
+    panel.layer.cornerRadius = 16.0;
+    panel.layer.borderWidth = 1.0;
+    panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.16].CGColor;
+    panel.hidden = YES;
+    [self addSubview:panel];
+    self.pointerSettingsPanel = panel;
+
+    NSArray<NSString*>* titles = @[
+        @"Opacity", @"Size", @"Outline opacity", @"Shadow opacity",
+        @"Cursor thickness", @"Outer circle", @"Inner circle",
+    ];
+    NSMutableArray<UILabel*>* labels = [NSMutableArray array];
+    for (NSString* title in titles) {
+        UILabel* label = [[UILabel alloc] initWithFrame:CGRectZero];
+        label.text = title;
+        label.textColor = UIColor.whiteColor;
+        label.font = [UIFont systemFontOfSize:14.0];
+        [panel addSubview:label];
+        [labels addObject:label];
+    }
+    self.pointerSettingLabels = labels;
+
+    self.pointerOpacitySlider = [self makePointerSliderFrom:0.1 to:1.0
+                                                        key:kBVNPointerOpacityKey];
+    self.pointerSizeSlider = [self makePointerSliderFrom:12.0 to:64.0
+                                                     key:kBVNPointerSizeKey];
+    self.pointerOutlineSlider = [self makePointerSliderFrom:0.0 to:1.0
+                                                        key:kBVNPointerOutlineOpacityKey];
+    self.pointerShadowSlider = [self makePointerSliderFrom:0.0 to:1.0
+                                                       key:kBVNPointerShadowOpacityKey];
+    self.pointerThicknessSlider = [self makePointerSliderFrom:0.5 to:6.0
+                                                          key:kBVNPointerThicknessKey];
+    for (UISlider* slider in @[self.pointerOpacitySlider,
+                              self.pointerSizeSlider,
+                              self.pointerOutlineSlider,
+                              self.pointerShadowSlider,
+                              self.pointerThicknessSlider]) {
+        [panel addSubview:slider];
+    }
+
+    self.pointerOuterSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    self.pointerOuterSwitch.on = [[NSUserDefaults standardUserDefaults]
+        boolForKey:kBVNPointerOuterCircleKey];
+    [self.pointerOuterSwitch addTarget:self
+                                action:@selector(pointerSettingChanged:)
+                      forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:self.pointerOuterSwitch];
+
+    self.pointerInnerSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    self.pointerInnerSwitch.on = [[NSUserDefaults standardUserDefaults]
+        boolForKey:kBVNPointerInnerCircleKey];
+    [self.pointerInnerSwitch addTarget:self
+                                action:@selector(pointerSettingChanged:)
+                      forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:self.pointerInnerSwitch];
+
+    self.pointerSettingsBackItem = [self makePanelItemWithTitle:@"Back"
+                                                         action:@selector(closePointerSettings)
+                                                    destructive:NO];
+    [panel addSubview:self.pointerSettingsBackItem];
+}
+
+- (void)applyPointerAppearance {
+    if (self.cursorView == nil) {
+        return;
+    }
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    const CGFloat size = [defaults doubleForKey:kBVNPointerSizeKey];
+    const CGFloat thickness = [defaults doubleForKey:kBVNPointerThicknessKey];
+    self.cursorView.bounds = CGRectMake(0.0, 0.0, size, size);
+    self.cursorView.layer.cornerRadius = size / 2.0;
+    self.cursorView.layer.borderWidth = thickness;
+    self.cursorView.layer.borderColor =
+        [UIColor colorWithWhite:1.0
+                          alpha:[defaults doubleForKey:kBVNPointerOutlineOpacityKey]].CGColor;
+    self.cursorView.layer.shadowOpacity =
+        (float)[defaults doubleForKey:kBVNPointerShadowOpacityKey];
+    self.cursorView.alpha = [defaults doubleForKey:kBVNPointerOpacityKey];
+
+    const CGFloat haloInset = MAX(1.0, thickness);
+    self.cursorHaloView.frame = CGRectMake(-haloInset, -haloInset,
+                                           size + haloInset * 2.0,
+                                           size + haloInset * 2.0);
+    self.cursorHaloView.layer.cornerRadius =
+        (size + haloInset * 2.0) / 2.0;
+    self.cursorHaloView.layer.borderWidth = MAX(1.0, thickness * 0.75);
+    self.cursorHaloView.hidden =
+        ![defaults boolForKey:kBVNPointerOuterCircleKey];
+
+    const CGFloat dotSize = MAX(3.0, size * 0.18);
+    self.cursorDotView.frame = CGRectMake((size - dotSize) / 2.0,
+                                          (size - dotSize) / 2.0,
+                                          dotSize, dotSize);
+    self.cursorDotView.layer.cornerRadius = dotSize / 2.0;
+    self.cursorDotView.hidden =
+        ![defaults boolForKey:kBVNPointerInnerCircleKey];
+}
+
+- (void)pointerSettingChanged:(UIControl*)sender {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    if (sender == self.pointerOpacitySlider) {
+        [defaults setFloat:self.pointerOpacitySlider.value
+                    forKey:kBVNPointerOpacityKey];
+    } else if (sender == self.pointerSizeSlider) {
+        [defaults setFloat:self.pointerSizeSlider.value
+                    forKey:kBVNPointerSizeKey];
+    } else if (sender == self.pointerOutlineSlider) {
+        [defaults setFloat:self.pointerOutlineSlider.value
+                    forKey:kBVNPointerOutlineOpacityKey];
+    } else if (sender == self.pointerShadowSlider) {
+        [defaults setFloat:self.pointerShadowSlider.value
+                    forKey:kBVNPointerShadowOpacityKey];
+    } else if (sender == self.pointerThicknessSlider) {
+        [defaults setFloat:self.pointerThicknessSlider.value
+                    forKey:kBVNPointerThicknessKey];
+    } else if (sender == self.pointerOuterSwitch) {
+        [defaults setBool:self.pointerOuterSwitch.on
+                   forKey:kBVNPointerOuterCircleKey];
+    } else if (sender == self.pointerInnerSwitch) {
+        [defaults setBool:self.pointerInnerSwitch.on
+                   forKey:kBVNPointerInnerCircleKey];
+    }
+    [self applyPointerAppearance];
+    [self positionCursor];
 }
 
 - (void)buildStartupNotice {
@@ -509,12 +692,20 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.pointerItem = [self makePanelItemWithTitle:@"Pointer: direct tap"
                                              action:@selector(togglePointerMode)
                                         destructive:NO];
+    self.pointerSettingsItem = [self makePanelItemWithTitle:@"Pointer settings"
+                                                     action:@selector(openPointerSettings)
+                                                destructive:NO];
+    self.displayItem = [self makePanelItemWithTitle:@"Display: fit"
+                                             action:@selector(toggleDisplayMode)
+                                        destructive:NO];
     self.quitItem = [self makePanelItemWithTitle:@"Quit to library"
                                           action:@selector(askToQuit)
                                      destructive:YES];
     [panel addSubview:self.keyboardItem];
     [panel addSubview:self.rotationItem];
     [panel addSubview:self.pointerItem];
+    [panel addSubview:self.pointerSettingsItem];
+    [panel addSubview:self.displayItem];
     [panel addSubview:self.quitItem];
 
     // Confirmation is drawn inside this panel rather than presented as a
@@ -611,6 +802,10 @@ static BVNGuestOverlayView* gOverlay = nil;
     // SDL owns a renderer and its own logical-size mapping - pass the touch
     // down as before.
     UIView* presentation = BVNGuestPresentationView();
+    int softwareWidth = 0;
+    int softwareHeight = 0;
+    const BOOL softwareGuest = presentation == nil &&
+        BVNGuestControlsScreenSize(&softwareWidth, &softwareHeight);
 
     // A tap on the letterbox is not a tap on the game.
     //
@@ -630,8 +825,8 @@ static BVNGuestOverlayView* gOverlay = nil;
         CGRectContainsPoint(presentation.frame,
                             [self convertPoint:point
                                          toView:presentation.superview]);
-    const BOOL claim =
-        presentation != nil && (self.trackpadMode || insidePicture);
+    const BOOL claim = softwareGuest ||
+        (presentation != nil && (self.trackpadMode || insidePicture));
 
     // Report what happened, at most once a second. Build 68 removed this line
     // when the ownership change went in and immediately needed it back: the
@@ -654,7 +849,8 @@ static BVNGuestOverlayView* gOverlay = nil;
             presentation == nil ? @"none" : NSStringFromClass(presentation.class),
             presentation.frame.origin.x, presentation.frame.origin.y,
             presentation.frame.size.width, presentation.frame.size.height,
-            presentation == nil ? @"passed down to SDL"
+            softwareGuest ? @"claimed for software guest"
+                          : presentation == nil ? @"passed down to SDL"
                                 : (claim ? @"claimed for the guest"
                                          : @"ignored: outside the picture")];
         BVNLogWrite(BVNLogLevelInfo, "input", message.UTF8String);
@@ -675,12 +871,47 @@ static BVNGuestOverlayView* gOverlay = nil;
     return nil;
 }
 
-- (BOOL)sendGuestPointer:(UITouch*)touch phase:(int)phase {
+- (BOOL)guestSizeWidth:(CGFloat*)width height:(CGFloat*)height {
     UIView* presentation = BVNGuestPresentationView();
-    if (presentation == nil) {
+    if (presentation != nil) {
+        if (width) { *width = presentation.bounds.size.width; }
+        if (height) { *height = presentation.bounds.size.height; }
+        return presentation.bounds.size.width > 0.0 &&
+               presentation.bounds.size.height > 0.0;
+    }
+    int guestWidth = 0;
+    int guestHeight = 0;
+    if (!BVNGuestControlsScreenSize(&guestWidth, &guestHeight)) {
         return NO;
     }
-    const CGPoint point = [touch locationInView:presentation];
+    if (width) { *width = guestWidth; }
+    if (height) { *height = guestHeight; }
+    return YES;
+}
+
+- (CGPoint)guestPointForTouch:(UITouch*)touch {
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation != nil) {
+        return [touch locationInView:presentation];
+    }
+    CGFloat guestWidth = 0.0;
+    CGFloat guestHeight = 0.0;
+    if (![self guestSizeWidth:&guestWidth height:&guestHeight] ||
+        self.bounds.size.width <= 0.0 || self.bounds.size.height <= 0.0) {
+        return CGPointZero;
+    }
+    const CGPoint local = [touch locationInView:self];
+    return CGPointMake(local.x * guestWidth / self.bounds.size.width,
+                       local.y * guestHeight / self.bounds.size.height);
+}
+
+- (BOOL)sendGuestPointer:(UITouch*)touch phase:(int)phase {
+    CGFloat guestWidth = 0.0;
+    CGFloat guestHeight = 0.0;
+    if (![self guestSizeWidth:&guestWidth height:&guestHeight]) {
+        return NO;
+    }
+    const CGPoint point = [self guestPointForTouch:touch];
     BVNGuestControlsSendPointer((int)lround(point.x), (int)lround(point.y),
                                 phase);
     return YES;
@@ -692,7 +923,9 @@ static BVNGuestOverlayView* gOverlay = nil;
         return;
     }
     UITouch* touch = touches.anyObject;
-    if (touch == nil || BVNGuestPresentationView() == nil) {
+    CGFloat guestWidth = 0.0;
+    CGFloat guestHeight = 0.0;
+    if (touch == nil || ![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         [super touchesBegan:touches withEvent:event];
         return;
     }
@@ -704,10 +937,7 @@ static BVNGuestOverlayView* gOverlay = nil;
         self.trackpadTouchStart = [touch locationInView:self];
         self.trackpadTouchStartTime = touch.timestamp;
         self.trackpadTouchMoved = NO;
-        UIView* presentation = BVNGuestPresentationView();
-        self.trackpadLastPoint = presentation != nil
-            ? [touch locationInView:presentation]
-            : CGPointZero;
+        self.trackpadLastPoint = [touch locationInView:self];
         return;
     }
     [self sendGuestPointer:touch phase:1];
@@ -723,18 +953,18 @@ static BVNGuestOverlayView* gOverlay = nil;
         return;
     }
 
-    UIView* presentation = BVNGuestPresentationView();
-    if (presentation == nil) {
-        return;
-    }
-    // Relative motion, in the presenting view's own scale so a given finger
-    // movement covers the same fraction of the picture whatever the letterbox
-    // is doing.
-    const CGPoint now = [touch locationInView:presentation];
+    CGFloat guestWidth = 0.0;
+    CGFloat guestHeight = 0.0;
+    if (![self guestSizeWidth:&guestWidth height:&guestHeight]) { return; }
+    // Measure on the stable overlay, then convert the delta into guest pixels.
+    // This works for both the transformed Metal view and SDL's software path.
+    const CGPoint now = [touch locationInView:self];
     const CGPoint before = self.trackpadLastPoint;
     self.trackpadLastPoint = now;
-    const CGFloat dx = now.x - before.x;
-    const CGFloat dy = now.y - before.y;
+    const CGFloat dx = (now.x - before.x) * guestWidth /
+                       MAX(1.0, self.bounds.size.width);
+    const CGFloat dy = (now.y - before.y) * guestHeight /
+                       MAX(1.0, self.bounds.size.height);
     if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
         self.trackpadTouchMoved = YES;
     }
@@ -783,27 +1013,38 @@ static BVNGuestOverlayView* gOverlay = nil;
 // ---------------------------------------------------------------------------
 
 - (void)moveCursorBy:(CGPoint)delta {
-    UIView* presentation = BVNGuestPresentationView();
-    if (presentation == nil) {
+    CGFloat guestWidth = 0.0;
+    CGFloat guestHeight = 0.0;
+    if (![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         return;
     }
-    const CGRect bounds = presentation.bounds;
     CGPoint point = self.cursorGuestPoint;
-    point.x = MIN(MAX(point.x + delta.x, 0.0), bounds.size.width - 1.0);
-    point.y = MIN(MAX(point.y + delta.y, 0.0), bounds.size.height - 1.0);
+    point.x = MIN(MAX(point.x + delta.x, 0.0), guestWidth - 1.0);
+    point.y = MIN(MAX(point.y + delta.y, 0.0), guestHeight - 1.0);
     self.cursorGuestPoint = point;
     [self positionCursor];
 }
 
 - (void)positionCursor {
     UIView* presentation = BVNGuestPresentationView();
-    if (presentation == nil || !self.trackpadMode) {
+    CGFloat guestWidth = 0.0;
+    CGFloat guestHeight = 0.0;
+    if (!self.trackpadMode ||
+        ![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         self.cursorView.hidden = YES;
         return;
     }
+    if (CGPointEqualToPoint(self.cursorGuestPoint, CGPointZero)) {
+        self.cursorGuestPoint = CGPointMake(guestWidth / 2.0,
+                                            guestHeight / 2.0);
+    }
     self.cursorView.hidden = NO;
-    self.cursorView.center = [presentation convertPoint:self.cursorGuestPoint
-                                                 toView:self];
+    self.cursorView.center = presentation != nil
+        ? [presentation convertPoint:self.cursorGuestPoint toView:self]
+        : CGPointMake(self.cursorGuestPoint.x * self.bounds.size.width /
+                          MAX(1.0, guestWidth),
+                      self.cursorGuestPoint.y * self.bounds.size.height /
+                          MAX(1.0, guestHeight));
     [self bringSubviewToFront:self.cursorView];
 }
 
@@ -815,13 +1056,15 @@ static BVNGuestOverlayView* gOverlay = nil;
     if (enabled) {
         // Start in the middle of the picture rather than at 0,0, which on a
         // Wine desktop is behind the menu button.
-        UIView* presentation = BVNGuestPresentationView();
-        if (presentation != nil) {
-            self.cursorGuestPoint =
-                CGPointMake(presentation.bounds.size.width / 2.0,
-                            presentation.bounds.size.height / 2.0);
+        CGFloat guestWidth = 0.0;
+        CGFloat guestHeight = 0.0;
+        if ([self guestSizeWidth:&guestWidth height:&guestHeight]) {
+            self.cursorGuestPoint = CGPointMake(guestWidth / 2.0,
+                                                guestHeight / 2.0);
         }
     }
+    [[NSUserDefaults standardUserDefaults] setBool:enabled
+                                            forKey:kBVNTrackpadModeKey];
     [self positionCursor];
     BVNLogWrite(BVNLogLevelInfo, "input",
                 enabled ? "Pointer mode: trackpad (drag to move, tap to click)."
@@ -866,6 +1109,7 @@ static BVNGuestOverlayView* gOverlay = nil;
 
     [self layoutMenuPanelWithSafeArea:safe];
     [self layoutKeyboardPanelWithSafeArea:safe];
+    [self layoutPointerSettingsPanelWithSafeArea:safe];
     [self positionCursor];
 
     // Deliberately does NOT re-fit the guest picture. That belongs to the poll
@@ -902,7 +1146,8 @@ static BVNGuestOverlayView* gOverlay = nil;
         }
     } else {
         for (UIButton* item in @[self.keyboardItem, self.rotationItem,
-                                 self.pointerItem, self.quitItem]) {
+                                 self.pointerItem, self.pointerSettingsItem,
+                                 self.displayItem, self.quitItem]) {
             item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
                                     kBVNMenuRowHeight);
             cursor += kBVNMenuRowHeight;
@@ -1041,7 +1286,9 @@ static BVNGuestOverlayView* gOverlay = nil;
         return;
     }
     UIView* presentation = BVNGuestPresentationView();
-    if (presentation == nil) {
+    CGFloat guestWidth = 0.0;
+    CGFloat guestHeight = 0.0;
+    if (![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         return;
     }
     // Midpoint of the two fingers, in the presenting view's bounds - which are
@@ -1049,8 +1296,14 @@ static BVNGuestOverlayView* gOverlay = nil;
     // view's scale transform for us.
     CGPoint point = self.trackpadMode
         ? self.cursorGuestPoint
-        : [recognizer locationInView:presentation];
-    if (!CGRectContainsPoint(presentation.bounds, point)) {
+        : presentation != nil
+            ? [recognizer locationInView:presentation]
+            : CGPointMake([recognizer locationInView:self].x * guestWidth /
+                              MAX(1.0, self.bounds.size.width),
+                          [recognizer locationInView:self].y * guestHeight /
+                              MAX(1.0, self.bounds.size.height));
+    if (point.x < 0.0 || point.y < 0.0 ||
+        point.x >= guestWidth || point.y >= guestHeight) {
         return;
     }
     BVNGuestControlsSendRightClick((int)lround(point.x), (int)lround(point.y));
@@ -1064,6 +1317,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.menuOpen = !self.menuOpen;
     if (!self.menuOpen) {
         self.confirmingQuit = NO;
+        self.pointerSettingsOpen = NO;
     }
     [self applyMenuState];
     BVNLogWrite(BVNLogLevelInfo, "input",
@@ -1071,21 +1325,71 @@ static BVNGuestOverlayView* gOverlay = nil;
                               : "Guest overlay menu closed.");
 }
 
+- (void)layoutPointerSettingsPanelWithSafeArea:(UIEdgeInsets)safe {
+    const CGFloat availableWidth = self.bounds.size.width - safe.left -
+                                   safe.right - kBVNOverlayMargin * 2.0;
+    const CGFloat availableHeight = self.bounds.size.height - safe.top -
+                                    safe.bottom - kBVNOverlayMargin * 2.0;
+    const CGFloat width = MIN(540.0, MAX(280.0, availableWidth));
+    const CGFloat height = MIN(350.0, MAX(280.0, availableHeight));
+    const CGFloat x = safe.left + (availableWidth - width) / 2.0 +
+                      kBVNOverlayMargin;
+    const CGFloat y = safe.top + (availableHeight - height) / 2.0 +
+                      kBVNOverlayMargin;
+    self.pointerSettingsPanel.frame = CGRectMake(x, y, width, height);
+
+    const CGFloat inset = 16.0;
+    const CGFloat backHeight = 38.0;
+    self.pointerSettingsBackItem.frame =
+        CGRectMake(inset, 4.0, width - inset * 2.0, backHeight);
+    const CGFloat rowTop = backHeight + 4.0;
+    const CGFloat rowHeight = (height - rowTop - 8.0) /
+                              self.pointerSettingLabels.count;
+    const CGFloat labelWidth = MIN(160.0, width * 0.42);
+    NSArray<UIControl*>* controls = @[
+        self.pointerOpacitySlider, self.pointerSizeSlider,
+        self.pointerOutlineSlider, self.pointerShadowSlider,
+        self.pointerThicknessSlider, self.pointerOuterSwitch,
+        self.pointerInnerSwitch,
+    ];
+    for (NSUInteger index = 0; index < controls.count; ++index) {
+        const CGFloat rowY = rowTop + rowHeight * index;
+        self.pointerSettingLabels[index].frame =
+            CGRectMake(inset, rowY, labelWidth, rowHeight);
+        UIControl* control = controls[index];
+        if ([control isKindOfClass:UISwitch.class]) {
+            control.center = CGPointMake(width - inset -
+                                         control.bounds.size.width / 2.0,
+                                         rowY + rowHeight / 2.0);
+        } else {
+            control.frame = CGRectMake(inset + labelWidth + 8.0,
+                                       rowY,
+                                       width - inset * 2.0 - labelWidth - 8.0,
+                                       rowHeight);
+        }
+    }
+}
+
 - (void)closeMenu {
     self.menuOpen = NO;
     self.confirmingQuit = NO;
+    self.pointerSettingsOpen = NO;
     [self applyMenuState];
 }
 
 - (void)applyMenuState {
     self.menuButton.alpha = self.menuOpen ? 1.0 : 0.4;
     self.scrim.hidden = !self.menuOpen;
-    self.menuPanel.hidden = !self.menuOpen;
+    self.menuPanel.hidden = !self.menuOpen || self.pointerSettingsOpen;
+    self.pointerSettingsPanel.hidden = !self.menuOpen ||
+                                       !self.pointerSettingsOpen;
 
     const BOOL confirming = self.confirmingQuit;
     self.keyboardItem.hidden = confirming;
     self.rotationItem.hidden = confirming;
     self.pointerItem.hidden = confirming;
+    self.pointerSettingsItem.hidden = confirming;
+    self.displayItem.hidden = confirming;
     self.quitItem.hidden = confirming;
     self.quitPrompt.hidden = !confirming;
     self.quitCancelItem.hidden = !confirming;
@@ -1100,6 +1404,10 @@ static BVNGuestOverlayView* gOverlay = nil;
                        forState:UIControlStateNormal];
     [self.pointerItem setTitle:(self.trackpadMode ? @"Pointer: trackpad"
                                                   : @"Pointer: direct tap")
+                      forState:UIControlStateNormal];
+    [self.displayItem setTitle:(BVNGuestPresentationIsStretched()
+                                    ? @"Display: fill screen"
+                                    : @"Display: fit aspect")
                       forState:UIControlStateNormal];
     [self setNeedsLayout];
 }
@@ -1119,6 +1427,25 @@ static BVNGuestOverlayView* gOverlay = nil;
 - (void)togglePointerMode {
     [self setTrackpadModeEnabled:!self.trackpadMode];
     [self applyMenuState];
+}
+
+- (void)openPointerSettings {
+    self.pointerSettingsOpen = YES;
+    [self applyMenuState];
+}
+
+- (void)closePointerSettings {
+    self.pointerSettingsOpen = NO;
+    [self applyMenuState];
+}
+
+- (void)toggleDisplayMode {
+    BVNGuestSetPresentationStretched(!BVNGuestPresentationIsStretched());
+    [self applyMenuState];
+    BVNLogWrite(BVNLogLevelInfo, "graphics",
+                BVNGuestPresentationIsStretched()
+                    ? "Guest display mode: fill screen."
+                    : "Guest display mode: fit aspect.");
 }
 
 - (void)toggleRotation {
@@ -1343,37 +1670,32 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
     }
 }
 
-static void BVNCancelTrackingInView(UIView* view) {
-    if ([view isKindOfClass:UIControl.class]) {
-        [(UIControl*)view cancelTrackingWithEvent:nil];
-    }
-    for (UIGestureRecognizer* recognizer in view.gestureRecognizers) {
-        recognizer.enabled = NO;
-        recognizer.enabled = YES;
-    }
-    for (UIView* child in view.subviews) {
-        BVNCancelTrackingInView(child);
-    }
-}
-
 extern "C" void BVNGuestOverlayGeometryDidChange(void) {
     if (!NSThread.isMainThread || gOverlay == nil) {
         return;
     }
-    // A scene rotation can cancel the touch sequence at the hosting-window
-    // boundary without a matching -touchesCancelled: reaching this direct
-    // UIWindow child. Clear both our retained guest touch and UIKit's control
-    // / recognizer state; otherwise the same stale sequence blocks all later
-    // touches, even after rotating back.
-    gOverlay.guestTouch = nil;
-    [gOverlay releaseHeldKeys];
-    [gOverlay closeMenu];
-    BVNCancelTrackingInView(gOverlay);
-    gOverlay.userInteractionEnabled = NO;
-    gOverlay.userInteractionEnabled = YES;
-    [gOverlay setNeedsLayout];
+    // UIKit can retain the pre-rotation touch-delivery chain even after every
+    // recognizer/control is manually cancelled. Rebuild this lightweight view
+    // so the post-rotation UIWindow gets a fresh responder and hit-test chain.
+    // Pointer style/mode are UserDefaults-backed; preserve the movable menu
+    // position and startup notice explicitly.
+    BVNGuestOverlayView* oldOverlay = gOverlay;
+    const CGPoint menuFraction = oldOverlay.menuButtonFraction;
+    const BOOL startupVisible = !oldOverlay.startupNotice.hidden;
+    NSString* startupText = oldOverlay.startupProgress.text;
+    [oldOverlay releaseHeldKeys];
+    [oldOverlay removeFromSuperview];
+    gOverlay = nil;
+    BVNGuestOverlayInstall();
+    if (gOverlay != nil) {
+        gOverlay.menuButtonFraction = menuFraction;
+        gOverlay.startupNotice.hidden = !startupVisible;
+        gOverlay.startupProgress.text = startupText;
+        [gOverlay setNeedsLayout];
+    }
     BVNLogWrite(BVNLogLevelInfo, "input",
-                "Reset guest overlay touch tracking after geometry change.");
+                "Rebuilt guest overlay after geometry change; the new scene "
+                "has a fresh touch responder chain.");
 }
 
 // Called from the JIT's allocator, which is not the main thread. Recorded here

@@ -200,6 +200,16 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         }
     }
 
+    if (request->sharedDirectoryHostPath != nullptr &&
+        request->sharedDirectoryHostPath[0] != '\0') {
+        launch.sharedDirectoryHostPath = request->sharedDirectoryHostPath;
+        if (!directoryExists(launch.sharedDirectoryHostPath)) {
+            error = std::string("The shared directory '") +
+                    launch.sharedDirectoryHostPath + "' does not exist.";
+            return false;
+        }
+    }
+
     if (request->workingDirectory != nullptr) {
         launch.workingDirectory = request->workingDirectory;
     }
