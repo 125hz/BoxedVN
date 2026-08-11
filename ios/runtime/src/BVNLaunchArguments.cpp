@@ -41,6 +41,13 @@ bool launchesAnyOf(const BVNLaunchConfiguration& launch,
 
 }  // namespace
 
+void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch) {
+    const bool importedWineGame = launch.runThroughWine &&
+        !launch.gameDirectoryHostPath.empty();
+    launch.useWineD3DVulkanRenderer = importedWineGame;
+    launch.enableWineD3DVulkan = importedWineGame;
+}
+
 bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
     // The Fruit of Grisaia: run it WITHOUT DXVK.
     //

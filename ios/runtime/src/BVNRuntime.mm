@@ -220,7 +220,7 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     launch.bitsPerPixel = request->bitsPerPixel;
     launch.soundEnabled = request->soundEnabled;
     launch.runThroughWine = request->runThroughWine;
-    launch.enableWineD3DVulkan = !launch.gameDirectoryHostPath.empty();
+    BVNApplyDefaultRendererPolicy(launch);
 
     // LAST, so a profile can override any default above it. Build 66 called
     // this before enableWineD3DVulkan was assigned, so its Grisaia profile -
@@ -386,7 +386,8 @@ void runSession(const BVNLaunchConfiguration& launch) {
     // Setting a service to disabled alone is insufficient because Wine 10
     // auto-starts associated root PnP services regardless of Start.
     if (launch.runThroughWine) {
-        const boxedvn::WineRenderer renderer = launch.enableWineD3DVulkan
+        const boxedvn::WineRenderer renderer =
+            launch.useWineD3DVulkanRenderer
             ? boxedvn::WineRenderer::Vulkan
             : boxedvn::WineRenderer::Default;
         const boxedvn::WinePrefixPreparationResult prefix =
@@ -400,14 +401,22 @@ void runSession(const BVNLaunchConfiguration& launch) {
             setState(BVNRuntimeStateFailed);
             return;
         }
-        const char* prefixMessage =
-            launch.enableWineD3DVulkan
+        const char* prefixMessage = nullptr;
+        if (launch.useWineD3DVulkanRenderer) {
+            prefixMessage = launch.enableWineD3DVulkan
                 ? "Wine prefix ready: unsupported NDIS and Bluetooth "
-                  "drivers disabled; stale GDI/no-3D policy repaired; "
+                  "drivers disabled; stale GDI/OpenGL policy repaired; "
                   "imported game uses DXVK through Boxedwine and iOS "
                   "MoltenVK/Metal."
                 : "Wine prefix ready: unsupported NDIS and Bluetooth "
-                  "drivers disabled; Wine HID bus and nsiproxy available.";
+                  "drivers disabled; stale GDI/OpenGL policy repaired; "
+                  "imported game uses WineD3D's Vulkan renderer through "
+                  "Boxedwine and iOS MoltenVK/Metal; DXVK is disabled.";
+        } else {
+            prefixMessage =
+                "Wine prefix ready: unsupported NDIS and Bluetooth "
+                "drivers disabled; Wine HID bus and nsiproxy available.";
+        }
         BVNLogWrite(BVNLogLevelInfo, "prefix", prefixMessage);
 
         // Shadow the rootfs's stock DXVK with the MoltenVK-compatible build.

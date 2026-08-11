@@ -6,17 +6,17 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-11 (build 76 prepared from build-75 device evidence.
-Build 75 proved the title heartbeat ineffective, confirmed portrait hit tests
-continue while touch delivery stays wedged, and cut the measured NDIS startup
-gap from roughly 57 seconds to roughly 8. Build 76 replaces the title heartbeat
-with a shared X11-over-Vulkan partial-present compositor, resets UIKit touch
-tracking after rotation, defers the initial landscape request out of the
-launching touch transaction, and publishes a separately named entitlement-
-template IPA. GitHub Actions run 31536075940 passed the host tests, iPhoneOS
-compile, unsigned package, and entitlement-template package; physical-device
-validation remains pending. Song of Saya remains device-proven playable with
-the interpreter workaround. The newest
+**Last updated:** 2026-08-11 (build 77 prepared from build-76 device evidence.
+Both build-76 Grisaia startup logs selected WineD3D's unavailable OpenGL host
+renderer and terminated at Boxedwine's fatal GLX thunk 2897 (`glXChooseVisual`)
+before creating any Vulkan presentation surface. Build 77 separates the generic
+WineD3D-over-Vulkan policy from the per-title DXVK switch: every imported Wine
+game repairs its prefix to `renderer=vulkan`, while Grisaia still keeps DXVK
+disabled. The entitlement build is device-proven to have the increased-memory
+request in its installed signature: it reported 5.99 GB before the process
+limit, versus 3.29 GB for the normal IPA. CI and fresh-device validation of the
+build-77 renderer correction remain pending. Song of Saya remains device-proven
+playable with the interpreter workaround. The newest
 detail is at the end of the session log; the open-problem list lives in
 `docs/CONTINUING_WITHOUT_A_MAC.md`.)
 **Branch:** `ios`
@@ -3326,3 +3326,32 @@ compile and validated both packages: unsigned SHA-256
 and entitlement-template SHA-256
 `4b57b2edaea6fd80a324f497c44d2c2696e1a50661ff44e249a33386504bbf25`.
 All physical-device behavior remains pending device evidence.
+
+### 2026-08-11 — build 77: repair clean-prefix renderer selection
+
+The normal and entitlement build-76 logs ended on the same fatal core path.
+Both said `wined3d_dll_init Using the OpenGL renderer`, resolved the GLX entry
+points, and then stopped at `Uknown int 99 call: 2897`. Index 2897 is
+`kXChooseVisual`; the iOS build intentionally has no host OpenGL dispatcher, so
+this was an emulator abort rather than an idle blue screen. Neither log reached
+`Registered Vulkan surface`, which also excludes build 76's new
+X11-over-Vulkan compositor as the cause of this startup failure.
+
+The latent caller bug was that `BVNRuntime` used the `enableWineD3DVulkan`
+field for two independent choices: whether to force WineD3D's Vulkan renderer
+in the prefix, and whether to mount the patched DXVK DLLs. Grisaia's profile
+correctly turned the latter off, but on a clean/recreated prefix that also left
+Wine's default OpenGL renderer selected. The earlier build-75 prefix already
+contained `renderer=vulkan`, which is why the same profile happened to launch
+there.
+
+Build 77 adds a separate `useWineD3DVulkanRenderer` policy. Imported Wine games
+always set it before title profiles run; Grisaia then disables only DXVK. Prefix
+preparation therefore writes `renderer=vulkan` on both clean and existing
+prefixes while leaving Boxedwine's `-dxvk` switch absent for this Direct3D 9
+engine. A host regression test locks that ordering and independence down.
+
+The entitlement log independently closes the packaging question: its installed
+signature reported `Increased limit signed; 5.99 GB available`, while the
+normal IPA reported `Standard limit; 3.29 GB available`. The renderer abort is
+identical in both logs and unrelated to the entitlement.

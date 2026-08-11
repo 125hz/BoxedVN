@@ -9,6 +9,22 @@
 
 #include <algorithm>
 
+BOXEDVN_TEST(imported_game_keeps_wined3d_vulkan_when_profile_disables_dxvk) {
+    BVNLaunchConfiguration launch;
+    launch.runThroughWine = true;
+    launch.gameDirectoryHostPath = "/games/grisaia";
+    launch.executablePath = "/bin/wine";
+    launch.arguments = {"D:\\BootMenu.exe"};
+
+    BVNApplyDefaultRendererPolicy(launch);
+    CHECK(launch.useWineD3DVulkanRenderer);
+    CHECK(launch.enableWineD3DVulkan);
+
+    CHECK(BVNApplyKnownCompatibilityProfile(launch));
+    CHECK(launch.useWineD3DVulkanRenderer);
+    CHECK(!launch.enableWineD3DVulkan);
+}
+
 BOXEDVN_TEST(wine_notepad_command_uses_valueless_nozip_switch) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs/boxedwine.zip";
@@ -215,10 +231,13 @@ BOXEDVN_TEST(grisaia_profile_keeps_dxvk_out_of_a_direct3d9_engine) {
         BVNLaunchConfiguration launch;
         launch.executablePath = "/bin/wine";
         launch.arguments = {executable};
+        launch.gameDirectoryHostPath = "/games/grisaia";
+        launch.useWineD3DVulkanRenderer = true;
         launch.enableWineD3DVulkan = true;
 
         CHECK(BVNApplyKnownCompatibilityProfile(launch));
         CHECK(!launch.enableWineD3DVulkan);
+        CHECK(launch.useWineD3DVulkanRenderer);
         // It must not pick up Saya's interpreter diagnostic by accident.
         CHECK(launch.interpreterModules.empty());
 
