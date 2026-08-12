@@ -449,7 +449,11 @@ struct GameDetailView: View {
                      + "Chromium switches it needs. Anything typed here is "
                      + "added to those, and a switch you name yourself wins "
                      + "over BoxedVN's. Put --bvn-no-default-switches here to "
-                     + "get none of them.")
+                     + "get none of them, or --bvn-boot-diagnostics to make "
+                     + "the game report what its startup is waiting on. "
+                     + "Diagnostics edit the game's index.html, keep the "
+                     + "original beside it, and put it back when you remove "
+                     + "the line.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 TextField("Working directory (inside the game)",

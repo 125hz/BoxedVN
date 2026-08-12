@@ -44,6 +44,8 @@
 
 #include "BVNExecMemory.h"
 #include "BVNLaunchArguments.h"
+#include "boxedvn/boot_diagnostics.h"
+#include "boxedvn/engine_profile.h"
 #include "boxedvn/wine_prefix.h"
 #include "BVNRuntime.h"
 
@@ -242,6 +244,35 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         BVNApplyEngineCompatibilityProfile(launch);
     if (!engineProfile.reason.empty()) {
         BVNLogWrite(BVNLogLevelInfo, "engine", engineProfile.reason.c_str());
+    }
+
+    // Install or remove the guest-side probe. Done on every launch of a
+    // browser-engine game, not only when it is switched on, so that turning
+    // it off actually puts the game's own HTML back rather than leaving
+    // BoxedVN's script in a file the user thinks is untouched.
+    if (!launch.gameDirectoryHostPath.empty()) {
+        const boxedvn::BootDiagnosticsResult diagnostics =
+            boxedvn::setBootDiagnostics(launch.gameDirectoryHostPath,
+                                        engineProfile.bootDiagnostics);
+        if (!diagnostics.ok) {
+            BVNLogWrite(BVNLogLevelError, "diagnostics",
+                        diagnostics.error.c_str());
+        } else if (diagnostics.changed) {
+            char message[320];
+            snprintf(message, sizeof(message),
+                     engineProfile.bootDiagnostics
+                         ? "Boot diagnostics installed into %s; the original "
+                           "is saved beside it as %s%s. Look for \"BOXEDVN "
+                           "boot\" lines below."
+                         : "Boot diagnostics removed; %s restored from the "
+                           "saved original.%s%s",
+                     diagnostics.documentPath.c_str(),
+                     engineProfile.bootDiagnostics
+                         ? diagnostics.documentPath.c_str() : "",
+                     engineProfile.bootDiagnostics
+                         ? boxedvn::kBootDiagnosticsBackupSuffix : "");
+            BVNLogWrite(BVNLogLevelInfo, "diagnostics", message);
+        }
     }
 
     // LAST, so a profile can override any default above it. Build 66 called

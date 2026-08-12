@@ -3,6 +3,7 @@
 
 add_library(boxedvn_support STATIC
     src/architecture.cpp
+    src/boot_diagnostics.cpp
     src/direct3d_profile.cpp
     src/engine_profile.cpp
     src/json.cpp

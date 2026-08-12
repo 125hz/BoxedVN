@@ -57,6 +57,10 @@ void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch);
 struct BVNEngineProfileResult {
     /// True when switches were actually appended to `launch.arguments`.
     bool applied = false;
+    /// True when this game's launch settings asked BoxedVN to instrument the
+    /// guest's own HTML. The caller performs the installation; deciding it
+    /// here keeps the sentinel's handling next to the other one.
+    bool bootDiagnostics = false;
     /// One sentence for the session log, naming the engine and what was done
     /// about it. Non-empty whenever an engine was recognised, including the
     /// case where BoxedVN deliberately added nothing.

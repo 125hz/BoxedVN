@@ -117,6 +117,7 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
     const boxedvn::ChromiumSwitchMerge merged =
         boxedvn::mergeChromiumSwitches(launch.arguments);
     launch.arguments = merged.arguments;
+    result.bootDiagnostics = merged.bootDiagnostics;
 
     if (merged.optedOut) {
         result.reason = std::string(engine) + " detected (" +

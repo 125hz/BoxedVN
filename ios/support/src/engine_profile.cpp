@@ -163,6 +163,7 @@ std::vector<std::string> chromiumCompatibilitySwitches() {
 }
 
 const char kChromiumDefaultsOptOut[] = "--bvn-no-default-switches";
+const char kBootDiagnosticsOptIn[] = "--bvn-boot-diagnostics";
 
 namespace {
 
@@ -231,8 +232,28 @@ ChromiumSwitchMerge mergeChromiumSwitches(
             result.optedOut = true;
             continue;  // Stripped: it is BoxedVN's word, not Chromium's.
         }
+        if (argument == kBootDiagnosticsOptIn) {
+            result.bootDiagnostics = true;
+            continue;  // Also BoxedVN's word.
+        }
         result.arguments.push_back(argument);
     }
+
+    // The probe reports through console.log, which reaches the session log
+    // only when Chromium is logging to stderr. Asking for diagnostics and
+    // silently getting none would be worse than not offering them.
+    if (result.bootDiagnostics) {
+        const bool alreadyLogging = std::any_of(
+            result.arguments.begin(), result.arguments.end(),
+            [](const std::string& argument) {
+                return argument.rfind("--enable-logging", 0) == 0;
+            });
+        if (!alreadyLogging) {
+            result.arguments.push_back("--enable-logging=stderr");
+            result.added++;
+        }
+    }
+
     if (result.optedOut) {
         return result;
     }

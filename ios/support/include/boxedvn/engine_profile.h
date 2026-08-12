@@ -164,6 +164,12 @@ std::vector<std::string> chromiumCompatibilitySwitches();
 // than a side effect of typing anything is the point: see mergeChromiumSwitches.
 extern const char kChromiumDefaultsOptOut[];
 
+// A line a user can put in launch settings to ask BoxedVN to instrument the
+// game's own HTML with the probe in boxedvn/boot_diagnostics.h, and to turn
+// on the Chromium logging that carries its output into the session log.
+// Stripped before launch; never reaches the guest.
+extern const char kBootDiagnosticsOptIn[];
+
 struct ChromiumSwitchMerge {
     // The full argument list to pass to the guest: the user's own, minus the
     // opt-out line, plus whatever BoxedVN contributed.
@@ -178,6 +184,10 @@ struct ChromiumSwitchMerge {
     bool mergedFeatures = false;
     // True when the user asked for no defaults at all.
     bool optedOut = false;
+    // True when the user asked for boot diagnostics. The caller installs the
+    // probe; this only reports the request and ensures Chromium logging is
+    // on, because without it the probe's output goes nowhere.
+    bool bootDiagnostics = false;
 };
 
 // Combines BoxedVN's switches with whatever the user typed in launch
