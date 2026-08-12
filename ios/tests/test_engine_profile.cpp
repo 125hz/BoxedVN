@@ -180,13 +180,36 @@ BOXEDVN_TEST(detectGuestEngineRespectsDepthLimit) {
           GuestEngine::NwJs);
 }
 
-BOXEDVN_TEST(chromiumSwitchesCoverTheFourKnownFailures) {
+BOXEDVN_TEST(chromiumSwitchesCoverTheKnownDeviceFailures) {
     const std::vector<std::string> options = chromiumCompatibilitySwitches();
-    CHECK_EQ(options.size(), static_cast<std::size_t>(4));
-    CHECK_CONTAINS(options[0], "--no-sandbox");
-    CHECK_CONTAINS(options[1], "--in-process-gpu");
-    CHECK_CONTAINS(options[2], "--disable-direct-composition");
-    CHECK_CONTAINS(options[3], "CalculateNativeWinOcclusion");
+    const std::string joined = [&options] {
+        std::string all;
+        for (const std::string& option : options) {
+            all += option;
+            all += ' ';
+        }
+        return all;
+    }();
+
+    // Each of these is tied to an observed device failure; see the header.
+    CHECK_CONTAINS(joined, "--no-sandbox");
+    CHECK_CONTAINS(joined, "--disable-gpu ");
+    CHECK_CONTAINS(joined, "--disable-software-rasterizer");
+    CHECK_CONTAINS(joined, "--disable-direct-composition");
+    CHECK_CONTAINS(joined, "CalculateNativeWinOcclusion");
+    CHECK_CONTAINS(joined, "--disable-background-timer-throttling");
+    CHECK_CONTAINS(joined, "--disable-renderer-backgrounding");
+    CHECK_CONTAINS(joined, "--disable-backgrounding-occluded-windows");
+
+    // Chromium resolves a repeated --disable-features to the last one it
+    // sees, so the set must never carry two of them.
+    std::size_t featureSwitches = 0;
+    for (const std::string& option : options) {
+        if (option.rfind("--disable-features=", 0) == 0) {
+            featureSwitches++;
+        }
+    }
+    CHECK_EQ(featureSwitches, static_cast<std::size_t>(1));
 
     // Every entry must be a switch. A bare word here would be handed to the
     // game as a positional argument, and NW.js treats the first positional as
@@ -220,7 +243,8 @@ BOXEDVN_TEST(engineProfileAppendsSwitchesForAnImportedNwJsGame) {
         BVNApplyEngineCompatibilityProfile(launch);
     CHECK(result.applied);
     CHECK_CONTAINS(result.reason, "NW.js");
-    CHECK_EQ(launch.arguments.size(), static_cast<std::size_t>(4));
+    CHECK_EQ(launch.arguments.size(),
+             chromiumCompatibilitySwitches().size());
     CHECK_EQ(launch.arguments[0], std::string("--no-sandbox"));
 
     // The switches must reach the guest after the executable, which is where

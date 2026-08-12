@@ -212,37 +212,51 @@ Windows - is a Chromium application wearing a game's name. That changes what
 and the game still shows nothing, because the failure is in Chromium's process
 model, its compositor or its font stack rather than in the renderer.
 
-Build 95 recognises the engine from the files a game ships (`nw.dll`,
-`nw.pak`, `package.nw`, `app.asar`) and passes Chromium's own switches for the
-four Windows facilities Wine under Boxedwine implements only partly:
-`--no-sandbox`, `--in-process-gpu`, `--disable-direct-composition` and
-`--disable-features=CalculateNativeWinOcclusion`. The engine and the evidence
+Build 96 recognises the engine from the files a game ships (`nw.dll`,
+`nw.pak`, `package.nw`, `app.asar`) and passes Chromium's own switches for
+the facilities in question: `--no-sandbox`, `--disable-gpu`,
+`--disable-software-rasterizer`, `--disable-direct-composition`,
+`--disable-features=CalculateNativeWinOcclusion`,
+`--disable-background-timer-throttling`, `--disable-renderer-backgrounding`
+and `--disable-backgrounding-occluded-windows`. The engine and the evidence
 for it are logged under `engine:`. Putting any `--switch` in a game's launch
 settings takes the decision over completely and BoxedVN adds none of its own.
 
-What this is based on, and what falsifies it:
+Three device runs of the same NW.js/RPG Maker MV title established the set:
 
-- **Not device-proven.** The switches were chosen from a build-94 device log
-  in which DXVK created a device, the guest mapped an X11 window, and the
-  window stayed black for fifty seconds before the renderer aborted. Each
-  switch is argued in `ios/support/include/boxedvn/engine_profile.h` against a
-  specific line of that log. None of them has been observed to help yet.
-- If a device log still shows no pixels with all four applied, the next thing
-  to test is software compositing - `--disable-gpu
-  --disable-software-rasterizer` in launch settings. That pair is deliberately
-  not the default: it would mask whether the switches above worked, and
-  software rasterising a browser engine is what exhausted the JIT arena before
-  build 94 resized it.
-- A renderer that aborts in Blink's `FontCache` with `Check failed: false` has
-  found no font at all. `--no-sandbox` is the first candidate, because the
-  sandbox is what forces the renderer to reach DirectWrite through the browser
-  process. If it persists, the prefix genuinely has no usable face and the fix
-  is `Documents/Fonts` (section 7).
-- A "Profile error occurred" dialog from the game is Chromium reporting
-  corrupt SQLite in its own user-data directory, normally left behind by a
-  previous run that was killed part way through a write. It is not fatal -
-  Chromium says so - and it should stop recurring once the guest stops dying.
-  Do not read it as the cause of a black screen.
+| run | switches | result |
+|---|---|---|
+| 1 | none | black window; renderer aborts in `FontCache`; guest exits 1 |
+| 2 | `--no-sandbox --in-process-gpu --disable-direct-composition --disable-features=CalculateNativeWinOcclusion` | no abort; the game's own 816x624 window appears; three composited presents, then a white page and no further frames |
+| 3 | GPU pair swapped for `--disable-gpu --disable-software-rasterizer`, throttling switches added | PixiJS initialises in Canvas mode, audio opens, the render loop runs and draws the game's loading screen |
+
+So: `--no-sandbox` is what stops the `FontCache` abort, and software
+compositing is what actually produces frames - the hardware path in run 2
+created a presentation swapchain and never presented to it. Run 3 changed
+several switches at once, so the individual contributions are not isolated
+and the set is shipped as a set.
+
+**What is still unresolved.** Run 3 reaches RPG Maker's `Scene_Boot` and
+stays there. `Scene_Boot` waits on its database JSONs and on the `GameFont`
+face, and reports neither as failed, so something is pending rather than
+erroring. Two candidates, in order:
+
+- Chromium's proxy and DNS services never settle under Wine. The run-3 log
+  repeats `dns_config_service_win.cc: Failed to read DnsConfig` every five
+  seconds indefinitely and reports WPAD-over-DHCP failures four times. Test
+  with `--no-proxy-server --disable-background-networking`.
+- The `GameFont` face never resolves. RPG Maker waits on it before leaving
+  `Scene_Boot` and, on the CSS-font-loading path, does so without a timeout.
+  Test by putting a font in `Documents/Fonts` (section 7).
+
+`--enable-logging=stderr` puts Chromium's console output, including page JS
+errors, into the session log and is the right first thing to add to any run
+that stalls. It is what identified the Canvas-mode PixiJS line above.
+
+Other things seen in these logs that are *not* the problem: a "Profile error
+occurred" dialog (Chromium reporting corrupt SQLite in its own user-data
+directory, explicitly non-fatal), `Lost UI shared context` on the software
+path, and `RoGetActivationFactory` failing for `windows.ui.dll`.
 
 ---
 

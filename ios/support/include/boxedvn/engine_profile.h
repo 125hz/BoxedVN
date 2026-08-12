@@ -99,47 +99,60 @@ GuestEngineProfile detectGuestEngine(const std::string& gameDirectory,
 // The Chromium command-line switches BoxedVN passes to a Chromium-family
 // guest, in the order it passes them.
 //
-// Each one repairs a specific Windows assumption that Wine under Boxedwine
-// does not meet. They are Chromium's own supported switches, so they are
-// forward-compatible across the NW.js versions RPG Maker has shipped, and
-// unrecognised ones are ignored rather than fatal:
+// Each repairs a Windows assumption that Wine under Boxedwine does not meet.
+// They are Chromium's own supported switches, so they are forward-compatible
+// across the NW.js versions RPG Maker has shipped and an unrecognised one is
+// ignored rather than fatal. Three device runs of the same NW.js title
+// established them:
+//
+//   run 1 (build 94, no switches)   black window, then the renderer aborts
+//                                   in FontCache and the guest exits 1
+//   run 2 (+first four switches)    no abort, the game's own 816x624 window
+//                                   appears, three composited presents and
+//                                   then nothing: a white page
+//   run 3 (GPU switches swapped     PixiJS initialises in Canvas mode, audio
+//          for software rendering)  opens, the render loop runs
 //
 //   --no-sandbox
 //       The Windows sandbox is built from token, job-object and handle
-//       behaviour Wine implements only partly. It is also what forces the
+//       behaviour Wine implements only partly, and it is what forces the
 //       renderer to reach DirectWrite through the browser process rather
-//       than directly, which is the documented cause of Blink aborting in
-//       FontCache with an empty font collection.
+//       than directly. Run 1 aborted in Blink's FontCache with an empty
+//       font collection; run 2 did not. This is what fixed that.
 //
-//   --in-process-gpu
-//       Runs the GPU service inside the browser process, where the window
-//       handle it must bind a surface to actually lives. A cross-process
-//       surface bind that fails reports exactly "Failed to create surface"
-//       from gles2_command_buffer_stub and leaves a mapped, permanently
-//       black window. It also removes one x86 process from a guest that
-//       already starts six to ten, each translating its own copy of the
-//       engine through the JIT arena.
+//   --disable-gpu, --disable-software-rasterizer
+//       Composite in the browser process through Skia and GDI, and do not
+//       fall back to SwiftShader. Run 2 kept the hardware path
+//       (--in-process-gpu) and produced a window whose presentation
+//       swapchain was created and never presented to. The software path is
+//       the one Wine's GDI and BoxedVN's X11 compositor already handle -
+//       it drew a Chromium dialog as far back as build 92 - and refusing
+//       SwiftShader keeps a second x86 rasteriser out of the JIT arena.
+//       WebGL is unavailable on this path; PixiJS falls back to Canvas,
+//       which is what run 3 reported.
 //
 //   --disable-direct-composition
 //       Chromium presents through DirectComposition by default. Wine's
 //       dcomp is a stub, so the swap chain is created, the frame is
-//       submitted, and nothing reaches the window: a healthy Direct3D
-//       device with no pixels. This forces the plain DXGI swap-chain path.
+//       submitted, and nothing reaches the window.
 //
-//   --disable-features=CalculateNativeWinOcclusion
-//       Chromium stops painting a window it believes is occluded. That
-//       calculation walks the real window stack, which under Wine's X11
-//       driver inside a single full-screen guest can report the game's own
-//       window covered. A window that is never repainted is black.
+//   --disable-features=CalculateNativeWinOcclusion,
+//   --disable-background-timer-throttling,
+//   --disable-renderer-backgrounding,
+//   --disable-backgrounding-occluded-windows
+//       Chromium stops painting, and suspends requestAnimationFrame, for a
+//       window it believes is hidden or occluded. Its visibility comes from
+//       window messages and a walk of the real window stack, neither of
+//       which means under Wine inside a single full-screen guest what it
+//       means on Windows. In run 2 BoxedVN's presenter did not attach to
+//       the guest's window until a minute after the guest created it, which
+//       is exactly the window of time in which Chromium would have decided
+//       it was not visible.
 //
-// This is a starting set with a clear falsifier rather than a settled
-// answer: if a device log still shows no pixels with all four applied, the
-// next thing to test is software compositing (`--disable-gpu
-// --disable-software-rasterizer`), which trades frame rate for a path that
-// touches no Wine graphics code at all. That pair is deliberately NOT
-// included here - it would mask whether the switches above worked, and
-// software rasterising a browser engine is what exhausted the JIT arena in
-// build 94.
+// These are shipped as a set because that is how they were proven. Run 3
+// changed the GPU pair and the three throttling switches together, so their
+// individual contributions are not isolated, and this comment should not be
+// read as claiming they are.
 std::vector<std::string> chromiumCompatibilitySwitches();
 
 // True when `arguments` already contains a Chromium switch, meaning the user

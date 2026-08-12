@@ -148,11 +148,17 @@ GuestEngineProfile detectGuestEngine(const std::string& gameDirectory,
 
 std::vector<std::string> chromiumCompatibilitySwitches() {
     // See the header for why each of these is here and what falsifies it.
+    // This exact list is the one device run 3 reached a rendering engine
+    // with; it is shipped as a set because that is how it was proven.
     return {
         "--no-sandbox",
-        "--in-process-gpu",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
         "--disable-direct-composition",
         "--disable-features=CalculateNativeWinOcclusion",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
     };
 }
 

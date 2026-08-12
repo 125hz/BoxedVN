@@ -4349,3 +4349,70 @@ failures (125 before; 15 for the engine profile, 3 for the font installer),
 built and run with MSVC on Windows via the `tests-only` preset. The changed
 Objective-C++ and Swift compile only in the iPhoneOS job. Device acceptance
 is pending.
+
+---
+
+### Build 96 — three device runs, and a browser engine that renders
+
+Build 95's switches were argued from a log; they have now been run. The
+sequence, all on the same NW.js/RPG Maker MV title:
+
+| run | switches | result |
+|---|---|---|
+| 1 (build 94) | none | black window; renderer aborts in `FontCache`; guest exits 1 |
+| 2 | `--no-sandbox --in-process-gpu --disable-direct-composition --disable-features=CalculateNativeWinOcclusion` | no abort; the game's own 816x624 window appears; three composited presents, then a white page and nothing further |
+| 3 | GPU pair swapped for `--disable-gpu --disable-software-rasterizer`, throttling switches added | `[INFO:CONSOLE] "PixiJS 4.5.4 - ✰ Canvas ✰"`, `openAudio: freq=44100(got 48000)`, the render loop runs and draws the game's loading screen |
+
+Two of build 95's four guesses were right and one was wrong.
+
+**Right:** `--no-sandbox` is what stops the `FontCache` abort. Run 1 died
+there and run 2 did not, with nothing else in that area changed. The
+sandbox was indeed what forced the renderer to reach DirectWrite through
+the browser process.
+
+**Wrong:** `--in-process-gpu` was not enough. Run 2 created a presentation
+swapchain at the game's own 816x624 and never presented to it once - three
+composited X11 presents in the whole session, six pipelines, two shader
+modules, FPS 0.0. A game does not render with two shader modules. The
+hardware path was reachable and inert.
+
+Software compositing is what actually produced frames, which in hindsight
+follows from this port's own history: BoxedVN's X11 compositor drew a
+Chromium dialog as far back as build 92, so that path was already proven
+and the D3D path was not. `--disable-software-rasterizer` keeps SwiftShader
+out, so WebGL is simply unavailable and PixiJS takes its Canvas branch -
+visible in the console line above - which also keeps a second x86
+rasteriser out of the JIT arena.
+
+The shipped set is now those eight switches. Run 3 changed the GPU pair and
+the three throttling switches together, so their individual contributions
+are *not* isolated; the header says so rather than implying a precision the
+runs do not support.
+
+**Where it stops.** Run 3 reaches RPG Maker's `Scene_Boot` and stays there.
+`Scene_Boot.isReady` gates on the database JSONs and on the `GameFont`
+face, and the log reports neither as failed - no JS error of any kind - so
+something is pending rather than erroring. Ranked:
+
+1. Chromium's proxy/DNS services never settle. The log repeats
+   `dns_config_service_win.cc(669): Failed to read DnsConfig` every five
+   seconds to the end of the session, and reports WPAD-over-DHCP failure
+   four times. `--no-proxy-server --disable-background-networking` is the
+   next test and needs no new build.
+2. `GameFont` never resolves. RPG Maker waits for it before leaving
+   `Scene_Boot` and, on the CSS-font-loading path, without a timeout. Build
+   95's `Documents/Fonts` is the lever, and it has not reached a device yet.
+
+The JIT allocation rate falling to roughly one per ten seconds by the end
+of run 3 argues for stalled rather than merely slow, but that is an
+inference and not yet a measurement.
+
+`--enable-logging=stderr` earned its place in the toolkit here: it is what
+produced the PixiJS line that proved the renderer was alive and in Canvas
+mode. It belongs in any run that stalls.
+
+**Build evidence:** the host-independent suite still runs 143 tests with
+zero failures, built and run with MSVC on Windows via the `tests-only`
+preset. The switch-set test now checks the set by content rather than by
+index, and asserts there is never more than one `--disable-features=`,
+because Chromium resolves a repeat to the last one seen.
