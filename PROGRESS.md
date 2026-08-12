@@ -15,8 +15,9 @@ from dirty bounds and rejects a truncated full-height ancestor update instead
 of stretching it. It also keeps Wine's X11 root large enough to contain the
 fake-fullscreen Vulkan client. This removes the stale 960/1280 root ratio that
 matches the cursor-over-QL while 05-highlights device evidence. The Windows
-support suite remains 92/92; iPhoneOS compilation and fresh-device validation
-are pending. Song of Saya remains
+support suite remains 92/92. GitHub Actions run 31550538185 passed the full
+iPhoneOS build and published the direct IPA; fresh-device validation is
+pending. Song of Saya remains
 device-proven playable with the
 interpreter workaround.
 The newest
@@ -3571,7 +3572,13 @@ second time. The original root size is restored when that client is destroyed.
 Button diagnostics now include the X11 root extent, making this invariant
 observable in the next log.
 
-**Local evidence:** `git diff --check` passes. The Windows host-independent
-executable runs all 92 tests with zero failures, and CTest passes 1/1. The
-iPhoneOS compile, IPA publication, and physical rendering/input acceptance are
-pending build 81.
+**Build evidence:** `git diff --check` passes. The Windows host-independent
+executable runs all 92 tests with zero failures, and CTest passes 1/1. GitHub
+Actions run 31550538185 passed the same host suite plus the full iPhoneOS
+compile, app validation, increased-memory entitlement check, packaging, and
+rolling Release upload in 3 minutes 30 seconds. The published build 81
+`BoxedVN.ipa` is 8,156,674 bytes and its downloaded SHA-256 matches the Release
+digest and sidecar:
+`b663f4fdb364614da500e8ae550f6e62a27eeba424ccf213e9a84312b49615cf`.
+The direct URL returns HTTP 200 and `Content-Disposition: attachment`. Physical
+rendering/input acceptance remains pending build 81.

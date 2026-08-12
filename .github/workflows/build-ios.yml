@@ -214,6 +214,7 @@ jobs:
           else
             gh release edit "${release_tag}" \
               --prerelease \
+              --target "${GITHUB_SHA}" \
               --title "Latest BoxedVN iOS build" \
               --notes-file "${notes_file}"
           fi
