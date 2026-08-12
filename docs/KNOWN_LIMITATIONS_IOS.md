@@ -307,28 +307,35 @@ under `fonts:`. A total of zero is logged as an error in its own right,
 because a guest with no font cannot run a program that draws text and
 nothing else in the log would say so.
 
-**Fonts are ruled out, at every level.** A run with two user-supplied
-scalable faces in the prefix (`NotoSansJP-Medium.ttf`, `msgothic.ttc`) and
-`WINEDEBUG=warn+font,warn+dwrite` produced exactly four dwrite warnings in
-the whole session:
+**Solved, and device-proven.** RPG Maker will not leave `Scene_Boot` until
+`Graphics.isFontLoaded("GameFont")` is true, and on the CSS font-loading path
+it waits for that without any timeout. Under Wine the engine's own trigger -
+a hidden element styled `font-size: 0px` - never causes Blink to load the
+face, so the wait never ends and nothing anywhere reports an error.
+
+Asking Blink for the face directly is the entire repair:
 
 ```
-warn:dwrite:factory_create_system_fontset Failed to add font file, hr 0x88985003, path L"C:\windowsonts\coure.fon"
-                                          ... serife.fon, smalle.fon, sserife.fon
+BOXEDVN fontfix requested GameFont, Blink returned 1 face(s)
+BOXEDVN fontfix not needed; GameFont loaded on its own
+BOXEDVN boot 1 ... faces=GameFont:loaded|azuki:error|kaku:error gameFont=true scene=Scene_Map
 ```
 
-Four `.fon` files refused, everything else in `C:\windowsonts` accepted.
-Chromium's DirectWrite system font set is built and contains real scalable
-faces, and the guest hangs in exactly the same place regardless. Font
-availability, font format and font registration are all eliminated.
+The ten-second gate override never fired. Build 105 installs that request
+for every recognised RPG Maker guest; `--bvn-no-font-fix` declines it.
 
-What remains unexplained is `document.fonts.ready` never settling on a
-document whose font set is healthy. In Blink that promise is resolved from
-the document lifecycle rather than from font loads, so the next question is
-whether the renderer completes a layout at all - which needs visibility
-inside the guest, not another host-side measurement.
+Getting there cost nine device runs and four wrong theories - the GPU
+process, `.fon` bitmap fonts, font registration, and the render lifecycle -
+every one of them eliminated by a measurement rather than by argument. The
+lesson worth keeping is in the order: the fault was named within one run of
+the guest being able to report its own state, and not before.
 
-**Build 100's census, for the record.** The guest reported 56 font files and
+Fonts were, in the end, genuinely involved - but not through availability,
+format or registration, all of which were healthy. Note also `azuki:error`
+and `kaku:error`: two further faces this title declares do fail to load, and
+the game proceeds regardless.
+
+**Build 100's census, for the record.****Build 100's census, for the record.** The guest reported 56 font files and
 `coue1255.fon, coue1256.fon, coue1257.fon` as examples: the root filesystem
 ships Wine's bundled fonts and they are legacy `.fon` bitmap faces.
 Chromium reaches fonts through DirectWrite, which loads TrueType and

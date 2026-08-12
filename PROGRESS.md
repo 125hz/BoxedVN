@@ -4465,3 +4465,65 @@ seconds every single time. The scan is what lets a user *change* the
 program; the manifest already recorded that the selected one is runnable,
 and that is what Launch uses. Launch now waits for the scan only when the
 selection is something the scan has not judged yet.
+
+---
+
+### Build 105 — an RPG Maker guest reaches its map
+
+The font gate is solved and device-proven. `Scene_Boot` will not finish
+while `Graphics.isFontLoaded("GameFont")` is false, and on the CSS
+font-loading path RPG Maker waits for that with no timeout at all. Under
+Wine the engine's own trigger - a hidden element styled `font-size: 0px` -
+never causes Blink to load the face. Nothing reports an error because
+nothing has failed; the game simply waits forever.
+
+Asking Blink for the face directly is the whole repair:
+
+```
+BOXEDVN fontfix requested GameFont, Blink returned 1 face(s)
+BOXEDVN fontfix not needed; GameFont loaded on its own
+BOXEDVN boot 1 raf=30 ... gameFont=true scene=Scene_Map
+```
+
+`scene=Scene_Map` - past the boot gate, past the title, into the game. The
+ten-second override never fired.
+
+**What it cost, and why.** Nine device runs and four wrong theories: the GPU
+process, `.fon` bitmap fonts, font registration, the render lifecycle. Every
+one died to a measurement. The fault was named within a single run of the
+guest being able to report its own state - and the reason that took so long
+is that the first eight runs were spent on things that could be proposed
+without a build.
+
+**A new failure, much further along.** The session ends seconds after
+`Scene_Map`:
+
+```
+Received fatal exception EXCEPTION_INT_DIVIDE_BY_ZERO
+Received fatal exception EXCEPTION_INT_DIVIDE_BY_ZERO
+Guest fault snapshot: pid 8e thread a3 write protection fault at 7FFFFFC0;
+    EIP 106EF7C2 ntdll.dll.so+0004B7C2 ... bytes 89 08
+err:seh:NtRaiseException Unhandled exception code c0000005 addr 0x106ef7c2
+[32:556] WARNING:audio_sync_reader.cc(177) ASR: No room in socket buffer.: Pipe closed.
+```
+
+A renderer process took an x86 divide-by-zero; `ASR: Pipe closed` is the
+browser noticing afterwards, not a cause. The `mov [eax], ecx` at
+0x7FFFFFC0 is the crash handler faulting on the way down.
+
+Audio is the first thing to eliminate: `openAudio: freq=44100(got 48000)`
+means the guest asked for 44100 and the device gave 48000, a resample ratio
+sits between those two numbers, and `Scene_Map` is exactly where RPG Maker
+starts its background music. The sound toggle in launch settings tests that
+without a build.
+
+**Also in this build.** Installation of the injected scripts always rebuilds
+from the saved original: build 104 skipped its work when it recognised its
+own marker, so a device on 104 ran 103's probe and reported fields that had
+been replaced, wasting a run. And the orientation flash is fixed
+deterministically - the library window's contents stay hidden until the
+orientation matches the setting - after requesting the geometry earlier
+proved insufficient against UIKit's animated, asynchronous application of
+it.
+
+160 host-independent tests pass.
