@@ -68,13 +68,43 @@ typedef enum {
     BVNExecMemStrategyStikDebugDualMap = 7,
 } BVNExecMemStrategy;
 
-/// Runs the StikDebug/TXM handshake once and caches the result; later calls
-/// are free.
+/// Asks StikDebug to prepare the whole executable arena, and retains it for
+/// the life of the process. Executes nothing.
+///
+/// This is separate from BVNExecMemProbe because the two steps are urgent at
+/// different moments. Preparation has a deadline that has nothing to do with
+/// the user: it can only succeed while StikDebug is attached and running its
+/// universal script, and that session ends on its own. Doing it at guest
+/// launch meant a user who browsed their library for a few minutes first
+/// found JIT gone and had to restart the app through StikDebug and launch
+/// something immediately. Executing generated code, by contrast, has no
+/// deadline and carries a crash risk, so it stays at guest launch where the
+/// user has just asked for something that needs it.
+///
+/// Idempotent, and remembers only success: a refusal leaves the next caller
+/// free to ask again, which is what lets a user attach StikDebug after
+/// opening the app and still launch a game.
+///
+/// May block for as long as the debugger takes to service the request, and
+/// can be stopped indefinitely if a debugger is attached without a working
+/// script - call it off the main thread with a timeout.
+///
+/// Returns true when at least one segment is prepared.
+bool BVNExecMemPrepareArena(void);
+
+/// True once BVNExecMemPrepareArena has succeeded. Says nothing about
+/// whether code has been executed from the arena; see
+/// BVNExecMemExecutionConfirmed for that.
+bool BVNExecMemArenaPrepared(void);
+
+/// Confirms the arena by writing a small function into it and calling it,
+/// then caches the result; later calls are free. Prepares the arena first if
+/// BVNExecMemPrepareArena has not already succeeded.
 ///
 /// `allowExecute` controls the one step that cannot be made safe: actually
-/// calling into the newly prepared arena. Pass false from anywhere that must not
-/// issue StikDebug's breakpoint request (app launch, a status refresh); pass
-/// true only from the deliberate guest-launch path - see BVNRuntime.h.
+/// calling into the prepared arena. Pass false from anywhere that must not
+/// do that (a status refresh); pass true only from the deliberate
+/// guest-launch path - see BVNRuntime.h.
 ///
 /// Returns the strategy in use, or BVNExecMemStrategyNone.
 BVNExecMemStrategy BVNExecMemProbe(bool allowExecute);

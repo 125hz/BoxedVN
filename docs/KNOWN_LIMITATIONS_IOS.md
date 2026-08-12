@@ -98,6 +98,18 @@ relaunch remain untested. See
 
 ## 2. JIT is required and BoxedVN cannot enable it
 
+**Build 98 takes the executable arena at app startup rather than at guest
+launch.** StikDebug's script session ends on its own, and the arena request
+used to be the first thing a *launch* did - minutes later, after the user had
+browsed their library - by which time it often could not be serviced, and the
+only cure was to restart the app through StikDebug and launch a game
+immediately. Preparation is the half with the deadline and it executes
+nothing, so it is done at startup, off the main thread with the same six
+second timeout; the execution test, which is the half that can crash, stays
+at guest launch. A refusal is not remembered, so attaching StikDebug after
+opening the app and then launching still works. The session log says which
+happened under `jit:`.
+
 A sideloaded iOS app cannot prepare executable memory by itself. On iOS 26/27,
 `CS_DEBUGGED` is necessary but no longer sufficient: the target stops once at
 StikDebug's universal JIT breakpoint and StikDebug/debugserver prepares every

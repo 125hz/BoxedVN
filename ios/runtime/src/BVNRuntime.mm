@@ -42,6 +42,7 @@
 
 #include <SDL.h>
 
+#include "BVNExecMemory.h"
 #include "BVNLaunchArguments.h"
 #include "boxedvn/wine_prefix.h"
 #include "BVNRuntime.h"
@@ -290,6 +291,53 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
 // kernel already associated with that fault. One leaked thread is a small
 // price for the main thread never blocking indefinitely.
 constexpr int64_t kJitProbeTimeoutSeconds = 6;
+
+// Prepares the executable arena on a background thread and waits for it with
+// the same hard timeout, and for the same reason: this runs on the thread
+// servicing UIKit's run loop, and a debugger that stops the requesting thread
+// without resuming it would otherwise freeze the app before its UI appears.
+//
+// A failure or a timeout is deliberately not fatal and not surfaced as an
+// alert. Nothing has been asked for yet, BVNExecMemPrepareArena remembers
+// only success, and the guest-launch path will ask again - so a user who
+// opens BoxedVN before attaching StikDebug simply gets the old behaviour.
+void prepareJitArenaWithTimeout() {
+    if (gJitProbeInFlight.load()) {
+        return;
+    }
+    gJitProbeInFlight.store(true);
+
+    __block bool prepared = false;
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+    dispatch_async(
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            prepared = BVNExecMemPrepareArena();
+            gJitProbeInFlight.store(false);
+            dispatch_semaphore_signal(finished);
+        });
+
+    const long timedOut = dispatch_semaphore_wait(
+        finished,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      kJitProbeTimeoutSeconds * NSEC_PER_SEC));
+    if (timedOut != 0) {
+        BVNLogWrite(BVNLogLevelWarning, "jit",
+                    "StikDebug did not answer the startup request for "
+                    "executable memory within the timeout. Leaving it to the "
+                    "guest-launch path to ask again rather than blocking the "
+                    "app before its UI appears.");
+        return;
+    }
+    BVNLogWrite(prepared ? BVNLogLevelInfo : BVNLogLevelWarning, "jit",
+                prepared
+                    ? "Executable memory was obtained at startup, so JIT no "
+                      "longer depends on StikDebug still being attached when "
+                      "a game is launched."
+                    : "Executable memory could not be obtained at startup. "
+                      "If StikDebug is attached later, launching a game will "
+                      "ask again.");
+    BVNLogWrite(BVNLogLevelInfo, "jit", BVNExecMemReport());
+}
 
 BVNJITReport probeJitWithTimeout() {
     if (gJitProbeInFlight.load()) {
@@ -720,6 +768,24 @@ extern "C" int BVNGuestMain(int argc, char* argv[]) {
                     ? BVNLogLevelInfo
                     : BVNLogLevelWarning,
                 "jit", startupJIT.detail);
+
+    // Take the arena now, while StikDebug is still there.
+    //
+    // StikDebug's script session ends on its own, and it used to be the guest
+    // launch - minutes later, after the user had browsed their library -
+    // that first asked for executable memory. By then the request often could
+    // not be serviced, so the game would not start and the only cure was to
+    // restart the app through StikDebug and launch something immediately.
+    // Preparation is the half with the deadline; it executes nothing, so it
+    // adds no crash path to app startup. The execution test stays at guest
+    // launch, unchanged.
+    //
+    // Only when the process is actually flagged CS_DEBUGGED: without that
+    // there is no debugger to answer, and issuing the breakpoint anyway would
+    // turn "JIT is unavailable" into a SIGTRAP during startup.
+    if (startupJIT.status == BVNJITStatusLikelyAvailable) {
+        prepareJitArenaWithTimeout();
+    }
 
     setState(BVNRuntimeStateIdle);
 

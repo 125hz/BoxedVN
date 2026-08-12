@@ -4416,3 +4416,52 @@ zero failures, built and run with MSVC on Windows via the `tests-only`
 preset. The switch-set test now checks the set by content rather than by
 index, and asserts there is never more than one `--disable-features=`,
 because Chromium resolves a repeat to the last one seen.
+
+---
+
+### Build 98 — take the JIT arena while StikDebug is still there
+
+A user report, and a real design defect rather than a subtlety: sit on the
+library for a few minutes and games stop launching, until the app is
+restarted through StikDebug and something is launched immediately.
+
+The cause is when BoxedVN asks. `BVNExecMemProbe` did everything in one
+call - plan the arena, ask StikDebug to prepare 512 MiB in eight segments,
+write a three-instruction function into the first one, call it - and that
+call was deliberately deferred to guest launch, because the execution step
+can take the process down with no recovery and running it on every cold
+start is exactly what made every cold launch crash once before.
+
+But the two halves have different deadlines. Preparation can only succeed
+while StikDebug is attached and running its universal script, and that
+session ends on its own schedule, not the user's. Execution has no deadline
+at all: it just needs to happen before the guest runs.
+
+So they are split. `BVNExecMemPrepareArena` obtains and retains all the
+segments and executes nothing; `BVNGuestMain` calls it during startup, on a
+background thread with the existing six-second timeout, and only when the
+process is actually flagged `CS_DEBUGGED` - without a debugger there is
+nobody to answer and the breakpoint would just be a SIGTRAP.
+`BVNExecMemProbe` keeps the execution test, and prepares the arena itself
+if startup did not, so a user who attaches StikDebug after opening the app
+still launches normally.
+
+Preparation remembers only success. A refusal must not be sticky, or
+attaching StikDebug second would be unrecoverable without a restart - which
+is the very failure this is meant to remove.
+
+No new crash path: the startup half never executes anything, and the risky
+call site is unchanged.
+
+**Not device-tested.** The falsifier is direct: launch BoxedVN through
+StikDebug, leave it on the library for ten minutes, then start a game. The
+log should show the arena obtained at 00:00 and no StikDebug request at all
+at launch time.
+
+Also in this build: opening a game re-scanned its whole content directory
+and PE-inspected every executable before Launch would enable, which for a
+game shipping tens of thousands of asset files greyed the button out for
+seconds every single time. The scan is what lets a user *change* the
+program; the manifest already recorded that the selected one is runnable,
+and that is what Launch uses. Launch now waits for the scan only when the
+selection is something the scan has not judged yet.

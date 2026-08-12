@@ -60,6 +60,13 @@ struct ArenaSegment {
 std::mutex gArenaMutex;
 std::vector<ArenaSegment> gSegments;
 size_t gAllocationCount = 0;
+// Segments have been obtained from StikDebug. Set only on success, so a
+// refusal never stops a later attempt from asking again.
+bool gPrepared = false;
+// The execution test has run. Separate from gPrepared because the two happen
+// at different moments for different reasons: preparation must occur while
+// StikDebug is still attached, and executing generated code must occur only
+// when the user has asked for something that needs it.
 bool gProbed = false;
 bool gExecutionConfirmed = false;
 char gReport[1600] = "not probed yet";
@@ -384,13 +391,11 @@ extern "C" bool BVNExecMemExecutionConfirmed(void) {
 
 extern "C" bool BVNExecMemNeedsWriteFlip(void) { return false; }
 
-extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
-    if (gProbed) {
-        return gExecutionConfirmed ? BVNExecMemStrategyStikDebugDualMap
-                                   : BVNExecMemStrategyNone;
-    }
-    if (!allowExecute) {
-        return BVNExecMemStrategyNone;
+extern "C" bool BVNExecMemArenaPrepared(void) { return gPrepared; }
+
+extern "C" bool BVNExecMemPrepareArena(void) {
+    if (gPrepared) {
+        return true;
     }
 
     gReport[0] = '\0';
@@ -414,8 +419,11 @@ extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
         allocatePrepared(plan.segmentBytes, error, sizeof(error));
     if (!mapping.executable) {
         reportLine(error);
-        gProbed = true;
-        return BVNExecMemStrategyNone;
+        // Deliberately NOT sticky. A user who opens BoxedVN before attaching
+        // StikDebug must be able to attach it and launch, so a refusal here
+        // has to leave the next caller free to ask again. Only success is
+        // remembered.
+        return false;
     }
 
     char rxProtection[9];
@@ -428,34 +436,11 @@ extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
              plan.segmentBytes / kMiB, rxProtection, rwProtection);
     reportLine(line);
 
-    memcpy(mapping.writable, kProbeCode, sizeof(kProbeCode));
-    sys_icache_invalidate(mapping.executable, sizeof(kProbeCode));
-    reportLine("About to execute through the r-x mapping after writing only "
-               "through its r-w alias.");
-
-#if defined(__aarch64__)
-    using ProbeFunction = uint32_t (*)(void);
-    const uint32_t value =
-        reinterpret_cast<ProbeFunction>(mapping.executable)();
-#else
-    const uint32_t value = 0;
-#endif
-    gProbed = true;
-
-    if (value != kProbeExpectedValue) {
-        snprintf(line, sizeof(line),
-                 "Probe returned 0x%08X instead of 0x%08X.", value,
-                 kProbeExpectedValue);
-        reportLine(line);
-        releaseMapping(mapping);
-        return BVNExecMemStrategyNone;
-    }
-
-    // The remaining segments are prepared here, still inside the one
-    // deliberate handshake, because there is no later moment when asking is
-    // safe. A refusal part way through is not fatal: the segments already
-    // prepared are a working arena, and saying so beats losing the JIT over
-    // capacity the guest may never have needed.
+    // The remaining segments are prepared here, inside the one deliberate
+    // handshake, because there is no later moment when asking is safe. A
+    // refusal part way through is not fatal: the segments already prepared
+    // are a working arena, and saying so beats losing the JIT over capacity
+    // the guest may never have needed.
     {
         std::lock_guard<std::mutex> lock(gArenaMutex);
         gSegments.clear();
@@ -485,9 +470,93 @@ extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
         gAllocationCount = 0;
 
         snprintf(line, sizeof(line),
+                 "%zu MiB in %zu segment(s) is retained for Wine and no "
+                 "further StikDebug stops are required. Execution through it "
+                 "is confirmed separately, when a guest is about to start.",
+                 arenaCapacity() / kMiB, gSegments.size());
+    }
+    gPrepared = true;
+    reportLine(line);
+    return true;
+}
+
+extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
+    if (gProbed) {
+        return gExecutionConfirmed ? BVNExecMemStrategyStikDebugDualMap
+                                   : BVNExecMemStrategyNone;
+    }
+    if (!allowExecute) {
+        return BVNExecMemStrategyNone;
+    }
+
+    // Ordinarily the arena is already here: BVNGuestMain prepares it during
+    // app startup, while StikDebug is still attached. This call covers the
+    // case where that did not happen or was refused - StikDebug attached
+    // after the app opened, most obviously - and keeps this function's old
+    // behaviour for any caller that never pre-prepared.
+    if (!gPrepared && !BVNExecMemPrepareArena()) {
+        gProbed = true;
+        return BVNExecMemStrategyNone;
+    }
+
+    constexpr size_t kMiB = 1024u * 1024u;
+    char line[256];
+    DualMapping first;
+    {
+        std::lock_guard<std::mutex> lock(gArenaMutex);
+        if (gSegments.empty() || !gSegments.front().mapping.executable) {
+            gProbed = true;
+            reportLine("The arena reports itself prepared but holds no "
+                       "segment, so there is nothing to execute from.");
+            return BVNExecMemStrategyNone;
+        }
+        first = gSegments.front().mapping;
+    }
+
+    // Write at offset 0 of the first segment and execute there. Nothing has
+    // been handed out yet - BVNExecMemAlloc refuses until gExecutionConfirmed
+    // - so this cannot land on live guest code, and the allocators are reset
+    // below so the probe's three instructions are simply overwritten by the
+    // first real translation.
+    memcpy(first.writable, kProbeCode, sizeof(kProbeCode));
+    sys_icache_invalidate(first.executable, sizeof(kProbeCode));
+    reportLine("About to execute through the r-x mapping after writing only "
+               "through its r-w alias.");
+
+#if defined(__aarch64__)
+    using ProbeFunction = uint32_t (*)(void);
+    const uint32_t value =
+        reinterpret_cast<ProbeFunction>(first.executable)();
+#else
+    const uint32_t value = 0;
+#endif
+    gProbed = true;
+
+    if (value != kProbeExpectedValue) {
+        snprintf(line, sizeof(line),
+                 "Probe returned 0x%08X instead of 0x%08X.", value,
+                 kProbeExpectedValue);
+        reportLine(line);
+        {
+            std::lock_guard<std::mutex> lock(gArenaMutex);
+            for (ArenaSegment& segment : gSegments) {
+                releaseMapping(segment.mapping);
+            }
+            gSegments.clear();
+        }
+        gPrepared = false;
+        return BVNExecMemStrategyNone;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(gArenaMutex);
+        for (ArenaSegment& segment : gSegments) {
+            segment.allocator.reset(segment.mapping.length);
+        }
+        gAllocationCount = 0;
+        snprintf(line, sizeof(line),
                  "Probe executed successfully. %zu MiB in %zu segment(s) is "
-                 "retained for Wine and no further StikDebug stops are "
-                 "required.",
+                 "retained for Wine.",
                  arenaCapacity() / kMiB, gSegments.size());
     }
     gExecutionConfirmed = true;
