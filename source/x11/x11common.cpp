@@ -1564,7 +1564,7 @@ static void x11_ListPixelFormats(CPU* cpu) {
         Depth depth;
         depth.read(memory, depthAddress);
         U32 bits_per_rgb = X11_READD(Visual, depth.visuals, bits_per_rgb);
-        visualFormats.push_back({depth.depth, bits_per_rgb, 32});
+        visualFormats.push_back({(U32)depth.depth, bits_per_rgb, 32u});
     }
 
     const std::vector<XPixmapFormatEntry> formats =
