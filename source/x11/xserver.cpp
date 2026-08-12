@@ -422,18 +422,26 @@ XWindowPtr XServer::getWindow(U32 window) {
 }
 
 int XServer::destroyWindow(U32 window) {
-	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(windowsMutex);
-	XWindowPtr w = windows.get(window);
-	if (!w) {
-		return BadWindow;
+	bool destroyedFakeFullScreenWindow = false;
+	{
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(windowsMutex);
+		XWindowPtr w = windows.get(window);
+		if (!w) {
+			return BadWindow;
+		}
+		w->onDestroy();
+		windows.remove(window);
+		if (w->id == grabbedId) {
+			ungrabPointer(0);
+		}
+		if (fakeFullScreenWnd && fakeFullScreenWnd->id == window) {
+			fakeFullScreenWnd = nullptr;
+			destroyedFakeFullScreenWindow = true;
+		}
 	}
-	w->onDestroy();
-	windows.remove(window);
-	if (w->id == grabbedId) {
-		ungrabPointer(0);
-	}
-	if (fakeFullScreenWnd && fakeFullScreenWnd->id == window) {
-		fakeFullScreenWnd = nullptr;
+	if (destroyedFakeFullScreenWindow) {
+		// Root restoration can resize native state; keep it outside windowsMutex.
+		setFakeFullScreenWindow(nullptr);
 	}
 	return Success;
 }
@@ -711,6 +719,62 @@ void XServer::changeScreen(U32 width, U32 height) {
 	U32 rect[] = { 0, 0, width, height };
 	U32 atom = server->internAtom(B("_GTK_WORKAREAS_D0"), false);
 	root->setProperty(atom, XA_CARDINAL, 32, sizeof(U32) * 4, (U8*)&rect, false);
+}
+
+void XServer::setFakeFullScreenWindow(XWindowPtr wnd) {
+#ifdef BOXEDWINE_IOS
+	if (wnd && root) {
+		if (!savedRootSizeForFakeFullScreen) {
+			rootWidthBeforeFakeFullScreen = root->width();
+			rootHeightBeforeFakeFullScreen = root->height();
+			savedRootSizeForFakeFullScreen = true;
+		}
+
+		// iOS presents the Vulkan client as the whole native screen even while
+		// Wine keeps its decorated X11 window at a non-zero root position. The
+		// SDL/input surface was resized to the client, but the X11 root was not.
+		// Wine therefore scaled root-space pointer coordinates through the old
+		// desktop size and a game scaled them again to its backbuffer. Expand the
+		// virtual root far enough to contain the presented client. Do not call
+		// changeScreen(): that would resize SDL a second time and create another
+		// independent presentation transform.
+		S32 clientX = 0;
+		S32 clientY = 0;
+		wnd->windowToScreen(clientX, clientY);
+		const U32 requiredWidth = (U32)std::max<S32>(
+			(S32)wnd->width(), clientX + (S32)wnd->width());
+		const U32 requiredHeight = (U32)std::max<S32>(
+			(S32)wnd->height(), clientY + (S32)wnd->height());
+		const U32 rootWidth = std::max(root->width(), requiredWidth);
+		const U32 rootHeight = std::max(root->height(), requiredHeight);
+		if (rootWidth != root->width() || rootHeight != root->height()) {
+			root->moveResize(0, 0, rootWidth, rootHeight);
+			U32 rect[] = {0, 0, rootWidth, rootHeight};
+			U32 atom = internAtom(B("_GTK_WORKAREAS_D0"), false);
+			root->setProperty(atom, XA_CARDINAL, 32, sizeof(rect),
+				(U8*)&rect, false);
+		}
+		klog_fmt("iOS fake-fullscreen X11 root synchronized: client 0x%x "
+			"%ux%u at %d,%d, root %ux%u (saved %ux%u)",
+			wnd->id, wnd->width(), wnd->height(), clientX, clientY,
+			root->width(), root->height(), rootWidthBeforeFakeFullScreen,
+			rootHeightBeforeFakeFullScreen);
+	} else if (!wnd && root && savedRootSizeForFakeFullScreen) {
+		root->moveResize(0, 0, rootWidthBeforeFakeFullScreen,
+			rootHeightBeforeFakeFullScreen);
+		U32 rect[] = {0, 0, rootWidthBeforeFakeFullScreen,
+			rootHeightBeforeFakeFullScreen};
+		U32 atom = internAtom(B("_GTK_WORKAREAS_D0"), false);
+		root->setProperty(atom, XA_CARDINAL, 32, sizeof(rect),
+			(U8*)&rect, false);
+		klog_fmt("iOS fake-fullscreen X11 root restored to %ux%u",
+			rootWidthBeforeFakeFullScreen, rootHeightBeforeFakeFullScreen);
+		rootWidthBeforeFakeFullScreen = 0;
+		rootHeightBeforeFakeFullScreen = 0;
+		savedRootSizeForFakeFullScreen = false;
+	}
+#endif
+	fakeFullScreenWnd = wnd;
 }
 
 void XServer::processExit(U32 pid) {
@@ -1034,10 +1098,11 @@ void XServer::mouseButton(U32 button, S32 x, S32 y, bool pressed) {
 	if (fakeFullScreenWnd && fakeFullScreenButtonLogCount < 32) {
 		++fakeFullScreenButtonLogCount;
 		klog_fmt("iOS fake-fullscreen button %s #%u: guest %d,%d -> root "
-			"%d,%d, direct target 0x%x (%ux%u)",
+			"%d,%d, direct target 0x%x (%ux%u), X11 root %ux%u",
 			pressed ? "down" : "up", fakeFullScreenButtonLogCount,
 			guestX, guestY, x, y, fakeFullScreenWnd->id,
-			fakeFullScreenWnd->width(), fakeFullScreenWnd->height());
+			fakeFullScreenWnd->width(), fakeFullScreenWnd->height(),
+			root ? root->width() : 0, root ? root->height() : 0);
 	}
 #endif
 	if (isGrabbed) {

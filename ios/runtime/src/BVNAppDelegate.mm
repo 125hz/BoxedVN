@@ -856,8 +856,6 @@ static NSMutableData* gGuestX11PatchPixels = nil;
 static uint32_t gGuestX11PatchWidth = 0;
 static uint32_t gGuestX11PatchHeight = 0;
 static uint32_t gGuestX11ActiveWindow = 0;
-static uint32_t gGuestX11LogicalWidth = 0;
-static uint32_t gGuestX11LogicalHeight = 0;
 static std::atomic<bool> gGuestX11PatchVisible{false};
 
 static void BVNRemoveGuestX11PatchView(void) {
@@ -867,8 +865,6 @@ static void BVNRemoveGuestX11PatchView(void) {
     gGuestX11PatchWidth = 0;
     gGuestX11PatchHeight = 0;
     gGuestX11ActiveWindow = 0;
-    gGuestX11LogicalWidth = 0;
-    gGuestX11LogicalHeight = 0;
     gGuestX11PatchVisible.store(false, std::memory_order_release);
 }
 
@@ -942,8 +938,6 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         gGuestX11ActiveWindow != activeWindowId;
     if (activeWindowChanged) {
         gGuestX11ActiveWindow = activeWindowId;
-        gGuestX11LogicalWidth = activeWidth;
-        gGuestX11LogicalHeight = activeHeight;
         memset(gGuestX11PatchPixels.mutableBytes, 0,
                gGuestX11PatchPixels.length);
     }
@@ -980,38 +974,42 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         return;
     }
 
-    // Some WineD3D paths copy a complete logical framebuffer into a wider
-    // Vulkan client (the captured case is 960x720 -> 1280x720). Remember that
-    // mapping and apply it to later text-only dirty rectangles. This keeps the
-    // X11 text cadence without mixing an unscaled left slice with the Vulkan
-    // frame or copying unrelated pixels to the right.
-    const bool completeLogicalFrame =
-        clientLeft == 0 && clientTop == 0 &&
+    // Dirty bounds describe a rectangle within the active client; they are
+    // not a second framebuffer size. Build 80 treated a 960x720 dirty region
+    // as a complete logical image and stretched it to 1280x720, visibly
+    // enlarging the title screen and cutting off its right side. Map only from
+    // the active client's live size to the presentation size. Usually that is
+    // the required 1:1 transform.
+    const bool truncatedFullHeightUpdate =
+        windowIsActiveAncestor && clientLeft == 0 && clientTop == 0 &&
         clientBottom == (int32_t)activeHeight &&
-        clientRight >= (int32_t)activeWidth / 2;
-    if (completeLogicalFrame) {
-        gGuestX11LogicalWidth = (uint32_t)clientRight;
-        gGuestX11LogicalHeight = (uint32_t)clientBottom;
-        memset(gGuestX11PatchPixels.mutableBytes, 0,
-               gGuestX11PatchPixels.length);
-    }
-    const uint32_t logicalWidth = MAX(1u, gGuestX11LogicalWidth);
-    const uint32_t logicalHeight = MAX(1u, gGuestX11LogicalHeight);
-    const int32_t logicalLeft = MAX(0, clientLeft);
-    const int32_t logicalTop = MAX(0, clientTop);
-    const int32_t logicalRight = MIN((int32_t)logicalWidth, clientRight);
-    const int32_t logicalBottom = MIN((int32_t)logicalHeight, clientBottom);
-    if (logicalRight <= logicalLeft || logicalBottom <= logicalTop) {
+        clientRight < (int32_t)activeWidth;
+    if (truncatedFullHeightUpdate) {
+        static uint64_t skippedTruncatedCount = 0;
+        ++skippedTruncatedCount;
+        if (skippedTruncatedCount <= 12 ||
+            skippedTruncatedCount % 120 == 0) {
+            NSString* message = [NSString stringWithFormat:
+                @"Skipped incoherent X11 ancestor present #%llu: window "
+                 "0x%x dirty client %d,%d %dx%d, active 0x%x %dx%d. The "
+                 "dirty rectangle is not a framebuffer size and will not "
+                 "be stretched over Vulkan.",
+                (unsigned long long)skippedTruncatedCount, windowId,
+                clientLeft, clientTop, clientRight - clientLeft,
+                clientBottom - clientTop, activeWindowId, (int)activeWidth,
+                (int)activeHeight];
+            BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
+        }
         return;
     }
-    const int32_t clippedLeft = (int32_t)((int64_t)logicalLeft * guestWidth /
-                                           logicalWidth);
-    const int32_t clippedTop = (int32_t)((int64_t)logicalTop * guestHeight /
-                                          logicalHeight);
-    const int32_t clippedRight = (int32_t)(((int64_t)logicalRight * guestWidth +
-                                             logicalWidth - 1) / logicalWidth);
-    const int32_t clippedBottom = (int32_t)(((int64_t)logicalBottom * guestHeight +
-                                              logicalHeight - 1) / logicalHeight);
+    const int32_t clippedLeft = (int32_t)((int64_t)clientLeft * guestWidth /
+                                           activeWidth);
+    const int32_t clippedTop = (int32_t)((int64_t)clientTop * guestHeight /
+                                          activeHeight);
+    const int32_t clippedRight = (int32_t)(((int64_t)clientRight * guestWidth +
+                                             activeWidth - 1) / activeWidth);
+    const int32_t clippedBottom = (int32_t)(((int64_t)clientBottom * guestHeight +
+                                              activeHeight - 1) / activeHeight);
 
     uint32_t* destination =
         reinterpret_cast<uint32_t*>(gGuestX11PatchPixels.mutableBytes);
@@ -1019,21 +1017,21 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
     const int32_t clientOffsetY = activeScreenY - screenY;
     for (int32_t destinationY = clippedTop;
          destinationY < clippedBottom; ++destinationY) {
-        const int32_t logicalY = MIN(logicalBottom - 1,
-            (int32_t)((int64_t)destinationY * logicalHeight / guestHeight));
+        const int32_t clientY = MIN(clientBottom - 1,
+            (int32_t)((int64_t)destinationY * activeHeight / guestHeight));
         const uint32_t* sourceRow = reinterpret_cast<const uint32_t*>(
-            pixels + (clientOffsetY + logicalY) * pitch);
+            pixels + (clientOffsetY + clientY) * pitch);
         uint32_t* destinationRow = destination +
             destinationY * guestWidth;
         for (int32_t destinationX = clippedLeft;
              destinationX < clippedRight; ++destinationX) {
-            const int32_t logicalX = MIN(logicalRight - 1,
-                (int32_t)((int64_t)destinationX * logicalWidth / guestWidth));
+            const int32_t clientX = MIN(clientRight - 1,
+                (int32_t)((int64_t)destinationX * activeWidth / guestWidth));
             // Boxedwine's X11 visual is BGRX in little-endian memory. Core
             // Graphics consumes BGRA here, so make only the updated rectangle
             // opaque and leave the rest transparent over the Vulkan frame.
             destinationRow[destinationX] =
-                sourceRow[clientOffsetX + logicalX] | 0xff000000u;
+                sourceRow[clientOffsetX + clientX] | 0xff000000u;
         }
     }
 
@@ -1070,15 +1068,14 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
     ++patchCount;
     if (patchCount <= 12 || patchCount % 120 == 0) {
         NSString* message = [NSString stringWithFormat:
-            @"Composited X11 %@ present #%llu: window 0x%x %dx%d at %d,%d, "
-             "active 0x%x %dx%d at %d,%d, dirty %d,%d %dx%d, logical "
-             "%dx%d, published %d,%d %dx%d over guest %dx%d.",
-            completeLogicalFrame ? @"logical-frame" : @"partial",
+            @"Composited X11 client present #%llu: window 0x%x %dx%d at %d,%d, "
+             "active 0x%x %dx%d at %d,%d, dirty %d,%d %dx%d, "
+             "mapping %dx%d, published %d,%d %dx%d over guest %dx%d.",
             (unsigned long long)patchCount, windowId, (int)windowWidth,
             (int)windowHeight, screenX, screenY, activeWindowId,
             (int)activeWidth, (int)activeHeight, activeScreenX, activeScreenY,
             dirtyX, dirtyY, (int)dirtyWidth, (int)dirtyHeight,
-            (int)logicalWidth, (int)logicalHeight, clippedLeft, clippedTop,
+            (int)activeWidth, (int)activeHeight, clippedLeft, clippedTop,
             clippedRight - clippedLeft, clippedBottom - clippedTop,
             (int)guestWidth, (int)guestHeight];
         BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);

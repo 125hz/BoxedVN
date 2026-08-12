@@ -44,7 +44,7 @@ public:
 
 	XWindowPtr createNewWindow(U32 displayId, const XWindowPtr& parent, U32 width, U32 height, U32 depth, U32 x, U32 y, U32 c_class, U32 border_width, const VisualPtr& visual);
 	XWindowPtr getWindow(U32 window);
-	void setFakeFullScreenWindow(XWindowPtr wnd) {fakeFullScreenWnd = wnd;}
+	void setFakeFullScreenWindow(XWindowPtr wnd);
 	int destroyWindow(U32 window);
 
 	XPixmapPtr createNewPixmap(U32 width, U32 height, U32 depth, const VisualPtr& visual);
@@ -97,6 +97,11 @@ public:
 	// so if that opengl/vulkan window is not full screen, then it will have a non zero x,y coord which will throw off the mouse
 	// to get around this, we track the current non full screen opengl/vulkan window and adjust the mouse pos using its x,y pos.
 	XWindowPtr fakeFullScreenWnd; 
+#ifdef BOXEDWINE_IOS
+	U32 rootWidthBeforeFakeFullScreen = 0;
+	U32 rootHeightBeforeFakeFullScreen = 0;
+	bool savedRootSizeForFakeFullScreen = false;
+#endif
 	U32 inputFocusRevertTo = 0;
 	XWindowPtr selectionWindow;
 	U32 selectionOwner = 0;

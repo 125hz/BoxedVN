@@ -6,20 +6,17 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-11 (build 80 prepared from the two build-79 device
-logs. They show that build 79's full-backing promotion copied Grisaia's
-decorated 1286x752 Wine parent over its 1280x720 Vulkan client, exposing the
-29-pixel title bar and unused black backing area. Build 80 accepts only X11
-updates related to the active client, rejects ancestor invalidations that
-escape the client rectangle, and scales a complete 960x720 logical COPY frame
-to the 1280x720 presentation before applying later text updates. Fake-
-fullscreen input now dispatches directly to the active client instead of
-re-hit-testing against the stale 800x600 X11 root; the portrait log proves
-UIKit continued receiving touches after rotation. Pointer settings now include
-a persistent 0.5x-3.0x trackpad sensitivity slider. GitHub Actions run
-31549007709 passed all 92 tests, the iPhoneOS compile, validation, entitlement
-packaging, smoke test, and rolling Release upload. Fresh-device validation
-remains pending. Song of Saya remains
+**Last updated:** 2026-08-11 (build 81 prepared from the two build-80 Grisaia
+logs and screenshots. Build 80 incorrectly interpreted a 960x720 dirty
+rectangle inside the 1280x720 active client as a second framebuffer size and
+stretched it across the whole presentation. That exactly produced the enlarged
+title screen and cut-off right side. Build 81 never derives presentation scale
+from dirty bounds and rejects a truncated full-height ancestor update instead
+of stretching it. It also keeps Wine's X11 root large enough to contain the
+fake-fullscreen Vulkan client. This removes the stale 960/1280 root ratio that
+matches the cursor-over-QL while 05-highlights device evidence. The Windows
+support suite remains 92/92; iPhoneOS compilation and fresh-device validation
+are pending. Song of Saya remains
 device-proven playable with the
 interpreter workaround.
 The newest
@@ -3542,3 +3539,39 @@ The Release targets `cbdce90013a6cb01bb3cc6c6b404c0d7095e9fad` and the
 asset lists `Payload/BoxedVN.app`, including `_CodeSignature/CodeResources` for
 the ad-hoc entitlement template. Physical rendering and input acceptance
 remain pending build 80.
+
+### 2026-08-11 - build 81: one client coordinate space for rendering and input
+
+The build-80 reports are `boxedvn-20260811-191321.log` and
+`boxedvn-20260811-191651.log`. Both independently register Grisaia's final
+Vulkan presentation client as 1280x720 at X11 root position `(3,29)`, and both
+show a decorated 1286x752 ancestor repeatedly presenting only the client
+rectangle `(3,29) 960x720`. Build 80 labelled those dirty bounds a 960x720
+"logical frame" and published them as 1280x720. That 4:3 horizontal expansion
+is the direct source of the enlarged title screen and the missing right edge.
+A dirty rectangle says which pixels changed; it cannot establish a second
+framebuffer resolution.
+
+The compositor no longer stores or applies a dirty-derived logical size. It
+maps every legitimate update through the active client's live 1280x720 extent.
+The specific incoherent ancestor case - a `(0,0)` client-relative update that
+covers the full height but stops before the active right edge - is rejected
+instead of stretched or left as a vertical seam over the Vulkan image. Bounded
+diagnostics report those rejections so the next device log can prove whether
+Wine produces a corrected full-width update afterward.
+
+The pointer symptom has the same stale-width signature: in the screenshot the
+native cursor is over QL near guest x=1090 while the game highlights 05 near
+x=817, approximately `1090 * 960 / 1280`. `createVulkanSurface` resized SDL and
+`KNativeInputSDL` to the active client but did not resize Boxedwine's X11 root.
+Direct delivery therefore still gave Wine root coordinates whose declared
+desktop size could be the preceding 960-wide mode. Build 81 synchronizes the
+virtual X11 root to contain the fake-fullscreen client without resizing SDL a
+second time. The original root size is restored when that client is destroyed.
+Button diagnostics now include the X11 root extent, making this invariant
+observable in the next log.
+
+**Local evidence:** `git diff --check` passes. The Windows host-independent
+executable runs all 92 tests with zero failures, and CTest passes 1/1. The
+iPhoneOS compile, IPA publication, and physical rendering/input acceptance are
+pending build 81.
