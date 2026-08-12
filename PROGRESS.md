@@ -4203,3 +4203,63 @@ device.
 capture the log. If ANGLE reaches DXGI, the swapchain call and its failure
 will be named; if it does not, the absence is itself the answer and the
 remaining suspect is ANGLE's own window handling.
+
+### 2026-08-12 - build 94: the environment field reached the wrong box
+
+`81d5c22e-boxedvn20260812022149.log` is build 93. Two things in it.
+
+**The XGetVisualInfo fix is doing more than stopping a crash.** A Chromium
+dialog now renders - "Profile error occurred", with text, a checkbox and a
+button, drawn by Chromium's software compositor. Nothing rendered at all
+before build 92. The winex11 fault stays gone.
+
+**The diagnostic run did not happen.** The launch line ends:
+
+```
+... -env WINEDEBUG=warn+d3d_shader,-d3d /bin/wine d:\Game.exe WINEDEBUG=err+all,warn+dxgi,warn+d3d11,fixme-all
+```
+
+The value is after `d:\Game.exe`, so it went in as a program argument, and
+BoxedVN's own `-env WINEDEBUG=` default is still present - which only happens
+when no caller WINEDEBUG was set. It was typed into Arguments rather than
+Environment. The plumbing itself is correct end to end and was re-checked:
+`Session.launch` forwards `environment` into `BVNLaunchRequest`, `BVNRuntime`
+copies it into the launch, and `BVNBuildLaunchArguments` skips its default
+when the caller sets one.
+
+That is a footgun build 93 introduced by putting a second multi-line field
+next to the first. The Arguments field now says so: a line shaped like
+`NAME=VALUE`, with no leading dash or slash and a plausible variable name, is
+flagged in place as an environment variable that would have no effect where
+it is. It is a warning, not a silent correction - `NAME=VALUE` can be a
+legitimate argument and the user keeps the choice.
+
+**A new lead, present in every log so far.** Chromium's SQLite databases are
+in a bad state:
+
+```
+History sqlite error 1: no such table: main.visits, sql: CREATE INDEX IF NOT EXISTS visits_url_index ON visits (url)
+Web sqlite error 11: malformed database schema (meta) - table meta already exists, sql: CREATE TABLE IF NOT EXISTS web_app_manifest_section (...)
+PreviewsOptOut sqlite error 11: malformed database schema (previews_v1) - table previews_v1 already exists, sql: CREATE TABLE IF NOT EXISTS enabled_previews_v1 (...)
+```
+
+Error 1 on a missing table can be normal on a new profile; error 11 is
+SQLITE_CORRUPT and is not. "Table X already exists" while creating a
+different table is what SQLite reports when it re-parses a schema that
+disagrees with its cache, and creating an index on a table it cannot see is
+the same disagreement from the other side. That is what produces the profile
+dialog, and a browser engine whose profile did not open is a candidate for an
+app window that never paints.
+
+Not yet chased, deliberately. `fcntl` byte-range locking is implemented
+(`KProcess::fcntl` -> `setLock`/`getLock`), and the shared-file-mapping path
+has a mutation-to-cache notification gate and its own tests, so neither is an
+obvious hole; picking through the filesystem layer on this much evidence
+would be guessing. The cheap discriminator first: delete the game's Wine
+prefix so the profile is created from nothing. If a fresh profile still
+reports SQLITE_CORRUPT, it is a live emulator defect and worth the dig. If it
+comes up clean, the corruption is leftover state from processes killed at
+quit and the question becomes what is not being flushed.
+
+**Build evidence:** the host-independent suite still runs 125 tests with zero
+failures. The changed view compiles only in the iPhoneOS job.

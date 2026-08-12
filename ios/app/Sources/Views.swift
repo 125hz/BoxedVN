@@ -427,6 +427,14 @@ struct GameDetailView: View {
                 TextField("Arguments (one per line)", text: $argumentsText,
                           axis: .vertical)
                     .lineLimit(1...4)
+                if !misplacedEnvironmentLines.isEmpty {
+                    Text("\(misplacedEnvironmentLines.joined(separator: ", ")) "
+                         + "looks like an environment variable. Arguments are "
+                         + "passed to the program, so this would have no "
+                         + "effect. Move it to Environment below.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 TextField("Working directory (inside the game)",
                           text: $workingDirectory)
                 TextField("Environment (NAME=VALUE, one per line)",
@@ -508,6 +516,29 @@ struct GameDetailView: View {
     }
 
     @discardableResult
+    /// Argument lines that are really environment assignments. A Windows
+    /// program argument does not look like `NAME=VALUE` with no leading dash
+    /// or slash, and an entry typed here instead of in Environment reaches the
+    /// game as a command-line word it ignores - silently, which is how a
+    /// diagnostic run gets thrown away.
+    private var misplacedEnvironmentLines: [String] {
+        argumentsText
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in
+                guard let equals = line.firstIndex(of: "="),
+                      equals != line.startIndex,
+                      !line.hasPrefix("-"), !line.hasPrefix("/") else {
+                    return false
+                }
+                let name = line[line.startIndex..<equals]
+                return name.allSatisfy {
+                    $0.isLetter || $0.isNumber || $0 == "_"
+                } && (name.first?.isNumber == false)
+            }
+            .map { String($0.prefix(while: { $0 != "=" })) }
+    }
+
     private func save() -> Bool {
         let arguments = argumentsText
             .split(separator: "\n", omittingEmptySubsequences: true)
