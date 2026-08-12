@@ -3792,8 +3792,14 @@ Build 86's first iPhoneOS compile stopped on the single invalid usage constant
 flag, so build 87 uses the documented `MTLTextureUsageUnknown` inference mode.
 No build-86 IPA was published.
 
-**Pre-CI evidence:** `git diff --check` passes. In the Visual Studio developer
+**Build evidence:** `git diff --check` passes. In the Visual Studio developer
 environment the host-independent executable runs all 93 tests with zero
-failures and CTest passes 1/1. The iPhoneOS compile, package validation, and
-long-session physical Grisaia/portrait-trackpad acceptance remain pending build
-87.
+failures and CTest passes 1/1. GitHub Actions run 31558665062 passed the same
+suite plus the full iPhoneOS compile, app validation, increased-memory
+entitlement check, packaging, and direct rolling Release upload; the IPA job
+completed in 4 minutes 2 seconds. The published build 87 `BoxedVN.ipa` is
+8,171,553 bytes and its downloaded SHA-256 matches the Release digest:
+`6a65b8b8064bb9db9217db9be4024272697d5149623f73dc8b2c72a0b1edfaef`.
+The rolling Release targets the exact producing commit
+`46357e618a8d25436144128a3ba390aabbe6c23a`. Long-session physical Grisaia and
+portrait-trackpad acceptance remain pending build 87.
