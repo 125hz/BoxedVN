@@ -3827,5 +3827,12 @@ installation is successfully registered.
 **Build evidence:** `git diff --check` passes. In the Visual Studio developer
 environment the host-independent executable runs all 94 tests with zero
 failures, including installed-prefix candidate filtering, and CTest passes 1/1.
-The iPhoneOS compile, unsigned IPA packaging, and physical installer acceptance
-remain pending GitHub Actions and device testing.
+GitHub Actions run 31561134921 passed the same suite plus the full iPhoneOS
+compile, app validation, increased-memory entitlement check, packaging, and
+direct rolling Release upload; the IPA job completed in 2 minutes 19 seconds.
+The published build 88 `BoxedVN.ipa` is 8,190,986 bytes with Release SHA-256
+`651b57cbabe8d5cb8c9b0e06760b152c053f21fff90ef666221b3d8456d1293c`.
+The rolling Release targets the exact producing commit
+`a30653d515a8da7d5b634953c2a8213522855e82`. Physical installer completion,
+automatic executable selection, and installed-game launch acceptance remain
+pending device testing.
