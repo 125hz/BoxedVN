@@ -275,13 +275,25 @@ translated in that window. Cross-process IPC is not involved: run 6 added
 --disable-background-networking` also changed nothing, and the DNS retries
 continue regardless.
 
-Untested candidates, cheapest first: `--disable-remote-fonts`, which removes
-the pending web font so `document.fonts.ready` has nothing to wait for; and a
-real system font supplied through `Documents/Fonts` (section 7), which
-addresses the case where Blink's font machinery is wedged for want of any
-system face at all - the same underlying weakness that aborted the renderer
-outright before `--no-sandbox`. Note that the second does not obviously fix
-the first: a system font does not settle a pending `@font-face` load.
+Run 7 added `--disable-remote-fonts` and changed nothing: forty-one more
+`font=false` samples. That removes the game's `@font-face` from the picture
+entirely, so what is stuck is not the web font load - it is
+`document.fonts.ready` itself never settling.
+
+That narrows it usefully. In Blink, `FontFaceSet.ready` is resolved from the
+document lifecycle, not from the font loads alone; a renderer that never
+completes a layout never resolves it. Timers are demonstrably alive in this
+state - the probe's own `setInterval` fires forty-one times - so "the
+renderer is dead" is not the explanation either. The open question is whether
+the document lifecycle is running at all, which the next probe answers
+directly by logging `document.fonts.status` and whether `ready` ever
+resolves, and by bypassing `Graphics.isFontLoaded` to see whether anything
+downstream of the gate renders.
+
+A system font supplied through `Documents/Fonts` (section 7) remains
+untested. It addresses a different failure - Blink having no usable face at
+all, the weakness that aborted the renderer outright before `--no-sandbox` -
+and should not be assumed to fix this one.
 
 `--enable-logging=stderr` puts Chromium's console output, including page JS
 errors, into the session log and is the right first thing to add to any run
