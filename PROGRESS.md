@@ -15,8 +15,9 @@ Xlib `Screen` records still say 800x600 because Boxedwine only populated them
 when each display opened. Build 82 updates every live Xlib screen record to the
 fake-fullscreen client's 1280x720 size and repairs the reversed client/root
 conversion in `XQueryPointer`'s backing input path. The Windows support suite
-remains 92/92; iPhoneOS compilation and fresh-device input validation are
-pending. Song of Saya remains
+remains 92/92. GitHub Actions run 31552046685 passed the full iPhoneOS build
+and published the direct IPA; fresh-device input validation is pending. Song
+of Saya remains
 device-proven playable with the
 interpreter workaround.
 The newest
@@ -3617,7 +3618,14 @@ and window coordinates. The iOS `XWarpPointer` path preserves the same
 client-local invariant. Bounded `XQueryPointer` diagnostics now report root,
 local, Xlib-screen, and fake-client dimensions for the next device log.
 
-**Local evidence:** `git diff --check` passes. The Windows host-independent
-executable runs all 92 tests with zero failures, and CTest passes 1/1. The
-iPhoneOS compile, IPA publication, and physical right-side input acceptance
-are pending build 82.
+**Build evidence:** `git diff --check` passes. The Windows host-independent
+executable runs all 92 tests with zero failures, and CTest passes 1/1. GitHub
+Actions run 31552046685 passed the same host suite plus the full iPhoneOS
+compile, app validation, increased-memory entitlement check, packaging, and
+rolling Release upload in 2 minutes 30 seconds. The published build 82
+`BoxedVN.ipa` is 8,157,877 bytes and its downloaded SHA-256 matches the Release
+digest and sidecar:
+`289a416a643ac550548a1f794ddbb73508eac796b0f33976288025e1407e6542`.
+The rolling Release targets the exact producing commit
+`821854e1646d56fd242787675cc0d16b7f250573`. Physical right-side input
+acceptance remains pending build 82.
