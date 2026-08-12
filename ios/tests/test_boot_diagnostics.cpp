@@ -176,6 +176,12 @@ BOXEDVN_TEST(boot_diagnostics_script_reports_every_gate_that_matters) {
     CHECK_CONTAINS(script, "gameFont=");
     CHECK_CONTAINS(script, "db=");
     CHECK_CONTAINS(script, "scene=");
+    // Added after a device run showed every other gate healthy and only the
+    // game's own web font unresolved: the face list says whether Blink ever
+    // tried to load it, and the forced load says whether it can be loaded.
+    CHECK_CONTAINS(script, "faces=");
+    CHECK_CONTAINS(script, "forcedLoad=");
+    CHECK_CONTAINS(script, "GameFont");
     CHECK_CONTAINS(script, kBootDiagnosticsMarker);
     // It runs inside somebody's game: every read is guarded, so a guest that
     // is not RPG Maker reports what it can instead of throwing.

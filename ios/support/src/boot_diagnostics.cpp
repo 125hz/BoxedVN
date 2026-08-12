@@ -102,7 +102,7 @@ std::string bootDiagnosticsScript() {
     return
         "<script>/* " + std::string(kBootDiagnosticsMarker) + " */\n"
         R"JS((function () {
-  var n = 0, frames = 0, ready = "pending";
+  var n = 0, frames = 0, ready = "pending", forced = "not-tried";
   function say(text) { try { console.log("BOXEDVN " + text); } catch (e) {} }
   function ask(fn) { try { return String(fn()); } catch (e) { return "ERR"; } }
 
@@ -119,12 +119,43 @@ std::string bootDiagnosticsScript() {
     (function tick() { frames++; requestAnimationFrame(tick); })();
   } catch (e) {}
 
+  // Every @font-face the document declares, with the status Blink gives it.
+  // "unloaded" means nobody has asked for it yet, "error" means the file
+  // could not be used, and the difference decides whether this is the game's
+  // trigger not firing or the font itself being rejected.
+  function faces() {
+    var out = [];
+    try {
+      document.fonts.forEach(function (face) {
+        out.push(face.family + ":" + face.status);
+      });
+    } catch (e) { return "ERR"; }
+    return out.length ? out.join("|") : "none";
+  }
+
+  // Ask Blink to load the game's face directly. RPG Maker triggers it with a
+  // zero-pixel hidden element and then waits for check() to agree, so if that
+  // trigger is what does not fire here, this both proves it and clears the
+  // wait. Reported either way; it is an experiment, not a silent repair.
+  setTimeout(function () {
+    try {
+      forced = "requested";
+      document.fonts.load('10px "GameFont"').then(function (list) {
+        forced = "loaded(" + (list ? list.length : 0) + ")";
+      }, function (error) {
+        forced = "failed(" + error + ")";
+      });
+    } catch (e) { forced = "threw"; }
+  }, 5000);
+
   setInterval(function () {
     say("boot " + (++n)
       + " raf=" + frames
       + " docState=" + ask(function () { return document.readyState; })
       + " fontsReady=" + ready
       + " fontsStatus=" + ask(function () { return document.fonts.status; })
+      + " forcedLoad=" + forced
+      + " faces=" + faces()
       + " img=" + ask(function () { return ImageManager.isReady(); })
       + " db=" + ask(function () { return !!DataManager.isDatabaseLoaded(); })
       + " gameFont=" + ask(function () { return Graphics.isFontLoaded("GameFont"); })
