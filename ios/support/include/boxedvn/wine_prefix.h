@@ -6,6 +6,7 @@
 #ifndef BOXEDVN_WINE_PREFIX_H
 #define BOXEDVN_WINE_PREFIX_H
 
+#include <cstddef>
 #include <string>
 
 namespace boxedvn {
@@ -53,6 +54,38 @@ bool installBundledDxvk(const std::string& sourceDirectory,
                         const std::string& writableRootPath,
                         bool& changed,
                         std::string& error);
+
+struct GuestFontInstallResult {
+    bool ok = true;
+    // Font files copied into the prefix by this call.
+    std::size_t installed = 0;
+    // Font files the user has supplied, whether or not they were copied now.
+    std::size_t available = 0;
+    std::string error;
+};
+
+// Copies the user's own font files into the prefix at
+// drive_c/windows/Fonts, where Wine's font backend scans for them on the next
+// start. Accepts .ttf, .ttc, .otf and .fon; anything else in the directory is
+// ignored rather than treated as an error.
+//
+// This exists because a font the guest cannot find is not a cosmetic problem.
+// A Chromium-family game aborts outright when Blink's font collection comes
+// back empty - the renderer stops at a CHECK in FontCache and takes the whole
+// guest with it - and a Japanese title with no CJK face renders its text as
+// mojibake, which then gets misread as a renderer fault. BoxedVN cannot ship
+// fonts: the ones these games expect are Microsoft's, and the root filesystem
+// archives have not been reviewed for redistribution either. What it can do
+// is make the user's own fonts reachable, which is the same thing Wine's
+// documented manual workaround does.
+//
+// A missing source directory is not an error; it is the ordinary case for a
+// user who has not supplied any. Existing files are skipped rather than
+// overwritten: unlike the DXVK modules these are the user's files, BoxedVN
+// has no newer version of them, and recopying every face on every launch
+// would be slow for a large CJK font.
+GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
+                                         const std::string& writableRootPath);
 
 // Updates a Wine registry text document in memory. Section names use normal
 // Windows separators (for example "Software\\Wine\\Direct3D"); this function

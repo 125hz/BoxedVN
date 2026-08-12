@@ -330,3 +330,90 @@ BOXEDVN_TEST(wine_prefix_suppresses_the_missing_runtime_download_prompts) {
 
     fs::remove_all(temporary, ec);
 }
+
+BOXEDVN_TEST(guest_fonts_are_installed_where_wine_scans_for_them) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-fonts-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    const fs::path source = temporary / "Fonts";
+    const fs::path root = temporary / "prefix";
+    fs::create_directories(source, ec);
+
+    std::ofstream(source / "NotoSansJP-Regular.otf") << "otf";
+    std::ofstream(source / "meiryo.ttc") << "ttc";
+    std::ofstream(source / "arial.TTF") << "ttf";
+    // Not a font. A user's Fonts folder collects whatever the Files app put
+    // there, and a stray file must not be copied or counted.
+    std::ofstream(source / "readme.txt") << "notes";
+
+    const GuestFontInstallResult result =
+        installGuestFonts(source.string(), root.string());
+    CHECK(result.ok);
+    CHECK(result.error.empty());
+    CHECK_EQ(result.available, static_cast<std::size_t>(3));
+    CHECK_EQ(result.installed, static_cast<std::size_t>(3));
+
+    // Wine's font backend scans drive_c/windows/Fonts, so anywhere else is
+    // the same as not installing them at all.
+    const fs::path destination =
+        root / "home/username/.wine/drive_c/windows/Fonts";
+    CHECK(fs::exists(destination / "NotoSansJP-Regular.otf", ec));
+    CHECK(fs::exists(destination / "meiryo.ttc", ec));
+    CHECK(fs::exists(destination / "arial.TTF", ec));
+    CHECK(!fs::exists(destination / "readme.txt", ec));
+
+    fs::remove_all(temporary, ec);
+}
+
+BOXEDVN_TEST(guest_fonts_already_present_are_not_recopied) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-fonts-repeat-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    const fs::path source = temporary / "Fonts";
+    const fs::path root = temporary / "prefix";
+    fs::create_directories(source, ec);
+    std::ofstream(source / "cjk.ttf") << "font";
+
+    CHECK_EQ(installGuestFonts(source.string(), root.string()).installed,
+             static_cast<std::size_t>(1));
+
+    // These are the user's files and BoxedVN has no newer version of them, so
+    // a second launch must be free rather than recopying a large CJK face.
+    const GuestFontInstallResult again =
+        installGuestFonts(source.string(), root.string());
+    CHECK(again.ok);
+    CHECK_EQ(again.available, static_cast<std::size_t>(1));
+    CHECK_EQ(again.installed, static_cast<std::size_t>(0));
+
+    fs::remove_all(temporary, ec);
+}
+
+BOXEDVN_TEST(guest_fonts_tolerate_a_user_who_supplied_none) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-fonts-none-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+
+    // No Fonts directory at all: the ordinary case, and not an error.
+    const GuestFontInstallResult absent =
+        installGuestFonts((temporary / "Fonts").string(),
+                          (temporary / "prefix").string());
+    CHECK(absent.ok);
+    CHECK_EQ(absent.available, static_cast<std::size_t>(0));
+    CHECK(absent.error.empty());
+
+    // An empty one must not write a stray directory into the prefix.
+    fs::create_directories(temporary / "Fonts", ec);
+    const GuestFontInstallResult empty =
+        installGuestFonts((temporary / "Fonts").string(),
+                          (temporary / "prefix").string());
+    CHECK(empty.ok);
+    CHECK_EQ(empty.installed, static_cast<std::size_t>(0));
+    CHECK(!fs::exists(temporary / "prefix/home/username/.wine/drive_c/windows/Fonts", ec));
+
+    CHECK(installGuestFonts("", (temporary / "prefix").string()).ok);
+
+    fs::remove_all(temporary, ec);
+}

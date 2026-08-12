@@ -233,6 +233,16 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     launch.requestedWineRenderer = static_cast<int>(request->wineRenderer);
     BVNApplyDefaultRendererPolicy(launch);
 
+    // Before the per-title profile, so a title profile can still override
+    // anything decided here, and after the user's own arguments have been
+    // copied in, because whether they already carry Chromium switches is what
+    // decides if BoxedVN adds its own.
+    const BVNEngineProfileResult engineProfile =
+        BVNApplyEngineCompatibilityProfile(launch);
+    if (!engineProfile.reason.empty()) {
+        BVNLogWrite(BVNLogLevelInfo, "engine", engineProfile.reason.c_str());
+    }
+
     // LAST, so a profile can override any default above it. Build 66 called
     // this before enableWineD3DVulkan was assigned, so its Grisaia profile -
     // whose whole point was to turn DXVK off - was silently overwritten two
@@ -434,6 +444,38 @@ void runSession(const BVNLaunchConfiguration& launch) {
                 "drivers disabled; Wine HID bus and nsiproxy available.";
         }
         BVNLogWrite(BVNLogLevelInfo, "prefix", prefixMessage);
+
+        // Make the user's own fonts reachable by the guest. A guest that can
+        // find no font at all is not a cosmetic problem: a Chromium-family
+        // game stops at a CHECK in Blink's FontCache when its font collection
+        // comes back empty, which ends the whole session, and a Japanese
+        // title with no CJK face draws mojibake that then gets misread as a
+        // renderer fault. A failure here is reported and does not stop the
+        // launch - the guest may well have everything it needs already, and
+        // refusing to start it would turn a possible problem into a certain
+        // one.
+        if (const char* fontsDirectory = BVNPathFonts()) {
+            const boxedvn::GuestFontInstallResult fonts =
+                boxedvn::installGuestFonts(fontsDirectory,
+                                           launch.writableRootPath);
+            if (!fonts.ok) {
+                BVNLogWrite(BVNLogLevelError, "fonts", fonts.error.c_str());
+            } else if (fonts.available == 0) {
+                BVNLogWrite(BVNLogLevelInfo, "fonts",
+                            "No user fonts supplied. The guest sees only what "
+                            "the root filesystem provides; if a game reports "
+                            "an empty font collection or draws mojibake, put "
+                            ".ttf/.ttc/.otf files in Documents/Fonts through "
+                            "the Files app.");
+            } else {
+                char message[192];
+                snprintf(message, sizeof(message),
+                         "User fonts: %zu supplied, %zu newly copied into "
+                         "drive_c/windows/Fonts.",
+                         fonts.available, fonts.installed);
+                BVNLogWrite(BVNLogLevelInfo, "fonts", message);
+            }
+        }
 
         // Shadow the rootfs's stock DXVK with the MoltenVK-compatible build.
         // Upstream DXVK requires geometryShader and VK_EXT_transform_feedback

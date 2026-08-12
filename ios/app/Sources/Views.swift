@@ -788,7 +788,7 @@ struct SettingsView: View {
                      + "is tested against.")
             }
 
-            Section("Storage") {
+            Section {
                 if let games = Storage.games {
                     LabeledContent("Games", value: games.path)
                         .font(.caption)
@@ -801,10 +801,26 @@ struct SettingsView: View {
                     LabeledContent("Shared E: drive", value: shared.path)
                         .font(.caption)
                 }
+                if let fonts = Storage.fonts {
+                    LabeledContent("Fonts", value: fonts.path)
+                        .font(.caption)
+                }
                 if let logs = Storage.logs {
                     LabeledContent("Logs", value: logs.path)
                         .font(.caption)
                 }
+            } header: {
+                Text("Storage")
+            } footer: {
+                // Reading Storage.fonts above is what creates the folder. Say
+                // what it is for: a missing font is the one absence that ends
+                // a session outright rather than degrading it, and nothing
+                // else in the app would ever prompt a user to fill this in.
+                Text("Put .ttf, .ttc or .otf files in the Fonts folder to make "
+                     + "them available to every game. Games built on a browser "
+                     + "engine stop at startup when they can find no font at "
+                     + "all, and a Japanese game needs a CJK face to avoid "
+                     + "mojibake. BoxedVN ships no fonts of its own.")
             }
         }
         .navigationTitle("Settings")

@@ -200,6 +200,12 @@ enum Storage {
     static var logs: URL? { directory(BVNPathLogs()) }
     static var caches: URL? { directory(BVNPathCaches()) }
 
+    /// Fonts the user drops in through the Files app, copied into every Wine
+    /// prefix at launch. Reading this creates the folder, which is the point
+    /// of touching it at startup: a user cannot put a font somewhere that
+    /// only appears after the launch the missing font already broke.
+    static var fonts: URL? { directory(BVNPathFonts()) }
+
     /// The root filesystem archive shipped inside the app bundle, if the build
     /// included one.  A development build made without it returns nil and the
     /// user is asked to import an archive instead.

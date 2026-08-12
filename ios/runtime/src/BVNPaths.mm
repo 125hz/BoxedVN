@@ -19,6 +19,8 @@
  *  Documents            (visible in Files, included in backup)
  *      Games/<id>/      imported game content and its manifest
  *      Logs/            session logs, exportable through the share sheet
+ *      Fonts/           font files the user supplies, copied into every
+ *                       prefix at launch
  *
  *  Caches               (visible to nobody, purgeable by the system)
  *
@@ -112,6 +114,7 @@ CachedPath gRootFilesystems;
 CachedPath gWinePrefixes;
 CachedPath gGames;
 CachedPath gLogs;
+CachedPath gFonts;
 CachedPath gCaches;
 CachedPath gBundledRootfs;
 
@@ -134,6 +137,11 @@ extern "C" const char* BVNPathGames(void) {
 
 extern "C" const char* BVNPathLogs(void) {
     return cachedSubdirectory(gLogs, NSDocumentDirectory, @"Logs",
+                              /*excludeFromBackup=*/false);
+}
+
+extern "C" const char* BVNPathFonts(void) {
+    return cachedSubdirectory(gFonts, NSDocumentDirectory, @"Fonts",
                               /*excludeFromBackup=*/false);
 }
 

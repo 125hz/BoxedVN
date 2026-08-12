@@ -204,6 +204,48 @@ presentation. OpenGL remains unsupported.
 
 ---
 
+## 3a. Games built on a browser engine
+
+An NW.js or Electron game - which is what RPG Maker MV and MZ deploy for
+Windows - is a Chromium application wearing a game's name. That changes what
+"compatible" means: the Direct3D layer underneath can be completely healthy
+and the game still shows nothing, because the failure is in Chromium's process
+model, its compositor or its font stack rather than in the renderer.
+
+Build 95 recognises the engine from the files a game ships (`nw.dll`,
+`nw.pak`, `package.nw`, `app.asar`) and passes Chromium's own switches for the
+four Windows facilities Wine under Boxedwine implements only partly:
+`--no-sandbox`, `--in-process-gpu`, `--disable-direct-composition` and
+`--disable-features=CalculateNativeWinOcclusion`. The engine and the evidence
+for it are logged under `engine:`. Putting any `--switch` in a game's launch
+settings takes the decision over completely and BoxedVN adds none of its own.
+
+What this is based on, and what falsifies it:
+
+- **Not device-proven.** The switches were chosen from a build-94 device log
+  in which DXVK created a device, the guest mapped an X11 window, and the
+  window stayed black for fifty seconds before the renderer aborted. Each
+  switch is argued in `ios/support/include/boxedvn/engine_profile.h` against a
+  specific line of that log. None of them has been observed to help yet.
+- If a device log still shows no pixels with all four applied, the next thing
+  to test is software compositing - `--disable-gpu
+  --disable-software-rasterizer` in launch settings. That pair is deliberately
+  not the default: it would mask whether the switches above worked, and
+  software rasterising a browser engine is what exhausted the JIT arena before
+  build 94 resized it.
+- A renderer that aborts in Blink's `FontCache` with `Check failed: false` has
+  found no font at all. `--no-sandbox` is the first candidate, because the
+  sandbox is what forces the renderer to reach DirectWrite through the browser
+  process. If it persists, the prefix genuinely has no usable face and the fix
+  is `Documents/Fonts` (section 7).
+- A "Profile error occurred" dialog from the game is Chromium reporting
+  corrupt SQLite in its own user-data directory, normally left behind by a
+  previous run that was killed part way through a write. It is not fatal -
+  Chromium says so - and it should stop recurring once the guest stops dying.
+  Do not read it as the cause of a black screen.
+
+---
+
 ## 4. Runtime and display behaviour
 
 The following remains unproven or deliberately constrained:
@@ -255,11 +297,15 @@ The following remains unproven or deliberately constrained:
   device-proven for basic ASCII entry before build 64 replaced it. **The build
   64 UIKit overlay keyboard is untested on device.** Hardware keyboards, native
   IME and GameController mapping still require device tests.
-- Japanese locale/font profiles are not implemented. The Wine 10 root has
-  CP932 NLS data but defaults to an English (ACP 1252) prefix and lacks a CJK
-  font. A Japanese game's error text may therefore appear as mojibake even
-  when the underlying error is unrelated. Do not interpret garbled text as a
-  renderer failure by itself.
+- Japanese locale profiles are not implemented. The Wine 10 root has CP932
+  NLS data but defaults to an English (ACP 1252) prefix. A Japanese game's
+  error text may therefore appear as mojibake even when the underlying error
+  is unrelated. Do not interpret garbled text as a renderer failure by itself.
+  The font half of this is now addressable by the user: build 95 copies any
+  `.ttf`, `.ttc`, `.otf` or `.fon` file placed in `Documents/Fonts` into every
+  prefix's `drive_c/windows/Fonts` at launch, and the session log reports how
+  many were found. BoxedVN still ships no fonts - the faces these games ask
+  for are Microsoft's - and the locale itself remains English.
 
 ---
 
@@ -303,6 +349,14 @@ visible in Files.
   Song of Saya's known critical-section hang. Wine 10.0 remains pinned as a
   legacy fallback and is device-proven through Notepad. Wine 11.0 has not yet
   been booted on iOS.
+- **Fonts.** The archive is a TinyCore image and BoxedVN ships no fonts of its
+  own, so a guest sees only whatever faces the archive's Wine installed.
+  Anything the user puts in `Documents/Fonts` (`.ttf`, `.ttc`, `.otf`,
+  `.fon`) is copied into every prefix's `drive_c/windows/Fonts` at launch,
+  where Wine's font backend picks it up on the next start. Existing files are
+  never overwritten and the session log reports the counts under `fonts:`.
+  This is the supported route for a CJK face, and for a browser-engine game
+  that aborts with an empty font collection.
 - A bundled root takes precedence over an imported root. This lets a targeted
   runtime-migration build reliably replace an older imported Wine version.
   Unbundled builds continue to use the imported archive.

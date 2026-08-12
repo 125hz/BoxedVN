@@ -4265,3 +4265,87 @@ quit and the question becomes what is not being flushed.
 failures. The changed view compiles only in the iPhoneOS job, which is what
 caught a `@discardableResult` left above the new helper instead of `save()`;
 GitHub Actions run 31574564972 then passed the full job.
+
+---
+
+### Build 95 — the guest is a browser, so treat it like one
+
+The build-94 device log (`boxedvn20260812025918.log`, an NW.js/RPG Maker MV
+title) is the first one where every layer BoxedVN has been fixing is visibly
+healthy and the game still fails:
+
+```
+renderer: DXVK: nw.dll imports dxgi.dll, and WineD3D cannot reach Direct3D 10 on Metal.
+[mvk-info] Created VkDevice to run on GPU Apple A19 GPU ...
+iOS guest startup complete: first mapped X11 window 0x10096
+```
+
+The renderer choice is right, DXVK created a device on MoltenVK, the guest
+mapped a window. Then, for fifty seconds, nothing. Two lines say why, and
+neither is about Direct3D:
+
+```
+[ERROR:gles2_command_buffer_stub.cc(226)] ContextResult::kFatalFailure: Failed to create surface.
+[ERROR:gpu_process_transport_factory.cc(1024)] Lost UI shared context.
+```
+
+and then the session ends:
+
+```
+[FATAL:FontCache.cpp(382)] Check failed: false.
+Received fatal exception EXCEPTION_BREAKPOINT
+runtime: guest exited with code 1
+```
+
+Both are Chromium failing at things Wine implements only partly - binding a
+surface to a window handle across a process boundary, and reaching
+DirectWrite from a sandboxed renderer - not Boxedwine failing to emulate x86.
+Build 6ff5ef82 already recognised this class of guest well enough to route it
+to DXVK; what it did not do is anything about the browser sitting on top.
+
+`boxedvn::detectGuestEngine` now identifies NW.js and Electron from the files
+a game ships, and `BVNApplyEngineCompatibilityProfile` passes Chromium's own
+switches for the four facilities in question: `--no-sandbox`,
+`--in-process-gpu`, `--disable-direct-composition` and
+`--disable-features=CalculateNativeWinOcclusion`. Each is argued against a
+specific line of that log in `engine_profile.h`. This is keyed to the engine
+rather than to a title, so it covers every RPG Maker MV/MZ game rather than
+one; `--in-process-gpu` also removes a process from a guest that starts six
+to ten of them, which is the arena pressure build 6ff5ef82 resized for.
+
+Any `--switch` in a game's launch settings takes the decision over entirely
+and BoxedVN adds none of its own - Chromium resolves a repeated
+`--disable-features` to the last one seen, so merging could silently drop the
+entry the user came to add. The engine, the evidence and which way that went
+are logged under `engine:`.
+
+**Fonts are now the user's to supply.** A renderer that aborts in `FontCache`
+has found no font at all, and BoxedVN cannot ship one: the faces these games
+expect are Microsoft's, and the root filesystem archives are unreviewed for
+redistribution. `installGuestFonts` copies anything in `Documents/Fonts`
+(`.ttf`, `.ttc`, `.otf`, `.fon`) into every prefix's `drive_c/windows/Fonts`
+at launch, where Wine's font backend picks it up on the next start. Existing
+files are never overwritten, Settings shows the folder and says what it is
+for, and the counts are logged under `fonts:`. This also closes the font half
+of the long-standing CJK/mojibake limitation; the English locale itself is
+unchanged.
+
+**What this does not claim.** None of it is device-proven. The falsifiers are
+written down in `docs/KNOWN_LIMITATIONS_IOS.md` section 3a, and the honest
+summary is: if build 95 still shows a black window, try `--disable-gpu
+--disable-software-rasterizer` in launch settings next, and if `FontCache`
+still aborts with `--no-sandbox` applied, the prefix genuinely has no usable
+face and `Documents/Fonts` is the fix rather than a convenience.
+
+The "Profile error occurred" dialog is unchanged and still expected. It is
+Chromium reporting corrupt SQLite in its own user-data directory, it is
+explicitly non-fatal, and the discriminator recorded for build 93 - delete
+the prefix, see whether a profile built from nothing is still SQLITE_CORRUPT -
+is still the right next step for it. It should not be read as the cause of a
+black screen.
+
+**Build evidence:** the host-independent suite runs 143 tests with zero
+failures (125 before; 15 for the engine profile, 3 for the font installer),
+built and run with MSVC on Windows via the `tests-only` preset. The changed
+Objective-C++ and Swift compile only in the iPhoneOS job. Device acceptance
+is pending.

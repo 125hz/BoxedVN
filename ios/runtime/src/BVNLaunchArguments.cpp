@@ -6,6 +6,7 @@
 #include "BVNLaunchArguments.h"
 
 #include "boxedvn/direct3d_profile.h"
+#include "boxedvn/engine_profile.h"
 
 #include <initializer_list>
 
@@ -91,6 +92,51 @@ void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch) {
         ? "WineD3D: no Direct3D 10/11 module was found, but the scan stopped "
           "at its file limit, so this is not conclusive."
         : "WineD3D: nothing in this game links Direct3D 10, 11 or 12.";
+}
+
+BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
+    BVNLaunchConfiguration& launch) {
+    BVNEngineProfileResult result;
+    if (!launch.runThroughWine || launch.gameDirectoryHostPath.empty()) {
+        return result;
+    }
+
+    const boxedvn::GuestEngineProfile profile =
+        boxedvn::detectGuestEngine(launch.gameDirectoryHostPath);
+    if (!profile.isChromium()) {
+        return result;
+    }
+
+    std::string engine = boxedvn::toString(profile.engine);
+    if (profile.framework != boxedvn::GuestFramework::Unknown) {
+        engine += " (";
+        engine += boxedvn::toString(profile.framework);
+        engine += ")";
+    }
+
+    // A user who has typed switches into launch settings is testing something,
+    // and appending four more would change what they are testing without
+    // saying so. Their line wins outright rather than being merged: Chromium
+    // resolves a repeated --disable-features to the last one seen, so a merge
+    // could silently drop the entry they came to add.
+    if (boxedvn::argumentsCarryChromiumSwitch(launch.arguments)) {
+        result.reason = std::string(engine) +
+            " detected (" + profile.evidence +
+            "), but this game's launch settings already carry Chromium "
+            "switches, so BoxedVN added none of its own.";
+        return result;
+    }
+
+    for (const std::string& option : boxedvn::chromiumCompatibilitySwitches()) {
+        launch.arguments.push_back(option);
+    }
+    result.applied = true;
+    result.reason = std::string(engine) + " detected (" + profile.evidence +
+        "): a browser engine draws through Windows facilities Wine only "
+        "partly implements, so BoxedVN passes Chromium's own switches for "
+        "the sandbox, the GPU process, DirectComposition and occlusion. "
+        "Clear them by putting any --switch in this game's launch settings.";
+    return result;
 }
 
 bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {

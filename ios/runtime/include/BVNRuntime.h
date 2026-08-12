@@ -199,6 +199,12 @@ const char* BVNPathWinePrefixes(void);
 const char* BVNPathGames(void);
 const char* BVNPathLogs(void);
 
+// Documents/Fonts: font files the user drops in through the Files app, copied
+// into every Wine prefix at launch.  BoxedVN ships no fonts of its own - the
+// faces these games expect are Microsoft's - so this is the only way a guest
+// that needs a font the root filesystem lacks can get one.
+const char* BVNPathFonts(void);
+
 // Caches: regenerable data, safe for the system to purge.
 const char* BVNPathCaches(void);
 

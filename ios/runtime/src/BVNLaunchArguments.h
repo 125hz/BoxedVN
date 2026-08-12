@@ -54,6 +54,22 @@ struct BVNLaunchConfiguration {
 /// without disabling WineD3D-over-Vulkan.
 void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch);
 
+struct BVNEngineProfileResult {
+    /// True when switches were actually appended to `launch.arguments`.
+    bool applied = false;
+    /// One sentence for the session log, naming the engine and what was done
+    /// about it. Non-empty whenever an engine was recognised, including the
+    /// case where BoxedVN deliberately added nothing.
+    std::string reason;
+};
+
+/// Recognises the application engine an imported game is built on and passes
+/// that engine's compatibility switches. Unlike the per-title profile below,
+/// this is keyed to the engine, so it covers every game built on it. Applies
+/// only to imported Wine games; a bare Wine program is left alone.
+BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
+    BVNLaunchConfiguration& launch);
+
 /// Adds a narrowly scoped engine workaround when the requested Windows
 /// program is one for which device diagnostics have established that need.
 /// Returns true when a profile was selected.

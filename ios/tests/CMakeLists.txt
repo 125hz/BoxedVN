@@ -11,6 +11,7 @@ add_executable(boxedvn_tests
     test_range_allocator.cpp
     test_jit_arena_plan.cpp
     test_direct3d_profile.cpp
+    test_engine_profile.cpp
     test_pixmap_formats.cpp
     test_getrusage_fairness.cpp
     test_vk_pipeline_guard.cpp

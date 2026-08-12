@@ -5,6 +5,8 @@
 
 #include "boxedvn/wine_prefix.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -325,6 +327,71 @@ bool installBundledDxvk(const std::string& sourceDirectory,
         changed = true;
     }
     return true;
+}
+
+GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
+                                         const std::string& writableRootPath) {
+    GuestFontInstallResult result;
+    if (sourceDirectory.empty()) {
+        return result;
+    }
+    std::error_code ec;
+    const fs::path source(sourceDirectory);
+    if (!fs::is_directory(source, ec)) {
+        return result;
+    }
+
+    const fs::path destination = fs::path(writableRootPath) / "home" /
+        "username" / ".wine" / "drive_c" / "windows" / "Fonts";
+
+    bool createdDestination = false;
+    for (const fs::directory_entry& entry : fs::directory_iterator(source, ec)) {
+        std::error_code entryEc;
+        if (!entry.is_regular_file(entryEc) || entryEc) {
+            continue;
+        }
+        std::string extension = entry.path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char character) {
+                           return static_cast<char>(std::tolower(character));
+                       });
+        if (extension != ".ttf" && extension != ".ttc" &&
+            extension != ".otf" && extension != ".fon") {
+            continue;
+        }
+        result.available++;
+
+        // Deferred until the first real font is found, so a user with an
+        // empty Fonts folder does not get an empty directory written into
+        // every prefix.
+        if (!createdDestination) {
+            std::error_code createEc;
+            fs::create_directories(destination, createEc);
+            if (createEc) {
+                result.ok = false;
+                result.error = "Could not create the guest font directory: " +
+                               createEc.message();
+                return result;
+            }
+            createdDestination = true;
+        }
+
+        const fs::path target = destination / entry.path().filename();
+        std::error_code copyEc;
+        if (fs::exists(target, copyEc)) {
+            continue;
+        }
+        fs::copy_file(entry.path(), target, copyEc);
+        if (copyEc) {
+            result.ok = false;
+            result.error = "Could not install the font " +
+                           entry.path().filename().string() + ": " +
+                           copyEc.message();
+            return result;
+        }
+        result.installed++;
+    }
+    return result;
 }
 
 WinePrefixPreparationResult prepareWinePrefix(
