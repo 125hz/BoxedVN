@@ -303,8 +303,62 @@ void CPU::prepareFpuException(int code, int trapNo, int error) {
     }
 }
 
+// Reports where a divide exception was raised, once per occurrence and
+// bounded.
+//
+// A guest that takes #DE says nothing about itself: the Windows program sees
+// EXCEPTION_INT_DIVIDE_BY_ZERO, and if its own handler then faults - as
+// Chromium's did on the device, in ntdll before it could print a backtrace -
+// the only trace left is the exception name. That is not enough to tell a
+// program legitimately dividing by a zero it computed from an emulator
+// executing the division wrongly, and those need completely different work.
+//
+// The register dump names the divisor, so the two cases separate at a
+// glance: a genuine zero operand is visible in the registers, while a
+// divisor that is plainly non-zero at the moment of the trap points at the
+// translation instead.
+static void logDivideExceptionSnapshot(CPU* cpu, int error) {
+    static std::atomic<U32> loggedDivideCount{0};
+    if (loggedDivideCount.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+
+    KThread* thread = cpu->thread;
+    const U32 eip = cpu->seg[CS].address + cpu->eip.u32;
+    const BString module = thread->process->getModuleName(eip);
+    const U32 moduleOffset = thread->process->getModuleEip(eip);
+
+    char instructionBytes[16 * 3 + 1] = {};
+    if (thread->memory->canRead(eip, 16)) {
+        U8 bytes[16];
+        thread->memory->memcpy(bytes, eip, sizeof(bytes));
+        for (size_t index = 0; index < sizeof(bytes); ++index) {
+            snprintf(instructionBytes + index * 3,
+                     sizeof(instructionBytes) - index * 3,
+                     "%02X%s", bytes[index],
+                     index + 1 == sizeof(bytes) ? "" : " ");
+        }
+    } else {
+        safe_strcpy(instructionBytes, "unreadable", sizeof(instructionBytes));
+    }
+
+    klog_fmt("Guest divide exception: pid %x thread %x %s; EIP %.8X %s+%.8X; "
+             "EAX %.8X ECX %.8X EDX %.8X EBX %.8X ESP %.8X EBP %.8X "
+             "ESI %.8X EDI %.8X; bytes %s",
+             thread->process->id, thread->id,
+             error == 0 ? "divide by zero" : "quotient overflow",
+             eip, module.c_str(), moduleOffset,
+             cpu->reg[0].u32, cpu->reg[1].u32, cpu->reg[2].u32,
+             cpu->reg[3].u32, cpu->reg[4].u32, cpu->reg[5].u32,
+             cpu->reg[6].u32, cpu->reg[7].u32, instructionBytes);
+}
+
 void CPU::prepareException(int code, int error) {
     const KProcessPtr& process = this->thread->process;
+
+    if (code == EXCEPTION_DIVIDE) {
+        logDivideExceptionSnapshot(this, error);
+    }
 
      // blocking signals, signalfd can't handle these
     if (code==EXCEPTION_GP && (process->sigActions[K_SIGSEGV].handlerAndSigAction!=K_SIG_IGN && process->sigActions[K_SIGSEGV].handlerAndSigAction!=K_SIG_DFL)) {
