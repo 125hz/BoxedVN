@@ -15,8 +15,9 @@ same 800/1280 ratio, so build 83 starts every imported Wine game whose launch
 resolution is `default` on a generic 1280x720 virtual monitor. Explicit
 per-game resolutions still take precedence. This prevents Wine from caching
 an 800-pixel monitor before a game creates a 1280-pixel client. The Windows
-support suite passes 93/93; fresh-device input validation and the iPhoneOS CI
-build are pending. Song
+support suite passes 93/93, and GitHub Actions run 31553074737 passed the full
+iPhoneOS build and published the direct IPA. Fresh-device input validation is
+pending. Song
 of Saya remains
 device-proven playable with the
 interpreter workaround.
@@ -3652,7 +3653,14 @@ before Wine caches display metrics. A user-selected resolution such as
 1024x576 remains authoritative and is emitted exactly once. Wine tools retain
 their explicit sizes.
 
-**Local evidence:** `git diff --check` passes. The host-independent Windows
+**Build evidence:** `git diff --check` passes. The host-independent Windows
 suite now runs 93 tests with zero failures, including a new explicit-resolution
-precedence regression test, and CTest passes 1/1. The full iPhoneOS compile and
-physical right-side input acceptance remain pending build 83.
+precedence regression test, and CTest passes 1/1. GitHub Actions run
+31553074737 passed the same support suite plus the full iPhoneOS compile, app
+validation, increased-memory entitlement check, packaging, and rolling Release
+upload in 2 minutes 25 seconds. The published build 83 `BoxedVN.ipa` is
+8,158,088 bytes; its downloaded SHA-256 matches the Release digest and
+sidecar: `e1d1c70107c8c4142386782e74547dff202f74e114ed7b1b7ba1fcc46945b627`.
+The rolling Release targets the exact producing commit
+`e09a9ab2421530b9d9ab32807b3a49627ecf880f`. Physical right-side input
+acceptance remains pending build 83.
