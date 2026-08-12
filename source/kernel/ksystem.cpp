@@ -17,6 +17,9 @@
  */
 
 #include "boxedwine.h"
+#ifdef BOXEDWINE_IOS
+#include "BVNRuntime.h"
+#endif
 
 #include "bufferaccess.h"
 #include "kstat.h"
@@ -328,12 +331,24 @@ U32 KSystem::tgkill(U32 threadGroupId, U32 threadId, U32 signal) {
 U32 KSystem::sysinfo(KThread* thread, U32 address) {
     KMemory* memory = thread->memory;
 
+#ifdef BOXEDWINE_IOS
+    const U32 totalPages = static_cast<U32>(
+        std::min<uint64_t>(BVNGuestReportedTotalMemory() / K_PAGE_SIZE,
+                           0xffffffffull));
+    const U32 freePages = static_cast<U32>(
+        std::min<uint64_t>(BVNGuestReportedFreeMemory() / K_PAGE_SIZE,
+                           totalPages));
+#else
+    const U32 totalPages = 262144; // 1 GB
+    const U32 freePages = 196608;
+#endif
+
     memory->writed(address, KSystem::getMilliesSinceStart()/1000); address+=4;
     memory->writed(address, 0); address+=4;
     memory->writed(address, 0); address+=4;
     memory->writed(address, 0); address+=4;
-    memory->writed(address, 262144); address+=4; // 1 GB
-    memory->writed(address, 196608); address+=4;
+    memory->writed(address, totalPages); address+=4;
+    memory->writed(address, freePages); address+=4;
     memory->writed(address, 0); address+=4;
     memory->writed(address, 0); address+=4;
     memory->writed(address, 0); address+=4;

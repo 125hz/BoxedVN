@@ -188,7 +188,7 @@ static NSArray<NSArray<BVNOverlayKey*>*>* BVNKeyboardRows(void) {
 
 static const CGFloat kBVNOverlayMargin = 10.0;
 static const CGFloat kBVNMenuButtonSize = 46.0;
-static const CGFloat kBVNMenuRowHeight = 50.0;
+static const CGFloat kBVNMenuRowHeight = 46.0;
 static const CGFloat kBVNMenuWidth = 268.0;
 static const CGFloat kBVNKeyGap = 4.0;
 // Slightly faster than 1:1 so a small finger movement crosses a Wine dialog,
@@ -208,6 +208,14 @@ static NSString* const kBVNPointerOuterCircleKey =
     @"BoxedVN.pointer.outerCircle";
 static NSString* const kBVNPointerInnerCircleKey =
     @"BoxedVN.pointer.innerCircle";
+static NSString* const kBVNPerformanceEnabledKey =
+    @"BoxedVN.performance.enabled";
+static NSString* const kBVNPerformanceFPSKey = @"BoxedVN.performance.fps";
+static NSString* const kBVNPerformanceRAMKey = @"BoxedVN.performance.ram";
+static NSString* const kBVNPerformanceFrameTimeKey =
+    @"BoxedVN.performance.frameTime";
+static NSString* const kBVNPerformanceBatteryKey =
+    @"BoxedVN.performance.battery";
 
 @interface BVNGuestOverlayView : UIView
 
@@ -215,10 +223,11 @@ static NSString* const kBVNPointerInnerCircleKey =
 @property (nonatomic, strong) UIView* scrim;
 @property (nonatomic, strong) UIView* menuPanel;
 @property (nonatomic, strong) UIButton* keyboardItem;
-@property (nonatomic, strong) UIButton* rotationItem;
 @property (nonatomic, strong) UIButton* pointerItem;
 @property (nonatomic, strong) UIButton* pointerSettingsItem;
 @property (nonatomic, strong) UIButton* displayItem;
+@property (nonatomic, strong) UIButton* performanceItem;
+@property (nonatomic, strong) UIButton* performanceSettingsItem;
 @property (nonatomic, strong) UIButton* quitItem;
 @property (nonatomic, strong) UILabel* quitPrompt;
 @property (nonatomic, strong) UIButton* quitConfirmItem;
@@ -229,6 +238,7 @@ static NSString* const kBVNPointerInnerCircleKey =
 @property (nonatomic, assign) BOOL menuOpen;
 @property (nonatomic, assign) BOOL confirmingQuit;
 @property (nonatomic, assign) BOOL pointerSettingsOpen;
+@property (nonatomic, assign) BOOL performanceSettingsOpen;
 @property (nonatomic, assign) BOOL layingOut;
 // The finger currently acting as the guest's mouse. A second finger belongs to
 // the two-finger right-click gesture, not to a second cursor.
@@ -257,6 +267,20 @@ static NSString* const kBVNPointerInnerCircleKey =
 @property (nonatomic, strong) UISlider* pointerThicknessSlider;
 @property (nonatomic, strong) UISwitch* pointerOuterSwitch;
 @property (nonatomic, strong) UISwitch* pointerInnerSwitch;
+
+@property (nonatomic, strong) UIView* performanceView;
+@property (nonatomic, strong) UILabel* performanceLabel;
+@property (nonatomic, strong) NSTimer* performanceTimer;
+@property (nonatomic, assign) uint64_t performanceLastFrameCount;
+@property (nonatomic, assign) NSTimeInterval performanceLastSampleTime;
+@property (nonatomic, assign) CGPoint performanceFraction;
+@property (nonatomic, strong) UIView* performanceSettingsPanel;
+@property (nonatomic, strong) UIButton* performanceSettingsBackItem;
+@property (nonatomic, strong) NSArray<UILabel*>* performanceSettingLabels;
+@property (nonatomic, strong) UISwitch* performanceFPSSwitch;
+@property (nonatomic, strong) UISwitch* performanceRAMSwitch;
+@property (nonatomic, strong) UISwitch* performanceFrameTimeSwitch;
+@property (nonatomic, strong) UISwitch* performanceBatterySwitch;
 // The cursor's position in the presenting view's bounds, i.e. guest pixels.
 @property (nonatomic, assign) CGPoint cursorGuestPoint;
 @property (nonatomic, assign) CGPoint trackpadTouchStart;
@@ -285,6 +309,7 @@ static NSString* const kBVNPointerInnerCircleKey =
 @end
 
 static BVNGuestOverlayView* gOverlay = nil;
+static std::atomic<uint64_t> gPerformancePresentedFrames{0};
 
 @implementation BVNGuestOverlayView
 
@@ -304,6 +329,11 @@ static BVNGuestOverlayView* gOverlay = nil;
         kBVNPointerThicknessKey: @2.0,
         kBVNPointerOuterCircleKey: @YES,
         kBVNPointerInnerCircleKey: @YES,
+        kBVNPerformanceEnabledKey: @NO,
+        kBVNPerformanceFPSKey: @YES,
+        kBVNPerformanceRAMKey: @YES,
+        kBVNPerformanceFrameTimeKey: @YES,
+        kBVNPerformanceBatteryKey: @YES,
     }];
     self.heldScancodes = [NSMutableSet set];
     self.keyRows = BVNKeyboardRows();
@@ -313,6 +343,8 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self buildKeyboard];
     [self buildCursor];
     [self buildPointerSettings];
+    [self buildPerformanceOverlay];
+    [self buildPerformanceSettings];
     [self buildStartupNotice];
     [self reportUnresolvedKeys];
     return self;
@@ -511,6 +543,149 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self positionCursor];
 }
 
+- (void)buildPerformanceOverlay {
+    UIView* view = [[UIView alloc] initWithFrame:CGRectZero];
+    view.backgroundColor = [UIColor colorWithWhite:0.03 alpha:0.78];
+    view.layer.cornerRadius = 10.0;
+    view.layer.borderWidth = 1.0;
+    view.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.22].CGColor;
+    view.hidden = ![[NSUserDefaults standardUserDefaults]
+        boolForKey:kBVNPerformanceEnabledKey];
+
+    UILabel* label = [[UILabel alloc] initWithFrame:CGRectZero];
+    label.textColor = UIColor.whiteColor;
+    label.font = [UIFont monospacedDigitSystemFontOfSize:12.0
+                                                  weight:UIFontWeightMedium];
+    label.numberOfLines = 0;
+    label.userInteractionEnabled = NO;
+    [view addSubview:label];
+
+    UIPanGestureRecognizer* drag = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(dragPerformanceOverlay:)];
+    [view addGestureRecognizer:drag];
+    [self addSubview:view];
+    self.performanceView = view;
+    self.performanceLabel = label;
+    self.performanceFraction = CGPointMake(1.0, 0.0);
+    self.performanceLastFrameCount =
+        gPerformancePresentedFrames.load(std::memory_order_relaxed);
+    self.performanceLastSampleTime = CACurrentMediaTime();
+
+    self.performanceTimer = [NSTimer timerWithTimeInterval:0.5
+                                                     target:self
+                                                   selector:@selector(updatePerformanceOverlay:)
+                                                   userInfo:nil
+                                                    repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.performanceTimer
+                              forMode:NSRunLoopCommonModes];
+    UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+    [self updatePerformanceOverlay:self.performanceTimer];
+}
+
+- (UISwitch*)makePerformanceSwitchForKey:(NSString*)key {
+    UISwitch* control = [[UISwitch alloc] initWithFrame:CGRectZero];
+    control.on = [[NSUserDefaults standardUserDefaults] boolForKey:key];
+    [control addTarget:self action:@selector(performanceSettingChanged:)
+       forControlEvents:UIControlEventValueChanged];
+    return control;
+}
+
+- (void)buildPerformanceSettings {
+    UIView* panel = [[UIView alloc] initWithFrame:CGRectZero];
+    panel.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.98];
+    panel.layer.cornerRadius = 16.0;
+    panel.layer.borderWidth = 1.0;
+    panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.16].CGColor;
+    panel.hidden = YES;
+    [self addSubview:panel];
+    self.performanceSettingsPanel = panel;
+
+    NSArray<NSString*>* titles = @[@"FPS", @"RAM used / total",
+                                    @"Frame-time", @"Battery"];
+    NSMutableArray<UILabel*>* labels = [NSMutableArray array];
+    for (NSString* title in titles) {
+        UILabel* label = [[UILabel alloc] initWithFrame:CGRectZero];
+        label.text = title;
+        label.textColor = UIColor.whiteColor;
+        label.font = [UIFont systemFontOfSize:15.0];
+        [panel addSubview:label];
+        [labels addObject:label];
+    }
+    self.performanceSettingLabels = labels;
+    self.performanceFPSSwitch = [self makePerformanceSwitchForKey:kBVNPerformanceFPSKey];
+    self.performanceRAMSwitch = [self makePerformanceSwitchForKey:kBVNPerformanceRAMKey];
+    self.performanceFrameTimeSwitch =
+        [self makePerformanceSwitchForKey:kBVNPerformanceFrameTimeKey];
+    self.performanceBatterySwitch =
+        [self makePerformanceSwitchForKey:kBVNPerformanceBatteryKey];
+    for (UISwitch* control in @[self.performanceFPSSwitch,
+                                self.performanceRAMSwitch,
+                                self.performanceFrameTimeSwitch,
+                                self.performanceBatterySwitch]) {
+        [panel addSubview:control];
+    }
+    self.performanceSettingsBackItem =
+        [self makePanelItemWithTitle:@"Back"
+                              action:@selector(closePerformanceSettings)
+                         destructive:NO];
+    [panel addSubview:self.performanceSettingsBackItem];
+}
+
+- (void)updatePerformanceOverlay:(NSTimer*)timer {
+    const NSTimeInterval now = CACurrentMediaTime();
+    const uint64_t frames =
+        gPerformancePresentedFrames.load(std::memory_order_relaxed);
+    const NSTimeInterval elapsed = MAX(0.001, now - self.performanceLastSampleTime);
+    const double fps = (double)(frames - self.performanceLastFrameCount) / elapsed;
+    self.performanceLastFrameCount = frames;
+    self.performanceLastSampleTime = now;
+
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableArray<NSString*>* lines = [NSMutableArray array];
+    if ([defaults boolForKey:kBVNPerformanceFPSKey]) {
+        [lines addObject:[NSString stringWithFormat:@"FPS       %5.1f", fps]];
+    }
+    if ([defaults boolForKey:kBVNPerformanceRAMKey]) {
+        const BVNMemoryReport memory = BVNMemoryProbe();
+        const uint64_t total = MIN(memory.physicalMemoryBytes,
+                                   memory.processResidentBytes +
+                                       memory.availableBytes);
+        NSByteCountFormatter* formatter = [[NSByteCountFormatter alloc] init];
+        formatter.countStyle = NSByteCountFormatterCountStyleMemory;
+        formatter.allowedUnits = NSByteCountFormatterUseMB |
+                                 NSByteCountFormatterUseGB;
+        [lines addObject:[NSString stringWithFormat:@"RAM       %@ / %@",
+            [formatter stringFromByteCount:(long long)memory.processResidentBytes],
+            [formatter stringFromByteCount:(long long)total]]];
+    }
+    if ([defaults boolForKey:kBVNPerformanceFrameTimeKey]) {
+        [lines addObject:[NSString stringWithFormat:@"Frame     %5.1f ms",
+            fps > 0.01 ? 1000.0 / fps : 0.0]];
+    }
+    if ([defaults boolForKey:kBVNPerformanceBatteryKey]) {
+        const float level = UIDevice.currentDevice.batteryLevel;
+        [lines addObject:level >= 0.0f
+            ? [NSString stringWithFormat:@"Battery   %3.0f%%", level * 100.0f]
+            : @"Battery      --"];
+    }
+    self.performanceLabel.text = [lines componentsJoinedByString:@"\n"];
+    [self setNeedsLayout];
+}
+
+- (void)performanceSettingChanged:(UISwitch*)sender {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    if (sender == self.performanceFPSSwitch) {
+        [defaults setBool:sender.on forKey:kBVNPerformanceFPSKey];
+    } else if (sender == self.performanceRAMSwitch) {
+        [defaults setBool:sender.on forKey:kBVNPerformanceRAMKey];
+    } else if (sender == self.performanceFrameTimeSwitch) {
+        [defaults setBool:sender.on forKey:kBVNPerformanceFrameTimeKey];
+    } else if (sender == self.performanceBatterySwitch) {
+        [defaults setBool:sender.on forKey:kBVNPerformanceBatteryKey];
+    }
+    [self updatePerformanceOverlay:self.performanceTimer];
+}
+
 - (void)buildStartupNotice {
     UIView* notice = [[UIView alloc] initWithFrame:self.bounds];
     notice.backgroundColor = [UIColor colorWithRed:10.0 / 255.0
@@ -608,7 +783,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     // carries a UIButtonConfiguration, and once it does, a later
     // -setTitle:forState: is not reflected until the configuration is
     // refreshed. On build 64 that made the two rows whose titles change at
-    // runtime - "Show/Hide keyboard" and "Rotation: locked/free" - render as
+    // runtime - such as "Show/Hide keyboard" and pointer/performance state - render as
     // blank rows, while "Quit to library", whose title is only ever set here,
     // looked fine. A custom button has no configuration and no such rule.
     UIButton* button = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -698,9 +873,6 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.keyboardItem = [self makePanelItemWithTitle:@"Show keyboard"
                                               action:@selector(toggleKeyboard)
                                          destructive:NO];
-    self.rotationItem = [self makePanelItemWithTitle:@"Rotation: locked"
-                                              action:@selector(toggleRotation)
-                                         destructive:NO];
     self.pointerItem = [self makePanelItemWithTitle:@"Pointer: direct tap"
                                              action:@selector(togglePointerMode)
                                         destructive:NO];
@@ -710,14 +882,21 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.displayItem = [self makePanelItemWithTitle:@"Display: fit"
                                              action:@selector(toggleDisplayMode)
                                         destructive:NO];
+    self.performanceItem = [self makePanelItemWithTitle:@"Performance overlay: off"
+                                                  action:@selector(togglePerformanceOverlay)
+                                             destructive:NO];
+    self.performanceSettingsItem = [self makePanelItemWithTitle:@"Performance settings"
+                                                          action:@selector(openPerformanceSettings)
+                                                     destructive:NO];
     self.quitItem = [self makePanelItemWithTitle:@"Quit to library"
                                           action:@selector(askToQuit)
                                      destructive:YES];
     [panel addSubview:self.keyboardItem];
-    [panel addSubview:self.rotationItem];
     [panel addSubview:self.pointerItem];
     [panel addSubview:self.pointerSettingsItem];
     [panel addSubview:self.displayItem];
+    [panel addSubview:self.performanceItem];
+    [panel addSubview:self.performanceSettingsItem];
     [panel addSubview:self.quitItem];
 
     // Confirmation is drawn inside this panel rather than presented as a
@@ -818,6 +997,13 @@ static BVNGuestOverlayView* gOverlay = nil;
     int softwareHeight = 0;
     const BOOL softwareGuest = presentation == nil &&
         BVNGuestControlsScreenSize(&softwareWidth, &softwareHeight);
+    float softwareX = 0.0f;
+    float softwareY = 0.0f;
+    const BOOL insideSoftwarePicture = softwareGuest &&
+        BVNGuestControlsMapSoftwarePoint((float)point.x, (float)point.y,
+                                         &softwareX, &softwareY) &&
+        softwareX >= 0.0f && softwareY >= 0.0f &&
+        softwareX < softwareWidth && softwareY < softwareHeight;
 
     // A tap on the letterbox is not a tap on the game.
     //
@@ -837,7 +1023,8 @@ static BVNGuestOverlayView* gOverlay = nil;
         CGRectContainsPoint(presentation.frame,
                             [self convertPoint:point
                                          toView:presentation.superview]);
-    const BOOL claim = softwareGuest ||
+    const BOOL claim = (softwareGuest &&
+                        (self.trackpadMode || insideSoftwarePicture)) ||
         (presentation != nil && (self.trackpadMode || insidePicture));
 
     // Report what happened, at most once a second. Build 68 removed this line
@@ -861,7 +1048,8 @@ static BVNGuestOverlayView* gOverlay = nil;
             presentation == nil ? @"none" : NSStringFromClass(presentation.class),
             presentation.frame.origin.x, presentation.frame.origin.y,
             presentation.frame.size.width, presentation.frame.size.height,
-            softwareGuest ? @"claimed for software guest"
+            softwareGuest ? (claim ? @"claimed for software guest"
+                                   : @"ignored: outside software picture")
                           : presentation == nil ? @"passed down to SDL"
                                 : (claim ? @"claimed for the guest"
                                          : @"ignored: outside the picture")];
@@ -913,6 +1101,12 @@ static BVNGuestOverlayView* gOverlay = nil;
         return CGPointZero;
     }
     const CGPoint local = [touch locationInView:self];
+    float mappedX = 0.0f;
+    float mappedY = 0.0f;
+    if (BVNGuestControlsMapSoftwarePoint((float)local.x, (float)local.y,
+                                         &mappedX, &mappedY)) {
+        return CGPointMake(mappedX, mappedY);
+    }
     return CGPointMake(local.x * guestWidth / self.bounds.size.width,
                        local.y * guestHeight / self.bounds.size.height);
 }
@@ -924,6 +1118,10 @@ static BVNGuestOverlayView* gOverlay = nil;
         return NO;
     }
     const CGPoint point = [self guestPointForTouch:touch];
+    if (point.x < 0.0 || point.y < 0.0 ||
+        point.x >= guestWidth || point.y >= guestHeight) {
+        return NO;
+    }
     BVNGuestControlsSendPointer((int)lround(point.x), (int)lround(point.y),
                                 phase);
     return YES;
@@ -1032,10 +1230,23 @@ static BVNGuestOverlayView* gOverlay = nil;
     }
     const CGPoint before = self.trackpadLastPoint;
     self.trackpadLastPoint = now;
-    const CGFloat dx = (now.x - before.x) * guestWidth /
-                       MAX(1.0, self.bounds.size.width);
-    const CGFloat dy = (now.y - before.y) * guestHeight /
-                       MAX(1.0, self.bounds.size.height);
+    CGFloat dx = (now.x - before.x) * guestWidth /
+                 MAX(1.0, self.bounds.size.width);
+    CGFloat dy = (now.y - before.y) * guestHeight /
+                 MAX(1.0, self.bounds.size.height);
+    if (BVNGuestPresentationView() == nil) {
+        float beforeX = 0.0f;
+        float beforeY = 0.0f;
+        float nowX = 0.0f;
+        float nowY = 0.0f;
+        if (BVNGuestControlsMapSoftwarePoint((float)before.x, (float)before.y,
+                                             &beforeX, &beforeY) &&
+            BVNGuestControlsMapSoftwarePoint((float)now.x, (float)now.y,
+                                             &nowX, &nowY)) {
+            dx = nowX - beforeX;
+            dy = nowY - beforeY;
+        }
+    }
     const CGFloat totalX = now.x - self.trackpadTouchStart.x;
     const CGFloat totalY = now.y - self.trackpadTouchStart.y;
     if (hypot(totalX, totalY) > 4.0) {
@@ -1123,12 +1334,24 @@ static BVNGuestOverlayView* gOverlay = nil;
                                             guestHeight / 2.0);
     }
     self.cursorView.hidden = NO;
-    self.cursorView.center = presentation != nil
-        ? [presentation convertPoint:self.cursorGuestPoint toView:self]
-        : CGPointMake(self.cursorGuestPoint.x * self.bounds.size.width /
-                          MAX(1.0, guestWidth),
-                      self.cursorGuestPoint.y * self.bounds.size.height /
-                          MAX(1.0, guestHeight));
+    if (presentation != nil) {
+        self.cursorView.center =
+            [presentation convertPoint:self.cursorGuestPoint toView:self];
+    } else {
+        float windowX = 0.0f;
+        float windowY = 0.0f;
+        if (BVNGuestControlsMapSoftwarePointToWindow(
+                (float)self.cursorGuestPoint.x, (float)self.cursorGuestPoint.y,
+                &windowX, &windowY)) {
+            self.cursorView.center = CGPointMake(windowX, windowY);
+        } else {
+            self.cursorView.center = CGPointMake(
+                self.cursorGuestPoint.x * self.bounds.size.width /
+                    MAX(1.0, guestWidth),
+                self.cursorGuestPoint.y * self.bounds.size.height /
+                    MAX(1.0, guestHeight));
+        }
+    }
     [self bringSubviewToFront:self.cursorView];
 }
 
@@ -1195,6 +1418,8 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self layoutMenuPanelWithSafeArea:safe];
     [self layoutKeyboardPanelWithSafeArea:safe];
     [self layoutPointerSettingsPanelWithSafeArea:safe];
+    [self layoutPerformanceSettingsPanelWithSafeArea:safe];
+    [self layoutPerformanceOverlayWithSafeArea:safe];
     [self positionCursor];
 
     // Deliberately does NOT re-fit the guest picture. That belongs to the poll
@@ -1230,9 +1455,11 @@ static BVNGuestOverlayView* gOverlay = nil;
             cursor += kBVNMenuRowHeight;
         }
     } else {
-        for (UIButton* item in @[self.keyboardItem, self.rotationItem,
-                                 self.pointerItem, self.pointerSettingsItem,
-                                 self.displayItem, self.quitItem]) {
+        for (UIButton* item in @[self.keyboardItem, self.pointerItem,
+                                 self.pointerSettingsItem, self.displayItem,
+                                 self.performanceItem,
+                                 self.performanceSettingsItem,
+                                 self.quitItem]) {
             item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
                                     kBVNMenuRowHeight);
             cursor += kBVNMenuRowHeight;
@@ -1403,6 +1630,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     if (!self.menuOpen) {
         self.confirmingQuit = NO;
         self.pointerSettingsOpen = NO;
+        self.performanceSettingsOpen = NO;
     }
     [self applyMenuState];
     BVNLogWrite(BVNLogLevelInfo, "input",
@@ -1456,10 +1684,86 @@ static BVNGuestOverlayView* gOverlay = nil;
     }
 }
 
+- (void)layoutPerformanceSettingsPanelWithSafeArea:(UIEdgeInsets)safe {
+    const CGFloat availableWidth = self.bounds.size.width - safe.left -
+                                   safe.right - kBVNOverlayMargin * 2.0;
+    const CGFloat availableHeight = self.bounds.size.height - safe.top -
+                                    safe.bottom - kBVNOverlayMargin * 2.0;
+    const CGFloat width = MIN(440.0, MAX(280.0, availableWidth));
+    const CGFloat height = MIN(270.0, MAX(230.0, availableHeight));
+    const CGFloat x = safe.left + (availableWidth - width) / 2.0 +
+                      kBVNOverlayMargin;
+    const CGFloat y = safe.top + (availableHeight - height) / 2.0 +
+                      kBVNOverlayMargin;
+    self.performanceSettingsPanel.frame = CGRectMake(x, y, width, height);
+    const CGFloat inset = 16.0;
+    self.performanceSettingsBackItem.frame =
+        CGRectMake(inset, 4.0, width - inset * 2.0, 38.0);
+    const CGFloat rowTop = 44.0;
+    const CGFloat rowHeight = (height - rowTop - 8.0) /
+                              self.performanceSettingLabels.count;
+    NSArray<UISwitch*>* controls = @[self.performanceFPSSwitch,
+                                     self.performanceRAMSwitch,
+                                     self.performanceFrameTimeSwitch,
+                                     self.performanceBatterySwitch];
+    for (NSUInteger index = 0; index < controls.count; ++index) {
+        const CGFloat rowY = rowTop + rowHeight * index;
+        self.performanceSettingLabels[index].frame =
+            CGRectMake(inset, rowY, width - 100.0, rowHeight);
+        UISwitch* control = controls[index];
+        control.center = CGPointMake(width - inset - control.bounds.size.width / 2.0,
+                                     rowY + rowHeight / 2.0);
+    }
+}
+
+- (void)layoutPerformanceOverlayWithSafeArea:(UIEdgeInsets)safe {
+    const CGSize text = [self.performanceLabel
+        sizeThatFits:CGSizeMake(260.0, CGFLOAT_MAX)];
+    const CGSize size = CGSizeMake(MAX(156.0, ceil(text.width) + 20.0),
+                                   MAX(38.0, ceil(text.height) + 16.0));
+    self.performanceView.bounds = CGRectMake(0.0, 0.0, size.width, size.height);
+    self.performanceLabel.frame = CGRectInset(self.performanceView.bounds,
+                                               10.0, 8.0);
+    const CGFloat minX = safe.left + kBVNOverlayMargin + size.width / 2.0;
+    const CGFloat maxX = self.bounds.size.width - safe.right -
+                         kBVNOverlayMargin - size.width / 2.0;
+    const CGFloat minY = safe.top + kBVNOverlayMargin + size.height / 2.0;
+    const CGFloat maxY = self.bounds.size.height - safe.bottom -
+                         kBVNOverlayMargin - size.height / 2.0;
+    self.performanceView.center = CGPointMake(
+        minX + MAX(0.0, maxX - minX) * self.performanceFraction.x,
+        minY + MAX(0.0, maxY - minY) * self.performanceFraction.y);
+}
+
+- (void)dragPerformanceOverlay:(UIPanGestureRecognizer*)recognizer {
+    const CGPoint translation = [recognizer translationInView:self];
+    [recognizer setTranslation:CGPointZero inView:self];
+    const UIEdgeInsets safe = self.safeAreaInsets;
+    const CGFloat halfWidth = self.performanceView.bounds.size.width / 2.0;
+    const CGFloat halfHeight = self.performanceView.bounds.size.height / 2.0;
+    const CGFloat minX = safe.left + kBVNOverlayMargin + halfWidth;
+    const CGFloat maxX = self.bounds.size.width - safe.right -
+                         kBVNOverlayMargin - halfWidth;
+    const CGFloat minY = safe.top + kBVNOverlayMargin + halfHeight;
+    const CGFloat maxY = self.bounds.size.height - safe.bottom -
+                         kBVNOverlayMargin - halfHeight;
+    CGPoint center = self.performanceView.center;
+    center.x = MIN(MAX(center.x + translation.x, minX), MAX(minX, maxX));
+    center.y = MIN(MAX(center.y + translation.y, minY), MAX(minY, maxY));
+    self.performanceView.center = center;
+    if (recognizer.state == UIGestureRecognizerStateEnded ||
+        recognizer.state == UIGestureRecognizerStateCancelled) {
+        self.performanceFraction = CGPointMake(
+            maxX > minX ? (center.x - minX) / (maxX - minX) : 0.0,
+            maxY > minY ? (center.y - minY) / (maxY - minY) : 0.0);
+    }
+}
+
 - (void)closeMenu {
     self.menuOpen = NO;
     self.confirmingQuit = NO;
     self.pointerSettingsOpen = NO;
+    self.performanceSettingsOpen = NO;
     [self applyMenuState];
 }
 
@@ -1467,15 +1771,19 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.menuButton.alpha = self.menuOpen ? 1.0 : 0.4;
     self.scrim.hidden = !self.menuOpen;
     self.menuPanel.hidden = !self.menuOpen || self.pointerSettingsOpen;
+    self.menuPanel.hidden = self.menuPanel.hidden || self.performanceSettingsOpen;
     self.pointerSettingsPanel.hidden = !self.menuOpen ||
                                        !self.pointerSettingsOpen;
+    self.performanceSettingsPanel.hidden = !self.menuOpen ||
+                                           !self.performanceSettingsOpen;
 
     const BOOL confirming = self.confirmingQuit;
     self.keyboardItem.hidden = confirming;
-    self.rotationItem.hidden = confirming;
     self.pointerItem.hidden = confirming;
     self.pointerSettingsItem.hidden = confirming;
     self.displayItem.hidden = confirming;
+    self.performanceItem.hidden = confirming;
+    self.performanceSettingsItem.hidden = confirming;
     self.quitItem.hidden = confirming;
     self.quitPrompt.hidden = !confirming;
     self.quitCancelItem.hidden = !confirming;
@@ -1484,10 +1792,6 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self.keyboardItem setTitle:(self.keyboardPanel.hidden ? @"Show keyboard"
                                                            : @"Hide keyboard")
                        forState:UIControlStateNormal];
-    [self.rotationItem setTitle:(BVNGuestRotationIsUnlocked()
-                                     ? @"Rotation: free"
-                                     : @"Rotation: locked")
-                       forState:UIControlStateNormal];
     [self.pointerItem setTitle:(self.trackpadMode ? @"Pointer: trackpad"
                                                   : @"Pointer: direct tap")
                       forState:UIControlStateNormal];
@@ -1495,6 +1799,19 @@ static BVNGuestOverlayView* gOverlay = nil;
                                     ? @"Display: fill screen"
                                     : @"Display: fit aspect")
                       forState:UIControlStateNormal];
+    const BOOL performanceEnabled = [[NSUserDefaults standardUserDefaults]
+        boolForKey:kBVNPerformanceEnabledKey];
+    [self.performanceItem setTitle:(performanceEnabled
+                                        ? @"Performance overlay: on"
+                                        : @"Performance overlay: off")
+                         forState:UIControlStateNormal];
+    if (self.menuOpen) {
+        [self bringSubviewToFront:self.scrim];
+        [self bringSubviewToFront:self.menuPanel];
+        [self bringSubviewToFront:self.pointerSettingsPanel];
+        [self bringSubviewToFront:self.performanceSettingsPanel];
+    }
+    [self bringSubviewToFront:self.menuButton];
     [self setNeedsLayout];
 }
 
@@ -1520,6 +1837,28 @@ static BVNGuestOverlayView* gOverlay = nil;
     [self applyMenuState];
 }
 
+- (void)openPerformanceSettings {
+    self.performanceSettingsOpen = YES;
+    [self applyMenuState];
+}
+
+- (void)closePerformanceSettings {
+    self.performanceSettingsOpen = NO;
+    [self applyMenuState];
+}
+
+- (void)togglePerformanceOverlay {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    const BOOL enabled = ![defaults boolForKey:kBVNPerformanceEnabledKey];
+    [defaults setBool:enabled forKey:kBVNPerformanceEnabledKey];
+    self.performanceView.hidden = !enabled;
+    self.performanceLastFrameCount =
+        gPerformancePresentedFrames.load(std::memory_order_relaxed);
+    self.performanceLastSampleTime = CACurrentMediaTime();
+    [self updatePerformanceOverlay:self.performanceTimer];
+    [self applyMenuState];
+}
+
 - (void)closePointerSettings {
     self.pointerSettingsOpen = NO;
     [self applyMenuState];
@@ -1532,17 +1871,6 @@ static BVNGuestOverlayView* gOverlay = nil;
                 BVNGuestPresentationIsStretched()
                     ? "Guest display mode: fill screen."
                     : "Guest display mode: fit aspect.");
-}
-
-- (void)toggleRotation {
-    const bool unlocked = !BVNGuestRotationIsUnlocked();
-    // End the UIControl transaction before UIKit begins replacing/resizing
-    // the scene hierarchy. Leaving this panel open while its own touch-up
-    // handler initiates rotation is how a control can remain in tracking
-    // state across the transition.
-    [self closeMenu];
-    [self cancelTrackpadGesture];
-    BVNGuestSetRotationUnlocked(unlocked);
 }
 
 - (void)askToQuit {
@@ -1763,6 +2091,10 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
     }
 }
 
+extern "C" void BVNGuestPerformanceFramePresented(void) {
+    gPerformancePresentedFrames.fetch_add(1, std::memory_order_relaxed);
+}
+
 extern "C" void BVNGuestOverlayGeometryDidChange(void) {
     if (!NSThread.isMainThread || gOverlay == nil) {
         return;
@@ -1774,14 +2106,18 @@ extern "C" void BVNGuestOverlayGeometryDidChange(void) {
     // position and startup notice explicitly.
     BVNGuestOverlayView* oldOverlay = gOverlay;
     const CGPoint menuFraction = oldOverlay.menuButtonFraction;
+    const CGPoint performanceFraction = oldOverlay.performanceFraction;
     const BOOL startupVisible = !oldOverlay.startupNotice.hidden;
     NSString* startupText = oldOverlay.startupProgress.text;
+    [oldOverlay.performanceTimer invalidate];
+    oldOverlay.performanceTimer = nil;
     [oldOverlay releaseHeldKeys];
     [oldOverlay removeFromSuperview];
     gOverlay = nil;
     BVNGuestOverlayInstall();
     if (gOverlay != nil) {
         gOverlay.menuButtonFraction = menuFraction;
+        gOverlay.performanceFraction = performanceFraction;
         gOverlay.startupNotice.hidden = !startupVisible;
         gOverlay.startupProgress.text = startupText;
         [gOverlay setNeedsLayout];
@@ -1801,6 +2137,8 @@ extern "C" void BVNGuestOverlayRemove(void) {
     if (!NSThread.isMainThread || gOverlay == nil) {
         return;
     }
+    [gOverlay.performanceTimer invalidate];
+    gOverlay.performanceTimer = nil;
     [gOverlay releaseHeldKeys];
     [gOverlay removeFromSuperview];
     gOverlay = nil;

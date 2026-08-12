@@ -50,6 +50,7 @@ extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
 extern "C" void BVNGuestVulkanSurfaceDidPresent(void* surface);
 extern "C" bool BVNGuestTakeX11PatchClearRequest(void);
 extern "C" void BVNGuestClearX11Patches(void);
+extern "C" void BVNGuestPerformanceFramePresented(void);
 extern "C" void* BVNCreateOffscreenMetalLayer(U32 width, U32 height);
 extern "C" void BVNDestroyOffscreenMetalLayer(void* layer);
 
@@ -705,10 +706,22 @@ void KVulkdanSDLImpl::presentVulkanSwapchain(void* swapchain, int result) {
 #ifdef BOXEDWINE_IOS
     if (presentation && (result == 0 || result == 1000001003)) {
         bvnReportPresentRate();
+        BVNGuestPerformanceFramePresented();
         // WineD3D uses X11/GDI for partial COPY presents. Those patches sit
-        // transparently above the last Vulkan frame; the next successful full
-        // Vulkan present supersedes them, so clear the overlay exactly once.
-        if (BVNGuestTakeX11PatchClearRequest()) {
+        // transparently above the last Vulkan frame. A sparse Vulkan present
+        // is not necessarily newer than those asynchronously published GDI
+        // patches: Grisaia drops to one Vulkan present every 2-5 seconds while
+        // its text is still updating through X11, and clearing at that cadence
+        // made the visible dialogue jump backwards until the next patch.
+        // Clear only after two nearby Vulkan presents establish that the game
+        // is actively animating again and the full-frame stream supersedes
+        // the patch layer.
+        static U32 previousSuccessfulPresent = 0;
+        const U32 presentNow = SDL_GetTicks();
+        const bool fullFrameStreamActive = previousSuccessfulPresent != 0 &&
+            presentNow - previousSuccessfulPresent <= 250;
+        previousSuccessfulPresent = presentNow;
+        if (fullFrameStreamActive && BVNGuestTakeX11PatchClearRequest()) {
             DISPATCH_MAIN_THREAD_BLOCK_BEGIN
             BVNGuestClearX11Patches();
             DISPATCH_MAIN_THREAD_BLOCK_END

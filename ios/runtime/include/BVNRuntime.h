@@ -162,11 +162,25 @@ typedef struct {
     // It is a changing snapshot, not the device's total RAM.
     uint64_t availableBytes;
     uint64_t physicalMemoryBytes;
+    // Current resident footprint of BoxedVN itself. Used by the optional
+    // in-game performance overlay; unlike availableBytes this is memory
+    // already committed by the process.
+    uint64_t processResidentBytes;
     const char* detail;
 } BVNMemoryReport;
 
 // Safe and side-effect free. Suitable for the library screen and its timer.
 BVNMemoryReport BVNMemoryProbe(void);
+
+// Memory advertised to the 32-bit Linux/Wine guest. Boxedwine historically
+// hard-coded 1 GB in both sysinfo() and /proc/meminfo; iOS can safely expose a
+// larger but still 32-bit-addressable budget when the signed process has it.
+uint64_t BVNGuestReportedTotalMemory(void);
+uint64_t BVNGuestReportedFreeMemory(void);
+
+// Applies the persisted whole-app orientation preference after Settings
+// changes it. Values are 0 portrait, 1 landscape, 2 landscape flipped.
+void BVNApplyPreferredOrientation(void);
 
 // ---------------------------------------------------------------------------
 // Storage layout

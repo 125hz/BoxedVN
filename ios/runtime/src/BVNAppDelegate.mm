@@ -66,10 +66,6 @@ extern "C" bool BVNLogStartSessionFile(void);
 @interface BVNAppDelegate : SDLUIKitDelegate
 @property (nonatomic, strong) UIWindow* libraryWindow;
 @property (nonatomic, assign) BOOL guestOrientationLocked;
-// Set from the in-game overlay's rotation control. Only meaningful while
-// guestOrientationLocked is YES, i.e. while a guest session is running.
-@property (nonatomic, assign) BOOL guestRotationUnlocked;
-@property (nonatomic, assign) UIInterfaceOrientation orientationBeforeGuest;
 - (void)createLibraryWindowForScene:(UIWindowScene*)scene;
 - (UIWindow*)superWindowForGuest;
 @end
@@ -103,6 +99,31 @@ extern "C" bool BVNLogStartSessionFile(void);
 @end
 
 static __weak BVNAppDelegate* gAppDelegate = nil;
+static NSString* const kBVNPreferredOrientationKey =
+    @"BoxedVN.preferredOrientation";
+
+static NSInteger BVNPreferredOrientationValue(void) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    const NSInteger value = [defaults objectForKey:kBVNPreferredOrientationKey]
+        ? [defaults integerForKey:kBVNPreferredOrientationKey] : 1;
+    return MIN(2, MAX(0, value));
+}
+
+static UIInterfaceOrientationMask BVNPreferredOrientationMask(void) {
+    switch (BVNPreferredOrientationValue()) {
+        case 0: return UIInterfaceOrientationMaskPortrait;
+        case 2: return UIInterfaceOrientationMaskLandscapeLeft;
+        default: return UIInterfaceOrientationMaskLandscapeRight;
+    }
+}
+
+static BOOL BVNOrientationMatchesPreference(UIInterfaceOrientation orientation) {
+    switch (BVNPreferredOrientationValue()) {
+        case 0: return orientation == UIInterfaceOrientationPortrait;
+        case 2: return orientation == UIInterfaceOrientationLandscapeLeft;
+        default: return orientation == UIInterfaceOrientationLandscapeRight;
+    }
+}
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanSurfaceViews = nil;
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanWaitingOverlays = nil;
 
@@ -175,6 +196,9 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     BVNLogStartSessionFile();
 
     gAppDelegate = self;
+    [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+        kBVNPreferredOrientationKey: @1,
+    }];
 
     [NSNotificationCenter.defaultCenter
         addObserver:self
@@ -197,23 +221,11 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 
 - (UIInterfaceOrientationMask)application:(UIApplication*)application
     supportedInterfaceOrientationsForWindow:(UIWindow*)window {
-    // Guest sessions start landscape-locked, and stay that way unless the
-    // player unlocks rotation from the in-game overlay. The lock exists
-    // because a live orientation change while boxedmain owns the main thread
-    // makes UIKit replace SDL's Metal drawable and first responder in the
-    // middle of the emulator's event loop; on build 15 that presented as a
-    // frozen guest and a permanently unresponsive keyboard button. What is
-    // different now is that the presenter re-fits the picture and the pointer
-    // transform on every layout pass (BVNGuestOverlayView.layoutSubviews), so
-    // a new drawable is expected rather than fatal - but it is still opt-in,
-    // and locked remains the default. The SwiftUI library is freely rotatable
-    // before and after a guest.
-    if (self.guestOrientationLocked) {
-        return self.guestRotationUnlocked
-                   ? UIInterfaceOrientationMaskAllButUpsideDown
-                   : UIInterfaceOrientationMaskLandscape;
-    }
-    return UIInterfaceOrientationMaskAllButUpsideDown;
+    // A single persisted orientation owns the library and the guest. This
+    // avoids changing UIWindow/Metal geometry during launch or play, which is
+    // the transition that repeatedly invalidated UIKit's touch responder
+    // chain on physical devices.
+    return BVNPreferredOrientationMask();
 }
 
 - (void)createLibraryWindowForScene:(UIWindowScene*)scene {
@@ -278,22 +290,24 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     BVNRuntimeNotifyFrontendReady();
 }
 
-- (void)waitForLandscapeWithAttempt:(NSUInteger)attempt
-                         completion:(dispatch_block_t)completion {
+- (void)waitForPreferredOrientationWithAttempt:(NSUInteger)attempt
+                                     completion:(dispatch_block_t)completion {
     UIWindowScene* scene = self.libraryWindow.windowScene;
     const CGSize size = self.libraryWindow.bounds.size;
-    const BOOL boundsAreLandscape = size.width > size.height;
-    const BOOL sceneIsLandscape =
-        scene == nil || UIInterfaceOrientationIsLandscape(scene.interfaceOrientation);
+    const BOOL wantsPortrait = BVNPreferredOrientationValue() == 0;
+    const BOOL boundsMatch = wantsPortrait ? size.height >= size.width
+                                           : size.width >= size.height;
+    const BOOL sceneMatches = scene == nil ||
+        BVNOrientationMatchesPreference(scene.interfaceOrientation);
 
     // Waiting for both values matters. interfaceOrientation changes before
     // the final layout pass on some iOS releases; creating SDL in that gap
     // gives its CAMetalLayer the portrait drawable which caused the stretched
     // first frame and subsequent rotation freezes reported on build 15.
-    if (boundsAreLandscape && sceneIsLandscape) {
+    if (boundsMatch && sceneMatches) {
         dispatch_async(dispatch_get_main_queue(), ^{
             BVNLogWrite(BVNLogLevelInfo, "frontend",
-                        "Landscape guest geometry settled before SDL startup.");
+                        "Preferred app geometry settled before SDL startup.");
             completion();
         });
         return;
@@ -301,7 +315,7 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 
     if (attempt >= 180) {
         BVNLogWrite(BVNLogLevelWarning, "frontend",
-                    "Landscape geometry did not settle within three seconds; "
+                    "Preferred geometry did not settle within three seconds; "
                     "continuing so the launch request cannot remain stuck.");
         completion();
         return;
@@ -310,7 +324,8 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  (int64_t)(NSEC_PER_SEC / 60)),
                    dispatch_get_main_queue(), ^{
-        [self waitForLandscapeWithAttempt:attempt + 1 completion:completion];
+        [self waitForPreferredOrientationWithAttempt:attempt + 1
+                                           completion:completion];
     });
 }
 
@@ -318,32 +333,24 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     NSAssert(NSThread.isMainThread, @"Guest presentation must be prepared on main");
 
     UIWindowScene* scene = self.libraryWindow.windowScene;
-    self.orientationBeforeGuest = scene.interfaceOrientation;
-    if (self.orientationBeforeGuest == UIInterfaceOrientationUnknown) {
-        self.orientationBeforeGuest =
-            self.libraryWindow.bounds.size.width > self.libraryWindow.bounds.size.height
-                ? UIInterfaceOrientationLandscapeRight
-                : UIInterfaceOrientationPortrait;
-    }
     self.guestOrientationLocked = YES;
-    self.guestRotationUnlocked = NO;
     [self.libraryWindow.rootViewController
         setNeedsUpdateOfSupportedInterfaceOrientations];
 
     if (scene == nil) {
         BVNLogWrite(BVNLogLevelWarning, "frontend",
-                    "No UIWindowScene was available for the landscape guest "
+                    "No UIWindowScene was available for the preferred guest "
                     "request; continuing with the current geometry.");
         completion();
         return;
     }
 
     BVNLogWrite(BVNLogLevelInfo, "frontend",
-                "Requesting landscape and waiting for UIKit to finish before "
+                "Confirming the locked app orientation before "
                 "creating SDL's guest window.");
     UIWindowSceneGeometryPreferencesIOS* preferences =
         [[UIWindowSceneGeometryPreferencesIOS alloc]
-            initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+            initWithInterfaceOrientations:BVNPreferredOrientationMask()];
     // The launch request originates in a SwiftUI button action. Let that
     // touch-up transaction finish before changing scene geometry; rotating
     // inside it can leave UIKit's window-level touch delivery permanently in
@@ -352,40 +359,19 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
         [scene requestGeometryUpdateWithPreferences:preferences
                                       errorHandler:^(NSError* error) {
             NSString* message = [NSString stringWithFormat:
-                @"UIKit did not apply the preferred landscape guest geometry: %@",
+                @"UIKit did not apply the preferred app geometry: %@",
                 error.localizedDescription];
             BVNLogWrite(BVNLogLevelWarning, "frontend", message.UTF8String);
         }];
-        [self waitForLandscapeWithAttempt:0 completion:completion];
+        [self waitForPreferredOrientationWithAttempt:0 completion:completion];
     });
 }
 
 - (void)finishGuestPresentation {
     NSAssert(NSThread.isMainThread, @"Guest presentation must finish on main");
     self.guestOrientationLocked = NO;
-    self.guestRotationUnlocked = NO;
     [self.libraryWindow.rootViewController
         setNeedsUpdateOfSupportedInterfaceOrientations];
-
-    UIWindowScene* scene = self.libraryWindow.windowScene;
-    UIInterfaceOrientationMask restoreMask = UIInterfaceOrientationMaskPortrait;
-    if (UIInterfaceOrientationIsLandscape(self.orientationBeforeGuest)) {
-        restoreMask = self.orientationBeforeGuest == UIInterfaceOrientationLandscapeLeft
-                          ? UIInterfaceOrientationMaskLandscapeLeft
-                          : UIInterfaceOrientationMaskLandscapeRight;
-    }
-    if (scene != nil) {
-        UIWindowSceneGeometryPreferencesIOS* preferences =
-            [[UIWindowSceneGeometryPreferencesIOS alloc]
-                initWithInterfaceOrientations:restoreMask];
-        [scene requestGeometryUpdateWithPreferences:preferences
-                                      errorHandler:^(NSError* error) {
-            NSString* message = [NSString stringWithFormat:
-                @"UIKit did not restore the library orientation: %@",
-                error.localizedDescription];
-            BVNLogWrite(BVNLogLevelWarning, "frontend", message.UTF8String);
-        }];
-    }
 }
 
 - (BOOL)setGuestKeyboardVisible:(BOOL)visible {
@@ -568,61 +554,56 @@ extern "C" void BVNFinishGuestPresentation(void) {
     [gAppDelegate finishGuestPresentation];
 }
 
-// Implemented in platform/sdl/knativescreenSDL.cpp. SDL asks its own view
-// controller for the orientation mask too, and answers landscape-only for a
-// window that is wider than it is tall unless SDL_HINT_ORIENTATIONS says
-// otherwise. UIKit intersects that with the app delegate's mask, so both have
-// to be changed together or nothing happens.
-extern "C" void BVNGuestControlsSetRotationHint(bool allowPortrait);
-
 extern "C" UIWindow* BVNGuestUIWindow(void) {
     return [gAppDelegate superWindowForGuest];
 }
 
-extern "C" bool BVNGuestRotationIsUnlocked(void) {
-    return gAppDelegate.guestRotationUnlocked == YES;
+extern "C" const char* BVNGuestPreferredOrientationHint(void) {
+    switch (BVNPreferredOrientationValue()) {
+        case 0: return "Portrait";
+        case 2: return "LandscapeLeft";
+        default: return "LandscapeRight";
+    }
 }
 
-extern "C" void BVNGuestSetRotationUnlocked(bool unlocked) {
+extern "C" void BVNApplyPreferredOrientation(void) {
     if (!NSThread.isMainThread) {
-        BVNLogWrite(BVNLogLevelWarning, "frontend",
-                    "Ignored an off-main guest rotation request.");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BVNApplyPreferredOrientation();
+        });
         return;
     }
     BVNAppDelegate* delegate = gAppDelegate;
     if (delegate == nil) {
         return;
     }
-    delegate.guestRotationUnlocked = unlocked ? YES : NO;
-    BVNGuestControlsSetRotationHint(unlocked);
-
     UIWindow* guestWindow = [delegate superWindowForGuest];
     [guestWindow.rootViewController
         setNeedsUpdateOfSupportedInterfaceOrientations];
     [delegate.libraryWindow.rootViewController
         setNeedsUpdateOfSupportedInterfaceOrientations];
 
-    // Re-locking has to actively put the device back into landscape; UIKit
-    // does not rotate on its own just because portrait stopped being allowed
-    // while the device is still held that way.
     UIWindowScene* scene = guestWindow.windowScene
                                ?: delegate.libraryWindow.windowScene;
-    if (!unlocked && scene != nil) {
+    if (scene != nil) {
         UIWindowSceneGeometryPreferencesIOS* preferences =
             [[UIWindowSceneGeometryPreferencesIOS alloc]
-                initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+                initWithInterfaceOrientations:BVNPreferredOrientationMask()];
         [scene requestGeometryUpdateWithPreferences:preferences
                                        errorHandler:^(NSError* error) {
             NSString* message = [NSString stringWithFormat:
-                @"UIKit did not return the guest to landscape: %@",
+                @"UIKit did not apply the selected app orientation: %@",
                 error.localizedDescription];
             BVNLogWrite(BVNLogLevelWarning, "frontend", message.UTF8String);
         }];
     }
 
-    BVNLogWrite(BVNLogLevelInfo, "frontend",
-                unlocked ? "Guest rotation unlocked by the player."
-                         : "Guest rotation re-locked to landscape.");
+    NSString* message = [NSString stringWithFormat:
+        @"App orientation locked to %@.",
+        BVNPreferredOrientationValue() == 0 ? @"portrait"
+            : BVNPreferredOrientationValue() == 2 ? @"landscape flipped"
+                                                   : @"landscape"];
+    BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
 }
 
 extern "C" bool BVNGuestKeyboardSetVisible(bool visible) {

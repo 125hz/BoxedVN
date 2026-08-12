@@ -17,6 +17,9 @@
  */
 
 #include "boxedwine.h"
+#ifdef BOXEDWINE_IOS
+#include "BVNRuntime.h"
+#endif
 
 #include "bufferaccess.h"
 
@@ -25,6 +28,15 @@
 
 FsOpenNode* openMemInfo(const std::shared_ptr<FsNode>& node, U32 flags, U32 data) {
     char meminfo[128];
+#ifdef BOXEDWINE_IOS
+    const unsigned long long totalKB =
+        BVNGuestReportedTotalMemory() / 1024ull;
+    const unsigned long long freeKB =
+        BVNGuestReportedFreeMemory() / 1024ull;
+    snprintf(meminfo, sizeof(meminfo),
+             "MemTotal: %llu kB\nMemFree: %llu kB\n", totalKB, freeKB);
+#else
     snprintf(meminfo, sizeof(meminfo), "MemTotal: %d kB\nMemFree: %d kB\n", 1024*1024, 768*1024);
+#endif
     return new BufferAccess(node, flags, BString::copy(meminfo));
 }

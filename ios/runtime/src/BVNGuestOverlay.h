@@ -62,6 +62,10 @@ void BVNGuestOverlayApplyPendingState(void);
 // later touch appear dead until process restart.
 void BVNGuestOverlayGeometryDidChange(void);
 
+// Records one successful full Vulkan presentation for the optional FPS and
+// frame-time overlay. Safe from the presentation thread.
+void BVNGuestPerformanceFramePresented(void);
+
 // ---------------------------------------------------------------------------
 // Implemented by BVNAppDelegate.mm
 // ---------------------------------------------------------------------------
@@ -69,9 +73,6 @@ void BVNGuestOverlayGeometryDidChange(void);
 // SDL's own UIWindow for the running guest, bypassing the library-window
 // fallback in -[BVNAppDelegate window].  nil when no session is running.
 UIWindow* BVNGuestUIWindow(void);
-
-bool BVNGuestRotationIsUnlocked(void);
-void BVNGuestSetRotationUnlocked(bool unlocked);
 
 // Re-fits the guest picture when the window has changed shape since the last
 // fit, and reports whether it did.  Cheap when nothing has moved.  This is the
@@ -109,6 +110,14 @@ void BVNGuestControlsSendPointer(int x, int y, int phase);
 // Returns the current emulated screen size for software-rendered sessions.
 // Vulkan sessions normally use BVNGuestPresentationView's guest-sized bounds.
 bool BVNGuestControlsScreenSize(int* width, int* height);
+
+// SDL_RenderSetLogicalSize owns the Wine desktop's viewport. These helpers
+// apply that exact renderer transform for the UIKit overlay, avoiding a
+// separate whole-window approximation near the right edge.
+bool BVNGuestControlsMapSoftwarePoint(float windowX, float windowY,
+                                      float* guestX, float* guestY);
+bool BVNGuestControlsMapSoftwarePointToWindow(float guestX, float guestY,
+                                              float* windowX, float* windowY);
 
 // A right click at a point in the same space.  Used by the two-finger tap.
 void BVNGuestControlsSendRightClick(int x, int y);

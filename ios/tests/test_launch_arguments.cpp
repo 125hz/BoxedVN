@@ -68,7 +68,7 @@ BOXEDVN_TEST(game_command_preserves_mount_environment_and_arguments) {
         "boxedvn", "-root", "/prefix", "-zip", "/rootfs.zip", "-nozip",
         "-mount_drive", "/games/example", "d",
         "-mount_drive", "/documents/shared", "e",
-        "-resolution", "1280x720", "-nosound",
+        "-resolution", "1024x576", "-nosound",
         "-dxvk", "1", "-w",
         "/home/username/.wine/dosdevices/d:/content",
         "-env", "WINEDEBUG=warn+d3d_shader,-d3d",

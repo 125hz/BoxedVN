@@ -588,10 +588,29 @@ struct StatusView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @AppStorage("BoxedVN.preferredOrientation")
+    private var preferredOrientation = 1
     @State private var showingRootFilesystemImporter = false
 
     var body: some View {
         List {
+            Section {
+                Picker("App orientation", selection: $preferredOrientation) {
+                    Text("Portrait").tag(0)
+                    Text("Landscape").tag(1)
+                    Text("Landscape flipped").tag(2)
+                }
+                .onChange(of: preferredOrientation) { _ in
+                    BVNApplyPreferredOrientation()
+                }
+            } header: {
+                Text("Display")
+            } footer: {
+                Text("BoxedVN stays in this orientation in the library and "
+                     + "while Wine is running. Change it here before "
+                     + "launching a game.")
+            }
+
             Section {
                 Text(model.rootFilesystemDescription)
                     .font(.callout)

@@ -97,6 +97,10 @@ public:
     // presenter measured. Public because UIKit calls it after a rotation, via
     // BVNGuestPresentationGeometryChanged.
     void refreshIOSGuestPointerTransform();
+    bool mapIOSSoftwarePoint(float windowX, float windowY,
+                             float* guestX, float* guestY);
+    bool mapIOSSoftwarePointToWindow(float guestX, float guestY,
+                                     float* windowX, float* windowY);
 #endif
 
     bool clipboardIsTextAvailable() override;

@@ -3664,3 +3664,47 @@ sidecar: `e1d1c70107c8c4142386782e74547dff202f74e114ed7b1b7ba1fcc46945b627`.
 The rolling Release targets the exact producing commit
 `e09a9ab2421530b9d9ab32807b3a49627ecf880f`. Physical right-side input
 acceptance remains pending build 83.
+
+### 2026-08-11 - build 84: coherent phone mode, mixed-present persistence, and runtime controls
+
+The build-83 device logs separate the remaining high-resolution input problem
+from UIKit. At 1280x720, the overlay, SDL, the X11 root, every live Xlib
+`Screen`, and the active Wine client all receive the requested coordinates
+unchanged as far as x=1196. Grisaia still exposes a narrower logical hit-test
+range, while its own 1024x576 mode is device-confirmed to reach the final
+controls. Generic game sessions left on `default` therefore now start Wine at
+1024x576. This remains a title-independent 16:9 policy; explicit 1280x720 is
+still available for DPI-aware games. Browse the PC uses the same mode, making
+Wine's non-antialiased desktop text more legible on a phone.
+
+The software Wine desktop no longer estimates cursor coordinates from the
+whole UIWindow. The UIKit overlay converts both direct touches and the visual
+trackpad cursor through SDL's actual logical renderer viewport with
+`SDL_RenderWindowToLogical` / `SDL_RenderLogicalToWindow`, including its
+letterbox. This removes the small visual-cursor versus click offset and stops
+black-bar taps from being clamped onto a guest edge.
+
+`fps-drop.log` rules out RAM exhaustion and a blocked GPU: the signed process
+has 5.99 GB of headroom, the JIT arena still has over 60 MB free, host present
+calls take only milliseconds, and Wine continues publishing X11/GDI partial
+updates while Vulkan falls to 0.2-0.6 presents/sec. The mixed presenter was
+clearing those newer patches on every sparse Vulkan present. It now preserves
+the patch layer during sparse/static cadence and clears it only after two
+nearby Vulkan presents prove a full-frame animation stream has resumed.
+
+The 1 GB value shown inside both games was not an iOS limit: Boxedwine
+hard-coded it in Linux `sysinfo()` and `/proc/meminfo`. On iOS these now report
+a live host-backed budget capped at 3 GB, which is the safe ceiling for the
+32-bit Wine address space. The optional in-game performance overlay is
+draggable and displays FPS, process RAM used/available total, frame-time, and
+battery; each metric has an independent persistent switch.
+
+Live rotation was removed from the in-game menu. Settings now selects one
+whole-app orientation (portrait, landscape, or landscape flipped), and UIKit
+and SDL receive the same single-orientation policy before Wine starts. This
+avoids replacing the active responder/Metal hierarchy during a session.
+
+**Local evidence:** `git diff --check` passes. In the Visual Studio developer
+environment the host-independent suite builds successfully, runs all 93 tests
+with zero failures, and CTest passes 1/1. iPhoneOS compilation and physical
+input/FPS acceptance remain pending build 84.

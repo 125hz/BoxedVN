@@ -158,6 +158,26 @@ extern "C" bool BVNGuestControlsScreenSize(int* width, int* height) {
            gIOSActiveScreen->screenHeight() > 0;
 }
 
+extern "C" bool BVNGuestControlsMapSoftwarePoint(float windowX, float windowY,
+                                                   float* guestX, float* guestY) {
+    if (!gIOSActiveScreen) {
+        return false;
+    }
+    return gIOSActiveScreen->mapIOSSoftwarePoint(windowX, windowY,
+                                                 guestX, guestY);
+}
+
+extern "C" bool BVNGuestControlsMapSoftwarePointToWindow(float guestX,
+                                                           float guestY,
+                                                           float* windowX,
+                                                           float* windowY) {
+    if (!gIOSActiveScreen) {
+        return false;
+    }
+    return gIOSActiveScreen->mapIOSSoftwarePointToWindow(
+        guestX, guestY, windowX, windowY);
+}
+
 // The window changed shape (rotation, or the presenter re-letterboxed). The
 // pointer transform is re-derived from the presenter's measured rectangle;
 // it is never predicted. See refreshIOSGuestPointerTransform.
@@ -167,17 +187,10 @@ extern "C" void BVNGuestPresentationGeometryChanged(void) {
     }
 }
 
-// SDL asks its view controller for the supported orientations on every UIKit
-// rotation query, and answers from SDL_HINT_ORIENTATIONS when it is set. With
-// no hint it derives the answer from the guest window's shape: an 800x600
-// window is wider than it is tall, so SDL reports landscape-only and UIKit
-// never even offers portrait. The app delegate's own mask is ANDed with this
-// one, so unlocking rotation has to change both.
-extern "C" void BVNGuestControlsSetRotationHint(bool allowPortrait) {
-    SDL_SetHint(SDL_HINT_ORIENTATIONS,
-                allowPortrait ? "LandscapeLeft LandscapeRight Portrait"
-                              : "LandscapeLeft LandscapeRight");
-}
+// Implemented by BVNAppDelegate.mm. SDL's view controller intersects this
+// hint with the UIApplicationDelegate mask, so both use the same persisted
+// whole-app orientation rather than allowing a live guest rotation.
+extern "C" const char* BVNGuestPreferredOrientationHint(void);
 
 #endif
 
@@ -572,6 +585,25 @@ bool KNativeScreenSDL::isVisible() {
 }
 
 #ifdef BOXEDWINE_IOS
+bool KNativeScreenSDL::mapIOSSoftwarePoint(float windowX, float windowY,
+                                            float* guestX, float* guestY) {
+    if (!renderer || !guestX || !guestY) {
+        return false;
+    }
+    SDL_RenderWindowToLogical(renderer, windowX, windowY, guestX, guestY);
+    return true;
+}
+
+bool KNativeScreenSDL::mapIOSSoftwarePointToWindow(float guestX, float guestY,
+                                                    float* windowX,
+                                                    float* windowY) {
+    if (!renderer || !windowX || !windowY) {
+        return false;
+    }
+    SDL_RenderLogicalToWindow(renderer, guestX, guestY, windowX, windowY);
+    return true;
+}
+
 void KNativeScreenSDL::syncIOSGuestPresentation(const char* reason) {
     if (!window || !renderer) {
         return;
@@ -1082,12 +1114,10 @@ void KNativeScreenSDL::recreateMainWindow() {
         SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, scaleQuality.c_str());
 
 #ifdef BOXEDWINE_IOS
-        // UIKit settles the scene in landscape before this SDL window exists,
-        // and keeps it landscape for the session. Matching that policy in
-        // SDL prevents its view controller from advertising a live portrait
-        // transition that Boxedwine cannot safely service while boxedmain
-        // owns the main thread.
-        SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+        // UIKit settles the scene in the user's locked orientation before
+        // this SDL window exists. Match that exact single orientation here.
+        SDL_SetHint(SDL_HINT_ORIENTATIONS,
+                    BVNGuestPreferredOrientationHint());
         input->scaleX = 100;
         input->scaleY = 100;
         input->scaleXOffset = 0;

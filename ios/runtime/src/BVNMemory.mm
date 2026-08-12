@@ -6,9 +6,11 @@
 #import <Foundation/Foundation.h>
 
 #include <os/proc.h>
+#include <mach/mach.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -115,6 +117,16 @@ BVNMemoryEntitlementStatus signedEntitlementStatus(std::string& detail) {
 
 }  // namespace
 
+static uint64_t processResidentBytes(void) {
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return static_cast<uint64_t>(info.resident_size);
+}
+
 extern "C" BVNMemoryReport BVNMemoryProbe(void) {
     static thread_local std::string detail;
     BVNMemoryReport report{};
@@ -122,6 +134,27 @@ extern "C" BVNMemoryReport BVNMemoryProbe(void) {
     report.availableBytes = static_cast<uint64_t>(os_proc_available_memory());
     report.physicalMemoryBytes =
         static_cast<uint64_t>(NSProcessInfo.processInfo.physicalMemory);
+    report.processResidentBytes = processResidentBytes();
     report.detail = detail.c_str();
     return report;
+}
+
+extern "C" uint64_t BVNGuestReportedTotalMemory(void) {
+    constexpr uint64_t kMinimum = 512ull * 1024ull * 1024ull;
+    // The guest is 32-bit. Advertising more than 3 GB invites Wine to make
+    // allocations that cannot coexist in its user address space even when
+    // the iOS host process has a 6 GB entitlement budget.
+    constexpr uint64_t kGuestAddressableMaximum = 3ull * 1024ull * 1024ull * 1024ull;
+    const BVNMemoryReport report = BVNMemoryProbe();
+    const uint64_t processBudget = report.availableBytes +
+                                   report.processResidentBytes;
+    return std::max(kMinimum,
+                    std::min(kGuestAddressableMaximum,
+                             std::min(report.physicalMemoryBytes,
+                                      processBudget)));
+}
+
+extern "C" uint64_t BVNGuestReportedFreeMemory(void) {
+    return std::min(BVNGuestReportedTotalMemory(),
+                    static_cast<uint64_t>(os_proc_available_memory()));
 }

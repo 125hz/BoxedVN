@@ -80,6 +80,7 @@ struct MemoryReport {
     var entitlement: EntitlementStatus
     var availableBytes: UInt64
     var physicalMemoryBytes: UInt64
+    var processResidentBytes: UInt64
     var detail: String
 
     var statusText: String {
@@ -107,6 +108,7 @@ struct MemoryReport {
             entitlement: status,
             availableBytes: report.availableBytes,
             physicalMemoryBytes: report.physicalMemoryBytes,
+            processResidentBytes: report.processResidentBytes,
             detail: report.detail.map(String.init(cString:)) ?? ""
         )
     }

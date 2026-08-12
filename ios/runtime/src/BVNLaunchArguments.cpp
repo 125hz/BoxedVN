@@ -180,12 +180,18 @@ std::vector<std::string> BVNBuildLaunchArguments(
         // absolute pointer positions back through that stale monitor, so an
         // otherwise-correct x=1218 arrives at the Windows game near x=761.
         //
-        // Start generic game sessions on a 1280x720 virtual monitor. This is
+        // Start generic game sessions on a 1024x576 virtual monitor. This is
         // not a title profile: every imported Wine game with no explicit
-        // resolution gets the same coherent 16:9 desktop, while a resolution
-        // selected by the user above continues to take precedence.
+        // resolution gets the same coherent 16:9 desktop. 1024x576 is also
+        // the largest mode for which the current 32-bit Wine X11 driver keeps
+        // its logical monitor, DirectInput range and DXVK client identical on
+        // iOS. At 1280x720 Wine exposes a 960/1024-wide logical input range to
+        // some non-DPI-aware applications, making the final controls on the
+        // right unreachable even though UIKit and X11 both report x=1279.
+        // A resolution selected by the user above continues to take
+        // precedence, so 1280x720 remains available for DPI-aware titles.
         argv.push_back("-resolution");
-        argv.push_back("1280x720");
+        argv.push_back("1024x576");
     }
     if (launch.bitsPerPixel == 16 || launch.bitsPerPixel == 32) {
         argv.push_back("-bpp");
