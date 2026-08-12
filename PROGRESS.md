@@ -3750,7 +3750,14 @@ The shared Wine desktop and newly imported games again default to a coherent
 pointer range at that size can explicitly select 1024x576 in launch settings;
 the explicit selection still overrides the global default.
 
-**Local evidence:** `git diff --check` passes. In the Visual Studio developer
+**Build evidence:** `git diff --check` passes. In the Visual Studio developer
 environment the host-independent suite builds successfully and CTest passes
-1/1, covering all 93 tests. iPhoneOS compilation and long-session physical
-Grisaia acceptance remain pending build 85.
+1/1, covering all 93 tests. GitHub Actions run 31557165044 passed the same
+suite plus the full iPhoneOS compile, app validation, increased-memory
+entitlement check, packaging, and direct rolling Release upload; the IPA job
+completed in 2 minutes 2 seconds. The published build 85 `BoxedVN.ipa` is
+8,170,864 bytes and its downloaded SHA-256 matches the Release digest:
+`4109105e99a129c7e8e3c8191ba5b19459f0720f32b90a464b993fbbca08737c`.
+The rolling Release targets the exact producing commit
+`1312c5960622b146b8750b875f131d8e2871cd01`. Long-session physical Grisaia
+acceptance remains pending build 85.
