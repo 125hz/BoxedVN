@@ -3860,8 +3860,14 @@ The launch button now reloads the saved manifest-backed game before starting,
 so renderer and resolution changes apply to the same launch instead of one
 launch later.
 
-**Local build evidence:** `git diff --check` passes. In the Visual Studio
-developer environment the host-independent executable runs all 99 tests with
-zero failures and CTest passes 1/1. The full iPhoneOS compile, package
-validation, rolling Release upload, and physical White Album 2 acceptance are
-pending.
+**Build evidence:** `git diff --check` passes. In the Visual Studio developer
+environment the host-independent executable runs all 99 tests with zero
+failures and CTest passes 1/1. GitHub Actions run 31563506762 passed the same
+suite plus the full iPhoneOS compile, app validation, increased-memory
+entitlement check, packaging, and direct rolling Release upload; the IPA job
+completed in 2 minutes 4 seconds. The published build 89 `BoxedVN.ipa` is
+8,196,447 bytes and its downloaded SHA-256 matches the Release digest:
+`0f0c3d1d044bbf60c13159d22ded5449cac56aebffe1f31c89a7c354995509fb`.
+The rolling Release targets the exact producing commit
+`f72cc24798248da38faa5b997e7b5e33bc03e7cd`. Physical White Album 2 launch
+acceptance remains pending build 89.
