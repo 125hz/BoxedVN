@@ -114,28 +114,31 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
         engine += ")";
     }
 
-    // A user who has typed switches into launch settings is testing something,
-    // and appending four more would change what they are testing without
-    // saying so. Their line wins outright rather than being merged: Chromium
-    // resolves a repeated --disable-features to the last one seen, so a merge
-    // could silently drop the entry they came to add.
-    if (boxedvn::argumentsCarryChromiumSwitch(launch.arguments)) {
-        result.reason = std::string(engine) +
-            " detected (" + profile.evidence +
-            "), but this game's launch settings already carry Chromium "
-            "switches, so BoxedVN added none of its own.";
+    const boxedvn::ChromiumSwitchMerge merged =
+        boxedvn::mergeChromiumSwitches(launch.arguments);
+    launch.arguments = merged.arguments;
+
+    if (merged.optedOut) {
+        result.reason = std::string(engine) + " detected (" +
+            profile.evidence + "), but this game's launch settings ask for no "
+            "default switches, so BoxedVN added none.";
         return result;
     }
 
-    for (const std::string& option : boxedvn::chromiumCompatibilitySwitches()) {
-        launch.arguments.push_back(option);
-    }
-    result.applied = true;
+    result.applied = merged.added > 0 || merged.mergedFeatures;
     result.reason = std::string(engine) + " detected (" + profile.evidence +
         "): a browser engine draws through Windows facilities Wine only "
         "partly implements, so BoxedVN passes Chromium's own switches for "
-        "the sandbox, the GPU process, DirectComposition and occlusion. "
-        "Clear them by putting any --switch in this game's launch settings.";
+        "the sandbox, the GPU process, DirectComposition and occlusion. ";
+
+    char detail[224];
+    snprintf(detail, sizeof(detail),
+             "%zu added, %zu left to this game's own launch settings%s. Put "
+             "\"%s\" in the arguments field to add none.",
+             merged.added, merged.deferredToUser,
+             merged.mergedFeatures ? ", one feature list combined" : "",
+             boxedvn::kChromiumDefaultsOptOut);
+    result.reason += detail;
     return result;
 }
 

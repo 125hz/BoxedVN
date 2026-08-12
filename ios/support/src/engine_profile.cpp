@@ -162,6 +162,113 @@ std::vector<std::string> chromiumCompatibilitySwitches() {
     };
 }
 
+const char kChromiumDefaultsOptOut[] = "--bvn-no-default-switches";
+
+namespace {
+
+// "--disable-features=a,b" -> "--disable-features"; "--no-sandbox" -> itself.
+std::string switchName(const std::string& argument) {
+    const std::size_t equals = argument.find('=');
+    return equals == std::string::npos ? argument : argument.substr(0, equals);
+}
+
+std::string switchValue(const std::string& argument) {
+    const std::size_t equals = argument.find('=');
+    return equals == std::string::npos ? std::string()
+                                       : argument.substr(equals + 1);
+}
+
+// Appends the entries of `addition` that `value` does not already list.
+// Comma separated, order preserving, so the user's own entries stay first.
+std::string mergeCommaList(const std::string& value,
+                           const std::string& addition) {
+    std::string merged = value;
+    std::size_t start = 0;
+    while (start <= addition.size()) {
+        const std::size_t comma = addition.find(',', start);
+        const std::size_t end =
+            comma == std::string::npos ? addition.size() : comma;
+        const std::string entry = addition.substr(start, end - start);
+        if (!entry.empty()) {
+            bool present = false;
+            std::size_t scan = 0;
+            while (scan <= merged.size()) {
+                const std::size_t next = merged.find(',', scan);
+                const std::size_t stop =
+                    next == std::string::npos ? merged.size() : next;
+                if (merged.compare(scan, stop - scan, entry) == 0) {
+                    present = true;
+                    break;
+                }
+                if (next == std::string::npos) {
+                    break;
+                }
+                scan = next + 1;
+            }
+            if (!present) {
+                if (!merged.empty()) {
+                    merged += ',';
+                }
+                merged += entry;
+            }
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return merged;
+}
+
+}  // namespace
+
+ChromiumSwitchMerge mergeChromiumSwitches(
+    const std::vector<std::string>& userArguments) {
+    ChromiumSwitchMerge result;
+
+    for (const std::string& argument : userArguments) {
+        if (argument == kChromiumDefaultsOptOut) {
+            result.optedOut = true;
+            continue;  // Stripped: it is BoxedVN's word, not Chromium's.
+        }
+        result.arguments.push_back(argument);
+    }
+    if (result.optedOut) {
+        return result;
+    }
+
+    for (const std::string& option : chromiumCompatibilitySwitches()) {
+        const std::string name = switchName(option);
+
+        auto existing = std::find_if(
+            result.arguments.begin(), result.arguments.end(),
+            [&name](const std::string& argument) {
+                return switchName(argument) == name;
+            });
+
+        if (existing == result.arguments.end()) {
+            result.arguments.push_back(option);
+            result.added++;
+            continue;
+        }
+
+        // --disable-features is a list, so two of them are not a conflict -
+        // and letting one replace the other is exactly the silent loss this
+        // function exists to avoid, because Chromium keeps only the last.
+        if (name == "--disable-features") {
+            const std::string merged =
+                mergeCommaList(switchValue(*existing), switchValue(option));
+            if (merged != switchValue(*existing)) {
+                *existing = name + "=" + merged;
+                result.mergedFeatures = true;
+            }
+            continue;
+        }
+        result.deferredToUser++;
+    }
+    return result;
+}
+
 bool argumentsCarryChromiumSwitch(const std::vector<std::string>& arguments) {
     for (const std::string& argument : arguments) {
         if (argument.rfind("--", 0) == 0 && argument.size() > 2) {

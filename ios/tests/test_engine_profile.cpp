@@ -14,10 +14,12 @@
 
 #include "BVNLaunchArguments.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace boxedvn;
@@ -259,7 +261,37 @@ BOXEDVN_TEST(engineProfileAppendsSwitchesForAnImportedNwJsGame) {
     CHECK(executable < sandbox);
 }
 
-BOXEDVN_TEST(engineProfileYieldsToSwitchesInLaunchSettings) {
+BOXEDVN_TEST(engineProfileAddsToTheUsersOwnSwitchesRatherThanStandingDown) {
+    const TemporaryTree tree("launch_merge");
+    tree.addFile("Game.exe");
+    tree.addFile("nw.dll");
+
+    BVNLaunchConfiguration launch;
+    launch.runThroughWine = true;
+    launch.gameDirectoryHostPath = tree.string();
+    launch.executablePath = "d:\\Game.exe";
+    // A diagnostic switch, which is how console output reaches the session
+    // log. Adding it must not cost the compatibility switches: an earlier
+    // version stood down entirely here, so turning on logging silently broke
+    // the guest being debugged.
+    launch.arguments.push_back("--enable-logging=stderr");
+
+    const BVNEngineProfileResult result =
+        BVNApplyEngineCompatibilityProfile(launch);
+    CHECK(result.applied);
+    CHECK_EQ(launch.arguments.size(),
+             chromiumCompatibilitySwitches().size() + 1);
+    CHECK_EQ(launch.arguments[0], std::string("--enable-logging=stderr"));
+
+    const auto has = [&launch](const std::string& option) {
+        return std::find(launch.arguments.begin(), launch.arguments.end(),
+                         option) != launch.arguments.end();
+    };
+    CHECK(has("--no-sandbox"));
+    CHECK(has("--disable-gpu"));
+}
+
+BOXEDVN_TEST(engineProfileLetsAUserSwitchWinOverItsOwn) {
     const TemporaryTree tree("launch_override");
     tree.addFile("Game.exe");
     tree.addFile("nw.dll");
@@ -268,16 +300,71 @@ BOXEDVN_TEST(engineProfileYieldsToSwitchesInLaunchSettings) {
     launch.runThroughWine = true;
     launch.gameDirectoryHostPath = tree.string();
     launch.executablePath = "d:\\Game.exe";
+    launch.arguments.push_back("--in-process-gpu");
+    launch.arguments.push_back("--disable-gpu");
+
+    BVNApplyEngineCompatibilityProfile(launch);
+
+    // Exactly one --disable-gpu: the user's. A duplicate would be harmless to
+    // Chromium but would make the log lie about who chose what.
+    CHECK_EQ(std::count(launch.arguments.begin(), launch.arguments.end(),
+                        std::string("--disable-gpu")),
+             1);
+    CHECK(std::find(launch.arguments.begin(), launch.arguments.end(),
+                    std::string("--in-process-gpu")) != launch.arguments.end());
+}
+
+BOXEDVN_TEST(engineProfileCombinesFeatureListsRatherThanReplacingThem) {
+    const TemporaryTree tree("launch_features");
+    tree.addFile("Game.exe");
+    tree.addFile("nw.dll");
+
+    BVNLaunchConfiguration launch;
+    launch.runThroughWine = true;
+    launch.gameDirectoryHostPath = tree.string();
+    launch.executablePath = "d:\\Game.exe";
+    launch.arguments.push_back("--disable-features=NetworkService");
+
+    const BVNEngineProfileResult result =
+        BVNApplyEngineCompatibilityProfile(launch);
+    CHECK(result.applied);
+
+    // Chromium keeps only the last --disable-features it sees, so there must
+    // be exactly one, and it must carry both sides.
+    std::size_t featureSwitches = 0;
+    std::string combined;
+    for (const std::string& argument : launch.arguments) {
+        if (argument.rfind("--disable-features=", 0) == 0) {
+            featureSwitches++;
+            combined = argument;
+        }
+    }
+    CHECK_EQ(featureSwitches, static_cast<std::size_t>(1));
+    CHECK_CONTAINS(combined, "NetworkService");
+    CHECK_CONTAINS(combined, "CalculateNativeWinOcclusion");
+}
+
+BOXEDVN_TEST(engineProfileHonoursAnExplicitOptOut) {
+    const TemporaryTree tree("launch_optout");
+    tree.addFile("Game.exe");
+    tree.addFile("nw.dll");
+
+    BVNLaunchConfiguration launch;
+    launch.runThroughWine = true;
+    launch.gameDirectoryHostPath = tree.string();
+    launch.executablePath = "d:\\Game.exe";
+    launch.arguments.push_back(kChromiumDefaultsOptOut);
     launch.arguments.push_back("--disable-gpu");
 
     const BVNEngineProfileResult result =
         BVNApplyEngineCompatibilityProfile(launch);
     CHECK(!result.applied);
-    // Silence would be worse than the wrong switches: the log has to say the
-    // engine was recognised and that BoxedVN deliberately stood back.
-    CHECK_CONTAINS(result.reason, "NW.js");
-    CHECK_CONTAINS(result.reason, "added none");
+    CHECK_CONTAINS(result.reason, "no default switches");
+
+    // The opt-out is BoxedVN's own word and must never reach the guest, which
+    // would reject it or treat it as an unknown switch.
     CHECK_EQ(launch.arguments.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(launch.arguments[0], std::string("--disable-gpu"));
 }
 
 BOXEDVN_TEST(engineProfileLeavesNativeAndNonImportedLaunchesAlone) {

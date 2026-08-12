@@ -231,8 +231,16 @@ the facilities in question: `--no-sandbox`, `--disable-gpu`,
 `--disable-features=CalculateNativeWinOcclusion`,
 `--disable-background-timer-throttling`, `--disable-renderer-backgrounding`
 and `--disable-backgrounding-occluded-windows`. The engine and the evidence
-for it are logged under `engine:`. Putting any `--switch` in a game's launch
-settings takes the decision over completely and BoxedVN adds none of its own.
+for it are logged under `engine:`.
+
+Anything in a game's launch settings is *added to* these rather than
+replacing them. A switch the user names wins over BoxedVN's copy of the same
+switch, `--disable-features` lists are combined value by value because
+Chromium keeps only the last one it sees, and
+`--bvn-no-default-switches` - stripped before launch, never passed to the
+guest - turns the whole set off. Build 96 stood down entirely as soon as any
+switch appeared, which meant adding `--enable-logging=stderr` to debug a
+guest silently removed the eight switches keeping it alive.
 
 Three device runs of the same NW.js/RPG Maker MV title established the set:
 

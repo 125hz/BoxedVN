@@ -155,6 +155,51 @@ GuestEngineProfile detectGuestEngine(const std::string& gameDirectory,
 // read as claiming they are.
 std::vector<std::string> chromiumCompatibilitySwitches();
 
+// A line a user can put in launch settings to mean "add none of the switches
+// above". It is stripped before launch and never reaches the guest.
+//
+// Chromium has no way to express the negation of a switch - there is no
+// --enable-sandbox to cancel --no-sandbox - so without this there would be no
+// way to turn one of BoxedVN's defaults off. Being an explicit opt-out rather
+// than a side effect of typing anything is the point: see mergeChromiumSwitches.
+extern const char kChromiumDefaultsOptOut[];
+
+struct ChromiumSwitchMerge {
+    // The full argument list to pass to the guest: the user's own, minus the
+    // opt-out line, plus whatever BoxedVN contributed.
+    std::vector<std::string> arguments;
+
+    std::size_t added = 0;
+    // Switches BoxedVN would have added but the user had already named, and
+    // therefore left alone.
+    std::size_t deferredToUser = 0;
+    // True when the user's own --disable-features was combined with
+    // BoxedVN's rather than one replacing the other.
+    bool mergedFeatures = false;
+    // True when the user asked for no defaults at all.
+    bool optedOut = false;
+};
+
+// Combines BoxedVN's switches with whatever the user typed in launch
+// settings.
+//
+// The first version of this stood down completely as soon as the user's
+// arguments contained any switch at all, on the grounds that a merge could
+// silently drop a repeated --disable-features - Chromium keeps only the last
+// one it sees. That reasoning was right about the hazard and wrong about the
+// fix: it meant adding one diagnostic switch such as --enable-logging=stderr
+// silently removed eight compatibility switches, turning a debugging session
+// into a broken guest for a reason nothing in the app explained. That is the
+// same silent-footgun shape this project already had to fix once, when an
+// environment variable typed into the arguments field was quietly ignored.
+//
+// So: merge, and handle the hazard directly. A switch the user names wins
+// outright and BoxedVN does not add its own copy. --disable-features is
+// combined value by value, because it is a list rather than a setting. The
+// opt-out line above turns the whole set off.
+ChromiumSwitchMerge mergeChromiumSwitches(
+    const std::vector<std::string>& userArguments);
+
 // True when `arguments` already contains a Chromium switch, meaning the user
 // has taken over this decision in launch settings and BoxedVN must not append
 // its own. Matching is on the "--switch" form only: a bare path or a game's

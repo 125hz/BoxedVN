@@ -445,6 +445,13 @@ struct GameDetailView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                Text("A game built on a browser engine already gets the "
+                     + "Chromium switches it needs. Anything typed here is "
+                     + "added to those, and a switch you name yourself wins "
+                     + "over BoxedVN's. Put --bvn-no-default-switches here to "
+                     + "get none of them.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 TextField("Working directory (inside the game)",
                           text: $workingDirectory)
                 TextField("Environment (NAME=VALUE, one per line)",
