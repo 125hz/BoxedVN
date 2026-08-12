@@ -3935,9 +3935,23 @@ This removes the last executable-name entry from the renderer path. The
 per-title profile table is unchanged; it now only carries measured
 workarounds, not renderer defaults.
 
-**Build evidence:** the host-independent suite runs 118 tests with zero
-failures in the Visual Studio developer environment, including new coverage
-for arena sizing (floor, ceiling, unknown-budget fallback, page alignment) and
-for the PE import reader against assembled PE32 images with real import and
-delay-import directories, truncated files and non-PE files. Device acceptance
-for both changes is pending.
+**Build evidence:** `git diff --check` passes. In the Visual Studio developer
+environment the host-independent suite runs 118 tests with zero failures and
+CTest passes 1/1, including new coverage for arena sizing (floor, ceiling,
+unknown-budget fallback, page alignment) and for the PE import reader against
+assembled PE32 images with real import and delay-import directories,
+truncated files and non-PE files. GitHub Actions run 31568386650 passed the
+same suite plus the full iPhoneOS compile, app validation, increased-memory
+entitlement check, packaging and direct rolling Release upload; the IPA job
+completed in 3 minutes 23 seconds. That compile is the only place
+`BVNExecMemory.cpp` and the iOS branch of `platform/linux/platform.cpp` are
+built, so it is what confirms the segmented arena compiles for arm64. The
+published build 90 `BoxedVN.ipa` is 8,206,200 bytes with Release SHA-256
+`b1ce2e2d07fc2bbb19e690f5cb55aa02fae23837d944f679997a4f6196510420`. The
+rolling Release targets the exact producing commit
+`6ff5ef82ce8726227864a08b67f8de0cda3d9868`.
+
+**Not yet proven:** no device run has exercised either change. Specifically
+untested on hardware are how long StikDebug takes to prepare more than one
+segment, whether a device refuses a later segment, and whether the automatic
+DXVK selection now reached by more titles creates devices MoltenVK accepts.
