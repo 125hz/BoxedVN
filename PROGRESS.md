@@ -3704,7 +3704,14 @@ whole-app orientation (portrait, landscape, or landscape flipped), and UIKit
 and SDL receive the same single-orientation policy before Wine starts. This
 avoids replacing the active responder/Metal hierarchy during a session.
 
-**Local evidence:** `git diff --check` passes. In the Visual Studio developer
+**Build evidence:** `git diff --check` passes. In the Visual Studio developer
 environment the host-independent suite builds successfully, runs all 93 tests
-with zero failures, and CTest passes 1/1. iPhoneOS compilation and physical
-input/FPS acceptance remain pending build 84.
+with zero failures, and CTest passes 1/1. GitHub Actions run 31555770021 passed
+the same host suite plus the full iPhoneOS compile, app validation,
+increased-memory entitlement check, packaging, and direct rolling Release
+upload; the IPA job completed in 3 minutes 2 seconds. The published build 84
+`BoxedVN.ipa` is 8,170,022 bytes and its downloaded SHA-256 matches the Release
+digest: `1fba39f89efee6e548046d1b10f39f8c5dbd6f6bb6b01bffa03b64efeb346c69`.
+The rolling Release targets the exact producing commit
+`1b5f78b1f80436c7f090e9320ef6fac1d5da3394`. Physical right-edge input and
+late-session Grisaia FPS acceptance remain pending build 84.
