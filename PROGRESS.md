@@ -15,7 +15,7 @@ from dirty bounds and rejects a truncated full-height ancestor update instead
 of stretching it. It also keeps Wine's X11 root large enough to contain the
 fake-fullscreen Vulkan client. This removes the stale 960/1280 root ratio that
 matches the cursor-over-QL while 05-highlights device evidence. The Windows
-support suite remains 92/92. GitHub Actions run 31550538185 passed the full
+support suite remains 92/92. GitHub Actions run 31550815893 passed the full
 iPhoneOS build and published the direct IPA; fresh-device validation is
 pending. Song of Saya remains
 device-proven playable with the
@@ -3574,11 +3574,13 @@ observable in the next log.
 
 **Build evidence:** `git diff --check` passes. The Windows host-independent
 executable runs all 92 tests with zero failures, and CTest passes 1/1. GitHub
-Actions run 31550538185 passed the same host suite plus the full iPhoneOS
+Actions run 31550815893 passed the same host suite plus the full iPhoneOS
 compile, app validation, increased-memory entitlement check, packaging, and
-rolling Release upload in 3 minutes 30 seconds. The published build 81
-`BoxedVN.ipa` is 8,156,674 bytes and its downloaded SHA-256 matches the Release
+rolling Release upload in 2 minutes 49 seconds. The published build 81
+`BoxedVN.ipa` is 8,156,671 bytes and its downloaded SHA-256 matches the Release
 digest and sidecar:
-`b663f4fdb364614da500e8ae550f6e62a27eeba424ccf213e9a84312b49615cf`.
-The direct URL returns HTTP 200 and `Content-Disposition: attachment`. Physical
-rendering/input acceptance remains pending build 81.
+`0f6b2866f393e46b89c506ec28af58976593b1829cc3a984b174812df9f2fb5a`.
+The direct URL returns HTTP 200 and `Content-Disposition: attachment`, and the
+rolling Release now targets the exact producing commit
+`5b747a51c9641d78e19a9da07c66d6dea1966fd9`. Physical rendering/input
+acceptance remains pending build 81.
