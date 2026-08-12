@@ -712,9 +712,44 @@ U32 XServer::openDisplay(KThread* thread) {
 	return displayAddress;
 }
 
+void XServer::updateDisplayScreenSize(U32 width, U32 height) {
+	std::vector<DisplayDataPtr> activeDisplays;
+	{
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(displayMutex);
+		for (auto& display : displays) {
+			activeDisplays.push_back(display.value);
+		}
+	}
+
+	U32 updated = 0;
+	for (const DisplayDataPtr& data : activeDisplays) {
+		KProcessPtr process = data ? data->process.lock() : nullptr;
+		if (!process || !process->memory || !data->displayAddress) {
+			continue;
+		}
+		KMemory* memory = process->memory;
+		const U32 screenAddress =
+			X11_READD(Display, data->displayAddress, screens);
+		if (!screenAddress) {
+			continue;
+		}
+		X11_WRITED(Screen, screenAddress, width, width);
+		X11_WRITED(Screen, screenAddress, height, height);
+		X11_WRITED(Screen, screenAddress, mwidth, (U32)(width * 0.2646));
+		X11_WRITED(Screen, screenAddress, mheight, (U32)(height * 0.2646));
+		++updated;
+	}
+
+#ifdef BOXEDWINE_IOS
+	klog_fmt("iOS synchronized %u live Xlib Screen record(s) to %ux%u",
+		updated, width, height);
+#endif
+}
+
 void XServer::changeScreen(U32 width, U32 height) {
 	KNativeSystem::changeScreenSize(width, height);
 	root->moveResize(0, 0, width, height);
+	updateDisplayScreenSize(width, height);
 
 	U32 rect[] = { 0, 0, width, height };
 	U32 atom = server->internAtom(B("_GTK_WORKAREAS_D0"), false);
@@ -754,6 +789,13 @@ void XServer::setFakeFullScreenWindow(XWindowPtr wnd) {
 			root->setProperty(atom, XA_CARDINAL, 32, sizeof(rect),
 				(U8*)&rect, false);
 		}
+		// Xlib caches WidthOfScreen/HeightOfScreen in every open Display.
+		// These records were created on the 800x600 Wine desktop and changing
+		// only the root XWindow leaves Wine clipping absolute cursor positions
+		// at x=800 even though the presented client and UIKit input are 1280
+		// pixels wide. The client is the native presentation coordinate space;
+		// publish its dimensions to every already-open Xlib Display as well.
+		updateDisplayScreenSize(wnd->width(), wnd->height());
 		klog_fmt("iOS fake-fullscreen X11 root synchronized: client 0x%x "
 			"%ux%u at %d,%d, root %ux%u (saved %ux%u)",
 			wnd->id, wnd->width(), wnd->height(), clientX, clientY,
@@ -767,6 +809,8 @@ void XServer::setFakeFullScreenWindow(XWindowPtr wnd) {
 		U32 atom = internAtom(B("_GTK_WORKAREAS_D0"), false);
 		root->setProperty(atom, XA_CARDINAL, 32, sizeof(rect),
 			(U8*)&rect, false);
+		updateDisplayScreenSize(rootWidthBeforeFakeFullScreen,
+			rootHeightBeforeFakeFullScreen);
 		klog_fmt("iOS fake-fullscreen X11 root restored to %ux%u",
 			rootWidthBeforeFakeFullScreen, rootHeightBeforeFakeFullScreen);
 		rootWidthBeforeFakeFullScreen = 0;

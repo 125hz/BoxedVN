@@ -184,15 +184,20 @@ bool KNativeInputSDL::getMousePos(int* x, int* y, bool allowWarp) {
     }
 #endif
 #ifdef BOXEDWINE_IOS
-    // Already guest coordinates - mouseMove/mouseButton put them through
-    // xFromScreen on the way in, so they must not go through it again.
+    // Already fake-fullscreen client coordinates - mouseMove/mouseButton put
+    // them through xFromScreen on the way in, so they must not go through it
+    // again. Validate in that client space, then convert once to X11 root
+    // coordinates. XQueryPointer and the server's hit-testing callers expect
+    // root coordinates; the old screenToWindow call converted in the opposite
+    // direction and XQueryPointer subtracted the client origin a second time.
     if (hasInjectedPointer) {
         *x = injectedX;
         *y = injectedY;
+        const bool valid = checkMousePos(*x, *y, allowWarp);
         if (XServer::getServer(true) && XServer::getServer()->fakeFullScreenWnd) {
-            XServer::getServer()->fakeFullScreenWnd->screenToWindow(*x, *y);
+            XServer::getServer()->fakeFullScreenWnd->windowToScreen(*x, *y);
         }
-        return checkMousePos(*x, *y, false);
+        return valid;
     }
 #endif
     SDL_GetMouseState(x, y);
@@ -224,9 +229,15 @@ void KNativeInputSDL::setMousePos(int x, int y) {
     hasInjectedPointer = true;
 #endif
 
+#ifdef BOXEDWINE_IOS
+    // XWarpPointer supplies fake-fullscreen client coordinates on iOS. Keep
+    // them in the same client space used by injectedX/injectedY; getMousePos
+    // performs the single client-to-root conversion when X11 asks for it.
+#else
     if (XServer::getServer(true) && XServer::getServer()->fakeFullScreenWnd) {
         XServer::getServer()->fakeFullScreenWnd->screenToWindow(x, y);
     }
+#endif
     x = xToScreen(x);
     y = yToScreen(y);
 

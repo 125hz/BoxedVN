@@ -125,6 +125,8 @@ public:
 	void iterateFbConfigs(std::function<bool(const CLXFBConfigPtr& cfg)> callback);
 
 private:
+	void updateDisplayScreenSize(U32 width, U32 height);
+
 	static std::atomic_int nextId;
 	static XServer* server;
 

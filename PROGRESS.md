@@ -6,17 +6,16 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-11 (build 81 prepared from the two build-80 Grisaia
-logs and screenshots. Build 80 incorrectly interpreted a 960x720 dirty
-rectangle inside the 1280x720 active client as a second framebuffer size and
-stretched it across the whole presentation. That exactly produced the enlarged
-title screen and cut-off right side. Build 81 never derives presentation scale
-from dirty bounds and rejects a truncated full-height ancestor update instead
-of stretching it. It also keeps Wine's X11 root large enough to contain the
-fake-fullscreen Vulkan client. This removes the stale 960/1280 root ratio that
-matches the cursor-over-QL while 05-highlights device evidence. The Windows
-support suite remains 92/92. GitHub Actions run 31550815893 passed the full
-iPhoneOS build and published the direct IPA; fresh-device validation is
+**Last updated:** 2026-08-11 (build 81 is device-confirmed to fix Grisaia's
+stretched/cut-off resolution, but its right-side input fix was incomplete. The
+two build-81 logs prove UIKit, the overlay, SDL, the active 1280x720 client, and
+the expanded 1283x749 root all receive right-side coordinates unchanged, up to
+guest x=1250. They also expose the remaining boundary: Wine's already-open
+Xlib `Screen` records still say 800x600 because Boxedwine only populated them
+when each display opened. Build 82 updates every live Xlib screen record to the
+fake-fullscreen client's 1280x720 size and repairs the reversed client/root
+conversion in `XQueryPointer`'s backing input path. The Windows support suite
+remains 92/92; iPhoneOS compilation and fresh-device input validation are
 pending. Song of Saya remains
 device-proven playable with the
 interpreter workaround.
@@ -3584,3 +3583,41 @@ The direct URL returns HTTP 200 and `Content-Disposition: attachment`, and the
 rolling Release now targets the exact producing commit
 `5b747a51c9641d78e19a9da07c66d6dea1966fd9`. Physical rendering/input
 acceptance remains pending build 81.
+
+### 2026-08-11 - build 82: synchronize Wine's live Xlib screen records
+
+Build 81 fixed the resolution, which is now device-confirmed. The remaining
+input reports are `boxedvn-20260811-194259.log` and
+`boxedvn-20260811-194901.log`. They disprove another UIKit or presentation
+transform error: the overlay and SDL are both 1:1 at 1280x720, the X11 root is
+successfully expanded to 1283x749 around the client at `(3,29)`, and taps at
+guest x=1021, 1117, 1202, 1241, and 1250 all reach the correct fake-fullscreen
+X11 target unchanged. Nevertheless, the game still stops responding on the
+right near x=800.
+
+The remaining 800-pixel boundary comes from `XServer::createScreen`. Every
+Wine X11 connection gets an Xlib `Screen` struct whose width/height are copied
+only once, while the desktop is still 800x600. Build 81 resized the root
+`XWindow`, but never updated those already-open guest-memory records. Wine can
+therefore continue clipping or translating absolute cursor positions against
+an 800-pixel screen while Boxedwine delivers positions across a 1280-pixel
+client.
+
+Build 82 adds one screen-size synchronization path. It updates width, height,
+and physical dimensions in every live Xlib `Screen` whenever Boxedwine changes
+the desktop, enters fake fullscreen, or restores the desktop. Fake fullscreen
+publishes the active client size (1280x720), which is the same coordinate space
+used by UIKit, SDL, pointer injection, and the Vulkan presentation.
+
+`KNativeInputSDL::getMousePos` also had its fake-fullscreen conversion reversed:
+it called `screenToWindow` on coordinates that were already client-local, then
+`XQueryPointer` subtracted the client origin again. It now validates once in
+client space and calls `windowToScreen` exactly once before X11 reports root
+and window coordinates. The iOS `XWarpPointer` path preserves the same
+client-local invariant. Bounded `XQueryPointer` diagnostics now report root,
+local, Xlib-screen, and fake-client dimensions for the next device log.
+
+**Local evidence:** `git diff --check` passes. The Windows host-independent
+executable runs all 92 tests with zero failures, and CTest passes 1/1. The
+iPhoneOS compile, IPA publication, and physical right-side input acceptance
+are pending build 82.

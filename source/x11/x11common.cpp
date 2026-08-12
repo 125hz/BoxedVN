@@ -575,6 +575,10 @@ static void x11_QueryPointer(CPU* cpu) {
     S32 x = 0;
     S32 y = 0;
     KNativeSystem::getCurrentInput()->getMousePos(&x, &y);
+#ifdef BOXEDWINE_IOS
+    const S32 rootX = x;
+    const S32 rootY = y;
+#endif
     memory->writed(ARG3, root->id);
 
     XWindowPtr child = root->getWindowFromPoint(x, y);
@@ -585,6 +589,23 @@ static void x11_QueryPointer(CPU* cpu) {
     memory->writed(ARG7, x);
     memory->writed(ARG8, y);
     memory->writed(ARG9, server->getInputModifiers());
+#ifdef BOXEDWINE_IOS
+    static U32 queryPointerLogCount = 0;
+    if (server->fakeFullScreenWnd && queryPointerLogCount < 32) {
+        ++queryPointerLogCount;
+        const U32 displayScreen = X11_READD(Display, ARG1, screens);
+        const U32 displayWidth = displayScreen
+            ? X11_READD(Screen, displayScreen, width) : 0;
+        const U32 displayHeight = displayScreen
+            ? X11_READD(Screen, displayScreen, height) : 0;
+        klog_fmt("iOS XQueryPointer #%u: query 0x%x, root %d,%d, local "
+                 "%d,%d, Xlib Screen %ux%u, fake client 0x%x %ux%u",
+                 queryPointerLogCount, window->id, rootX, rootY, x, y,
+                 displayWidth, displayHeight, server->fakeFullScreenWnd->id,
+                 server->fakeFullScreenWnd->width(),
+                 server->fakeFullScreenWnd->height());
+    }
+#endif
     EAX = Success;
 }
 
