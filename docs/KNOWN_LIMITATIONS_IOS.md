@@ -248,25 +248,40 @@ created a presentation swapchain and never presented to it. Run 3 changed
 several switches at once, so the individual contributions are not isolated
 and the set is shipped as a set.
 
-**What is still unresolved.** Runs 3-5 reach RPG Maker's `Scene_Boot` and
-stay there. Run 5 was left for six and a half minutes, which refutes "it is
-merely slow": the last JIT arena allocation came four minutes before the
-session was ended, so no new guest code was translated at all in that time,
-and the only activity in the whole tail of the log is Chromium's DNS
-retry timer at five second intervals. The browser process is alive and the
-renderer has stopped. Run 4 also refuted the proxy/DNS explanation -
-`--no-proxy-server --disable-background-networking` changed nothing, and the
-DNS retries continue regardless. `Scene_Boot` waits on its database JSONs and on the `GameFont`
-face, and reports neither as failed, so something is pending rather than
-erroring. Two candidates, in order:
+**Where it stops, established rather than guessed.** Runs 3-6 reach RPG
+Maker's `Scene_Boot` and stay there. Run 6 printed the three conditions that
+gate it, every three seconds, from a probe added to the game's own
+`index.html`:
 
-- Chromium's proxy and DNS services never settle under Wine. The run-3 log
-  repeats `dns_config_service_win.cc: Failed to read DnsConfig` every five
-  seconds indefinitely and reports WPAD-over-DHCP failures four times. Test
-  with `--no-proxy-server --disable-background-networking`.
-- The `GameFont` face never resolves. RPG Maker waits on it before leaving
-  `Scene_Boot` and, on the CSS-font-loading path, does so without a timeout.
-  Test by putting a font in `Documents/Fonts` (section 7).
+```
+BOOTCHK 41 img=true db=[object Object] font=false errUrl=null
+```
+
+Forty-one identical lines. Images are ready, the database is loaded (`&&`
+yields the truthy object a plugin's wrapper returns), no resource failed to
+load, and `Graphics.isFontLoaded('GameFont')` is false and stays false. The
+guest is blocked on the font and on nothing else.
+
+The mechanism is RPG Maker's, and it has no timeout. `Graphics._fontLoaded`
+is assigned from `document.fonts.ready`; `isFontLoaded` returns false while
+that field is null. A `document.fonts.ready` that never settles therefore
+hangs `Scene_Boot` silently and permanently.
+
+These runs also refuted two whole classes of explanation. Waiting does not
+help: run 5 was left six and a half minutes, and its last JIT arena
+allocation is four minutes before the session ended, so no new guest code was
+translated in that window. Cross-process IPC is not involved: run 6 added
+`--single-process` and the result was identical. `--no-proxy-server
+--disable-background-networking` also changed nothing, and the DNS retries
+continue regardless.
+
+Untested candidates, cheapest first: `--disable-remote-fonts`, which removes
+the pending web font so `document.fonts.ready` has nothing to wait for; and a
+real system font supplied through `Documents/Fonts` (section 7), which
+addresses the case where Blink's font machinery is wedged for want of any
+system face at all - the same underlying weakness that aborted the renderer
+outright before `--no-sandbox`. Note that the second does not obviously fix
+the first: a system font does not settle a pending `@font-face` load.
 
 `--enable-logging=stderr` puts Chromium's console output, including page JS
 errors, into the session log and is the right first thing to add to any run
