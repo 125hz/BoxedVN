@@ -251,26 +251,35 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     // it off actually puts the game's own HTML back rather than leaving
     // BoxedVN's script in a file the user thinks is untouched.
     if (!launch.gameDirectoryHostPath.empty()) {
+        boxedvn::GuestBootScripts scripts;
+        scripts.diagnostics = engineProfile.bootDiagnostics;
+        scripts.fontFix = engineProfile.fontGateShim;
         const boxedvn::BootDiagnosticsResult diagnostics =
-            boxedvn::setBootDiagnostics(launch.gameDirectoryHostPath,
-                                        engineProfile.bootDiagnostics);
+            boxedvn::setGuestBootScripts(launch.gameDirectoryHostPath,
+                                         scripts);
         if (!diagnostics.ok) {
             BVNLogWrite(BVNLogLevelError, "diagnostics",
                         diagnostics.error.c_str());
         } else if (diagnostics.changed) {
-            char message[320];
-            snprintf(message, sizeof(message),
-                     engineProfile.bootDiagnostics
-                         ? "Boot diagnostics installed into %s; the original "
-                           "is saved beside it as %s%s. Look for \"BOXEDVN "
-                           "boot\" lines below."
-                         : "Boot diagnostics removed; %s restored from the "
-                           "saved original.%s%s",
-                     diagnostics.documentPath.c_str(),
-                     engineProfile.bootDiagnostics
-                         ? diagnostics.documentPath.c_str() : "",
-                     engineProfile.bootDiagnostics
-                         ? boxedvn::kBootDiagnosticsBackupSuffix : "");
+            char message[448];
+            if (scripts.any()) {
+                snprintf(message, sizeof(message),
+                         "Wrote %s%s%s into %s. The untouched original is "
+                         "beside it as %s%s; remove the scripts and it is put "
+                         "back byte for byte.",
+                         scripts.fontFix ? "the RPG Maker font-gate fix" : "",
+                         (scripts.fontFix && scripts.diagnostics)
+                             ? " and " : "",
+                         scripts.diagnostics ? "boot diagnostics" : "",
+                         diagnostics.documentPath.c_str(),
+                         diagnostics.documentPath.c_str(),
+                         boxedvn::kBootDiagnosticsBackupSuffix);
+            } else {
+                snprintf(message, sizeof(message),
+                         "Removed BoxedVN's scripts; %s restored from the "
+                         "saved original.",
+                         diagnostics.documentPath.c_str());
+            }
             BVNLogWrite(BVNLogLevelInfo, "diagnostics", message);
         }
     }

@@ -170,6 +170,12 @@ extern const char kChromiumDefaultsOptOut[];
 // Stripped before launch; never reaches the guest.
 extern const char kBootDiagnosticsOptIn[];
 
+// A line that turns the RPG Maker font-gate shim off for one game. The shim
+// is on by default for a recognised RPG Maker guest, because without it that
+// guest does not start at all; this exists so the default can be disproved on
+// a title where it turns out to hurt.
+extern const char kFontGateShimOptOut[];
+
 struct ChromiumSwitchMerge {
     // The full argument list to pass to the guest: the user's own, minus the
     // opt-out line, plus whatever BoxedVN contributed.
@@ -184,6 +190,8 @@ struct ChromiumSwitchMerge {
     bool mergedFeatures = false;
     // True when the user asked for no defaults at all.
     bool optedOut = false;
+    // True when the RPG Maker font-gate shim should be installed.
+    bool fontGateShim = false;
     // True when the user asked for boot diagnostics. The caller installs the
     // probe; this only reports the request and ensures Chromium logging is
     // on, because without it the probe's output goes nowhere.

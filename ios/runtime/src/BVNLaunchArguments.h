@@ -61,6 +61,10 @@ struct BVNEngineProfileResult {
     /// guest's own HTML. The caller performs the installation; deciding it
     /// here keeps the sentinel's handling next to the other one.
     bool bootDiagnostics = false;
+    /// True when the RPG Maker font-gate shim should be installed. On by
+    /// default for a recognised RPG Maker guest, because without it that
+    /// guest does not finish starting.
+    bool fontGateShim = false;
     /// One sentence for the session log, naming the engine and what was done
     /// about it. Non-empty whenever an engine was recognised, including the
     /// case where BoxedVN deliberately added nothing.

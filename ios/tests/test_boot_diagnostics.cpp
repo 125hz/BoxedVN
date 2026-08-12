@@ -58,6 +58,12 @@ private:
     fs::path root_;
 };
 
+GuestBootScripts diagnostics() {
+    GuestBootScripts scripts;
+    scripts.diagnostics = true;
+    return scripts;
+}
+
 const char kMvDocument[] =
     "<!DOCTYPE html>\n<html><body><script src=\"js/main.js\"></script>"
     "</body></html>\n";
@@ -70,7 +76,7 @@ BOXEDVN_TEST(boot_diagnostics_instruments_the_rpg_maker_mv_document) {
     write(document, kMvDocument);
 
     const BootDiagnosticsResult result =
-        setBootDiagnostics(game.string(), true);
+        setGuestBootScripts(game.string(), diagnostics());
     CHECK(result.ok);
     CHECK(result.changed);
     CHECK_CONTAINS(result.documentPath, "index.html");
@@ -97,9 +103,9 @@ BOXEDVN_TEST(boot_diagnostics_restores_the_original_byte_for_byte) {
     const fs::path document = game.path() / "www" / "index.html";
     write(document, kMvDocument);
 
-    CHECK(setBootDiagnostics(game.string(), true).ok);
+    CHECK(setGuestBootScripts(game.string(), diagnostics()).ok);
     const BootDiagnosticsResult removed =
-        setBootDiagnostics(game.string(), false);
+        setGuestBootScripts(game.string(), GuestBootScripts{});
     CHECK(removed.ok);
     CHECK(removed.changed);
 
@@ -115,19 +121,19 @@ BOXEDVN_TEST(boot_diagnostics_is_idempotent_in_both_directions) {
     const fs::path document = game.path() / "www" / "index.html";
     write(document, kMvDocument);
 
-    CHECK(setBootDiagnostics(game.string(), true).ok);
+    CHECK(setGuestBootScripts(game.string(), diagnostics()).ok);
     const std::string once = readAll(document);
 
     // Installing twice must not stack two copies of the probe.
     const BootDiagnosticsResult again =
-        setBootDiagnostics(game.string(), true);
+        setGuestBootScripts(game.string(), diagnostics());
     CHECK(again.ok);
     CHECK(!again.changed);
     CHECK_EQ(readAll(document), once);
 
-    CHECK(setBootDiagnostics(game.string(), false).ok);
+    CHECK(setGuestBootScripts(game.string(), GuestBootScripts{}).ok);
     const BootDiagnosticsResult removedAgain =
-        setBootDiagnostics(game.string(), false);
+        setGuestBootScripts(game.string(), GuestBootScripts{});
     CHECK(removedAgain.ok);
     CHECK(!removedAgain.changed);
     CHECK_EQ(readAll(document), std::string(kMvDocument));
@@ -138,7 +144,7 @@ BOXEDVN_TEST(boot_diagnostics_finds_the_rpg_maker_mz_layout) {
     const fs::path document = game.path() / "index.html";
     write(document, kMvDocument);
 
-    CHECK(setBootDiagnostics(game.string(), true).changed);
+    CHECK(setGuestBootScripts(game.string(), diagnostics()).changed);
     CHECK_CONTAINS(readAll(document), kBootDiagnosticsMarker);
 }
 
@@ -147,7 +153,7 @@ BOXEDVN_TEST(boot_diagnostics_appends_when_there_is_no_body_close) {
     const fs::path document = game.path() / "www" / "index.html";
     write(document, "<html><script src=\"js/main.js\"></script>");
 
-    CHECK(setBootDiagnostics(game.string(), true).changed);
+    CHECK(setGuestBootScripts(game.string(), diagnostics()).changed);
     CHECK_CONTAINS(readAll(document), kBootDiagnosticsMarker);
 }
 
@@ -158,13 +164,13 @@ BOXEDVN_TEST(boot_diagnostics_leaves_a_game_with_no_document_alone) {
     write(game.path() / "Game.exe", "MZ");
 
     const BootDiagnosticsResult result =
-        setBootDiagnostics(game.string(), true);
+        setGuestBootScripts(game.string(), diagnostics());
     CHECK(result.ok);
     CHECK(!result.changed);
     CHECK(result.documentPath.empty());
 
-    CHECK(setBootDiagnostics("/boxedvn/no/such/game", true).ok);
-    CHECK(setBootDiagnostics("", true).ok);
+    CHECK(setGuestBootScripts("/boxedvn/no/such/game", diagnostics()).ok);
+    CHECK(setGuestBootScripts("", diagnostics()).ok);
 }
 
 BOXEDVN_TEST(boot_diagnostics_script_reports_every_gate_that_matters) {
@@ -186,4 +192,69 @@ BOXEDVN_TEST(boot_diagnostics_script_reports_every_gate_that_matters) {
     // It runs inside somebody's game: every read is guarded, so a guest that
     // is not RPG Maker reports what it can instead of throwing.
     CHECK_CONTAINS(script, "catch");
+}
+
+BOXEDVN_TEST(boot_scripts_refresh_when_the_injected_text_changes) {
+    // Build 104 skipped re-injection whenever it saw its own marker, so a
+    // device running a newer BoxedVN kept executing an older probe and a
+    // whole run reported fields that had been replaced. Installation must
+    // rebuild from the saved original, not recognise itself and stop.
+    const Scratch game("refresh");
+    const fs::path document = game.path() / "www" / "index.html";
+    write(document, kMvDocument);
+
+    GuestBootScripts probe;
+    probe.diagnostics = true;
+    CHECK(setGuestBootScripts(game.string(), probe).changed);
+
+    GuestBootScripts both;
+    both.diagnostics = true;
+    both.fontFix = true;
+    const BootDiagnosticsResult updated =
+        setGuestBootScripts(game.string(), both);
+    CHECK(updated.ok);
+    CHECK(updated.changed);
+
+    const std::string html = readAll(document);
+    CHECK_CONTAINS(html, "fontfix");
+    // Exactly one copy of the probe: rebuilding from the original is what
+    // stops repeated installs from stacking.
+    const std::string marker(kBootDiagnosticsMarker);
+    std::size_t count = 0, at = 0;
+    while ((at = html.find(marker, at)) != std::string::npos) {
+        count++;
+        at += marker.size();
+    }
+    CHECK_EQ(count, static_cast<std::size_t>(2));  // probe + font fix banner
+
+    CHECK(setGuestBootScripts(game.string(), GuestBootScripts{}).changed);
+    CHECK_EQ(readAll(document), std::string(kMvDocument));
+}
+
+BOXEDVN_TEST(font_gate_shim_opens_the_gate_and_says_so) {
+    const std::string script = fontGateShimScript();
+    // It must ask Blink for the face before overriding anything: if the load
+    // succeeds there is nothing to work around.
+    CHECK_CONTAINS(script, "document.fonts.load");
+    CHECK_CONTAINS(script, "GameFont");
+    CHECK_CONTAINS(script, "Graphics.isFontLoaded");
+    // And it must report what it did. A silent behaviour change inside
+    // somebody's game is not acceptable even when it is the right one.
+    CHECK_CONTAINS(script, "fontfix");
+    CHECK_CONTAINS(script, "fallback");
+}
+
+BOXEDVN_TEST(font_gate_shim_installs_without_diagnostics) {
+    const Scratch game("fontfix_only");
+    const fs::path document = game.path() / "www" / "index.html";
+    write(document, kMvDocument);
+
+    GuestBootScripts scripts;
+    scripts.fontFix = true;
+    CHECK(setGuestBootScripts(game.string(), scripts).changed);
+
+    const std::string html = readAll(document);
+    CHECK_CONTAINS(html, "fontfix");
+    // The reporting probe is a separate opt-in and must not come along.
+    CHECK(html.find("BOXEDVN boot") == std::string::npos);
 }

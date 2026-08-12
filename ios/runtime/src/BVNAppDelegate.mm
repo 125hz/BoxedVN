@@ -308,8 +308,38 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     // already explicitly hides this window before a guest starts (see
     // BVNRuntime.mm's runSession), so the level trick was never load-bearing
     // - removing it costs nothing and removes the most likely interference.
+    // Show the window, but not its contents, until the orientation is the one
+    // the user chose.
+    //
+    // Requesting the geometry above is not enough on its own: UIKit applies it
+    // asynchronously and animates the change, so a scene that connected in
+    // portrait rotates the library in front of the user for about a second.
+    // The launch screen is a plain colour, so the only thing whose rotation is
+    // visible is this window's contents - which means hiding them until the
+    // orientation settles removes the symptom entirely, whatever UIKit's
+    // timing turns out to be. That is a guarantee; winning a race with UIKit
+    // is not.
+    //
+    // The wait is the same bounded poll the guest path already uses, so a
+    // preference UIKit never applies costs three seconds and then shows the
+    // library anyway rather than leaving a permanently blank screen.
+    window.alpha = 0.0;
     [window makeKeyAndVisible];
     self.libraryWindow = window;
+
+    __weak UIWindow* weakWindow = window;
+    [self waitForPreferredOrientationWithAttempt:0 completion:^{
+        UIWindow* settled = weakWindow;
+        if (settled == nil) {
+            return;
+        }
+        // A short fade rather than a hard cut: the window has been on screen
+        // as a plain colour for a frame or two, and appearing abruptly reads
+        // as a glitch of its own.
+        [UIView animateWithDuration:0.12 animations:^{
+            settled.alpha = 1.0;
+        }];
+    }];
 
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "scene-owned library window created");

@@ -118,6 +118,12 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
         boxedvn::mergeChromiumSwitches(launch.arguments);
     launch.arguments = merged.arguments;
     result.bootDiagnostics = merged.bootDiagnostics;
+    // Only for RPG Maker: the shim knows that engine's boot gate by name, and
+    // installing it into an unrelated NW.js application would be a change
+    // with no reason behind it.
+    result.fontGateShim = merged.fontGateShim &&
+        (profile.framework == boxedvn::GuestFramework::RpgMakerMv ||
+         profile.framework == boxedvn::GuestFramework::RpgMakerMz);
 
     if (merged.optedOut) {
         result.reason = std::string(engine) + " detected (" +

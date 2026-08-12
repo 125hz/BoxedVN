@@ -167,8 +167,51 @@ std::string bootDiagnosticsScript() {
         "\n</script>\n";
 }
 
-BootDiagnosticsResult setBootDiagnostics(const std::string& gameDirectory,
-                                         bool enabled) {
+std::string fontGateShimScript() {
+    return
+        "<script>/* " + std::string(kBootDiagnosticsMarker) + "-FONT-FIX */\n"
+        R"JS((function () {
+  function say(t) { try { console.log("BOXEDVN " + t); } catch (e) {} }
+
+  // Ask for the face directly. RPG Maker triggers it with a hidden element
+  // styled font-size:0px and then waits for check() to agree; if that trigger
+  // is what fails here, this is the whole repair and nothing below fires.
+  try {
+    document.fonts.load('10px "GameFont"').then(function (list) {
+      say("fontfix requested GameFont, Blink returned " +
+          (list ? list.length : 0) + " face(s)");
+    }, function (error) {
+      say("fontfix could not load GameFont: " + error);
+    });
+  } catch (e) { say("fontfix could not ask for GameFont: " + e); }
+
+  var tries = 0;
+  var timer = setInterval(function () {
+    tries++;
+    try {
+      if (typeof Graphics === "undefined" || !Graphics.isFontLoaded) { return; }
+      if (Graphics.isFontLoaded("GameFont")) {
+        say("fontfix not needed; GameFont loaded on its own");
+        clearInterval(timer);
+        return;
+      }
+      if (tries >= 5) {
+        // Ten seconds. RPG Maker's own non-CSS path gives up at sixty and
+        // throws; this gives up sooner and continues, because a game drawn in
+        // a fallback face beats a game that never starts.
+        Graphics.isFontLoaded = function () { return true; };
+        say("fontfix opened the boot gate after 10s; GameFont never reached " +
+            "loaded status, so text may use a fallback face");
+        clearInterval(timer);
+      }
+    } catch (e) { clearInterval(timer); }
+  }, 2000);
+})();)JS"
+        "\n</script>\n";
+}
+
+BootDiagnosticsResult setGuestBootScripts(const std::string& gameDirectory,
+                                          const GuestBootScripts& scripts) {
     BootDiagnosticsResult result;
     if (gameDirectory.empty()) {
         result.ok = true;
@@ -196,23 +239,31 @@ BootDiagnosticsResult setBootDiagnostics(const std::string& gameDirectory,
         ec.clear();
     }
 
-    const fs::path backup =
-        document.string() + kBootDiagnosticsBackupSuffix;
+    const fs::path backup = document.string() + kBootDiagnosticsBackupSuffix;
     const bool haveBackup = fs::is_regular_file(backup, ec);
     ec.clear();
 
-    if (!enabled) {
+    std::string current;
+    if (!readWholeFile(document, current)) {
+        result.error = "Could not read " + result.documentPath + ".";
+        return result;
+    }
+
+    // The pristine document is always the starting point, never the file as
+    // it stands. Editing the current contents is how build 104 ended up
+    // running an older BoxedVN's probe on a newer build: it saw its own
+    // marker, concluded the work was done, and left stale code in place for a
+    // whole device run.
+    std::string original = current;
+    if (haveBackup && !readWholeFile(backup, original)) {
+        result.error = "Could not read the saved copy of " +
+                       result.documentPath + ".";
+        return result;
+    }
+
+    if (!scripts.any()) {
         if (!haveBackup) {
             result.ok = true;
-            return result;
-        }
-        // Restore the original bytes rather than trying to remove the
-        // injected text from the current file: an edit made in between would
-        // otherwise be silently reverted or, worse, half-reverted.
-        std::string original;
-        if (!readWholeFile(backup, original)) {
-            result.error = "Could not read the saved copy of " +
-                           result.documentPath + ".";
             return result;
         }
         if (!writeWholeFile(document, original)) {
@@ -225,31 +276,34 @@ BootDiagnosticsResult setBootDiagnostics(const std::string& gameDirectory,
         return result;
     }
 
-    std::string html;
-    if (!readWholeFile(document, html)) {
-        result.error = "Could not read " + result.documentPath + ".";
-        return result;
+    std::string injected;
+    if (scripts.diagnostics) {
+        injected += bootDiagnosticsScript();
     }
-    if (html.find(kBootDiagnosticsMarker) != std::string::npos) {
-        result.ok = true;  // Already instrumented.
+    if (scripts.fontFix) {
+        injected += fontGateShimScript();
+    }
+
+    std::string desired = original;
+    const std::size_t close = findBodyClose(desired);
+    if (close == std::string::npos) {
+        desired += injected;
+    } else {
+        desired.insert(close, injected);
+    }
+
+    if (desired == current) {
+        result.ok = true;  // Already exactly this, down to the byte.
         return result;
     }
 
-    if (!haveBackup && !writeWholeFile(backup, html)) {
+    if (!haveBackup && !writeWholeFile(backup, original)) {
         result.error = "Could not save an untouched copy of " +
                        result.documentPath +
                        ", so BoxedVN did not modify it.";
         return result;
     }
-
-    const std::string script = bootDiagnosticsScript();
-    const std::size_t close = findBodyClose(html);
-    if (close == std::string::npos) {
-        html += script;
-    } else {
-        html.insert(close, script);
-    }
-    if (!writeWholeFile(document, html)) {
+    if (!writeWholeFile(document, desired)) {
         result.error = "Could not write " + result.documentPath + ".";
         return result;
     }

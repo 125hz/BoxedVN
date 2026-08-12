@@ -164,6 +164,7 @@ std::vector<std::string> chromiumCompatibilitySwitches() {
 
 const char kChromiumDefaultsOptOut[] = "--bvn-no-default-switches";
 const char kBootDiagnosticsOptIn[] = "--bvn-boot-diagnostics";
+const char kFontGateShimOptOut[] = "--bvn-no-font-fix";
 
 namespace {
 
@@ -226,6 +227,7 @@ std::string mergeCommaList(const std::string& value,
 ChromiumSwitchMerge mergeChromiumSwitches(
     const std::vector<std::string>& userArguments) {
     ChromiumSwitchMerge result;
+    bool declinedFontFix = false;
 
     for (const std::string& argument : userArguments) {
         if (argument == kChromiumDefaultsOptOut) {
@@ -236,8 +238,14 @@ ChromiumSwitchMerge mergeChromiumSwitches(
             result.bootDiagnostics = true;
             continue;  // Also BoxedVN's word.
         }
+        if (argument == kFontGateShimOptOut) {
+            declinedFontFix = true;
+            continue;
+        }
         result.arguments.push_back(argument);
     }
+
+    result.fontGateShim = !declinedFontFix;
 
     // The probe reports through console.log, which reaches the session log
     // only when Chromium is logging to stderr. Asking for diagnostics and
