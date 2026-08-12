@@ -4262,4 +4262,6 @@ comes up clean, the corruption is leftover state from processes killed at
 quit and the question becomes what is not being flushed.
 
 **Build evidence:** the host-independent suite still runs 125 tests with zero
-failures. The changed view compiles only in the iPhoneOS job.
+failures. The changed view compiles only in the iPhoneOS job, which is what
+caught a `@discardableResult` left above the new helper instead of `save()`;
+GitHub Actions run 31574564972 then passed the full job.
