@@ -290,6 +290,15 @@ directly by logging `document.fonts.status` and whether `ready` ever
 resolves, and by bypassing `Graphics.isFontLoaded` to see whether anything
 downstream of the gate renders.
 
+Build 99 stops this being unanswerable from the host. `censusGuestFonts`
+counts the font files a guest can actually see - the user's own in the
+prefix, the root filesystem's `drive_c/windows/Fonts`, and the faces Wine
+ships in `share/wine/fonts` that `wine.inf` installs into a new prefix - by
+reading the archive's central directory, and every launch logs the totals
+under `fonts:`. A total of zero is logged as an error in its own right,
+because a guest with no font cannot run a program that draws text and
+nothing else in the log would say so.
+
 A system font supplied through `Documents/Fonts` (section 7) remains
 untested. It addresses a different failure - Blink having no usable face at
 all, the weakness that aborted the renderer outright before `--no-sandbox` -

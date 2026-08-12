@@ -525,6 +525,40 @@ void runSession(const BVNLaunchConfiguration& launch) {
             }
         }
 
+        // Say how many faces the guest can actually see. Whether a guest has
+        // any font at all is decisive for a browser engine - an empty
+        // collection aborts Blink outright, and RPG Maker waits forever for
+        // document.fonts.ready - and it is not answerable from outside the
+        // emulator, which is why several launches were spent guessing at
+        // command-line switches that cannot conjure a font.
+        const boxedvn::GuestFontCensus census =
+            boxedvn::censusGuestFonts(launch.rootFilesystemZipPath,
+                                      launch.writableRootPath);
+        if (!census.ok) {
+            BVNLogWrite(BVNLogLevelWarning, "fonts", census.error.c_str());
+        } else if (census.total() == 0) {
+            BVNLogWrite(BVNLogLevelError, "fonts",
+                        "This guest can see NO font files at all: none in the "
+                        "prefix, none in the root filesystem's Fonts "
+                        "directory, and none bundled with Wine. A program "
+                        "that needs text cannot work in this state. Put "
+                        ".ttf/.ttc/.otf files in Documents/Fonts through the "
+                        "Files app.");
+        } else {
+            char message[320];
+            snprintf(message, sizeof(message),
+                     "Guest fonts: %zu total - %zu supplied by you, %zu in "
+                     "the root filesystem's Fonts directory, %zu bundled "
+                     "with Wine.",
+                     census.total(), census.inPrefix, census.inRootFilesystem,
+                     census.wineBundled);
+            std::string line(message);
+            if (!census.examples.empty()) {
+                line += " For example: " + census.examples + ".";
+            }
+            BVNLogWrite(BVNLogLevelInfo, "fonts", line.c_str());
+        }
+
         // Shadow the rootfs's stock DXVK with the MoltenVK-compatible build.
         // Upstream DXVK requires geometryShader and VK_EXT_transform_feedback
         // and therefore refuses to create a device on Metal at all; the

@@ -417,3 +417,83 @@ BOXEDVN_TEST(guest_fonts_tolerate_a_user_who_supplied_none) {
 
     fs::remove_all(temporary, ec);
 }
+
+BOXEDVN_TEST(guest_font_census_counts_every_place_a_font_can_come_from) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-font-census-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    const fs::path root = temporary / "prefix";
+    const fs::path archive = temporary / "rootfs.zip";
+    const fs::path prefixFonts =
+        root / "home/username/.wine/drive_c/windows/Fonts";
+    fs::create_directories(prefixFonts, ec);
+    std::ofstream(prefixFonts / "user-supplied.ttf") << "font";
+
+    zipFile zip = zipOpen64(archive.string().c_str(), APPEND_STATUS_CREATE);
+    CHECK(zip != nullptr);
+    if (zip != nullptr) {
+        CHECK(addZipEntry(
+            zip, "home/username/.wine/drive_c/windows/Fonts/tahoma.ttf", "f"));
+        CHECK(addZipEntry(zip, "opt/wine/share/wine/fonts/marlett.ttf", "f"));
+        CHECK(addZipEntry(zip, "opt/wine/share/wine/fonts/system.fon", "f"));
+        // Neither a font nor in a font directory. Both have to be ignored, or
+        // the count says the guest has faces it cannot use.
+        CHECK(addZipEntry(zip, "opt/wine/lib/wine/gdi32.dll.so", "x"));
+        CHECK(addZipEntry(zip, "usr/share/doc/fonts.txt", "x"));
+        zipClose(zip, nullptr);
+    }
+
+    const GuestFontCensus census =
+        censusGuestFonts(archive.string(), root.string());
+    CHECK(census.ok);
+    CHECK(census.error.empty());
+    CHECK_EQ(census.inPrefix, static_cast<std::size_t>(1));
+    CHECK_EQ(census.inRootFilesystem, static_cast<std::size_t>(1));
+    CHECK_EQ(census.wineBundled, static_cast<std::size_t>(2));
+    CHECK_EQ(census.total(), static_cast<std::size_t>(4));
+    // The log has to show what kind of faces these are, not only how many.
+    CHECK(!census.examples.empty());
+
+    fs::remove_all(temporary, ec);
+}
+
+BOXEDVN_TEST(guest_font_census_reports_a_root_filesystem_with_no_fonts) {
+    // The state that matters: a guest that can see nothing. It must be
+    // reported as zero rather than as an error, because it is a real and
+    // actionable configuration, not a malfunction of the census.
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-font-census-empty-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    fs::create_directories(temporary, ec);
+    const fs::path archive = temporary / "rootfs.zip";
+
+    zipFile zip = zipOpen64(archive.string().c_str(), APPEND_STATUS_CREATE);
+    CHECK(zip != nullptr);
+    if (zip != nullptr) {
+        CHECK(addZipEntry(zip, "home/username/.wine/user.reg", "x"));
+        CHECK(addZipEntry(zip, "opt/wine/lib/wine/dwrite.dll.so", "x"));
+        zipClose(zip, nullptr);
+    }
+
+    const GuestFontCensus census =
+        censusGuestFonts(archive.string(), (temporary / "prefix").string());
+    CHECK(census.ok);
+    CHECK_EQ(census.total(), static_cast<std::size_t>(0));
+    CHECK(census.examples.empty());
+
+    fs::remove_all(temporary, ec);
+}
+
+BOXEDVN_TEST(guest_font_census_reports_an_unreadable_archive) {
+    const GuestFontCensus missing =
+        censusGuestFonts("/boxedvn/no/such/rootfs.zip", "/boxedvn/no/prefix");
+    CHECK(!missing.ok);
+    CHECK(!missing.error.empty());
+
+    // No archive at all is not a failure: a caller may only want the prefix.
+    const GuestFontCensus prefixOnly = censusGuestFonts("", "/boxedvn/no");
+    CHECK(prefixOnly.ok);
+    CHECK_EQ(prefixOnly.total(), static_cast<std::size_t>(0));
+}

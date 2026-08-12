@@ -329,6 +329,116 @@ bool installBundledDxvk(const std::string& sourceDirectory,
     return true;
 }
 
+namespace {
+
+bool isFontFileName(const std::string& lowerName) {
+    static const char* const suffixes[] = {".ttf", ".ttc", ".otf", ".fon"};
+    for (const char* suffix : suffixes) {
+        const std::string candidate(suffix);
+        if (lowerName.size() > candidate.size() &&
+            lowerName.compare(lowerName.size() - candidate.size(),
+                              candidate.size(), candidate) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string lowered(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+    return value;
+}
+
+// True when `lowerPath` sits directly or indirectly under `lowerPrefix`.
+bool isUnder(const std::string& lowerPath, const char* lowerPrefix) {
+    const std::string prefix(lowerPrefix);
+    return lowerPath.size() > prefix.size() &&
+           lowerPath.compare(0, prefix.size(), prefix) == 0;
+}
+
+void noteExample(GuestFontCensus& census, const std::string& name) {
+    if (std::count(census.examples.begin(), census.examples.end(), ',') >= 2) {
+        return;
+    }
+    if (!census.examples.empty()) {
+        census.examples += ", ";
+    }
+    census.examples += name;
+}
+
+}  // namespace
+
+GuestFontCensus censusGuestFonts(const std::string& rootFilesystemZipPath,
+                                 const std::string& writableRootPath) {
+    GuestFontCensus census;
+
+    std::error_code ec;
+    const fs::path prefixFonts = fs::path(writableRootPath) / "home" /
+        "username" / ".wine" / "drive_c" / "windows" / "Fonts";
+    if (fs::is_directory(prefixFonts, ec)) {
+        for (const fs::directory_entry& entry :
+             fs::directory_iterator(prefixFonts, ec)) {
+            std::error_code entryEc;
+            if (!entry.is_regular_file(entryEc) || entryEc) {
+                continue;
+            }
+            const std::string name = entry.path().filename().string();
+            if (isFontFileName(lowered(name))) {
+                census.inPrefix++;
+                noteExample(census, name);
+            }
+        }
+    }
+
+    if (rootFilesystemZipPath.empty()) {
+        census.ok = true;
+        return census;
+    }
+    unzFile zip = unzOpen64(rootFilesystemZipPath.c_str());
+    if (zip == nullptr) {
+        census.error = "Could not open the root filesystem ZIP to count its "
+                       "fonts.";
+        return census;
+    }
+
+    // Walk the central directory only. Names are all that is needed, so no
+    // entry is opened and nothing is decompressed - this stays cheap on an
+    // archive with tens of thousands of entries.
+    int status = unzGoToFirstFile(zip);
+    while (status == UNZ_OK) {
+        char rawName[512] = {};
+        unz_file_info64 info{};
+        if (unzGetCurrentFileInfo64(zip, &info, rawName, sizeof(rawName) - 1,
+                                    nullptr, 0, nullptr, 0) != UNZ_OK) {
+            break;
+        }
+
+        std::string name(rawName);
+        std::replace(name.begin(), name.end(), '\\', '/');
+        const std::string lowerName = lowered(name);
+        if (isFontFileName(lowerName)) {
+            const std::string base =
+                name.substr(name.find_last_of('/') + 1);
+            if (isUnder(lowerName,
+                        "home/username/.wine/drive_c/windows/fonts/")) {
+                census.inRootFilesystem++;
+                noteExample(census, base);
+            } else if (isUnder(lowerName, "opt/wine/share/wine/fonts/")) {
+                census.wineBundled++;
+                noteExample(census, base);
+            }
+        }
+        status = unzGoToNextFile(zip);
+    }
+    unzClose(zip);
+
+    census.ok = true;
+    return census;
+}
+
 GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
                                          const std::string& writableRootPath) {
     GuestFontInstallResult result;

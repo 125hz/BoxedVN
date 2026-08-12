@@ -87,6 +87,47 @@ struct GuestFontInstallResult {
 GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
                                          const std::string& writableRootPath);
 
+struct GuestFontCensus {
+    bool ok = false;
+
+    // Font files the user supplied, already copied into the prefix.
+    std::size_t inPrefix = 0;
+    // Font files the root filesystem ships in drive_c/windows/Fonts, which a
+    // prefix created from it inherits.
+    std::size_t inRootFilesystem = 0;
+    // Font files Wine ships in share/wine/fonts. wine.inf installs these into
+    // a new prefix, so they count as available even when the prefix's own
+    // Fonts directory is empty in the archive.
+    std::size_t wineBundled = 0;
+
+    // A few names, so the log shows what kind of faces these are rather than
+    // only how many. Comma separated, possibly empty.
+    std::string examples;
+
+    std::string error;
+
+    std::size_t total() const {
+        return inPrefix + inRootFilesystem + wineBundled;
+    }
+};
+
+// Counts the font files a guest can actually see, across the read-only root
+// filesystem archive and the writable prefix overlaid on it.
+//
+// This exists because "does the guest have a font" turned out to be both
+// decisive and unanswerable from outside. A Chromium-family guest aborts in
+// Blink's FontCache when its font collection is empty, and RPG Maker hangs
+// forever in Scene_Boot when document.fonts.ready never settles - two very
+// different-looking failures with one candidate cause, and no way to tell
+// from the host whether that cause is present. Every switch tried against
+// the second failure was a guess, because a command line cannot conjure a
+// font. This turns the question into a log line.
+//
+// Reads the archive's central directory only; nothing is extracted and no
+// entry data is decompressed.
+GuestFontCensus censusGuestFonts(const std::string& rootFilesystemZipPath,
+                                 const std::string& writableRootPath);
+
 // Updates a Wine registry text document in memory. Section names use normal
 // Windows separators (for example "Software\\Wine\\Direct3D"); this function
 // performs Wine's on-disk backslash escaping. `serialisedValue` is the complete
