@@ -4039,4 +4039,12 @@ failures and CTest passes 1/1, including new coverage for the pixmap-format
 list (depth 1 present, visual depths preserved, depth 4 padded, no duplicate
 depths, a server-described depth not overridden, sorted order) and for the
 prefix policy suppressing both runtime prompts idempotently without touching
-the renderer keys. Neither change has been run on a device.
+the renderer keys. GitHub Actions run 31570543624 passed the same suite plus
+the full iPhoneOS compile, app validation, increased-memory entitlement check,
+packaging and direct rolling Release upload. That compile is the only place
+`source/x11/x11common.cpp` is built, and it caught a narrowing conversion the
+MSVC host build accepts. The published build 91 `BoxedVN.ipa` is 8,209,812
+bytes with Release SHA-256
+`a50b920731817b1916ff2ab5a33fe611340341bf7fb4b5f62f23e9a5c5a1d7ac`, targeting
+commit `9030daac1772c159a649009c0531578ee52d4f4f`. Neither change has been run
+on a device.
