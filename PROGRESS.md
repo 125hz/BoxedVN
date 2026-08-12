@@ -4190,4 +4190,16 @@ next attempt at the surface failure answerable rather than another guess.
 
 **Build evidence:** the host-independent suite still runs 125 tests with zero
 failures. The changed ABI, its Swift callers and the new view compile only in
-the iPhoneOS job. Not yet run on a device.
+the iPhoneOS job; GitHub Actions run 31572841868 passed it along with app
+validation, the increased-memory entitlement check, packaging and the rolling
+Release upload. The published build 93 `BoxedVN.ipa` is 8,211,707 bytes with
+Release SHA-256
+`658f0c95e149cd61bda10e1c9ff72b4476769c2bc9f0566eeab0e75a1cce34dd`,
+targeting commit `817930dc3441410bfa1914cefb8aa2687f6dbc0a`. Not yet run on a
+device.
+
+**Next run, to answer the surface failure:** set this game's environment to
+`WINEDEBUG=err+all,warn+dxgi,warn+d3d11,fixme-all` in launch settings and
+capture the log. If ANGLE reaches DXGI, the swapchain call and its failure
+will be named; if it does not, the absence is itself the answer and the
+remaining suspect is ANGLE's own window handling.
