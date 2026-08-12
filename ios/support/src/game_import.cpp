@@ -64,6 +64,35 @@ bool looksLikeSupportExecutable(const std::string& relativePath) {
     return false;
 }
 
+bool looksLikeInstalledGameExecutable(const std::string& relativePath) {
+    std::string lower = toLower(relativePath);
+    std::replace(lower.begin(), lower.end(), '\\', '/');
+
+    // These locations belong to Wine/Windows itself or to installers rather
+    // than to a game. Keep per-user application directories eligible because
+    // small indie games legitimately install under AppData/Local.
+    static const char* kRejectedPrefixes[] = {
+        "windows/",
+        "program files/common files/",
+        "program files (x86)/common files/",
+        "programdata/package cache/",
+        "$recycle.bin/",
+    };
+    for (const char* prefix : kRejectedPrefixes) {
+        if (lower.rfind(prefix, 0) == 0) {
+            return false;
+        }
+    }
+
+    if (lower.rfind("users/", 0) == 0 &&
+        (lower.find("/appdata/local/temp/") != std::string::npos ||
+         lower.find("/temp/") != std::string::npos)) {
+        return false;
+    }
+
+    return !looksLikeSupportExecutable(lower);
+}
+
 std::vector<DiscoveredExecutable> discoverExecutables(
     const std::string& contentDirectory) {
     std::vector<DiscoveredExecutable> discovered;

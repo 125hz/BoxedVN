@@ -29,6 +29,12 @@ import UniformTypeIdentifiers
 /// AppModel.importRootFilesystem), so a non-ZIP selection is still caught
 /// and reported clearly rather than silently accepted.
 let zipImportContentTypes: [UTType] = [.zip, .data]
+let windowsInstallerContentTypes: [UTType] = {
+    guard let executable = UTType(filenameExtension: "exe") else {
+        return [.data]
+    }
+    return [executable, .data]
+}()
 
 /// A UIKit import-mode picker rather than SwiftUI's `.fileImporter`.
 ///
@@ -126,9 +132,13 @@ struct LibraryView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showingGameImporter = false
     @State private var showingFolderImporter = false
+    @State private var showingInstallerImporter = false
     @State private var pendingImportURL: URL?
     @State private var pendingTitle = ""
     @State private var showingTitlePrompt = false
+    @State private var pendingInstallerURL: URL?
+    @State private var pendingInstallerTitle = ""
+    @State private var showingInstallerTitlePrompt = false
 
     var body: some View {
         List {
@@ -184,7 +194,10 @@ struct LibraryView: View {
                     }
                 }
                 .disabled(model.rootFilesystem == nil
-                          || model.runtimeState == .running)
+                          || model.isInstallingGame
+                          || model.runtimeState == .starting
+                          || model.runtimeState == .running
+                          || model.runtimeState == .stopping)
             } header: {
                 Text("Desktop")
             }
@@ -224,15 +237,60 @@ struct LibraryView: View {
                         Text(model.importProgressMessage)
                     }
                 }
+                if model.isInstallingGame {
+                    HStack {
+                        ProgressView()
+                        Text(model.installerProgressMessage)
+                    }
+                }
             }
 
             Section("Actions") {
+                Button {
+                    showingInstallerImporter = true
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Install game from EXE...")
+                            Text("Runs the installer, then adds its 32-bit game "
+                                 + "program to this list")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "shippingbox.and.arrow.backward")
+                    }
+                }
+                .disabled(model.isInstallingGame || model.isImporting
+                          || model.rootFilesystem == nil
+                          || model.runtimeState == .starting
+                          || model.runtimeState == .running
+                          || model.runtimeState == .stopping)
+                .alert("Name the installed game",
+                       isPresented: $showingInstallerTitlePrompt) {
+                    TextField("Title", text: $pendingInstallerTitle)
+                    Button("Run installer") {
+                        if let url = pendingInstallerURL {
+                            model.installGame(
+                                from: url, title: pendingInstallerTitle)
+                        }
+                        pendingInstallerURL = nil
+                    }
+                    Button("Cancel", role: .cancel) {
+                        pendingInstallerURL = nil
+                    }
+                } message: {
+                    Text("The installer gets its own persistent C: drive. "
+                         + "Finish or cancel it normally; BoxedVN scans for "
+                         + "the installed game after Wine closes.")
+                }
                 Button("Import game from ZIP…") { showingGameImporter = true }
-                    .disabled(model.isImporting)
+                    .disabled(model.isImporting || model.isInstallingGame)
                 Button("Import game from folder…") { showingFolderImporter = true }
-                    .disabled(model.isImporting)
+                    .disabled(model.isImporting || model.isInstallingGame)
                 Button("Run Wine Notepad") { model.launchWineNotepad() }
-                    .disabled(model.rootFilesystem == nil)
+                    .disabled(model.rootFilesystem == nil
+                              || model.isInstallingGame)
                 if model.runtimeState == .running {
                     Button("Quit running session", role: .destructive) {
                         model.requestShutdown()
@@ -263,6 +321,15 @@ struct LibraryView: View {
                 },
                 onCancel: { showingFolderImporter = false })
         }
+        .sheet(isPresented: $showingInstallerImporter) {
+            DocumentImportPicker(
+                contentTypes: windowsInstallerContentTypes,
+                onResult: { result in
+                    showingInstallerImporter = false
+                    handleInstaller(result)
+                },
+                onCancel: { showingInstallerImporter = false })
+        }
         .alert("Name this game", isPresented: $showingTitlePrompt) {
             TextField("Title", text: $pendingTitle)
             Button("Import") {
@@ -292,6 +359,21 @@ struct LibraryView: View {
         pendingImportURL = url
         pendingTitle = url.deletingPathExtension().lastPathComponent
         showingTitlePrompt = true
+    }
+
+    private func handleInstaller(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            Log.write("Installer picker selected \(url.lastPathComponent)",
+                      category: "installer")
+            pendingInstallerURL = url
+            pendingInstallerTitle = url.deletingPathExtension().lastPathComponent
+            showingInstallerTitlePrompt = true
+        case .failure(let error):
+            Log.write("Installer picker failed: \(error.localizedDescription)",
+                      category: "installer", level: BVNLogLevelError)
+            model.alertMessage = error.localizedDescription
+        }
     }
 
 }

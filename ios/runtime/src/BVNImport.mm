@@ -200,6 +200,12 @@ extern "C" size_t BVNDiscoverExecutables(const char* contentDirectory,
     return discovered.size();
 }
 
+extern "C" bool BVNLooksLikeInstalledGameExecutable(
+    const char* relativePath) {
+    return relativePath != nullptr &&
+        boxedvn::looksLikeInstalledGameExecutable(relativePath);
+}
+
 extern "C" void BVNMakeIdentifier(const char* title, char* out, size_t capacity) {
     copyInto(out, capacity, boxedvn::makeIdentifier(title != nullptr ? title : ""));
 }

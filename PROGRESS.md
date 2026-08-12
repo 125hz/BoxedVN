@@ -3803,3 +3803,29 @@ completed in 4 minutes 2 seconds. The published build 87 `BoxedVN.ipa` is
 The rolling Release targets the exact producing commit
 `46357e618a8d25436144128a3ba390aabbe6c23a`. Long-session physical Grisaia and
 portrait-trackpad acceptance remain pending build 87.
+
+### 2026-08-11 - build 88: EXE installer workflow and library discovery
+
+The previous Wine desktop could manually execute an installer from the shared
+E: drive, but the result stayed inside the tools prefix and was never added to
+the game library. Build 88 adds an **Install game from EXE** action. It stages a
+validated runnable 32-bit Windows installer, creates a new per-game Wine prefix,
+runs the installer at 1280x720, and scans the same persistent prefix after Wine
+exits. The generated manifest retains the installed C: drive as its content
+directory, so subsequent launches use the original `C:\\...` executable path,
+registry, dependencies, and save locations instead of copying files into a
+different environment. Installers that deliberately target D: are also detected
+and retain that directory.
+
+Automatic discovery filters Wine's Windows directory, common support files,
+temporary setup paths, uninstallers, redistributables, crash reporters, and
+updaters before selecting a launch target. Cancelling an installer or installing
+only unsupported 64-bit executables leaves no broken library entry and removes
+the incomplete prefix. The installer staging copy is deleted once a C-drive
+installation is successfully registered.
+
+**Build evidence:** `git diff --check` passes. In the Visual Studio developer
+environment the host-independent executable runs all 94 tests with zero
+failures, including installed-prefix candidate filtering, and CTest passes 1/1.
+The iPhoneOS compile, unsigned IPA packaging, and physical installer acceptance
+remain pending GitHub Actions and device testing.

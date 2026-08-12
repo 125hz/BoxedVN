@@ -35,6 +35,12 @@ std::vector<DiscoveredExecutable> discoverExecutables(
 // handlers, redistributable bundles.  Exposed for testing.
 bool looksLikeSupportExecutable(const std::string& relativePath);
 
+// True when an executable found in a Wine prefix is a plausible installed
+// game entry point. Wine's drive_c can contain Windows helpers, uninstallers,
+// redistributables and temporary setup programs; none should be selected as
+// the library's launch target merely because they are runnable PE files.
+bool looksLikeInstalledGameExecutable(const std::string& relativePath);
+
 // Builds a manifest for a freshly imported game.  `selectedExecutable` may be
 // empty, in which case the first runnable discovery is used; if there is none,
 // selectedExecutable is left empty and the caller must surface the diagnostics.

@@ -174,6 +174,21 @@ BOXEDVN_TEST(support_executables_are_demoted) {
     CHECK_EQ(looksLikeSupportExecutable("kanon.exe"), false);
 }
 
+BOXEDVN_TEST(installed_game_candidates_exclude_wine_and_setup_helpers) {
+    CHECK_EQ(looksLikeInstalledGameExecutable(
+                 "Program Files/My VN/game.exe"), true);
+    CHECK_EQ(looksLikeInstalledGameExecutable(
+                 "users/username/AppData/Local/My VN/game.exe"), true);
+    CHECK_EQ(looksLikeInstalledGameExecutable(
+                 "windows/system32/notepad.exe"), false);
+    CHECK_EQ(looksLikeInstalledGameExecutable(
+                 "Program Files/Common Files/helper.exe"), false);
+    CHECK_EQ(looksLikeInstalledGameExecutable(
+                 "users/username/AppData/Local/Temp/setup.exe"), false);
+    CHECK_EQ(looksLikeInstalledGameExecutable(
+                 "Program Files/My VN/unins000.exe"), false);
+}
+
 BOXEDVN_TEST(build_manifest_picks_the_first_runnable_executable) {
     std::vector<DiscoveredExecutable> discovered;
 

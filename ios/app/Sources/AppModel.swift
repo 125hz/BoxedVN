@@ -22,11 +22,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var runtimeState: RuntimeState = .idle
     @Published private(set) var isImporting = false
     @Published var importProgressMessage = ""
+    @Published private(set) var isInstallingGame = false
+    @Published var installerProgressMessage = ""
     @Published private(set) var isInstallingRootFilesystem = false
     @Published var alertMessage: String?
 
     private var pollTimer: Timer?
     private var pollCount = 0
+    private var pendingGameInstallation: PendingGameInstallation?
 
     init() {
         reloadGames()
@@ -110,6 +113,66 @@ final class AppModel: ObservableObject {
             reloadGames()
         } catch {
             alertMessage = "Could not delete \(game.title): \(error.localizedDescription)"
+        }
+    }
+
+    func installGame(from url: URL, title: String) {
+        guard !isInstallingGame else { return }
+        guard runtimeState != .starting && runtimeState != .running &&
+              runtimeState != .stopping else {
+            alertMessage = "Quit the running session before starting an installer."
+            return
+        }
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed. Import Boxedwine's "
+                         + "root filesystem archive in Settings first."
+            return
+        }
+
+        isInstallingGame = true
+        installerProgressMessage = "Preparing \(url.lastPathComponent)..."
+        let needsScope = url.startAccessingSecurityScopedResource()
+
+        Task.detached(priority: .userInitiated) {
+            defer { if needsScope { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let installation = try GameLibrary.prepareInstaller(
+                    from: url, title: title)
+                await MainActor.run {
+                    self.pendingGameInstallation = installation
+                    self.installerProgressMessage = "Installer running..."
+                    do {
+                        try Session.launch(
+                            rootFilesystem: rootFilesystem,
+                            writableRoot: installation.winePrefixRoot,
+                            gameDirectory: installation.stagingDirectory,
+                            sharedDirectory: Storage.sharedFiles,
+                            executablePath: installation.guestInstallerPath,
+                            arguments: [],
+                            environment: [],
+                            workingDirectory:
+                                "/home/username/.wine/dosdevices/d:/",
+                            width: 1280,
+                            height: 720,
+                            soundEnabled: true,
+                            runThroughWine: true)
+                    } catch {
+                        self.pendingGameInstallation = nil
+                        self.isInstallingGame = false
+                        self.installerProgressMessage = ""
+                        GameLibrary.discardInstaller(installation)
+                        self.alertMessage = error.localizedDescription
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.isInstallingGame = false
+                    self.installerProgressMessage = ""
+                    self.alertMessage = error.localizedDescription
+                    Log.write(error.localizedDescription, category: "installer",
+                              level: BVNLogLevelError)
+                }
+            }
         }
     }
 
@@ -362,11 +425,48 @@ final class AppModel: ObservableObject {
                             self.alertMessage = message
                         }
                     }
+                    self.finishInstallerIfNeeded(afterEntering: state)
                 }
                 self.refreshJIT()
                 self.pollCount += 1
                 if self.pollCount % 10 == 0 {
                     self.memory = .probe()
+                }
+            }
+        }
+    }
+
+    private func finishInstallerIfNeeded(afterEntering state: RuntimeState) {
+        guard state == .stopped || state == .failed,
+              let installation = pendingGameInstallation else { return }
+        pendingGameInstallation = nil
+        installerProgressMessage = "Finding the installed game..."
+        let runtimeFailure = state == .failed ? Session.lastError : ""
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let game = try GameLibrary.finishInstaller(installation)
+                await MainActor.run {
+                    self.isInstallingGame = false
+                    self.installerProgressMessage = ""
+                    self.reloadGames()
+                    self.alertMessage = "\(game.title) was installed and added "
+                                      + "to the game list."
+                    Log.write("Installed \(game.title); selected "
+                              + game.selectedExecutable,
+                              category: "installer")
+                }
+            } catch {
+                GameLibrary.discardInstaller(installation)
+                await MainActor.run {
+                    self.isInstallingGame = false
+                    self.installerProgressMessage = ""
+                    let prefix = runtimeFailure.isEmpty
+                        ? "The installer closed, but BoxedVN could not add the game."
+                        : "The installer session failed: \(runtimeFailure)"
+                    self.alertMessage = prefix + "\n\n" + error.localizedDescription
+                    Log.write(self.alertMessage ?? error.localizedDescription,
+                              category: "installer", level: BVNLogLevelError)
                 }
             }
         }

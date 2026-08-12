@@ -113,6 +113,10 @@ size_t BVNDiscoverExecutables(const char* contentDirectory,
                               BVNDiscoveredExecutable* out,
                               size_t capacity);
 
+// Applies the installed-prefix entry-point filter used after an installer
+// exits. The input is a '/'- or '\\'-separated path relative to drive_c.
+bool BVNLooksLikeInstalledGameExecutable(const char* relativePath);
+
 // ---------------------------------------------------------------------------
 // Manifests
 // ---------------------------------------------------------------------------
