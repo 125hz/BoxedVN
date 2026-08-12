@@ -4048,3 +4048,75 @@ bytes with Release SHA-256
 `a50b920731817b1916ff2ab5a33fe611340341bf7fb4b5f62f23e9a5c5a1d7ac`, targeting
 commit `9030daac1772c159a649009c0531578ee52d4f4f`. Neither change has been run
 on a device.
+
+### 2026-08-12 - build 92: XGetVisualInfo returned the wrong array layout
+
+`boxedvn-20260812-014052.log` is build 91 and the winex11 fault is unchanged,
+register for register. Build 91's pixmap-format work was right about the
+mechanism and wrong about the value: the index is not depth 1.
+
+Disassembling winex11.so from the pinned archive backwards from the faulting
+address identifies the function. It begins at 0x83d4, and:
+
+```
+0x083f1  mov  esi, ecx            ; arg3
+0x083f3  mov  edx, [ecx + 0xc]    ; arg3->depth
+0x08400  mov  eax, [eax]          ; pixmap_formats
+0x08402  mov  eax, [eax + edx*4]  ; pixmap_formats[depth]
+...
+0x0843c  mov  dword [esp+0x78], 0x28   ; biSize
+0x08453  mov  word  [esp+0x84], 1      ; biPlanes
+0x08461  mov  eax, [eax+4]             ; ->bits_per_pixel   <-- faults
+```
+
+Offset 0xc of arg3 is `XVisualInfo.depth`, arg4 is a RECT, and the body builds
+a BITMAPINFOHEADER: this is Wine's `create_surface(hwnd, window, vis, rect)`,
+the window surface used for software drawing. So the depth came from an
+XVisualInfo Wine obtained from `XGetVisualInfo`.
+
+`x11_GetVisualInfo` allocated `(sizeof(XVisualInfo) + sizeof(U32)) * count`
+and returned a table of `count` pointers followed by the structures. Xlib
+returns one flat array, which callers index as `info[i]` and very often just
+dereference as `*info` to take the first match. Every field a client read was
+therefore shifted by four bytes per match. For the single match a lookup by
+visual ID returns, the shift is four bytes and each field reads its
+predecessor:
+
+```
+   depth          <- screen        (0)
+   c_class        <- depth
+   red_mask       <- c_class
+   green_mask     <- red_mask
+   ...
+```
+
+`depth` reads `screen`, which is 0, and `pixmap_formats[0]` is NULL - exactly
+the observed fault. The rest of the visual was wrong just as silently: wrong
+class, wrong colour masks, wrong colormap size, for every X client under
+Boxedwine, not only Wine.
+
+Two other functions in the same tree - `glXChooseVisual` and
+`glXGetVisualFromFBConfig` - already allocate exactly `sizeof(XVisualInfo)`
+and return the structure at the returned address. This one was the outlier.
+
+`x11_GetVisualInfo` now writes the structures contiguously from the returned
+address, and `xvisualinfo.h` carries `static_assert`s pinning every field
+offset, because this class of mistake produces wrong pixels rather than a
+crash and had gone unnoticed.
+
+Build 91's depth-1 and depth-4 pixmap formats are kept. They are still
+correct - a real X server advertises formats for depths that have no visual,
+and Wine indexes that array by depth - but they were not this fault, and the
+build 91 entry should be read with that correction.
+
+**Whether this fixes the black screen is not yet known.** It is a strong
+candidate: winex11 hands `default_visual` to `create_client_window`, which is
+what a window's Vulkan or GL surface is created against, and a visual with
+depth 0 and scrambled masks is a plausible reason for
+`eglCreateWindowSurface` to fail and for the software-compositing fallback to
+fault immediately afterwards. That chain is reasoning, not evidence, and the
+next device log settles it.
+
+**Build evidence:** the host-independent suite still runs 125 tests with zero
+failures. `source/x11/x11common.cpp` and `xvisualinfo.h` compile only in the
+iPhoneOS job, which is what checks the new static assertions.

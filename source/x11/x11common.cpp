@@ -1526,17 +1526,27 @@ static void x11_GetVisualInfo(CPU* cpu) {
         EAX = 0;
         return;
     }
-    U32 listAddress = thread->process->alloc(thread, (sizeof(XVisualInfo) + sizeof(U32)) * count);
+    // Xlib returns one flat array of XVisualInfo. The caller indexes it as
+    // `info[i]`, and very often just dereferences `*info` to take the first
+    // match, then releases the whole block with XFree.
+    //
+    // This used to return a table of `count` pointers followed by the
+    // structures, which is not that layout and is not any Xlib API's layout.
+    // Every field a client read came out shifted by four bytes per match. With
+    // the single match a lookup by visual ID returns, `depth` read the
+    // structure's `screen` field - zero - so Wine's X11 driver ended up with a
+    // depth-0 visual and then null-dereferenced `pixmap_formats[0]` while
+    // building the BITMAPINFOHEADER for a window surface. Its class and its
+    // RGB masks were wrong in the same way, quietly, for everything else.
+    U32 listAddress = thread->process->alloc(thread, sizeof(XVisualInfo) * count);
     EAX = listAddress;
-    U32 itemAddress = listAddress + sizeof(U32) * count;
-    Display::iterateVisuals(thread, displayAddress, [&memory, &listAddress, &itemAddress, mask, &infoTemplate](S32 screenIndex, U32 visualAddress, Depth* depth, Visual* visual) {
+    U32 itemAddress = listAddress;
+    Display::iterateVisuals(thread, displayAddress, [&memory, &itemAddress, mask, &infoTemplate](S32 screenIndex, U32 visualAddress, Depth* depth, Visual* visual) {
         if (infoTemplate.match(mask, screenIndex, depth, visual)) {
             XVisualInfo* visualInfo = (XVisualInfo*)memory->lockReadWriteMemory(itemAddress, sizeof(XVisualInfo));
-            memory->writed(listAddress, itemAddress);
-            itemAddress += sizeof(XVisualInfo);
-            listAddress += sizeof(U32);
             visualInfo->set(screenIndex, visualAddress, depth->depth, visual);
             memory->unlockMemory((U8*)visualInfo);
+            itemAddress += sizeof(XVisualInfo);
         }
         return true;
         });

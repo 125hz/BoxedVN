@@ -19,6 +19,8 @@
 #ifndef __X_VISUAL_INFO_H__
 #define __X_VISUAL_INFO_H__
 
+#include <stddef.h>
+
 struct XVisualInfo {
 	VisualPtrAddress visual;
 	VisualID visualid;
@@ -38,5 +40,21 @@ struct XVisualInfo {
 };
 
 static_assert(sizeof(XVisualInfo) == 40, "emulation expects sizeof(XVisualInfo) to be 40");
+
+// XGetVisualInfo hands the guest a flat array of these, so a client reads each
+// field at a fixed byte offset from the pointer it was given. Getting that
+// wrong does not fail loudly: the client keeps running with a visual whose
+// depth, class and colour masks are all somebody else's. Pin the offsets Xlib
+// clients compile against.
+static_assert(offsetof(XVisualInfo, visual) == 0, "XVisualInfo.visual must be at offset 0");
+static_assert(offsetof(XVisualInfo, visualid) == 4, "XVisualInfo.visualid must be at offset 4");
+static_assert(offsetof(XVisualInfo, screen) == 8, "XVisualInfo.screen must be at offset 8");
+static_assert(offsetof(XVisualInfo, depth) == 12, "XVisualInfo.depth must be at offset 12");
+static_assert(offsetof(XVisualInfo, c_class) == 16, "XVisualInfo.class must be at offset 16");
+static_assert(offsetof(XVisualInfo, red_mask) == 20, "XVisualInfo.red_mask must be at offset 20");
+static_assert(offsetof(XVisualInfo, green_mask) == 24, "XVisualInfo.green_mask must be at offset 24");
+static_assert(offsetof(XVisualInfo, blue_mask) == 28, "XVisualInfo.blue_mask must be at offset 28");
+static_assert(offsetof(XVisualInfo, colormap_size) == 32, "XVisualInfo.colormap_size must be at offset 32");
+static_assert(offsetof(XVisualInfo, bits_per_rgb) == 36, "XVisualInfo.bits_per_rgb must be at offset 36");
 
 #endif
