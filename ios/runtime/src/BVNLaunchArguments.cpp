@@ -171,6 +171,21 @@ std::vector<std::string> BVNBuildLaunchArguments(
         argv.push_back("-resolution");
         argv.push_back(std::to_string(launch.width) + "x" +
                        std::to_string(launch.height));
+    } else if (launch.runThroughWine &&
+               !launch.gameDirectoryHostPath.empty()) {
+        // A game's "default" resolution used to leave Boxedwine's X11 root
+        // at 800x600. Games are free to create a larger client afterwards
+        // (Grisaia switches to 1280x720), but Wine has already cached the
+        // original 800-pixel monitor geometry by then. Its X11 driver scales
+        // absolute pointer positions back through that stale monitor, so an
+        // otherwise-correct x=1218 arrives at the Windows game near x=761.
+        //
+        // Start generic game sessions on a 1280x720 virtual monitor. This is
+        // not a title profile: every imported Wine game with no explicit
+        // resolution gets the same coherent 16:9 desktop, while a resolution
+        // selected by the user above continues to take precedence.
+        argv.push_back("-resolution");
+        argv.push_back("1280x720");
     }
     if (launch.bitsPerPixel == 16 || launch.bitsPerPixel == 32) {
         argv.push_back("-bpp");

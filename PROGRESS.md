@@ -7,16 +7,16 @@ working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
 **Last updated:** 2026-08-11 (build 81 is device-confirmed to fix Grisaia's
-stretched/cut-off resolution, but its right-side input fix was incomplete. The
-two build-81 logs prove UIKit, the overlay, SDL, the active 1280x720 client, and
-the expanded 1283x749 root all receive right-side coordinates unchanged, up to
-guest x=1250. They also expose the remaining boundary: Wine's already-open
-Xlib `Screen` records still say 800x600 because Boxedwine only populated them
-when each display opened. Build 82 updates every live Xlib screen record to the
-fake-fullscreen client's 1280x720 size and repairs the reversed client/root
-conversion in `XQueryPointer`'s backing input path. The Windows support suite
-remains 92/92. GitHub Actions run 31552046685 passed the full iPhoneOS build
-and published the direct IPA; fresh-device input validation is pending. Song
+stretched/cut-off resolution, but builds 81 and 82 did not fix its right-side
+input. The build-82 log proves Boxedwine now delivers taps as far right as
+guest x=1227 to the correct 1280x720 X11 client, while Wine still initialized
+the session at 800x600. The observed in-game x position is compressed by the
+same 800/1280 ratio, so build 83 starts every imported Wine game whose launch
+resolution is `default` on a generic 1280x720 virtual monitor. Explicit
+per-game resolutions still take precedence. This prevents Wine from caching
+an 800-pixel monitor before a game creates a 1280-pixel client. The Windows
+support suite passes 93/93; fresh-device input validation and the iPhoneOS CI
+build are pending. Song
 of Saya remains
 device-proven playable with the
 interpreter workaround.
@@ -3629,3 +3629,30 @@ digest and sidecar:
 The rolling Release targets the exact producing commit
 `821854e1646d56fd242787675cc0d16b7f250573`. Physical right-side input
 acceptance remains pending build 82.
+
+### 2026-08-11 - build 83: start default game sessions on a coherent 1280x720 Wine monitor
+
+The device report and `boxedvn-20260811-200729.log` show that build 82 did not
+fix right-side input. Its new diagnostics isolate the remaining transform:
+UIKit hit tests reach screen x=783, the native overlay maps trackpad positions
+as far as guest x=1227, Boxedwine targets the active 1280x720 client directly,
+and `XQueryPointer` reports a 1280x720 Xlib screen. The game nevertheless acts
+near x=767, which is the same 800/1280 compression seen in the UI.
+
+The launch command in that same log contains no `-resolution`, so Wine starts
+and caches its virtual monitor at Boxedwine's 800x600 default before Grisaia
+later creates its 1280x720 client. Changing Xlib's live screen record after the
+game opens is too late for Wine's already-built Windows monitor geometry.
+
+Build 83 fixes the ordering generically in `BVNBuildLaunchArguments`: every
+imported Wine game left on the launch setting `default` now receives
+`-resolution 1280x720` before Wine starts. This is not keyed to Grisaia or an
+executable name. It gives all default game sessions one coherent 16:9 monitor
+before Wine caches display metrics. A user-selected resolution such as
+1024x576 remains authoritative and is emitted exactly once. Wine tools retain
+their explicit sizes.
+
+**Local evidence:** `git diff --check` passes. The host-independent Windows
+suite now runs 93 tests with zero failures, including a new explicit-resolution
+precedence regression test, and CTest passes 1/1. The full iPhoneOS compile and
+physical right-side input acceptance remain pending build 83.

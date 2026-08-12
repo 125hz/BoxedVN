@@ -67,7 +67,8 @@ BOXEDVN_TEST(game_command_preserves_mount_environment_and_arguments) {
     const std::vector<std::string> expected = {
         "boxedvn", "-root", "/prefix", "-zip", "/rootfs.zip", "-nozip",
         "-mount_drive", "/games/example", "d",
-        "-mount_drive", "/documents/shared", "e", "-nosound",
+        "-mount_drive", "/documents/shared", "e",
+        "-resolution", "1280x720", "-nosound",
         "-dxvk", "1", "-w",
         "/home/username/.wine/dosdevices/d:/content",
         "-env", "WINEDEBUG=warn+d3d_shader,-d3d",
@@ -76,6 +77,23 @@ BOXEDVN_TEST(game_command_preserves_mount_environment_and_arguments) {
     };
 
     CHECK(actual == expected);
+}
+
+BOXEDVN_TEST(explicit_game_resolution_overrides_ios_default_monitor) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.writableRootPath = "/prefix";
+    launch.gameDirectoryHostPath = "/games/example";
+    launch.executablePath = "d:\\game.exe";
+    launch.width = 1024;
+    launch.height = 576;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const auto option = std::find(actual.begin(), actual.end(), "-resolution");
+    CHECK(option != actual.end());
+    CHECK(option + 1 != actual.end());
+    CHECK(*(option + 1) == "1024x576");
+    CHECK(std::count(actual.begin(), actual.end(), "-resolution") == 1);
 }
 
 BOXEDVN_TEST(explicit_wine_dll_policy_is_not_overwritten) {
