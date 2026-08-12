@@ -515,7 +515,6 @@ struct GameDetailView: View {
         }
     }
 
-    @discardableResult
     /// Argument lines that are really environment assignments. A Windows
     /// program argument does not look like `NAME=VALUE` with no leading dash
     /// or slash, and an entry typed here instead of in Environment reaches the
@@ -539,6 +538,7 @@ struct GameDetailView: View {
             .map { String($0.prefix(while: { $0 != "=" })) }
     }
 
+    @discardableResult
     private func save() -> Bool {
         let arguments = argumentsText
             .split(separator: "\n", omittingEmptySubsequences: true)
