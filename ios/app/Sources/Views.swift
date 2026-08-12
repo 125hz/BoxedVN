@@ -401,7 +401,17 @@ struct GameDetailView: View {
         List {
             Section("Executable") {
                 if executables.isEmpty {
-                    Text("Scanning…").foregroundStyle(.secondary)
+                    // Name the program the manifest already chose rather than
+                    // showing only "Scanning…". Launch works during the scan,
+                    // so the row has to say what it would launch.
+                    if !selected.isEmpty {
+                        LabeledContent("Program", value: selected)
+                    }
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Looking for other programs…")
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     Picker("Program", selection: $selected) {
                         ForEach(executables) { executable in
@@ -474,9 +484,7 @@ struct GameDetailView: View {
                         model.launch(updated)
                     }
                 }
-                    .disabled(selected.isEmpty
-                              || !(executables.first { $0.relativePath == selected }?
-                                    .runnable ?? false))
+                    .disabled(!canLaunchSelection)
             } footer: {
                 if !model.jit.isUsable {
                     Text("JIT is not available, so launching will fail. "
@@ -513,6 +521,33 @@ struct GameDetailView: View {
                     ?? executables.first?.relativePath ?? ""
             }
         }
+    }
+
+    /// Whether Launch can act on the current selection.
+    ///
+    /// Opening a game re-scans its whole content directory and inspects every
+    /// executable it finds, which for a game shipping tens of thousands of
+    /// asset files takes long enough to notice. While that ran, `executables`
+    /// was empty, so the old condition - "is the selected entry marked
+    /// runnable" - was false and Launch sat greyed out for seconds every
+    /// single time, including for a game the user has already played.
+    ///
+    /// The scan exists so the user can *change* which program runs. It is not
+    /// what makes the current one launchable: import already inspected that
+    /// executable and wrote its verdict into the manifest, and the manifest's
+    /// choice is exactly what Launch is about to use. So the button waits for
+    /// the scan only when the selection has been changed to something the
+    /// scan has not judged yet.
+    private var canLaunchSelection: Bool {
+        if selected.isEmpty {
+            return false
+        }
+        guard let scanned = executables.first(where: {
+            $0.relativePath == selected
+        }) else {
+            return selected == game.selectedExecutable
+        }
+        return scanned.runnable
     }
 
     /// Argument lines that are really environment assignments. A Windows
