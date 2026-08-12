@@ -792,6 +792,8 @@ struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("BoxedVN.preferredOrientation")
     private var preferredOrientation = 1
+    @AppStorage(Preferences.soundEnabledKey)
+    private var soundEnabled = true
     @State private var showingRootFilesystemImporter = false
 
     var body: some View {
@@ -811,6 +813,14 @@ struct SettingsView: View {
                 Text("BoxedVN stays in this orientation in the library and "
                      + "while Wine is running. Change it here before "
                      + "launching a game.")
+            }
+
+            Section {
+                Toggle("Sound", isOn: $soundEnabled)
+            } footer: {
+                Text("Off tells the guest there is no audio device at all, "
+                     + "rather than muting one. Turn it off to find out "
+                     + "whether a game that crashes is crashing in its audio.")
             }
 
             Section {

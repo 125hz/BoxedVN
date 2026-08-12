@@ -154,7 +154,7 @@ final class AppModel: ObservableObject {
                                 "/home/username/.wine/dosdevices/d:/",
                             width: 1280,
                             height: 720,
-                            soundEnabled: true,
+                            soundEnabled: Preferences.soundEnabled,
                             runThroughWine: true)
                     } catch {
                         self.pendingGameInstallation = nil
@@ -299,7 +299,7 @@ final class AppModel: ObservableObject {
                 workingDirectory: game.guestWorkingDirectory,
                 width: game.requestedWidth,
                 height: game.requestedHeight,
-                soundEnabled: true,
+                soundEnabled: Preferences.soundEnabled,
                 runThroughWine: true,
                 wineRenderer: Self.wineRenderer(for: game.renderer)
             )
@@ -352,7 +352,7 @@ final class AppModel: ObservableObject {
                 workingDirectory: nil,
                 width: 1280,
                 height: 720,
-                soundEnabled: true,
+                soundEnabled: Preferences.soundEnabled,
                 runThroughWine: true
             )
         } catch {
@@ -384,7 +384,7 @@ final class AppModel: ObservableObject {
                 workingDirectory: nil,
                 width: 800,
                 height: 600,
-                soundEnabled: true,
+                soundEnabled: Preferences.soundEnabled,
                 runThroughWine: true
             )
         } catch {

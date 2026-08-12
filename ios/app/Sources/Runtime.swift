@@ -70,6 +70,31 @@ struct JITReport {
 
 // MARK: - Memory entitlement
 
+/// Settings that apply to every session rather than to one game.
+///
+/// Read from UserDefaults at launch time rather than held in a view, because
+/// the launch path runs from AppModel and must see the current value whether
+/// or not the Settings screen has ever been opened.
+enum Preferences {
+    static let soundEnabledKey = "BoxedVN.soundEnabled"
+
+    /// Whether a guest gets an audio device at all. Off passes Boxedwine's
+    /// `-nosound`, which is stronger than muting: the guest is told there is
+    /// no device, so nothing opens one and nothing decodes into one.
+    ///
+    /// Worth having beyond taste. A device run reached RPG Maker's map and
+    /// then lost a renderer to an x86 divide-by-zero, with the guest having
+    /// asked for 44100 Hz and been given 48000 - a resample ratio between two
+    /// numbers, at exactly the point a game starts its music. Being able to
+    /// take audio out of the picture is how that gets attributed.
+    static var soundEnabled: Bool {
+        if UserDefaults.standard.object(forKey: soundEnabledKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: soundEnabledKey)
+    }
+}
+
 struct MemoryReport {
     enum EntitlementStatus {
         case unknown
