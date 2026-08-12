@@ -452,6 +452,10 @@ BOXEDVN_TEST(guest_font_census_counts_every_place_a_font_can_come_from) {
     CHECK_EQ(census.inRootFilesystem, static_cast<std::size_t>(1));
     CHECK_EQ(census.wineBundled, static_cast<std::size_t>(2));
     CHECK_EQ(census.total(), static_cast<std::size_t>(4));
+    // The split that matters: DirectWrite, and so Chromium, can load the
+    // three scalable faces and cannot load the .fon at all.
+    CHECK_EQ(census.scalable, static_cast<std::size_t>(3));
+    CHECK_EQ(census.bitmap, static_cast<std::size_t>(1));
     // The log has to show what kind of faces these are, not only how many.
     CHECK(!census.examples.empty());
 
@@ -496,4 +500,38 @@ BOXEDVN_TEST(guest_font_census_reports_an_unreadable_archive) {
     const GuestFontCensus prefixOnly = censusGuestFonts("", "/boxedvn/no");
     CHECK(prefixOnly.ok);
     CHECK_EQ(prefixOnly.total(), static_cast<std::size_t>(0));
+}
+
+BOXEDVN_TEST(guest_font_census_separates_bitmap_fonts_from_usable_ones) {
+    // The state a real device was in: a Fonts directory that is not empty and
+    // is nonetheless useless to a browser engine, because DirectWrite cannot
+    // load the legacy .fon bitmap format at all. Counting these together
+    // reports a healthy font situation for a guest that has none.
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-font-census-fon-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    fs::create_directories(temporary, ec);
+    const fs::path archive = temporary / "rootfs.zip";
+
+    zipFile zip = zipOpen64(archive.string().c_str(), APPEND_STATUS_CREATE);
+    CHECK(zip != nullptr);
+    if (zip != nullptr) {
+        for (const char* name : {"coue1255.fon", "coue1256.fon",
+                                 "sserife.fon", "smalle.fon"}) {
+            CHECK(addZipEntry(
+                zip, (std::string("opt/wine/share/wine/fonts/") + name).c_str(),
+                "f"));
+        }
+        zipClose(zip, nullptr);
+    }
+
+    const GuestFontCensus census =
+        censusGuestFonts(archive.string(), (temporary / "prefix").string());
+    CHECK(census.ok);
+    CHECK_EQ(census.total(), static_cast<std::size_t>(4));
+    CHECK_EQ(census.bitmap, static_cast<std::size_t>(4));
+    CHECK_EQ(census.scalable, static_cast<std::size_t>(0));
+
+    fs::remove_all(temporary, ec);
 }

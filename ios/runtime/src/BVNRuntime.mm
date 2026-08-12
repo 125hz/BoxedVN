@@ -544,14 +544,33 @@ void runSession(const BVNLaunchConfiguration& launch) {
                         "that needs text cannot work in this state. Put "
                         ".ttf/.ttc/.otf files in Documents/Fonts through the "
                         "Files app.");
+        } else if (census.scalable == 0) {
+            // The state the build-100 device log was actually in: 56 fonts,
+            // every one of them a .fon. Worth its own message, because a full
+            // Fonts directory makes this look like anything but a font
+            // problem, and adding more .fon files would change nothing.
+            char message[448];
+            snprintf(message, sizeof(message),
+                     "This guest has %zu font file(s) and NOT ONE that "
+                     "DirectWrite can load: all %zu are legacy .fon bitmap "
+                     "fonts, which only GDI understands. Chromium, and so "
+                     "every NW.js or Electron game, reaches fonts through "
+                     "DirectWrite and sees an empty collection here - it "
+                     "aborts in FontCache, or waits forever for "
+                     "document.fonts.ready. Put a .ttf/.ttc/.otf in "
+                     "Documents/Fonts through the Files app.",
+                     census.total(), census.bitmap);
+            BVNLogWrite(BVNLogLevelError, "fonts", message);
         } else {
-            char message[320];
+            char message[384];
             snprintf(message, sizeof(message),
                      "Guest fonts: %zu total - %zu supplied by you, %zu in "
                      "the root filesystem's Fonts directory, %zu bundled "
-                     "with Wine.",
+                     "with Wine. %zu are scalable (DirectWrite, and so "
+                     "Chromium, can use these); %zu are .fon bitmap fonts "
+                     "(GDI only).",
                      census.total(), census.inPrefix, census.inRootFilesystem,
-                     census.wineBundled);
+                     census.wineBundled, census.scalable, census.bitmap);
             std::string line(message);
             if (!census.examples.empty()) {
                 line += " For example: " + census.examples + ".";

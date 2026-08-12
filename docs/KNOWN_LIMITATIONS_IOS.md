@@ -307,8 +307,20 @@ under `fonts:`. A total of zero is logged as an error in its own right,
 because a guest with no font cannot run a program that draws text and
 nothing else in the log would say so.
 
-A system font supplied through `Documents/Fonts` (section 7) remains
-untested. It addresses a different failure - Blink having no usable face at
+**Build 100's census answered it.** The guest reported 56 font files and
+`coue1255.fon, coue1256.fon, coue1257.fon` as examples: the root filesystem
+ships Wine's bundled fonts and they are legacy `.fon` bitmap faces.
+Chromium reaches fonts through DirectWrite, which loads TrueType and
+OpenType and does not load `.fon` at all - that is GDI's format. So a guest
+with a full Fonts directory presents an empty font collection to a browser
+engine, which is both failures at once: the `FontCache` abort before
+`--no-sandbox`, and `document.fonts.ready` never settling after it. It also
+explains why seven runs of command-line switches achieved nothing. Build 101
+counts scalable and bitmap faces separately and says this in one line rather
+than leaving it to be inferred from example file names.
+
+The fix is a scalable font in `Documents/Fonts` (section 7); a Japanese
+title wants a CJK face there in any case. It addresses a different failure - Blink having no usable face at
 all, the weakness that aborted the renderer outright before `--no-sandbox` -
 and should not be assumed to fix this one.
 

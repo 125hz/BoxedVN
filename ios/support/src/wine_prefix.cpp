@@ -359,6 +359,27 @@ bool isUnder(const std::string& lowerPath, const char* lowerPrefix) {
            lowerPath.compare(0, prefix.size(), prefix) == 0;
 }
 
+bool isScalableFontName(const std::string& lowerName) {
+    static const char* const suffixes[] = {".ttf", ".ttc", ".otf"};
+    for (const char* suffix : suffixes) {
+        const std::string candidate(suffix);
+        if (lowerName.size() > candidate.size() &&
+            lowerName.compare(lowerName.size() - candidate.size(),
+                              candidate.size(), candidate) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void countFormat(GuestFontCensus& census, const std::string& lowerName) {
+    if (isScalableFontName(lowerName)) {
+        census.scalable++;
+    } else {
+        census.bitmap++;
+    }
+}
+
 void noteExample(GuestFontCensus& census, const std::string& name) {
     if (std::count(census.examples.begin(), census.examples.end(), ',') >= 2) {
         return;
@@ -386,8 +407,10 @@ GuestFontCensus censusGuestFonts(const std::string& rootFilesystemZipPath,
                 continue;
             }
             const std::string name = entry.path().filename().string();
-            if (isFontFileName(lowered(name))) {
+            const std::string lowerName = lowered(name);
+            if (isFontFileName(lowerName)) {
                 census.inPrefix++;
+                countFormat(census, lowerName);
                 noteExample(census, name);
             }
         }
@@ -425,9 +448,11 @@ GuestFontCensus censusGuestFonts(const std::string& rootFilesystemZipPath,
             if (isUnder(lowerName,
                         "home/username/.wine/drive_c/windows/fonts/")) {
                 census.inRootFilesystem++;
+                countFormat(census, lowerName);
                 noteExample(census, base);
             } else if (isUnder(lowerName, "opt/wine/share/wine/fonts/")) {
                 census.wineBundled++;
+                countFormat(census, lowerName);
                 noteExample(census, base);
             }
         }

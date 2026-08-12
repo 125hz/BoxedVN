@@ -100,6 +100,18 @@ struct GuestFontCensus {
     // Fonts directory is empty in the archive.
     std::size_t wineBundled = 0;
 
+    // Of the totals above, how many are in a format DirectWrite can load.
+    //
+    // This split is the whole point of the census. Chromium reaches fonts
+    // through DirectWrite, which understands TrueType and OpenType and does
+    // not understand the legacy .fon bitmap format at all - GDI does. A guest
+    // whose only faces are .fon therefore has a full Fonts directory and an
+    // empty font collection as far as a browser engine is concerned, which
+    // looks like every other font failure and is not one: adding more .fon
+    // files would change nothing.
+    std::size_t scalable = 0;  // .ttf, .ttc, .otf
+    std::size_t bitmap = 0;    // .fon
+
     // A few names, so the log shows what kind of faces these are rather than
     // only how many. Comma separated, possibly empty.
     std::string examples;
