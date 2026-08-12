@@ -16,8 +16,10 @@ to the 1280x720 presentation before applying later text updates. Fake-
 fullscreen input now dispatches directly to the active client instead of
 re-hit-testing against the stale 800x600 X11 root; the portrait log proves
 UIKit continued receiving touches after rotation. Pointer settings now include
-a persistent 0.5x-3.0x trackpad sensitivity slider. Windows host tests pass;
-iPhoneOS CI and fresh-device validation remain pending. Song of Saya remains
+a persistent 0.5x-3.0x trackpad sensitivity slider. GitHub Actions run
+31549007709 passed all 92 tests, the iPhoneOS compile, validation, entitlement
+packaging, smoke test, and rolling Release upload. Fresh-device validation
+remains pending. Song of Saya remains
 device-proven playable with the
 interpreter workaround.
 The newest
@@ -3529,6 +3531,14 @@ Pointer settings now expose a persistent trackpad sensitivity slider from
 appearance controls and gesture semantics are unchanged.
 
 **Build evidence:** `git diff --check` passes. The Windows host-independent
-suite passes its one CTest target, which contains all 92 assertions. The
-Objective-C++ runtime and iPhoneOS core still require the macOS GitHub Actions
-compile; physical rendering and input acceptance remain pending build 80.
+executable runs all 92 tests with zero failures, and CTest passes 1/1. GitHub
+Actions run 31549007709 passed the same host suite plus the macOS iPhoneOS
+compile, app validation, increased-memory entitlement check, packaging, smoke
+test, and rolling Release upload in 4 minutes 45 seconds. The published build
+80 `BoxedVN.ipa` is 8,155,666 bytes; a fresh Release download matches the
+runner and published checksum, SHA-256
+`4027e331c26f7c653c487e578942e111f97f0a60c0fd4de6985646170a01e67d`.
+The Release targets `cbdce90013a6cb01bb3cc6c6b404c0d7095e9fad` and the
+asset lists `Payload/BoxedVN.app`, including `_CodeSignature/CodeResources` for
+the ad-hoc entitlement template. Physical rendering and input acceptance
+remain pending build 80.
