@@ -248,8 +248,15 @@ created a presentation swapchain and never presented to it. Run 3 changed
 several switches at once, so the individual contributions are not isolated
 and the set is shipped as a set.
 
-**What is still unresolved.** Run 3 reaches RPG Maker's `Scene_Boot` and
-stays there. `Scene_Boot` waits on its database JSONs and on the `GameFont`
+**What is still unresolved.** Runs 3-5 reach RPG Maker's `Scene_Boot` and
+stay there. Run 5 was left for six and a half minutes, which refutes "it is
+merely slow": the last JIT arena allocation came four minutes before the
+session was ended, so no new guest code was translated at all in that time,
+and the only activity in the whole tail of the log is Chromium's DNS
+retry timer at five second intervals. The browser process is alive and the
+renderer has stopped. Run 4 also refuted the proxy/DNS explanation -
+`--no-proxy-server --disable-background-networking` changed nothing, and the
+DNS retries continue regardless. `Scene_Boot` waits on its database JSONs and on the `GameFont`
 face, and reports neither as failed, so something is pending rather than
 erroring. Two candidates, in order:
 
