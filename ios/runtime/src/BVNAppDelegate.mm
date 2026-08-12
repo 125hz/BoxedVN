@@ -31,6 +31,7 @@
  */
 
 #import <UIKit/UIKit.h>
+#import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
 #import <objc/message.h>
@@ -833,41 +834,95 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface) {
 // change with it.
 static CGRect gGuestPresentationContentRect = CGRectZero;
 @interface BVNX11PatchView : UIView
-@property (nonatomic, strong) NSData* pixelData;
-@property (nonatomic, assign) uint32_t pixelWidth;
-@property (nonatomic, assign) uint32_t pixelHeight;
+- (BOOL)configureForPixelWidth:(uint32_t)width
+                        height:(uint32_t)height;
+- (BOOL)presentPixelData:(NSData*)pixelData;
 @end
 
 @implementation BVNX11PatchView
 
-- (void)drawRect:(CGRect)rect {
-    (void)rect;
-    if (self.pixelData == nil || self.pixelWidth == 0 ||
-        self.pixelHeight == 0) {
-        return;
+{
+    id<MTLCommandQueue> _commandQueue;
+    id<MTLTexture> _patchTexture;
+}
+
++ (Class)layerClass {
+    return CAMetalLayer.class;
+}
+
+- (BOOL)configureForPixelWidth:(uint32_t)width
+                        height:(uint32_t)height {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil || width == 0 || height == 0) {
+        return NO;
+    }
+    _commandQueue = [device newCommandQueue];
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                                  MTLPixelFormatBGRA8Unorm
+                                                         width:width
+                                                        height:height
+                                                     mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageBlitSource;
+    _patchTexture = [device newTextureWithDescriptor:descriptor];
+    if (_commandQueue == nil || _patchTexture == nil) {
+        return NO;
     }
 
-    CGDataProviderRef provider = CGDataProviderCreateWithCFData(
-        (__bridge CFDataRef)self.pixelData);
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGImageRef image = CGImageCreate(
-        self.pixelWidth, self.pixelHeight, 8, 32, self.pixelWidth * 4,
-        colorSpace,
-        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
-        provider, nullptr, false, kCGRenderingIntentDefault);
-    CGColorSpaceRelease(colorSpace);
-    CGDataProviderRelease(provider);
-    if (image == nullptr) {
-        return;
+    CAMetalLayer* layer = (CAMetalLayer*)self.layer;
+    layer.device = device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = NO;
+    layer.opaque = NO;
+    layer.backgroundColor = UIColor.clearColor.CGColor;
+    layer.contentsScale = 1.0;
+    layer.drawableSize = CGSizeMake(width, height);
+    layer.presentsWithTransaction = NO;
+    return YES;
+}
+
+- (BOOL)presentPixelData:(NSData*)pixelData {
+    if (_patchTexture == nil || pixelData == nil ||
+        pixelData.length < _patchTexture.width * _patchTexture.height * 4) {
+        return NO;
     }
 
-    CGContextRef context = UIGraphicsGetCurrentContext();
-    CGContextSaveGState(context);
-    CGContextTranslateCTM(context, 0.0, self.bounds.size.height);
-    CGContextScaleCTM(context, 1.0, -1.0);
-    CGContextDrawImage(context, self.bounds, image);
-    CGContextRestoreGState(context);
-    CGImageRelease(image);
+    // Keep one shared Metal texture for the lifetime of the guest surface.
+    // Core Animation's UIView backing-store path retained a small amount of
+    // state for every forced partial draw/flush while SDL owned the main run
+    // loop. At Grisaia's 20-45 GDI patches/sec that grew resident memory by
+    // roughly 220 MB in three minutes, then presentation stopped near the
+    // device limit. Uploading into this fixed allocation gives CA only its
+    // normal bounded drawable pool, independent of the number of patches.
+    const MTLRegion fullRegion = MTLRegionMake2D(
+        0, 0, _patchTexture.width, _patchTexture.height);
+    [_patchTexture replaceRegion:fullRegion
+                     mipmapLevel:0
+                       withBytes:pixelData.bytes
+                     bytesPerRow:_patchTexture.width * 4];
+
+    CAMetalLayer* layer = (CAMetalLayer*)self.layer;
+    id<CAMetalDrawable> drawable = [layer nextDrawable];
+    id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
+    if (drawable == nil || commandBuffer == nil) {
+        return NO;
+    }
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    [blit copyFromTexture:_patchTexture
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(_patchTexture.width,
+                                      _patchTexture.height, 1)
+                toTexture:drawable.texture
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [commandBuffer presentDrawable:drawable];
+    [commandBuffer commit];
+    return YES;
 }
 
 @end
@@ -959,9 +1014,13 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         gGuestX11PatchView.opaque = NO;
         gGuestX11PatchView.userInteractionEnabled = NO;
         gGuestX11PatchView.contentScaleFactor = 1.0;
-        gGuestX11PatchView.pixelData = gGuestX11PatchPixels;
-        gGuestX11PatchView.pixelWidth = guestWidth;
-        gGuestX11PatchView.pixelHeight = guestHeight;
+        if (![gGuestX11PatchView configureForPixelWidth:guestWidth
+                                                 height:guestHeight]) {
+            BVNLogWrite(BVNLogLevelError, "graphics",
+                        "Could not create the bounded Metal X11 compositor.");
+            BVNRemoveGuestX11PatchView();
+            return;
+        }
     }
 
     const bool activeWindowChanged =
@@ -1069,25 +1128,16 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
     gGuestX11PatchView.hidden = NO;
     gGuestX11PatchVisible.store(true, std::memory_order_release);
 
-    // Redraw the persistent layer backing store rather than allocating a new
-    // full-screen UIImage for every dirty rectangle. SDL owns the main thread
-    // for the entire guest session, so UIKit's ordinary per-run-loop
-    // autorelease-pool drain never occurs. The old path could retain thousands
-    // of full-resolution image wrappers/snapshots during a few minutes of text
-    // rendering and eventually starve Core Animation even though the guest and
-    // X11 producer were still running. displayIfNeeded consumes the shared
-    // pixel buffer synchronously, and the explicit autoreleasepool bounds any
-    // temporary Core Graphics/UIKit objects to this one patch.
-    const CGRect dirtyRect = activeWindowChanged
-        ? gGuestX11PatchView.bounds
-        : CGRectMake(clippedLeft, clippedTop, clippedRight - clippedLeft,
-                     clippedBottom - clippedTop);
-    [gGuestX11PatchView setNeedsDisplayInRect:dirtyRect];
-    [gGuestX11PatchView.layer displayIfNeeded];
-
-    // Event-driven visual novels may sleep after drawing a line of text; commit
-    // the patch now rather than waiting for a later Vulkan transition.
-    [CATransaction flush];
+    if (![gGuestX11PatchView presentPixelData:gGuestX11PatchPixels]) {
+        static bool loggedMetalPresentFailure = false;
+        if (!loggedMetalPresentFailure) {
+            loggedMetalPresentFailure = true;
+            BVNLogWrite(BVNLogLevelWarning, "graphics",
+                        "The bounded Metal X11 compositor could not obtain "
+                        "a drawable; later patches will retry.");
+        }
+        return;
+    }
     gGuestX11PatchCount.fetch_add(1, std::memory_order_relaxed);
     BVNGuestPerformanceFramePresented();
 
@@ -1123,8 +1173,6 @@ extern "C" void BVNGuestClearX11Patches(void) {
         memset(gGuestX11PatchPixels.mutableBytes, 0,
                gGuestX11PatchPixels.length);
     }
-    [gGuestX11PatchView setNeedsDisplay];
-    [gGuestX11PatchView.layer displayIfNeeded];
     gGuestX11PatchView.hidden = YES;
 }
 static bool gGuestPresentationIsLetterboxed = false;

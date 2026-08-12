@@ -1234,11 +1234,27 @@ static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
     }
     const CGPoint before = self.trackpadLastPoint;
     self.trackpadLastPoint = now;
-    CGFloat dx = (now.x - before.x) * guestWidth /
-                 MAX(1.0, self.bounds.size.width);
-    CGFloat dy = (now.y - before.y) * guestHeight /
-                 MAX(1.0, self.bounds.size.height);
-    if (BVNGuestPresentationView() == nil) {
+    CGFloat dx = 0.0;
+    CGFloat dy = 0.0;
+    UIView* presentation = BVNGuestPresentationView();
+    if (presentation != nil) {
+        // Convert both samples through UIKit's actual presentation transform.
+        // Scaling the overlay's X/Y independently by the guest dimensions
+        // made portrait trackpad motion about four times faster horizontally
+        // than vertically because the landscape guest occupies only part of
+        // the portrait window. Point conversion accounts for letterboxing,
+        // rotation, and scale while one sensitivity value remains isotropic.
+        const CGPoint guestBefore = [self convertPoint:before
+                                                toView:presentation];
+        const CGPoint guestNow = [self convertPoint:now
+                                             toView:presentation];
+        dx = guestNow.x - guestBefore.x;
+        dy = guestNow.y - guestBefore.y;
+    } else {
+        dx = (now.x - before.x) * guestWidth /
+             MAX(1.0, self.bounds.size.width);
+        dy = (now.y - before.y) * guestHeight /
+             MAX(1.0, self.bounds.size.height);
         float beforeX = 0.0f;
         float beforeY = 0.0f;
         float nowX = 0.0f;

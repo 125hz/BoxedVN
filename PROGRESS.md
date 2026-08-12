@@ -3761,3 +3761,34 @@ completed in 2 minutes 2 seconds. The published build 85 `BoxedVN.ipa` is
 The rolling Release targets the exact producing commit
 `1312c5960622b146b8750b875f131d8e2871cd01`. Long-session physical Grisaia
 acceptance remains pending build 85.
+
+### 2026-08-11 - build 86: bounded Metal patches and isotropic trackpad motion
+
+`boxedvn-20260811-214111.log` supplies the missing long-session memory evidence.
+During Grisaia dialogue the mixed renderer initially remains healthy at roughly
+20-45 X11 patches/sec, but process resident memory rises from 1225.1 MB at
+patch 4 to 1446.6 MB at patch 4440. Immediately afterward both streams collapse
+to 0.0 X11 patches/sec and 0.3-0.6 Vulkan frames/sec. This is not JIT exhaustion
+or a GPU wait: the JIT arena still has 61.0 MB free, Vulkan acquire/present calls
+remain immediate, host CPU falls to about 0.4 cores, and the guest continues its
+getrusage/sched_yield loop.
+
+Build 85 bounded temporary Core Graphics objects but still forced a UIKit
+backing-store draw and Core Animation flush for every GDI patch while SDL owned
+the main run loop. Build 86 removes that accumulating path. The X11 overlay now
+owns one fixed BGRA Metal texture, updates it in place, and presents through
+CAMetalLayer's bounded drawable pool. The guest pixel buffer and Metal texture
+stay allocated once per resolution regardless of how many dialogue patches are
+published.
+
+Trackpad deltas are now converted through UIKit's live presentation transform
+before the scalar sensitivity is applied. Portrait letterboxing previously
+scaled X by guest-width/window-width and Y by guest-height/window-height, making
+the two axes visibly different. The same physical movement now maps through the
+actual rotated, scaled presentation on both axes.
+
+**Pre-CI evidence:** `git diff --check` passes. In the Visual Studio developer
+environment the host-independent executable runs all 93 tests with zero
+failures and CTest passes 1/1. The iPhoneOS compile, package validation, and
+long-session physical Grisaia/portrait-trackpad acceptance remain pending build
+86.
