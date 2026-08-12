@@ -4119,4 +4119,9 @@ next device log settles it.
 
 **Build evidence:** the host-independent suite still runs 125 tests with zero
 failures. `source/x11/x11common.cpp` and `xvisualinfo.h` compile only in the
-iPhoneOS job, which is what checks the new static assertions.
+iPhoneOS job, which is what checks the new static assertions; GitHub Actions
+run 31571491414 passed it along with app validation, the increased-memory
+entitlement check, packaging and the rolling Release upload. The published
+build 92 `BoxedVN.ipa` is 8,209,537 bytes with Release SHA-256
+`10d57eacd6ac08b90101ea1e84fbf4c4343a1612950bae6c841c94fd5fc5f697`,
+targeting commit `d675f1dddb3e71423c4d0eb46db40dcc9d336956`.
