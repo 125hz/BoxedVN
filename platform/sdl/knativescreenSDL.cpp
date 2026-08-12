@@ -600,7 +600,11 @@ bool KNativeScreenSDL::mapIOSSoftwarePointToWindow(float guestX, float guestY,
     if (!renderer || !windowX || !windowY) {
         return false;
     }
-    SDL_RenderLogicalToWindow(renderer, guestX, guestY, windowX, windowY);
+    int mappedX = 0;
+    int mappedY = 0;
+    SDL_RenderLogicalToWindow(renderer, guestX, guestY, &mappedX, &mappedY);
+    *windowX = (float)mappedX;
+    *windowY = (float)mappedY;
     return true;
 }
 
