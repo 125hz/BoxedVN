@@ -295,7 +295,7 @@ final class AppModel: ObservableObject {
                 sharedDirectory: Storage.sharedFiles,
                 executablePath: game.guestExecutablePath,
                 arguments: GameLibrary.arguments(for: game),
-                environment: [],
+                environment: GameLibrary.environment(for: game),
                 workingDirectory: game.guestWorkingDirectory,
                 width: game.requestedWidth,
                 height: game.requestedHeight,

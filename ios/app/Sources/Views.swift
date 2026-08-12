@@ -387,6 +387,7 @@ struct GameDetailView: View {
     @State private var executables: [ExecutableDescription] = []
     @State private var selected: String = ""
     @State private var argumentsText = ""
+    @State private var environmentText = ""
     @State private var workingDirectory = ""
     @State private var resolution = "default"
     @State private var renderer = "automatic"
@@ -428,6 +429,11 @@ struct GameDetailView: View {
                     .lineLimit(1...4)
                 TextField("Working directory (inside the game)",
                           text: $workingDirectory)
+                TextField("Environment (NAME=VALUE, one per line)",
+                          text: $environmentText, axis: .vertical)
+                    .lineLimit(1...4)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
                 Picker("Resolution", selection: $resolution) {
                     ForEach(resolutions, id: \.self) { Text($0) }
                 }
@@ -439,6 +445,12 @@ struct GameDetailView: View {
                 Text("Automatic reads the game's own files and picks DXVK when "
                      + "anything in it needs Direct3D 10 or 11. Override it "
                      + "if a game reports that Direct3D could not start.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Environment entries reach the guest and override "
+                     + "BoxedVN's own. Use LANG for a game that expects a "
+                     + "locale, or WINEDEBUG to make a game that starts but "
+                     + "draws nothing explain itself in the session log.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Save") { save() }
@@ -477,6 +489,8 @@ struct GameDetailView: View {
             selected = game.selectedExecutable
             workingDirectory = game.workingDirectory
             argumentsText = GameLibrary.arguments(for: game).joined(separator: "\n")
+            environmentText =
+                GameLibrary.environment(for: game).joined(separator: "\n")
             renderer = renderers.contains(game.renderer)
                 ? game.renderer : "automatic"
             if game.requestedWidth > 0 && game.requestedHeight > 0 {
@@ -499,6 +513,12 @@ struct GameDetailView: View {
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+        // An entry without '=' is not an assignment. The manifest writer drops
+        // it, so dropping it here too keeps the field showing what was saved.
+        let environment = environmentText
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.contains("=") }
 
         var width: UInt32 = 0
         var height: UInt32 = 0
@@ -514,7 +534,7 @@ struct GameDetailView: View {
             try GameLibrary.updateLaunchSettings(
                 for: game, selectedExecutable: selected,
                 workingDirectory: workingDirectory, renderer: renderer,
-                arguments: arguments,
+                arguments: arguments, environment: environment,
                 width: width, height: height)
             saveError = nil
             model.reloadGames()

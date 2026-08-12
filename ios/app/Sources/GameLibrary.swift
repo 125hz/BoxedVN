@@ -323,19 +323,29 @@ enum GameLibrary {
 
     static func updateLaunchSettings(
         for game: Game, selectedExecutable: String, workingDirectory: String,
-        renderer: String, arguments: [String], width: UInt32, height: UInt32
+        renderer: String, arguments: [String], environment: [String],
+        width: UInt32, height: UInt32
     ) throws {
         var errorBuffer = [CChar](repeating: 0, count: Int(BVN_MAX_DIAGNOSTIC))
-        let storage = arguments.map { strdup($0) }
-        defer { storage.forEach { free($0) } }
-        var pointers = storage.map { UnsafePointer<CChar>($0) }
+        let argumentStorage = arguments.map { strdup($0) }
+        let environmentStorage = environment.map { strdup($0) }
+        defer {
+            argumentStorage.forEach { free($0) }
+            environmentStorage.forEach { free($0) }
+        }
+        var argumentPointers = argumentStorage.map { UnsafePointer<CChar>($0) }
+        var environmentPointers =
+            environmentStorage.map { UnsafePointer<CChar>($0) }
 
-        let ok = pointers.withUnsafeMutableBufferPointer { buffer in
-            BVNManifestUpdateLaunchSettings(
-                game.manifestURL.path, selectedExecutable, workingDirectory,
-                renderer,
-                buffer.baseAddress, buffer.count, width, height,
-                &errorBuffer, errorBuffer.count)
+        let ok = argumentPointers.withUnsafeMutableBufferPointer { args in
+            environmentPointers.withUnsafeMutableBufferPointer { env in
+                BVNManifestUpdateLaunchSettings(
+                    game.manifestURL.path, selectedExecutable, workingDirectory,
+                    renderer,
+                    args.baseAddress, args.count,
+                    env.baseAddress, env.count, width, height,
+                    &errorBuffer, errorBuffer.count)
+            }
         }
         if !ok {
             throw GameLibraryError.manifestFailed(String(cString: errorBuffer))
@@ -347,6 +357,23 @@ enum GameLibrary {
     static func arguments(for game: Game) -> [String] {
         var buffer = [CChar](repeating: 0, count: 8192)
         let written = BVNManifestCopyArgumentsJoined(
+            game.manifestURL.path, &buffer, buffer.count)
+        guard written > 0 else { return [] }
+        return String(cString: buffer)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+    }
+
+    /// The per-game environment recorded in the manifest, each entry
+    /// "NAME=VALUE".  Same newline encoding as the arguments above.
+    ///
+    /// These reach the guest as Boxedwine `-env` values, and a game's own
+    /// entry wins over BoxedVN's defaults - including WINEDEBUG, which is how
+    /// a title that starts but renders nothing can be made to say why without
+    /// waiting for a new build.
+    static func environment(for game: Game) -> [String] {
+        var buffer = [CChar](repeating: 0, count: 8192)
+        let written = BVNManifestCopyEnvironmentJoined(
             game.manifestURL.path, &buffer, buffer.count)
         guard written > 0 else { return [] }
         return String(cString: buffer)

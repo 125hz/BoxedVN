@@ -314,6 +314,12 @@ visible in Files.
   prefix policy disables those two modules, which is Wine's own documented
   way to suppress the offer (the registry equivalent of
   `WINEDLLOVERRIDES="mscoree,mshtml="`).
+- A game can carry its own guest environment entries in launch settings, one
+  `NAME=VALUE` per line. They reach the guest as Boxedwine `-env` values and
+  override BoxedVN's own, which is the supported way to set `LANG` for a title
+  that expects a locale, to add a per-game `WINEDLLOVERRIDES`, or to raise
+  `WINEDEBUG` on a game that starts but draws nothing so the session log says
+  why.
 - **Consequence: .NET Framework applications and embedded Internet Explorer
   do not run.** They did not run before either - the runtime was never
   present - but the failure is now "module not found" rather than a download

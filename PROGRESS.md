@@ -4125,3 +4125,69 @@ entitlement check, packaging and the rolling Release upload. The published
 build 92 `BoxedVN.ipa` is 8,209,537 bytes with Release SHA-256
 `10d57eacd6ac08b90101ea1e84fbf4c4343a1612950bae6c841c94fd5fc5f697`,
 targeting commit `d675f1dddb3e71423c4d0eb46db40dcc9d336956`.
+
+### 2026-08-12 - build 93: the XGetVisualInfo fix lands; per-game guest environment
+
+`boxedvn-20260812-015621.log` is build 92. The repeating winex11 fault is
+**gone** - no `winex11.so+00008461` line anywhere in the run - so returning
+XGetVisualInfo's results as a flat array fixed that null dereference and
+Wine's window surfaces now build. That is four emulator defects fixed from
+this title's logs: the JIT arena ceiling, name-list renderer selection, the
+incomplete pixmap-format list, and the visual-info array layout.
+
+The Chromium GPU process still fails the same way and the client area is
+still black:
+
+```
+gles2_command_buffer_stub.cc(226) ContextResult::kFatalFailure: Failed to create surface
+gpu_process_transport_factory.cc(1024) Lost UI shared context
+```
+
+The guest is alive around it - twelve processes, new ones still starting, the
+JIT still translating - so this is a rendering-path failure, not a hang.
+
+**What is now ruled out, with evidence rather than reasoning:**
+
+- The JIT arena. 400 MB free at the failure.
+- Direct3D 11 device creation. DXVK creates the device and a `VkDevice` on
+  the A19.
+- DirectComposition. `dcomp.dll.so` extracted from the pinned archive and
+  disassembled: `DCompositionCreateDevice2` is `mov eax, 0x80004001; ret 0xc`,
+  a clean `E_NOTIMPL`, so Chromium of this vintage rejects it and takes its
+  `CreateViewGLSurface` fallback.
+- A refused Vulkan surface. `KVulkdanSDLImpl::createVulkanSurface` logs
+  `Failed to create vulkan surface` on failure; that line never appears and no
+  `vkCreateXlibSurfaceKHR` reaches the host.
+- A DXGI swapchain failure. DXVK logs swapchain errors at its default level
+  and logs nothing, so ANGLE fails before it calls DXGI.
+
+That leaves the inside of ANGLE, which logs nothing at Chromium's default
+verbosity. The one clue is DXVK's `D3D11Texture2D::QueryInterface: Unknown
+interface query f8fb5c27-c6b3-4f75-a4c8-439af2ef564c` immediately before the
+failure. That GUID is present in the bundled DXVK `d3d11.dll`, in its GUID
+table between `9eb576dd-9f77-4d86-81aa-8bab5fe490e2` and `ID3D11Texture2D`,
+so DXVK knows the interface somewhere but does not answer it on a texture. It
+has not been identified and no further inference from it is justified.
+
+**The blocker is now diagnostic reach, not analysis.** Nothing in BoxedVN
+could change what the guest logs: `environment` existed in the manifest but
+was never plumbed to a launch - `AppModel` passed `environment: []`
+unconditionally - and there was no UI for it, so the only way to change
+`WINEDEBUG` was a new build.
+
+Build 93 wires it through: `BVNManifestUpdateLaunchSettings` gains
+`environment`/`environmentCount`, `BVNManifestCopyEnvironmentJoined` mirrors
+the existing newline-joined encoding used for arguments, `GameLibrary`
+reads and writes it, and launch settings gain a field. Entries reach the
+guest as Boxedwine `-env` values, and `BVNBuildLaunchArguments` already
+skips its own `WINEDEBUG` default when the caller supplies one, so a game's
+entry wins. An entry with no `=` is dropped at both the UI and the manifest
+writer rather than carried forever.
+
+This is a compatibility feature in its own right - `LANG` for a title that
+expects a locale, a per-game `WINEDLLOVERRIDES` - and it is what makes the
+next attempt at the surface failure answerable rather than another guess.
+
+**Build evidence:** the host-independent suite still runs 125 tests with zero
+failures. The changed ABI, its Swift callers and the new view compile only in
+the iPhoneOS job. Not yet run on a device.

@@ -13,6 +13,7 @@
 
 #include "BVNImport.h"
 
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -307,8 +308,9 @@ extern "C" void BVNManifestRead(const char* manifestPath,
 extern "C" bool BVNManifestUpdateLaunchSettings(
     const char* manifestPath, const char* selectedExecutable,
     const char* workingDirectory, const char* renderer,
-    const char* const* arguments,
-    size_t argumentCount, uint32_t requestedWidth, uint32_t requestedHeight,
+    const char* const* arguments, size_t argumentCount,
+    const char* const* environment, size_t environmentCount,
+    uint32_t requestedWidth, uint32_t requestedHeight,
     char* error, size_t errorCapacity) {
     if (manifestPath == nullptr) {
         copyInto(error, errorCapacity, "No manifest path was given.");
@@ -344,6 +346,15 @@ extern "C" bool BVNManifestUpdateLaunchSettings(
     for (size_t i = 0; i < argumentCount && arguments != nullptr; ++i) {
         if (arguments[i] != nullptr) {
             manifest.arguments.emplace_back(arguments[i]);
+        }
+    }
+    manifest.environment.clear();
+    for (size_t i = 0; i < environmentCount && environment != nullptr; ++i) {
+        // An entry without '=' is not an assignment and Wine would ignore it.
+        // Dropping it here keeps a typo out of the manifest instead of
+        // silently carrying it into every future launch.
+        if (environment[i] != nullptr && strchr(environment[i], '=') != nullptr) {
+            manifest.environment.emplace_back(environment[i]);
         }
     }
     manifest.requestedWidth = requestedWidth;
@@ -383,6 +394,36 @@ extern "C" size_t BVNManifestCopyArgumentsJoined(const char* manifestPath,
             joined.push_back('\n');
         }
         joined += argument;
+    }
+    copyInto(out, capacity, joined);
+    return joined.size() < capacity ? joined.size() : (capacity > 0 ? capacity - 1 : 0);
+}
+
+extern "C" size_t BVNManifestCopyEnvironmentJoined(const char* manifestPath,
+                                                   char* out,
+                                                   size_t capacity) {
+    if (out != nullptr && capacity > 0) {
+        out[0] = '\0';
+    }
+    if (manifestPath == nullptr) {
+        return 0;
+    }
+    std::string text;
+    std::string error;
+    if (!readTextFile(manifestPath, text, error)) {
+        return 0;
+    }
+    const boxedvn::ManifestParseResult parsed = boxedvn::parseManifest(text);
+    if (!parsed.ok) {
+        return 0;
+    }
+
+    std::string joined;
+    for (const std::string& entry : parsed.manifest.environment) {
+        if (!joined.empty()) {
+            joined.push_back('\n');
+        }
+        joined += entry;
     }
     copyInto(out, capacity, joined);
     return joined.size() < capacity ? joined.size() : (capacity > 0 ? capacity - 1 : 0);

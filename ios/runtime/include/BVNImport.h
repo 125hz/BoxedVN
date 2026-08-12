@@ -168,6 +168,8 @@ bool BVNManifestUpdateLaunchSettings(const char* manifestPath,
                                      const char* renderer,
                                      const char* const* arguments,
                                      size_t argumentCount,
+                                     const char* const* environment,
+                                     size_t environmentCount,
                                      uint32_t requestedWidth,
                                      uint32_t requestedHeight,
                                      char* error,
@@ -181,6 +183,12 @@ bool BVNManifestUpdateLaunchSettings(const char* manifestPath,
 size_t BVNManifestCopyArgumentsJoined(const char* manifestPath,
                                       char* out,
                                       size_t capacity);
+
+// The same encoding for the guest environment, whose entries are "NAME=VALUE".
+// A newline cannot appear in one, so joining on it stays unambiguous.
+size_t BVNManifestCopyEnvironmentJoined(const char* manifestPath,
+                                        char* out,
+                                        size_t capacity);
 
 // ---------------------------------------------------------------------------
 // Runtime backend description
