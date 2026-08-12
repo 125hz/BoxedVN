@@ -3871,3 +3871,73 @@ completed in 2 minutes 4 seconds. The published build 89 `BoxedVN.ipa` is
 The rolling Release targets the exact producing commit
 `f72cc24798248da38faa5b997e7b5e33bc03e7cd`. Physical White Album 2 launch
 acceptance remains pending build 89.
+
+### 2026-08-12 - build 90: the JIT arena is sized for the device, and the automatic renderer reads the game's binaries
+
+A device log from a Chromium-based (NW.js) title exposed two general defects.
+Neither is specific to that engine; both are things any heavier game runs into.
+
+**1. The JIT arena was a fixed 128 MiB, and a multi-process guest exhausts it.**
+The log shows 2,176 successful 64 KiB arena allocations followed by
+`JIT arena exhausted: requested 65536 bytes with 0 of 134217728 bytes free`,
+repeated for every later allocation, with the guest wedged at that point. A
+browser-engine guest starts six to ten guest processes, each translating its
+own copy of the engine, so the demand is several times what a Direct3D 9
+visual novel plus WineDbg needed - which is what 128 MiB was sized for in
+build 23.
+
+The arena is now prepared as 64 MiB segments whose count comes from
+`BVNPlanJitArena`: an eighth of the smaller of `os_proc_available_memory()`
+and device RAM, with a 128 MiB floor (the capacity every device result up to
+build 89 was measured against) and a 512 MiB ceiling. The ceiling exists
+because `BVNGuestReportedTotalMemory` advertises up to 3 GB to the 32-bit
+guest, and an arena that crowds that out only trades one failure for another.
+All segments are prepared inside the single startup handshake; requesting a
+region once the guest is running would stop it at a debugger breakpoint that a
+background-suspended StikDebug would never service, which is the same
+constraint build 23 recorded. A kernel refusal part way through now costs
+capacity instead of the whole JIT: whatever was prepared stays usable and the
+log says how much.
+
+`Platform::alloc64kBlock` also reported the wrong failure. Both an unprepared
+arena and a full one produced "could not obtain executable memory. On iOS this
+needs an attached JIT enabler" - so a guest that had successfully translated
+two thousand blocks was reported as having no JIT enabler attached. The two
+cases are now distinguished through `BVNExecMemArenaStatus`, and the
+capacity-exhaustion message names the request size, the free bytes and the
+segment count.
+
+**2. Automatic renderer selection was a list of executable names.** Metal has
+no geometry shader stage, so wined3d's Vulkan adapter can never advertise
+Direct3D 10 (section 1au). Any Direct3D 10/11 title outside the name list
+therefore got the one renderer that structurally cannot run it. The log shows
+exactly that: `wined3d_select_feature_level` reports none of the requested
+feature levels supported, the game's D3D11 device creation fails with
+`eglInitialize D3D11 failed with error EGL_NOT_INITIALIZED`, and it falls back
+to rasterising in software - which is also what generated enough x86 to run
+the arena dry in defect 1.
+
+`boxedvn::detectDirect3DUsage` replaces the name list. It reads the import and
+delay-import directories of the `.exe` and `.dll` files in the game directory
+and selects DXVK when anything links `d3d10*`, `d3d11*`, `d3d12*` or `dxgi`,
+or when the game ships ANGLE (`libGLESv2.dll`/`libEGL.dll`, which reach D3D11
+through `LoadLibrary` and so appear in no import table). Direct3D 8/9 and
+DirectDraw stay on WineD3D, because routing those through DXVK is what stopped
+a Direct3D 9 title from starting in build 65. The reader is bounded at every
+step - headers, section table and descriptor arrays only, a file cap and a
+depth cap - so a large or hostile game directory cannot stall a launch. The
+chosen renderer and the evidence for it are written to the session log under
+`renderer:`, because a wrong choice shows up only as a game that starts and
+renders nothing. Explicit per-game selections and the existing per-title
+compatibility profiles still take priority, in that order.
+
+This removes the last executable-name entry from the renderer path. The
+per-title profile table is unchanged; it now only carries measured
+workarounds, not renderer defaults.
+
+**Build evidence:** the host-independent suite runs 118 tests with zero
+failures in the Visual Studio developer environment, including new coverage
+for arena sizing (floor, ceiling, unknown-budget fallback, page alignment) and
+for the PE import reader against assembled PE32 images with real import and
+delay-import directories, truncated files and non-PE files. Device acceptance
+for both changes is pending.

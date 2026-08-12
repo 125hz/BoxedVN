@@ -9,11 +9,14 @@ add_executable(boxedvn_tests
     test_zip_import.cpp
     test_launch_arguments.cpp
     test_range_allocator.cpp
+    test_jit_arena_plan.cpp
+    test_direct3d_profile.cpp
     test_getrusage_fairness.cpp
     test_vk_pipeline_guard.cpp
     test_wine_prefix.cpp
     ../runtime/src/BVNLaunchArguments.cpp
     ../runtime/src/BVNRangeAllocator.cpp
+    ../runtime/src/BVNJitArenaPlan.cpp
 )
 
 target_include_directories(boxedvn_tests PRIVATE

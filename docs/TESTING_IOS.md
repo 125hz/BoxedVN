@@ -179,10 +179,12 @@ StikDebug target even if the home badge still says `JIT ready`.
 a detail line explaining that the universal handshake is deferred.
 
 Tap **Run Wine Notepad** for the definitive test. **Expected:** StikDebug logs
-one `brk #0xf00d` prepare-region request; BoxedVN reports that the 128 MiB arena
-was prepared, mapped as separate RX/RW aliases, written, cache-flushed, and
-executed. The session log should then show live arena allocations explicitly
-saying that no further StikDebug breakpoint was issued. If the universal
+one `brk #0xf00d` prepare-region request per arena segment, all of them during
+this one handshake; BoxedVN reports the total capacity it prepared (at least
+the 128 MiB floor, more on a device with headroom), mapped as separate RX/RW
+aliases, written, cache-flushed, and executed. The session log should then
+show live arena allocations explicitly saying that no further StikDebug
+breakpoint was issued. If the universal
 script is not servicing the initial request, BoxedVN should report a timeout
 after about six seconds or a guarded-handshake error instead of freezing or
 terminating. Build 27 acceptance specifically includes launching once with the

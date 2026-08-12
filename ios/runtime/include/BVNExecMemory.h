@@ -92,6 +92,13 @@ bool BVNExecMemExecutionConfirmed(void);
 /// here. Returns NULL if the probe failed or the bounded arena is exhausted.
 void* BVNExecMemAlloc(size_t length);
 
+/// Current arena totals, summed over the prepared segments. Any output
+/// pointer may be NULL. Returns false when no segment was ever prepared,
+/// which is how a caller tells "the JIT never started" apart from "the JIT
+/// started and ran out of room" - two failures that need opposite advice.
+bool BVNExecMemArenaStatus(size_t* capacityBytes, size_t* availableBytes,
+                           size_t* segmentCount);
+
 void BVNExecMemFree(void* address, size_t length);
 
 /// Returns the writable alias for an executable range.  `address` remains

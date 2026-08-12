@@ -247,6 +247,11 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
                     "boxedmain command line below for what it changed.");
     }
 
+    if (!launch.rendererReason.empty()) {
+        BVNLogWrite(BVNLogLevelInfo, "renderer",
+                    launch.rendererReason.c_str());
+    }
+
     gPendingLaunch = std::move(launch);
     gHasPendingLaunch = true;
     gState = BVNRuntimeStateStarting;

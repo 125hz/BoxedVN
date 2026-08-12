@@ -358,11 +358,32 @@ U8* Platform::alloc64kBlock(U32 count, bool executable) {
         // ios/runtime/include/BVNExecMemory.h.
         U8* jitMemory = (U8*)BVNExecMemAlloc((size_t)len);
         if (!jitMemory) {
-            kpanic_fmt("alloc64kBlock: could not obtain executable memory.  On "
+            // These are two different failures and they need opposite advice.
+            // Reporting the setup message for both cost real debugging time:
+            // a guest that had translated two thousand blocks was reported as
+            // having no JIT enabler attached.
+            size_t capacity = 0;
+            size_t available = 0;
+            size_t segments = 0;
+            if (BVNExecMemArenaStatus(&capacity, &available, &segments)) {
+                kpanic_fmt("alloc64kBlock: the executable arena is full. %llu "
+                           "bytes were requested; %llu of %llu bytes are free "
+                           "across %llu prepared segment(s).  The JIT enabler "
+                           "is working - this guest simply needs more native "
+                           "code than was prepared at startup, which cannot be "
+                           "extended once the guest is running.",
+                           (unsigned long long)len,
+                           (unsigned long long)available,
+                           (unsigned long long)capacity,
+                           (unsigned long long)segments);
+            } else {
+                kpanic_fmt(
+                       "alloc64kBlock: could not obtain executable memory.  On "
                        "iOS this needs an attached JIT enabler (the kernel must "
                        "have this process flagged CS_DEBUGGED).  Runtime status "
                        "in the app reports exactly which allocation strategies "
                        "were tried and what the kernel did with each.");
+            }
         }
         return jitMemory;
     }

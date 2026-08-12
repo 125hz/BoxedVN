@@ -11,6 +11,7 @@
  */
 
 #include "BVNExecMemory.h"
+#include "BVNJitArenaPlan.h"
 #include "BVNRangeAllocator.h"
 
 #include <errno.h>
@@ -24,6 +25,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <vector>
 
 #include "BVNRuntime.h"
 
@@ -38,21 +40,45 @@ struct DualMapping {
 // Preparing executable memory requires stopping at StikDebug's universal
 // breakpoint. Doing that for every 64 KiB Boxedwine code block makes Wine
 // startup spend nearly all its time stopped in debugserver (and fails once
-// StikDebug is background-suspended). Prepare one modest arena during the
+// StikDebug is background-suspended). Prepare the whole arena during the
 // explicit startup probe, then service live JIT allocations without another
 // external handshake.
-// Wine's debugger pushed the Song of Saya launch beyond the original 64 MiB
-// arena on-device.  Prepare one larger region up front: requesting another
-// StikDebug breakpoint while the guest is running is not safe.
-constexpr size_t kJitArenaSize = 128u * 1024u * 1024u;
+//
+// How large that arena is, and why it is a list of segments rather than one
+// mapping, is decided by BVNPlanJitArena - see BVNJitArenaPlan.h. A single
+// fixed 128 MiB was enough for a Direct3D 9 visual novel plus WineDbg, but
+// not for a guest that runs a browser engine: a Chromium/NW.js title starts
+// six to ten guest processes, each translating its own copy of the engine,
+// and ran the arena dry mid-launch after roughly 2,180 blocks. Every later
+// allocation then failed and the guest wedged with a message about the JIT
+// enabler that had, in fact, worked perfectly.
+struct ArenaSegment {
+    DualMapping mapping;
+    BVNRangeAllocator allocator;
+};
 
 std::mutex gArenaMutex;
-DualMapping gArena;
-BVNRangeAllocator gArenaAllocator;
+std::vector<ArenaSegment> gSegments;
 size_t gAllocationCount = 0;
 bool gProbed = false;
 bool gExecutionConfirmed = false;
 char gReport[1600] = "not probed yet";
+
+size_t arenaCapacity() {
+    size_t total = 0;
+    for (const ArenaSegment& segment : gSegments) {
+        total += segment.allocator.capacity();
+    }
+    return total;
+}
+
+size_t arenaAvailable() {
+    size_t total = 0;
+    for (const ArenaSegment& segment : gSegments) {
+        total += segment.allocator.available();
+    }
+    return total;
+}
 
 size_t pageSize() { return static_cast<size_t>(getpagesize()); }
 
@@ -291,13 +317,25 @@ bool containsRange(const DualMapping& mapping, void* address, size_t length) {
     return offset <= mapping.length - length;
 }
 
-bool startsInArena(void* address) {
-    if (!gArena.executable || !address) {
-        return false;
+// The segment whose executable mapping `address` starts inside, or nullptr.
+// Segments are separate mappings at unrelated addresses, so this is a scan
+// over a handful of entries rather than arithmetic on one base.
+ArenaSegment* segmentStartingAt(void* address) {
+    if (!address) {
+        return nullptr;
     }
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(gArena.executable);
-    return start >= base && start - base < gArena.length;
+    for (ArenaSegment& segment : gSegments) {
+        if (!segment.mapping.executable) {
+            continue;
+        }
+        const uintptr_t base =
+            reinterpret_cast<uintptr_t>(segment.mapping.executable);
+        if (start >= base && start - base < segment.mapping.length) {
+            return &segment;
+        }
+    }
+    return nullptr;
 }
 
 constexpr uint32_t kProbeExpectedValue = 0x4258;
@@ -358,15 +396,22 @@ extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
     gReport[0] = '\0';
     char error[512] = {};
     char line[256];
+
+    const BVNMemoryReport memory = BVNMemoryProbe();
+    const BVNJitArenaPlan plan = BVNPlanJitArena(
+        memory.availableBytes, memory.physicalMemoryBytes, pageSize());
+    constexpr size_t kMiB = 1024u * 1024u;
+
     snprintf(line, sizeof(line),
-             "Requesting one %zu MiB executable arena from StikDebug; live "
-             "Wine JIT allocations will be suballocated without more "
-             "debugger breakpoints.",
-             kJitArenaSize / (1024u * 1024u));
+             "Requesting %zu MiB of executable memory from StikDebug as %zu "
+             "segment(s) of %zu MiB; live Wine JIT allocations will be "
+             "suballocated without more debugger breakpoints.",
+             plan.totalBytes() / kMiB, plan.segmentCount,
+             plan.segmentBytes / kMiB);
     reportLine(line);
 
     DualMapping mapping =
-        allocatePrepared(kJitArenaSize, error, sizeof(error));
+        allocatePrepared(plan.segmentBytes, error, sizeof(error));
     if (!mapping.executable) {
         reportLine(error);
         gProbed = true;
@@ -378,9 +423,9 @@ extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
     protectionText(mapping.executable, rxProtection);
     protectionText(mapping.writable, rwProtection);
     snprintf(line, sizeof(line),
-             "StikDebug prepared the %zu MiB arena; dual mapping is rx %s, "
-             "rw %s.",
-             kJitArenaSize / (1024u * 1024u), rxProtection, rwProtection);
+             "StikDebug prepared the first %zu MiB segment; dual mapping is "
+             "rx %s, rw %s.",
+             plan.segmentBytes / kMiB, rxProtection, rwProtection);
     reportLine(line);
 
     memcpy(mapping.writable, kProbeCode, sizeof(kProbeCode));
@@ -406,15 +451,47 @@ extern "C" BVNExecMemStrategy BVNExecMemProbe(bool allowExecute) {
         return BVNExecMemStrategyNone;
     }
 
+    // The remaining segments are prepared here, still inside the one
+    // deliberate handshake, because there is no later moment when asking is
+    // safe. A refusal part way through is not fatal: the segments already
+    // prepared are a working arena, and saying so beats losing the JIT over
+    // capacity the guest may never have needed.
     {
         std::lock_guard<std::mutex> lock(gArenaMutex);
-        gArena = mapping;
-        gArenaAllocator.reset(mapping.length);
+        gSegments.clear();
+        gSegments.reserve(plan.segmentCount);
+        gSegments.push_back(ArenaSegment{});
+        gSegments.back().mapping = mapping;
+        gSegments.back().allocator.reset(mapping.length);
+
+        for (size_t i = 1; i < plan.segmentCount; ++i) {
+            char segmentError[512] = {};
+            DualMapping extra =
+                allocatePrepared(plan.segmentBytes, segmentError,
+                                 sizeof(segmentError));
+            if (!extra.executable) {
+                snprintf(line, sizeof(line),
+                         "Segment %zu of %zu could not be prepared (%s); "
+                         "continuing with the %zu MiB already prepared.",
+                         i + 1, plan.segmentCount, segmentError,
+                         arenaCapacity() / kMiB);
+                reportLine(line);
+                break;
+            }
+            gSegments.push_back(ArenaSegment{});
+            gSegments.back().mapping = extra;
+            gSegments.back().allocator.reset(extra.length);
+        }
         gAllocationCount = 0;
+
+        snprintf(line, sizeof(line),
+                 "Probe executed successfully. %zu MiB in %zu segment(s) is "
+                 "retained for Wine and no further StikDebug stops are "
+                 "required.",
+                 arenaCapacity() / kMiB, gSegments.size());
     }
     gExecutionConfirmed = true;
-    reportLine("Probe executed successfully. The prepared arena is retained "
-               "for Wine and no further StikDebug stops are required.");
+    reportLine(line);
     return BVNExecMemStrategyStikDebugDualMap;
 }
 
@@ -434,55 +511,67 @@ extern "C" void* BVNExecMemAlloc(size_t length) {
     }
 
     std::lock_guard<std::mutex> lock(gArenaMutex);
-    size_t offset = 0;
-    if (!gArena.executable ||
-        !gArenaAllocator.allocate(length, pageSize(), &offset)) {
-        char error[320];
-        snprintf(error, sizeof(error),
-                 "JIT arena exhausted: requested %zu bytes with %zu of %zu "
-                 "bytes free. Refusing to issue another debugger breakpoint "
-                 "during guest execution.",
-                 length, gArenaAllocator.available(),
-                 gArenaAllocator.capacity());
-        BVNLogWrite(BVNLogLevelError, "jit", error);
-        return nullptr;
+    // First fit across the segments. A block that no segment can hold is a
+    // genuinely exhausted arena; a block that only a later segment can hold
+    // is the normal case once the earlier ones fill up.
+    for (ArenaSegment& segment : gSegments) {
+        size_t offset = 0;
+        if (!segment.mapping.executable ||
+            !segment.allocator.allocate(length, pageSize(), &offset)) {
+            continue;
+        }
+
+        gAllocationCount++;
+        if (gAllocationCount <= 8 || gAllocationCount % 64 == 0) {
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "JIT arena allocation #%zu: %zu bytes, %zu bytes remain "
+                     "across %zu segment(s); no StikDebug breakpoint issued.",
+                     gAllocationCount, length, arenaAvailable(),
+                     gSegments.size());
+            BVNLogWrite(BVNLogLevelInfo, "jit", line);
+            BVNGuestLoadingUpdateJITProgress(gAllocationCount);
+        }
+        return segment.mapping.executable + offset;
     }
 
-    gAllocationCount++;
-    if (gAllocationCount <= 8 || gAllocationCount % 64 == 0) {
-        char line[256];
-        snprintf(line, sizeof(line),
-                 "JIT arena allocation #%zu: %zu bytes, %zu bytes remain; "
-                 "no StikDebug breakpoint issued.",
-                 gAllocationCount, length, gArenaAllocator.available());
-        BVNLogWrite(BVNLogLevelInfo, "jit", line);
-        BVNGuestLoadingUpdateJITProgress(gAllocationCount);
-    }
-    return gArena.executable + offset;
+    char error[384];
+    snprintf(error, sizeof(error),
+             "JIT arena exhausted: requested %zu bytes with %zu of %zu bytes "
+             "free across %zu segment(s), none of them contiguous enough. "
+             "Refusing to issue another debugger breakpoint during guest "
+             "execution.",
+             length, arenaAvailable(), arenaCapacity(), gSegments.size());
+    BVNLogWrite(BVNLogLevelError, "jit", error);
+    return nullptr;
 }
 
 extern "C" void* BVNExecMemWritableAddress(void* address, size_t length) {
     std::lock_guard<std::mutex> lock(gArenaMutex);
-    if (!containsRange(gArena, address, length)) {
+    ArenaSegment* segment = segmentStartingAt(address);
+    if (!segment || !containsRange(segment->mapping, address, length)) {
         return nullptr;
     }
-    const size_t offset = reinterpret_cast<uintptr_t>(address) -
-                          reinterpret_cast<uintptr_t>(gArena.executable);
-    if (!gArenaAllocator.contains(offset, length)) {
+    const size_t offset =
+        reinterpret_cast<uintptr_t>(address) -
+        reinterpret_cast<uintptr_t>(segment->mapping.executable);
+    if (!segment->allocator.contains(offset, length)) {
         return nullptr;
     }
-    return gArena.writable + offset;
+    return segment->mapping.writable + offset;
 }
 
 extern "C" bool BVNExecMemReleaseIfOwned(void* address, size_t length) {
     std::lock_guard<std::mutex> lock(gArenaMutex);
-    if (!startsInArena(address)) {
+    ArenaSegment* segment = segmentStartingAt(address);
+    if (!segment) {
         return false;
     }
 
-    const size_t offset = reinterpret_cast<uintptr_t>(address) -
-                          reinterpret_cast<uintptr_t>(gArena.executable);
-    if (!gArenaAllocator.release(offset, length)) {
+    const size_t offset =
+        reinterpret_cast<uintptr_t>(address) -
+        reinterpret_cast<uintptr_t>(segment->mapping.executable);
+    if (!segment->allocator.release(offset, length)) {
         // The pointer still belongs to the arena. Report the caller bug but
         // claim ownership so Platform::releaseNativeMemory does not munmap a
         // slice out of the shared executable mapping.
@@ -494,6 +583,22 @@ extern "C" bool BVNExecMemReleaseIfOwned(void* address, size_t length) {
         BVNLogWrite(BVNLogLevelError, "jit", error);
     }
     return true;
+}
+
+extern "C" bool BVNExecMemArenaStatus(size_t* capacityBytes,
+                                      size_t* availableBytes,
+                                      size_t* segmentCount) {
+    std::lock_guard<std::mutex> lock(gArenaMutex);
+    if (capacityBytes) {
+        *capacityBytes = arenaCapacity();
+    }
+    if (availableBytes) {
+        *availableBytes = arenaAvailable();
+    }
+    if (segmentCount) {
+        *segmentCount = gSegments.size();
+    }
+    return !gSegments.empty();
 }
 
 extern "C" void BVNExecMemFree(void* address, size_t length) {

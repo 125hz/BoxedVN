@@ -436,9 +436,9 @@ struct GameDetailView: View {
                     Text("WineD3D (D3D8/9 compatibility)").tag("wined3d")
                     Text("DXVK (D3D10/11)").tag("dxvk")
                 }
-                Text("Try WineD3D when a game reports that Direct3D could not "
-                     + "start. DXVK is primarily for games that require "
-                     + "Direct3D 10 or 11.")
+                Text("Automatic reads the game's own files and picks DXVK when "
+                     + "anything in it needs Direct3D 10 or 11. Override it "
+                     + "if a game reports that Direct3D could not start.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Save") { save() }

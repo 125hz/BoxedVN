@@ -42,6 +42,11 @@ struct BVNLaunchConfiguration {
     // games on iOS. This flag specifically selects Boxedwine's patched DXVK
     // DLL overlay for titles that require it.
     bool enableWineD3DVulkan = false;
+    // Why the renderer above was chosen, in one sentence, for the session
+    // log. A wrong renderer shows up as a game that starts and then renders
+    // nothing, so the reason has to be recoverable from the log rather than
+    // reconstructed from the source.
+    std::string rendererReason;
 };
 
 /// Selects the generic iOS renderer policy before a title profile narrows it.

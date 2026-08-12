@@ -175,7 +175,7 @@ probe report failure even with a genuine StikDebug attach confirmed via
 
 | | macOS arm64 | iOS 26/27 arm64 |
 |---|---|---|
-| Allocation | `mmap(..., MAP_JIT)` | one bounded `mmap(r-x)` arena followed by StikDebug's universal prepare-region request (`x16 = 1`, `brk #0xf00d`) |
+| Allocation | `mmap(..., MAP_JIT)` | a bounded set of `mmap(r-x)` segments, each followed by StikDebug's universal prepare-region request (`x16 = 1`, `brk #0xf00d`) |
 | Region behaviour | one mapping, per-thread W xor X | two mappings of the same pages: permanent `r-x` execution and `rw-` generation aliases |
 | `pthread_jit_write_protect_np` | required around writes | **unavailable; not used** |
 | Gate | `com.apple.security.cs.allow-jit` at signing time | kernel-set `CS_DEBUGGED` **plus** an active StikDebug universal script that prepares pages through debugserver/TXM |
@@ -220,7 +220,7 @@ crash on a launch or a timer tick the user didn't ask for.
 
 `BVNJITProbeExecute()` — **gated to the deliberate guest-launch path:**
 1. refuse immediately unless `CS_DEBUGGED` is set
-2. `mmap` one 128 MiB arena `r-x`, with no `MAP_JIT`
+2. `mmap` the first arena segment `r-x`, with no `MAP_JIT`
 3. issue StikDebug's universal prepare-region request (`x16 = 1`,
    `brk #0xf00d`); its active script services the stop and prepares every
    16 KiB page through debugserver/TXM
@@ -228,8 +228,25 @@ crash on a launch or a timer tick the user didn't ask for.
    `rw-`
 5. write three ARM64 instructions through the `rw-` alias, invalidate the
    instruction cache for the `r-x` address, and call the `r-x` address
-6. retain that proven dual mapping and suballocate Boxedwine's 64 KiB code
-   blocks from it; live guest execution does not issue another debugger stop
+6. prepare the remaining segments the same way, still inside this one
+   deliberate handshake, stopping early and keeping what succeeded if the
+   kernel refuses one
+7. retain those proven dual mappings and suballocate Boxedwine's 64 KiB code
+   blocks from them; live guest execution does not issue another debugger stop
+
+How many segments, and therefore how much total capacity, comes from
+`BVNPlanJitArena` (`ios/runtime/src/BVNJitArenaPlan.h`): an eighth of the
+smaller of `os_proc_available_memory()` and the device's RAM, with a 128 MiB
+floor and a 512 MiB ceiling. The floor is the capacity every device result up
+to build 89 was measured against. The ceiling exists because the guest needs
+the rest: `BVNGuestReportedTotalMemory` advertises up to 3 GB to a 32-bit
+Wine, and an arena that crowds that out trades one failure for another.
+
+The old single fixed 128 MiB was sized for one Direct3D 9 title plus a fully
+attached WineDbg. It is not enough for a guest that runs a browser engine:
+those start six to ten guest processes, each translating its own copy of the
+engine, and exhaust it mid-launch. Every allocation after that point fails and
+the guest wedges.
 
 Only called from `BVNRuntime.mm`'s `runSession()`, immediately before
 `boxedmain()` actually starts a guest. That is a deliberate, user-initiated
@@ -380,8 +397,11 @@ Build 22 device logs prove that software path reaches and interacts with Song
 of Saya's launcher, but Start Game requests a real D3D9 feature level. The
 no-3D adapter supplies none, the engine faults through null, and Wine starts
 its debugger. That debugger then exhausts the original 64 MiB JIT arena.
-Build 23 raises the single pre-authorized arena to 128 MiB; it deliberately
-does not request a second StikDebug stop during live guest execution.
+Build 23 raised the single pre-authorized arena to 128 MiB, and build 90
+replaces the fixed size with the budget-derived segment plan above. Both
+deliberately refuse to request another StikDebug stop during live guest
+execution: by then StikDebug may be suspended in the background, and the stop
+would never be serviced.
 
 The dormant `source/opengl/es` backend was compile-tested against 26R2 and is
 not viable: its 2016 fixed-function declarations lack the constants and

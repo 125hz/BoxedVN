@@ -3,6 +3,7 @@
 
 add_library(boxedvn_support STATIC
     src/architecture.cpp
+    src/direct3d_profile.cpp
     src/json.cpp
     src/manifest.cpp
     src/path_safety.cpp

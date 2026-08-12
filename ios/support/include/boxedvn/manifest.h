@@ -69,9 +69,11 @@ struct GameManifest {
     // Name of the Wine prefix directory this game uses.
     std::string winePrefix;
 
-    // "automatic", "wined3d", or "dxvk". Automatic chooses WineD3D for
-    // broad Direct3D 9 compatibility; a known D3D 10/11 profile may opt into
-    // DXVK. Stored per game so users can override imperfect detection.
+    // "automatic", "wined3d", or "dxvk". Automatic reads the game's own
+    // binaries (see boxedvn/direct3d_profile.h) and selects DXVK when
+    // anything in it links Direct3D 10 or newer, which WineD3D cannot reach
+    // on Metal; everything else stays on WineD3D. Stored per game so users
+    // can override imperfect detection.
     std::string renderer = "automatic";
 
     // Every executable found during import, so the user can change their mind

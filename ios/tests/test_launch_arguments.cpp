@@ -49,16 +49,9 @@ BOXEDVN_TEST(renderer_override_can_force_dxvk_for_an_imported_game) {
     CHECK_EQ(launch.enableWineD3DVulkan, true);
 }
 
-BOXEDVN_TEST(song_of_saya_automatic_profile_enables_dxvk) {
-    BVNLaunchConfiguration launch;
-    launch.runThroughWine = true;
-    launch.gameDirectoryHostPath = "/games/saya";
-    launch.executablePath = "D:\\Saya_en.exe";
-
-    BVNApplyDefaultRendererPolicy(launch);
-
-    CHECK_EQ(launch.enableWineD3DVulkan, true);
-}
+// The automatic choice is now made from what the game's binaries link, so it
+// is tested against real files in test_direct3d_profile.cpp rather than
+// against a list of executable names here.
 
 BOXEDVN_TEST(wine_notepad_command_uses_valueless_nozip_switch) {
     BVNLaunchConfiguration launch;

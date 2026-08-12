@@ -101,7 +101,7 @@ relaunch remain untested. See
 A sideloaded iOS app cannot prepare executable memory by itself. On iOS 26/27,
 `CS_DEBUGGED` is necessary but no longer sufficient: the target stops once at
 StikDebug's universal JIT breakpoint and StikDebug/debugserver prepares every
-16 KiB page in a bounded 128 MiB arena through TXM. BoxedVN then maps those
+16 KiB page of a bounded arena through TXM. BoxedVN then maps those
 physical pages twice—an `r-x` address used for execution and an `rw-` alias
 used for code generation—and suballocates live code locally. This is a
 **different mechanism from macOS's `MAP_JIT`**; BoxedVN never requests
@@ -121,12 +121,21 @@ used for code generation—and suballocates live code locally. This is a
 - **Runtime status** reports `CS_DEBUGGED` safely. It cannot prove page
   preparation without issuing the breakpoint, so the full RX/RW mapping and
   execution test is intentionally deferred until a guest launch.
-- The executable arena is deliberately bounded. Build 22 proved that Saya plus
-  Wine's debugger exceeds 64 MiB, so build 23 raises the limit to 128 MiB. If
-  a future workload needs more than 128 MiB of simultaneous native code,
-  BoxedVN fails with an explicit
-  arena-exhaustion log instead of stopping the guest at a surprise debugger
-  breakpoint.
+- The executable arena is deliberately bounded, and the bound is decided
+  before the guest starts. Asking StikDebug for another region once the guest
+  is running would stop it at a live debugger breakpoint that a
+  background-suspended StikDebug would never service, so the whole budget is
+  prepared during the one startup handshake. `BVNPlanJitArena` sizes it at an
+  eighth of the smaller of `os_proc_available_memory()` and device RAM, with a
+  128 MiB floor and a 512 MiB ceiling, split into 64 MiB segments so that a
+  kernel refusal part way through costs capacity rather than the whole JIT.
+  A workload that still exceeds the prepared total fails with an explicit
+  arena-exhaustion log naming the capacity, not with the "no JIT enabler
+  attached" message - those are opposite problems and used to share wording.
+- **Guests that run a browser engine are the demanding case.** Chromium,
+  Electron and NW.js titles start six to ten guest processes, each translating
+  its own copy of the engine. A fixed 128 MiB ran dry mid-launch for one of
+  them.
 - **There is no whole-runtime fallback when JIT is unavailable.** Boxedwine
   does contain a decoded interpreter, but Wine startup still requires the JIT
   arena. Build 32 can mark a named guest module or bounded guest address range

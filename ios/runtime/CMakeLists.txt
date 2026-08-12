@@ -14,6 +14,7 @@ add_library(boxedvn_runtime STATIC
     src/BVNJIT.mm
     src/BVNMemory.mm
     src/BVNExecMemory.cpp
+    src/BVNJitArenaPlan.cpp
     src/BVNRangeAllocator.cpp
     src/BVNPaths.mm
     src/BVNImport.mm

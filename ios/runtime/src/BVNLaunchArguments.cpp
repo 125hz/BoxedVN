@@ -5,6 +5,8 @@
 
 #include "BVNLaunchArguments.h"
 
+#include "boxedvn/direct3d_profile.h"
+
 #include <initializer_list>
 
 #include <algorithm>
@@ -49,16 +51,46 @@ void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch) {
     // D3D8/D3D9 engines BoxedVN primarily targets. Forcing DXVK into every
     // imported game is unsafe: games may probe its D3D10/11 DLLs even when
     // their main renderer is older, and DXVK can request Metal-impossible
-    // features before the game has a chance to fall back. Known titles that
-    // structurally require D3D11 opt in below, and users can override this
-    // choice per game.
+    // features before the game has a chance to fall back. Users can override
+    // this choice per game.
     launch.enableWineD3DVulkan = importedWineGame &&
         launch.requestedWineRenderer == 2;
-
-    if (importedWineGame && launch.requestedWineRenderer == 0 &&
-        launchesAnyOf(launch, {"saya_en.exe"})) {
-        launch.enableWineD3DVulkan = true;
+    if (!importedWineGame) {
+        launch.rendererReason.clear();
+        return;
     }
+    if (launch.requestedWineRenderer != 0) {
+        launch.rendererReason = launch.requestedWineRenderer == 2
+            ? "DXVK was selected explicitly in this game's launch settings."
+            : "WineD3D was selected explicitly in this game's launch "
+              "settings.";
+        return;
+    }
+
+    // Which games get DXVK used to be a list of executable names, which meant
+    // every unlisted Direct3D 10/11 title silently got the one renderer that
+    // structurally cannot run it. wined3d's Vulkan adapter cannot advertise
+    // Direct3D 10 on Metal - there is no geometry shader stage - so it
+    // reports no supported feature level, the game's device creation fails,
+    // and whatever fallback it has takes over. For a Chromium-based engine
+    // that fallback is a software rasteriser, which then translates enough
+    // x86 to exhaust the JIT arena before the first frame.
+    //
+    // Ask the binaries instead. They say which Direct3D they link, and that
+    // answer covers titles nobody has sat down with.
+    const boxedvn::Direct3DUsage usage =
+        boxedvn::detectDirect3DUsage(launch.gameDirectoryHostPath);
+    if (usage.needsModernDirect3D) {
+        launch.enableWineD3DVulkan = true;
+        launch.rendererReason =
+            "DXVK: " + usage.evidence +
+            ", and WineD3D cannot reach Direct3D 10 on Metal.";
+        return;
+    }
+    launch.rendererReason = usage.reachedLimit
+        ? "WineD3D: no Direct3D 10/11 module was found, but the scan stopped "
+          "at its file limit, so this is not conclusive."
+        : "WineD3D: nothing in this game links Direct3D 10, 11 or 12.";
 }
 
 bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
@@ -102,6 +134,10 @@ bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
         // an explicit DXVK selection in launch settings is a real override.
         if (launch.requestedWineRenderer != 2) {
             launch.enableWineD3DVulkan = false;
+            launch.rendererReason =
+                "WineD3D: a per-title compatibility profile overrides the "
+                "automatic choice, because DXVK failed to create a device "
+                "for this engine on device.";
         }
         return true;
     }
