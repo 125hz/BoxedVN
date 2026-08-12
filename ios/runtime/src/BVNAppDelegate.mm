@@ -832,12 +832,57 @@ extern "C" void BVNUnregisterGuestVulkanSurface(void* surface) {
 // rectangle recorded here. The two must agree; if one changes the other has to
 // change with it.
 static CGRect gGuestPresentationContentRect = CGRectZero;
-static UIImageView* gGuestX11PatchView = nil;
+@interface BVNX11PatchView : UIView
+@property (nonatomic, strong) NSData* pixelData;
+@property (nonatomic, assign) uint32_t pixelWidth;
+@property (nonatomic, assign) uint32_t pixelHeight;
+@end
+
+@implementation BVNX11PatchView
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    if (self.pixelData == nil || self.pixelWidth == 0 ||
+        self.pixelHeight == 0) {
+        return;
+    }
+
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData(
+        (__bridge CFDataRef)self.pixelData);
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGImageRef image = CGImageCreate(
+        self.pixelWidth, self.pixelHeight, 8, 32, self.pixelWidth * 4,
+        colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+        provider, nullptr, false, kCGRenderingIntentDefault);
+    CGColorSpaceRelease(colorSpace);
+    CGDataProviderRelease(provider);
+    if (image == nullptr) {
+        return;
+    }
+
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    CGContextSaveGState(context);
+    CGContextTranslateCTM(context, 0.0, self.bounds.size.height);
+    CGContextScaleCTM(context, 1.0, -1.0);
+    CGContextDrawImage(context, self.bounds, image);
+    CGContextRestoreGState(context);
+    CGImageRelease(image);
+}
+
+@end
+
+static BVNX11PatchView* gGuestX11PatchView = nil;
 static NSMutableData* gGuestX11PatchPixels = nil;
 static uint32_t gGuestX11PatchWidth = 0;
 static uint32_t gGuestX11PatchHeight = 0;
 static uint32_t gGuestX11ActiveWindow = 0;
 static std::atomic<bool> gGuestX11PatchVisible{false};
+static std::atomic<uint64_t> gGuestX11PatchCount{0};
+
+extern "C" uint64_t BVNGuestX11PatchCount(void) {
+    return gGuestX11PatchCount.load(std::memory_order_relaxed);
+}
 
 static void BVNRemoveGuestX11PatchView(void) {
     [gGuestX11PatchView removeFromSuperview];
@@ -887,6 +932,7 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
                                            bool windowIsActiveAncestor) {
     NSCAssert(NSThread.isMainThread,
               @"X11 partial presentation must run on main");
+    @autoreleasepool {
     UIView* presentation = BVNGuestPresentationView();
     if (presentation == nil || pixels == nullptr || bitsPerPixel != 32 ||
         pitch < windowWidth * 4 || dirtyWidth == 0 || dirtyHeight == 0 ||
@@ -907,12 +953,15 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         gGuestX11PatchHeight = guestHeight;
         gGuestX11PatchPixels = [NSMutableData
             dataWithLength:(NSUInteger)guestWidth * guestHeight * 4];
-        gGuestX11PatchView = [[UIImageView alloc]
+        gGuestX11PatchView = [[BVNX11PatchView alloc]
             initWithFrame:presentation.frame];
         gGuestX11PatchView.backgroundColor = UIColor.clearColor;
         gGuestX11PatchView.opaque = NO;
         gGuestX11PatchView.userInteractionEnabled = NO;
-        gGuestX11PatchView.contentMode = UIViewContentModeScaleToFill;
+        gGuestX11PatchView.contentScaleFactor = 1.0;
+        gGuestX11PatchView.pixelData = gGuestX11PatchPixels;
+        gGuestX11PatchView.pixelWidth = guestWidth;
+        gGuestX11PatchView.pixelHeight = guestHeight;
     }
 
     const bool activeWindowChanged =
@@ -1016,50 +1065,51 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         }
     }
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef context = CGBitmapContextCreate(
-        gGuestX11PatchPixels.mutableBytes, guestWidth, guestHeight, 8,
-        guestWidth * 4, colorSpace,
-        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
-    CGColorSpaceRelease(colorSpace);
-    if (context == nullptr) {
-        return;
-    }
-    CGImageRef image = CGBitmapContextCreateImage(context);
-    CGContextRelease(context);
-    if (image == nullptr) {
-        return;
-    }
-    gGuestX11PatchView.image = [UIImage imageWithCGImage:image];
-    CGImageRelease(image);
     BVNSyncGuestX11PatchGeometry(presentation);
     gGuestX11PatchView.hidden = NO;
     gGuestX11PatchVisible.store(true, std::memory_order_release);
 
-    // UIImageView updates normally wait for the next Core Animation commit.
-    // That is not prompt enough here: event-driven visual novels may sleep in
-    // pselect for several seconds after drawing a line of text, and their next
-    // Vulkan present only arrives when a transition/animation begins. Commit
-    // the patch now so GDI/X11 text advances are visible independently of the
-    // game's Vulkan cadence. This is intentionally emulator-wide; it repairs
-    // every mixed Vulkan + GDI guest rather than naming a particular title.
+    // Redraw the persistent layer backing store rather than allocating a new
+    // full-screen UIImage for every dirty rectangle. SDL owns the main thread
+    // for the entire guest session, so UIKit's ordinary per-run-loop
+    // autorelease-pool drain never occurs. The old path could retain thousands
+    // of full-resolution image wrappers/snapshots during a few minutes of text
+    // rendering and eventually starve Core Animation even though the guest and
+    // X11 producer were still running. displayIfNeeded consumes the shared
+    // pixel buffer synchronously, and the explicit autoreleasepool bounds any
+    // temporary Core Graphics/UIKit objects to this one patch.
+    const CGRect dirtyRect = activeWindowChanged
+        ? gGuestX11PatchView.bounds
+        : CGRectMake(clippedLeft, clippedTop, clippedRight - clippedLeft,
+                     clippedBottom - clippedTop);
+    [gGuestX11PatchView setNeedsDisplayInRect:dirtyRect];
+    [gGuestX11PatchView.layer displayIfNeeded];
+
+    // Event-driven visual novels may sleep after drawing a line of text; commit
+    // the patch now rather than waiting for a later Vulkan transition.
     [CATransaction flush];
+    gGuestX11PatchCount.fetch_add(1, std::memory_order_relaxed);
+    BVNGuestPerformanceFramePresented();
 
     static uint64_t patchCount = 0;
     ++patchCount;
     if (patchCount <= 12 || patchCount % 120 == 0) {
+        const BVNMemoryReport memory = BVNMemoryProbe();
         NSString* message = [NSString stringWithFormat:
             @"Composited X11 client present #%llu: window 0x%x %dx%d at %d,%d, "
              "active 0x%x %dx%d at %d,%d, dirty %d,%d %dx%d, "
-             "mapping %dx%d, published %d,%d %dx%d over guest %dx%d.",
+             "mapping %dx%d, published %d,%d %dx%d over guest %dx%d; "
+             "process resident %.1f MB.",
             (unsigned long long)patchCount, windowId, (int)windowWidth,
             (int)windowHeight, screenX, screenY, activeWindowId,
             (int)activeWidth, (int)activeHeight, activeScreenX, activeScreenY,
             dirtyX, dirtyY, (int)dirtyWidth, (int)dirtyHeight,
             (int)activeWidth, (int)activeHeight, clippedLeft, clippedTop,
             clippedRight - clippedLeft, clippedBottom - clippedTop,
-            (int)guestWidth, (int)guestHeight];
+            (int)guestWidth, (int)guestHeight,
+            (double)memory.processResidentBytes / (1024.0 * 1024.0)];
         BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
+    }
     }
 }
 
@@ -1073,7 +1123,8 @@ extern "C" void BVNGuestClearX11Patches(void) {
         memset(gGuestX11PatchPixels.mutableBytes, 0,
                gGuestX11PatchPixels.length);
     }
-    gGuestX11PatchView.image = nil;
+    [gGuestX11PatchView setNeedsDisplay];
+    [gGuestX11PatchView.layer displayIfNeeded];
     gGuestX11PatchView.hidden = YES;
 }
 static bool gGuestPresentationIsLetterboxed = false;

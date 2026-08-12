@@ -51,6 +51,7 @@ extern "C" void BVNGuestVulkanSurfaceDidPresent(void* surface);
 extern "C" bool BVNGuestTakeX11PatchClearRequest(void);
 extern "C" void BVNGuestClearX11Patches(void);
 extern "C" void BVNGuestPerformanceFramePresented(void);
+extern "C" uint64_t BVNGuestX11PatchCount(void);
 extern "C" void* BVNCreateOffscreenMetalLayer(U32 width, U32 height);
 extern "C" void BVNDestroyOffscreenMetalLayer(void* layer);
 
@@ -552,11 +553,13 @@ void bvnReportPresentRate(void) {
     static U32 windowStart = 0;
     static U32 frames = 0;
     static double lastCpuSeconds = 0.0;
+    static uint64_t lastX11PatchCount = 0;
 
     ++frames;
     const U32 now = SDL_GetTicks();
     if (windowStart == 0) {
         windowStart = now;
+        lastX11PatchCount = BVNGuestX11PatchCount();
         return;
     }
     const U32 elapsed = now - windowStart;
@@ -575,6 +578,9 @@ void bvnReportPresentRate(void) {
     const double wallSeconds = (double)elapsed / 1000.0;
     const double coresBusy = lastCpuSeconds > 0.0
         ? (cpuSeconds - lastCpuSeconds) / wallSeconds : 0.0;
+    const uint64_t x11PatchCount = BVNGuestX11PatchCount();
+    const uint64_t x11PatchDelta = x11PatchCount >= lastX11PatchCount
+        ? x11PatchCount - lastX11PatchCount : 0;
 
     // How much of that window the fairness throttle took from the guest. If
     // this approaches the window length the mitigation is the bottleneck, not
@@ -593,11 +599,13 @@ void bvnReportPresentRate(void) {
     const U64 schedYield =
         bvnFairness::schedYieldCalls.load(std::memory_order_relaxed);
 
-    klog_fmt("iOS guest performance: %.1f presented frames/sec over %u ms; "
+    klog_fmt("iOS guest performance: %.1f Vulkan frames/sec and %.1f X11 "
+             "patches/sec over %u ms; "
              "host CPU %.2f cores busy; fairness throttle %llu ms across "
              "%llu scheduling points; guest polled getrusage %llu and "
              "sched_yield %llu times",
-             (double)frames / wallSeconds, elapsed, coresBusy,
+             (double)frames / wallSeconds,
+             (double)x11PatchDelta / wallSeconds, elapsed, coresBusy,
              (unsigned long long)((throttleUs - lastThrottleUs) / 1000),
              (unsigned long long)(throttleCount - lastThrottleCount),
              (unsigned long long)(getrusage - lastGetrusage),
@@ -636,31 +644,17 @@ void bvnReportPresentRate(void) {
     lastPresentCalls = presentCalls;
     lastAcquireUs = acquireUs;
 
-    // Grisaia is bimodal: 30 fps at 0.90 cores with 740,000 getrusage calls a
-    // second while a sprite animates, then 0.4 fps at 0.46 cores with 37,000 -
-    // the *whole guest*, spin loop included, slows by twenty times rather than
-    // any one thing blocking. Less CPU used, not more, so it is waiting.
-    //
-    // Guessing at what it waits for has cost several builds. Take a thread
-    // snapshot instead, at the moment it is actually happening: per-thread
-    // run state and CPU time is what distinguishes a futex wait from a timer
-    // from a starved runnable thread. Once per 30 s so it cannot itself
-    // become the problem.
-    static U32 lastSnapshot = 0;
-    static bool previousWindowWasSlow = false;
-    const bool slow = (double)frames / wallSeconds < 2.0;
-    if (slow && previousWindowWasSlow &&
-        (lastSnapshot == 0 || now - lastSnapshot >= 30000)) {
-        lastSnapshot = now;
-        KSystem::logThreadSnapshot("guest presented under 2 frames/sec for "
-                                   "two consecutive windows");
-    }
-    previousWindowWasSlow = slow;
+    // Do not take a full guest thread snapshot merely because Vulkan is idle.
+    // Mixed-rendered visual novels intentionally advance static text through
+    // X11 patches with almost no full presents. Build 84 mistook that healthy
+    // state for a hang every 30 seconds; snapshotting every process stopped
+    // the emulator long enough to produce recurring ~1 second present stalls.
 
     lastThrottleUs = throttleUs;
     lastThrottleCount = throttleCount;
     lastGetrusage = getrusage;
     lastSchedYield = schedYield;
+    lastX11PatchCount = x11PatchCount;
     lastCpuSeconds = cpuSeconds;
     windowStart = now;
     frames = 0;

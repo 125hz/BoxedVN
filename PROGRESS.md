@@ -3715,3 +3715,42 @@ digest: `1fba39f89efee6e548046d1b10f39f8c5dbd6f6bb6b01bffa03b64efeb346c69`.
 The rolling Release targets the exact producing commit
 `1b5f78b1f80436c7f090e9320ef6fac1d5da3394`. Physical right-edge input and
 late-session Grisaia FPS acceptance remain pending build 84.
+
+### 2026-08-11 - build 85: bounded mixed-render presentation and truthful FPS
+
+`boxedvn-20260811-211158.log` confirms that Grisaia's static dialogue is not a
+zero-frame guest. Once the full Vulkan stream becomes sparse at 0.2-0.6
+frames/sec, Boxedwine continues producing X11/GDI text patches at roughly
+25-50 updates/sec: the compositor counter advances from 240 to 6000, the game
+and Vulkan threads remain runnable, JIT still has about 70 MB free, and host
+CPU remains near half a core. Animated transitions correctly return the full
+Vulkan stream to 25-57 frames/sec.
+
+The late visible stall was therefore downstream of the guest. Build 84's
+native X11 bridge allocated a new full-resolution Core Graphics image plus an
+autoreleased UIImage for every partial update. SDL owns the main thread for an
+entire guest session, so UIKit's ordinary run-loop autorelease-pool boundary is
+not guaranteed to drain that 25-50-times-per-second stream. Build 85 replaces
+it with one persistent UIView backing store, redraws only invalidated regions,
+and wraps each publication in an explicit autorelease pool. The periodic log
+now includes process resident memory so a long device run can verify that the
+footprint stays bounded.
+
+The same log also reveals a self-inflicted one-second interruption: every 30
+seconds the Vulkan-only slow-frame detector stopped all guest processes to
+print a full thread/futex snapshot, after which the next
+`vkQueuePresentKHR` repeatedly took about 1000 ms. Static mixed-render scenes
+are no longer classified as hangs and that invasive recurring snapshot was
+removed. Performance telemetry now reports Vulkan and X11 rates separately,
+while the draggable overlay counts their coalesced visible updates rather than
+misleadingly displaying zero during normally rendered dialogue.
+
+The shared Wine desktop and newly imported games again default to a coherent
+1280x720 monitor. Older non-DPI-aware games that expose a narrower internal
+pointer range at that size can explicitly select 1024x576 in launch settings;
+the explicit selection still overrides the global default.
+
+**Local evidence:** `git diff --check` passes. In the Visual Studio developer
+environment the host-independent suite builds successfully and CTest passes
+1/1, covering all 93 tests. iPhoneOS compilation and long-session physical
+Grisaia acceptance remain pending build 85.

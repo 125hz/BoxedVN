@@ -310,6 +310,7 @@ static NSString* const kBVNPerformanceBatteryKey =
 
 static BVNGuestOverlayView* gOverlay = nil;
 static std::atomic<uint64_t> gPerformancePresentedFrames{0};
+static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
 
 @implementation BVNGuestOverlayView
 
@@ -632,6 +633,8 @@ static std::atomic<uint64_t> gPerformancePresentedFrames{0};
 }
 
 - (void)updatePerformanceOverlay:(NSTimer*)timer {
+    @autoreleasepool {
+    (void)timer;
     const NSTimeInterval now = CACurrentMediaTime();
     const uint64_t frames =
         gPerformancePresentedFrames.load(std::memory_order_relaxed);
@@ -670,6 +673,7 @@ static std::atomic<uint64_t> gPerformancePresentedFrames{0};
     }
     self.performanceLabel.text = [lines componentsJoinedByString:@"\n"];
     [self setNeedsLayout];
+    }
 }
 
 - (void)performanceSettingChanged:(UISwitch*)sender {
@@ -2092,7 +2096,22 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
 }
 
 extern "C" void BVNGuestPerformanceFramePresented(void) {
-    gPerformancePresentedFrames.fetch_add(1, std::memory_order_relaxed);
+    // Vulkan full frames and Wine's X11/GDI partial updates can arrive from
+    // different threads for the same display interval. Count the union of
+    // visible updates rather than Vulkan alone, but coalesce near-simultaneous
+    // notifications so the overlay cannot double-count a mixed present.
+    const uint64_t now = (uint64_t)(CACurrentMediaTime() * 1000000000.0);
+    uint64_t previous =
+        gPerformanceLastUpdateNanoseconds.load(std::memory_order_relaxed);
+    while (previous == 0 || now - previous >= 8000000ull) {
+        if (gPerformanceLastUpdateNanoseconds.compare_exchange_weak(
+                previous, now, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            gPerformancePresentedFrames.fetch_add(1,
+                                                  std::memory_order_relaxed);
+            return;
+        }
+    }
 }
 
 extern "C" void BVNGuestOverlayGeometryDidChange(void) {

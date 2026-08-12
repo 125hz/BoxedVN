@@ -8,8 +8,8 @@
  *  (at your option) any later version.  See license.txt.
  *
  *  ---------------------------------------------------------------------
- *  The in-game overlay: a floating menu button and the on-screen keyboard,
- *  rotation lock and quit control behind it.
+ *  The in-game overlay: a floating menu button, on-screen keyboard, pointer
+ *  controls, performance display and quit control behind it.
  *
  *  This is the interface BVNGuestOverlay.mm needs from the rest of the
  *  runtime, and the interface the rest of the runtime needs from it.  It is
@@ -62,8 +62,9 @@ void BVNGuestOverlayApplyPendingState(void);
 // later touch appear dead until process restart.
 void BVNGuestOverlayGeometryDidChange(void);
 
-// Records one successful full Vulkan presentation for the optional FPS and
-// frame-time overlay. Safe from the presentation thread.
+// Records one visible guest update (Vulkan frame or X11/GDI patch) for the
+// optional FPS and frame-time overlay. Calls from different render paths are
+// coalesced at display cadence. Safe from either presentation thread.
 void BVNGuestPerformanceFramePresented(void);
 
 // ---------------------------------------------------------------------------

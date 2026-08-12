@@ -248,10 +248,9 @@ final class AppModel: ObservableObject {
     /// Notepad also runs in, so a file saved from one is visible in the other.
     /// Games keep their own prefixes - see `launch(_:)` for why.
     ///
-    /// 1024x576 rather than the old 800x600 default. 16:9 matches the
-    /// phone closely enough that the letterbox is thin, which keeps window
-    /// edges away from the Dynamic Island instead of underneath it, while
-    /// keeping Wine's un-antialiased desktop text readable on a phone.
+    /// Keep the shared Wine desktop at 1280x720. Imported games use the same
+    /// default virtual-monitor size, while an older non-DPI-aware game can
+    /// explicitly select 1024x576 in its own launch settings.
     ///
     /// Two builds tried to run this inside Wine's virtual desktop
     /// (`explorer /desktop=shell,1280x720`) so it would look like Windows.
@@ -287,8 +286,8 @@ final class AppModel: ObservableObject {
                 arguments: ["E:\\"],
                 environment: [],
                 workingDirectory: nil,
-                width: 1024,
-                height: 576,
+                width: 1280,
+                height: 720,
                 soundEnabled: true,
                 runThroughWine: true
             )
