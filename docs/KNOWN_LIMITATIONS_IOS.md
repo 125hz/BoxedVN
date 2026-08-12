@@ -335,6 +335,33 @@ format or registration, all of which were healthy. Note also `azuki:error`
 and `kaku:error`: two further faces this title declares do fail to load, and
 the game proceeds regardless.
 
+**After the font gate: a divide by zero in FFmpeg.** The guest reaches
+`Scene_Map` and a renderer dies seconds later. Build 108's PE-image naming
+finally attributed it:
+
+```
+Guest divide exception: pid 99 thread ab divide by zero;
+    EIP 76B8D515 ffmpeg.dll+0002D515 (image at 76B60000);
+    EAX 00000001 ECX 00000000 ... bytes F7 F1 50 FF 37 68 4C 60 D0 76 6A 30 6A 00
+```
+
+`F7 F1` is `DIV ECX` with `ECX` zero, so the divisor really was zero and the
+emulator executed the instruction correctly - the JIT is not at fault. The
+instruction stream after it pushes five arguments ending in the quotient,
+with `0x30` among them, which is the shape of an `av_log(..., AV_LOG_DEBUG,
+fmt, x, 1/rate)` call: FFmpeg computing a ratio for a log line whose
+arguments are evaluated even when the message is discarded.
+
+Two threads of the same process hit the identical instruction with identical
+registers, so it is deterministic rather than a race.
+
+Turning BoxedVN's sound off does not avoid it, because that removes the
+audio *device* and the engine goes on fetching its music and handing it to
+`decodeAudioData` regardless. Build 109 makes the setting mean what it says:
+with sound off, an RPG Maker guest also gets its `AudioManager` play entry
+points silenced, so nothing is fetched or decoded. That is a workaround for
+this crash, not a diagnosis of why FFmpeg sees a zero rate.
+
 **Build 100's census, for the record.****Build 100's census, for the record.** The guest reported 56 font files and
 `coue1255.fon, coue1256.fon, coue1257.fon` as examples: the root filesystem
 ships Wine's bundled fonts and they are legacy `.fon` bitmap faces.

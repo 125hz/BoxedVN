@@ -254,6 +254,12 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         boxedvn::GuestBootScripts scripts;
         scripts.diagnostics = engineProfile.bootDiagnostics;
         scripts.fontFix = engineProfile.fontGateShim;
+        // Sound off means the engine does not decode audio either. A device
+        // run proved that matters: with -nosound passed and no audio device
+        // open, a renderer still died dividing by zero inside ffmpeg.dll,
+        // because the game had gone on fetching its music and handing it to
+        // decodeAudioData regardless.
+        scripts.silenceAudio = engineProfile.rpgMaker && !launch.soundEnabled;
         const boxedvn::BootDiagnosticsResult diagnostics =
             boxedvn::setGuestBootScripts(launch.gameDirectoryHostPath,
                                          scripts);

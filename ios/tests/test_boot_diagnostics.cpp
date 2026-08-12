@@ -258,3 +258,33 @@ BOXEDVN_TEST(font_gate_shim_installs_without_diagnostics) {
     // The reporting probe is a separate opt-in and must not come along.
     CHECK(html.find("BOXEDVN boot") == std::string::npos);
 }
+
+BOXEDVN_TEST(silence_audio_shim_stops_the_engine_asking_for_sound) {
+    const std::string script = silenceAudioScript();
+    // The point is to prevent the decode, not to mute the output, so it has
+    // to reach the engine's play entry points rather than a volume.
+    CHECK_CONTAINS(script, "AudioManager");
+    CHECK_CONTAINS(script, "playBgm");
+    CHECK_CONTAINS(script, "playSe");
+    CHECK_CONTAINS(script, "BOXEDVN");
+    // It must give up rather than poll a guest that is not RPG Maker forever.
+    CHECK_CONTAINS(script, "clearInterval");
+}
+
+BOXEDVN_TEST(silence_audio_installs_independently_of_the_other_scripts) {
+    const Scratch game("silence_only");
+    const fs::path document = game.path() / "www" / "index.html";
+    write(document, kMvDocument);
+
+    GuestBootScripts scripts;
+    scripts.silenceAudio = true;
+    CHECK(setGuestBootScripts(game.string(), scripts).changed);
+
+    const std::string html = readAll(document);
+    CHECK_CONTAINS(html, "AudioManager");
+    CHECK(html.find("BOXEDVN boot") == std::string::npos);
+    CHECK(html.find("fontfix") == std::string::npos);
+
+    CHECK(setGuestBootScripts(game.string(), GuestBootScripts{}).changed);
+    CHECK_EQ(readAll(document), std::string(kMvDocument));
+}

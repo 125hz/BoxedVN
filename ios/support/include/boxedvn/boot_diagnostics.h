@@ -88,7 +88,18 @@ struct GuestBootScripts {
     // continuing.
     bool fontFix = false;
 
-    bool any() const { return diagnostics || fontFix; }
+    // Stop the engine asking for audio at all.
+    //
+    // BoxedVN's sound setting removes the guest's audio *device*, which is
+    // not the same as removing audio work: RPG Maker still fetches its music
+    // and hands it to decodeAudioData, and a device run with -nosound still
+    // lost a renderer to a divide by zero inside ffmpeg.dll. Turning sound
+    // off should mean the engine does not decode either, both because that is
+    // what the setting says and because it is what makes it a usable
+    // workaround for that crash.
+    bool silenceAudio = false;
+
+    bool any() const { return diagnostics || fontFix || silenceAudio; }
 };
 
 // The script BoxedVN injects. Exposed for tests, and so the exact text a
@@ -105,6 +116,9 @@ std::string bootDiagnosticsScript();
 
 // The RPG Maker font-gate shim. Exposed for the same reason.
 std::string fontGateShimScript();
+
+// The RPG Maker audio-silencing shim. Exposed for the same reason.
+std::string silenceAudioScript();
 
 // Finds the game's HTML entry point - www/index.html as RPG Maker MV
 // deploys it, or index.html at the top level as MZ does - and installs or

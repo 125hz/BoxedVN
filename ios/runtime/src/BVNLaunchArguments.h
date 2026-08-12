@@ -65,6 +65,9 @@ struct BVNEngineProfileResult {
     /// default for a recognised RPG Maker guest, because without it that
     /// guest does not finish starting.
     bool fontGateShim = false;
+    /// True when the guest is RPG Maker, so the caller can apply the engine
+    /// shims that only make sense there.
+    bool rpgMaker = false;
     /// One sentence for the session log, naming the engine and what was done
     /// about it. Non-empty whenever an engine was recognised, including the
     /// case where BoxedVN deliberately added nothing.

@@ -210,6 +210,32 @@ std::string fontGateShimScript() {
         "\n</script>\n";
 }
 
+std::string silenceAudioScript() {
+    return
+        "<script>/* " + std::string(kBootDiagnosticsMarker) + "-SILENCE */\n"
+        R"JS((function () {
+  function say(t) { try { console.log("BOXEDVN " + t); } catch (e) {} }
+  var names = ["playBgm", "playBgs", "playMe", "playSe", "playStaticSe"];
+  var applied = 0;
+  var timer = setInterval(function () {
+    try {
+      if (typeof AudioManager === "undefined") { return; }
+      for (var i = 0; i < names.length; i++) {
+        if (typeof AudioManager[names[i]] === "function") {
+          AudioManager[names[i]] = function () {};
+          applied++;
+        }
+      }
+      clearInterval(timer);
+      say("silenced " + applied + " audio entry point(s); sound is off, so " +
+          "the engine will not fetch or decode audio either");
+    } catch (e) { clearInterval(timer); }
+  }, 250);
+  setTimeout(function () { clearInterval(timer); }, 30000);
+})();)JS"
+        "\n</script>\n";
+}
+
 BootDiagnosticsResult setGuestBootScripts(const std::string& gameDirectory,
                                           const GuestBootScripts& scripts) {
     BootDiagnosticsResult result;
@@ -282,6 +308,9 @@ BootDiagnosticsResult setGuestBootScripts(const std::string& gameDirectory,
     }
     if (scripts.fontFix) {
         injected += fontGateShimScript();
+    }
+    if (scripts.silenceAudio) {
+        injected += silenceAudioScript();
     }
 
     std::string desired = original;

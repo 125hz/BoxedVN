@@ -121,9 +121,10 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
     // Only for RPG Maker: the shim knows that engine's boot gate by name, and
     // installing it into an unrelated NW.js application would be a change
     // with no reason behind it.
-    result.fontGateShim = merged.fontGateShim &&
-        (profile.framework == boxedvn::GuestFramework::RpgMakerMv ||
-         profile.framework == boxedvn::GuestFramework::RpgMakerMz);
+    result.rpgMaker =
+        profile.framework == boxedvn::GuestFramework::RpgMakerMv ||
+        profile.framework == boxedvn::GuestFramework::RpgMakerMz;
+    result.fontGateShim = merged.fontGateShim && result.rpgMaker;
 
     if (merged.optedOut) {
         result.reason = std::string(engine) + " detected (" +
