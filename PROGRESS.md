@@ -6,18 +6,18 @@ what has not been tried yet, and what to do next. Update it at the end of every
 working session. Keep it honest — an inflated status here costs more time than
 it saves.
 
-**Last updated:** 2026-08-11 (build 79 prepared from the first build-78 device
-log. Build 78 is device-proven to start Grisaia at 1280x720 and sustain about
-58 fps during active presentation, but it exposed two shared compositor/input
-defects: full-screen GDI dirty rectangles could form a visible seam over the
-Vulkan frame, and fake-fullscreen X11 motion chose its target window before
-converting the game-local point to root coordinates. Build 79 publishes a
-coherent full-window X11 snapshot, makes motion and button targeting use the
-same root-space point, and adds rotation/fill diagnostics. Trackpad gestures
-now reset their first-motion baseline, support hold-to-drag, and hide the
-cursor behind the Wine startup page. GitHub Actions run 31547397032 passed all
-92 tests, the iPhoneOS compile, entitlement packaging, and rolling Release
-upload. Fresh-device validation remains pending. Song of Saya remains
+**Last updated:** 2026-08-11 (build 80 prepared from the two build-79 device
+logs. They show that build 79's full-backing promotion copied Grisaia's
+decorated 1286x752 Wine parent over its 1280x720 Vulkan client, exposing the
+29-pixel title bar and unused black backing area. Build 80 accepts only X11
+updates related to the active client, rejects ancestor invalidations that
+escape the client rectangle, and scales a complete 960x720 logical COPY frame
+to the 1280x720 presentation before applying later text updates. Fake-
+fullscreen input now dispatches directly to the active client instead of
+re-hit-testing against the stale 800x600 X11 root; the portrait log proves
+UIKit continued receiving touches after rotation. Pointer settings now include
+a persistent 0.5x-3.0x trackpad sensitivity slider. Windows host tests pass;
+iPhoneOS CI and fresh-device validation remain pending. Song of Saya remains
 device-proven playable with the
 interpreter workaround.
 The newest
@@ -3489,3 +3489,46 @@ digest: SHA-256
 Its direct URL returned HTTP 200 with `Content-Disposition: attachment`.
 Physical Fit/Fill, portrait input, pointer targeting, trackpad dragging, and
 mixed-present rendering remain pending a fresh device test.
+
+### 2026-08-11 — build 80: client-aware mixed presents and direct fake-fullscreen input
+
+The build-79 logs are `boxedvn-20260811-184649.log` and
+`boxedvn-20260811-185325.log`. The Grisaia run registers the real Vulkan client
+as X11 window `0x10134`, 1280x720 at root position `(3,29)`. Immediately around
+it, the X11 fallback reports a decorated 1286x752 parent at `(0,0)`. Build 79's
+broad-update heuristic promoted that parent's entire backing store as a
+1280x720 overlay. This exactly explains the screenshot: source row zero is the
+Wine title bar, and the backing pixels to the right of the game's 960x720 COPY
+region are black. Opening the native menu caused a fresh Vulkan present to
+clear the bad overlay; closing it allowed the next X11 repaint to expose it
+again.
+
+Build 80 removes full-parent promotion. `XWindow::draw` now sends mixed-present
+updates only when the dirty window is the active Vulkan client, an ancestor,
+or a descendant. The iOS compositor uses the active client's root rectangle as
+the coordinate origin and rejects a decorated ancestor update if any part
+escapes that client. A complete client-contained logical frame such as the
+observed 960x720 COPY is scaled coherently to 1280x720, and its scale is reused
+for later partial dialogue updates. This preserves the immediate GDI text path
+without copying decorations, a black unused strip, or an unscaled vertical
+slice over the Vulkan frame.
+
+The pointer failure is below UIKit. In landscape the active client is already
+wider than Boxedwine's 800x600 root; in the second log it is 1280x960 at
+`(-3,23)`. After unlocking rotation, the overlay is rebuilt at 402x874 and
+continues logging portrait hit tests, proving the responder chain is alive.
+Boxedwine nevertheless converted those guest pixels to root space and asked
+the smaller root to choose a window again. Points toward the right/bottom can
+therefore select an overlapping Wine child or fall outside the root. Motion
+and button dispatch now start at `fakeFullScreenWnd` and bubble to its parents;
+ordinary desktop sessions still use root hit-testing. The same change covers
+direct touch, trackpad click, Fit, Fill, and post-rotation input.
+
+Pointer settings now expose a persistent trackpad sensitivity slider from
+0.5x to 3.0x, defaulting to the previous fixed 1.4x movement. The existing
+appearance controls and gesture semantics are unchanged.
+
+**Build evidence:** `git diff --check` passes. The Windows host-independent
+suite passes its one CTest target, which contains all 92 assertions. The
+Objective-C++ runtime and iPhoneOS core still require the macOS GitHub Actions
+compile; physical rendering and input acceptance remain pending build 80.

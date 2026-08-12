@@ -21,9 +21,11 @@
 
 #ifdef BOXEDWINE_IOS
 extern "C" void BVNGuestCompositeX11Patch(const U8* pixels, U32 pitch,
-	S32 bitsPerPixel, S32 screenX, S32 screenY, U32 windowWidth,
-	U32 windowHeight, S32 dirtyX, S32 dirtyY, U32 dirtyWidth,
-	U32 dirtyHeight);
+	S32 bitsPerPixel, U32 windowId, S32 screenX, S32 screenY,
+	U32 windowWidth, U32 windowHeight, S32 dirtyX, S32 dirtyY,
+	U32 dirtyWidth, U32 dirtyHeight, U32 activeWindowId,
+	S32 activeScreenX, S32 activeScreenY, U32 activeWidth,
+	U32 activeHeight, bool windowIsActiveAncestor);
 #endif
 #include "knativesystem.h"
 
@@ -944,14 +946,42 @@ void XWindow::draw() {
 #ifdef BOXEDWINE_IOS
 	if (wasDirty && dirtyBoundsValid &&
 		!KNativeSystem::getScreen()->canBltToScreen()) {
-		S32 absoluteX = 0;
-		S32 absoluteY = 0;
-		windowToScreen(absoluteX, absoluteY);
-		BVNGuestCompositeX11Patch(data, bytes_per_line,
-			visual ? visual->bits_per_rgb : 32, absoluteX, absoluteY,
-			width(), height(), dirtyLeft, dirtyTop,
-			(U32)(dirtyRight - dirtyLeft),
-			(U32)(dirtyBottom - dirtyTop));
+		XServer* server = XServer::getServer(true);
+		XWindowPtr active = server ? server->fakeFullScreenWnd : nullptr;
+		if (active) {
+			bool isActiveAncestor = false;
+			bool isRelated = false;
+			for (XWindowPtr cursor = active; cursor; cursor = cursor->parent) {
+				if (cursor.get() == this) {
+					isRelated = true;
+					isActiveAncestor = cursor != active;
+					break;
+				}
+			}
+			if (!isRelated) {
+				for (XWindowPtr cursor = parent; cursor; cursor = cursor->parent) {
+					if (cursor == active) {
+						isRelated = true;
+						break;
+					}
+				}
+			}
+			if (isRelated) {
+				S32 absoluteX = 0;
+				S32 absoluteY = 0;
+				windowToScreen(absoluteX, absoluteY);
+				S32 activeX = 0;
+				S32 activeY = 0;
+				active->windowToScreen(activeX, activeY);
+				BVNGuestCompositeX11Patch(data, bytes_per_line,
+					visual ? visual->bits_per_rgb : 32, id,
+					absoluteX, absoluteY, width(), height(), dirtyLeft,
+					dirtyTop, (U32)(dirtyRight - dirtyLeft),
+					(U32)(dirtyBottom - dirtyTop), active->id,
+					activeX, activeY, active->width(), active->height(),
+					isActiveAncestor);
+			}
+		}
 	}
 #endif
 	KNativeSystem::getScreen()->putBitsOnWnd(id, data, visual?visual->bits_per_rgb:32, bytes_per_line, screenX, screenY, width(), height(), palette, isDirty);

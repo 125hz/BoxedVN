@@ -855,6 +855,9 @@ static UIImageView* gGuestX11PatchView = nil;
 static NSMutableData* gGuestX11PatchPixels = nil;
 static uint32_t gGuestX11PatchWidth = 0;
 static uint32_t gGuestX11PatchHeight = 0;
+static uint32_t gGuestX11ActiveWindow = 0;
+static uint32_t gGuestX11LogicalWidth = 0;
+static uint32_t gGuestX11LogicalHeight = 0;
 static std::atomic<bool> gGuestX11PatchVisible{false};
 
 static void BVNRemoveGuestX11PatchView(void) {
@@ -863,6 +866,9 @@ static void BVNRemoveGuestX11PatchView(void) {
     gGuestX11PatchPixels = nil;
     gGuestX11PatchWidth = 0;
     gGuestX11PatchHeight = 0;
+    gGuestX11ActiveWindow = 0;
+    gGuestX11LogicalWidth = 0;
+    gGuestX11LogicalHeight = 0;
     gGuestX11PatchVisible.store(false, std::memory_order_release);
 }
 
@@ -887,6 +893,7 @@ static void BVNSyncGuestX11PatchGeometry(UIView* presentation) {
 extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
                                            uint32_t pitch,
                                            int32_t bitsPerPixel,
+                                           uint32_t windowId,
                                            int32_t screenX,
                                            int32_t screenY,
                                            uint32_t windowWidth,
@@ -894,12 +901,19 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
                                            int32_t dirtyX,
                                            int32_t dirtyY,
                                            uint32_t dirtyWidth,
-                                           uint32_t dirtyHeight) {
+                                           uint32_t dirtyHeight,
+                                           uint32_t activeWindowId,
+                                           int32_t activeScreenX,
+                                           int32_t activeScreenY,
+                                           uint32_t activeWidth,
+                                           uint32_t activeHeight,
+                                           bool windowIsActiveAncestor) {
     NSCAssert(NSThread.isMainThread,
               @"X11 partial presentation must run on main");
     UIView* presentation = BVNGuestPresentationView();
     if (presentation == nil || pixels == nullptr || bitsPerPixel != 32 ||
-        pitch < windowWidth * 4 || dirtyWidth == 0 || dirtyHeight == 0) {
+        pitch < windowWidth * 4 || dirtyWidth == 0 || dirtyHeight == 0 ||
+        activeWindowId == 0 || activeWidth == 0 || activeHeight == 0) {
         return;
     }
 
@@ -924,56 +938,102 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         gGuestX11PatchView.contentMode = UIViewContentModeScaleToFill;
     }
 
-    // A full-screen WineD3D window can use a GDI COPY present for only part of
-    // a frame. Publishing only that dirty rectangle as an opaque UIImage over
-    // the Vulkan frame mixes two independently timed snapshots and produces a
-    // hard cut at the dirty edge (1280x720 Grisaia exposed it at guest x=720).
-    // Its XWindow backing store contains the whole current window, so publish
-    // a coherent full-window snapshot when it covers the presentation.
-    const bool coversPresentation =
-        screenX <= 0 && screenY <= 0 &&
-        screenX + (int32_t)windowWidth >= (int32_t)guestWidth &&
-        screenY + (int32_t)windowHeight >= (int32_t)guestHeight;
-    const uint64_t dirtyArea = (uint64_t)dirtyWidth * dirtyHeight;
-    const uint64_t guestArea = (uint64_t)guestWidth * guestHeight;
-    // Keep small dialogue/control updates cheap. The coherent snapshot is for
-    // broad COPY presents where the edge between render paths is visible.
-    const bool publishFullWindow = coversPresentation &&
-        dirtyArea * 4 >= guestArea;
-    const int32_t sourceLeft = publishFullWindow ? 0 : MAX(0, dirtyX);
-    const int32_t sourceTop = publishFullWindow ? 0 : MAX(0, dirtyY);
-    const int32_t sourceRight = publishFullWindow
-        ? (int32_t)windowWidth
-        : MIN((int32_t)windowWidth, dirtyX + (int32_t)dirtyWidth);
-    const int32_t sourceBottom = publishFullWindow
-        ? (int32_t)windowHeight
-        : MIN((int32_t)windowHeight, dirtyY + (int32_t)dirtyHeight);
-    const int32_t destinationLeft = screenX + sourceLeft;
-    const int32_t destinationTop = screenY + sourceTop;
-    const int32_t clippedLeft = MAX(0, destinationLeft);
-    const int32_t clippedTop = MAX(0, destinationTop);
-    const int32_t clippedRight = MIN((int32_t)guestWidth,
-                                     screenX + sourceRight);
-    const int32_t clippedBottom = MIN((int32_t)guestHeight,
-                                      screenY + sourceBottom);
-    if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) {
+    const bool activeWindowChanged =
+        gGuestX11ActiveWindow != activeWindowId;
+    if (activeWindowChanged) {
+        gGuestX11ActiveWindow = activeWindowId;
+        gGuestX11LogicalWidth = activeWidth;
+        gGuestX11LogicalHeight = activeHeight;
+        memset(gGuestX11PatchPixels.mutableBytes, 0,
+               gGuestX11PatchPixels.length);
+    }
+
+    const int32_t sourceLeft = MAX(0, dirtyX);
+    const int32_t sourceTop = MAX(0, dirtyY);
+    const int32_t sourceRight = MIN((int32_t)windowWidth,
+                                    dirtyX + (int32_t)dirtyWidth);
+    const int32_t sourceBottom = MIN((int32_t)windowHeight,
+                                     dirtyY + (int32_t)dirtyHeight);
+    const int32_t absoluteLeft = screenX + sourceLeft;
+    const int32_t absoluteTop = screenY + sourceTop;
+    const int32_t absoluteRight = screenX + sourceRight;
+    const int32_t absoluteBottom = screenY + sourceBottom;
+    const int32_t activeRight = activeScreenX + (int32_t)activeWidth;
+    const int32_t activeBottom = activeScreenY + (int32_t)activeHeight;
+
+    // A decorated Wine parent surrounds the active Vulkan client. Its broad
+    // frame invalidations include the title bar and unused backing pixels;
+    // they are not guest presents. Build 79 promoted those invalidations and
+    // visibly copied a 29-pixel title bar plus a black right-hand strip. Only
+    // accept ancestor updates wholly inside the active client's root rect.
+    if (windowIsActiveAncestor &&
+        (absoluteLeft < activeScreenX || absoluteTop < activeScreenY ||
+         absoluteRight > activeRight || absoluteBottom > activeBottom)) {
         return;
     }
 
+    const int32_t clientLeft = MAX(activeScreenX, absoluteLeft) - activeScreenX;
+    const int32_t clientTop = MAX(activeScreenY, absoluteTop) - activeScreenY;
+    const int32_t clientRight = MIN(activeRight, absoluteRight) - activeScreenX;
+    const int32_t clientBottom = MIN(activeBottom, absoluteBottom) - activeScreenY;
+    if (clientRight <= clientLeft || clientBottom <= clientTop) {
+        return;
+    }
+
+    // Some WineD3D paths copy a complete logical framebuffer into a wider
+    // Vulkan client (the captured case is 960x720 -> 1280x720). Remember that
+    // mapping and apply it to later text-only dirty rectangles. This keeps the
+    // X11 text cadence without mixing an unscaled left slice with the Vulkan
+    // frame or copying unrelated pixels to the right.
+    const bool completeLogicalFrame =
+        clientLeft == 0 && clientTop == 0 &&
+        clientBottom == (int32_t)activeHeight &&
+        clientRight >= (int32_t)activeWidth / 2;
+    if (completeLogicalFrame) {
+        gGuestX11LogicalWidth = (uint32_t)clientRight;
+        gGuestX11LogicalHeight = (uint32_t)clientBottom;
+        memset(gGuestX11PatchPixels.mutableBytes, 0,
+               gGuestX11PatchPixels.length);
+    }
+    const uint32_t logicalWidth = MAX(1u, gGuestX11LogicalWidth);
+    const uint32_t logicalHeight = MAX(1u, gGuestX11LogicalHeight);
+    const int32_t logicalLeft = MAX(0, clientLeft);
+    const int32_t logicalTop = MAX(0, clientTop);
+    const int32_t logicalRight = MIN((int32_t)logicalWidth, clientRight);
+    const int32_t logicalBottom = MIN((int32_t)logicalHeight, clientBottom);
+    if (logicalRight <= logicalLeft || logicalBottom <= logicalTop) {
+        return;
+    }
+    const int32_t clippedLeft = (int32_t)((int64_t)logicalLeft * guestWidth /
+                                           logicalWidth);
+    const int32_t clippedTop = (int32_t)((int64_t)logicalTop * guestHeight /
+                                          logicalHeight);
+    const int32_t clippedRight = (int32_t)(((int64_t)logicalRight * guestWidth +
+                                             logicalWidth - 1) / logicalWidth);
+    const int32_t clippedBottom = (int32_t)(((int64_t)logicalBottom * guestHeight +
+                                              logicalHeight - 1) / logicalHeight);
+
     uint32_t* destination =
         reinterpret_cast<uint32_t*>(gGuestX11PatchPixels.mutableBytes);
-    const int32_t sourceOffsetX = clippedLeft - screenX;
-    const int32_t sourceOffsetY = clippedTop - screenY;
-    for (int32_t y = 0; y < clippedBottom - clippedTop; ++y) {
+    const int32_t clientOffsetX = activeScreenX - screenX;
+    const int32_t clientOffsetY = activeScreenY - screenY;
+    for (int32_t destinationY = clippedTop;
+         destinationY < clippedBottom; ++destinationY) {
+        const int32_t logicalY = MIN(logicalBottom - 1,
+            (int32_t)((int64_t)destinationY * logicalHeight / guestHeight));
         const uint32_t* sourceRow = reinterpret_cast<const uint32_t*>(
-            pixels + (sourceOffsetY + y) * pitch) + sourceOffsetX;
+            pixels + (clientOffsetY + logicalY) * pitch);
         uint32_t* destinationRow = destination +
-            (clippedTop + y) * guestWidth + clippedLeft;
-        for (int32_t x = 0; x < clippedRight - clippedLeft; ++x) {
+            destinationY * guestWidth;
+        for (int32_t destinationX = clippedLeft;
+             destinationX < clippedRight; ++destinationX) {
+            const int32_t logicalX = MIN(logicalRight - 1,
+                (int32_t)((int64_t)destinationX * logicalWidth / guestWidth));
             // Boxedwine's X11 visual is BGRX in little-endian memory. Core
             // Graphics consumes BGRA here, so make only the updated rectangle
             // opaque and leave the rest transparent over the Vulkan frame.
-            destinationRow[x] = sourceRow[x] | 0xff000000u;
+            destinationRow[destinationX] =
+                sourceRow[clientOffsetX + logicalX] | 0xff000000u;
         }
     }
 
@@ -1010,12 +1070,15 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
     ++patchCount;
     if (patchCount <= 12 || patchCount % 120 == 0) {
         NSString* message = [NSString stringWithFormat:
-            @"Composited X11 %@ present #%llu: window %dx%d at %d,%d, "
-             "dirty %d,%d %dx%d, published %d,%d %dx%d over guest %dx%d.",
-            publishFullWindow ? @"full-window" : @"partial",
-            (unsigned long long)patchCount, (int)windowWidth,
-            (int)windowHeight, screenX, screenY, dirtyX, dirtyY,
-            (int)dirtyWidth, (int)dirtyHeight, clippedLeft, clippedTop,
+            @"Composited X11 %@ present #%llu: window 0x%x %dx%d at %d,%d, "
+             "active 0x%x %dx%d at %d,%d, dirty %d,%d %dx%d, logical "
+             "%dx%d, published %d,%d %dx%d over guest %dx%d.",
+            completeLogicalFrame ? @"logical-frame" : @"partial",
+            (unsigned long long)patchCount, windowId, (int)windowWidth,
+            (int)windowHeight, screenX, screenY, activeWindowId,
+            (int)activeWidth, (int)activeHeight, activeScreenX, activeScreenY,
+            dirtyX, dirtyY, (int)dirtyWidth, (int)dirtyHeight,
+            (int)logicalWidth, (int)logicalHeight, clippedLeft, clippedTop,
             clippedRight - clippedLeft, clippedBottom - clippedTop,
             (int)guestWidth, (int)guestHeight];
         BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);

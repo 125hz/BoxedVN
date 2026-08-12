@@ -1000,7 +1000,14 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 		fakeFullScreenWnd->windowToScreen(x, y);
 	}
 	if (root) { // might not be set at the very start
-		XWindowPtr wnd = root->getWindowFromPoint(x, y);
+		// The native guest view is the fake-fullscreen client's coordinate
+		// space. Root hit-testing is both unnecessary and incorrect here: the
+		// emulated root can still be 800x600 while the presented Wine client is
+		// 1280x720/960. Points on the right or bottom then land on an overlapping
+		// parent (or outside the root) even though UIKit mapped them correctly.
+		XWindowPtr wnd = fakeFullScreenWnd
+			? fakeFullScreenWnd
+			: root->getWindowFromPoint(x, y);
 		if (wnd) {
 			if (wnd != pointerWindow) {
 				pointerMoved(pointerWindow, wnd, x, y, NotifyNormal);
@@ -1015,9 +1022,24 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 }
 
 void XServer::mouseButton(U32 button, S32 x, S32 y, bool pressed) {
+#ifdef BOXEDWINE_IOS
+	const S32 guestX = x;
+	const S32 guestY = y;
+#endif
 	if (fakeFullScreenWnd) {
 		fakeFullScreenWnd->windowToScreen(x, y);
 	}
+#ifdef BOXEDWINE_IOS
+	static U32 fakeFullScreenButtonLogCount = 0;
+	if (fakeFullScreenWnd && fakeFullScreenButtonLogCount < 32) {
+		++fakeFullScreenButtonLogCount;
+		klog_fmt("iOS fake-fullscreen button %s #%u: guest %d,%d -> root "
+			"%d,%d, direct target 0x%x (%ux%u)",
+			pressed ? "down" : "up", fakeFullScreenButtonLogCount,
+			guestX, guestY, x, y, fakeFullScreenWnd->id,
+			fakeFullScreenWnd->width(), fakeFullScreenWnd->height());
+	}
+#endif
 	if (isGrabbed) {
 		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(grabbedMutex);
 		XWindowPtr grabbed = getWindow(grabbedId);
@@ -1043,7 +1065,12 @@ void XServer::mouseButton(U32 button, S32 x, S32 y, bool pressed) {
 		}
 	}
 	if (root) { // might not be set at the very start
-		XWindowPtr wnd = root->getWindowFromPoint(x, y);
+		// See mouseMove: native coordinates already address the active client.
+		// Start dispatch there and bubble to its parents rather than asking a
+		// differently-sized root window to select the target again.
+		XWindowPtr wnd = fakeFullScreenWnd
+			? fakeFullScreenWnd
+			: root->getWindowFromPoint(x, y);
 		while (wnd && !wnd->mouseButtonScreenCoords(button, x, y, pressed)) {
 			wnd = wnd->parent;
 		}

@@ -194,8 +194,9 @@ static const CGFloat kBVNKeyGap = 4.0;
 // Slightly faster than 1:1 so a small finger movement crosses a Wine dialog,
 // but not so fast that a title-bar button is unhittable - which is the whole
 // reason trackpad mode exists.
-static const CGFloat kBVNTrackpadSensitivity = 1.4;
 static NSString* const kBVNTrackpadModeKey = @"BoxedVN.pointer.trackpad";
+static NSString* const kBVNPointerSensitivityKey =
+    @"BoxedVN.pointer.sensitivity";
 static NSString* const kBVNPointerOpacityKey = @"BoxedVN.pointer.opacity";
 static NSString* const kBVNPointerSizeKey = @"BoxedVN.pointer.size";
 static NSString* const kBVNPointerOutlineOpacityKey =
@@ -249,6 +250,7 @@ static NSString* const kBVNPointerInnerCircleKey =
 @property (nonatomic, strong) UIButton* pointerSettingsBackItem;
 @property (nonatomic, strong) NSArray<UILabel*>* pointerSettingLabels;
 @property (nonatomic, strong) UISlider* pointerOpacitySlider;
+@property (nonatomic, strong) UISlider* pointerSensitivitySlider;
 @property (nonatomic, strong) UISlider* pointerSizeSlider;
 @property (nonatomic, strong) UISlider* pointerOutlineSlider;
 @property (nonatomic, strong) UISlider* pointerShadowSlider;
@@ -295,6 +297,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.opaque = NO;
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         kBVNPointerOpacityKey: @1.0,
+        kBVNPointerSensitivityKey: @1.4,
         kBVNPointerSizeKey: @22.0,
         kBVNPointerOutlineOpacityKey: @1.0,
         kBVNPointerShadowOpacityKey: @0.85,
@@ -384,7 +387,7 @@ static BVNGuestOverlayView* gOverlay = nil;
     self.pointerSettingsPanel = panel;
 
     NSArray<NSString*>* titles = @[
-        @"Opacity", @"Size", @"Outline opacity", @"Shadow opacity",
+        @"Sensitivity", @"Opacity", @"Size", @"Outline opacity", @"Shadow opacity",
         @"Cursor thickness", @"Outer circle", @"Inner circle",
     ];
     NSMutableArray<UILabel*>* labels = [NSMutableArray array];
@@ -398,6 +401,8 @@ static BVNGuestOverlayView* gOverlay = nil;
     }
     self.pointerSettingLabels = labels;
 
+    self.pointerSensitivitySlider = [self makePointerSliderFrom:0.5 to:3.0
+                                                             key:kBVNPointerSensitivityKey];
     self.pointerOpacitySlider = [self makePointerSliderFrom:0.1 to:1.0
                                                         key:kBVNPointerOpacityKey];
     self.pointerSizeSlider = [self makePointerSliderFrom:12.0 to:64.0
@@ -408,7 +413,8 @@ static BVNGuestOverlayView* gOverlay = nil;
                                                        key:kBVNPointerShadowOpacityKey];
     self.pointerThicknessSlider = [self makePointerSliderFrom:0.5 to:6.0
                                                           key:kBVNPointerThicknessKey];
-    for (UISlider* slider in @[self.pointerOpacitySlider,
+    for (UISlider* slider in @[self.pointerSensitivitySlider,
+                              self.pointerOpacitySlider,
                               self.pointerSizeSlider,
                               self.pointerOutlineSlider,
                               self.pointerShadowSlider,
@@ -476,7 +482,10 @@ static BVNGuestOverlayView* gOverlay = nil;
 
 - (void)pointerSettingChanged:(UIControl*)sender {
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-    if (sender == self.pointerOpacitySlider) {
+    if (sender == self.pointerSensitivitySlider) {
+        [defaults setFloat:self.pointerSensitivitySlider.value
+                    forKey:kBVNPointerSensitivityKey];
+    } else if (sender == self.pointerOpacitySlider) {
         [defaults setFloat:self.pointerOpacitySlider.value
                     forKey:kBVNPointerOpacityKey];
     } else if (sender == self.pointerSizeSlider) {
@@ -1035,8 +1044,10 @@ static BVNGuestOverlayView* gOverlay = nil;
             [self cancelTrackpadHoldTimer];
         }
     }
-    [self moveCursorBy:CGPointMake(dx * kBVNTrackpadSensitivity,
-                                   dy * kBVNTrackpadSensitivity)];
+    const CGFloat sensitivity = [[NSUserDefaults standardUserDefaults]
+        doubleForKey:kBVNPointerSensitivityKey];
+    [self moveCursorBy:CGPointMake(dx * sensitivity,
+                                   dy * sensitivity)];
     BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
                                 (int)lround(self.cursorGuestPoint.y), 0);
 }
@@ -1421,7 +1432,8 @@ static BVNGuestOverlayView* gOverlay = nil;
                               self.pointerSettingLabels.count;
     const CGFloat labelWidth = MIN(160.0, width * 0.42);
     NSArray<UIControl*>* controls = @[
-        self.pointerOpacitySlider, self.pointerSizeSlider,
+        self.pointerSensitivitySlider, self.pointerOpacitySlider,
+        self.pointerSizeSlider,
         self.pointerOutlineSlider, self.pointerShadowSlider,
         self.pointerThicknessSlider, self.pointerOuterSwitch,
         self.pointerInnerSwitch,
