@@ -306,6 +306,22 @@ visible in Files.
 - A bundled root takes precedence over an imported root. This lets a targeted
   runtime-migration build reliably replace an older imported Wine version.
   Unbundled builds continue to use the imported archive.
+- **The archive contains neither Wine Mono nor Wine Gecko.** Verified against
+  the pinned Wine 11.0 archive: it has no `opt/wine/share/wine/mono` and no
+  `opt/wine/share/wine/gecko`. Left alone, Wine offers to download each of
+  them the first time an application touches `mscoree` or `mshtml`, and it
+  does so once per prefix - which means once per imported game. BoxedVN's
+  prefix policy disables those two modules, which is Wine's own documented
+  way to suppress the offer (the registry equivalent of
+  `WINEDLLOVERRIDES="mscoree,mshtml="`).
+- **Consequence: .NET Framework applications and embedded Internet Explorer
+  do not run.** They did not run before either - the runtime was never
+  present - but the failure is now "module not found" rather than a download
+  prompt. To restore the prompt for one prefix, delete the `mscoree` and
+  `mshtml` values under `[Software\Wine\DllOverrides]` in that prefix's
+  `user.reg`. Bundling wine-mono into the root filesystem would remove the
+  limitation properly and has not been done: it adds roughly 80 MB to a
+  download that is already 155 MB.
 
 ---
 

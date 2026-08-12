@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 #include "../../tools/x11/X11_def.h"
 #include "x11.h"
+#include "xpixmapformats.h"
 #include "knativesystem.h"
 
 Int99Callback int9BCallback[X11_COUNT];
@@ -1551,19 +1552,32 @@ static void x11_ListPixelFormats(CPU* cpu) {
     U32 ndepths = X11_READD(Screen, screenAddress, ndepths);
     U32 count_return = ARG2;
 
-    if (count_return) {
-        memory->writed(count_return, ndepths);
-    }
-    U32 listAddress = thread->process->alloc(thread, sizeof(XPixmapFormatValues) * ndepths);
-    EAX = listAddress;
-
+    // The screen's visual depths are only part of the answer. A client indexes
+    // pixmap_formats by depth and dereferences the entry, so a depth an X
+    // server is expected to support for off-screen drawables - depth 1 above
+    // all, which is what every monochrome mask is - must appear here even
+    // though no visual has it. See source/x11/xpixmapformats.h.
+    std::vector<XPixmapFormatEntry> visualFormats;
     U32 depthsAddress = X11_READD(Screen, screenAddress, depths);
     for (U32 i = 0; i < ndepths; i++) {
         U32 depthAddress = depthsAddress + i * sizeof(Depth);
         Depth depth;
         depth.read(memory, depthAddress);
         U32 bits_per_rgb = X11_READD(Visual, depth.visuals, bits_per_rgb);
-        listAddress += XPixmapFormatValues::write(memory, listAddress, depth.depth, bits_per_rgb, 32);
+        visualFormats.push_back({depth.depth, bits_per_rgb, 32});
+    }
+
+    const std::vector<XPixmapFormatEntry> formats =
+        xBuildPixmapFormats(visualFormats);
+
+    if (count_return) {
+        memory->writed(count_return, (U32)formats.size());
+    }
+    U32 listAddress = thread->process->alloc(thread, (U32)(sizeof(XPixmapFormatValues) * formats.size()));
+    EAX = listAddress;
+
+    for (const XPixmapFormatEntry& format : formats) {
+        listAddress += XPixmapFormatValues::write(memory, listAddress, format.depth, format.bitsPerPixel, format.scanlinePad);
     }
 }
 

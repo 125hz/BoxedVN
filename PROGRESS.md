@@ -3955,3 +3955,88 @@ rolling Release targets the exact producing commit
 untested on hardware are how long StikDebug takes to prepare more than one
 segment, whether a device refuses a later segment, and whether the automatic
 DXVK selection now reached by more titles creates devices MoltenVK accepts.
+
+### 2026-08-12 - build 91: X11 pixmap formats, and no more runtime download prompts
+
+Build 90's two changes are device-confirmed by `summer-memories.log`:
+`renderer: DXVK: nw.dll imports dxgi.dll, and WineD3D cannot reach Direct3D 10
+on Metal` shows the binary-derived renderer choice replacing the old name
+list, and the arena came up as `512 MiB in 8 segment(s)` in about 1.5 seconds,
+peaking around 3,200 allocations with 400 MB still free where 128 MiB used to
+run dry at 2,180. DXVK then created a real `VkDevice` on the A19 and ANGLE's
+`eglInitialize D3D11` no longer fails. The title still shows a black client
+area; that is a separate, still-open problem recorded at the end of this
+entry.
+
+**Boxedwine's X server advertised an incomplete pixmap-format list.** The same
+log carries a repeating fault:
+
+```
+Guest fault snapshot: pid a thread b read protection fault at 00000004;
+  EIP ... /opt/wine/lib/wine/i386-unix/winex11.so+00008461
+  bytes 8B 40 04 66 89 84 24 86 00 00 00 0F B7 C0 0F AF
+```
+
+Disassembling winex11.so from the pinned root filesystem at that offset shows
+Wine filling in a BITMAPINFOHEADER - `biSize = 0x28`, `biPlanes = 1` - and
+then reading `pixmap_formats[depth]->bits_per_pixel` to set `biBitCount`
+before computing the DIB stride. The faulting instruction is
+`mov eax, [eax+4]`, which is `bits_per_pixel` at offset 4 of
+`XPixmapFormatValues`, on a NULL entry.
+
+`x11_ListPixelFormats` built its list from the screen's *visual* depths, and
+`XServer::initDepths` publishes 32, 24, 16 and 8. Those are two different X11
+concepts: a visual says what a window can be created with, a pixmap format
+says what an off-screen drawable can be created with. Every X server supports
+depth-1 pixmaps - a bitmap is one - and no server has a depth-1 visual. Wine
+indexes `pixmap_formats[]` by depth and dereferences the entry, so an omitted
+depth is a null dereference inside the driver rather than a graceful failure.
+Monochrome bitmaps are ordinary Windows drawing: cursor and icon masks,
+region masks, ImageList masks, any `CreateBitmap(w, h, 1, 1, NULL)`.
+
+`xBuildPixmapFormats` now adds the formats a server must provide regardless
+of its visuals - depth 1 at 1 bpp and depth 4 padded to 8 bpp, as Xorg
+reports them - deduplicates depths shared by several visuals, and sorts by
+depth. A depth the server really does describe is never overridden.
+
+**Wine no longer offers to download Wine Mono or Wine Gecko.** The pinned
+Wine 11.0 archive was checked directly through its ZIP central directory: it
+contains no `opt/wine/share/wine/mono` and no `opt/wine/share/wine/gecko`, so
+the offer appears for every prefix, which is every imported game. The prefix
+policy now disables `mscoree` and `mshtml` in
+`[Software\Wine\DllOverrides]`, which is the registry form of Wine's own
+`WINEDLLOVERRIDES="mscoree,mshtml="`. This is applied to every prefix,
+including ones that make no renderer choice, and is idempotent. The cost is
+stated in `docs/KNOWN_LIMITATIONS_IOS.md` §7: .NET Framework and embedded-IE
+applications now fail with a missing module instead of asking for a runtime
+BoxedVN cannot supply.
+
+**Still open: a Chromium GPU process cannot create its presentation
+surface.** `gles2_command_buffer_stub.cc(226) ContextResult::kFatalFailure:
+Failed to create surface` is followed by `Lost UI shared context`, and the
+game's client area stays black. What is ruled out:
+
+- Not the JIT arena. 400 MB remained free.
+- Not Direct3D 11 device creation. DXVK created the device and a `VkDevice`.
+- Not DirectComposition being half-implemented. `dcomp.dll.so` was extracted
+  from the archive and disassembled: `DCompositionCreateDevice2` is
+  `mov eax, 0x80004001; ret 0xc` - a clean `E_NOTIMPL` - so a Chromium of
+  this vintage rejects it and takes its `CreateViewGLSurface` fallback.
+- Not a refused Vulkan surface. `KVulkdanSDLImpl::createVulkanSurface` logs
+  `Failed to create vulkan surface` on failure and that line never appears;
+  no `vkCreateXlibSurfaceKHR` reached the host at all.
+
+The last guest-side event before the failure is DXVK's
+`D3D11Texture2D::QueryInterface: Unknown interface query
+f8fb5c27-c6b3-4f75-a4c8-439af2ef564c`, which is ANGLE asking a texture for an
+interface DXVK does not implement. That IID has not been identified. The next
+step is a run with Wine's `dxgi` and `vulkan` channels enabled so the call
+between ANGLE's `eglCreateWindowSurface` and DXVK's swapchain is visible;
+nothing in the current default `WINEDEBUG=warn+d3d_shader,-d3d` records it.
+
+**Build evidence:** the host-independent suite runs 125 tests with zero
+failures and CTest passes 1/1, including new coverage for the pixmap-format
+list (depth 1 present, visual depths preserved, depth 4 padded, no duplicate
+depths, a server-described depth not overridden, sorted order) and for the
+prefix policy suppressing both runtime prompts idempotently without touching
+the renderer keys. Neither change has been run on a device.

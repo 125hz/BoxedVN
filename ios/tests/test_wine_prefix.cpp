@@ -282,3 +282,51 @@ BOXEDVN_TEST(wine_prefix_leaves_shader_model_alone_without_vulkan) {
 
     fs::remove_all(temporary, ec);
 }
+
+BOXEDVN_TEST(wine_prefix_suppresses_the_missing_runtime_download_prompts) {
+    // The root filesystem ships neither Wine Mono nor Wine Gecko, so Wine
+    // offers to download them the first time an application touches mscoree
+    // or mshtml. That offer is a dead end on a phone and it recurs for every
+    // imported game, because every game gets its own prefix.
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-prefix-runtimes-test-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    fs::create_directories(temporary, ec);
+    const fs::path archive = temporary / "rootfs.zip";
+    const fs::path prefix = temporary / "prefix";
+
+    zipFile zip = zipOpen64(archive.string().c_str(), APPEND_STATUS_CREATE);
+    CHECK(zip != nullptr);
+    if (zip != nullptr) {
+        CHECK(addZipEntry(zip, "home/username/.wine/user.reg",
+                          "WINE REGISTRY Version 2\n"));
+        CHECK(addZipEntry(zip, "home/username/.wine/system.reg",
+                          "WINE REGISTRY Version 2\n"));
+        zipClose(zip, nullptr);
+    }
+
+    // Applied for every prefix, including one that makes no renderer choice.
+    const WinePrefixPreparationResult prepared = prepareWinePrefix(
+        archive.string(), prefix.string(), WineRenderer::Default);
+    CHECK_EQ(prepared.ok, true);
+    CHECK_EQ(prepared.changed, true);
+
+    const std::string userRegistry =
+        readTestFile(prefix / "home/username/.wine/user.reg");
+    CHECK_CONTAINS(userRegistry, "[Software\\\\Wine\\\\DllOverrides]");
+    CHECK_CONTAINS(userRegistry, "\"mscoree\"=\"\"");
+    CHECK_CONTAINS(userRegistry, "\"mshtml\"=\"\"");
+    // A renderer was not requested, so nothing else in the user registry may
+    // have been touched.
+    CHECK_EQ(userRegistry.find("\"renderer\""), std::string::npos);
+
+    // Re-preparing an already-patched prefix must be a no-op, or every launch
+    // rewrites the registry Wine is about to read.
+    const WinePrefixPreparationResult repeated = prepareWinePrefix(
+        archive.string(), prefix.string(), WineRenderer::Default);
+    CHECK_EQ(repeated.ok, true);
+    CHECK_EQ(repeated.changed, false);
+
+    fs::remove_all(temporary, ec);
+}

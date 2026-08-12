@@ -346,47 +346,69 @@ WinePrefixPreparationResult prepareWinePrefix(
     }
     result.changed = extracted;
 
-    if (renderer != WineRenderer::Default) {
+    {
         std::string contents;
         if (!readFile(userRegistry, contents, result.error)) {
             return result;
         }
-        const char* rendererValue = renderer == WineRenderer::Vulkan
-            ? "\"vulkan\""
-            : "\"gdi\"";
-        bool direct3DChanged = setWineRegistryValue(
-            contents, "Software\\Wine\\Direct3D", "renderer", rendererValue);
+        bool userRegistryChanged = false;
 
-        if (renderer == WineRenderer::Vulkan) {
-            // Metal has no geometry shader stage, so MoltenVK reports
-            // geometryShader = false on every device, and it always will.
-            // Direct3D 10 requires geometry shaders, so wined3d's Vulkan
-            // adapter can never reach shader model 4. Its DXBC reader then
-            // skips every SM4+ code chunk ("Skipping SM4+ shader"), and a
-            // shader with nothing left to read fails with E_INVALIDARG.
-            //
-            // Saya's device log shows both halves of this. Shaders carrying an
-            // Aon9 feature-level-9 chunk are read as ps_2_1/vs_2_0 and created
-            // successfully; SM4-only shaders fail, and every draw with them
-            // fails behind it.
-            //
-            // Capping the reported shader model makes the device honestly
-            // feature level 9_3 instead of advertising a capability the
-            // backend will not honour. A game that ships _level_9_x shaders -
-            // as this one does - then selects the set that actually works.
-            // This cannot raise a capability, only stop one being claimed, so
-            // it cannot break a title that already renders.
-            for (const char* stage : {"MaxShaderModelVS", "MaxShaderModelPS"}) {
-                direct3DChanged |= setWineRegistryValue(
-                    contents, "Software\\Wine\\Direct3D", stage,
-                    "dword:00000003");
-            }
-            direct3DChanged |= setWineRegistryValue(
-                contents, "Software\\Wine\\Direct3D", "MaxShaderModelGS",
-                "dword:00000000");
+        // Wine offers to download Wine Mono and Wine Gecko the first time an
+        // application touches mscoree or mshtml, because the root filesystem
+        // ships neither. On a phone that dialog is a dead end: it appears
+        // over the game with no obvious cause, the download is large, and it
+        // has to happen again for every prefix, which is once per imported
+        // game. Disabling the two modules is Wine's own documented way to
+        // suppress the offer - the same thing WINEDLLOVERRIDES="mscoree,
+        // mshtml=" does - and it costs only what was already unavailable:
+        // a .NET Framework or embedded-Internet-Explorer application now
+        // fails to find the module instead of asking for a runtime BoxedVN
+        // cannot supply. Everything else is unaffected; these two modules are
+        // not used by native Windows code.
+        for (const char* missingRuntime : {"mscoree", "mshtml"}) {
+            userRegistryChanged |= setWineRegistryValue(
+                contents, "Software\\Wine\\DllOverrides", missingRuntime,
+                "\"\"");
         }
 
-        if (direct3DChanged) {
+        if (renderer != WineRenderer::Default) {
+            const char* rendererValue = renderer == WineRenderer::Vulkan
+                ? "\"vulkan\""
+                : "\"gdi\"";
+            userRegistryChanged |= setWineRegistryValue(
+                contents, "Software\\Wine\\Direct3D", "renderer", rendererValue);
+
+            if (renderer == WineRenderer::Vulkan) {
+                // Metal has no geometry shader stage, so MoltenVK reports
+                // geometryShader = false on every device, and it always will.
+                // Direct3D 10 requires geometry shaders, so wined3d's Vulkan
+                // adapter can never reach shader model 4. Its DXBC reader then
+                // skips every SM4+ code chunk ("Skipping SM4+ shader"), and a
+                // shader with nothing left to read fails with E_INVALIDARG.
+                //
+                // Saya's device log shows both halves of this. Shaders carrying an
+                // Aon9 feature-level-9 chunk are read as ps_2_1/vs_2_0 and created
+                // successfully; SM4-only shaders fail, and every draw with them
+                // fails behind it.
+                //
+                // Capping the reported shader model makes the device honestly
+                // feature level 9_3 instead of advertising a capability the
+                // backend will not honour. A game that ships _level_9_x shaders -
+                // as this one does - then selects the set that actually works.
+                // This cannot raise a capability, only stop one being claimed, so
+                // it cannot break a title that already renders.
+                for (const char* stage : {"MaxShaderModelVS", "MaxShaderModelPS"}) {
+                    userRegistryChanged |= setWineRegistryValue(
+                        contents, "Software\\Wine\\Direct3D", stage,
+                        "dword:00000003");
+                }
+                userRegistryChanged |= setWineRegistryValue(
+                    contents, "Software\\Wine\\Direct3D", "MaxShaderModelGS",
+                    "dword:00000000");
+            }
+        }
+
+        if (userRegistryChanged) {
             if (!atomicWrite(userRegistry, contents, result.error)) {
                 return result;
             }

@@ -11,18 +11,21 @@ add_executable(boxedvn_tests
     test_range_allocator.cpp
     test_jit_arena_plan.cpp
     test_direct3d_profile.cpp
+    test_pixmap_formats.cpp
     test_getrusage_fairness.cpp
     test_vk_pipeline_guard.cpp
     test_wine_prefix.cpp
     ../runtime/src/BVNLaunchArguments.cpp
     ../runtime/src/BVNRangeAllocator.cpp
     ../runtime/src/BVNJitArenaPlan.cpp
+    ../../source/x11/xpixmapformats.cpp
 )
 
 target_include_directories(boxedvn_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../source/x11"
 )
 # boxedwine_zlib is linked directly so the ZIP tests can build hostile archives
 # with minizip's writer rather than checking in binary fixtures.
