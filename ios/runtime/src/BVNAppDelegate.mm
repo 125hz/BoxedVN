@@ -864,7 +864,9 @@ static CGRect gGuestPresentationContentRect = CGRectZero;
                                                         height:height
                                                      mipmapped:NO];
     descriptor.storageMode = MTLStorageModeShared;
-    descriptor.usage = MTLTextureUsageBlitSource;
+    // Metal does not require a usage flag for blit sources. Unknown lets the
+    // driver infer this texture's replaceRegion + blit-copy access pattern.
+    descriptor.usage = MTLTextureUsageUnknown;
     _patchTexture = [device newTextureWithDescriptor:descriptor];
     if (_commandQueue == nil || _patchTexture == nil) {
         return NO;

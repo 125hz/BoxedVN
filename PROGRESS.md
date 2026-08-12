@@ -3762,7 +3762,7 @@ The rolling Release targets the exact producing commit
 `1312c5960622b146b8750b875f131d8e2871cd01`. Long-session physical Grisaia
 acceptance remains pending build 85.
 
-### 2026-08-11 - build 86: bounded Metal patches and isotropic trackpad motion
+### 2026-08-11 - build 87: bounded Metal patches and isotropic trackpad motion
 
 `boxedvn-20260811-214111.log` supplies the missing long-session memory evidence.
 During Grisaia dialogue the mixed renderer initially remains healthy at roughly
@@ -3775,7 +3775,7 @@ getrusage/sched_yield loop.
 
 Build 85 bounded temporary Core Graphics objects but still forced a UIKit
 backing-store draw and Core Animation flush for every GDI patch while SDL owned
-the main run loop. Build 86 removes that accumulating path. The X11 overlay now
+the main run loop. Build 87 removes that accumulating path. The X11 overlay now
 owns one fixed BGRA Metal texture, updates it in place, and presents through
 CAMetalLayer's bounded drawable pool. The guest pixel buffer and Metal texture
 stay allocated once per resolution regardless of how many dialogue patches are
@@ -3787,8 +3787,13 @@ scaled X by guest-width/window-width and Y by guest-height/window-height, making
 the two axes visibly different. The same physical movement now maps through the
 actual rotated, scaled presentation on both axes.
 
+Build 86's first iPhoneOS compile stopped on the single invalid usage constant
+`MTLTextureUsageBlitSource`; Metal permits blit-source access without a usage
+flag, so build 87 uses the documented `MTLTextureUsageUnknown` inference mode.
+No build-86 IPA was published.
+
 **Pre-CI evidence:** `git diff --check` passes. In the Visual Studio developer
 environment the host-independent executable runs all 93 tests with zero
 failures and CTest passes 1/1. The iPhoneOS compile, package validation, and
 long-session physical Grisaia/portrait-trackpad acceptance remain pending build
-86.
+87.
