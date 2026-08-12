@@ -428,7 +428,8 @@ enum Session {
         width: UInt32,
         height: UInt32,
         soundEnabled: Bool,
-        runThroughWine: Bool
+        runThroughWine: Bool,
+        wineRenderer: BVNWineRenderer = BVNWineRendererAutomatic
     ) throws {
         var errorBuffer = [CChar](repeating: 0, count: 1024)
 
@@ -465,6 +466,7 @@ enum Session {
                             request.bitsPerPixel = 32
                             request.soundEnabled = soundEnabled
                             request.runThroughWine = runThroughWine
+                            request.wineRenderer = wineRenderer
                             request.argumentCount = argumentPointers.count
                             request.environmentCount = environmentPointers.count
 

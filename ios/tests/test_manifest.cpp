@@ -23,6 +23,7 @@ GameManifest sampleManifest() {
     manifest.selectedExecutable = "bin/kanon.exe";
     manifest.workingDirectory = "bin";
     manifest.winePrefix = "kanon";
+    manifest.renderer = "dxvk";
     manifest.arguments = {"-window", "--lang=ja"};
     manifest.environment = {"LANG=ja_JP.UTF-8"};
     manifest.requestedWidth = 800;
@@ -58,6 +59,7 @@ BOXEDVN_TEST(manifest_round_trips_through_json) {
     CHECK_EQ(result.selectedExecutable, original.selectedExecutable);
     CHECK_EQ(result.workingDirectory, original.workingDirectory);
     CHECK_EQ(result.winePrefix, original.winePrefix);
+    CHECK_EQ(result.renderer, original.renderer);
     CHECK_EQ(result.backend, std::string("boxedwine-x86"));
     CHECK_EQ(result.arguments.size(), original.arguments.size());
     CHECK_EQ(result.arguments[1], std::string("--lang=ja"));
@@ -172,6 +174,30 @@ BOXEDVN_TEST(support_executables_are_demoted) {
     CHECK_EQ(looksLikeSupportExecutable("unins000.exe"), true);
     CHECK_EQ(looksLikeSupportExecutable("redist/vcredist_x86.exe"), true);
     CHECK_EQ(looksLikeSupportExecutable("kanon.exe"), false);
+}
+
+BOXEDVN_TEST(legacy_manifest_defaults_to_automatic_renderer) {
+    const ManifestParseResult parsed = parseManifest(
+        "{\"schemaVersion\":1,\"id\":\"legacy\","
+        "\"contentDirectory\":\"content\"}");
+
+    CHECK_EQ(parsed.ok, true);
+    CHECK_EQ(parsed.manifest.renderer, std::string("automatic"));
+}
+
+BOXEDVN_TEST(unknown_manifest_renderer_defaults_to_automatic) {
+    GameManifest manifest = sampleManifest();
+    std::string text = serialiseManifest(manifest);
+    const std::string known = "\"dxvk\"";
+    const size_t offset = text.find(known);
+    CHECK(offset != std::string::npos);
+    if (offset != std::string::npos) {
+        text.replace(offset, known.size(), "\"unknown\"");
+    }
+
+    const ManifestParseResult parsed = parseManifest(text);
+    CHECK_EQ(parsed.ok, true);
+    CHECK_EQ(parsed.manifest.renderer, std::string("automatic"));
 }
 
 BOXEDVN_TEST(installed_game_candidates_exclude_wine_and_setup_helpers) {

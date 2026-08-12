@@ -230,6 +230,7 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     launch.bitsPerPixel = request->bitsPerPixel;
     launch.soundEnabled = request->soundEnabled;
     launch.runThroughWine = request->runThroughWine;
+    launch.requestedWineRenderer = static_cast<int>(request->wineRenderer);
     BVNApplyDefaultRendererPolicy(launch);
 
     // LAST, so a profile can override any default above it. Build 66 called

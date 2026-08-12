@@ -18,11 +18,46 @@ BOXEDVN_TEST(imported_game_keeps_wined3d_vulkan_when_profile_disables_dxvk) {
 
     BVNApplyDefaultRendererPolicy(launch);
     CHECK(launch.useWineD3DVulkanRenderer);
-    CHECK(launch.enableWineD3DVulkan);
+    CHECK(!launch.enableWineD3DVulkan);
 
     CHECK(BVNApplyKnownCompatibilityProfile(launch));
     CHECK(launch.useWineD3DVulkanRenderer);
     CHECK(!launch.enableWineD3DVulkan);
+}
+
+BOXEDVN_TEST(automatic_renderer_uses_wined3d_for_unknown_imported_games) {
+    BVNLaunchConfiguration launch;
+    launch.runThroughWine = true;
+    launch.gameDirectoryHostPath = "/games/white-album-2";
+    launch.executablePath = "D:\\WA2.exe";
+
+    BVNApplyDefaultRendererPolicy(launch);
+
+    CHECK_EQ(launch.useWineD3DVulkanRenderer, true);
+    CHECK_EQ(launch.enableWineD3DVulkan, false);
+}
+
+BOXEDVN_TEST(renderer_override_can_force_dxvk_for_an_imported_game) {
+    BVNLaunchConfiguration launch;
+    launch.runThroughWine = true;
+    launch.gameDirectoryHostPath = "/games/unknown-d3d11-game";
+    launch.executablePath = "D:\\game.exe";
+    launch.requestedWineRenderer = 2;
+
+    BVNApplyDefaultRendererPolicy(launch);
+
+    CHECK_EQ(launch.enableWineD3DVulkan, true);
+}
+
+BOXEDVN_TEST(song_of_saya_automatic_profile_enables_dxvk) {
+    BVNLaunchConfiguration launch;
+    launch.runThroughWine = true;
+    launch.gameDirectoryHostPath = "/games/saya";
+    launch.executablePath = "D:\\Saya_en.exe";
+
+    BVNApplyDefaultRendererPolicy(launch);
+
+    CHECK_EQ(launch.enableWineD3DVulkan, true);
 }
 
 BOXEDVN_TEST(wine_notepad_command_uses_valueless_nozip_switch) {
@@ -272,6 +307,15 @@ BOXEDVN_TEST(grisaia_profile_keeps_dxvk_out_of_a_direct3d9_engine) {
     saya.enableWineD3DVulkan = true;
     CHECK(BVNApplyKnownCompatibilityProfile(saya));
     CHECK(saya.enableWineD3DVulkan);
+
+    // The launch-settings selector must remain authoritative even when an
+    // automatic compatibility profile exists for that executable name.
+    BVNLaunchConfiguration forced;
+    forced.executablePath = "D:\\grisaia.exe";
+    forced.requestedWineRenderer = 2;
+    forced.enableWineD3DVulkan = true;
+    CHECK(BVNApplyKnownCompatibilityProfile(forced));
+    CHECK(forced.enableWineD3DVulkan);
 }
 
 BOXEDVN_TEST(command_does_not_let_boxedwine_truncate_frontend_log) {

@@ -22,6 +22,7 @@ struct Game: Identifiable, Hashable {
     var selectedExecutable: String
     var workingDirectory: String
     var winePrefix: String
+    var renderer: String
     var requestedWidth: UInt32
     var requestedHeight: UInt32
     var importedAt: Date
@@ -192,6 +193,7 @@ enum GameLibrary {
             selectedExecutable: cString(&summary.selectedExecutable, Int(BVN_MAX_PATH)),
             workingDirectory: cString(&summary.workingDirectory, Int(BVN_MAX_PATH)),
             winePrefix: identifier,
+            renderer: "automatic",
             requestedWidth: 0,
             requestedHeight: 0,
             importedAt: Date()
@@ -321,7 +323,7 @@ enum GameLibrary {
 
     static func updateLaunchSettings(
         for game: Game, selectedExecutable: String, workingDirectory: String,
-        arguments: [String], width: UInt32, height: UInt32
+        renderer: String, arguments: [String], width: UInt32, height: UInt32
     ) throws {
         var errorBuffer = [CChar](repeating: 0, count: Int(BVN_MAX_DIAGNOSTIC))
         let storage = arguments.map { strdup($0) }
@@ -331,6 +333,7 @@ enum GameLibrary {
         let ok = pointers.withUnsafeMutableBufferPointer { buffer in
             BVNManifestUpdateLaunchSettings(
                 game.manifestURL.path, selectedExecutable, workingDirectory,
+                renderer,
                 buffer.baseAddress, buffer.count, width, height,
                 &errorBuffer, errorBuffer.count)
         }
@@ -431,6 +434,7 @@ enum GameLibrary {
             workingDirectory: cString(
                 &summary.workingDirectory, Int(BVN_MAX_PATH)),
             winePrefix: winePrefix,
+            renderer: cString(&summary.renderer, Int(BVN_MAX_SHORT)),
             requestedWidth: summary.requestedWidth,
             requestedHeight: summary.requestedHeight,
             importedAt: Date(timeIntervalSince1970: TimeInterval(

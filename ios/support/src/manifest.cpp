@@ -98,6 +98,9 @@ std::string serialiseManifest(const GameManifest& manifest) {
     writer.key("winePrefix");
     writer.value(manifest.winePrefix);
 
+    writer.key("renderer");
+    writer.value(manifest.renderer);
+
     writer.key("arguments");
     writer.beginArray();
     for (const std::string& argument : manifest.arguments) {
@@ -213,6 +216,10 @@ ManifestParseResult parseManifest(const std::string& text) {
     manifest.selectedExecutable = optionalString(root, "selectedExecutable");
     manifest.workingDirectory = optionalString(root, "workingDirectory");
     manifest.winePrefix = optionalString(root, "winePrefix");
+    manifest.renderer = optionalString(root, "renderer");
+    if (manifest.renderer != "wined3d" && manifest.renderer != "dxvk") {
+        manifest.renderer = "automatic";
+    }
     manifest.arguments = optionalStringArray(root, "arguments");
     manifest.environment = optionalStringArray(root, "environment");
     manifest.requestedWidth =

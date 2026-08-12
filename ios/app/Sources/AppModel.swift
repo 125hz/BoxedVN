@@ -300,7 +300,8 @@ final class AppModel: ObservableObject {
                 width: game.requestedWidth,
                 height: game.requestedHeight,
                 soundEnabled: true,
-                runThroughWine: true
+                runThroughWine: true,
+                wineRenderer: Self.wineRenderer(for: game.renderer)
             )
         } catch {
             alertMessage = error.localizedDescription
@@ -433,6 +434,14 @@ final class AppModel: ObservableObject {
                     self.memory = .probe()
                 }
             }
+        }
+    }
+
+    private static func wineRenderer(for value: String) -> BVNWineRenderer {
+        switch value {
+        case "wined3d": return BVNWineRendererWineD3D
+        case "dxvk": return BVNWineRendererDXVK
+        default: return BVNWineRendererAutomatic
         }
     }
 

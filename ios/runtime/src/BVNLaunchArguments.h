@@ -31,6 +31,9 @@ struct BVNLaunchConfiguration {
     uint32_t bitsPerPixel = 0;
     bool soundEnabled = true;
     bool runThroughWine = true;
+    // 0 automatic, 1 force WineD3D, 2 force DXVK. Mirrors the C launch ABI
+    // without making this host-independent unit dependent on Objective-C.
+    int requestedWineRenderer = 0;
     // Every imported game needs WineD3D's Vulkan renderer on iOS because the
     // iPhone build has no host OpenGL backend. This is independent of DXVK:
     // Direct3D 9 titles can use WineD3D-over-Vulkan while DXVK stays disabled.

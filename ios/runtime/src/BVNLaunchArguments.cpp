@@ -45,7 +45,20 @@ void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch) {
     const bool importedWineGame = launch.runThroughWine &&
         !launch.gameDirectoryHostPath.empty();
     launch.useWineD3DVulkanRenderer = importedWineGame;
-    launch.enableWineD3DVulkan = importedWineGame;
+    // WineD3D-over-Vulkan is the broad compatibility path for the classic
+    // D3D8/D3D9 engines BoxedVN primarily targets. Forcing DXVK into every
+    // imported game is unsafe: games may probe its D3D10/11 DLLs even when
+    // their main renderer is older, and DXVK can request Metal-impossible
+    // features before the game has a chance to fall back. Known titles that
+    // structurally require D3D11 opt in below, and users can override this
+    // choice per game.
+    launch.enableWineD3DVulkan = importedWineGame &&
+        launch.requestedWineRenderer == 2;
+
+    if (importedWineGame && launch.requestedWineRenderer == 0 &&
+        launchesAnyOf(launch, {"saya_en.exe"})) {
+        launch.enableWineD3DVulkan = true;
+    }
 }
 
 bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
@@ -85,7 +98,11 @@ bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
     // ordering is fixed in build 67; the falsifier above applies to that run,
     // not to build 66's.
     if (launchesAnyOf(launch, {"bootmenu.exe", "grisaia.exe"})) {
-        launch.enableWineD3DVulkan = false;
+        // Automatic and WineD3D honor the measured compatibility result, but
+        // an explicit DXVK selection in launch settings is a real override.
+        if (launch.requestedWineRenderer != 2) {
+            launch.enableWineD3DVulkan = false;
+        }
         return true;
     }
 

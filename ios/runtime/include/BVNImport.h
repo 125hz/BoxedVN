@@ -149,6 +149,7 @@ typedef struct {
     char selectedExecutable[BVN_MAX_PATH];
     char workingDirectory[BVN_MAX_PATH];
     char winePrefix[BVN_MAX_SHORT];
+    char renderer[BVN_MAX_SHORT];
     uint32_t requestedWidth;
     uint32_t requestedHeight;
     int64_t importedAtUnixSeconds;
@@ -164,6 +165,7 @@ void BVNManifestRead(const char* manifestPath, BVNManifestSummary* out);
 bool BVNManifestUpdateLaunchSettings(const char* manifestPath,
                                      const char* selectedExecutable,
                                      const char* workingDirectory,
+                                     const char* renderer,
                                      const char* const* arguments,
                                      size_t argumentCount,
                                      uint32_t requestedWidth,

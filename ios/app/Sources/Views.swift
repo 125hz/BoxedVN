@@ -389,10 +389,12 @@ struct GameDetailView: View {
     @State private var argumentsText = ""
     @State private var workingDirectory = ""
     @State private var resolution = "default"
+    @State private var renderer = "automatic"
     @State private var saveError: String?
 
     private let resolutions = ["default", "640x480", "800x600", "1024x576",
                                "1280x720", "1920x1080"]
+    private let renderers = ["automatic", "wined3d", "dxvk"]
 
     var body: some View {
         List {
@@ -429,6 +431,16 @@ struct GameDetailView: View {
                 Picker("Resolution", selection: $resolution) {
                     ForEach(resolutions, id: \.self) { Text($0) }
                 }
+                Picker("Direct3D renderer", selection: $renderer) {
+                    Text("Automatic (recommended)").tag("automatic")
+                    Text("WineD3D (D3D8/9 compatibility)").tag("wined3d")
+                    Text("DXVK (D3D10/11)").tag("dxvk")
+                }
+                Text("Try WineD3D when a game reports that Direct3D could not "
+                     + "start. DXVK is primarily for games that require "
+                     + "Direct3D 10 or 11.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Button("Save") { save() }
                 if let saveError {
                     Text(saveError).foregroundStyle(.red).font(.caption)
@@ -436,7 +448,12 @@ struct GameDetailView: View {
             }
 
             Section {
-                Button("Launch") { save(); model.launch(game) }
+                Button("Launch") {
+                    if save(),
+                       let updated = model.games.first(where: { $0.id == game.id }) {
+                        model.launch(updated)
+                    }
+                }
                     .disabled(selected.isEmpty
                               || !(executables.first { $0.relativePath == selected }?
                                     .runnable ?? false))
@@ -460,6 +477,8 @@ struct GameDetailView: View {
             selected = game.selectedExecutable
             workingDirectory = game.workingDirectory
             argumentsText = GameLibrary.arguments(for: game).joined(separator: "\n")
+            renderer = renderers.contains(game.renderer)
+                ? game.renderer : "automatic"
             if game.requestedWidth > 0 && game.requestedHeight > 0 {
                 resolution = "\(game.requestedWidth)x\(game.requestedHeight)"
             }
@@ -474,7 +493,8 @@ struct GameDetailView: View {
         }
     }
 
-    private func save() {
+    @discardableResult
+    private func save() -> Bool {
         let arguments = argumentsText
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -493,12 +513,15 @@ struct GameDetailView: View {
         do {
             try GameLibrary.updateLaunchSettings(
                 for: game, selectedExecutable: selected,
-                workingDirectory: workingDirectory, arguments: arguments,
+                workingDirectory: workingDirectory, renderer: renderer,
+                arguments: arguments,
                 width: width, height: height)
             saveError = nil
             model.reloadGames()
+            return true
         } catch {
             saveError = error.localizedDescription
+            return false
         }
     }
 }

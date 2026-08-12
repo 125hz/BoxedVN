@@ -298,6 +298,7 @@ extern "C" void BVNManifestRead(const char* manifestPath,
     copyInto(out->workingDirectory, sizeof(out->workingDirectory),
              manifest.workingDirectory);
     copyInto(out->winePrefix, sizeof(out->winePrefix), manifest.winePrefix);
+    copyInto(out->renderer, sizeof(out->renderer), manifest.renderer);
     out->requestedWidth = manifest.requestedWidth;
     out->requestedHeight = manifest.requestedHeight;
     out->importedAtUnixSeconds = manifest.importedAtUnixSeconds;
@@ -305,7 +306,8 @@ extern "C" void BVNManifestRead(const char* manifestPath,
 
 extern "C" bool BVNManifestUpdateLaunchSettings(
     const char* manifestPath, const char* selectedExecutable,
-    const char* workingDirectory, const char* const* arguments,
+    const char* workingDirectory, const char* renderer,
+    const char* const* arguments,
     size_t argumentCount, uint32_t requestedWidth, uint32_t requestedHeight,
     char* error, size_t errorCapacity) {
     if (manifestPath == nullptr) {
@@ -332,6 +334,11 @@ extern "C" bool BVNManifestUpdateLaunchSettings(
     }
     if (workingDirectory != nullptr) {
         manifest.workingDirectory = workingDirectory;
+    }
+    if (renderer != nullptr) {
+        const std::string requested(renderer);
+        manifest.renderer = requested == "wined3d" || requested == "dxvk"
+            ? requested : "automatic";
     }
     manifest.arguments.clear();
     for (size_t i = 0; i < argumentCount && arguments != nullptr; ++i) {

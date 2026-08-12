@@ -3836,3 +3836,32 @@ The rolling Release targets the exact producing commit
 `a30653d515a8da7d5b634953c2a8213522855e82`. Physical installer completion,
 automatic executable selection, and installed-game launch acceptance remain
 pending device testing.
+
+### 2026-08-11 - build 89: safe Direct3D renderer policy and per-game override
+
+`boxedvn-20260811-231830.log` shows that White Album 2 did not fail in the x86
+translator or while creating WineD3D's Vulkan device. BoxedVN launched every
+imported game with `-dxvk 1`; WineD3D successfully created a `VkDevice` on the
+Apple A19 GPU, but the later DXVK probe requested unavailable geometry-shader,
+shader-cull-distance, robust-buffer-access-2, and null-descriptor features.
+MoltenVK rejected the request, DXVK reported `Failed to create device` twice,
+and the guest exited with code 1.
+
+Build 89 removes the blanket DXVK opt-in. Automatic mode now uses
+WineD3D-over-Vulkan for imported games, which is the broad Direct3D 8/9
+compatibility path and is the path that succeeded in this device log. The
+known Direct3D 11 Saya profile retains DXVK. Every game now stores a renderer
+choice in its manifest and exposes **Automatic**, **WineD3D**, and **DXVK** in
+launch settings, so an unknown Direct3D 10/11 game can opt into DXVK without a
+new filename patch. Explicit user selection takes priority over an automatic
+compatibility profile, and older manifests safely default to Automatic.
+
+The launch button now reloads the saved manifest-backed game before starting,
+so renderer and resolution changes apply to the same launch instead of one
+launch later.
+
+**Local build evidence:** `git diff --check` passes. In the Visual Studio
+developer environment the host-independent executable runs all 99 tests with
+zero failures and CTest passes 1/1. The full iPhoneOS compile, package
+validation, rolling Release upload, and physical White Album 2 acceptance are
+pending.

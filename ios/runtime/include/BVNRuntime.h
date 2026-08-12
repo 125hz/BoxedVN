@@ -215,6 +215,12 @@ const char* BVNPathBundledDxvkDirectory(void);
 // Launching a guest
 // ---------------------------------------------------------------------------
 
+typedef enum {
+    BVNWineRendererAutomatic = 0,
+    BVNWineRendererWineD3D = 1,
+    BVNWineRendererDXVK = 2,
+} BVNWineRenderer;
+
 typedef struct {
     // Absolute host path of the Boxedwine root filesystem ZIP.  Mounted
     // read-only at '/'; writes land in writableRootPath.  Required.
@@ -256,6 +262,10 @@ typedef struct {
     uint32_t bitsPerPixel;
 
     bool soundEnabled;
+
+    // Per-game Direct3D translator choice. Automatic is the safe general
+    // policy; known D3D10/11 profiles may still choose DXVK.
+    BVNWineRenderer wineRenderer;
 
     // When true, run Wine through /bin/wine rather than executing
     // executablePath directly.  Windows programs need this; Linux programs
