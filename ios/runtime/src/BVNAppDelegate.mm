@@ -266,6 +266,31 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
         return;
     }
 
+    // Ask for the preferred orientation BEFORE the window is shown.
+    //
+    // Nothing used to apply it until a guest was launched, so the library
+    // appeared in whatever orientation iOS chose from Info.plist - which lists
+    // portrait, so a device held in portrait got a portrait window - and UIKit
+    // then consulted this delegate, saw a landscape-only mask, and rotated a
+    // window the user was already looking at. That is the visible spin at app
+    // start: not a transient glitch but the app correcting itself in public.
+    //
+    // Requesting the geometry against the scene first means the correction
+    // happens before anything is on screen. It is a request, not a guarantee -
+    // UIKit may still refuse - so the error is logged rather than assumed
+    // away, and the existing pre-guest confirmation is left in place.
+    UIWindowSceneGeometryPreferencesIOS* preferences =
+        [[UIWindowSceneGeometryPreferencesIOS alloc]
+            initWithInterfaceOrientations:BVNPreferredOrientationMask()];
+    [scene requestGeometryUpdateWithPreferences:preferences
+                                   errorHandler:^(NSError* error) {
+        NSString* message = [NSString stringWithFormat:
+            @"UIKit did not apply the preferred orientation before the "
+            @"library window was shown, so the app may visibly rotate: %@",
+            error.localizedDescription];
+        BVNLogWrite(BVNLogLevelWarning, "frontend", message.UTF8String);
+    }];
+
     UIWindow* window = [[UIWindow alloc] initWithWindowScene:scene];
     window.rootViewController = (UIViewController*)controller;
     // Deliberately left at the standard UIWindowLevelNormal - a previous

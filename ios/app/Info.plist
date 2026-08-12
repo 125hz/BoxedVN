@@ -64,11 +64,17 @@
 	</array>
 	<key>UIStatusBarHidden</key>
 	<true/>
+	<!-- All three stay listed because the app orientation is a user setting
+	     and UIKit will not honour a choice this list does not allow. The
+	     ORDER is deliberate: iOS uses it to pick a launch orientation when
+	     the device's own is ambiguous, and landscape-right is the default
+	     setting, so leading with portrait meant the common case launched
+	     portrait and then rotated in front of the user. -->
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
-		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationPortrait</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
