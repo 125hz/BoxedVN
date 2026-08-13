@@ -448,27 +448,46 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
         if (forceInterpreter) {
             static std::atomic<U32> interpretedBlocks{0};
             static std::atomic<U32> firstEip{0};
-            static std::atomic<U32> lastEip{0};
+            static std::atomic<U32> minEip{0xFFFFFFFF};
+            static std::atomic<U32> maxEip{0};
             const U32 seen =
                 interpretedBlocks.fetch_add(1, std::memory_order_relaxed);
             if (seen == 0) {
                 firstEip.store(startIp, std::memory_order_relaxed);
             }
-            lastEip.store(startIp, std::memory_order_relaxed);
+            // Latest is not the same as furthest, and only the span says
+            // whether a range saw execution across its address space or only
+            // at one entry point.
+            U32 previousMin = minEip.load(std::memory_order_relaxed);
+            while (startIp < previousMin &&
+                   !minEip.compare_exchange_weak(previousMin, startIp,
+                                                 std::memory_order_relaxed)) {
+            }
+            U32 previousMax = maxEip.load(std::memory_order_relaxed);
+            while (startIp > previousMax &&
+                   !maxEip.compare_exchange_weak(previousMax, startIp,
+                                                 std::memory_order_relaxed)) {
+            }
 
             if (seen == 0 || (seen & (seen + 1)) == 0) {
                 if (matchedRangeEnd) {
                     klog_fmt("Interpreter range %.8X-%.8X: entered=yes "
-                             "blocks=%u first_eip=%.8X last_eip=%.8X",
+                             "blocks=%u first_eip=%.8X latest_eip=%.8X "
+                             "min_eip=%.8X max_eip=%.8X",
                              matchedRangeStart, matchedRangeEnd, seen + 1,
                              firstEip.load(std::memory_order_relaxed),
-                             startIp);
+                             startIp,
+                             minEip.load(std::memory_order_relaxed),
+                             maxEip.load(std::memory_order_relaxed));
                 } else {
                     klog_fmt("Interpreter module '%s': entered=yes blocks=%u "
-                             "first_eip=%.8X last_eip=%.8X",
+                             "first_eip=%.8X latest_eip=%.8X min_eip=%.8X "
+                             "max_eip=%.8X",
                              mappedModule.c_str(), seen + 1,
                              firstEip.load(std::memory_order_relaxed),
-                             startIp);
+                             startIp,
+                             minEip.load(std::memory_order_relaxed),
+                             maxEip.load(std::memory_order_relaxed));
                 }
             }
         }

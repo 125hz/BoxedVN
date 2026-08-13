@@ -1,6 +1,7 @@
 #include "boxedwine.h"
 
 #include "ksignal.h"
+#include "ksystem.h"
 #include "bufferaccess.h"
 #include "kstat.h"
 #include "../../softmmu/kmemory_soft.h"
@@ -392,6 +393,38 @@ static void logDivideExceptionSnapshot(CPU* cpu, int error) {
              cpu->reg[6].u32, cpu->reg[7].u32, instructionBytes);
     klog_fmt("Guest divide exception: the %u bytes ending at EIP %.8X are: %s",
              windowLength, eip, window);
+
+    // Dump the head of every range the user asked to interpret.
+    //
+    // A range is requested because the code inside it is the suspect, and the
+    // first question about a suspect function is which helpers it calls -
+    // those stay JIT compiled and a defect in one survives the experiment
+    // entirely. The guest's own DLLs are not available on a development
+    // machine, so this is the only way to read them.
+    for (const auto& range : KSystem::interpreterRanges) {
+        const U32 available = range.second - range.first;
+        const U32 length = available < 512 ? available : 512;
+        if (!length || !thread->memory->canRead(range.first, length)) {
+            continue;
+        }
+        std::vector<U8> code(length);
+        thread->memory->memcpy(code.data(), range.first, length);
+
+        // In lines, so a long dump stays readable and no single klog entry
+        // has to be enormous.
+        constexpr U32 kPerLine = 32;
+        for (U32 offset = 0; offset < length; offset += kPerLine) {
+            const U32 count =
+                (length - offset) < kPerLine ? (length - offset) : kPerLine;
+            char line[kPerLine * 3 + 1] = {};
+            for (U32 index = 0; index < count; ++index) {
+                snprintf(line + index * 3, sizeof(line) - index * 3, "%02X%s",
+                         code[offset + index], index + 1 == count ? "" : " ");
+            }
+            klog_fmt("Interpreter range code %.8X: %s", range.first + offset,
+                     line);
+        }
+    }
 }
 
 void CPU::prepareException(int code, int error) {
