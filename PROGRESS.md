@@ -1,23 +1,37 @@
 # BoxedVN — Progress and Handoff
 
-## Build 120: preserve lazy SHR carry across the ARM64 RCR fallback
+## Build 121: correct ARM64 zero-count double shifts and mounted-drive writes
 
-The Build 119 Summer Memories device log reached `Scene_Map` with 37
-`requestAnimationFrame` callbacks, proving that removing module-wide FFmpeg
-interpretation restored Chromium's event loop. It then crashed at the same
-`ffmpeg.dll+0x2D515` `div ecx` with `ECX=0`. The single-op ARM64 RCR fallback
-was entered while the preceding SHR carry still lived in Boxedwine's lazy
-flags; the reference interpreter reads architectural EFLAGS, so it consumed
-stale carry. Build 120 calls `fillFlags()` before transferring that one RCR to
-the reference core. This remains device-validation pending.
+The Build 120 Summer Memories log again reached `Scene_Map` and then crashed
+at `ffmpeg.dll+0x2D515` (`div ecx`, `ECX=0`). That disproves the immediate-RCR
+fallback from builds 119 and 120, so Build 121 removes it instead of layering
+another title-specific workaround onto the emulator.
 
-The accompanying Fate log is not the same class of emulator fault. Its first
-exception names a missing child directory,
-`Documents/faterealtanua_savedata`; Build 119 supplies the canonical Documents
-folder through its lowercase guest alias. The game then falls back to another
-absent save directory under D:, and the later missing `kag` member is cascading
-script fallout. Creating a title-named directory in the emulator would be a
-game patch, so no such heuristic was added.
+Offline disassembly connects the failing caller to FFmpeg's `av_reduce`, then
+to `av_gcd`. That path contains variable-count `SHLD`/`SHRD`. Boxedwine's
+dead-flags translation emitted these operations without the zero-count guard
+used by its live-flags translation. On ARM64, the double-shift emitter builds
+the result from two host shifts and an OR; with masked `CL=0`, the complementary
+host shift wraps 32 to zero and incorrectly ORs the source into the destination.
+On x86, zero-count `SHLD`/`SHRD` must be a complete no-op. Build 121 masks the
+count and skips both register and memory forms when it is zero, whether or not
+the guest later consumes their flags. A regression deliberately kills the
+double shift's flags with a later `OR`, selecting the formerly unguarded path.
+
+Fate is a separate core filesystem defect. Its Build 120 log proves the
+corrected `file://./d/faterealtanua_savedata/` path reaches the guest, but Wine
+then reports that creating that data path failed. `/mnt/drive_d` is a
+host-backed root, yet Boxedwine's synthesized mode bits only made `/tmp`,
+`/var`, `/home`, `/files`, and root-owned paths writable. The ordinary Wine
+user was therefore rejected before the host filesystem was even consulted.
+Build 121 marks mounted host trees writable in the virtual permission layer;
+the real host operations still decide whether an actual write is permitted.
+A filesystem regression mounts a drive and creates Fate's save directory as
+UID 1000.
+
+The local host-independent suite passes. The new native CPU/filesystem
+regressions and iPhoneOS ARM64 build remain CI-validation pending, and both
+games remain physical-device-validation pending.
 
 **Purpose of this file:** a single place that tells any future session (Claude,
 Codex or a human) exactly where the project stands, what is proven to work,

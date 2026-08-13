@@ -565,27 +565,6 @@ void Jit::writeRcr32Flags(RegPtr reg, RegPtr cf) {
 }
 
 void Jit::dynamic_rcr32_reg_op(DecodedOp* op) {
-#if defined(BOXEDWINE_JIT_ARMV8)
-    // The ARM64 fast path can consume the wrong carry when RCR immediately
-    // follows a lazily-recorded SHR and RCR's own flags are dead.  This is the
-    // normalisation pattern used by MSVC's 64-bit division helper:
-    //
-    //     shr high, 1
-    //     rcr low, 1
-    //
-    // A wrong carry corrupts the quotient without trapping at the rotate.
-    // The reference implementation reads architectural EFLAGS, whereas the
-    // preceding SHR normally leaves CF in Boxedwine's lazy-flag operands.
-    // Materialise that producer before branching to the interpreter; otherwise
-    // the fallback itself consumes stale CF and reproduces the bad quotient it
-    // was intended to avoid.  The dispatcher resumes JIT execution at the next
-    // instruction, so this preserves correctness without interpreting the
-    // containing DLL.
-    fillFlags();
-    emulateSingleOp();
-    currentLazyFlags = FLAGS_CFOF;
-    return;
-#endif
     if (op->needsToSetFlags(cpu) & (CF | OF)) {
         // op->imm already masked
         RegPtr oldCF = getCF();
@@ -844,9 +823,22 @@ void Jit::dshiftClM(DecodedOp* op, JitWidth width, InstRegRegCl callback, LazyFl
         } EndIf();
         currentLazyFlags = FLAGS_NULL;
     } else {
-        readWriteMem(width, calculateEaa(op), [op, width, callback, this](RegPtr value) {
-            (this->*callback)(width, value, getReadOnlyReg(op->reg), getReadOnlyReg(1, true, 1));
-        });
+        RegPtr src;
+        if (!doesShiftNeedToMask()) {
+            src = getReg(1);
+        } else {
+            src = getTmpReg8(1, false, 1);
+            andValue(JitWidth::b32, src, 0x1f);
+        }
+        // SHLD/SHRD with a zero masked count is a complete no-op on x86,
+        // including when none of its flags are consumed.  The ARM64 composite
+        // emitter cannot rely on the host's variable-shift masking here: its
+        // two halves would otherwise OR the source into the destination.
+        If(JitWidth::b8, src); {
+            readWriteMem(width, calculateEaa(op), [src, op, width, callback, this](RegPtr value) {
+                (this->*callback)(width, value, getReadOnlyReg(op->reg), src);
+            });
+        } EndIf();
     }
 }
 void Jit::dshiftCl(DecodedOp* op, JitWidth width, InstRegRegCl callback, LazyFlagType flagType) {
@@ -882,7 +874,18 @@ void Jit::dshiftCl(DecodedOp* op, JitWidth width, InstRegRegCl callback, LazyFla
         } EndIf();
         currentLazyFlags = FLAGS_NULL;
     } else {
-        (this->*callback)(width, getReg(op->reg), getReadOnlyReg(op->rm), getReadOnlyReg(1, true, 1));
+        RegPtr src;
+        if (!doesShiftNeedToMask()) {
+            src = getReg(1);
+        } else {
+            src = getTmpReg8(1, false, 1);
+            andValue(JitWidth::b32, src, 0x1f);
+        }
+        // Even if SHLD/SHRD's output flags are dead, CL=0 must leave the
+        // destination untouched.  This path used to bypass the guard above.
+        If(JitWidth::b8, src); {
+            (this->*callback)(width, getReg(op->reg), getReadOnlyReg(op->rm), src);
+        } EndIf();
     }
 }
 

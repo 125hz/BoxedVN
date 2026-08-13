@@ -1000,4 +1000,27 @@ void testShrRcrCarryChain() {
     verifyRegisters(cpu, regs, "shr/rcr carry chain");
 }
 
+void testDoubleShiftZeroCountWithDeadFlags() {
+    for (DoubleShiftOp op : {DOUBLE_SHLD, DOUBLE_SHRD}) {
+        U32 regs[8];
+        initRegs(regs);
+        regs[R_AX] = 0x12345678;
+        regs[R_CX] = 0;
+        regs[R_DX] = 0x90abcdef;
+
+        beginShift(CF | PF | ZF | SF | OF);
+        emitDoubleShift(op, asmjit::x86::eax, asmjit::x86::edx, COUNT_CL, 0);
+        // Consume flags from a later instruction so the double shift's own
+        // flags are dead, selecting the JIT path that used to omit CL=0's
+        // required no-op guard.
+        pushCode8(0x09); pushCode8(0xdb); // or ebx, ebx
+        writeRegsLocal(regs);
+        runTestCPU();
+
+        verifyRegisters(cpu, regs,
+            op == DOUBLE_SHLD ? "shld cl=0 with dead flags" :
+                                "shrd cl=0 with dead flags");
+    }
+}
+
 #endif

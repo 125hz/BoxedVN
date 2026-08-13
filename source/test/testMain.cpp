@@ -694,6 +694,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testShiftE16Cl_0x0d3, "Test Shift E16,CL 0d3"},
     {testShiftE32Cl_0x2d3, "Test Shift E32,CL 2d3"},
     {testShrRcrCarryChain, "Test SHR/RCR carry chain"},
+    {testDoubleShiftZeroCountWithDeadFlags, "Test SHLD/SHRD CL=0 with dead flags"},
     {testAam_0x0d4, "Test AAM 0d4"},
     {testAad_0x0d5, "Test AAD 0d5"},
     {testSalc_0x0d6, "Test Salc 0d6"},

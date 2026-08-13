@@ -1,3 +1,8 @@
+BoxedVN 0.1.0 (121)
+* Fixed zero-count SHLD/SHRD in the ARM64 JIT when the instruction's flags are dead; these shifts must leave the destination untouched.
+* Allowed ordinary Wine users to create files and save directories inside host-backed mounted drives while retaining host filesystem enforcement.
+* Removed the disproven ARM64 RCR interpreter fallback now that the FFmpeg failure has been traced to double-shift semantics.
+
 BoxedVN 0.1.0 (120)
 * Materialized lazy ARM64 flags before the single-instruction RCR interpreter fallback, so it consumes the carry produced by the preceding shift.
 

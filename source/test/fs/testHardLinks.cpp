@@ -5908,6 +5908,30 @@ void testLinuxPathResolutionSemantics() {
         process->close(prefixControlFd);
     }
 
+    // A -mount_drive tree is host-backed but used by an ordinary Wine user.
+    // Its virtual mode must therefore permit creating save directories while
+    // the host filesystem remains the final authority on actual access.
+    BString nativeDrive = root.stringByApppendingPath(B("drive-d"));
+    if (!Fs::makeNativeDirs(nativeDrive)) {
+        testFail("native mounted-drive directory was not created");
+    } else {
+        expectZero("create virtual mount parent", Fs::makeLocalDirs(B("/mnt")));
+        std::shared_ptr<FsNode> mountParent =
+            Fs::getNodeFromLocalPath(B(""), B("/mnt"), true);
+        Fs::addRootDirectoryNode(B("/mnt/drive_d"), nativeDrive, mountParent);
+        expectZero("create existing directory within mounted drive",
+            Fs::makeLocalDirs(B("/mnt/drive_d/d")));
+
+        process->userId = 1000;
+        process->effectiveUserId = 1000;
+        U32 mountedMkdir = process->mkdir(
+            B("/mnt/drive_d/d/faterealtanua_savedata"), 0755);
+        process->userId = originalUserId;
+        process->effectiveUserId = originalEffectiveUserId;
+        expectZero("non-root Wine user creates directory on mounted drive",
+            mountedMkdir);
+    }
+
     expectZero("stat symlink dot-dot", process->stat64(B("/tmp/dir-link/.."), STAT_A));
     expectZero("stat symlink target parent", process->stat64(B("/tmp/real"), STAT_B));
     expectU32("dot-dot is evaluated after following symlink", stat64Inode(memory, STAT_A), stat64Inode(memory, STAT_B));

@@ -235,3 +235,26 @@ lazy, while `emulateSingleOp()` transfers control to the reference core, whose
 materializes the lazy producer before the one-instruction fallback. This is
 still a core CPU-semantics fix and still needs a physical-device run to prove
 that `ffmpeg.dll+0x2D515` no longer receives a zero denominator.
+
+## Build 120 device result and Build 121 root fix
+
+Build 120 reaches `Scene_Map` but still traps at exactly
+`ffmpeg.dll+0x2D515` with `EAX=1`, `EDX=0`, and `ECX=0`. The RCR hypothesis is
+therefore disproven; Build 121 removes both the single-instruction fallback
+and its extra lazy-flag materialization.
+
+The actual ARM64 semantic mismatch is in the variable-count double-shift
+translation used by `av_gcd`. `Jit::dshiftCl` and `Jit::dshiftClM` already
+masked `CL` and skipped the operation when the double shift's output flags
+were live. When those flags were dead, however, they invoked the backend
+unconditionally. The ARM64 backend implements a 32-bit double shift as two
+variable shifts followed by OR. With masked count zero, its complementary
+shift count is 32; AArch64 masks that to zero and the emitter contaminates the
+destination with the source instead of performing x86's required no-op.
+
+Build 121 applies the same masked-zero guard to the dead-flags register and
+memory paths. The regression makes both `SHLD` and `SHRD` operate with `CL=0`,
+then overwrites their flags with `OR` so liveness analysis selects the exact
+previously broken branch. This is an emulator-wide instruction-semantics fix,
+not a game or DLL patch. CI compilation and a fresh physical-device run are
+still required before calling the Summer Memories failure fixed in practice.

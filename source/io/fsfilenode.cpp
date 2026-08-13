@@ -443,13 +443,25 @@ U32 FsFileNode::getMode() {
             result |= K__S_IXGRP | K__S_IXOTH;
         }
     }
+    bool isMountedHostPath = isRootPath && this->path != "/";
+    std::shared_ptr<FsNode> ancestor = this->getParent().lock();
+    while (!isMountedHostPath && ancestor) {
+        if (ancestor->type == Type::File) {
+            std::shared_ptr<FsFileNode> fileAncestor =
+                std::dynamic_pointer_cast<FsFileNode>(ancestor);
+            isMountedHostPath = fileAncestor && fileAncestor->isRootPath &&
+                fileAncestor->path != "/";
+        }
+        ancestor = ancestor->getParent().lock();
+    }
     bool isAutomationFilesPath = this->path == "/files" ||
         this->path.startsWith("/files/");
     if (KThread::currentThread()->process->userId == 0 ||
         this->path.startsWith("/tmp") ||
         this->path.startsWith("/var") ||
         this->path.startsWith("/home") ||
-        isAutomationFilesPath) {
+        isAutomationFilesPath ||
+        isMountedHostPath) {
         result |= K__S_IWRITE;
         // wine server needs to be private, but winetricks check "-w" in the script on /tmp which needs these 2
         if (!this->path.startsWith("/tmp/.wine")) {
