@@ -234,6 +234,25 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     launch.soundEnabled = request->soundEnabled;
     launch.runThroughWine = request->runThroughWine;
     launch.requestedWineRenderer = static_cast<int>(request->wineRenderer);
+    // Before everything else: these lines are BoxedVN's own vocabulary and
+    // must be out of the argument list before anything reasons about it.
+    BVNApplyGeneralArgumentSentinels(launch);
+    if (!launch.interpreterModules.empty()) {
+        std::string modules;
+        for (const std::string& module : launch.interpreterModules) {
+            if (!modules.empty()) {
+                modules += ", ";
+            }
+            modules += module;
+        }
+        BVNLogWrite(BVNLogLevelInfo, "cpu",
+                    ("Running through the interpreter instead of the ARM64 "
+                     "JIT, by request: " + modules +
+                     ". This is slow on purpose; it is how a translation "
+                     "defect is told apart from a guest computing a bad "
+                     "value.").c_str());
+    }
+
     BVNApplyDefaultRendererPolicy(launch);
 
     // Before the per-title profile, so a title profile can still override

@@ -44,6 +44,27 @@ bool launchesAnyOf(const BVNLaunchConfiguration& launch,
 
 }  // namespace
 
+const char kInterpretModulePrefix[] = "--bvn-interpret=";
+
+void BVNApplyGeneralArgumentSentinels(BVNLaunchConfiguration& launch) {
+    const std::string prefix(kInterpretModulePrefix);
+    std::vector<std::string> remaining;
+    remaining.reserve(launch.arguments.size());
+
+    for (const std::string& argument : launch.arguments) {
+        if (argument.size() > prefix.size() &&
+            argument.compare(0, prefix.size(), prefix) == 0) {
+            const std::string module = argument.substr(prefix.size());
+            if (!module.empty()) {
+                launch.interpreterModules.push_back(module);
+            }
+            continue;  // BoxedVN's word; the guest must never see it.
+        }
+        remaining.push_back(argument);
+    }
+    launch.arguments = remaining;
+}
+
 void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch) {
     const bool importedWineGame = launch.runThroughWine &&
         !launch.gameDirectoryHostPath.empty();

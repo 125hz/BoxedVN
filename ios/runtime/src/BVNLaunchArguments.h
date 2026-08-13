@@ -49,6 +49,23 @@ struct BVNLaunchConfiguration {
     std::string rendererReason;
 };
 
+/// A launch-settings line asking for one guest module to run through the
+/// interpreter instead of the ARM64 JIT: `--bvn-interpret=<name>`, repeatable.
+/// Stripped before launch and never passed to the guest.
+extern const char kInterpretModulePrefix[];
+
+/// Handles the launch-settings lines that are BoxedVN's own words rather than
+/// the guest's, for every launch rather than only for a recognised engine.
+///
+/// Currently one: interpreter selection. That exists because it is the only
+/// experiment that cleanly separates "this guest computed a bad value" from
+/// "this emulator translated its code wrongly" - run the suspect module
+/// through the interpreter and see whether the fault survives. Builds 31-34
+/// used exactly that to isolate a REP MOVS defect, but the selector was
+/// hardcoded per title; this puts it in the hands of whoever is holding the
+/// device.
+void BVNApplyGeneralArgumentSentinels(BVNLaunchConfiguration& launch);
+
 /// Selects the generic iOS renderer policy before a title profile narrows it.
 /// Imported games always use a Vulkan host path; a profile may disable DXVK
 /// without disabling WineD3D-over-Vulkan.

@@ -320,3 +320,45 @@ BOXEDVN_TEST(command_does_not_let_boxedwine_truncate_frontend_log) {
     const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
     CHECK(std::find(actual.begin(), actual.end(), "-log") == actual.end());
 }
+
+BOXEDVN_TEST(interpret_sentinel_selects_a_module_and_never_reaches_the_guest) {
+    BVNLaunchConfiguration launch;
+    launch.executablePath = "d:\\Game.exe";
+    launch.arguments.push_back("--bvn-interpret=ffmpeg");
+    launch.arguments.push_back("--no-sandbox");
+    launch.arguments.push_back("--bvn-interpret=d3d11");
+
+    BVNApplyGeneralArgumentSentinels(launch);
+
+    CHECK_EQ(launch.interpreterModules.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(launch.interpreterModules[0], std::string("ffmpeg"));
+    CHECK_EQ(launch.interpreterModules[1], std::string("d3d11"));
+
+    // The guest must receive only its own switches. A Chromium process given
+    // an unknown --bvn- switch would at best ignore it and at worst refuse.
+    CHECK_EQ(launch.arguments.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(launch.arguments[0], std::string("--no-sandbox"));
+
+    const std::vector<std::string> argv = BVNBuildLaunchArguments(launch);
+    for (const std::string& argument : argv) {
+        CHECK(argument.rfind("--bvn-interpret=", 0) != 0);
+    }
+    // And the selection has to actually reach Boxedwine.
+    CHECK(std::find(argv.begin(), argv.end(),
+                    std::string("-interpreterModule")) != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), std::string("ffmpeg")) !=
+          argv.end());
+}
+
+BOXEDVN_TEST(interpret_sentinel_ignores_an_empty_module_name) {
+    BVNLaunchConfiguration launch;
+    launch.executablePath = "d:\\Game.exe";
+    launch.arguments.push_back("--bvn-interpret=");
+
+    BVNApplyGeneralArgumentSentinels(launch);
+
+    // A name-less request selects nothing rather than an empty module, and
+    // the line is still consumed so the guest never sees it.
+    CHECK(launch.interpreterModules.empty());
+    CHECK_EQ(launch.arguments.size(), static_cast<std::size_t>(1));
+}

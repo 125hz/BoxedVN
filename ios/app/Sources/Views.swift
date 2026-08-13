@@ -453,7 +453,10 @@ struct GameDetailView: View {
                      + "the game report what its startup is waiting on. "
                      + "Diagnostics edit the game's index.html, keep the "
                      + "original beside it, and put it back when you remove "
-                     + "the line.")
+                     + "the line. --bvn-interpret=<module> runs one guest "
+                     + "module through the interpreter instead of the JIT, "
+                     + "which is slow but separates an emulator translation "
+                     + "bug from a guest computing a bad value.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 TextField("Working directory (inside the game)",
