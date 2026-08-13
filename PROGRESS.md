@@ -4566,3 +4566,49 @@ images do not: the guest reports `ImageManager.isReady()` false, and two of
 the game's `@font-face` declarations report `error` while the main one loads.
 The guest window is 816x624 inside a 1280x720 desktop and does not fill the
 screen. Both look unrelated to the JIT defect.
+
+---
+
+### Build 114 — the divide is guarded, and the guard is what breaks
+
+The 96-byte predecessor window disassembles cleanly. Synchronising on the
+function prologue `55 89 E5` at 0x76B8D4CC, the stream lands exactly on
+`F7 F1` at 0x76B8D515, which confirms the decode:
+
+```
+76B8D4FE  E8 25 F0 02 00   call 76BBC528        ; = ffmpeg.dll+0x5C528
+76B8D503  83 C4 20         add  esp, 0x20
+76B8D506  85 C0            test eax, eax
+76B8D508  74 23            je   76B8D52D        ; call failed -> skip
+76B8D50A  8B 0C 24         mov  ecx, [esp]      ; <-- ECX's producer
+76B8D50D  39 F1            cmp  ecx, esi
+76B8D50F  74 2F            je   76B8D540        ; ecx == esi -> SKIP THE DIVIDE
+76B8D511  31 D2            xor  edx, edx
+76B8D513  89 F0            mov  eax, esi
+76B8D515  F7 F1            div  ecx
+```
+
+The eight pushes before the call are two output pointers (`edx = esp`,
+`eax = esp+4`) and three 64-bit values passed as register pairs - `1`,
+`[ebp+0x14]`, and `0x7FFFFFFF`. That is `av_reduce(&num, &den, 1, den,
+INT_MAX)`.
+
+So the divide is **guarded**. Correct execution reduces 1/den, writes 1 into
+`*num`, `cmp ecx, esi` compares 1 against ESI = 1, the branch is taken and
+`div ecx` never executes at all. The DIV is not merely the detector of a bad
+value - it is unreachable code on a correct run.
+
+Under the JIT, `av_reduce` returns success (`eax != 0`, since the `test`
+did not branch away) and leaves `*num` = 0.
+
+**Which also explains why range A still crashed.** `av_reduce` is at
+`ffmpeg.dll+0x5C528`, and A covered 0x76B60000-0x76B8D515, or +0x00000 to
++0x2D515. The suspect function was outside the interpreted range the whole
+time. The run was not a failed experiment; it was an experiment whose range
+did not contain the defect.
+
+The module's real extent is now known too: `SizeOfImage=00314000`, so
+ffmpeg.dll spans 0x76B60000-0x76E74000. The 0x76BC0000 upper bound used for
+the first cut was a guess and was far short.
+
+Next cut interprets the callee itself rather than bisecting blindly.
