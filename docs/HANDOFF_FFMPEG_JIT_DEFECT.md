@@ -132,3 +132,70 @@ state I believe is wrong.
 
 These are almost certainly unrelated to the JIT defect; I'd rather solve that
 one first.
+
+
+---
+
+## Offline disassembly (the binary is now available)
+
+`ffmpeg.dll` was copied off the device. It verifies against the device
+report exactly: `SizeOfImage = 0x314000`, and RVA `0x2D515` is
+`F7 F1 50 FF 37 68 4C 60 1A 10 ...`, matching the device dump once the
+absolute operand is rebased (`0x101A604C` at file base `0x10000000` ->
+`0x76D0604C` at device base `0x76B60000`).
+
+The callee at `+0x5C528` is confirmed `av_reduce`: sign extraction by
+`sar eax,0x1f`, absolute value via `add`/`adc`/`xor`, a GCD call, a
+Stern-Brocot refinement loop, and finally
+
+```
+0005C81A  mov    eax, edx
+0005C81C  neg    eax
+0005C81E  test   edi, edi
+0005C820  cmovns eax, edx
+0005C826  mov    dword ptr [ecx], eax   ; *dst_num
+0005C82A  mov    dword ptr [ebx], esi   ; *dst_den
+```
+
+**It calls out of the tested range.** The interval `76BBC528-76BBC800`
+covered only the entry region, and only four blocks executed inside it:
+
+| helper | RVA | device address | called |
+|---|---|---|---|
+| `av_gcd` | `0x58840` | `0x76BB8840` | 1x |
+| 64-bit divide | `0x165480` | `0x76CC5480` | 5x |
+| (from `av_gcd`) | `0x16CFE0` | `0x76CC8FE0` | 2x |
+
+The divide helper is MSVC's `__alldiv`, and its normalisation loop is the
+strongest suspect in the whole chain:
+
+```
+001654E7  shr ebx, 1
+001654E9  rcr ecx, 1      ; rotate through carry - CF is an INPUT
+001654EB  shr edx, 1
+001654ED  rcr eax, 1
+001654EF  or  ebx, ebx
+001654F1  jne 0x101654E7
+```
+
+Each `rcr` consumes the carry produced by the `shr` immediately before it,
+and its own carry output is dead - overwritten by the next `shr`. So
+`DecodedOp::needsToSetFlags` reports no CF/OF requirement and
+`Jit::dynamic_rcr32_reg_op` takes its `else` branch, which reaches `rcr`
+through `dynamic_RI(..., &Jit::rcrValue)`. That path does fetch the incoming
+carry (`dynamic_RI` calls `getCF()` when `callbackWithCF` is set), so the
+plumbing is present; what is not yet verified is whether `getCF()`
+materialises the correct value from the lazily-recorded `shr` that produced
+it.
+
+That is a hypothesis, not a finding. The decisive test is one run
+interpreting `__alldiv` alone:
+
+```
+--bvn-interpret-range=76cc5480-76cc5530
+```
+
+`av_gcd` is the fallback if that comes back clean; it carries its own
+awkward semantics - `shrd`, `sar` by `cl`, `cmova`/`cmovne`/`cmove`, and a
+`mov ch, 0x20` followed by `test byte ptr [ebp-0x10], ch`, which is x86
+high-byte register aliasing.
