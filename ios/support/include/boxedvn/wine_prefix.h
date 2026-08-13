@@ -17,6 +17,27 @@ struct WinePrefixPreparationResult {
     std::string error;
 };
 
+// Which ANSI codepage the prefix presents to guest programs.
+//
+// A Windows program built for Japan passes 8-bit strings in CP932, and Wine
+// converts them to Unicode using the prefix's ANSI codepage before touching
+// the filesystem. BoxedVN's prefixes come from a pre-made English root, so
+// that codepage is 1252, and the conversion is wrong for every byte above
+// 0x7F.
+//
+// This is not only mojibake in a message box. A device log shows a Japanese
+// title whose own install directory contains U+FF0F FULLWIDTH SOLIDUS: the
+// game passes CP932 bytes 81 5E, a 1252 prefix decodes them as U+0081 U+005E,
+// and the resulting Unix path matches nothing on disk. The game reports
+// "Data path does not exist, trying to make it ... failed", cannot write its
+// save data, and dies with a script exception.
+enum class WineAnsiCodepage {
+    // Leave whatever the root filesystem was built with.
+    Default,
+    // CP932, Shift-JIS as Windows extends it.
+    Japanese,
+};
+
 enum class WineRenderer {
     Default,
     GDI,
@@ -35,7 +56,8 @@ enum class WineRenderer {
 WinePrefixPreparationResult prepareWinePrefix(
     const std::string& rootFilesystemZipPath,
     const std::string& writableRootPath,
-    WineRenderer renderer);
+    WineRenderer renderer,
+    WineAnsiCodepage codepage = WineAnsiCodepage::Default);
 
 // Copies the patched DXVK modules from `sourceDirectory` into the writable
 // overlay at /home/username/.wine/drive_c/dxvk, where Boxedwine's own `-dxvk`

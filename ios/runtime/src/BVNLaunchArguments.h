@@ -26,6 +26,8 @@ struct BVNLaunchConfiguration {
     // Inclusive start, exclusive end in the 32-bit guest address space.
     std::vector<std::pair<uint32_t, uint32_t>> interpreterRanges;
     std::string workingDirectory;
+    /// "ja" selects a CP932 prefix; empty leaves the root filesystem's own.
+    std::string guestLocale;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t bitsPerPixel = 0;
@@ -61,6 +63,10 @@ extern const char kInterpretModulePrefix[];
 /// This is how a defect is narrowed from a module to an instruction: halve
 /// the range, see which half the fault follows.
 extern const char kInterpretRangePrefix[];
+
+/// `--bvn-locale=ja` in launch settings: present the prefix to this game as a
+/// Japanese Windows install (ANSI codepage 932). Stripped before launch.
+extern const char kLocalePrefix[];
 
 /// Handles the launch-settings lines that are BoxedVN's own words rather than
 /// the guest's, for every launch rather than only for a recognised engine.

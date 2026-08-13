@@ -529,10 +529,20 @@ void runSession(const BVNLaunchConfiguration& launch) {
             launch.useWineD3DVulkanRenderer
             ? boxedvn::WineRenderer::Vulkan
             : boxedvn::WineRenderer::Default;
+        const boxedvn::WineAnsiCodepage codepage =
+            launch.guestLocale == "ja" ? boxedvn::WineAnsiCodepage::Japanese
+                                       : boxedvn::WineAnsiCodepage::Default;
         const boxedvn::WinePrefixPreparationResult prefix =
             boxedvn::prepareWinePrefix(launch.rootFilesystemZipPath,
                                        launch.writableRootPath,
-                                       renderer);
+                                       renderer, codepage);
+        if (codepage == boxedvn::WineAnsiCodepage::Japanese) {
+            BVNLogWrite(BVNLogLevelInfo, "prefix",
+                        "Presenting this prefix as a Japanese Windows install "
+                        "(ANSI codepage 932). A program that passes CP932 "
+                        "filenames can now address its own files; a prefix "
+                        "left at 1252 decodes every byte above 0x7F wrongly.");
+        }
         if (!prefix.ok) {
             setLastError("Could not prepare the writable Wine prefix: " +
                          prefix.error);

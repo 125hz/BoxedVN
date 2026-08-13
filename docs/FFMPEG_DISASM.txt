@@ -1,0 +1,338 @@
+
+=== CALLER of av_reduce (contains the DIV at +2D515) : RVA 2D4CC  (device 76B8D4CC) ===
+0002D4CC  push    ebp                               
+0002D4CD  mov     ebp, esp                          
+0002D4CF  push    edi                               
+0002D4D0  push    esi                               
+0002D4D1  and     esp, 0xfffffff8                   
+0002D4D4  sub     esp, 0x10                         
+0002D4D7  mov     eax, dword ptr [0x101eb784]       
+0002D4DC  mov     esi, dword ptr [ebp + 0x10]       
+0002D4DF  mov     edi, dword ptr [ebp + 8]          
+0002D4E2  xor     ecx, ecx                          
+0002D4E4  mov     edx, esp                          
+0002D4E6  xor     eax, ebp                          
+0002D4E8  mov     dword ptr [esp + 0xc], eax        
+0002D4EC  lea     eax, [esp + 4]                    
+0002D4F0  push    ecx                               
+0002D4F1  push    0x7fffffff                        
+0002D4F6  push    ecx                               
+0002D4F7  push    dword ptr [ebp + 0x14]            
+0002D4FA  push    ecx                               
+0002D4FB  push    esi                               
+0002D4FC  push    eax                               
+0002D4FD  push    edx                               
+0002D4FE  call    0x1005c528                           ; RVA 5C528 dev 76BBC528
+0002D503  add     esp, 0x20                         
+0002D506  test    eax, eax                          
+0002D508  je      0x1002d52d                           ; RVA 2D52D dev 76B8D52D
+0002D50A  mov     ecx, dword ptr [esp]              
+0002D50D  cmp     ecx, esi                          
+0002D50F  je      0x1002d540                           ; RVA 2D540 dev 76B8D540
+0002D511  xor     edx, edx                          
+0002D513  mov     eax, esi                          
+0002D515  div     ecx                               
+0002D517  push    eax                               
+0002D518  push    dword ptr [edi]                   
+0002D51A  push    0x101a604c                        
+0002D51F  push    0x30                              
+0002D521  push    0                                 
+0002D523  call    0x10058675                           ; RVA 58675 dev 76BB8675
+0002D528  add     esp, 0x14                         
+0002D52B  jmp     0x1002d540                           ; RVA 2D540 dev 76B8D540
+0002D52D  push    dword ptr [edi]                   
+0002D52F  push    0x101a607b                        
+0002D534  push    0x18                              
+0002D536  push    0                                 
+0002D538  call    0x10058675                           ; RVA 58675 dev 76BB8675
+0002D53D  add     esp, 0x10                         
+0002D540  mov     eax, dword ptr [esp]              
+0002D543  mov     ecx, dword ptr [esp + 4]          
+0002D547  test    eax, eax                          
+0002D549  jle     0x1002d58b                           ; RVA 2D58B dev 76B8D58B
+0002D54B  test    ecx, ecx                          
+0002D54D  jle     0x1002d58b                           ; RVA 2D58B dev 76B8D58B
+0002D54F  mov     ecx, dword ptr [esp]              
+0002D552  mov     edx, dword ptr [esp + 4]          
+0002D556  mov     eax, dword ptr [ebp + 0xc]        
+0002D559  mov     dword ptr [edi + 0x14], edx       
+0002D55C  mov     dword ptr [edi + 0x10], ecx       
+0002D55F  mov     esi, dword ptr [edi + 8]          
+0002D562  mov     dword ptr [esi + 0x308], edx      
+0002D568  mov     dword ptr [esi + 0x304], ecx      
+0002D56E  mov     esi, dword ptr [edi + 0x2a8]      
+0002D574  mov     esi, dword ptr [esi + 0x10]       
+0002D577  mov     dword ptr [esi + 0x308], edx      
+0002D57D  mov     dword ptr [esi + 0x304], ecx      
+0002D583  mov     dword ptr [edi + 0xb8], eax       
+0002D589  jmp     0x1002d5a0                           ; RVA 2D5A0 dev 76B8D5A0
+0002D58B  push    dword ptr [edi]                   
+0002D58D  push    ecx                               
+0002D58E  push    eax                               
+0002D58F  push    0x101a60a3                        
+0002D594  push    0x10                              
+0002D596  push    0                                 
+0002D598  call    0x10058675                           ; RVA 58675 dev 76BB8675
+0002D59D  add     esp, 0x18                         
+0002D5A0  mov     ecx, dword ptr [esp + 0xc]        
+0002D5A4  xor     ecx, ebp                          
+0002D5A6  call    0x10165460                           ; RVA 165460 dev 76CC5460
+0002D5AB  lea     esp, [ebp - 8]                    
+0002D5AE  pop     esi                               
+0002D5AF  pop     edi                               
+0002D5B0  pop     ebp                               
+0002D5B1  ret                                       
+
+=== __alldiv : RVA 165480  (device 76CC5480) ===
+00165480  push    edi                               
+00165481  push    esi                               
+00165482  push    ebx                               
+00165483  xor     edi, edi                          
+00165485  mov     eax, dword ptr [esp + 0x14]       
+00165489  or      eax, eax                          
+0016548B  jge     0x101654a1                           ; RVA 1654A1 dev 76CC54A1
+0016548D  inc     edi                               
+0016548E  mov     edx, dword ptr [esp + 0x10]       
+00165492  neg     eax                               
+00165494  neg     edx                               
+00165496  sbb     eax, 0                            
+00165499  mov     dword ptr [esp + 0x14], eax       
+0016549D  mov     dword ptr [esp + 0x10], edx       
+001654A1  mov     eax, dword ptr [esp + 0x1c]       
+001654A5  or      eax, eax                          
+001654A7  jge     0x101654bd                           ; RVA 1654BD dev 76CC54BD
+001654A9  inc     edi                               
+001654AA  mov     edx, dword ptr [esp + 0x18]       
+001654AE  neg     eax                               
+001654B0  neg     edx                               
+001654B2  sbb     eax, 0                            
+001654B5  mov     dword ptr [esp + 0x1c], eax       
+001654B9  mov     dword ptr [esp + 0x18], edx       
+001654BD  or      eax, eax                          
+001654BF  jne     0x101654d9                           ; RVA 1654D9 dev 76CC54D9
+001654C1  mov     ecx, dword ptr [esp + 0x18]       
+001654C5  mov     eax, dword ptr [esp + 0x14]       
+001654C9  xor     edx, edx                          
+001654CB  div     ecx                               
+001654CD  mov     ebx, eax                          
+001654CF  mov     eax, dword ptr [esp + 0x10]       
+001654D3  div     ecx                               
+001654D5  mov     edx, ebx                          
+001654D7  jmp     0x1016551a                           ; RVA 16551A dev 76CC551A
+001654D9  mov     ebx, eax                          
+001654DB  mov     ecx, dword ptr [esp + 0x18]       
+001654DF  mov     edx, dword ptr [esp + 0x14]       
+001654E3  mov     eax, dword ptr [esp + 0x10]       
+001654E7  shr     ebx, 1                            
+001654E9  rcr     ecx, 1                            
+001654EB  shr     edx, 1                            
+001654ED  rcr     eax, 1                            
+001654EF  or      ebx, ebx                          
+001654F1  jne     0x101654e7                           ; RVA 1654E7 dev 76CC54E7
+001654F3  div     ecx                               
+001654F5  mov     esi, eax                          
+001654F7  mul     dword ptr [esp + 0x1c]            
+001654FB  mov     ecx, eax                          
+001654FD  mov     eax, dword ptr [esp + 0x18]       
+00165501  mul     esi                               
+00165503  add     edx, ecx                          
+00165505  jb      0x10165515                           ; RVA 165515 dev 76CC5515
+00165507  cmp     edx, dword ptr [esp + 0x14]       
+0016550B  ja      0x10165515                           ; RVA 165515 dev 76CC5515
+0016550D  jb      0x10165516                           ; RVA 165516 dev 76CC5516
+0016550F  cmp     eax, dword ptr [esp + 0x10]       
+00165513  jbe     0x10165516                           ; RVA 165516 dev 76CC5516
+00165515  dec     esi                               
+00165516  xor     edx, edx                          
+00165518  mov     eax, esi                          
+0016551A  dec     edi                               
+0016551B  jne     0x10165524                           ; RVA 165524 dev 76CC5524
+0016551D  neg     edx                               
+0016551F  neg     eax                               
+00165521  sbb     edx, 0                            
+00165524  pop     ebx                               
+00165525  pop     esi                               
+00165526  pop     edi                               
+00165527  ret     0x10                              
+
+=== av_gcd : RVA 58840  (device 76BB8840) ===
+00058840  push    ebp                               
+00058841  mov     ebp, esp                          
+00058843  push    ebx                               
+00058844  push    edi                               
+00058845  push    esi                               
+00058846  sub     esp, 0xc                          
+00058849  mov     ecx, dword ptr [ebp + 8]          
+0005884C  mov     edx, dword ptr [ebp + 0xc]        
+0005884F  mov     edi, dword ptr [ebp + 0x14]       
+00058852  mov     esi, dword ptr [ebp + 0x10]       
+00058855  mov     eax, ecx                          
+00058857  or      eax, edx                          
+00058859  je      0x100589ee                           ; RVA 589EE dev 76BB89EE
+0005885F  mov     eax, esi                          
+00058861  or      eax, edi                          
+00058863  je      0x100589ea                           ; RVA 589EA dev 76BB89EA
+00058869  mov     eax, ecx                          
+0005886B  neg     ecx                               
+0005886D  mov     ebx, 0                            
+00058872  sbb     ebx, edx                          
+00058874  and     ecx, eax                          
+00058876  and     ebx, edx                          
+00058878  mov     eax, ecx                          
+0005887A  mov     edx, 0xcc95386d                   
+0005887F  mul     edx                               
+00058881  imul    eax, ecx, 0x22fdd63               
+00058887  imul    ebx, ebx, 0xcc95386d              
+0005888D  mov     ecx, esi                          
+0005888F  add     eax, edx                          
+00058891  mov     edx, 0xcc95386d                   
+00058896  add     ebx, eax                          
+00058898  mov     eax, esi                          
+0005889A  mov     esi, 0                            
+0005889F  shr     ebx, 0x1a                         
+000588A2  neg     ecx                               
+000588A4  sbb     esi, edi                          
+000588A6  and     ecx, eax                          
+000588A8  mov     eax, ecx                          
+000588AA  and     esi, edi                          
+000588AC  mul     edx                               
+000588AE  imul    eax, ecx, 0x22fdd63               
+000588B4  movzx   ecx, byte ptr [ebx + 0x101b4070]  
+000588BB  mov     bl, 0x20                          
+000588BD  add     eax, edx                          
+000588BF  imul    edx, esi, 0xcc95386d              
+000588C5  mov     esi, dword ptr [ebp + 0xc]        
+000588C8  add     edx, eax                          
+000588CA  shr     edx, 0x1a                         
+000588CD  movzx   edx, byte ptr [edx + 0x101b4070]  
+000588D4  mov     eax, ecx                          
+000588D6  cmp     ecx, edx                          
+000588D8  mov     dword ptr [ebp - 0x10], edx       
+000588DB  cmova   eax, edx                          
+000588DE  mov     edx, dword ptr [ebp + 8]          
+000588E1  mov     dword ptr [ebp - 0x18], eax       
+000588E4  mov     eax, esi                          
+000588E6  sar     eax, cl                           
+000588E8  shrd    edx, esi, cl                      
+000588EB  sar     esi, 0x1f                         
+000588EE  test    cl, bl                            
+000588F0  cmovne  edx, eax                          
+000588F3  cmove   esi, eax                          
+000588F6  push    esi                               
+000588F7  push    edx                               
+000588F8  call    0x1016cfe0                           ; RVA 16CFE0 dev 76CCCFE0
+000588FD  add     esp, 8                            
+00058900  mov     ecx, dword ptr [ebp - 0x10]       
+00058903  mov     ebx, edx                          
+00058905  mov     edx, dword ptr [ebp + 0x10]       
+00058908  mov     esi, eax                          
+0005890A  mov     eax, edi                          
+0005890C  shrd    edx, edi, cl                      
+0005890F  mov     ecx, dword ptr [ebp - 0x10]       
+00058912  sar     edi, 0x1f                         
+00058915  mov     ch, 0x20                          
+00058917  sar     eax, cl                           
+00058919  test    byte ptr [ebp - 0x10], ch         
+0005891C  cmovne  edx, eax                          
+0005891F  cmove   edi, eax                          
+00058922  push    edi                               
+00058923  push    edx                               
+00058924  call    0x1016cfe0                           ; RVA 16CFE0 dev 76CCCFE0
+00058929  add     esp, 8                            
+0005892C  mov     ecx, ebx                          
+0005892E  mov     edi, esi                          
+00058930  xor     ecx, edx                          
+00058932  xor     edi, eax                          
+00058934  or      edi, ecx                          
+00058936  jne     0x10058942                           ; RVA 58942 dev 76BB8942
+00058938  mov     dword ptr [ebp - 0x10], esi       
+0005893B  mov     edi, ebx                          
+0005893D  jmp     0x100589cf                           ; RVA 589CF dev 76BB89CF
+00058942  cmp     eax, esi                          
+00058944  mov     ecx, edx                          
+00058946  mov     edi, edx                          
+00058948  mov     dword ptr [ebp - 0x10], eax       
+0005894B  sbb     ecx, ebx                          
+0005894D  jl      0x10058954                           ; RVA 58954 dev 76BB8954
+0005894F  mov     edi, ebx                          
+00058951  mov     dword ptr [ebp - 0x10], esi       
+00058954  cmp     esi, eax                          
+00058956  mov     ecx, ebx                          
+00058958  sbb     ecx, edx                          
+0005895A  jge     0x10058960                           ; RVA 58960 dev 76BB8960
+0005895C  mov     ebx, edx                          
+0005895E  mov     esi, eax                          
+00058960  sub     esi, dword ptr [ebp - 0x10]       
+00058963  mov     ecx, 0                            
+00058968  mov     dword ptr [ebp - 0x14], edi       
+0005896B  mov     edx, 0x22fdd63                    
+00058970  mov     eax, esi                          
+00058972  sbb     ebx, edi                          
+00058974  neg     eax                               
+00058976  sbb     ecx, ebx                          
+00058978  and     eax, esi                          
+0005897A  mov     edi, eax                          
+0005897C  and     ecx, ebx                          
+0005897E  imul    edi, edx                          
+00058981  mov     edx, 0xcc95386d                   
+00058986  mul     edx                               
+00058988  mov     eax, 0xcc95386d                   
+0005898D  add     edx, edi                          
+0005898F  imul    ecx, eax                          
+00058992  mov     edi, dword ptr [ebp - 0x10]       
+00058995  mov     eax, ebx                          
+00058997  add     ecx, edx                          
+00058999  mov     edx, dword ptr [ebp - 0x14]       
+0005899C  shr     ecx, 0x1a                         
+0005899F  mov     cl, byte ptr [ecx + 0x101b4070]   
+000589A5  shrd    esi, ebx, cl                      
+000589A8  sar     eax, cl                           
+000589AA  sar     ebx, 0x1f                         
+000589AD  test    cl, 0x20                          
+000589B0  cmovne  esi, eax                          
+000589B3  cmove   ebx, eax                          
+000589B6  mov     eax, edi                          
+000589B8  xor     eax, esi                          
+000589BA  xor     edx, ebx                          
+000589BC  or      edx, eax                          
+000589BE  mov     edx, ebx                          
+000589C0  mov     ebx, dword ptr [ebp - 0x14]       
+000589C3  mov     eax, esi                          
+000589C5  mov     esi, edi                          
+000589C7  mov     edi, ebx                          
+000589C9  jne     0x10058942                           ; RVA 58942 dev 76BB8942
+000589CF  mov     ecx, dword ptr [ebp - 0x18]       
+000589D2  mov     esi, dword ptr [ebp - 0x10]       
+000589D5  mov     eax, 0                            
+000589DA  shld    edi, esi, cl                      
+000589DD  shl     esi, cl                           
+000589DF  test    cl, 0x20                          
+000589E2  cmovne  edi, esi                          
+000589E5  cmovne  esi, eax                          
+000589E8  jmp     0x100589ee                           ; RVA 589EE dev 76BB89EE
+000589EA  mov     esi, ecx                          
+000589EC  mov     edi, edx                          
+000589EE  mov     eax, esi                          
+000589F0  mov     edx, edi                          
+000589F2  add     esp, 0xc                          
+000589F5  pop     esi                               
+000589F6  pop     edi                               
+000589F7  pop     ebx                               
+000589F8  pop     ebp                               
+000589F9  ret                                       
+
+=== helper called by av_gcd : RVA 16CFE0  (device 76CCCFE0) ===
+0016CFE0  mov     edi, edi                          
+0016CFE2  push    ebp                               
+0016CFE3  mov     ebp, esp                          
+0016CFE5  mov     eax, dword ptr [ebp + 0xc]        
+0016CFE8  mov     ecx, dword ptr [ebp + 8]          
+0016CFEB  cdq                                       
+0016CFEC  xor     eax, edx                          
+0016CFEE  xor     ecx, edx                          
+0016CFF0  sub     ecx, edx                          
+0016CFF2  sbb     eax, edx                          
+0016CFF4  mov     edx, eax                          
+0016CFF6  mov     eax, ecx                          
+0016CFF8  pop     ebp                               
+0016CFF9  ret                                       

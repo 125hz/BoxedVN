@@ -532,7 +532,8 @@ GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
 WinePrefixPreparationResult prepareWinePrefix(
     const std::string& rootFilesystemZipPath,
     const std::string& writableRootPath,
-    WineRenderer renderer) {
+    WineRenderer renderer,
+    WineAnsiCodepage codepage) {
     WinePrefixPreparationResult result;
     const fs::path wineDirectory =
         fs::path(writableRootPath) / "home" / "username" / ".wine";
@@ -667,6 +668,27 @@ WinePrefixPreparationResult prepareWinePrefix(
             "System\\ControlSet001\\Enum\\ROOT\\WINE\\WINEBUS",
             "Service", "\"winebus\"")) {
         result.changed = true;
+    }
+
+    if (codepage == WineAnsiCodepage::Japanese) {
+        // What Wine consults to convert a program's 8-bit strings, including
+        // every filename it opens. MACCP is the Macintosh codepage Wine also
+        // keeps here; 10001 is its Japanese counterpart and is set for
+        // consistency rather than because anything reads it.
+        for (const auto& entry : {std::make_pair("ACP", "\"932\""),
+                                  std::make_pair("OEMCP", "\"932\""),
+                                  std::make_pair("MACCP", "\"10001\"")}) {
+            if (setWineRegistryValue(
+                    contents, "System\\ControlSet001\\Control\\Nls\\CodePage",
+                    entry.first, entry.second)) {
+                result.changed = true;
+            }
+        }
+        if (setWineRegistryValue(
+                contents, "System\\ControlSet001\\Control\\Nls\\Language",
+                "Default", "\"0411\"")) {
+            result.changed = true;
+        }
     }
 
     if (result.changed && !atomicWrite(systemRegistry, contents, result.error)) {

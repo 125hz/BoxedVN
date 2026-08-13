@@ -46,6 +46,7 @@ bool launchesAnyOf(const BVNLaunchConfiguration& launch,
 
 const char kInterpretModulePrefix[] = "--bvn-interpret=";
 const char kInterpretRangePrefix[] = "--bvn-interpret-range=";
+const char kLocalePrefix[] = "--bvn-locale=";
 
 namespace {
 
@@ -100,6 +101,12 @@ void BVNApplyGeneralArgumentSentinels(BVNLaunchConfiguration& launch) {
                 launch.interpreterModules.push_back(module);
             }
             continue;  // BoxedVN's word; the guest must never see it.
+        }
+        const std::string localePrefix(kLocalePrefix);
+        if (argument.size() > localePrefix.size() &&
+            argument.compare(0, localePrefix.size(), localePrefix) == 0) {
+            launch.guestLocale = argument.substr(localePrefix.size());
+            continue;
         }
         const std::string rangePrefix(kInterpretRangePrefix);
         if (argument.size() > rangePrefix.size() &&

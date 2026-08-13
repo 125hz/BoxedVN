@@ -535,3 +535,53 @@ BOXEDVN_TEST(guest_font_census_separates_bitmap_fonts_from_usable_ones) {
 
     fs::remove_all(temporary, ec);
 }
+
+BOXEDVN_TEST(japanese_prefix_sets_the_ansi_codepage_wine_converts_filenames_with) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-prefix-ja-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    const fs::path prefix = temporary / "prefix";
+    fs::create_directories(prefix / "home/username/.wine", ec);
+    const fs::path archive = temporary / "rootfs.zip";
+
+    zipFile zip = zipOpen64(archive.string().c_str(), APPEND_STATUS_CREATE);
+    CHECK(zip != nullptr);
+    if (zip != nullptr) {
+        CHECK(addZipEntry(zip, "home/username/.wine/user.reg",
+                          "WINE REGISTRY Version 2\n"));
+        CHECK(addZipEntry(zip, "home/username/.wine/system.reg",
+                          "WINE REGISTRY Version 2\n"));
+        zipClose(zip, nullptr);
+    }
+    std::ofstream(prefix / "home/username/.wine/user.reg")
+        << "WINE REGISTRY Version 2\n";
+    std::ofstream(prefix / "home/username/.wine/system.reg")
+        << "WINE REGISTRY Version 2\n";
+
+    const WinePrefixPreparationResult result =
+        prepareWinePrefix(archive.string(), prefix.string(),
+                          WineRenderer::Vulkan, WineAnsiCodepage::Japanese);
+    CHECK(result.ok);
+
+    const std::string system =
+        readTestFile(prefix / "home/username/.wine/system.reg");
+    CHECK_CONTAINS(system, "Nls\\\\CodePage");
+    CHECK_CONTAINS(system, "\"ACP\"=\"932\"");
+    CHECK_CONTAINS(system, "\"OEMCP\"=\"932\"");
+
+    // The default must not touch it: an English title on a CP932 prefix has
+    // the same problem in the other direction.
+    fs::remove_all(temporary, ec);
+    fs::create_directories(prefix / "home/username/.wine", ec);
+    std::ofstream(prefix / "home/username/.wine/user.reg")
+        << "WINE REGISTRY Version 2\n";
+    std::ofstream(prefix / "home/username/.wine/system.reg")
+        << "WINE REGISTRY Version 2\n";
+    CHECK(prepareWinePrefix(archive.string(), prefix.string(),
+                            WineRenderer::Vulkan).ok);
+    CHECK(readTestFile(prefix / "home/username/.wine/system.reg")
+              .find("ACP") == std::string::npos);
+
+    fs::remove_all(temporary, ec);
+}
