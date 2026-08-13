@@ -1269,7 +1269,14 @@ BString KProcess::getPeImageName(U32 address, U32* imageBase) {
                         PeImageRange found;
                         found.base = base;
                         found.end = base + sizeOfImage;
-                        found.name = B(name[0] ? name : "unnamed PE image");
+                        // Append rather than B(): the B() macro builds a
+                        // *literal* BString that keeps the pointer it was
+                        // given without copying, and `name` is a local
+                        // buffer. Build 111 did exactly that and the device
+                        // log printed the module as trailing heap garbage,
+                        // which also meant the interpreter matcher below was
+                        // comparing against nothing. append() copies.
+                        found.name += (name[0] ? name : "unnamed PE image");
                         {
                             BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(peImageMutex);
                             this->peImages.push_back(found);
