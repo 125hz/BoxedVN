@@ -435,6 +435,28 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
             }
         }
 #endif
+        // Say, once, that a requested selection actually took effect. A
+        // range or module that is never entered produces a clean run that
+        // looks exactly like a range that was entered and found innocent,
+        // and acting on that is how a bisection walks confidently in the
+        // wrong direction.
+        if (forceInterpreter) {
+            static std::atomic<U32> announced{0};
+            if (announced.fetch_add(1, std::memory_order_relaxed) == 0) {
+                if (matchedRangeEnd) {
+                    klog_fmt("Interpreter selection is live: guest EIP %.8X is "
+                             "inside the requested range %.8X-%.8X and is "
+                             "being interpreted, not JIT compiled.",
+                             startIp, matchedRangeStart, matchedRangeEnd);
+                } else {
+                    klog_fmt("Interpreter selection is live: guest EIP %.8X is "
+                             "in module '%s' and is being interpreted, not "
+                             "JIT compiled.",
+                             startIp, mappedModule.c_str());
+                }
+            }
+        }
+
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(memory->mutex);
         op = memory->getDecodedOp(startIp);
         if (!op) {

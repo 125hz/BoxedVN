@@ -45,6 +45,47 @@ bool launchesAnyOf(const BVNLaunchConfiguration& launch,
 }  // namespace
 
 const char kInterpretModulePrefix[] = "--bvn-interpret=";
+const char kInterpretRangePrefix[] = "--bvn-interpret-range=";
+
+namespace {
+
+// "0076b60000-0076b8e000" or "76b60000-76b8e000". Returns false for anything
+// that is not two hexadecimal numbers with a non-empty range between them,
+// because a silently-ignored range would look exactly like a range that was
+// applied and found innocent.
+bool parseInterpreterRange(const std::string& text, uint32_t& start,
+                           uint32_t& end) {
+    const std::size_t dash = text.find('-');
+    if (dash == std::string::npos || dash == 0 ||
+        dash + 1 >= text.size()) {
+        return false;
+    }
+    const std::string startText = text.substr(0, dash);
+    const std::string endText = text.substr(dash + 1);
+    if (startText.size() > 8 || endText.size() > 8) {
+        return false;
+    }
+    auto parseHex = [](const std::string& value, uint32_t& out) {
+        out = 0;
+        for (const char character : value) {
+            uint32_t digit;
+            if (character >= '0' && character <= '9') {
+                digit = static_cast<uint32_t>(character - '0');
+            } else if (character >= 'a' && character <= 'f') {
+                digit = static_cast<uint32_t>(character - 'a') + 10;
+            } else if (character >= 'A' && character <= 'F') {
+                digit = static_cast<uint32_t>(character - 'A') + 10;
+            } else {
+                return false;
+            }
+            out = (out << 4) | digit;
+        }
+        return true;
+    };
+    return parseHex(startText, start) && parseHex(endText, end) && start < end;
+}
+
+}  // namespace
 
 void BVNApplyGeneralArgumentSentinels(BVNLaunchConfiguration& launch) {
     const std::string prefix(kInterpretModulePrefix);
@@ -59,6 +100,17 @@ void BVNApplyGeneralArgumentSentinels(BVNLaunchConfiguration& launch) {
                 launch.interpreterModules.push_back(module);
             }
             continue;  // BoxedVN's word; the guest must never see it.
+        }
+        const std::string rangePrefix(kInterpretRangePrefix);
+        if (argument.size() > rangePrefix.size() &&
+            argument.compare(0, rangePrefix.size(), rangePrefix) == 0) {
+            uint32_t start = 0;
+            uint32_t end = 0;
+            if (parseInterpreterRange(argument.substr(rangePrefix.size()),
+                                      start, end)) {
+                launch.interpreterRanges.emplace_back(start, end);
+            }
+            continue;
         }
         remaining.push_back(argument);
     }

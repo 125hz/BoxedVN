@@ -54,6 +54,14 @@ struct BVNLaunchConfiguration {
 /// Stripped before launch and never passed to the guest.
 extern const char kInterpretModulePrefix[];
 
+/// A launch-settings line asking for one guest address range to run through
+/// the interpreter: `--bvn-interpret-range=START-END`, hexadecimal, inclusive
+/// start and exclusive end, repeatable. Stripped before launch.
+///
+/// This is how a defect is narrowed from a module to an instruction: halve
+/// the range, see which half the fault follows.
+extern const char kInterpretRangePrefix[];
+
 /// Handles the launch-settings lines that are BoxedVN's own words rather than
 /// the guest's, for every launch rather than only for a recognised engine.
 ///

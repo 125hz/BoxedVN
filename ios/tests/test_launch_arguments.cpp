@@ -362,3 +362,42 @@ BOXEDVN_TEST(interpret_sentinel_ignores_an_empty_module_name) {
     CHECK(launch.interpreterModules.empty());
     CHECK_EQ(launch.arguments.size(), static_cast<std::size_t>(1));
 }
+
+BOXEDVN_TEST(interpret_range_sentinel_reaches_boxedwine) {
+    BVNLaunchConfiguration launch;
+    launch.executablePath = "d:\\Game.exe";
+    launch.arguments.push_back("--bvn-interpret-range=76b60000-76b8e000");
+    launch.arguments.push_back("--no-sandbox");
+
+    BVNApplyGeneralArgumentSentinels(launch);
+
+    CHECK_EQ(launch.interpreterRanges.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(launch.interpreterRanges[0].first, 0x76b60000u);
+    CHECK_EQ(launch.interpreterRanges[0].second, 0x76b8e000u);
+    CHECK_EQ(launch.arguments.size(), static_cast<std::size_t>(1));
+
+    const std::vector<std::string> argv = BVNBuildLaunchArguments(launch);
+    CHECK(std::find(argv.begin(), argv.end(),
+                    std::string("-interpreterRange")) != argv.end());
+    CHECK(std::find(argv.begin(), argv.end(),
+                    std::string("76b60000-76b8e000")) != argv.end());
+}
+
+BOXEDVN_TEST(interpret_range_sentinel_rejects_what_it_cannot_parse) {
+    // A range that is silently dropped looks exactly like a range that was
+    // applied and found innocent, which is how a bisection walks confidently
+    // in the wrong direction. Anything unparseable must select nothing.
+    for (const char* bad : {"--bvn-interpret-range=nothex-76b8e000",
+                            "--bvn-interpret-range=76b8e000-76b60000",
+                            "--bvn-interpret-range=76b60000",
+                            "--bvn-interpret-range=-",
+                            "--bvn-interpret-range=76b60000-76b60000"}) {
+        BVNLaunchConfiguration launch;
+        launch.executablePath = "d:\\Game.exe";
+        launch.arguments.push_back(bad);
+        BVNApplyGeneralArgumentSentinels(launch);
+        CHECK(launch.interpreterRanges.empty());
+        // Still consumed: the guest must never see BoxedVN's own words.
+        CHECK(launch.arguments.empty());
+    }
+}

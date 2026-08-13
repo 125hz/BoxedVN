@@ -361,6 +361,26 @@ static void logDivideExceptionSnapshot(CPU* cpu, int error) {
         safe_strcpy(instructionBytes, "unreadable", sizeof(instructionBytes));
     }
 
+    // A window of the bytes leading up to the trap, so the instructions that
+    // produced the divisor can be disassembled from the log. x86 is
+    // variable-length and cannot be decoded backwards with certainty, but 96
+    // bytes is long enough that a disassembler re-synchronises well before
+    // the end.
+    char window[96 * 3 + 1] = {};
+    const U32 windowStart = eip >= 96 ? eip - 96 : 0;
+    const U32 windowLength = eip - windowStart;
+    if (windowLength && thread->memory->canRead(windowStart, windowLength)) {
+        std::vector<U8> before(windowLength);
+        thread->memory->memcpy(before.data(), windowStart, windowLength);
+        for (U32 index = 0; index < windowLength; ++index) {
+            snprintf(window + index * 3, sizeof(window) - index * 3,
+                     "%02X%s", before[index],
+                     index + 1 == windowLength ? "" : " ");
+        }
+    } else {
+        safe_strcpy(window, "unreadable", sizeof(window));
+    }
+
     klog_fmt("Guest divide exception: pid %x thread %x %s; EIP %.8X %s; "
              "EAX %.8X ECX %.8X EDX %.8X EBX %.8X ESP %.8X EBP %.8X "
              "ESI %.8X EDI %.8X; bytes %s",
@@ -370,6 +390,8 @@ static void logDivideExceptionSnapshot(CPU* cpu, int error) {
              cpu->reg[0].u32, cpu->reg[1].u32, cpu->reg[2].u32,
              cpu->reg[3].u32, cpu->reg[4].u32, cpu->reg[5].u32,
              cpu->reg[6].u32, cpu->reg[7].u32, instructionBytes);
+    klog_fmt("Guest divide exception: the %u bytes ending at EIP %.8X are: %s",
+             windowLength, eip, window);
 }
 
 void CPU::prepareException(int code, int error) {
