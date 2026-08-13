@@ -92,10 +92,14 @@ U32 KNativeInputSDL::screenHeight() {
 }
 
 bool KNativeInputSDL::mouseMove(int x, int y, bool relative) {
-    XServer* server = XServer::getServer(true);
-
     x = xFromScreen(x);
     y = yFromScreen(y);
+
+    return mouseMoveGuest(x, y, relative);
+}
+
+bool KNativeInputSDL::mouseMoveGuest(int x, int y, bool relative) {
+    XServer* server = XServer::getServer(true);
 
 #ifdef BOXEDWINE_IOS
     // Remember where the pointer now is, so getMousePos can answer with it.
@@ -139,6 +143,13 @@ bool KNativeInputSDL::mouseWheel(int amount, int x, int y) {
 }
 
 bool KNativeInputSDL::mouseButton(U32 down, U32 button, int x, int y) {
+    x = xFromScreen(x);
+    y = yFromScreen(y);
+
+    return mouseButtonGuest(down, button, x, y);
+}
+
+bool KNativeInputSDL::mouseButtonGuest(U32 down, U32 button, int x, int y) {
     if (KSystem::enableSoundAfterMouseClick) {
         KSystem::enableSoundAfterMouseClick = false;
         KSystem::soundEnabled = true;
@@ -146,9 +157,6 @@ bool KNativeInputSDL::mouseButton(U32 down, U32 button, int x, int y) {
             audio->soundEnabled();
             });
     }
-    x = xFromScreen(x);
-    y = yFromScreen(y);
-
     checkMousePos(x, y, true);
 
 #ifdef BOXEDWINE_IOS

@@ -1,5 +1,43 @@
 # BoxedVN — Progress and Handoff
 
+## Build 123: contain the game before Wine caches its monitor, and identify the browser spin
+
+The build-122 Fate/stay night log proves UIKit is no longer the uncertain
+part. A tap in the presented 1280x960 client maps to the expected guest menu
+coordinates, and both motion and button paths target that same X11 client.
+But the launch command starts Wine on a 1280x720 desktop. Wine caches that
+Windows monitor before Fate creates its taller 1280x960 client, recreating the
+same class of failure previously measured with Grisaia: changing Boxedwine's
+root and Xlib `Screen` after the game opens is too late for Windows coordinate
+conversion.
+
+Default imported-game sessions now start at 1280x960. This contains common
+1280-wide 16:9 and 4:3 clients before Wine starts, without naming either title;
+an explicit per-game resolution still wins. UIKit's overlay also has dedicated
+guest-pixel pointer entry points. Direct touch and the trackpad cursor now pass
+the exact coordinate obtained from the live presentation view to X11 instead
+of converting guest to SDL-window space and immediately converting it back.
+
+Summer Memories reaches `Scene_Map`, decrypts `Actor1_1.png`, assigns a blob,
+and Blink reports the image complete at its valid natural size of 576x384.
+Its JavaScript `onload` still does not run: requestAnimationFrame advances only
+twice in 3.5 seconds, then audio IPC begins timing out. The automatic snapshot
+settles why. Renderer process 008F's main thread 0090 consumes 979 ms of CPU in
+a one-second burst at guest EIP `44606973`; the image and audio paths are
+downstream of a guest-code spin, not failed resources or backends.
+
+That address was reported as `Unknown` because the PE fallback searched only
+16 MiB backward, too short for a Chromium/NW.js image. Core diagnostics now
+search up to 128 MiB for large PE headers, apply the same fallback to native-PC
+mapping, and include a bounded 96-byte x86 window around every runnable live
+EIP in the one-shot hang snapshot. The next Summer log will therefore name the
+module, offset, and actual instructions needed to isolate a JIT correctness
+fault without interpreting a whole browser DLL or patching a game's image
+loader.
+
+The Windows host-independent suite passes. The SDL/iPhoneOS compile and both
+physical-device outcomes remain CI/device validation gates.
+
 ## Build 122: make injected clicks pollable and capture the browser stall
 
 Build 121 is a major device advance. Fate/stay night now reaches and renders

@@ -92,8 +92,10 @@ extern "C" void BVNGuestControlsSendKey(U32 scancode, bool down) {
 // transform, so -[UITouch locationInView:] gives it guest pixels directly and
 // nothing about the intervening hierarchy can matter.
 //
-// Coordinates are already guest pixels. The bridge converts them back to the
-// host-window space expected by KNativeInputSDL's public pointer methods.
+// Coordinates are already guest pixels. Keep them in that space all the way
+// through the iOS-only entry points: converting guest -> SDL host -> guest was
+// mathematically redundant and introduced rounding whenever the software
+// desktop or a transformed Metal view was not 1:1.
 extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
     if (!gIOSActiveScreen) {
         return;
@@ -102,30 +104,23 @@ extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
     // Position first, then the button, exactly as SDL's own touch-to-mouse
     // synthesis does: X11 clients read the pointer position from the motion
     // that precedes the press.
-    // UIKit already resolved the presentation view's scale/transform and gave
-    // us guest pixels. KNativeInputSDL's public pointer methods normally take
-    // host-window coordinates and apply that transform themselves, so feed
-    // the inverse here. Passing x/y directly applied the letterbox transform
-    // twice; in portrait, most taps collapsed onto a guest edge.
-    const int screenX = input->xToScreen(x);
-    const int screenY = input->yToScreen(y);
     static U32 reportedButtonPhases = 0;
     if (phase != 0 && reportedButtonPhases < 16) {
         ++reportedButtonPhases;
-        klog_fmt("iOS overlay pointer %s at guest %d,%d -> SDL %d,%d "
-                 "(scale %u%%x%u%%)",
-                 phase == 1 ? "down" : "up", x, y, screenX, screenY,
+        klog_fmt("iOS overlay pointer %s at guest %d,%d (direct guest-pixel "
+                 "delivery; SDL scale %u%%x%u%%)",
+                 phase == 1 ? "down" : "up", x, y,
                  input->scaleX, input->scaleY);
     }
-    if (!input->mouseMove(screenX, screenY, false)) {
+    if (!input->mouseMoveGuest(x, y)) {
         onMouseMove((U32)x, (U32)y, false);
     }
     if (phase == 1) {
-        if (!input->mouseButton(1, 0, screenX, screenY)) {
+        if (!input->mouseButtonGuest(1, 0, x, y)) {
             onMouseButtonDown(0);
         }
     } else if (phase == 2) {
-        if (!input->mouseButton(0, 0, screenX, screenY)) {
+        if (!input->mouseButtonGuest(0, 0, x, y)) {
             onMouseButtonUp(0);
         }
     }
@@ -142,10 +137,9 @@ extern "C" void BVNGuestControlsSendRightClick(int x, int y) {
     }
     const KNativeInputSDLPtr& input = gIOSActiveScreen->input;
     klog_fmt("iOS overlay right click at guest %d,%d", x, y);
-    const int screenX = input->xToScreen(x);
-    const int screenY = input->yToScreen(y);
-    input->mouseButton(1, 1, screenX, screenY);
-    input->mouseButton(0, 1, screenX, screenY);
+    input->mouseMoveGuest(x, y);
+    input->mouseButtonGuest(1, 1, x, y);
+    input->mouseButtonGuest(0, 1, x, y);
 }
 
 extern "C" bool BVNGuestControlsScreenSize(int* width, int* height) {

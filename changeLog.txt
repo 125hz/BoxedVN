@@ -1,3 +1,8 @@
+BoxedVN 0.1.0 (123)
+* Started default Wine game sessions on a 1280x960 monitor so 1280x960 clients never outgrow Wine's cached desktop input geometry.
+* Delivered iOS direct-touch and trackpad coordinates to X11 as exact presented guest pixels, without a redundant guest-to-SDL-to-guest transform.
+* Resolved Chromium-sized PE images and captured runnable guest instruction windows in first-frame hang snapshots.
+
 BoxedVN 0.1.0 (122)
 * Kept direct iOS touch-button state visible to X11 polling as well as button events, fixing Windows engines that ignored otherwise-correct taps.
 * Added a one-shot guest thread/EIP snapshot when the opt-in browser boot heartbeat stops for ten seconds.

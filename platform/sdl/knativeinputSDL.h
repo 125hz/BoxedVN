@@ -41,6 +41,12 @@ public:
     bool mouseMove(int x, int y, bool relative) override;
     bool mouseWheel(int amount, int x, int y) override;
     bool mouseButton(U32 down, U32 button, int x, int y) override;
+    // UIKit's guest overlay already resolved the presentation transform and
+    // supplies client pixels.  These entry points deliberately skip SDL's
+    // host-window transform so direct touch and the visible trackpad cursor
+    // cannot accumulate a second scale/offset or integer round trip.
+    bool mouseMoveGuest(int x, int y, bool relative = false);
+    bool mouseButtonGuest(U32 down, U32 button, int x, int y);
     bool key(U32 sdlScanCode, U32 key, U32 down) override;  // the key code is specific to the back end
 
     bool getMousePos(int* x, int* y, bool allowWarp = true) override;
@@ -65,11 +71,12 @@ public:
 
 #ifdef BOXEDWINE_IOS
     // The last pointer position the UIKit overlay injected, in guest screen
-    // coordinates - i.e. already through xFromScreen/yFromScreen.
+    // coordinates. SDL events reach that space through
+    // xFromScreen/yFromScreen; UIKit's overlay supplies it directly.
     //
     // There is no host mouse on iOS. Since build 68 the overlay claims touches
-    // itself and calls mouseMove/mouseButton directly, which reaches the X
-    // server but never reaches SDL, so SDL_GetMouseState keeps reporting 0,0
+    // itself and calls the guest-pixel entry points, which reach the X server
+    // but never reach SDL, so SDL_GetMouseState keeps reporting 0,0
     // for the whole session. getMousePos is not a diagnostic: XQueryPointer is
     // built on it, and Wine's X11 driver answers GetCursorPos from
     // XQueryPointer, so every Windows program that asks where the pointer is -

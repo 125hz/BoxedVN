@@ -394,7 +394,7 @@ struct GameDetailView: View {
     @State private var saveError: String?
 
     private let resolutions = ["default", "640x480", "800x600", "1024x576",
-                               "1280x720", "1920x1080"]
+                               "1280x720", "1280x960", "1920x1080"]
     private let renderers = ["automatic", "wined3d", "dxvk"]
 
     var body: some View {

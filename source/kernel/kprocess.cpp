@@ -1203,7 +1203,12 @@ BString KProcess::getPeImageName(U32 address, U32* imageBase) {
     }
 
     constexpr U32 kAlignment = 0x10000;
-    constexpr U32 kMaxCandidates = 256;  // 16 MiB back
+    // Chromium/NW.js ships a single PE image well above 64 MiB. The original
+    // 16 MiB search ceiling resolved ordinary DLLs but labelled hot addresses
+    // near the far end of nw.dll as "Unknown", precisely where a browser
+    // renderer can spin. This path runs only for diagnostic/module resolution
+    // misses and probes one aligned header per 64 KiB, so cover 128 MiB.
+    constexpr U32 kMaxCandidates = 2048;  // 128 MiB back
     KMemory* memory = this->memory;
     if (!memory) {
         return BString();
@@ -3996,8 +4001,16 @@ static void describeNativePc(KProcess* process, uint64_t pc, char* out,
         snprintf(out, outSize, " mappedGuest=none");
         return;
     }
-    const BString module = process->getModuleName(guestEip);
-    const U32 moduleEip = process->getModuleEip(guestEip);
+    BString module = process->getModuleName(guestEip);
+    U32 moduleEip = process->getModuleEip(guestEip);
+    if (module == "Unknown") {
+        U32 imageBase = 0;
+        const BString peName = process->getPeImageName(guestEip, &imageBase);
+        if (peName.length()) {
+            module = peName;
+            moduleEip = guestEip - imageBase;
+        }
+    }
     snprintf(out, outSize, " mappedGuest=%08X %s+%08X", guestEip,
              module.length() ? module.c_str() : "unknown", moduleEip);
 }
@@ -4028,8 +4041,16 @@ void KProcess::logThreadSnapshot(const char* reason) {
         const U32 ebp = thread->diagnosticEbp.load(std::memory_order_relaxed);
         const U64 dispatches = thread->diagnosticDispatchCount.load(
             std::memory_order_relaxed);
-        const BString module = eip ? getModuleName(eip) : BString();
-        const U32 moduleEip = eip ? getModuleEip(eip) : 0;
+        BString module = eip ? getModuleName(eip) : BString();
+        U32 moduleEip = eip ? getModuleEip(eip) : 0;
+        if (eip && module == "Unknown") {
+            U32 imageBase = 0;
+            const BString peName = getPeImageName(eip, &imageBase);
+            if (peName.length()) {
+                module = peName;
+                moduleEip = eip - imageBase;
+            }
+        }
         // The dispatch counter and the EIP above are only refreshed at
         // dispatch boundaries, and Boxedwine's JIT chains blocks: a spin loop
         // can execute entirely inside compiled code without ever returning to
@@ -4069,6 +4090,37 @@ void KProcess::logThreadSnapshot(const char* reason) {
                  vulkanText, liveText);
         if (syscallText[0]) {
             klog_fmt("    tid=%04X%s", thread->id, syscallText);
+        }
+        // A live, runnable EIP with rising native CPU time is the signature of
+        // a translated guest spin. x86 instructions are variable length, so
+        // include enough bytes before and after the sample for an offline
+        // disassembler to synchronise. This is bounded to the one-shot hang
+        // snapshot and is useful for every engine, unlike an injected game
+        // script or a title-specific interpreter range.
+        if (!waitingCond && liveEip && memory && liveEip >= 64 &&
+            memory->canRead(liveEip - 64, 96)) {
+            U8 bytes[96];
+            memory->memcpy(bytes, liveEip - 64, sizeof(bytes));
+            char encoded[sizeof(bytes) * 3 + 1] = {};
+            for (size_t byte = 0; byte < sizeof(bytes); ++byte) {
+                snprintf(encoded + byte * 3, sizeof(encoded) - byte * 3,
+                         "%02X%s", bytes[byte],
+                         byte + 1 == sizeof(bytes) ? "" : " ");
+            }
+            BString liveModule = getModuleName(liveEip);
+            U32 liveOffset = getModuleEip(liveEip);
+            if (liveModule == "Unknown") {
+                U32 imageBase = 0;
+                const BString peName = getPeImageName(liveEip, &imageBase);
+                if (peName.length()) {
+                    liveModule = peName;
+                    liveOffset = liveEip - imageBase;
+                }
+            }
+            klog_fmt("    tid=%04X live code %s+%08X [%08X..%08X], "
+                     "sample at +64: %s", thread->id,
+                     liveModule.length() ? liveModule.c_str() : "unknown",
+                     liveOffset, liveEip - 64, liveEip + 32, encoded);
         }
 #if defined(__APPLE__)
         {

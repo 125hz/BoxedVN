@@ -384,15 +384,16 @@ std::vector<std::string> BVNBuildLaunchArguments(
         // absolute pointer positions back through that stale monitor, so an
         // otherwise-correct x=1218 arrives at the Windows game near x=761.
         //
-        // Start generic game sessions on a coherent 1280x720 virtual monitor.
-        // This remains title-independent: every imported Wine game with no
-        // explicit resolution gets the same 16:9 desktop before Wine caches
-        // its monitor geometry. Some older, non-DPI-aware games expose a
-        // narrower internal input range at 1280x720; their launch setting can
-        // explicitly select 1024x576 without changing the desktop or defaults
-        // for future games.
+        // Start generic game sessions on a coherent 1280x960 virtual monitor.
+        // Wine caches Windows monitor geometry before a game creates its
+        // rendering client. A 1280x720 desktop still failed for 1280x960
+        // visual novels: their visible client extended below the cached
+        // monitor and Windows pointer conversion rejected or compressed the
+        // otherwise-correct lower-screen coordinates. 1280x960 contains both
+        // common 1280-wide 16:9 clients and 4:3 clients without guessing a
+        // title. A user-selected resolution remains authoritative.
         argv.push_back("-resolution");
-        argv.push_back("1280x720");
+        argv.push_back("1280x960");
     }
     if (launch.bitsPerPixel == 16 || launch.bitsPerPixel == 32) {
         argv.push_back("-bpp");
