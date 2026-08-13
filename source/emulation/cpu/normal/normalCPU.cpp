@@ -415,6 +415,18 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
         }
         if (!forceInterpreter && !KSystem::interpreterModules.empty()) {
             mappedModule = this->thread->process->getModuleName(startIp);
+            if (mappedModule == "Unknown") {
+                // Every DLL a Windows program ships with is mapped as a
+                // section rather than as a Unix file, so the name above is
+                // "Unknown" for all of them and no request could ever match
+                // one. An accepted -interpreterModule that silently selects
+                // nothing is worse than a rejected one.
+                const BString peName =
+                    this->thread->process->getPeImageName(startIp);
+                if (peName.length()) {
+                    mappedModule = peName;
+                }
+            }
             for (const auto& requestedModule : KSystem::interpreterModules) {
                 if (mappedModule.contains(requestedModule, true)) {
                     forceInterpreter = true;

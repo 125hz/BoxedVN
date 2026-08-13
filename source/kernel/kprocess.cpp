@@ -1189,6 +1189,104 @@ BString KProcess::getModuleName(U32 eip) {
     return B("Unknown");
 }
 
+BString KProcess::getPeImageName(U32 address, U32* imageBase) {
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(peImageMutex);
+        for (const PeImageRange& image : this->peImages) {
+            if (address >= image.base && address < image.end) {
+                if (imageBase) {
+                    *imageBase = image.base;
+                }
+                return image.name;
+            }
+        }
+    }
+
+    constexpr U32 kAlignment = 0x10000;
+    constexpr U32 kMaxCandidates = 256;  // 16 MiB back
+    KMemory* memory = this->memory;
+    if (!memory) {
+        return BString();
+    }
+
+    U32 base = address & ~(kAlignment - 1);
+    for (U32 step = 0; step < kMaxCandidates; ++step) {
+        if (base < kAlignment) {
+            break;
+        }
+        if (memory->canRead(base, 0x40)) {
+            U8 dos[0x40];
+            memory->memcpy(dos, base, sizeof(dos));
+            if (dos[0] == 'M' && dos[1] == 'Z') {
+                const U32 lfanew = (U32)dos[0x3C] | ((U32)dos[0x3D] << 8) |
+                                   ((U32)dos[0x3E] << 16) |
+                                   ((U32)dos[0x3F] << 24);
+                if (lfanew >= 0x40 && lfanew <= 0x1000 &&
+                    memory->canRead(base + lfanew, 0x100)) {
+                    U8 pe[0x100];
+                    memory->memcpy(pe, base + lfanew, sizeof(pe));
+                    const U16 magic = (U16)pe[0x18] | ((U16)pe[0x19] << 8);
+                    const U32 sizeOfImage =
+                        (U32)pe[0x50] | ((U32)pe[0x51] << 8) |
+                        ((U32)pe[0x52] << 16) | ((U32)pe[0x53] << 24);
+                    if (pe[0] == 'P' && pe[1] == 'E' && pe[2] == 0 &&
+                        pe[3] == 0 && magic == 0x10B && sizeOfImage != 0 &&
+                        address - base < sizeOfImage) {
+                        char name[64] = {};
+                        const U32 exportRva =
+                            (U32)pe[0x78] | ((U32)pe[0x79] << 8) |
+                            ((U32)pe[0x7A] << 16) | ((U32)pe[0x7B] << 24);
+                        if (exportRva != 0 && exportRva < sizeOfImage &&
+                            memory->canRead(base + exportRva, 0x10)) {
+                            U8 directory[0x10];
+                            memory->memcpy(directory, base + exportRva,
+                                           sizeof(directory));
+                            const U32 nameRva =
+                                (U32)directory[0x0C] |
+                                ((U32)directory[0x0D] << 8) |
+                                ((U32)directory[0x0E] << 16) |
+                                ((U32)directory[0x0F] << 24);
+                            if (nameRva != 0 && nameRva < sizeOfImage) {
+                                for (U32 i = 0; i + 1 < sizeof(name); ++i) {
+                                    if (!memory->canRead(base + nameRva + i, 1)) {
+                                        name[i] = 0;
+                                        break;
+                                    }
+                                    U8 c = 0;
+                                    memory->memcpy(&c, base + nameRva + i, 1);
+                                    name[i] = (char)c;
+                                    if (c == 0) {
+                                        break;
+                                    }
+                                    if (c < 0x20 || c > 0x7E) {
+                                        name[0] = 0;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        PeImageRange found;
+                        found.base = base;
+                        found.end = base + sizeOfImage;
+                        found.name = B(name[0] ? name : "unnamed PE image");
+                        {
+                            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(peImageMutex);
+                            this->peImages.push_back(found);
+                        }
+                        if (imageBase) {
+                            *imageBase = base;
+                        }
+                        return found.name;
+                    }
+                }
+            }
+        }
+        base -= kAlignment;
+    }
+    return BString();
+}
+
 U32 KProcess::getModuleEip(U32 eip) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mappedFilesMutex);
     for (auto& n : this->mappedFiles) {

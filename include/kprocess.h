@@ -223,6 +223,23 @@ public:
     U32 createString(KThread* thread, const BString& str);
 
     BString getModuleName(U32 eip);
+
+    // The name of the Windows PE image containing `address`, or an empty
+    // string.
+    //
+    // getModuleName above only knows Unix mmap'd files - the .so modules Wine
+    // itself is built from - so it answers "Unknown" for anything Wine's
+    // loader mapped as a section, which is every DLL a Windows program ships
+    // with. That gap was silent and it mattered twice: a crash inside
+    // ffmpeg.dll could not be attributed, and -interpreterModule, which
+    // matches on this name, could never select such a module at all - the
+    // request was accepted and then quietly matched nothing.
+    //
+    // Resolved by walking back from the address on the 64 KiB boundaries PE
+    // images are mapped on and reading the headers. Results are cached per
+    // image, because this is consulted per decoded block when an interpreter
+    // module has been requested.
+    BString getPeImageName(U32 address, U32* imageBase = nullptr);
     U32 getModuleEip(U32 eip);
     MappedFilePtr getMappedFileForRange(U32 address, U32 len);
 #ifdef __TEST
@@ -439,6 +456,14 @@ private:
     // needs to be static, since during clone, the file pages and mappedFiles are cloned with the same map index, so this nextMappedFileIndex must be shared across processes
     static std::atomic_int nextMappedFileIndex;
     BOXEDWINE_MUTEX mappedFilesMutex;
+
+    struct PeImageRange {
+        U32 base = 0;
+        U32 end = 0;
+        BString name;
+    };
+    BOXEDWINE_MUTEX peImageMutex;
+    std::vector<PeImageRange> peImages;
 #ifdef __TEST
     std::shared_ptr<std::function<void()>> testAfterMappedFileRangeSnapshotHook;
     std::shared_ptr<std::function<void()>> testAfterCloneMemorySnapshotHook;

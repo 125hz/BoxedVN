@@ -317,103 +317,6 @@ void CPU::prepareFpuException(int code, int trapNo, int error) {
 // glance: a genuine zero operand is visible in the registers, while a
 // divisor that is plainly non-zero at the moment of the trap points at the
 // translation instead.
-// Names the PE image an address falls inside, when the process's mapped-file
-// table cannot.
-//
-// KProcess::getModuleName only knows Unix mmap'd files - the .so modules Wine
-// itself is built from - so every address inside a Windows DLL that Wine's
-// loader mapped as a section reports "Unknown". That is most of the guest.
-// A device crash landed at 0x76B8D515 and the report could say nothing about
-// which component it was in, which is the difference between a bug report and
-// a shrug.
-//
-// PE images are mapped on 64 KiB boundaries, so walking back from the address
-// looking for one whose headers cover it is reliable and bounded: at most 256
-// candidates, each rejected on the first byte that does not match. Every read
-// is guarded, because this runs on a thread that is already in trouble and
-// must not turn a reportable fault into a crash inside the reporter.
-static bool describePeModule(KThread* thread, U32 address, char* out,
-                             size_t outSize) {
-    constexpr U32 kAlignment = 0x10000;
-    constexpr U32 kMaxCandidates = 256;  // 16 MiB back
-    KMemory* memory = thread->memory;
-
-    U32 base = address & ~(kAlignment - 1);
-    for (U32 step = 0; step < kMaxCandidates; ++step, base -= kAlignment) {
-        if (base < kAlignment || !memory->canRead(base, 0x40)) {
-            if (base < kAlignment) {
-                break;
-            }
-            continue;
-        }
-        U8 dos[0x40];
-        memory->memcpy(dos, base, sizeof(dos));
-        if (dos[0] != 'M' || dos[1] != 'Z') {
-            continue;
-        }
-        const U32 lfanew = (U32)dos[0x3C] | ((U32)dos[0x3D] << 8) |
-                           ((U32)dos[0x3E] << 16) | ((U32)dos[0x3F] << 24);
-        if (lfanew < 0x40 || lfanew > 0x1000 ||
-            !memory->canRead(base + lfanew, 0x100)) {
-            continue;
-        }
-        U8 pe[0x100];
-        memory->memcpy(pe, base + lfanew, sizeof(pe));
-        if (pe[0] != 'P' || pe[1] != 'E' || pe[2] != 0 || pe[3] != 0) {
-            continue;
-        }
-        const U16 magic = (U16)pe[0x18] | ((U16)pe[0x19] << 8);
-        if (magic != 0x10B) {  // PE32; the guest is 32-bit by construction
-            continue;
-        }
-        const U32 sizeOfImage = (U32)pe[0x50] | ((U32)pe[0x51] << 8) |
-                                ((U32)pe[0x52] << 16) | ((U32)pe[0x53] << 24);
-        if (sizeOfImage == 0 || address - base >= sizeOfImage) {
-            continue;
-        }
-
-        // The export directory's Name field is the image's own idea of what
-        // it is called, which beats anything reconstructed from a path.
-        const U32 exportRva = (U32)pe[0x78] | ((U32)pe[0x79] << 8) |
-                              ((U32)pe[0x7A] << 16) | ((U32)pe[0x7B] << 24);
-        char name[64] = {};
-        if (exportRva != 0 && exportRva < sizeOfImage &&
-            memory->canRead(base + exportRva, 0x10)) {
-            U8 exportDirectory[0x10];
-            memory->memcpy(exportDirectory, base + exportRva,
-                           sizeof(exportDirectory));
-            const U32 nameRva =
-                (U32)exportDirectory[0x0C] | ((U32)exportDirectory[0x0D] << 8) |
-                ((U32)exportDirectory[0x0E] << 16) |
-                ((U32)exportDirectory[0x0F] << 24);
-            if (nameRva != 0 && nameRva < sizeOfImage) {
-                for (size_t index = 0; index + 1 < sizeof(name); ++index) {
-                    if (!memory->canRead(base + nameRva + (U32)index, 1)) {
-                        name[index] = '\0';
-                        break;
-                    }
-                    U8 character = 0;
-                    memory->memcpy(&character, base + nameRva + (U32)index, 1);
-                    name[index] = (char)character;
-                    if (character == 0) {
-                        break;
-                    }
-                    if (character < 0x20 || character > 0x7E) {
-                        name[0] = '\0';  // Not a name; do not report noise.
-                        break;
-                    }
-                }
-            }
-        }
-
-        snprintf(out, outSize, "%s+%.8X (image at %.8X)",
-                 name[0] != '\0' ? name : "unnamed PE image", address - base,
-                 base);
-        return true;
-    }
-    return false;
-}
-
 static void logDivideExceptionSnapshot(CPU* cpu, int error) {
     static std::atomic<U32> loggedDivideCount{0};
     if (loggedDivideCount.fetch_add(1, std::memory_order_relaxed) >= 16) {
@@ -427,9 +330,15 @@ static void logDivideExceptionSnapshot(CPU* cpu, int error) {
 
     // Fall back to the PE headers when the mapped-file table has nothing,
     // which is the normal case for anything Wine's loader mapped.
-    char location[128];
+    char location[160];
     if (module == "Unknown") {
-        if (!describePeModule(thread, eip, location, sizeof(location))) {
+        U32 imageBase = 0;
+        const BString peName =
+            thread->process->getPeImageName(eip, &imageBase);
+        if (peName.length()) {
+            snprintf(location, sizeof(location), "%s+%.8X (image at %.8X)",
+                     peName.c_str(), eip - imageBase, imageBase);
+        } else {
             snprintf(location, sizeof(location),
                      "unidentified (no PE image found below this address)");
         }
