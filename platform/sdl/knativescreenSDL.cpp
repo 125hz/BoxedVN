@@ -49,6 +49,10 @@ extern "C" void BVNGuestLoadingUpdateJITProgress(size_t allocationCount) {
     BVNGuestStartupNoticeSetProgress(allocationCount);
 }
 
+extern "C" void BVNGuestLogThreadSnapshot(const char* reason) {
+    KSystem::logThreadSnapshot(reason);
+}
+
 // ---------------------------------------------------------------------------
 // The bridge used by the UIKit guest overlay (ios/runtime/src/BVNGuestOverlay.mm).
 //

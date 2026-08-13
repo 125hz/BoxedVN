@@ -46,7 +46,12 @@
 #include <thread>
 
 #include "BVNRuntime.h"
-#include "ksystem.h"
+
+// Implemented in the SDL/core translation unit, which already includes
+// boxedwine.h in the order its internal headers require. Pulling ksystem.h
+// directly into this Objective-C++ bridge makes Foundation's NSString a
+// misleading fallback for Boxedwine's not-yet-declared BString.
+extern "C" void BVNGuestLogThreadSnapshot(const char* reason);
 
 namespace {
 
@@ -125,7 +130,7 @@ void startBootHeartbeatWatch() {
             BVNLogWrite(BVNLogLevelWarning, "diagnostics",
                         "Browser boot heartbeat stopped for 10 seconds; "
                         "capturing every guest thread and live EIP once.");
-            KSystem::logThreadSnapshot(
+            BVNGuestLogThreadSnapshot(
                 "browser boot heartbeat stopped for 10 seconds");
         }
     }).detach();
