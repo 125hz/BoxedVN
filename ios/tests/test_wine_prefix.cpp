@@ -585,3 +585,41 @@ BOXEDVN_TEST(japanese_prefix_sets_the_ansi_codepage_wine_converts_filenames_with
 
     fs::remove_all(temporary, ec);
 }
+
+BOXEDVN_TEST(prefix_creates_the_user_shell_folders_windows_programs_assume) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-prefix-shell-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    const fs::path prefix = temporary / "prefix";
+    fs::create_directories(prefix / "home/username/.wine", ec);
+    const fs::path archive = temporary / "rootfs.zip";
+
+    zipFile zip = zipOpen64(archive.string().c_str(), APPEND_STATUS_CREATE);
+    CHECK(zip != nullptr);
+    if (zip != nullptr) {
+        CHECK(addZipEntry(zip, "home/username/.wine/user.reg",
+                          "WINE REGISTRY Version 2\n"));
+        CHECK(addZipEntry(zip, "home/username/.wine/system.reg",
+                          "WINE REGISTRY Version 2\n"));
+        zipClose(zip, nullptr);
+    }
+    std::ofstream(prefix / "home/username/.wine/user.reg")
+        << "WINE REGISTRY Version 2\n";
+    std::ofstream(prefix / "home/username/.wine/system.reg")
+        << "WINE REGISTRY Version 2\n";
+
+    CHECK(prepareWinePrefix(archive.string(), prefix.string(),
+                            WineRenderer::Vulkan).ok);
+
+    const fs::path user =
+        prefix / "home/username/.wine/drive_c/users/username";
+    // Documents is the one that matters most: a save path is normally built
+    // from it, and a game that cannot find it reports its own fallback
+    // failing rather than a missing folder.
+    CHECK(fs::is_directory(user / "Documents", ec));
+    CHECK(fs::is_directory(user / "Saved Games", ec));
+    CHECK(fs::is_directory(user / "AppData/Roaming", ec));
+
+    fs::remove_all(temporary, ec);
+}

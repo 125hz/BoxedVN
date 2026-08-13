@@ -670,6 +670,34 @@ WinePrefixPreparationResult prepareWinePrefix(
         result.changed = true;
     }
 
+    // Windows programs assume the user's shell folders exist. Wine creates
+    // them when it bootstraps a prefix, but BoxedVN's prefixes are made by
+    // copying the registry out of a pre-built root filesystem, so whatever
+    // that root happened to contain is what a game gets - and a game that
+    // cannot find My Documents does not report a missing folder, it reports
+    // whatever its own fallback path fails at three steps later.
+    //
+    // A KiriKiri title looks for its save directory under Documents, finds
+    // nothing, falls back to a path built from its window title, and dies
+    // with "Member \"kag\" does not exist" - four steps from the cause.
+    {
+        const fs::path user = fs::path(writableRootPath) / "home" / "username" /
+            ".wine" / "drive_c" / "users" / "username";
+        for (const char* folder : {"Documents", "Desktop", "Downloads",
+                                   "Music", "Pictures", "Videos",
+                                   "Saved Games", "AppData/Roaming",
+                                   "AppData/Local"}) {
+            std::error_code createEc;
+            const fs::path target = user / fs::path(folder);
+            if (!fs::exists(target, createEc)) {
+                fs::create_directories(target, createEc);
+                if (!createEc) {
+                    result.changed = true;
+                }
+            }
+        }
+    }
+
     if (codepage == WineAnsiCodepage::Japanese) {
         // What Wine consults to convert a program's 8-bit strings, including
         // every filename it opens. MACCP is the Macintosh codepage Wine also
