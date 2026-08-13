@@ -1,3 +1,8 @@
+BoxedVN 0.1.0 (124)
+* Made fake-fullscreen pointer queries, warps, motion and button events share the exact 0,0-based pixels presented by UIKit.
+* Kept the X11 root and Wine's cached Screen at the same guest resolution instead of leaking decorated-window offsets into the virtual desktop.
+* Added an NW.js/Electron compatibility CPU path that interprets anonymous generated x86 while leaving mapped Wine and browser modules JIT-compiled.
+
 BoxedVN 0.1.0 (123)
 * Started default Wine game sessions on a 1280x960 monitor so 1280x960 clients never outgrow Wine's cached desktop input geometry.
 * Delivered iOS direct-touch and trackpad coordinates to X11 as exact presented guest pixels, without a redundant guest-to-SDL-to-guest transform.

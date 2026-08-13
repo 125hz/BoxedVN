@@ -558,8 +558,24 @@ static void x11_UngrabPointer(CPU* cpu) {
 
 // int XWarpPointer(Display* display, Window src_w, Window dest_w, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y)
 static void x11_WarpPointer(CPU* cpu) {
-    KNativeSystem::getCurrentInput()->setMousePos(ARG8, ARG9);
-    EAX = Success;
+	S32 x = ARG8;
+	S32 y = ARG9;
+#ifdef BOXEDWINE_IOS
+	XServer* server = XServer::getServer(true);
+	if (server && server->fakeFullScreenWnd && ARG3 &&
+		ARG3 != server->getRoot()->id &&
+		ARG3 != server->fakeFullScreenWnd->id) {
+		XWindowPtr destination = server->getWindow(ARG3);
+		if (destination) {
+			// XWarpPointer's destination is relative to dest_w. Convert from
+			// that physical hierarchy into the virtual presented client.
+			destination->windowToScreen(x, y);
+			server->fakeFullScreenWnd->screenToWindow(x, y);
+		}
+	}
+#endif
+	KNativeSystem::getCurrentInput()->setMousePos(x, y);
+	EAX = Success;
 }
 
 // Bool XQueryPointer(Display* display, Window w, Window* root_return, Window* child_return, int* root_x_return, int* root_y_return, int* win_x_return, int* win_y_return, unsigned int* mask_return)
@@ -582,11 +598,29 @@ static void x11_QueryPointer(CPU* cpu) {
 #endif
     memory->writed(ARG3, root->id);
 
-    XWindowPtr child = root->getWindowFromPoint(x, y);
-    memory->writed(ARG4, child->id);
+	XWindowPtr child;
+#ifdef BOXEDWINE_IOS
+	if (server->fakeFullScreenWnd && x >= 0 && y >= 0 &&
+		x < (S32)server->fakeFullScreenWnd->width() &&
+		y < (S32)server->fakeFullScreenWnd->height()) {
+		child = server->fakeFullScreenWnd;
+	} else
+#endif
+	{
+		child = root->getWindowFromPoint(x, y);
+	}
+	memory->writed(ARG4, child->id);
     memory->writed(ARG5, x);
     memory->writed(ARG6, y);
-    window->screenToWindow(x, y);
+	// x/y are virtual root pixels while non-root XWindow geometry remains in
+	// the physical compositor hierarchy. Convert through the active client's
+	// real origin only for a non-root query.
+#ifdef BOXEDWINE_IOS
+	if (server->fakeFullScreenWnd && window->id != root->id) {
+		server->fakeFullScreenWnd->windowToScreen(x, y);
+	}
+#endif
+	window->screenToWindow(x, y);
     memory->writed(ARG7, x);
     memory->writed(ARG8, y);
     const U32 inputModifiers = server->getInputModifiers();

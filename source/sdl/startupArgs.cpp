@@ -371,6 +371,9 @@ std::vector<BString> StartUpArgs::buildArgs() {
     if (this->disableWasmJitForWrittenCode) {
         args.push_back(B("-disableWasmJitForWrittenCode"));
     }
+    if (this->interpreterAnonymousExecutable) {
+        args.push_back(B("-interpreterAnonymousExecutable"));
+    }
     for (const auto& module : this->interpreterModules) {
         args.push_back(B("-interpreterModule"));
         args.push_back(module);
@@ -400,6 +403,8 @@ bool StartUpArgs::apply() {
     KSystem::forceRelativeMouse = this->forceRelativeMouse;
     KSystem::cacheReads = this->cacheReads;
     KSystem::disableWasmJitForWrittenCode = this->disableWasmJitForWrittenCode;
+    KSystem::interpreterAnonymousExecutable =
+        this->interpreterAnonymousExecutable;
     KSystem::interpreterModules = this->interpreterModules;
     KSystem::interpreterRanges = this->interpreterRanges;
     for (const auto& module : KSystem::interpreterModules) {
@@ -411,6 +416,10 @@ bool StartUpArgs::apply() {
         klog_fmt("Compatibility CPU profile: interpret guest range "
                  "%.8X-%.8X; JIT remains enabled outside it",
                  range.first, range.second);
+    }
+    if (KSystem::interpreterAnonymousExecutable) {
+        klog("Compatibility CPU profile: interpret anonymous executable "
+             "guest memory; JIT remains enabled for mapped ELF and PE code");
     }
     KSystem::pentiumLevel = this->pentiumLevel;
     KSystem::pollRate = this->pollRate;
@@ -977,6 +986,8 @@ bool StartUpArgs::parseStartupArgs(int argc, const char **argv) {
             this->cacheReads = true;
         }  else if (!strcmp(argv[i], "-disableWasmJitForWrittenCode")) {
             this->disableWasmJitForWrittenCode = true;
+        } else if (!strcmp(argv[i], "-interpreterAnonymousExecutable")) {
+            this->interpreterAnonymousExecutable = true;
         } else if (!strcmp(argv[i], "-interpreterModule") && i + 1 < argc) {
             this->interpreterModules.push_back(BString::copy(argv[i + 1]));
             i++;

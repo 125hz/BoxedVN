@@ -765,23 +765,17 @@ void XServer::setFakeFullScreenWindow(XWindowPtr wnd) {
 			savedRootSizeForFakeFullScreen = true;
 		}
 
-		// iOS presents the Vulkan client as the whole native screen even while
-		// Wine keeps its decorated X11 window at a non-zero root position. The
-		// SDL/input surface was resized to the client, but the X11 root was not.
-		// Wine therefore scaled root-space pointer coordinates through the old
-		// desktop size and a game scaled them again to its backbuffer. Expand the
-		// virtual root far enough to contain the presented client. Do not call
-		// changeScreen(): that would resize SDL a second time and create another
-		// independent presentation transform.
+		// iOS presents the Vulkan client as the whole virtual desktop even
+		// while Wine keeps its decorated compositor window at a private,
+		// non-zero X11 position. Root geometry and Xlib's cached Screen must
+		// describe the same 0,0-based space. Expanding the root by the title-bar
+		// offset produced 1288x1013 beside a 1280x960 Screen, so cursor polling
+		// and button events could never agree near the bottom of the game.
 		S32 clientX = 0;
 		S32 clientY = 0;
 		wnd->windowToScreen(clientX, clientY);
-		const U32 requiredWidth = (U32)std::max<S32>(
-			(S32)wnd->width(), clientX + (S32)wnd->width());
-		const U32 requiredHeight = (U32)std::max<S32>(
-			(S32)wnd->height(), clientY + (S32)wnd->height());
-		const U32 rootWidth = std::max(root->width(), requiredWidth);
-		const U32 rootHeight = std::max(root->height(), requiredHeight);
+		const U32 rootWidth = wnd->width();
+		const U32 rootHeight = wnd->height();
 		if (rootWidth != root->width() || rootHeight != root->height()) {
 			root->moveResize(0, 0, rootWidth, rootHeight);
 			U32 rect[] = {0, 0, rootWidth, rootHeight};

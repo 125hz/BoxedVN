@@ -155,6 +155,7 @@ public:
     static bool forceRelativeMouse;
     static bool cacheReads;
     static bool disableWasmJitForWrittenCode;
+    static bool interpreterAnonymousExecutable;
     // Title-scoped compatibility pulse for event-driven X11 render loops.
     // Module-name fragments that must use the decoded interpreter while the
     // rest of the guest continues through the native JIT. Used by bounded

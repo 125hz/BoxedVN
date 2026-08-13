@@ -224,20 +224,15 @@ bool KNativeInputSDL::getMousePos(int* x, int* y, bool allowWarp) {
     }
 #endif
 #ifdef BOXEDWINE_IOS
-    // Already fake-fullscreen client coordinates - mouseMove/mouseButton put
-    // them through xFromScreen on the way in, so they must not go through it
-    // again. Validate in that client space, then convert once to X11 root
-    // coordinates. XQueryPointer and the server's hit-testing callers expect
-    // root coordinates; the old screenToWindow call converted in the opposite
-    // direction and XQueryPointer subtracted the client origin a second time.
+    // The presented fake-fullscreen client *is* the virtual root coordinate
+    // space on iOS. Its decorated X11 window may physically sit at 8,53, but
+    // exposing that private compositor offset through GetCursorPos makes a
+    // 1280x960 game see positions outside Wine's 1280x960 Screen. Keep the
+    // injected pointer in the same 0,0-based guest pixels UIKit displays.
     if (hasInjectedPointer) {
         *x = injectedX;
         *y = injectedY;
-        const bool valid = checkMousePos(*x, *y, allowWarp);
-        if (XServer::getServer(true) && XServer::getServer()->fakeFullScreenWnd) {
-            XServer::getServer()->fakeFullScreenWnd->windowToScreen(*x, *y);
-        }
-        return valid;
+        return checkMousePos(*x, *y, allowWarp);
     }
 #endif
     SDL_GetMouseState(x, y);
@@ -245,9 +240,11 @@ bool KNativeInputSDL::getMousePos(int* x, int* y, bool allowWarp) {
     *x = xFromScreen(*x);
     *y = yFromScreen(*y);
 
+#ifndef BOXEDWINE_IOS
     if (XServer::getServer(true) && XServer::getServer()->fakeFullScreenWnd) {
         XServer::getServer()->fakeFullScreenWnd->screenToWindow(*x, *y);
     }
+#endif
     return checkMousePos(*x, *y, false);
 }
 
@@ -315,7 +312,7 @@ bool KNativeInputSDL::checkMousePos(int& x, int& y, bool allowWarp) {
         warp = true;
     }
     if (y >= (int)height) {
-        y = (int)height;
+        y = (int)height - 1;
         warp = true;
     }
     if (allowWarp && warp) {

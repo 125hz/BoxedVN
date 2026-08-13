@@ -248,6 +248,7 @@ BOXEDVN_TEST(engineProfileAppendsSwitchesForAnImportedNwJsGame) {
     CHECK_EQ(launch.arguments.size(),
              chromiumCompatibilitySwitches().size());
     CHECK_EQ(launch.arguments[0], std::string("--no-sandbox"));
+    CHECK(launch.interpretAnonymousExecutable);
 
     // The switches must reach the guest after the executable, which is where
     // Chromium parses its command line from.
@@ -259,6 +260,9 @@ BOXEDVN_TEST(engineProfileAppendsSwitchesForAnImportedNwJsGame) {
     CHECK(executable != argv.end());
     CHECK(sandbox != argv.end());
     CHECK(executable < sandbox);
+    CHECK(std::find(argv.begin(), argv.end(),
+                    std::string("-interpreterAnonymousExecutable")) !=
+          argv.end());
 }
 
 BOXEDVN_TEST(engineProfileAddsToTheUsersOwnSwitchesRatherThanStandingDown) {
@@ -360,6 +364,7 @@ BOXEDVN_TEST(engineProfileHonoursAnExplicitOptOut) {
         BVNApplyEngineCompatibilityProfile(launch);
     CHECK(!result.applied);
     CHECK_CONTAINS(result.reason, "no default switches");
+    CHECK(!launch.interpretAnonymousExecutable);
 
     // The opt-out is BoxedVN's own word and must never reach the guest, which
     // would reject it or treat it as an unknown switch.

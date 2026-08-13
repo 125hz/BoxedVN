@@ -402,6 +402,7 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
         // order, so nesting getModuleName() under the memory lock could
         // deadlock a concurrent loader thread.
         bool forceInterpreter = false;
+        bool matchedAnonymousExecutable = false;
         BString mappedModule;
         U32 matchedRangeStart = 0;
         U32 matchedRangeEnd = 0;
@@ -431,6 +432,22 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                 if (mappedModule.contains(requestedModule, true)) {
                     forceInterpreter = true;
                     break;
+                }
+            }
+        }
+        if (!forceInterpreter && KSystem::interpreterAnonymousExecutable) {
+            if (!mappedModule.length()) {
+                mappedModule = this->thread->process->getModuleName(startIp);
+            }
+            if (mappedModule == "Unknown") {
+                const BString peName =
+                    this->thread->process->getPeImageName(startIp);
+                if (peName.length()) {
+                    mappedModule = peName;
+                } else {
+                    forceInterpreter = true;
+                    matchedAnonymousExecutable = true;
+                    mappedModule = B("anonymous executable memory");
                 }
             }
         }
@@ -514,6 +531,10 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                              "%.8X-%.8X at %.8X; using the interpreter only "
                              "inside that range", matchedRangeStart,
                              matchedRangeEnd, startIp);
+                } else if (matchedAnonymousExecutable) {
+                    klog_fmt("Compatibility CPU activated for anonymous "
+                             "executable memory at %.8X; mapped ELF and PE "
+                             "code remains JIT compiled", startIp);
                 } else {
                     klog_fmt("Compatibility CPU activated for %s at %.8X; "
                              "using the interpreter for this module only",

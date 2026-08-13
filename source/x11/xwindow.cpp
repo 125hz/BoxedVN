@@ -1246,6 +1246,15 @@ void XWindow::motionNotify(const DisplayDataPtr& data, S32 x, S32 y) {
 	S32 window_x = x;
 	S32 window_y = y;
 	screenToWindow(window_x, window_y);
+	S32 virtual_root_x = x;
+	S32 virtual_root_y = y;
+#ifdef BOXEDWINE_IOS
+	XServer* server = XServer::getServer(true);
+	if (server && server->fakeFullScreenWnd) {
+		server->fakeFullScreenWnd->screenToWindow(virtual_root_x,
+			virtual_root_y);
+	}
+#endif
 
 	// winex11 doesn't seem to use subwindow
 	XEvent event = {};
@@ -1258,8 +1267,8 @@ void XWindow::motionNotify(const DisplayDataPtr& data, S32 x, S32 y) {
 	event.xmotion.time = XServer::getServer()->getEventTime();
 	event.xmotion.x = window_x;
 	event.xmotion.y = window_y;
-	event.xmotion.x_root = x;
-	event.xmotion.y_root = y;
+	event.xmotion.x_root = virtual_root_x;
+	event.xmotion.y_root = virtual_root_y;
 	event.xmotion.state = XServer::getServer()->getInputModifiers();
 	event.xmotion.is_hint = NotifyNormal;
 	event.xmotion.same_screen = True;
@@ -1475,6 +1484,15 @@ void XWindow::buttonNotify(const DisplayDataPtr& data, U32 button, S32 x, S32 y,
 	S32 window_x = x;
 	S32 window_y = y;
 	screenToWindow(window_x, window_y);
+	S32 virtual_root_x = x;
+	S32 virtual_root_y = y;
+#ifdef BOXEDWINE_IOS
+	XServer* server = XServer::getServer(true);
+	if (server && server->fakeFullScreenWnd) {
+		server->fakeFullScreenWnd->screenToWindow(virtual_root_x,
+			virtual_root_y);
+	}
+#endif
 
 	// winex11 doesn't seem to use subwindow
 	XEvent event = {};
@@ -1487,8 +1505,8 @@ void XWindow::buttonNotify(const DisplayDataPtr& data, U32 button, S32 x, S32 y,
 	event.xbutton.time = XServer::getServer()->getEventTime();
 	event.xbutton.x = window_x;
 	event.xbutton.y = window_y;
-	event.xbutton.x_root = x;
-	event.xbutton.y_root = y;
+	event.xbutton.x_root = virtual_root_x;
+	event.xbutton.y_root = virtual_root_y;
 	event.xbutton.state = XServer::getServer()->getInputModifiers();
 	event.xbutton.button = button;
 	event.xbutton.same_screen = True;	

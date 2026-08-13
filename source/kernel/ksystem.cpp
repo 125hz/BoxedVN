@@ -68,6 +68,7 @@ bool KSystem::disableHideCursor = false;
 bool KSystem::forceRelativeMouse = false;
 bool KSystem::cacheReads = false;
 bool KSystem::disableWasmJitForWrittenCode = false;
+bool KSystem::interpreterAnonymousExecutable = false;
 std::vector<BString> KSystem::interpreterModules;
 bool KSystem::stretchGuestToFill = false;
 std::vector<std::pair<U32, U32>> KSystem::interpreterRanges;
@@ -90,6 +91,7 @@ void KSystem::init() {
     KSystem::pentiumLevel = 4;
 	KSystem::interpreterModules.clear();
 	KSystem::interpreterRanges.clear();
+	KSystem::interpreterAnonymousExecutable = false;
 	KSystem::shutingDown = false;
     KSystem::startTimeTicks = KNativeSystem::getTicks();
     KSystem::startTimeMicroCounter = Platform::getMicroCounter();

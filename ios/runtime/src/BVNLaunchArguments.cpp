@@ -227,11 +227,20 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
         return result;
     }
 
+    // V8 emits x86 into anonymous executable heaps. On ARM64 iOS that x86
+    // otherwise goes through Boxedwine's JIT as a second JIT tier; the device
+    // hang snapshot showed the browser main thread spending 97.7% of a core
+    // in exactly such a block while Blink's decoded-image callback stopped.
+    // Keep Wine and every PE/ELF module JIT compiled, and use the correctness
+    // core only for generated anonymous code shared by NW.js/Electron titles.
+    launch.interpretAnonymousExecutable = true;
+
     result.applied = merged.added > 0 || merged.mergedFeatures;
     result.reason = std::string(engine) + " detected (" + profile.evidence +
         "): a browser engine draws through Windows facilities Wine only "
         "partly implements, so BoxedVN passes Chromium's own switches for "
-        "the sandbox, the GPU process, DirectComposition and occlusion. ";
+        "the sandbox, the GPU process, DirectComposition and occlusion, and "
+        "interprets only anonymously generated browser code. ";
 
     char detail[224];
     snprintf(detail, sizeof(detail),
@@ -468,6 +477,9 @@ std::vector<std::string> BVNBuildLaunchArguments(
     for (const std::string& module : launch.interpreterModules) {
         argv.push_back("-interpreterModule");
         argv.push_back(module);
+    }
+    if (launch.interpretAnonymousExecutable) {
+        argv.push_back("-interpreterAnonymousExecutable");
     }
     for (const auto& range : launch.interpreterRanges) {
         char encodedRange[18];

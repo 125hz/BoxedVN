@@ -1,5 +1,41 @@
 # BoxedVN — Progress and Handoff
 
+## Build 124: unify the virtual desktop and isolate generated browser code
+
+The Build-123 Fate log proves the requested 1280x960 monitor reaches Wine and
+the Vulkan client, but it also exposes the remaining contradiction. Xlib's
+cached `Screen` is 1280x960 while fake-fullscreen synchronization expands the
+X11 root to 1288x1013 to include the decorated client's physical origin at
+8,53. UIKit correctly maps taps into the visible menu band around guest Y=800,
+yet button events and `XQueryPointer` can describe different root positions.
+The private compositor placement is leaking into Windows' public desktop.
+
+Build 124 treats the presented client as the virtual root: UIKit injection,
+SDL mouse state, X11 motion/button root fields, `XQueryPointer`, and
+`XWarpPointer` all use the same 0,0-based guest pixels. Non-root X11 queries
+are converted through the decorated hierarchy only to calculate their local
+coordinates. Root and cached `Screen` dimensions now remain exactly the
+presented client size. This is shared fake-fullscreen infrastructure, not a
+Fate input rule.
+
+The Build-123 Summer snapshot also resolves the earlier `Unknown` address.
+The renderer main thread spends 97.7% of one core in executable memory at
+`38A62833`; no PE header exists below it, while three sampled worker threads
+are merely waiting inside `nw.dll`. The bytes at the hot dispatch boundary
+begin with a normal V8-generated x86 function prologue. The stalled callback
+therefore sits in anonymous browser-generated code rather than image decode,
+audio, DXVK, or a named game DLL.
+
+Build 124 adds an engine-level compatibility CPU policy for Chromium-family
+guests. Anonymous executable blocks run through Boxedwine's decoded
+interpreter, while ELF mappings, Wine, `nw.dll`, graphics and audio remain on
+the ARM64 JIT. The explicit `--bvn-no-default-switches` escape hatch disables
+this along with the other Chromium defaults. This covers NW.js and Electron
+games generally and avoids a Summer-specific script or asset patch.
+
+The Windows host-independent suite passes. The X11/ARM64 changes require the
+iPhoneOS CI compile, and both physical-device outcomes remain pending.
+
 ## Build 123: contain the game before Wine caches its monitor, and identify the browser spin
 
 The build-122 Fate/stay night log proves UIKit is no longer the uncertain
