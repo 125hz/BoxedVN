@@ -119,6 +119,33 @@ std::string bootDiagnosticsScript() {
     (function tick() { frames++; requestAnimationFrame(tick); })();
   } catch (e) {}
 
+  // RPG Maker keeps every bitmap it has asked for in ImageManager's cache,
+  // each carrying a loading state and the URL it came from. A title screen
+  // with no buttons and ImageManager.isReady() false is that cache holding
+  // something that never finished, and the URL says whether the failures
+  // share a directory, an extension, or an encryption scheme.
+  function images() {
+    try {
+      var items = ImageManager._imageCache._items;
+      var total = 0, loaded = 0, failed = 0, pending = 0, examples = [];
+      for (var key in items) {
+        var bitmap = items[key].bitmap;
+        if (!bitmap) { continue; }
+        total++;
+        var state = bitmap._loadingState;
+        if (state === "loaded" || state === "none") { loaded++; }
+        else if (state === "error") {
+          failed++;
+          if (examples.length < 3) { examples.push(bitmap._url || key); }
+        } else { pending++; if (examples.length < 3 && pending <= 1) {
+          examples.push("PENDING:" + (bitmap._url || key) + "=" + state); } }
+      }
+      return total + " loaded=" + loaded + " failed=" + failed
+        + " pending=" + pending
+        + (examples.length ? " [" + examples.join(" | ") + "]" : "");
+    } catch (e) { return "ERR"; }
+  }
+
   // Every @font-face the document declares, with the status Blink gives it.
   // "unloaded" means nobody has asked for it yet, "error" means the file
   // could not be used, and the difference decides whether this is the game's
@@ -157,6 +184,10 @@ std::string bootDiagnosticsScript() {
       + " forcedLoad=" + forced
       + " faces=" + faces()
       + " img=" + ask(function () { return ImageManager.isReady(); })
+      + " bitmaps=" + images()
+      + " encrypted=" + ask(function () {
+            return Decrypter.hasEncryptedImages + "/" +
+                   Decrypter.hasEncryptedAudio; })
       + " db=" + ask(function () { return !!DataManager.isDatabaseLoaded(); })
       + " gameFont=" + ask(function () { return Graphics.isFontLoaded("GameFont"); })
       + " scene=" + ask(function () {

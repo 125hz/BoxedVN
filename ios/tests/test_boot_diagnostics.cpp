@@ -288,3 +288,16 @@ BOXEDVN_TEST(silence_audio_installs_independently_of_the_other_scripts) {
     CHECK(setGuestBootScripts(game.string(), GuestBootScripts{}).changed);
     CHECK_EQ(readAll(document), std::string(kMvDocument));
 }
+
+BOXEDVN_TEST(boot_diagnostics_reports_which_resources_failed) {
+    const std::string script = bootDiagnosticsScript();
+    // "img=false" says the engine is not ready; it does not say what is not
+    // ready. A title screen with no buttons needs the failing URLs.
+    CHECK_CONTAINS(script, "ImageManager._imageCache");
+    CHECK_CONTAINS(script, "_loadingState");
+    CHECK_CONTAINS(script, "bitmaps=");
+    CHECK_CONTAINS(script, "failed=");
+    // Encrypted assets decrypt in JavaScript before decoding, so whether
+    // this title uses them changes where a broken image can come from.
+    CHECK_CONTAINS(script, "hasEncryptedImages");
+}
