@@ -4527,3 +4527,42 @@ proved insufficient against UIKit's animated, asynchronous application of
 it.
 
 160 host-independent tests pass.
+
+---
+
+### Build 112 — the crash is a JIT defect, isolated to one module
+
+`-interpreterModule ffmpeg` was the discriminator, and it answered cleanly.
+
+| run | ffmpeg.dll executed by | divide exceptions |
+|---|---|---|
+| builds 105-111 | ARM64 JIT | every run, same EIP, same registers |
+| build 112 | interpreter | **zero**; the game reaches its title screen |
+
+So the ARM64 JIT produces a different `ECX` at `ffmpeg.dll+0x2D515` than the
+interpreter does. The divisor really is zero as the JIT sees it - which means
+an *earlier* instruction in that module is translated wrongly and leaves a
+bad value behind. `div` is the detector, not the defect.
+
+Two caveats kept on the record. Interpreting a module also changes its
+timing, so a timing-dependent bug is not formally excluded; the identical
+registers across two threads argue against it. And the crash handler's own
+fault, with ASCII text in registers where pointers belong, still suggests
+memory corruption that may or may not share a cause.
+
+`docs/HANDOFF_FFMPEG_JIT_DEFECT.md` writes the case up for a second opinion.
+
+**Two mistakes in this stretch worth recording.** Build 111's
+`getPeImageName` built its result with `B()`, which is the *literal* BString
+constructor - it keeps the pointer and copies nothing - over a local buffer.
+That printed garbage in the log and, worse, made the interpreter matcher
+compare against garbage, so build 111's run was a silent no-op that looked
+like a result. And before that, an audio-silencing shim was written for a
+crash that turned out to have nothing to do with the game playing sound.
+Both cost a device run.
+
+**What is left on this title.** The title screen renders but buttons and some
+images do not: the guest reports `ImageManager.isReady()` false, and two of
+the game's `@font-face` declarations report `error` while the main one loads.
+The guest window is 816x624 inside a 1280x720 desktop and does not fill the
+screen. Both look unrelated to the JIT defect.
