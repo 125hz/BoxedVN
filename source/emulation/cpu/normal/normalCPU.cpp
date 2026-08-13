@@ -435,24 +435,40 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
             }
         }
 #endif
-        // Say, once, that a requested selection actually took effect. A
-        // range or module that is never entered produces a clean run that
-        // looks exactly like a range that was entered and found innocent,
-        // and acting on that is how a bisection walks confidently in the
-        // wrong direction.
+        // Account for what a requested selection actually did. A range or
+        // module that is never entered produces a clean run that looks
+        // exactly like one that was entered and found innocent, and acting
+        // on that is how a bisection walks confidently in the wrong
+        // direction.
+        //
+        // Counted rather than logged per block: the interesting facts are
+        // that it was entered at all, and the span it covered. Announced on
+        // first entry and then at widening intervals, so a long run reports
+        // its totals without the accounting becoming the cost.
         if (forceInterpreter) {
-            static std::atomic<U32> announced{0};
-            if (announced.fetch_add(1, std::memory_order_relaxed) == 0) {
+            static std::atomic<U32> interpretedBlocks{0};
+            static std::atomic<U32> firstEip{0};
+            static std::atomic<U32> lastEip{0};
+            const U32 seen =
+                interpretedBlocks.fetch_add(1, std::memory_order_relaxed);
+            if (seen == 0) {
+                firstEip.store(startIp, std::memory_order_relaxed);
+            }
+            lastEip.store(startIp, std::memory_order_relaxed);
+
+            if (seen == 0 || (seen & (seen + 1)) == 0) {
                 if (matchedRangeEnd) {
-                    klog_fmt("Interpreter selection is live: guest EIP %.8X is "
-                             "inside the requested range %.8X-%.8X and is "
-                             "being interpreted, not JIT compiled.",
-                             startIp, matchedRangeStart, matchedRangeEnd);
+                    klog_fmt("Interpreter range %.8X-%.8X: entered=yes "
+                             "blocks=%u first_eip=%.8X last_eip=%.8X",
+                             matchedRangeStart, matchedRangeEnd, seen + 1,
+                             firstEip.load(std::memory_order_relaxed),
+                             startIp);
                 } else {
-                    klog_fmt("Interpreter selection is live: guest EIP %.8X is "
-                             "in module '%s' and is being interpreted, not "
-                             "JIT compiled.",
-                             startIp, mappedModule.c_str());
+                    klog_fmt("Interpreter module '%s': entered=yes blocks=%u "
+                             "first_eip=%.8X last_eip=%.8X",
+                             mappedModule.c_str(), seen + 1,
+                             firstEip.load(std::memory_order_relaxed),
+                             startIp);
                 }
             }
         }

@@ -1282,6 +1282,13 @@ BString KProcess::getPeImageName(U32 address, U32* imageBase) {
                             BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(peImageMutex);
                             this->peImages.push_back(found);
                         }
+                        // Once per image. The extent is what stops an
+                        // address-range bisection from being run against a
+                        // guessed upper bound.
+                        klog_fmt("Resolved PE image: name=%s base=%.8X "
+                                 "SizeOfImage=%.8X end=%.8X (pid %x)",
+                                 found.name.c_str(), found.base, sizeOfImage,
+                                 found.end, this->id);
                         if (imageBase) {
                             *imageBase = base;
                         }
