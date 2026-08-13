@@ -1,5 +1,47 @@
 # BoxedVN — Progress and Handoff
 
+## Build 122: make injected clicks pollable and capture the browser stall
+
+Build 121 is a major device advance. Fate/stay night now reaches and renders
+its title menu, starts audio, and presents at 10.7 Vulkan frames per second.
+Its script reaches `titlemenu_object.show(800,0)` and then waits for the menu
+trigger. The overlay sends multiple correctly-scaled pointer down/up pairs to
+the 1280x960 client, but the trigger never fires.
+
+The remaining input mismatch is in the shared emulator backend. UIKit sends
+touches directly to `KNativeInputSDL::mouseButton`, bypassing SDL's event
+queue. The method emits the X11 button events, but `getInputModifiers()` still
+answers button-state polling exclusively from `SDL_GetMouseState()`. A Windows
+engine which polls the pointer therefore sees the right coordinates but no
+button held. Build 122 records UIKit's injected button mask atomically, makes
+it visible to X11 polling, and changes the bounded `XQueryPointer` trace to
+retain up to sixteen pressed-state samples after the initial startup samples
+have been exhausted. Press state is set before dispatch and release state is
+cleared after dispatch so X11's event-state-before-transition rule remains
+correct.
+
+Summer Memories no longer takes the Build 120 FFmpeg divide. It reaches
+`Scene_Map`, opens audio, and displays the title background. The opt-in probe
+reports `raf=37`, then `raf=39` 3.5 seconds later while the bitmap cache grows
+from one pending encrypted sprite to ten. It reports no failed resource, and
+the user ends the session about 27 seconds after the second sample. This is
+not evidence of a crash or a completely frozen process: Chromium service
+threads and the emulator continue running. It is evidence that the browser
+renderer becomes extremely slow or blocks while preparing encrypted images.
+
+Build 122 does not paper over that with a title asset rule. The generic probe
+now reports whether the pending bitmap's backing image has an empty, path,
+blob, or data source, whether Blink considers it complete, and its natural
+dimensions. The log capture watches the opt-in probe's normal three-second
+heartbeat; if it stops for ten seconds while the guest is still running, it
+takes one emulator thread snapshot with each guest thread's live EIP. That
+next device log will distinguish slow guest execution, a host call, a futex,
+and a stuck image decoder without another graphics guess.
+
+The Windows host-independent suite passes 169/169. The touched iOS core and
+Objective-C++ runtime still require the iPhoneOS CI compile, and both fixes
+remain physical-device-validation pending.
+
 ## Build 121: correct ARM64 zero-count double shifts and mounted-drive writes
 
 The Build 120 Summer Memories log again reached `Scene_Map` and then crashed

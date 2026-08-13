@@ -155,6 +155,26 @@ bool KNativeInputSDL::mouseButton(U32 down, U32 button, int x, int y) {
     injectedX = x;
     injectedY = y;
     hasInjectedPointer = true;
+
+    U32 injectedButtonMask = 0;
+    switch (button) {
+        case 0: injectedButtonMask = NATIVE_LEFT_BUTTON_MASK; break;
+        case 1: injectedButtonMask = NATIVE_RIGHT_BUTTON_MASK; break;
+        case 2: injectedButtonMask = NATIVE_MIDDLE_BUTTON_MASK; break;
+        case 3: injectedButtonMask = NATIVE_BUTTON_4_MASK; break;
+        case 4: injectedButtonMask = NATIVE_BUTTON_5_MASK; break;
+        default: break;
+    }
+
+    // X11 ButtonPress carries the state immediately before the press, while
+    // ButtonRelease carries the state immediately before the release.
+    // Set before dispatching a press and clear after dispatching a release;
+    // XWindow::buttonNotify then constructs both event states correctly, and
+    // polling performed while the press is held observes the same state.
+    if (down && injectedButtonMask) {
+        injectedButtonModifiers.fetch_or(injectedButtonMask,
+                                         std::memory_order_release);
+    }
 #endif
 
     XServer* server = XServer::getServer(true);
@@ -170,8 +190,20 @@ bool KNativeInputSDL::mouseButton(U32 down, U32 button, int x, int y) {
             btn = 9;
         }
         server->mouseButton(btn, x, y, down ? true : false);
+#ifdef BOXEDWINE_IOS
+        if (!down && injectedButtonMask) {
+            injectedButtonModifiers.fetch_and(~injectedButtonMask,
+                                              std::memory_order_release);
+        }
+#endif
         return true;
     }
+#ifdef BOXEDWINE_IOS
+    if (!down && injectedButtonMask) {
+        injectedButtonModifiers.fetch_and(~injectedButtonMask,
+                                          std::memory_order_release);
+    }
+#endif
     return false;
 }
 
@@ -314,6 +346,12 @@ U32 KNativeInputSDL::getInputModifiers() {
     if (result & SDL_BUTTON_X2MASK) {
         modifiers |= NATIVE_BUTTON_5_MASK;
     }
+#ifdef BOXEDWINE_IOS
+    // Direct UIKit injection bypasses SDL, so SDL_GetMouseState cannot know
+    // that a touch is currently held. Merge the state recorded by
+    // mouseButton() instead of making X11 polling disagree with its events.
+    modifiers |= injectedButtonModifiers.load(std::memory_order_acquire);
+#endif
     SDL_Keymod mods = SDL_GetModState();
     if (mods & KMOD_SHIFT) {
         modifiers |= NATIVE_SHIFT_MASK;

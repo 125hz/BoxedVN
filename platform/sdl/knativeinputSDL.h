@@ -21,6 +21,10 @@
 
 #include "knativeinput.h"
 
+#ifdef BOXEDWINE_IOS
+#include <atomic>
+#endif
+
 class KNativeInputSDL : public KNativeInput {
 public:
     KNativeInputSDL(U32 cx, U32 cy, int scaleX, int scaleY);
@@ -74,6 +78,13 @@ public:
     int injectedX = 0;
     int injectedY = 0;
     bool hasInjectedPointer = false;
+
+    // UIKit delivers guest touches directly to this backend; those presses
+    // never enter SDL's event queue. Keep their button state separately so
+    // XQueryPointer/GetKeyState-style polling agrees with the X11 button
+    // events emitted by mouseButton(). This is atomic because UIKit injects
+    // from its event thread while guest CPU threads poll through X11.
+    std::atomic<U32> injectedButtonModifiers{0};
 #endif
 
     bool handlSdlEvent(SDL_Event* e);

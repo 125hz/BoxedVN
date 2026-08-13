@@ -128,6 +128,18 @@ std::string bootDiagnosticsScript() {
     try {
       var items = ImageManager._imageCache._items;
       var total = 0, loaded = 0, failed = 0, pending = 0, examples = [];
+      function imageStage(bitmap, key, state) {
+        var image = bitmap._image;
+        var source = image && image.src ? String(image.src) : "";
+        var colon = source.indexOf(":");
+        var sourceKind = !source ? "empty" :
+          (colon > 0 ? source.substring(0, colon) : "path");
+        return "PENDING:" + (bitmap._url || key) + "=" + state
+          + ",src=" + sourceKind
+          + ",complete=" + (image ? image.complete : "none")
+          + ",natural=" + (image ? image.naturalWidth + "x" +
+                                      image.naturalHeight : "none");
+      }
       for (var key in items) {
         var bitmap = items[key].bitmap;
         if (!bitmap) { continue; }
@@ -138,7 +150,7 @@ std::string bootDiagnosticsScript() {
           failed++;
           if (examples.length < 3) { examples.push(bitmap._url || key); }
         } else { pending++; if (examples.length < 3 && pending <= 1) {
-          examples.push("PENDING:" + (bitmap._url || key) + "=" + state); } }
+          examples.push(imageStage(bitmap, key, state)); } }
       }
       return total + " loaded=" + loaded + " failed=" + failed
         + " pending=" + pending

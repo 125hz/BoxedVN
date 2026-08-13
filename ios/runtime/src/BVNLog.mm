@@ -41,9 +41,12 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "BVNRuntime.h"
+#include "ksystem.h"
 
 namespace {
 
@@ -65,6 +68,68 @@ int gLogFileDescriptor = -1;
 std::atomic<bool> gLoggingEnabled{true};
 std::atomic<uint64_t> gGeneration{0};
 os_log_t gOSLog = nullptr;
+
+// The opt-in browser boot probe normally prints every three seconds. If its
+// timer stops, the renderer's JavaScript thread is no longer servicing its
+// event loop even though Chromium's other processes may continue producing
+// log output. Capture that moment from the emulator core instead of trying to
+// infer it later from a screenshot.
+std::atomic<uint64_t> gBootHeartbeatSequence{0};
+std::atomic<uint64_t> gBootHeartbeatMicroseconds{0};
+std::atomic<uint64_t> gBootSnapshotSequence{0};
+std::atomic<bool> gBootWatchStarted{false};
+
+uint64_t monotonicMicroseconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void observeBootHeartbeat() {
+    gBootHeartbeatMicroseconds.store(monotonicMicroseconds(),
+                                     std::memory_order_relaxed);
+    gBootHeartbeatSequence.fetch_add(1, std::memory_order_release);
+}
+
+void startBootHeartbeatWatch() {
+    if (gBootWatchStarted.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::thread([] {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const uint64_t sequence =
+                gBootHeartbeatSequence.load(std::memory_order_acquire);
+            if (sequence == 0 || sequence ==
+                    gBootSnapshotSequence.load(std::memory_order_relaxed)) {
+                continue;
+            }
+            const uint64_t heartbeat = gBootHeartbeatMicroseconds.load(
+                std::memory_order_relaxed);
+            const uint64_t now = monotonicMicroseconds();
+            if (now < heartbeat || now - heartbeat < 10'000'000 ||
+                gBootHeartbeatSequence.load(std::memory_order_acquire) !=
+                    sequence) {
+                continue;
+            }
+
+            // Do not let a heartbeat from a guest that just exited produce a
+            // misleading snapshot of the next library screen or session.
+            if (BVNRuntimeGetState() != BVNRuntimeStateRunning) {
+                gBootSnapshotSequence.store(sequence,
+                                            std::memory_order_relaxed);
+                continue;
+            }
+
+            gBootSnapshotSequence.store(sequence, std::memory_order_relaxed);
+            BVNLogWrite(BVNLogLevelWarning, "diagnostics",
+                        "Browser boot heartbeat stopped for 10 seconds; "
+                        "capturing every guest thread and live EIP once.");
+            KSystem::logThreadSnapshot(
+                "browser boot heartbeat stopped for 10 seconds");
+        }
+    }).detach();
+}
 
 const char* levelName(BVNLogLevel level) {
     switch (level) {
@@ -109,10 +174,26 @@ int gCapturePipe[2] = {-1, -1};
 void* captureThread(void* /*context*/) {
     pthread_setname_np("BoxedVN log capture");
     char buffer[4096];
+    std::string pendingLine;
     while (true) {
         const ssize_t count = read(gCapturePipe[0], buffer, sizeof(buffer));
         if (count > 0) {
             writeToSinks(buffer, static_cast<size_t>(count));
+            pendingLine.append(buffer, static_cast<size_t>(count));
+            std::size_t newline = 0;
+            while ((newline = pendingLine.find('\n')) != std::string::npos) {
+                const std::string line = pendingLine.substr(0, newline);
+                if (line.find("BOXEDVN boot ") != std::string::npos) {
+                    observeBootHeartbeat();
+                }
+                pendingLine.erase(0, newline + 1);
+            }
+            // A guest can write an arbitrarily long unterminated line. Keep
+            // enough tail to recognise the marker across reads without
+            // allowing diagnostics themselves to grow without bound.
+            if (pendingLine.size() > 8192) {
+                pendingLine.erase(0, pendingLine.size() - 8192);
+            }
         } else if (count == 0) {
             break;  // write end closed
         } else if (errno != EINTR) {
@@ -196,6 +277,7 @@ extern "C" bool BVNLogStartSessionFile(void) {
     }
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    startBootHeartbeatWatch();
 
     pthread_mutex_unlock(&gMutex);
     return true;

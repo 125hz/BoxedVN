@@ -589,19 +589,34 @@ static void x11_QueryPointer(CPU* cpu) {
     window->screenToWindow(x, y);
     memory->writed(ARG7, x);
     memory->writed(ARG8, y);
-    memory->writed(ARG9, server->getInputModifiers());
+    const U32 inputModifiers = server->getInputModifiers();
+    memory->writed(ARG9, inputModifiers);
 #ifdef BOXEDWINE_IOS
     static U32 queryPointerLogCount = 0;
-    if (server->fakeFullScreenWnd && queryPointerLogCount < 32) {
-        ++queryPointerLogCount;
+    static U32 pressedQueryPointerLogCount = 0;
+    const bool logInitial = queryPointerLogCount < 32;
+    const U32 pointerButtonMask = Button1Mask | Button2Mask | Button3Mask |
+                                  Button4Mask | Button5Mask;
+    const bool logPressed = (inputModifiers & pointerButtonMask) != 0 &&
+                            pressedQueryPointerLogCount < 16;
+    if (server->fakeFullScreenWnd && (logInitial || logPressed)) {
+        if (logInitial) {
+            ++queryPointerLogCount;
+        } else {
+            ++pressedQueryPointerLogCount;
+        }
         const U32 displayScreen = X11_READD(Display, ARG1, screens);
         const U32 displayWidth = displayScreen
             ? X11_READD(Screen, displayScreen, width) : 0;
         const U32 displayHeight = displayScreen
             ? X11_READD(Screen, displayScreen, height) : 0;
-        klog_fmt("iOS XQueryPointer #%u: query 0x%x, root %d,%d, local "
-                 "%d,%d, Xlib Screen %ux%u, fake client 0x%x %ux%u",
-                 queryPointerLogCount, window->id, rootX, rootY, x, y,
+        klog_fmt("iOS XQueryPointer %s#%u: query 0x%x, root %d,%d, local "
+                 "%d,%d, mask 0x%x, Xlib Screen %ux%u, fake client 0x%x "
+                 "%ux%u",
+                 logInitial ? "" : "pressed ",
+                 logInitial ? queryPointerLogCount :
+                              pressedQueryPointerLogCount,
+                 window->id, rootX, rootY, x, y, inputModifiers,
                  displayWidth, displayHeight, server->fakeFullScreenWnd->id,
                  server->fakeFullScreenWnd->width(),
                  server->fakeFullScreenWnd->height());

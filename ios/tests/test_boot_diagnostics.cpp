@@ -297,6 +297,12 @@ BOXEDVN_TEST(boot_diagnostics_reports_which_resources_failed) {
     CHECK_CONTAINS(script, "_loadingState");
     CHECK_CONTAINS(script, "bitmaps=");
     CHECK_CONTAINS(script, "failed=");
+    // A bitmap can remain "decrypting" while it is still waiting for bytes,
+    // after it has received a blob, or while Blink is decoding that blob.
+    // Report the backing image stage so those are distinguishable.
+    CHECK_CONTAINS(script, "src=");
+    CHECK_CONTAINS(script, "complete=");
+    CHECK_CONTAINS(script, "natural=");
     // Encrypted assets decrypt in JavaScript before decoding, so whether
     // this title uses them changes where a broken image can come from.
     CHECK_CONTAINS(script, "hasEncryptedImages");

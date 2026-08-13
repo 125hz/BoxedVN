@@ -1,3 +1,8 @@
+BoxedVN 0.1.0 (122)
+* Kept direct iOS touch-button state visible to X11 polling as well as button events, fixing Windows engines that ignored otherwise-correct taps.
+* Added a one-shot guest thread/EIP snapshot when the opt-in browser boot heartbeat stops for ten seconds.
+* Expanded RPG Maker image diagnostics to identify whether a pending encrypted bitmap has reached Blink's image decoder.
+
 BoxedVN 0.1.0 (121)
 * Fixed zero-count SHLD/SHRD in the ARM64 JIT when the instruction's flags are dead; these shifts must leave the destination untouched.
 * Allowed ordinary Wine users to create files and save directories inside host-backed mounted drives while retaining host filesystem enforcement.
