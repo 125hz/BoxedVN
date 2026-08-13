@@ -574,10 +574,14 @@ void Jit::dynamic_rcr32_reg_op(DecodedOp* op) {
     //     rcr low, 1
     //
     // A wrong carry corrupts the quotient without trapping at the rotate.
-    // Execute this uncommon instruction with the reference implementation
-    // until the ARM64 carry path can be proven equivalent for every lazy-flag
-    // producer.  The dispatcher resumes JIT execution at the next instruction,
-    // so this preserves correctness without interpreting the containing DLL.
+    // The reference implementation reads architectural EFLAGS, whereas the
+    // preceding SHR normally leaves CF in Boxedwine's lazy-flag operands.
+    // Materialise that producer before branching to the interpreter; otherwise
+    // the fallback itself consumes stale CF and reproduces the bad quotient it
+    // was intended to avoid.  The dispatcher resumes JIT execution at the next
+    // instruction, so this preserves correctness without interpreting the
+    // containing DLL.
+    fillFlags();
     emulateSingleOp();
     currentLazyFlags = FLAGS_CFOF;
     return;

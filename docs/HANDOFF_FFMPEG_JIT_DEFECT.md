@@ -219,3 +219,19 @@ This is a correctness-first core fallback, not proof that the native ARM64
 host-independent suite remains clean; only a fresh physical-device run can
 show that this sequence was the bad producer inside `av_reduce` and that the
 title advances without the old divide exception.
+
+## Build 119 device result and Build 120 correction
+
+The fresh Build 119 log proved both halves of the earlier diagnosis more
+precisely. Chromium advanced from four animation frames to 37 and entered
+`Scene_Map`, so retiring module-wide FFmpeg interpretation fixed the stalled
+event loop. It then reached the same `ffmpeg.dll+0x2D515` divide with
+`ECX=0`, so the first RCR fallback had not corrected the quotient.
+
+The fallback boundary was incomplete: ARM64 JIT `SHR` keeps its result flags
+lazy, while `emulateSingleOp()` transfers control to the reference core, whose
+`RCR` reads architectural EFLAGS. Branching without first calling
+`fillFlags()` therefore made the reference RCR consume stale CF. Build 120
+materializes the lazy producer before the one-instruction fallback. This is
+still a core CPU-semantics fix and still needs a physical-device run to prove
+that `ffmpeg.dll+0x2D515` no longer receives a zero denominator.

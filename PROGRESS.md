@@ -1,5 +1,24 @@
 # BoxedVN — Progress and Handoff
 
+## Build 120: preserve lazy SHR carry across the ARM64 RCR fallback
+
+The Build 119 Summer Memories device log reached `Scene_Map` with 37
+`requestAnimationFrame` callbacks, proving that removing module-wide FFmpeg
+interpretation restored Chromium's event loop. It then crashed at the same
+`ffmpeg.dll+0x2D515` `div ecx` with `ECX=0`. The single-op ARM64 RCR fallback
+was entered while the preceding SHR carry still lived in Boxedwine's lazy
+flags; the reference interpreter reads architectural EFLAGS, so it consumed
+stale carry. Build 120 calls `fillFlags()` before transferring that one RCR to
+the reference core. This remains device-validation pending.
+
+The accompanying Fate log is not the same class of emulator fault. Its first
+exception names a missing child directory,
+`Documents/faterealtanua_savedata`; Build 119 supplies the canonical Documents
+folder through its lowercase guest alias. The game then falls back to another
+absent save directory under D:, and the later missing `kag` member is cascading
+script fallout. Creating a title-named directory in the emulator would be a
+game patch, so no such heuristic was added.
+
 **Purpose of this file:** a single place that tells any future session (Claude,
 Codex or a human) exactly where the project stands, what is proven to work,
 what has not been tried yet, and what to do next. Update it at the end of every

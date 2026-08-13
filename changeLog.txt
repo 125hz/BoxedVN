@@ -1,3 +1,6 @@
+BoxedVN 0.1.0 (120)
+* Materialized lazy ARM64 flags before the single-instruction RCR interpreter fallback, so it consumes the carry produced by the preceding shift.
+
 BoxedVN 0.1.0 (119)
 * Corrected an ARM64 SHR/RCR carry-chain failure without interpreting an entire guest DLL.
 * Retired the obsolete broad ffmpeg interpreter diagnostic that could stall browser-engine event loops.
