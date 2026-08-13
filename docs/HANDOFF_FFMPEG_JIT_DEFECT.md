@@ -199,3 +199,23 @@ interpreting `__alldiv` alone:
 awkward semantics - `shrd`, `sar` by `cl`, `cmova`/`cmovne`/`cmove`, and a
 `mov ch, 0x20` followed by `test byte ptr [ebp-0x10], ch`, which is x86
 high-byte register aliasing.
+
+## Build 119 correctness fallback
+
+The next supplied device log still used `-interpreterModule ffmpeg`. It no
+longer crashed, but Chromium's boot probe stopped at four animation frames,
+which confirmed that interpreting the whole media DLL is not shippable.
+
+Build 119 therefore moves the workaround into the emulator core at the
+narrowest statically-supported boundary: immediate 32-bit `RCR` on ARM64 is
+executed by the reference interpreter for that single instruction, after
+which dispatch resumes through the JIT. A CPU regression encodes the exact
+`SHR/RCR/SHR/RCR` sequence above. The saved exact
+`--bvn-interpret=ffmpeg` diagnostic is retired so existing manifests do not
+keep selecting the slow module-wide path.
+
+This is a correctness-first core fallback, not proof that the native ARM64
+`RCR` emitter has been repaired. CI can prove the source compiles and the
+host-independent suite remains clean; only a fresh physical-device run can
+show that this sequence was the bad producer inside `av_reduce` and that the
+title advances without the old divide exception.

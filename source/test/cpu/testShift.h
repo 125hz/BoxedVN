@@ -30,5 +30,6 @@ void testShrdE16R16Ib_0x1ac();
 void testShrdE32R32Ib_0x3ac();
 void testShrdE16R16Cl_0x1ad();
 void testShrdE32R32Cl_0x3ad();
+void testShrRcrCarryChain();
 
 #endif

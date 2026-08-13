@@ -1,3 +1,8 @@
+BoxedVN 0.1.0 (119)
+* Corrected an ARM64 SHR/RCR carry-chain failure without interpreting an entire guest DLL.
+* Retired the obsolete broad ffmpeg interpreter diagnostic that could stall browser-engine event loops.
+* Added lowercase aliases for standard Wine shell folders so Windows save-directory creation remains case-insensitive on iOS.
+
 25.0.0
 * Updated Wine to latest version
 * Internal change to emulate x11 rather than replace winex11 driver.

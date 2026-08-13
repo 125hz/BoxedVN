@@ -352,6 +352,51 @@ std::string lowered(std::string value) {
     return value;
 }
 
+bool directoryContainsExactName(const fs::path& directory,
+                                const std::string& name) {
+    std::error_code ec;
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (it->path().filename().string() == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ensureLowercaseGuestAlias(const fs::path& hostTarget,
+                               const std::string& guestTarget) {
+    const std::string lowerName = lowered(hostTarget.filename().string());
+    if (lowerName == hostTarget.filename().string() ||
+        directoryContainsExactName(hostTarget.parent_path(), lowerName)) {
+        return false;
+    }
+
+    // Boxedwine represents a guest symbolic link as a small host-side .link
+    // file.  Keep Wine's canonical shell-folder spelling and expose the
+    // lowercase spelling as an alias to the same directory instead of making
+    // two directories whose contents can diverge.
+    const fs::path alias = hostTarget.parent_path() / (lowerName + ".link");
+    {
+        std::ifstream existing(alias, std::ios::binary);
+        if (existing) {
+            const std::string contents((std::istreambuf_iterator<char>(existing)),
+                                       std::istreambuf_iterator<char>());
+            if (contents == guestTarget) {
+                return false;
+            }
+        }
+    }
+
+    std::ofstream stream(alias, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        return false;
+    }
+    stream.write(guestTarget.data(),
+                 static_cast<std::streamsize>(guestTarget.size()));
+    return static_cast<bool>(stream);
+}
+
 // True when `lowerPath` sits directly or indirectly under `lowerPrefix`.
 bool isUnder(const std::string& lowerPath, const char* lowerPrefix) {
     const std::string prefix(lowerPrefix);
@@ -677,23 +722,33 @@ WinePrefixPreparationResult prepareWinePrefix(
     // cannot find My Documents does not report a missing folder, it reports
     // whatever its own fallback path fails at three steps later.
     //
-    // A KiriKiri title looks for its save directory under Documents, finds
-    // nothing, falls back to a path built from its window title, and dies
-    // with "Member \"kag\" does not exist" - four steps from the cause.
+    // Some Windows runtimes turn their file URLs lowercase before asking Wine
+    // to create the save directory. The Boxedwine overlay is case-sensitive,
+    // so merely creating "Documents" still leaves the exact parent
+    // "documents" missing. Give each conventional shell folder a lowercase
+    // guest symlink to the canonical directory. This is a prefix-level Windows
+    // compatibility rule; no game or game-specific save path is named here.
     {
         const fs::path user = fs::path(writableRootPath) / "home" / "username" /
             ".wine" / "drive_c" / "users" / "username";
+        const std::string guestUser =
+            "/home/username/.wine/drive_c/users/username";
         for (const char* folder : {"Documents", "Desktop", "Downloads",
                                    "Music", "Pictures", "Videos",
-                                   "Saved Games", "AppData/Roaming",
+                                   "Saved Games", "AppData", "AppData/Roaming",
                                    "AppData/Local"}) {
             std::error_code createEc;
-            const fs::path target = user / fs::path(folder);
+            const fs::path relative(folder);
+            const fs::path target = user / relative;
             if (!fs::exists(target, createEc)) {
                 fs::create_directories(target, createEc);
                 if (!createEc) {
                     result.changed = true;
                 }
+            }
+            if (!createEc && ensureLowercaseGuestAlias(
+                    target, guestUser + "/" + relative.generic_string())) {
+                result.changed = true;
             }
         }
     }

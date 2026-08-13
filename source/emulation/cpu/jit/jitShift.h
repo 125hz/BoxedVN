@@ -565,6 +565,23 @@ void Jit::writeRcr32Flags(RegPtr reg, RegPtr cf) {
 }
 
 void Jit::dynamic_rcr32_reg_op(DecodedOp* op) {
+#if defined(BOXEDWINE_JIT_ARMV8)
+    // The ARM64 fast path can consume the wrong carry when RCR immediately
+    // follows a lazily-recorded SHR and RCR's own flags are dead.  This is the
+    // normalisation pattern used by MSVC's 64-bit division helper:
+    //
+    //     shr high, 1
+    //     rcr low, 1
+    //
+    // A wrong carry corrupts the quotient without trapping at the rotate.
+    // Execute this uncommon instruction with the reference implementation
+    // until the ARM64 carry path can be proven equivalent for every lazy-flag
+    // producer.  The dispatcher resumes JIT execution at the next instruction,
+    // so this preserves correctness without interpreting the containing DLL.
+    emulateSingleOp();
+    currentLazyFlags = FLAGS_CFOF;
+    return;
+#endif
     if (op->needsToSetFlags(cpu) & (CF | OF)) {
         // op->imm already masked
         RegPtr oldCF = getCF();

@@ -44,6 +44,18 @@ std::string readTestFile(const fs::path& path) {
                        std::istreambuf_iterator<char>());
 }
 
+bool testDirectoryContainsExactName(const fs::path& directory,
+                                    const std::string& name) {
+    std::error_code ec;
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (it->path().filename().string() == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::size_t countSubstring(const std::string& value,
                            const std::string& needle) {
     std::size_t count = 0;
@@ -620,6 +632,22 @@ BOXEDVN_TEST(prefix_creates_the_user_shell_folders_windows_programs_assume) {
     CHECK(fs::is_directory(user / "Documents", ec));
     CHECK(fs::is_directory(user / "Saved Games", ec));
     CHECK(fs::is_directory(user / "AppData/Roaming", ec));
+    CHECK_EQ(readTestFile(user / "documents.link"),
+             "/home/username/.wine/drive_c/users/username/Documents");
+    CHECK_EQ(readTestFile(user / "saved games.link"),
+             "/home/username/.wine/drive_c/users/username/Saved Games");
+    CHECK_EQ(readTestFile(user / "appdata.link"),
+             "/home/username/.wine/drive_c/users/username/AppData");
+    CHECK_EQ(readTestFile(user / "AppData/roaming.link"),
+             "/home/username/.wine/drive_c/users/username/AppData/Roaming");
+
+    // The alias must remain a link to the canonical folder on another pass;
+    // creating a second lowercase directory would split saved data by casing.
+    std::ofstream(user / "Documents/existing-save.dat") << "preserve";
+    CHECK(prepareWinePrefix(archive.string(), prefix.string(),
+                            WineRenderer::Vulkan).ok);
+    CHECK_EQ(readTestFile(user / "Documents/existing-save.dat"), "preserve");
+    CHECK(!testDirectoryContainsExactName(user, "documents"));
 
     fs::remove_all(temporary, ec);
 }

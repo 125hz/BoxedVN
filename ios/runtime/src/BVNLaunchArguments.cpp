@@ -27,6 +27,14 @@ bool endsWithIgnoringCase(std::string candidate, const char* suffix) {
                              normalizedSuffix.size(), normalizedSuffix) == 0;
 }
 
+bool equalsIgnoringCase(std::string left, const char* right) {
+    std::transform(left.begin(), left.end(), left.begin(),
+                   [](unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+    return left == right;
+}
+
 bool launchesAnyOf(const BVNLaunchConfiguration& launch,
                    std::initializer_list<const char*> executables) {
     for (const char* executable : executables) {
@@ -97,7 +105,13 @@ void BVNApplyGeneralArgumentSentinels(BVNLaunchConfiguration& launch) {
         if (argument.size() > prefix.size() &&
             argument.compare(0, prefix.size(), prefix) == 0) {
             const std::string module = argument.substr(prefix.size());
-            if (!module.empty()) {
+            // This exact value was issued as a temporary diagnostic while an
+            // ARM64 RCR carry defect was isolated.  Keeping it in an existing
+            // game manifest after the core correction would still interpret
+            // all of Chromium's media DLL and make its event loop appear
+            // frozen. Retire the old broad workaround; a future explicit
+            // diagnostic can still name ffmpeg.dll or use an address range.
+            if (!module.empty() && !equalsIgnoringCase(module, "ffmpeg")) {
                 launch.interpreterModules.push_back(module);
             }
             continue;  // BoxedVN's word; the guest must never see it.

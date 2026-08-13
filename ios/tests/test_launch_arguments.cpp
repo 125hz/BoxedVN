@@ -321,7 +321,7 @@ BOXEDVN_TEST(command_does_not_let_boxedwine_truncate_frontend_log) {
     CHECK(std::find(actual.begin(), actual.end(), "-log") == actual.end());
 }
 
-BOXEDVN_TEST(interpret_sentinel_selects_a_module_and_never_reaches_the_guest) {
+BOXEDVN_TEST(interpret_sentinel_retires_ffmpeg_workaround_and_never_reaches_guest) {
     BVNLaunchConfiguration launch;
     launch.executablePath = "d:\\Game.exe";
     launch.arguments.push_back("--bvn-interpret=ffmpeg");
@@ -330,9 +330,8 @@ BOXEDVN_TEST(interpret_sentinel_selects_a_module_and_never_reaches_the_guest) {
 
     BVNApplyGeneralArgumentSentinels(launch);
 
-    CHECK_EQ(launch.interpreterModules.size(), static_cast<std::size_t>(2));
-    CHECK_EQ(launch.interpreterModules[0], std::string("ffmpeg"));
-    CHECK_EQ(launch.interpreterModules[1], std::string("d3d11"));
+    CHECK_EQ(launch.interpreterModules.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(launch.interpreterModules[0], std::string("d3d11"));
 
     // The guest must receive only its own switches. A Chromium process given
     // an unknown --bvn- switch would at best ignore it and at worst refuse.
@@ -346,7 +345,9 @@ BOXEDVN_TEST(interpret_sentinel_selects_a_module_and_never_reaches_the_guest) {
     // And the selection has to actually reach Boxedwine.
     CHECK(std::find(argv.begin(), argv.end(),
                     std::string("-interpreterModule")) != argv.end());
-    CHECK(std::find(argv.begin(), argv.end(), std::string("ffmpeg")) !=
+    CHECK(std::find(argv.begin(), argv.end(), std::string("ffmpeg")) ==
+          argv.end());
+    CHECK(std::find(argv.begin(), argv.end(), std::string("d3d11")) !=
           argv.end());
 }
 

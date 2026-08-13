@@ -973,4 +973,31 @@ void testShrdE32R32Ib_0x3ac() { runDoubleShiftWidth(DOUBLE_SHRD, COUNT_IMM, 32, 
 void testShrdE16R16Cl_0x1ad() { runDoubleShiftWidth(DOUBLE_SHRD, COUNT_CL, 16, "shrd e16,r16,cl 1ad"); }
 void testShrdE32R32Cl_0x3ad() { runDoubleShiftWidth(DOUBLE_SHRD, COUNT_CL, 32, "shrd e32,r32,cl 3ad"); }
 
+void testShrRcrCarryChain() {
+    U32 regs[8];
+    initRegs(regs);
+    regs[R_AX] = 0x00000001;
+    regs[R_CX] = 0x00000001;
+    regs[R_DX] = 0x00000001;
+    regs[R_BX] = 0x00000001;
+
+    beginShift(0);
+    // Exact carry chain used by MSVC's 64-bit division normalisation loop.
+    // The OR makes both RCR outputs' flags dead, selecting the JIT path that
+    // previously lost the carry produced by each immediately preceding SHR.
+    pushCode8(0xd1); pushCode8(0xeb);  // shr ebx, 1
+    pushCode8(0xd1); pushCode8(0xd9);  // rcr ecx, 1
+    pushCode8(0xd1); pushCode8(0xea);  // shr edx, 1
+    pushCode8(0xd1); pushCode8(0xd8);  // rcr eax, 1
+    pushCode8(0x09); pushCode8(0xdb);  // or ebx, ebx
+    writeRegsLocal(regs);
+    runTestCPU();
+
+    regs[R_AX] = 0x80000000;
+    regs[R_CX] = 0x80000000;
+    regs[R_DX] = 0;
+    regs[R_BX] = 0;
+    verifyRegisters(cpu, regs, "shr/rcr carry chain");
+}
+
 #endif

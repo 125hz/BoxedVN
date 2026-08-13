@@ -4612,3 +4612,47 @@ ffmpeg.dll spans 0x76B60000-0x76E74000. The 0x76BC0000 upper bound used for
 the first cut was a guess and was far short.
 
 Next cut interprets the callee itself rather than bisecting blindly.
+
+---
+
+### Build 119 — core fixes for the ffmpeg carry chain and lowercase save paths
+
+The two attached build-118 sessions fail in different subsystems.
+
+Summer Memories is not waiting for the renderer. Its injected boot counter
+reaches `Scene_Map`, but `requestAnimationFrame` remains at 4 while the whole
+`ffmpeg.dll` runs through the interpreter. The module-wide discriminator that
+proved the ARM64 JIT defect is now the thing preventing Chromium's event loop
+from advancing at a usable rate.
+
+The strongest instruction-level suspect from the offline disassembly is the
+carry chain in MSVC's 64-bit divide helper:
+
+```
+shr ebx, 1
+rcr ecx, 1
+shr edx, 1
+rcr eax, 1
+```
+
+On ARM64, immediate 32-bit `RCR` now executes as one reference-interpreter
+instruction and returns straight to the JIT at the following instruction.
+That is a core correctness fallback for the opcode, not an ffmpeg or game
+patch. A regression reproduces the exact SHR/RCR chain. The old exact
+`--bvn-interpret=ffmpeg` diagnostic is retired during argument parsing so an
+existing manifest cannot continue interpreting the entire media DLL after the
+core correction; module and address-range diagnostics remain available.
+
+Fate/stay night's visible `Member "kag" does not exist` is downstream. Its
+first script exception is `getDirList` on
+`c:/users/username/documents/faterealtanua_savedata/`, followed by a failed
+fallback save and only then the missing engine object. Build 118 created the
+canonical `Documents` folder, but Boxedwine's overlay is case-sensitive and
+the runtime asks for lowercase `documents`. Prefix preparation now writes the
+same `.link` aliases Boxedwine uses for guest symlinks, mapping lowercase
+standard shell-folder names to their canonical directories without creating
+two independent save locations. The policy names no title-specific path.
+
+169 host-independent tests pass locally. The iPhoneOS build and ARM64 source
+compile remain GitHub Actions gates; whether both games pass their prior device
+boundaries remains pending a fresh physical-device run.
