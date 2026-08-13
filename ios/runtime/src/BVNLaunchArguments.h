@@ -23,10 +23,10 @@ struct BVNLaunchConfiguration {
     std::vector<std::string> arguments;
     std::vector<std::string> environment;
     std::vector<std::string> interpreterModules;
-    // Interpret executable guest memory that is neither an ELF mapping nor a
-    // PE image. Browser engines generate x86 into anonymous heaps; keeping
-    // DLLs on the JIT while interpreting that second-level JIT output avoids
-    // translating generated code through two optimisers at once.
+    // Watch executable guest memory that is neither an ELF mapping nor a PE
+    // image. Browser engines generate x86 into anonymous heaps; only a page
+    // whose JIT repeatedly returns without forward progress is demoted to the
+    // interpreter, while healthy generated code stays compiled.
     bool interpretAnonymousExecutable = false;
     // Inclusive start, exclusive end in the 32-bit guest address space.
     std::vector<std::pair<uint32_t, uint32_t>> interpreterRanges;

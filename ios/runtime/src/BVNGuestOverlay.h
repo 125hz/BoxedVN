@@ -67,6 +67,14 @@ void BVNGuestOverlayGeometryDidChange(void);
 // coalesced at display cadence. Safe from either presentation thread.
 void BVNGuestPerformanceFramePresented(void);
 
+// Records Wine's authoritative pointer position and cursor. These functions
+// are thread-safe; UIKit consumes the latest state from
+// BVNGuestOverlayApplyPendingState on Boxedwine's event-pump/main thread.
+void BVNGuestPointerPositionChanged(int x, int y);
+void BVNGuestCursorDefine(uint32_t id, const uint8_t* bgraPixels,
+                          int width, int height, int hotX, int hotY);
+void BVNGuestCursorSelect(uint32_t id, int shape, bool visible);
+
 // ---------------------------------------------------------------------------
 // Implemented by BVNAppDelegate.mm
 // ---------------------------------------------------------------------------

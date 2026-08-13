@@ -230,7 +230,9 @@ the facilities in question: `--no-sandbox`, `--disable-gpu`,
 `--disable-software-rasterizer`, `--disable-direct-composition`,
 `--disable-features=CalculateNativeWinOcclusion`,
 `--disable-background-timer-throttling`, `--disable-renderer-backgrounding`
-and `--disable-backgrounding-occluded-windows`. The engine and the evidence
+and `--disable-backgrounding-occluded-windows`. It also passes
+`--start-maximized`, because NW.js package defaults otherwise leave a
+desktop-sized game window centred inside BoxedVN's virtual monitor. The engine and the evidence
 for it are logged under `engine:`.
 
 Anything in a game's launch settings is *added to* these rather than

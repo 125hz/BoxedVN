@@ -35,6 +35,11 @@ public:
     static OpCallback getFunctionForOp(DecodedOp* op);
 
     OpCallback firstOp;
+
+#ifdef BOXEDWINE_JIT
+    U32 anonymousWatchdogEip = 0;
+    U32 anonymousWatchdogRepeats = 0;
+#endif
 };
 
 #endif

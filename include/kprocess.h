@@ -19,6 +19,8 @@
 #ifndef __KPROCESS_H__
 #define __KPROCESS_H__
 
+#include <unordered_set>
+
  // Not all Linux kenerals have the same layout, but this is a common one that seems to be used by many, other option is 0x80000
 #define ADDRESS_PROCESS_MMAP_START		     0xC0000
 #define ADDRESS_PROCESS_LOADER			     0xF0000
@@ -401,6 +403,8 @@ public:
 #ifdef BOXEDWINE_JIT
     OpCallback startJITOp = nullptr;
     std::atomic<bool> interpreterCompatibilityActivated{false};
+    bool isAnonymousInterpreterPage(U32 address);
+    bool activateAnonymousInterpreterPage(U32 address);
     void* emulateSingleOp = nullptr;
 #ifdef BOXEDWINE_POSIX
     void* signalHandler = nullptr;
@@ -415,6 +419,8 @@ public:
 #ifdef BOXEDWINE_MULTI_THREADED    
     BOXEDWINE_MUTEX normalBlockMutex;
 #endif
+    BOXEDWINE_MUTEX anonymousInterpreterPagesMutex;
+    std::unordered_set<U32> anonymousInterpreterPages;
     BOXEDWINE_MUTEX fdsMutex;
 
     // x11 stuff

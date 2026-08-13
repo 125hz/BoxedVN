@@ -349,6 +349,19 @@ KProcess::~KProcess() {
     }
 }
 
+#ifdef BOXEDWINE_JIT
+bool KProcess::isAnonymousInterpreterPage(U32 address) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(anonymousInterpreterPagesMutex);
+    return anonymousInterpreterPages.find(address >> K_PAGE_SHIFT) !=
+           anonymousInterpreterPages.end();
+}
+
+bool KProcess::activateAnonymousInterpreterPage(U32 address) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(anonymousInterpreterPagesMutex);
+    return anonymousInterpreterPages.insert(address >> K_PAGE_SHIFT).second;
+}
+#endif
+
 void KProcess::retireAllMappedFiles() noexcept {
     retryPendingMappedFileRetirements();
     while (true) {

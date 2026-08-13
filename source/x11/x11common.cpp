@@ -560,6 +560,20 @@ static void x11_UngrabPointer(CPU* cpu) {
 static void x11_WarpPointer(CPU* cpu) {
 	S32 x = ARG8;
 	S32 y = ARG9;
+	KNativeInputPtr input = KNativeSystem::getCurrentInput();
+
+	// Xlib gives dest_x/dest_y two different meanings.  With a destination
+	// window they are coordinates in that window; with None they are offsets
+	// from the pointer's current position.  Treating the latter as absolute
+	// coordinates made Wine's SetCursorPos/MoveCursorPlugin disagree with the
+	// pointer position returned by XQueryPointer.
+	if (!ARG3) {
+		S32 currentX = 0;
+		S32 currentY = 0;
+		input->getMousePos(&currentX, &currentY);
+		x += currentX;
+		y += currentY;
+	}
 #ifdef BOXEDWINE_IOS
 	XServer* server = XServer::getServer(true);
 	if (server && server->fakeFullScreenWnd && ARG3 &&
@@ -574,7 +588,7 @@ static void x11_WarpPointer(CPU* cpu) {
 		}
 	}
 #endif
-	KNativeSystem::getCurrentInput()->setMousePos(x, y);
+	input->setMousePos(x, y);
 	EAX = Success;
 }
 

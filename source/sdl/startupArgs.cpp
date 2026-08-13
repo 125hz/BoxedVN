@@ -418,8 +418,9 @@ bool StartUpArgs::apply() {
                  range.first, range.second);
     }
     if (KSystem::interpreterAnonymousExecutable) {
-        klog("Compatibility CPU profile: interpret anonymous executable "
-             "guest memory; JIT remains enabled for mapped ELF and PE code");
+        klog("Compatibility CPU profile: watch anonymous executable guest "
+             "memory for stalled JIT pages; healthy anonymous, ELF and PE "
+             "code remains JIT compiled");
     }
     KSystem::pentiumLevel = this->pentiumLevel;
     KSystem::pollRate = this->pollRate;

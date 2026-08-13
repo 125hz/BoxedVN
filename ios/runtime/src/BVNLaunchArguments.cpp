@@ -231,16 +231,18 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
     // otherwise goes through Boxedwine's JIT as a second JIT tier; the device
     // hang snapshot showed the browser main thread spending 97.7% of a core
     // in exactly such a block while Blink's decoded-image callback stopped.
-    // Keep Wine and every PE/ELF module JIT compiled, and use the correctness
-    // core only for generated anonymous code shared by NW.js/Electron titles.
+    // Keep Wine, every PE/ELF module and healthy V8 code JIT compiled. The
+    // core watches generated anonymous code and demotes only a page whose JIT
+    // repeatedly returns to the same guest instruction without progress.
     launch.interpretAnonymousExecutable = true;
 
     result.applied = merged.added > 0 || merged.mergedFeatures;
     result.reason = std::string(engine) + " detected (" + profile.evidence +
         "): a browser engine draws through Windows facilities Wine only "
         "partly implements, so BoxedVN passes Chromium's own switches for "
-        "the sandbox, the GPU process, DirectComposition and occlusion, and "
-        "interprets only anonymously generated browser code. ";
+        "the sandbox, the GPU process, DirectComposition, occlusion and "
+        "window sizing, and watches anonymous browser code for a stalled "
+        "JIT page. ";
 
     char detail[224];
     snprintf(detail, sizeof(detail),

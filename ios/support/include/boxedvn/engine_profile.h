@@ -149,6 +149,12 @@ GuestEngineProfile detectGuestEngine(const std::string& gameDirectory,
 //       is exactly the window of time in which Chromium would have decided
 //       it was not visible.
 //
+//   --start-maximized
+//       NW.js package defaults describe an ordinary Windows desktop and may
+//       request a small centred window. BoxedVN presents one guest at a time,
+//       so maximising the engine window uses the coherent virtual monitor and
+//       keeps its client/input geometry aligned with the displayed picture.
+//
 // These are shipped as a set because that is how they were proven. Run 3
 // changed the GPU pair and the three throttling switches together, so their
 // individual contributions are not isolated, and this comment should not be

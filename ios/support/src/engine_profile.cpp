@@ -159,6 +159,12 @@ std::vector<std::string> chromiumCompatibilitySwitches() {
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
         "--disable-backgrounding-occluded-windows",
+        // NW.js otherwise preserves the package's desktop-sized initial
+        // window inside Boxedwine's larger virtual monitor. Maximise the
+        // engine window generically so RPG Maker and other browser games use
+        // the presentation area instead of being a small window in its
+        // centre. A user-provided --start-maximized still wins in the merge.
+        "--start-maximized",
     };
 }
 

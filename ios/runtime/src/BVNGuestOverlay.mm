@@ -42,6 +42,9 @@
 #include "BVNRuntime.h"
 
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // The key table
@@ -195,6 +198,7 @@ static const CGFloat kBVNKeyGap = 4.0;
 // but not so fast that a title-bar button is unhittable - which is the whole
 // reason trackpad mode exists.
 static NSString* const kBVNTrackpadModeKey = @"BoxedVN.pointer.trackpad";
+static NSString* const kBVNPointerModeKey = @"BoxedVN.pointer.mode";
 static NSString* const kBVNPointerSensitivityKey =
     @"BoxedVN.pointer.sensitivity";
 static NSString* const kBVNPointerOpacityKey = @"BoxedVN.pointer.opacity";
@@ -253,7 +257,14 @@ static NSString* const kBVNPerformanceBatteryKey =
 // small Windows controls - a Wine title bar button, a file-manager row - that
 // a fingertip cannot hit accurately.
 @property (nonatomic, assign) BOOL trackpadMode;
+@property (nonatomic, assign) BOOL guestCursorMode;
 @property (nonatomic, strong) UIView* cursorView;
+@property (nonatomic, strong) UIImageView* guestCursorView;
+@property (nonatomic, assign) CGPoint guestCursorHotspot;
+@property (nonatomic, assign) CGSize guestCursorPixelSize;
+@property (nonatomic, assign) BOOL guestCursorVisible;
+@property (nonatomic, assign) uint64_t appliedPointerRevision;
+@property (nonatomic, assign) uint64_t appliedGuestCursorRevision;
 @property (nonatomic, strong) UIView* cursorHaloView;
 @property (nonatomic, strong) UIView* cursorDotView;
 @property (nonatomic, strong) UIView* pointerSettingsPanel;
@@ -312,6 +323,69 @@ static BVNGuestOverlayView* gOverlay = nil;
 static std::atomic<uint64_t> gPerformancePresentedFrames{0};
 static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
 
+namespace {
+
+struct BVNGuestCursorBitmap {
+    int width = 0;
+    int height = 0;
+    int hotX = 0;
+    int hotY = 0;
+    std::vector<uint8_t> pixels;
+};
+
+std::atomic<int> gGuestPointerX{0};
+std::atomic<int> gGuestPointerY{0};
+std::atomic<uint64_t> gGuestPointerRevision{0};
+std::atomic<uint32_t> gSelectedGuestCursorId{0};
+std::atomic<int> gSelectedGuestCursorShape{68};
+std::atomic<bool> gSelectedGuestCursorVisible{true};
+std::atomic<uint64_t> gGuestCursorRevision{0};
+std::mutex gGuestCursorMutex;
+std::unordered_map<uint32_t, BVNGuestCursorBitmap> gGuestCursorBitmaps;
+
+}  // namespace
+
+extern "C" void BVNGuestPointerPositionChanged(int x, int y) {
+    gGuestPointerX.store(x, std::memory_order_relaxed);
+    gGuestPointerY.store(y, std::memory_order_relaxed);
+    gGuestPointerRevision.fetch_add(1, std::memory_order_release);
+    if (NSThread.isMainThread) {
+        BVNGuestOverlayApplyPendingState();
+    }
+}
+
+extern "C" void BVNGuestCursorDefine(uint32_t id,
+                                      const uint8_t* bgraPixels,
+                                      int width, int height,
+                                      int hotX, int hotY) {
+    if (bgraPixels == nullptr || width <= 0 || height <= 0 ||
+        width > 512 || height > 512) {
+        return;
+    }
+    BVNGuestCursorBitmap bitmap;
+    bitmap.width = width;
+    bitmap.height = height;
+    bitmap.hotX = hotX;
+    bitmap.hotY = hotY;
+    bitmap.pixels.assign(bgraPixels,
+                         bgraPixels + (size_t)width * height * 4);
+    {
+        std::lock_guard<std::mutex> lock(gGuestCursorMutex);
+        gGuestCursorBitmaps[id] = std::move(bitmap);
+    }
+    gGuestCursorRevision.fetch_add(1, std::memory_order_release);
+}
+
+extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
+    gSelectedGuestCursorId.store(id, std::memory_order_relaxed);
+    gSelectedGuestCursorShape.store(shape, std::memory_order_relaxed);
+    gSelectedGuestCursorVisible.store(visible, std::memory_order_relaxed);
+    gGuestCursorRevision.fetch_add(1, std::memory_order_release);
+    if (NSThread.isMainThread) {
+        BVNGuestOverlayApplyPendingState();
+    }
+}
+
 @implementation BVNGuestOverlayView
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -338,8 +412,16 @@ static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
     }];
     self.heldScancodes = [NSMutableSet set];
     self.keyRows = BVNKeyboardRows();
-    self.trackpadMode = [[NSUserDefaults standardUserDefaults]
-        boolForKey:kBVNTrackpadModeKey];
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults objectForKey:kBVNPointerModeKey] != nil) {
+        const NSInteger pointerMode = [defaults integerForKey:kBVNPointerModeKey];
+        self.trackpadMode = pointerMode != 0;
+        self.guestCursorMode = pointerMode == 2;
+    } else {
+        // Preserve the old direct/trackpad choice when upgrading.
+        self.trackpadMode = [defaults boolForKey:kBVNTrackpadModeKey];
+        self.guestCursorMode = NO;
+    }
     [self buildMenu];
     [self buildKeyboard];
     [self buildCursor];
@@ -394,6 +476,13 @@ static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
     self.cursorView = cursor;
     self.cursorHaloView = halo;
     self.cursorDotView = dot;
+
+    UIImageView* guestCursor = [[UIImageView alloc] initWithFrame:CGRectZero];
+    guestCursor.contentMode = UIViewContentModeScaleToFill;
+    guestCursor.userInteractionEnabled = NO;
+    guestCursor.hidden = YES;
+    [self addSubview:guestCursor];
+    self.guestCursorView = guestCursor;
     [self applyPointerAppearance];
 }
 
@@ -1340,47 +1429,167 @@ static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
     [self positionCursor];
 }
 
-- (void)positionCursor {
+- (UIImage*)fallbackGuestCursorImageForShape:(int)shape {
+    NSString* symbolName = @"cursorarrow";
+    if (shape == 152) {
+        symbolName = @"character.cursor.ibeam";
+    } else if (shape == 130) {
+        symbolName = @"plus";
+    } else if (shape == 150 || shape == 1000) {
+        symbolName = @"hourglass";
+    }
+    UIImage* symbol = [UIImage systemImageNamed:symbolName];
+    if (symbol != nil) {
+        return [symbol imageWithTintColor:UIColor.whiteColor
+                           renderingMode:UIImageRenderingModeAlwaysOriginal];
+    }
+
+    // Old iOS versions do not have cursorarrow. Draw the familiar X11 arrow
+    // rather than falling back to BoxedVN's ring in "Wine cursor" mode.
+    UIGraphicsImageRenderer* renderer = [[UIGraphicsImageRenderer alloc]
+        initWithSize:CGSizeMake(24.0, 30.0)];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext* ctx) {
+        UIBezierPath* arrow = [UIBezierPath bezierPath];
+        [arrow moveToPoint:CGPointMake(2.0, 1.0)];
+        [arrow addLineToPoint:CGPointMake(2.0, 24.0)];
+        [arrow addLineToPoint:CGPointMake(8.0, 18.0)];
+        [arrow addLineToPoint:CGPointMake(13.0, 28.0)];
+        [arrow addLineToPoint:CGPointMake(18.0, 25.0)];
+        [arrow addLineToPoint:CGPointMake(13.0, 16.0)];
+        [arrow addLineToPoint:CGPointMake(22.0, 15.0)];
+        [arrow closePath];
+        arrow.lineWidth = 3.0;
+        [UIColor.blackColor setStroke];
+        [arrow stroke];
+        [UIColor.whiteColor setFill];
+        [arrow fill];
+    }];
+}
+
+- (void)applyGuestCursorState {
+    const uint64_t revision =
+        gGuestCursorRevision.load(std::memory_order_acquire);
+    if (revision == self.appliedGuestCursorRevision) {
+        return;
+    }
+    self.appliedGuestCursorRevision = revision;
+    const uint32_t cursorId =
+        gSelectedGuestCursorId.load(std::memory_order_relaxed);
+    BVNGuestCursorBitmap bitmap;
+    bool hasBitmap = false;
+    {
+        std::lock_guard<std::mutex> lock(gGuestCursorMutex);
+        auto found = gGuestCursorBitmaps.find(cursorId);
+        if (found != gGuestCursorBitmaps.end()) {
+            bitmap = found->second;
+            hasBitmap = true;
+        }
+    }
+
+    UIImage* image = nil;
+    if (hasBitmap) {
+        NSData* data = [NSData dataWithBytes:bitmap.pixels.data()
+                                      length:bitmap.pixels.size()];
+        CGDataProviderRef provider = CGDataProviderCreateWithCFData(
+            (__bridge CFDataRef)data);
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGImageRef cgImage = CGImageCreate(
+            bitmap.width, bitmap.height, 8, 32, bitmap.width * 4,
+            colorSpace,
+            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+            provider, nullptr, false, kCGRenderingIntentDefault);
+        if (cgImage != nullptr) {
+            image = [UIImage imageWithCGImage:cgImage scale:1.0
+                                  orientation:UIImageOrientationUp];
+            CGImageRelease(cgImage);
+        }
+        CGColorSpaceRelease(colorSpace);
+        CGDataProviderRelease(provider);
+        self.guestCursorHotspot = CGPointMake(bitmap.hotX, bitmap.hotY);
+        self.guestCursorPixelSize = CGSizeMake(bitmap.width, bitmap.height);
+    }
+    if (image == nil) {
+        image = [self fallbackGuestCursorImageForShape:
+            gSelectedGuestCursorShape.load(std::memory_order_relaxed)];
+        self.guestCursorHotspot = CGPointMake(2.0, 2.0);
+        self.guestCursorPixelSize = image.size;
+    }
+    self.guestCursorView.image = image;
+    self.guestCursorVisible =
+        gSelectedGuestCursorVisible.load(std::memory_order_relaxed);
+}
+
+- (CGPoint)overlayPointForGuestPoint:(CGPoint)point {
     UIView* presentation = BVNGuestPresentationView();
+    if (presentation != nil) {
+        return [presentation convertPoint:point toView:self];
+    }
+    float windowX = 0.0f;
+    float windowY = 0.0f;
+    if (BVNGuestControlsMapSoftwarePointToWindow(
+            (float)point.x, (float)point.y, &windowX, &windowY)) {
+        return CGPointMake(windowX, windowY);
+    }
+    CGFloat guestWidth = 1.0;
+    CGFloat guestHeight = 1.0;
+    [self guestSizeWidth:&guestWidth height:&guestHeight];
+    return CGPointMake(point.x * self.bounds.size.width / MAX(1.0, guestWidth),
+                       point.y * self.bounds.size.height / MAX(1.0, guestHeight));
+}
+
+- (void)positionCursor {
     CGFloat guestWidth = 0.0;
     CGFloat guestHeight = 0.0;
     if (!self.trackpadMode || !self.startupNotice.hidden ||
         ![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         self.cursorView.hidden = YES;
+        self.guestCursorView.hidden = YES;
         return;
     }
-    if (CGPointEqualToPoint(self.cursorGuestPoint, CGPointZero)) {
+    if (self.appliedPointerRevision == 0 &&
+        CGPointEqualToPoint(self.cursorGuestPoint, CGPointZero)) {
         self.cursorGuestPoint = CGPointMake(guestWidth / 2.0,
                                             guestHeight / 2.0);
     }
-    self.cursorView.hidden = NO;
-    if (presentation != nil) {
-        self.cursorView.center =
-            [presentation convertPoint:self.cursorGuestPoint toView:self];
-    } else {
-        float windowX = 0.0f;
-        float windowY = 0.0f;
-        if (BVNGuestControlsMapSoftwarePointToWindow(
-                (float)self.cursorGuestPoint.x, (float)self.cursorGuestPoint.y,
-                &windowX, &windowY)) {
-            self.cursorView.center = CGPointMake(windowX, windowY);
-        } else {
-            self.cursorView.center = CGPointMake(
-                self.cursorGuestPoint.x * self.bounds.size.width /
-                    MAX(1.0, guestWidth),
-                self.cursorGuestPoint.y * self.bounds.size.height /
-                    MAX(1.0, guestHeight));
-        }
+    const CGPoint cursorPoint =
+        [self overlayPointForGuestPoint:self.cursorGuestPoint];
+    self.cursorView.hidden = self.guestCursorMode;
+    self.cursorView.center = cursorPoint;
+
+    [self applyGuestCursorState];
+    self.guestCursorView.hidden = !self.guestCursorMode ||
+                                  !self.guestCursorVisible ||
+                                  self.guestCursorView.image == nil;
+    if (!self.guestCursorView.hidden) {
+        const CGPoint topLeftGuest = CGPointMake(
+            self.cursorGuestPoint.x - self.guestCursorHotspot.x,
+            self.cursorGuestPoint.y - self.guestCursorHotspot.y);
+        const CGPoint bottomRightGuest = CGPointMake(
+            topLeftGuest.x + self.guestCursorPixelSize.width,
+            topLeftGuest.y + self.guestCursorPixelSize.height);
+        const CGPoint topLeft = [self overlayPointForGuestPoint:topLeftGuest];
+        const CGPoint bottomRight =
+            [self overlayPointForGuestPoint:bottomRightGuest];
+        self.guestCursorView.frame = CGRectMake(
+            MIN(topLeft.x, bottomRight.x), MIN(topLeft.y, bottomRight.y),
+            MAX(1.0, fabs(bottomRight.x - topLeft.x)),
+            MAX(1.0, fabs(bottomRight.y - topLeft.y)));
+        [self bringSubviewToFront:self.guestCursorView];
     }
     [self bringSubviewToFront:self.cursorView];
 }
 
-- (void)setTrackpadModeEnabled:(BOOL)enabled {
-    if (self.trackpadMode == enabled) {
+- (void)setPointerMode:(NSInteger)mode {
+    mode = MAX(0, MIN(2, mode));
+    const BOOL enabled = mode != 0;
+    const BOOL guestCursor = mode == 2;
+    if (self.trackpadMode == enabled &&
+        self.guestCursorMode == guestCursor) {
         return;
     }
     [self cancelTrackpadGesture];
     self.trackpadMode = enabled;
+    self.guestCursorMode = guestCursor;
     if (enabled) {
         // Start in the middle of the picture rather than at 0,0, which on a
         // Wine desktop is behind the menu button.
@@ -1393,10 +1602,15 @@ static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
     }
     [[NSUserDefaults standardUserDefaults] setBool:enabled
                                             forKey:kBVNTrackpadModeKey];
+    [[NSUserDefaults standardUserDefaults] setInteger:mode
+                                               forKey:kBVNPointerModeKey];
     [self positionCursor];
     BVNLogWrite(BVNLogLevelInfo, "input",
-                enabled ? "Pointer mode: trackpad (drag to move, tap to click)."
-                        : "Pointer mode: direct (tap where you want to click).");
+                mode == 2
+                    ? "Pointer mode: trackpad with Wine cursor."
+                    : enabled
+                        ? "Pointer mode: trackpad with BoxedVN cursor."
+                        : "Pointer mode: direct tap.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,8 +2026,13 @@ static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
     [self.keyboardItem setTitle:(self.keyboardPanel.hidden ? @"Show keyboard"
                                                            : @"Hide keyboard")
                        forState:UIControlStateNormal];
-    [self.pointerItem setTitle:(self.trackpadMode ? @"Pointer: trackpad"
-                                                  : @"Pointer: direct tap")
+    NSString* pointerTitle = @"Pointer: direct tap";
+    if (self.trackpadMode) {
+        pointerTitle = self.guestCursorMode
+            ? @"Pointer: trackpad + Wine cursor"
+            : @"Pointer: trackpad + BoxedVN cursor";
+    }
+    [self.pointerItem setTitle:pointerTitle
                       forState:UIControlStateNormal];
     [self.displayItem setTitle:(BVNGuestPresentationIsStretched()
                                     ? @"Display: fill screen"
@@ -1848,7 +2067,9 @@ static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
 }
 
 - (void)togglePointerMode {
-    [self setTrackpadModeEnabled:!self.trackpadMode];
+    const NSInteger current = !self.trackpadMode
+        ? 0 : self.guestCursorMode ? 2 : 1;
+    [self setPointerMode:(current + 1) % 3];
     [self applyMenuState];
 }
 
@@ -2095,6 +2316,21 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
         // Trackpad mode may already be active from UserDefaults. Keep its
         // cursor behind the opaque startup page and reveal it only after Wine
         // has produced the desktop/game presentation.
+        [gOverlay positionCursor];
+    }
+    const uint64_t pointerRevision =
+        gGuestPointerRevision.load(std::memory_order_acquire);
+    if (pointerRevision != gOverlay.appliedPointerRevision) {
+        gOverlay.appliedPointerRevision = pointerRevision;
+        gOverlay.cursorGuestPoint = CGPointMake(
+            gGuestPointerX.load(std::memory_order_relaxed),
+            gGuestPointerY.load(std::memory_order_relaxed));
+        [gOverlay positionCursor];
+    }
+    const uint64_t cursorRevision =
+        gGuestCursorRevision.load(std::memory_order_acquire);
+    if (cursorRevision != gOverlay.appliedGuestCursorRevision) {
+        [gOverlay applyGuestCursorState];
         [gOverlay positionCursor];
     }
     if (!gOverlay.startupNotice.hidden) {

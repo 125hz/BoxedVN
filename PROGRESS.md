@@ -1,5 +1,39 @@
 # BoxedVN — Progress and Handoff
 
+## Build 125: one guest pointer, targeted browser recovery, maximized NW.js
+
+The Build-124 Fate log shows that UIKit injection, `XQueryPointer`, the Xlib
+`Screen`, the X11 root and the 1280x960 Vulkan client finally agree. The
+remaining visible mismatch is state, not scale: Fate's `MoveCursorPlugin`
+warps Wine's pointer while BoxedVN's white ring retains its independent last
+touch position. Boxedwine also treated the Xlib `XWarpPointer` form with
+`dest_w=None` as an absolute coordinate even though Xlib defines it as a
+relative offset.
+
+Build 125 corrects that X11 semantic and makes Wine's guest-pixel pointer the
+single source of truth for direct touch, trackpad motion, polling and guest
+warps. The pointer menu now cycles through direct tap, trackpad with the
+BoxedVN ring, and trackpad with Wine's selected X cursor. Custom X cursor
+bitmaps and hotspots cross the existing SDL/UIKit boundary; standard cursor
+shapes use a native overlay fallback. Both cursor styles use the exact same
+presentation transform as input.
+
+Summer Memories proves Build 124's broad anonymous interpreter was correct
+enough to enter the game but too expensive: requestAnimationFrame throughput
+falls steadily as more V8 code is decoded. The policy is now adaptive. V8's
+healthy anonymous pages remain ARM64-JIT compiled; if the dispatcher returns
+to exactly one anonymous guest EIP 65,536 times without forward progress,
+only that 4 KiB page is retired and decoded with the interpreter. This keeps
+the escape hatch that cleared the observed `38A62833` spin without placing
+the whole browser on the slow path. NW.js games also receive Chromium's
+generic `--start-maximized`, so a package's desktop-sized initial window uses
+the virtual monitor instead of remaining centred and small.
+
+The Windows host-independent suite passes. The Objective-C++, X11 and ARM64
+core changes still require the iPhoneOS CI compile, and performance, pointer
+alignment and maximized-window behaviour remain physical-device acceptance
+tests rather than claims made from compilation.
+
 ## Build 124: unify the virtual desktop and isolate generated browser code
 
 The Build-123 Fate log proves the requested 1280x960 monitor reaches Wine and

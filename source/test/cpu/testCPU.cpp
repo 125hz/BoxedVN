@@ -1282,4 +1282,27 @@ void testJitSignalPendingQueuedSignal() {
 #endif
 }
 
+void testAnonymousInterpreterPageSelection() {
+#ifdef BOXEDWINE_JIT
+    KProcessPtr process = KProcess::create();
+    constexpr U32 selected = 0x38A62833;
+    if (process->isAnonymousInterpreterPage(selected)) {
+        testFail("anonymous interpreter page selected before activation");
+    }
+    if (!process->activateAnonymousInterpreterPage(selected)) {
+        testFail("anonymous interpreter page first activation failed");
+    }
+    if (!process->isAnonymousInterpreterPage(selected) ||
+        !process->isAnonymousInterpreterPage(selected & ~(K_PAGE_SIZE - 1))) {
+        testFail("anonymous interpreter page did not cover its whole page");
+    }
+    if (process->isAnonymousInterpreterPage(selected + K_PAGE_SIZE)) {
+        testFail("anonymous interpreter page leaked into adjacent page");
+    }
+    if (process->activateAnonymousInterpreterPage(selected)) {
+        testFail("anonymous interpreter page duplicate activation succeeded");
+    }
+#endif
+}
+
 #endif

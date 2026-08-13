@@ -22,6 +22,9 @@
 #include "sdlcallback.h"
 #include "devinput.h"
 #include "knativeinputSDL.h"
+#ifdef BOXEDWINE_IOS
+extern "C" void BVNGuestPointerPositionChanged(int x, int y);
+#endif
 #include "knativesystem.h"
 #include "kdspaudio.h"
 
@@ -109,6 +112,7 @@ bool KNativeInputSDL::mouseMoveGuest(int x, int y, bool relative) {
         injectedX = x;
         injectedY = y;
         hasInjectedPointer = true;
+        BVNGuestPointerPositionChanged(x, y);
     }
 #endif
 
@@ -264,6 +268,7 @@ void KNativeInputSDL::setMousePos(int x, int y) {
     injectedX = x;
     injectedY = y;
     hasInjectedPointer = true;
+    BVNGuestPointerPositionChanged(x, y);
 #endif
 
 #ifdef BOXEDWINE_IOS

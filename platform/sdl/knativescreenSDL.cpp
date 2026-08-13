@@ -36,6 +36,10 @@ extern "C" bool BVNGuestPresentationContentRect(int* x, int* y, int* w, int* h);
 // The startup notice is UIKit text over SDL's backdrop; see BVNGuestOverlay.mm.
 extern "C" void BVNGuestStartupNoticeSetVisible(bool visible);
 extern "C" void BVNGuestStartupNoticeSetProgress(size_t jitBlocks);
+extern "C" void BVNGuestCursorDefine(U32 id, const U8* bgraPixels,
+                                      int width, int height,
+                                      int hotX, int hotY);
+extern "C" void BVNGuestCursorSelect(U32 id, int shape, bool visible);
 
 namespace {
 
@@ -983,6 +987,10 @@ void KNativeScreenSDL::buildCursor(KThread* thread, const std::shared_ptr<XCurso
         return;
     }
     U8* buffer = thread->memory->lockReadOnlyMemory(pixelsAddress, width * height * 4);
+#ifdef BOXEDWINE_IOS
+    BVNGuestCursorDefine(cursor->id, buffer, (int)width, (int)height,
+                         (int)xHot, (int)yHot);
+#endif
     SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(buffer, width, height, 32, width * 4, 0xff0000, 0xff00, 0xff, 0xff000000);
     SDL_Cursor* sdlCursor = SDL_CreateColorCursor(surface, xHot, yHot);
 
@@ -1081,6 +1089,9 @@ void KNativeScreenSDL::setCursor(const std::shared_ptr<XCursor>& cursor) {
             SDL_ShowCursor(0);
         }
     DISPATCH_MAIN_THREAD_BLOCK_END
+#ifdef BOXEDWINE_IOS
+    BVNGuestCursorSelect(cursor->id, cursor->shape, sdlCursor != nullptr);
+#endif
 }
 
 void KNativeScreenSDL::destroyTextureCache() {
