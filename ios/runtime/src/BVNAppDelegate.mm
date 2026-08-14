@@ -1242,7 +1242,8 @@ static bool gGuestPresentationIsLetterboxed = false;
 static void* gGuestPresentationSurface = nullptr;
 static uint32_t gGuestPresentationGuestWidth = 0;
 static uint32_t gGuestPresentationGuestHeight = 0;
-static bool gGuestPresentationStretch = false;
+// 0 = fit (letterbox), 1 = fill while preserving aspect (crop), 2 = stretch.
+static int gGuestPresentationMode = 0;
 
 // The natural drawable size of the presenting layer (bounds x contentsScale)
 // as of the last fit. Cached rather than read live because swapchains are
@@ -1251,9 +1252,14 @@ static bool gGuestPresentationStretch = false;
 static std::atomic<int> gGuestNaturalDrawableWidth{0};
 static std::atomic<int> gGuestNaturalDrawableHeight{0};
 
-extern "C" bool BVNGuestPreferredPresentationStretch(void) {
-    return [[NSUserDefaults standardUserDefaults]
-        boolForKey:@"BoxedVN.presentation.stretch"] == YES;
+extern "C" int BVNGuestPreferredPresentationMode(void) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults objectForKey:@"BoxedVN.presentation.mode"] != nil) {
+        return MAX(0, MIN(2,
+            (int)[defaults integerForKey:@"BoxedVN.presentation.mode"]));
+    }
+    // Preserve the old two-state preference when upgrading.
+    return [defaults boolForKey:@"BoxedVN.presentation.stretch"] ? 2 : 0;
 }
 
 // The geometry the current fit was computed for, measured on the Metal view's
@@ -1281,7 +1287,7 @@ extern "C" bool BVNGuestPresentationContentRect(int* x, int* y, int* w,
 extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                                                 uint32_t guestWidth,
                                                 uint32_t guestHeight,
-                                                bool stretchToFill) {
+                                                int presentationMode) {
     // Deliberately NOT dispatch_async(dispatch_get_main_queue()) when called
     // off-main. That is what build 63 did, and the device log proves the
     // blocks never ran: both of them were still queued when the session ended
@@ -1335,7 +1341,8 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
     gGuestPresentationSurface = surface;
     gGuestPresentationGuestWidth = guestWidth;
     gGuestPresentationGuestHeight = guestHeight;
-    gGuestPresentationStretch = stretchToFill;
+    presentationMode = MAX(0, MIN(2, presentationMode));
+    gGuestPresentationMode = presentationMode;
 
     // Horizontal safe-area insets only. In landscape the Dynamic Island is an
     // opaque cut-out at one end, so content must stay clear of it; the bottom
@@ -1402,8 +1409,15 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
     // guest resolution.
     CGFloat scaleX = available.size.width / (CGFloat)guestWidth;
     CGFloat scaleY = available.size.height / (CGFloat)guestHeight;
-    if (!stretchToFill) {
+    if (presentationMode == 0) {
         scaleX = scaleY = MIN(scaleX, scaleY);
+    } else if (presentationMode == 1) {
+        // Preserve the guest's shape while covering the available display.
+        // This fixes games that enter a 4:3 fullscreen surface but render a
+        // widescreen picture inside it: aspect-fit preserves both sets of
+        // bars, while stretch distorts the picture. Fill crops only the outer
+        // surface and keeps circles, fonts and cursor geometry undistorted.
+        scaleX = scaleY = MAX(scaleX, scaleY);
     }
     const CGRect target = CGRectMake(
         available.origin.x +
@@ -1465,6 +1479,10 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
     [view layoutIfNeeded];
     BVNSyncGuestX11PatchGeometry(view);
 
+    // Keep the full transformed frame, including a negative origin in aspect
+    // fill mode. The container clips it visually; retaining the full frame in
+    // diagnostics makes that crop explicit and never participates in UIKit's
+    // transform-aware input conversion.
     gGuestPresentationContentRect = target;
     gGuestPresentationIsLetterboxed =
         !CGRectEqualToRect(target, containerBounds);
@@ -1478,7 +1496,8 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
          "%.0fx%.0f, drawable %.0fx%.0f, contentsScale %.2f. SDL will now "
          "report its window as the view's bounds, so pointer coordinates are "
          "guest pixels.",
-        stretchToFill ? @"stretched to fill" : @"aspect-fitted",
+        presentationMode == 2 ? @"stretched to fill"
+            : presentationMode == 1 ? @"aspect-filled" : @"aspect-fitted",
         guestWidth, guestHeight, target.size.width, target.size.height,
         target.origin.x, target.origin.y, containerBounds.size.width,
         containerBounds.size.height, NSStringFromClass(container.class),
@@ -1556,28 +1575,28 @@ extern "C" bool BVNSyncGuestPresentationGeometry(void) {
     BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
                                     gGuestPresentationGuestWidth,
                                     gGuestPresentationGuestHeight,
-                                    gGuestPresentationStretch);
+                                    gGuestPresentationMode);
     BVNGuestOverlayGeometryDidChange();
     return true;
 }
 
-extern "C" bool BVNGuestPresentationIsStretched(void) {
-    return gGuestPresentationStretch;
+extern "C" int BVNGuestPresentationMode(void) {
+    return gGuestPresentationMode;
 }
 
-extern "C" void BVNGuestSetPresentationStretched(bool stretched) {
+extern "C" void BVNGuestSetPresentationMode(int mode) {
     if (!NSThread.isMainThread) {
         return;
     }
+    mode = MAX(0, MIN(2, mode));
     [[NSUserDefaults standardUserDefaults]
-        setBool:(stretched ? YES : NO)
-         forKey:@"BoxedVN.presentation.stretch"];
-    gGuestPresentationStretch = stretched;
+        setInteger:mode forKey:@"BoxedVN.presentation.mode"];
+    gGuestPresentationMode = mode;
     if (gGuestPresentationSurface != nullptr) {
         BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
                                         gGuestPresentationGuestWidth,
                                         gGuestPresentationGuestHeight,
-                                        stretched);
+                                        mode);
         BVNGuestPresentationGeometryChanged();
     }
 }
@@ -1592,7 +1611,7 @@ extern "C" void BVNForgetGuestPresentationAspect(void* surface) {
     gGuestPresentationSurface = nullptr;
     gGuestPresentationGuestWidth = 0;
     gGuestPresentationGuestHeight = 0;
-    gGuestPresentationStretch = false;
+    gGuestPresentationMode = 0;
     gLastFittedBounds = CGRectNull;
     gLastFittedInsets = UIEdgeInsetsZero;
     gGuestPresentationContentRect = CGRectZero;

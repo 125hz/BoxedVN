@@ -743,6 +743,22 @@ WinePrefixPreparationResult prepareWinePrefix(
         result.changed = true;
     }
 
+    // Chromium 64's final font fallback sequence tries its requested family,
+    // then "Sans", Arial, MS UI Gothic, Microsoft Sans Serif, Segoe UI,
+    // Calibri, Times New Roman and Courier New. If none resolves it enters
+    // FontCache::CrashWithFontInfo, whose entire implementation is a fatal
+    // CHECK(false). Wine ships a scalable Tahoma face, but Chromium never
+    // includes Tahoma in that last-resort list. Give only its synthetic
+    // "Sans" sentinel a stable substitute, leaving every real family free to
+    // resolve to a user's installed font first. This is a prefix-wide Windows
+    // compatibility baseline for Chromium/NW.js/Electron, not a game rule.
+    if (setWineRegistryValue(
+            contents,
+            "Software\\Microsoft\\Windows NT\\CurrentVersion\\FontSubstitutes",
+            "Sans", "\"Tahoma\"")) {
+        result.changed = true;
+    }
+
     // Wine 10's services.exe starts root PnP drivers even when their service
     // Start value is SERVICE_DISABLED.  wineboot also leaves an existing root
     // device untouched, so keeping the device but clearing its associated

@@ -504,7 +504,11 @@ visible in Files.
   where Wine's font backend picks it up on the next start. Existing files are
   never overwritten and the session log reports the counts under `fonts:`.
   This is the supported route for a CJK face, and for a browser-engine game
-  that aborts with an empty font collection.
+  that needs glyph coverage Wine does not supply. Build 131 also maps
+  Chromium's synthetic last-resort `Sans` name to Wine's bundled scalable
+  Tahoma. That prevents Chromium 64's deliberate `FontCache::CrashWithFontInfo`
+  abort when every named fallback is absent; it does not provide CJK glyphs or
+  replace a real family the game requested.
 - A bundled root takes precedence over an imported root. This lets a targeted
   runtime-migration build reliably replace an older imported Wine version.
   Unbundled builds continue to use the imported archive.

@@ -483,6 +483,15 @@ final class AppModel: ObservableObject {
         }
         let files = ContainerLibrary.filesDirectory(for: container)
         do {
+            // Keep diagnostics mounted to the container's D: drive, but scan
+            // an empty directory for compatibility. Otherwise one unrelated
+            // NW.js game anywhere under Files makes dxdiag inherit Chromium
+            // switches and anonymous-executable interpretation.
+            let compatibilityDirectory = files.appendingPathComponent(
+                ".boxedvn-diagnostics", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: compatibilityDirectory,
+                withIntermediateDirectories: true)
             try Session.launch(
                 rootFilesystem: rootFilesystem,
                 writableRoot: writableRoot,
@@ -499,7 +508,8 @@ final class AppModel: ObservableObject {
                 wineRenderer: Self.wineRenderer(for: container.renderer),
                 sharedDriveLetter:
                     container.sharedDriveLetter.lowercased().first ?? "e",
-                windowsVersion: container.windowsVersion)
+                windowsVersion: container.windowsVersion,
+                compatibilityDirectory: compatibilityDirectory)
         } catch {
             alertMessage = "Direct3D diagnostics could not start: "
                          + error.localizedDescription

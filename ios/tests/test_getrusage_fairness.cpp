@@ -62,7 +62,7 @@ BOXEDVN_TEST(getrusage_fairness_throttle_is_rate_limited_in_wall_time) {
     CHECK(!fairness.observe(now + 10).throttle);
 
     // And the cost it implies stays a small fraction of wall time.
-    CHECK(GetrusageFairness::kThrottleSleepUs * 4 <
+    CHECK(GetrusageFairness::kThrottleSleepUs * 20 <
           GetrusageFairness::kThrottleIntervalUs);
 }
 

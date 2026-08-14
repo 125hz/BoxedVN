@@ -258,6 +258,7 @@ static NSString* const kBVNPerformanceBatteryKey =
 // a fingertip cannot hit accurately.
 @property (nonatomic, assign) BOOL trackpadMode;
 @property (nonatomic, assign) BOOL guestCursorMode;
+@property (nonatomic, assign) BOOL wineCursorOnlyMode;
 @property (nonatomic, strong) UIView* cursorView;
 @property (nonatomic, strong) UIImageView* guestCursorView;
 @property (nonatomic, assign) CGPoint guestCursorHotspot;
@@ -424,13 +425,16 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.keyRows = BVNKeyboardRows();
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
     if ([defaults objectForKey:kBVNPointerModeKey] != nil) {
-        const NSInteger pointerMode = [defaults integerForKey:kBVNPointerModeKey];
+        const NSInteger pointerMode = MAX(
+            0, MIN(3, [defaults integerForKey:kBVNPointerModeKey]));
         self.trackpadMode = pointerMode != 0;
-        self.guestCursorMode = pointerMode == 2;
+        self.guestCursorMode = pointerMode >= 2;
+        self.wineCursorOnlyMode = pointerMode == 3;
     } else {
         // Preserve the old direct/trackpad choice when upgrading.
         self.trackpadMode = [defaults boolForKey:kBVNTrackpadModeKey];
         self.guestCursorMode = NO;
+        self.wineCursorOnlyMode = NO;
     }
     [self buildMenu];
     [self buildKeyboard];
@@ -793,8 +797,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     if ([defaults boolForKey:kBVNPerformanceBatteryKey]) {
         const float level = UIDevice.currentDevice.batteryLevel;
         [lines addObject:level >= 0.0f
-            ? [NSString stringWithFormat:@"Battery   %3.0f%%", level * 100.0f]
-            : @"Battery      --"];
+            ? [NSString stringWithFormat:@"%.0f%%", level * 100.0f]
+            : @"--"];
     }
     self.performanceLabel.text = [lines componentsJoinedByString:@"\n"];
     [self setNeedsLayout];
@@ -1678,21 +1682,26 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         self.guestCursorPixelSize = CGSizeMake(bitmap.width, bitmap.height);
     }
     if (image == nil) {
-        self.guestCursorUsesFallback = YES;
-        const int shape =
-            gSelectedGuestCursorShape.load(std::memory_order_relaxed);
-        image = [self fallbackGuestCursorImageForShape:
-            shape];
-        if (shape == 108 || shape == 116 || shape == 130 || shape == 150 ||
-            shape == 152 || shape == 88 || shape == 1000) {
-            self.guestCursorHotspot = CGPointMake(image.size.width / 2.0,
-                                                  image.size.height / 2.0);
-        } else if (shape == 60) {
-            self.guestCursorHotspot = CGPointMake(8.0, 3.0);
+        if (!self.wineCursorOnlyMode) {
+            self.guestCursorUsesFallback = YES;
+            const int shape =
+                gSelectedGuestCursorShape.load(std::memory_order_relaxed);
+            image = [self fallbackGuestCursorImageForShape:shape];
+            if (shape == 108 || shape == 116 || shape == 130 ||
+                shape == 150 || shape == 152 || shape == 88 ||
+                shape == 1000) {
+                self.guestCursorHotspot = CGPointMake(image.size.width / 2.0,
+                                                      image.size.height / 2.0);
+            } else if (shape == 60) {
+                self.guestCursorHotspot = CGPointMake(8.0, 3.0);
+            } else {
+                self.guestCursorHotspot = CGPointMake(2.0, 2.0);
+            }
+            self.guestCursorPixelSize = image.size;
         } else {
-            self.guestCursorHotspot = CGPointMake(2.0, 2.0);
+            self.guestCursorHotspot = CGPointZero;
+            self.guestCursorPixelSize = CGSizeZero;
         }
-        self.guestCursorPixelSize = image.size;
     }
     self.guestCursorView.image = image;
     self.guestCursorVisible =
@@ -1745,13 +1754,13 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.cursorView.center = cursorPoint;
 
     [self applyGuestCursorState];
-    // Selecting this mode is an explicit request for a visible guest cursor.
-    // Visual novels commonly hide Wine's cursor and draw their own sprite;
-    // on a touch-only device that leaves the trackpad with no position
-    // feedback at all. Preserve Wine's bitmap/shape and hotspot, but override
-    // the guest's hide request while this accessibility mode is selected.
+    // The fallback-assisted mode stays visible when a game hides Wine's
+    // cursor so a touch-only trackpad never loses position feedback. The
+    // Wine-only mode is deliberately literal: no bitmap and a guest hide
+    // request both produce no cursor.
     self.guestCursorView.hidden = !self.guestCursorMode ||
-                                  self.guestCursorView.image == nil;
+                                  self.guestCursorView.image == nil ||
+        (self.wineCursorOnlyMode && !self.guestCursorVisible);
     if (!self.guestCursorView.hidden) {
         NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
         const CGFloat guestScale = self.guestCursorUsesFallback
@@ -1776,16 +1785,23 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (void)setPointerMode:(NSInteger)mode {
-    mode = MAX(0, MIN(2, mode));
+    mode = MAX(0, MIN(3, mode));
     const BOOL enabled = mode != 0;
-    const BOOL guestCursor = mode == 2;
+    const BOOL guestCursor = mode >= 2;
+    const BOOL wineCursorOnly = mode == 3;
     if (self.trackpadMode == enabled &&
-        self.guestCursorMode == guestCursor) {
+        self.guestCursorMode == guestCursor &&
+        self.wineCursorOnlyMode == wineCursorOnly) {
         return;
     }
     [self cancelTrackpadGesture];
     self.trackpadMode = enabled;
     self.guestCursorMode = guestCursor;
+    self.wineCursorOnlyMode = wineCursorOnly;
+    // The selected guest cursor may not have changed, but changing between
+    // fallback-assisted and Wine-only presentation changes what the same
+    // revision must display.
+    self.appliedGuestCursorRevision = UINT64_MAX;
     if (enabled) {
         // Start in the middle of the picture rather than at 0,0, which on a
         // Wine desktop is behind the menu button.
@@ -1802,8 +1818,10 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                                forKey:kBVNPointerModeKey];
     [self positionCursor];
     BVNLogWrite(BVNLogLevelInfo, "input",
-                mode == 2
-                    ? "Pointer mode: trackpad with Wine cursor."
+                mode == 3
+                    ? "Pointer mode: trackpad with Wine bitmap only."
+                    : mode == 2
+                    ? "Pointer mode: trackpad with Wine cursor and fallback."
                     : enabled
                         ? "Pointer mode: trackpad with BoxedVN cursor."
                         : "Pointer mode: direct tap.");
@@ -2224,14 +2242,19 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                        forState:UIControlStateNormal];
     NSString* pointerTitle = @"Pointer: direct tap";
     if (self.trackpadMode) {
-        pointerTitle = self.guestCursorMode
-            ? @"Pointer: trackpad + Wine cursor"
+        pointerTitle = self.wineCursorOnlyMode
+            ? @"Pointer: Wine cursor only"
+            : self.guestCursorMode
+            ? @"Pointer: Wine cursor + fallback"
             : @"Pointer: trackpad + BoxedVN cursor";
     }
     [self.pointerItem setTitle:pointerTitle
                       forState:UIControlStateNormal];
-    [self.displayItem setTitle:(BVNGuestPresentationIsStretched()
-                                    ? @"Display: fill screen"
+    const int displayMode = BVNGuestPresentationMode();
+    [self.displayItem setTitle:(displayMode == 2
+                                    ? @"Display: stretch"
+                                    : displayMode == 1
+                                    ? @"Display: fill aspect"
                                     : @"Display: fit aspect")
                       forState:UIControlStateNormal];
     const BOOL performanceEnabled = [[NSUserDefaults standardUserDefaults]
@@ -2264,8 +2287,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 
 - (void)togglePointerMode {
     const NSInteger current = !self.trackpadMode
-        ? 0 : self.guestCursorMode ? 2 : 1;
-    [self setPointerMode:(current + 1) % 3];
+        ? 0 : self.wineCursorOnlyMode ? 3 : self.guestCursorMode ? 2 : 1;
+    [self setPointerMode:(current + 1) % 4];
     [self applyMenuState];
 }
 
@@ -2302,11 +2325,13 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (void)toggleDisplayMode {
-    BVNGuestSetPresentationStretched(!BVNGuestPresentationIsStretched());
+    const int mode = (BVNGuestPresentationMode() + 1) % 3;
+    BVNGuestSetPresentationMode(mode);
     [self applyMenuState];
-    BVNLogWrite(BVNLogLevelInfo, "graphics",
-                BVNGuestPresentationIsStretched()
-                    ? "Guest display mode: fill screen."
+    BVNLogWrite(BVNLogLevelInfo, "graphics", mode == 2
+                    ? "Guest display mode: stretch."
+                    : mode == 1
+                    ? "Guest display mode: fill aspect."
                     : "Guest display mode: fit aspect.");
 }
 

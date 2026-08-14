@@ -161,6 +161,10 @@ BOXEDVN_TEST(wine_prefix_is_extracted_and_patched_end_to_end) {
                             "\"Service\"=\"winebus\""), 1U);
     CHECK_CONTAINS(systemRegistry,
                    "[System\\\\ControlSet001\\\\Services\\\\NDIS]");
+    CHECK_CONTAINS(
+        systemRegistry,
+        "[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\FontSubstitutes]");
+    CHECK_CONTAINS(systemRegistry, "\"Sans\"=\"Tahoma\"");
 
     const WinePrefixPreparationResult repeated =
         prepareWinePrefix(archive.string(), prefix.string(),

@@ -42,8 +42,8 @@ extern "C" void BVNRegisterGuestVulkanSurface(void* surface);
 extern "C" void BVNApplyGuestPresentationAspect(void* surface,
                                                 U32 guestWidth,
                                                 U32 guestHeight,
-                                                bool stretchToFill);
-extern "C" bool BVNGuestPreferredPresentationStretch(void);
+                                                int presentationMode);
+extern "C" int BVNGuestPreferredPresentationMode(void);
 extern "C" void BVNUnregisterGuestVulkanSurface(void* surface);
 extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
                                                         int* height);
@@ -253,7 +253,7 @@ void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,
                 // the surface existed and could only see a stretched window.
                 BVNApplyGuestPresentationAspect(
                     (void*)result, wnd->width(), wnd->height(),
-                    BVNGuestPreferredPresentationStretch());
+                    BVNGuestPreferredPresentationMode());
                 screen->refreshIOSGuestPointerTransform();
             }
         }

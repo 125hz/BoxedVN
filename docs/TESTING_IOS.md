@@ -282,6 +282,16 @@ a guest switched to Vulkan. Japanese IME is still not part of it.
 
 From the same menu button:
 
+- **Display: fit aspect / fill aspect / stretch.** Fit must show the entire
+  guest without distortion. Fill must preserve the same shape while cropping
+  only enough of the outer surface to cover the phone; use this for a game
+  that places a 16:9 picture inside a 4:3 fullscreen surface. Stretch may fill
+  both axes but is expected to distort a mismatched aspect ratio. Touch and
+  both trackpad cursors must remain aligned in every mode.
+- **Pointer: Wine cursor only.** A Wine-provided bitmap must retain its native
+  image and hotspot. If Wine provides no bitmap, or the guest hides it, no
+  BoxedVN fallback may appear. The separate Wine cursor + fallback mode should
+  still provide visible feedback in those cases.
 - **Rotation: locked / free.** Unlock, turn the device to portrait, and check
   that the guest is drawn as a correctly proportioned band centred in the
   screen with black above and below - *not* stretched to the portrait window.

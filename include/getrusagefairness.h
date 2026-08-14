@@ -47,8 +47,8 @@ struct GetrusageFairnessDecision {
 //
 // Bounding it by wall time instead caps the cost at roughly
 // kThrottleSleepUs / kThrottleIntervalUs of the thread's time while still
-// delivering a thousand real scheduling points a second, which is a thousand
-// more than the livelock had.
+// delivering hundreds of real scheduling points a second, which is hundreds
+// more than the livelock had and still more than two per 120 Hz display frame.
 //
 // This detector is deliberately independent from sleeping and logging so its
 // state transitions can be unit-tested on the host.
@@ -101,12 +101,15 @@ public:
 
     static constexpr std::uint32_t kActivationCallCount = 32;
     static constexpr std::uint64_t kRapidCallWindowUs = 5000;
-    // At most one scheduling point per millisecond of wall time...
-    static constexpr std::uint64_t kThrottleIntervalUs = 1000;
+    // At most one scheduling point per four milliseconds of wall time. That
+    // remains frequent enough to wake worker/command-stream peers more than
+    // twice per 120 Hz frame without donating a tenth of every spinning
+    // thread's execution budget to the host scheduler.
+    static constexpr std::uint64_t kThrottleIntervalUs = 4000;
     // ...and each one costs this much. Darwin will not sleep for less than
     // about 50 us, so this is close to the smallest real scheduling point
-    // available, and it bounds the mitigation at roughly a tenth of the
-    // thread's time.
+    // available, and it bounds the mitigation at roughly 2.5% of the thread's
+    // time.
     static constexpr std::uint64_t kThrottleSleepUs = 100;
 
 private:

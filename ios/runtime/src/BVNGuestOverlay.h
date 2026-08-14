@@ -135,8 +135,8 @@ void BVNGuestControlsSendRightClick(int x, int y);
 // touch into its coordinate space.  nil when no guest surface exists.
 UIView* BVNGuestPresentationView(void);
 
-bool BVNGuestPresentationIsStretched(void);
-void BVNGuestSetPresentationStretched(bool stretched);
+int BVNGuestPresentationMode(void);
+void BVNGuestSetPresentationMode(int mode);
 
 // Re-derives the window-to-guest pointer transform from the rectangle the
 // presenter measured.  Presentation and input are never derived independently:

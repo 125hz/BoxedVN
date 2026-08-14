@@ -1,5 +1,54 @@
 # BoxedVN — Progress and Handoff
 
+## Build 131: browser last-resort fonts, aspect fill, and lower scheduler cost
+
+The supplied Summer Memories log reaches gameplay and remains responsive for
+about two minutes before Chromium 64 terminates its renderer at
+`FontCache.cpp(382)` with `Check failed: false` and
+`EXCEPTION_BREAKPOINT`. That source line is Chromium's intentional
+`FontCache::CrashWithFontInfo` abort: the browser exhausted system fallback
+and could not create any of its last-resort families. This is neither an iOS
+memory kill nor a lost Vulkan device. Wine already ships scalable Tahoma, but
+Chromium's final sequence never tries it, so prefix preparation now maps only
+Chromium's synthetic `Sans` sentinel to Tahoma in Wine's standard
+`FontSubstitutes` registry. Requested real families and user-supplied Japanese
+fonts still resolve first. The rule applies to every Chromium, NW.js, and
+Electron guest and does not inspect a game name.
+
+The latest device performance sample reports 529 ms inside fairness sleeps
+during a 5,215 ms interval: about ten percent of wall time, alongside only
+0.62 busy host CPU cores. The watchdog was yielding every millisecond on each
+polling guest thread. Its interval is now four milliseconds, bounding that
+cost near 2.5 percent while retaining 250 real scheduling opportunities per
+second, more than two per 120 Hz display frame. Summer still runs anonymous V8
+code through the correctness-first interpreter; this change removes measured
+host scheduling overhead without returning to the browser GPU/JIT experiments
+that previously regressed it before the menu. Fresh device FPS and stability
+remain acceptance checks.
+
+Fullscreen presentation now has three modes. **Fit aspect** retains the whole
+surface with bars, **Fill aspect** uses one uniform scale and crops the outer
+surface, and **Stretch** fills independently. Fruit of Grisaia's fullscreen
+path puts its 16:9 picture inside a 4:3 1024x768 surface, so Fit preserved both
+sets of bars and Stretch distorted it; Fill aspect removes the outer bars
+without changing circles, fonts, or pointer geometry. The default remains Fit
+for genuine 4:3 games.
+
+Pointer selection now includes **Wine cursor only**. It displays only Wine's
+actual X11 bitmap and hotspot, honours the guest's hide request, and never
+creates BoxedVN's fallback. The existing Wine-cursor mode retains its fallback
+for games/themes that provide no bitmap. The performance overlay's battery
+line is now only `65%` (or `--`). DXDiag also scans an isolated empty
+compatibility directory, so another NW.js game elsewhere in a container can no
+longer donate Chromium launch switches to the renderer test.
+
+The rebuilt Windows host-independent suite passes 173/173. Objective-C++,
+Swift, presentation geometry, and native ARM64 compilation remain the
+iPhoneOS CI gate; Summer stability/FPS, Fruit aspect fill, and Wine-only cursor
+behavior remain physical-device acceptance checks.
+
+---
+
 ## Build 130: ARM64 interpreter throughput and container utilities
 
 The Build-129 Summer Memories trace identifies the remaining frame-rate limit
