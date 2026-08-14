@@ -203,6 +203,8 @@ BOXEDVN_TEST(chromiumSwitchesCoverTheKnownDeviceFailures) {
     CHECK_CONTAINS(joined, "--disable-renderer-backgrounding");
     CHECK_CONTAINS(joined, "--disable-backgrounding-occluded-windows");
     CHECK_CONTAINS(joined, "--start-maximized");
+    CHECK_CONTAINS(joined, "--kiosk");
+    CHECK_CONTAINS(joined, "--start-fullscreen");
 
     // Chromium resolves a repeated --disable-features to the last one it
     // sees, so the set must never carry two of them.

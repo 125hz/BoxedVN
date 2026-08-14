@@ -1246,15 +1246,6 @@ void XWindow::motionNotify(const DisplayDataPtr& data, S32 x, S32 y) {
 	S32 window_x = x;
 	S32 window_y = y;
 	screenToWindow(window_x, window_y);
-	S32 virtual_root_x = x;
-	S32 virtual_root_y = y;
-#ifdef BOXEDWINE_IOS
-	XServer* server = XServer::getServer(true);
-	if (server && server->fakeFullScreenWnd) {
-		server->fakeFullScreenWnd->screenToWindow(virtual_root_x,
-			virtual_root_y);
-	}
-#endif
 
 	// winex11 doesn't seem to use subwindow
 	XEvent event = {};
@@ -1267,8 +1258,13 @@ void XWindow::motionNotify(const DisplayDataPtr& data, S32 x, S32 y) {
 	event.xmotion.time = XServer::getServer()->getEventTime();
 	event.xmotion.x = window_x;
 	event.xmotion.y = window_y;
-	event.xmotion.x_root = virtual_root_x;
-	event.xmotion.y_root = virtual_root_y;
+	// X11 requires root and window coordinates in one coherent hierarchy:
+	// x_root - window_origin must equal x. UIKit's guest pixels are converted
+	// to physical X11-root coordinates before reaching this method, so keep
+	// those physical coordinates in the event. XQueryPointer separately
+	// exposes the 0,0-based presented client to Wine on iOS.
+	event.xmotion.x_root = x;
+	event.xmotion.y_root = y;
 	event.xmotion.state = XServer::getServer()->getInputModifiers();
 	event.xmotion.is_hint = NotifyNormal;
 	event.xmotion.same_screen = True;
@@ -1484,15 +1480,6 @@ void XWindow::buttonNotify(const DisplayDataPtr& data, U32 button, S32 x, S32 y,
 	S32 window_x = x;
 	S32 window_y = y;
 	screenToWindow(window_x, window_y);
-	S32 virtual_root_x = x;
-	S32 virtual_root_y = y;
-#ifdef BOXEDWINE_IOS
-	XServer* server = XServer::getServer(true);
-	if (server && server->fakeFullScreenWnd) {
-		server->fakeFullScreenWnd->screenToWindow(virtual_root_x,
-			virtual_root_y);
-	}
-#endif
 
 	// winex11 doesn't seem to use subwindow
 	XEvent event = {};
@@ -1505,8 +1492,11 @@ void XWindow::buttonNotify(const DisplayDataPtr& data, U32 button, S32 x, S32 y,
 	event.xbutton.time = XServer::getServer()->getEventTime();
 	event.xbutton.x = window_x;
 	event.xbutton.y = window_y;
-	event.xbutton.x_root = virtual_root_x;
-	event.xbutton.y_root = virtual_root_y;
+	// Keep the X event internally self-consistent. Wine uses these root
+	// coordinates together with the receiving window's physical geometry when
+	// translating ButtonPress/Release into Windows mouse messages.
+	event.xbutton.x_root = x;
+	event.xbutton.y_root = y;
 	event.xbutton.state = XServer::getServer()->getInputModifiers();
 	event.xbutton.button = button;
 	event.xbutton.same_screen = True;	
@@ -1518,6 +1508,17 @@ void XWindow::buttonNotify(const DisplayDataPtr& data, U32 button, S32 x, S32 y,
 		event.xbutton.state |= ((Button1Mask) << (button - 1));
 	}
 	data->putEvent(event);
+#ifdef BOXEDWINE_IOS
+	static U32 acceptedButtonLogCount = 0;
+	if (acceptedButtonLogCount < 24) {
+		++acceptedButtonLogCount;
+		klog_fmt("iOS X11 queued button %s #%u: event window 0x%x, "
+			"local %d,%d, root %d,%d, display 0x%x, state 0x%x",
+			pressed ? "down" : "up", acceptedButtonLogCount, id,
+			window_x, window_y, x, y, data->displayId,
+			event.xbutton.state);
+	}
+#endif
 	if (XServer::getServer()->trace) {
 		BString log;
 		log.append(data->displayId, 16);

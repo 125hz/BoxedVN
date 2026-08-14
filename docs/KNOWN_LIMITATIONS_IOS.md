@@ -231,9 +231,11 @@ the facilities in question: `--no-sandbox`, `--disable-gpu`,
 `--disable-features=CalculateNativeWinOcclusion`,
 `--disable-background-timer-throttling`, `--disable-renderer-backgrounding`
 and `--disable-backgrounding-occluded-windows`. It also passes
-`--start-maximized`, because NW.js package defaults otherwise leave a
-desktop-sized game window centred inside BoxedVN's virtual monitor. The engine and the evidence
-for it are logged under `engine:`.
+`--start-maximized`, `--kiosk` and `--start-fullscreen`, because NW.js package
+defaults otherwise leave a decorated, desktop-sized game window centred
+inside BoxedVN's virtual monitor. Fullscreen is the engine-owned path that
+removes that frame; BoxedVN's native menu remains available outside the guest.
+The engine and the evidence for it are logged under `engine:`.
 
 Anything in a game's launch settings is *added to* these rather than
 replacing them. A switch the user names wins over BoxedVN's copy of the same

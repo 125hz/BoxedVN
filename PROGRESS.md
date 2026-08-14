@@ -1,5 +1,42 @@
 # BoxedVN — Progress and Handoff
 
+## Build 126: complete X11 clicks and recover mapped browser stalls
+
+The Build-125 Fate log closes an important branch of the input investigation:
+while the finger is held, Wine's `XQueryPointer` sees the expected guest point
+and `Button1Mask` (`0x100`). The missing click is later in the pipeline. X11
+button events were mixing a physical event-window coordinate with a
+fake-fullscreen client-relative `x_root/y_root`, violating the invariant Wine
+uses to translate X events into Windows mouse messages. Build 126 keeps event
+root and local coordinates in the real X11 hierarchy while retaining the
+0,0-based presented client only at the public pointer-query boundary.
+
+Direct touch now latches the last guest coordinate actually delivered, so a
+surface replacement or letterbox change while the finger is down cannot move
+the release to another part of the game. A trackpad tap holds the injected
+button for 60 ms instead of queuing press and release back-to-back; polling
+engines now get a scheduling interval in which the button is down. The Wine
+cursor option always renders its selected bitmap or standard-shape fallback
+when explicitly chosen, even if a visual novel hides the desktop cursor to
+draw its own. Bounded X11 delivery logs identify the exact receiving window,
+local/root coordinates and pre-event state in the next device log.
+
+The new Summer Memories snapshots explain the Build-125 regression: the
+runnable renderer thread repeatedly stops at `nw.dll+01DD8C20`, so a watchdog
+restricted to anonymous V8 memory cannot activate. The adaptive policy now
+permits one exact page in a PE browser module or anonymous executable memory
+after 65,536 identical dispatches, but continues to exclude every mapped ELF
+and Wine page. This preserves the fast JIT path except at the observed stall.
+Chromium-family games now also receive `--kiosk` and `--start-fullscreen` in
+addition to maximize, using Chromium/NW.js's real frame-removing mode rather
+than trying to resize a decorated game window from outside the engine.
+
+The Windows host-independent suite passes when run through Visual Studio's
+developer environment. Objective-C++, X11 and ARM64 core compilation remains
+the iPhoneOS CI gate; Fate click delivery, visible Wine cursor, Summer menu
+progress, fullscreen presentation and frame rate remain device acceptance
+tests.
+
 ## Build 125: one guest pointer, targeted browser recovery, maximized NW.js
 
 The Build-124 Fate log shows that UIKit injection, `XQueryPointer`, the Xlib

@@ -294,11 +294,20 @@ static NSString* const kBVNPerformanceBatteryKey =
 @property (nonatomic, strong) UISwitch* performanceBatterySwitch;
 // The cursor's position in the presenting view's bounds, i.e. guest pixels.
 @property (nonatomic, assign) CGPoint cursorGuestPoint;
+// A direct-touch press and release must use one stable guest transform. The
+// presenting UIView can be replaced or re-letterboxed while the finger is
+// down (notably while Vulkan recreates a surface), and remapping the same
+// UITouch at release then produces a click whose two halves are hundreds of
+// pixels apart. Keep the last guest point actually delivered until release.
+@property (nonatomic, assign) CGPoint directLastGuestPoint;
+@property (nonatomic, assign) BOOL directButtonHeld;
 @property (nonatomic, assign) CGPoint trackpadTouchStart;
 @property (nonatomic, assign) BOOL trackpadTouchMoved;
 @property (nonatomic, assign) BOOL trackpadHasMotionBaseline;
 @property (nonatomic, assign) BOOL trackpadButtonHeld;
+@property (nonatomic, assign) CGPoint trackpadButtonGuestPoint;
 @property (nonatomic, strong) NSTimer* trackpadHoldTimer;
+@property (nonatomic, strong) NSTimer* trackpadTapReleaseTimer;
 // Where the finger was on the previous -touchesMoved, in the presenting
 // view's coordinates. UIKit's own -previousLocationInView: cannot be used for
 // this: UITouch objects are recycled between gestures, and on the first move
@@ -1217,6 +1226,9 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     }
     BVNGuestControlsSendPointer((int)lround(point.x), (int)lround(point.y),
                                 phase);
+    if (phase != 2) {
+        self.directLastGuestPoint = point;
+    }
     return YES;
 }
 
@@ -1231,7 +1243,22 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     }
     BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
                                 (int)lround(self.cursorGuestPoint.y), 1);
+    self.trackpadButtonGuestPoint = self.cursorGuestPoint;
     self.trackpadButtonHeld = YES;
+}
+
+- (void)trackpadTapReleaseTimerFired:(NSTimer*)timer {
+    if (timer != self.trackpadTapReleaseTimer) {
+        return;
+    }
+    self.trackpadTapReleaseTimer = nil;
+    if (!self.trackpadButtonHeld) {
+        return;
+    }
+    BVNGuestControlsSendPointer(
+        (int)lround(self.trackpadButtonGuestPoint.x),
+        (int)lround(self.trackpadButtonGuestPoint.y), 2);
+    self.trackpadButtonHeld = NO;
 }
 
 - (void)cancelTrackpadHoldTimer {
@@ -1239,11 +1266,18 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.trackpadHoldTimer = nil;
 }
 
+- (void)cancelTrackpadTapReleaseTimer {
+    [self.trackpadTapReleaseTimer invalidate];
+    self.trackpadTapReleaseTimer = nil;
+}
+
 - (void)cancelTrackpadGesture {
     [self cancelTrackpadHoldTimer];
+    [self cancelTrackpadTapReleaseTimer];
     if (self.trackpadButtonHeld) {
-        BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
-                                    (int)lround(self.cursorGuestPoint.y), 2);
+        BVNGuestControlsSendPointer(
+            (int)lround(self.trackpadButtonGuestPoint.x),
+            (int)lround(self.trackpadButtonGuestPoint.y), 2);
     }
     self.trackpadButtonHeld = NO;
     self.trackpadHasMotionBaseline = NO;
@@ -1261,6 +1295,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     if (touch == nil || ![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         [super touchesBegan:touches withEvent:event];
         return;
+    }
+    if (self.trackpadMode && self.trackpadTapReleaseTimer != nil) {
+        // Finish the preceding tap before accepting another gesture; never
+        // overwrite a held injected button with the next touch's state.
+        [self cancelTrackpadGesture];
     }
     self.guestTouch = touch;
 
@@ -1284,7 +1323,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                   forMode:NSRunLoopCommonModes];
         return;
     }
-    [self sendGuestPointer:touch phase:1];
+    self.directButtonHeld = [self sendGuestPointer:touch phase:1];
 }
 
 - (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
@@ -1370,6 +1409,9 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                    dy * sensitivity)];
     BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
                                 (int)lround(self.cursorGuestPoint.y), 0);
+    if (self.trackpadButtonHeld) {
+        self.trackpadButtonGuestPoint = self.cursorGuestPoint;
+    }
 }
 
 - (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
@@ -1380,7 +1422,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.guestTouch = nil;
 
     if (!self.trackpadMode) {
-        [self sendGuestPointer:touch phase:2];
+        if (self.directButtonHeld) {
+            BVNGuestControlsSendPointer(
+                (int)lround(self.directLastGuestPoint.x),
+                (int)lround(self.directLastGuestPoint.y), 2);
+        }
+        self.directButtonHeld = NO;
         return;
     }
     [self cancelTrackpadHoldTimer];
@@ -1390,10 +1437,22 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         BVNGuestControlsSendPointer(x, y, 2);
         self.trackpadButtonHeld = NO;
     } else if (!self.trackpadTouchMoved) {
-        // Still click if the main run loop delayed the hold timer until after
-        // a stationary finger was released.
+        // A touchpad tap is recognized only at finger-up, but sending down and
+        // up back-to-back makes the injected button mask disappear before a
+        // polling Windows engine gets scheduled. Hold it for one short input
+        // quantum while keeping both halves at the same guest pixel.
         BVNGuestControlsSendPointer(x, y, 1);
-        BVNGuestControlsSendPointer(x, y, 2);
+        self.trackpadButtonGuestPoint = CGPointMake(x, y);
+        self.trackpadButtonHeld = YES;
+        [self cancelTrackpadTapReleaseTimer];
+        self.trackpadTapReleaseTimer = [NSTimer
+            timerWithTimeInterval:0.06
+                           target:self
+                         selector:@selector(trackpadTapReleaseTimerFired:)
+                         userInfo:nil
+                          repeats:NO];
+        [[NSRunLoop mainRunLoop] addTimer:self.trackpadTapReleaseTimer
+                                  forMode:NSRunLoopCommonModes];
     }
 }
 
@@ -1405,7 +1464,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     if (!self.trackpadMode) {
         // Release the button even on a cancel, or the guest is left with it
         // held.
-        [self sendGuestPointer:touch phase:2];
+        if (self.directButtonHeld) {
+            BVNGuestControlsSendPointer(
+                (int)lround(self.directLastGuestPoint.x),
+                (int)lround(self.directLastGuestPoint.y), 2);
+        }
+        self.directButtonHeld = NO;
     } else {
         [self cancelTrackpadGesture];
     }
@@ -1557,8 +1621,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.cursorView.center = cursorPoint;
 
     [self applyGuestCursorState];
+    // Selecting this mode is an explicit request for a visible guest cursor.
+    // Visual novels commonly hide Wine's cursor and draw their own sprite;
+    // on a touch-only device that leaves the trackpad with no position
+    // feedback at all. Preserve Wine's bitmap/shape and hotspot, but override
+    // the guest's hide request while this accessibility mode is selected.
     self.guestCursorView.hidden = !self.guestCursorMode ||
-                                  !self.guestCursorVisible ||
                                   self.guestCursorView.image == nil;
     if (!self.guestCursorView.hidden) {
         const CGPoint topLeftGuest = CGPointMake(

@@ -155,6 +155,12 @@ GuestEngineProfile detectGuestEngine(const std::string& gameDirectory,
 //       so maximising the engine window uses the coherent virtual monitor and
 //       keeps its client/input geometry aligned with the displayed picture.
 //
+//   --kiosk, --start-fullscreen
+//       Some older NW.js builds retain their decorated package-sized window
+//       even after --start-maximized. Chromium's fullscreen startup path uses
+//       the complete virtual monitor without that title bar. BoxedVN's native
+//       menu remains available for leaving the session.
+//
 // These are shipped as a set because that is how they were proven. Run 3
 // changed the GPU pair and the three throttling switches together, so their
 // individual contributions are not isolated, and this comment should not be

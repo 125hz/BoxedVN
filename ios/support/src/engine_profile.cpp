@@ -165,6 +165,13 @@ std::vector<std::string> chromiumCompatibilitySwitches() {
         // the presentation area instead of being a small window in its
         // centre. A user-provided --start-maximized still wins in the merge.
         "--start-maximized",
+        // Old NW.js packages can honour maximize while retaining their
+        // decorated, package-sized client. Chromium's fullscreen startup path
+        // removes that frame and uses the complete virtual monitor. Kiosk is
+        // intentional here: BoxedVN runs one imported game per session and
+        // owns the app-level exit/menu controls outside the guest.
+        "--kiosk",
+        "--start-fullscreen",
     };
 }
 

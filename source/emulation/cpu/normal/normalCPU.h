@@ -37,8 +37,8 @@ public:
     OpCallback firstOp;
 
 #ifdef BOXEDWINE_JIT
-    U32 anonymousWatchdogEip = 0;
-    U32 anonymousWatchdogRepeats = 0;
+    U32 adaptiveWatchdogEip = 0;
+    U32 adaptiveWatchdogRepeats = 0;
 #endif
 };
 

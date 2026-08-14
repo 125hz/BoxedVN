@@ -1,3 +1,13 @@
+BoxedVN 0.1.0 (126)
+* Kept direct presses and releases at one stable guest coordinate and made trackpad taps observable to polling Windows input loops.
+* Restored X11's root/local event-coordinate invariant and forced the optional Wine cursor visible when a game hides it.
+* Extended adaptive browser-stall recovery to one proven-stuck PE or anonymous page, and started Chromium-family games borderless fullscreen.
+
+BoxedVN 0.1.0 (125)
+* Made Wine's guest-pixel pointer authoritative across direct touch, trackpad motion and guest cursor warps.
+* Added separate BoxedVN and Wine cursor trackpad modes, including Wine cursor bitmap and hotspot bridging.
+* Replaced broad browser-code interpretation with a single-page forward-progress watchdog and requested maximized NW.js startup.
+
 BoxedVN 0.1.0 (124)
 * Made fake-fullscreen pointer queries, warps, motion and button events share the exact 0,0-based pixels presented by UIKit.
 * Kept the X11 root and Wine's cached Screen at the same guest resolution instead of leaking decorated-window offsets into the virtual desktop.
