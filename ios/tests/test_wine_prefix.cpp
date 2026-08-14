@@ -598,6 +598,39 @@ BOXEDVN_TEST(japanese_prefix_sets_the_ansi_codepage_wine_converts_filenames_with
     fs::remove_all(temporary, ec);
 }
 
+BOXEDVN_TEST(container_prefix_persists_the_selected_windows_version) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-prefix-version-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    const fs::path prefix = temporary / "prefix";
+    const fs::path archive = temporary / "rootfs.zip";
+    fs::create_directories(prefix / "home/username/.wine", ec);
+
+    zipFile zip = zipOpen64(archive.string().c_str(), APPEND_STATUS_CREATE);
+    CHECK(zip != nullptr);
+    if (zip != nullptr) {
+        CHECK(addZipEntry(zip, "home/username/.wine/user.reg",
+                          "WINE REGISTRY Version 2\n"));
+        CHECK(addZipEntry(zip, "home/username/.wine/system.reg",
+                          "WINE REGISTRY Version 2\n"));
+        zipClose(zip, nullptr);
+    }
+    std::ofstream(prefix / "home/username/.wine/user.reg")
+        << "WINE REGISTRY Version 2\n";
+    std::ofstream(prefix / "home/username/.wine/system.reg")
+        << "WINE REGISTRY Version 2\n";
+
+    CHECK(prepareWinePrefix(archive.string(), prefix.string(),
+                            WineRenderer::Vulkan,
+                            WineAnsiCodepage::Default, "win7").ok);
+    const std::string user =
+        readTestFile(prefix / "home/username/.wine/user.reg");
+    CHECK_CONTAINS(user, "[Software\\\\Wine]");
+    CHECK_CONTAINS(user, "\"Version\"=\"win7\"");
+    fs::remove_all(temporary, ec);
+}
+
 BOXEDVN_TEST(prefix_creates_the_user_shell_folders_windows_programs_assume) {
     const fs::path temporary = fs::temp_directory_path() /
         ("boxedvn-prefix-shell-" + std::to_string(::getpid()));

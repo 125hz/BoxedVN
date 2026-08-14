@@ -57,7 +57,8 @@ WinePrefixPreparationResult prepareWinePrefix(
     const std::string& rootFilesystemZipPath,
     const std::string& writableRootPath,
     WineRenderer renderer,
-    WineAnsiCodepage codepage = WineAnsiCodepage::Default);
+    WineAnsiCodepage codepage = WineAnsiCodepage::Default,
+    const std::string& windowsVersion = "");
 
 // Copies the patched DXVK modules from `sourceDirectory` into the writable
 // overlay at /home/username/.wine/drive_c/dxvk, where Boxedwine's own `-dxvk`

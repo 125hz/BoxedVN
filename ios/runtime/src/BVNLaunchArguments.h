@@ -19,6 +19,11 @@ struct BVNLaunchConfiguration {
     // independent prefixes for save/registry compatibility while documents
     // intentionally shared between games and the file browser live here.
     std::string sharedDirectoryHostPath;
+    char gameDriveLetter = 'd';
+    char sharedDriveLetter = 'e';
+    // Wine's documented compatibility version name (for example win10,
+    // win7, or winxp). Empty keeps the root filesystem default.
+    std::string windowsVersion;
     std::string executablePath;
     std::vector<std::string> arguments;
     std::vector<std::string> environment;

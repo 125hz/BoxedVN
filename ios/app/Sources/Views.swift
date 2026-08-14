@@ -130,15 +130,8 @@ struct RootView: View {
 
 struct LibraryView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var showingGameImporter = false
-    @State private var showingFolderImporter = false
-    @State private var showingInstallerImporter = false
-    @State private var pendingImportURL: URL?
-    @State private var pendingTitle = ""
-    @State private var showingTitlePrompt = false
-    @State private var pendingInstallerURL: URL?
-    @State private var pendingInstallerTitle = ""
-    @State private var showingInstallerTitlePrompt = false
+    @State private var showingContainerPrompt = false
+    @State private var containerName = ""
 
     var body: some View {
         List {
@@ -174,32 +167,34 @@ struct LibraryView: View {
                     .textSelection(.enabled)
             }
 
-            // Above the games on purpose: it is the way in to everything the
-            // library cannot show - Explorer, a Wine control panel, whatever a
-            // game's own installer left on the desktop.
             Section {
-                Button {
-                    model.launchWineDesktop()
-                } label: {
-                    Label {
+                ForEach(model.containers) { container in
+                    NavigationLink {
+                        ContainerDetailView(container: container)
+                    } label: {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Browse the PC")
-                            Text("Wine's file manager opens the shared E: drive "
-                                 + "at 1280x720")
+                            Text(container.name)
+                            Text("\(container.windowsVersion) · "
+                                 + "\(container.width)x\(container.height) · "
+                                 + container.renderer)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                    } icon: {
-                        Image(systemName: "macwindow")
                     }
                 }
-                .disabled(model.rootFilesystem == nil
-                          || model.isInstallingGame
-                          || model.runtimeState == .starting
-                          || model.runtimeState == .running
-                          || model.runtimeState == .stopping)
+                .onDelete { offsets in
+                    for index in offsets {
+                        model.deleteContainer(model.containers[index])
+                    }
+                }
+                Button {
+                    containerName = ""
+                    showingContainerPrompt = true
+                } label: {
+                    Label("New container", systemImage: "plus.rectangle.on.folder")
+                }
             } header: {
-                Text("Desktop")
+                Text("Containers")
             }
 
             Section {
@@ -245,137 +240,173 @@ struct LibraryView: View {
                 }
             }
 
-            Section("Actions") {
-                Button {
-                    showingInstallerImporter = true
-                } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Install game from EXE...")
-                            Text("Runs the installer, then adds its 32-bit game "
-                                 + "program to this list")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "shippingbox.and.arrow.backward")
-                    }
-                }
-                .disabled(model.isInstallingGame || model.isImporting
-                          || model.rootFilesystem == nil
-                          || model.runtimeState == .starting
-                          || model.runtimeState == .running
-                          || model.runtimeState == .stopping)
-                .alert("Name the installed game",
-                       isPresented: $showingInstallerTitlePrompt) {
-                    TextField("Title", text: $pendingInstallerTitle)
-                    Button("Run installer") {
-                        if let url = pendingInstallerURL {
-                            model.installGame(
-                                from: url, title: pendingInstallerTitle)
-                        }
-                        pendingInstallerURL = nil
-                    }
-                    Button("Cancel", role: .cancel) {
-                        pendingInstallerURL = nil
-                    }
-                } message: {
-                    Text("The installer gets its own persistent C: drive. "
-                         + "Finish or cancel it normally; BoxedVN scans for "
-                         + "the installed game after Wine closes.")
-                }
-                Button("Import game from ZIP…") { showingGameImporter = true }
-                    .disabled(model.isImporting || model.isInstallingGame)
-                Button("Import game from folder…") { showingFolderImporter = true }
-                    .disabled(model.isImporting || model.isInstallingGame)
-                Button("Run Wine Notepad") { model.launchWineNotepad() }
-                    .disabled(model.rootFilesystem == nil
-                              || model.isInstallingGame)
+            Section {
+                NavigationLink("Settings") { SettingsView() }
+                NavigationLink("Logs") { LogView() }
                 if model.runtimeState == .running {
                     Button("Quit running session", role: .destructive) {
                         model.requestShutdown()
                     }
                 }
             }
+        }
+        .alert("New container", isPresented: $showingContainerPrompt) {
+            TextField("Name", text: $containerName)
+            Button("Create") { model.createContainer(named: containerName) }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
 
-            Section {
-                NavigationLink("Settings") { SettingsView() }
-                NavigationLink("Logs") { LogView() }
-            }
-        }
-        .sheet(isPresented: $showingGameImporter) {
-            DocumentImportPicker(
-                contentTypes: zipImportContentTypes,
-                onResult: { result in
-                    showingGameImporter = false
-                    handleImport(result)
-                },
-                onCancel: { showingGameImporter = false })
-        }
-        .sheet(isPresented: $showingFolderImporter) {
-            DocumentImportPicker(
-                contentTypes: [.folder],
-                onResult: { result in
-                    showingFolderImporter = false
-                    handleImport(result)
-                },
-                onCancel: { showingFolderImporter = false })
-        }
-        .sheet(isPresented: $showingInstallerImporter) {
-            DocumentImportPicker(
-                contentTypes: windowsInstallerContentTypes,
-                onResult: { result in
-                    showingInstallerImporter = false
-                    handleInstaller(result)
-                },
-                onCancel: { showingInstallerImporter = false })
-        }
-        .alert("Name this game", isPresented: $showingTitlePrompt) {
-            TextField("Title", text: $pendingTitle)
-            Button("Import") {
-                if let url = pendingImportURL {
-                    model.importGame(from: url, title: pendingTitle)
+}
+
+// MARK: - Container detail
+
+struct ContainerDetailView: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var container: WineContainer
+    @State private var programs: [ContainerProgram] = []
+    @State private var isScanning = false
+    @State private var shortcutProgram: ContainerProgram?
+    @State private var shortcutTitle = ""
+    @State private var showingShortcutPrompt = false
+
+    private let resolutions = ["640x480", "800x600", "1024x768",
+                               "1280x720", "1280x960", "1366x1024",
+                               "1600x1200", "1920x1080"]
+
+    init(container: WineContainer) {
+        _container = State(initialValue: container)
+    }
+
+    var body: some View {
+        List {
+            Section("Desktop") {
+                Button {
+                    save()
+                    model.launchDesktop(container)
+                } label: {
+                    Label("Open desktop", systemImage: "macwindow")
                 }
-                pendingImportURL = nil
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Picker("Resolution", selection: resolutionBinding) {
+                    ForEach(resolutions, id: \.self) { Text($0) }
+                    if !resolutions.contains(resolutionBinding.wrappedValue) {
+                        Text(resolutionBinding.wrappedValue)
+                            .tag(resolutionBinding.wrappedValue)
+                    }
+                }
+                HStack {
+                    TextField("Width", value: $container.width, format: .number)
+                        .keyboardType(.numberPad)
+                    Text("×").foregroundStyle(.secondary)
+                    TextField("Height", value: $container.height, format: .number)
+                        .keyboardType(.numberPad)
+                }
+                Picker("Windows version", selection: $container.windowsVersion) {
+                    Text("Windows 10").tag("win10")
+                    Text("Windows 7").tag("win7")
+                    Text("Windows XP").tag("winxp")
+                }
+                Picker("Direct3D renderer", selection: $container.renderer) {
+                    Text("Automatic").tag("automatic")
+                    Text("WineD3D").tag("wined3d")
+                    Text("DXVK").tag("dxvk")
+                }
+                Picker("Shared folder drive", selection: $container.sharedDriveLetter) {
+                    ForEach(["e", "f", "g", "h", "i", "j", "k", "l", "m",
+                             "n", "o", "p", "q", "r", "s", "t", "u", "v",
+                             "w", "x", "y", "z"], id: \.self) { letter in
+                        Text(letter.uppercased() + ":").tag(letter)
+                    }
+                }
+                Button("Save settings") { save() }
             }
-            Button("Cancel", role: .cancel) { pendingImportURL = nil }
+
+            Section("Programs") {
+                if isScanning {
+                    HStack { ProgressView(); Text("Scanning C: and D:…") }
+                } else if programs.isEmpty {
+                    Text("No compatible 32-bit programs found.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(programs) { program in
+                        Button {
+                            shortcutProgram = program
+                            shortcutTitle = URL(fileURLWithPath:
+                                program.executable.relativePath)
+                                .deletingPathExtension().lastPathComponent
+                            showingShortcutPrompt = true
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(program.executable.relativePath)
+                                Text(program.drive.uppercased() + ": · Add to Home")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                Button("Scan again") { scan() }
+                    .disabled(isScanning)
+            }
+
+            Section("Files") {
+                LabeledContent("Container", value: "Containers/\(container.id)")
+                LabeledContent("Import folder", value: "Files")
+                LabeledContent("Container files", value: "D:")
+                LabeledContent("Shared files",
+                               value: container.sharedDriveLetter.uppercased() + ":")
+            }
+        }
+        .navigationTitle(container.name)
+        .task { scan() }
+        .alert("Add shortcut", isPresented: $showingShortcutPrompt) {
+            TextField("Title", text: $shortcutTitle)
+            Button("Add to Home") {
+                if let shortcutProgram {
+                    model.addShortcut(shortcutProgram, from: container,
+                                      title: shortcutTitle)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
         }
     }
 
-    private func handleImport(_ result: Result<URL, Error>) {
-        switch result {
-        case .success(let url):
-            Log.write("System document picker selected \(url.lastPathComponent)",
-                      category: "import")
-            prepareImport(url)
-        case .failure(let error):
-            Log.write("System document picker failed: \(error.localizedDescription)",
-                      category: "import", level: BVNLogLevelError)
-            model.alertMessage = error.localizedDescription
+    private var sessionIsBusy: Bool {
+        model.runtimeState == .starting || model.runtimeState == .running ||
+        model.runtimeState == .stopping
+    }
+
+    private var resolutionBinding: Binding<String> {
+        Binding(
+            get: { "\(container.width)x\(container.height)" },
+            set: { value in
+                let pieces = value.split(separator: "x")
+                if pieces.count == 2,
+                   let width = UInt32(pieces[0]), let height = UInt32(pieces[1]) {
+                    container.width = width
+                    container.height = height
+                }
+            })
+    }
+
+    private func save() {
+        container.width = min(max(container.width, 320), 3840)
+        container.height = min(max(container.height, 240), 2160)
+        model.updateContainer(container)
+    }
+
+    private func scan() {
+        guard !isScanning else { return }
+        isScanning = true
+        let current = container
+        Task {
+            programs = await Task.detached(priority: .userInitiated) {
+                ContainerLibrary.programs(in: current)
+            }.value
+            isScanning = false
         }
     }
-
-    private func prepareImport(_ url: URL) {
-        pendingImportURL = url
-        pendingTitle = url.deletingPathExtension().lastPathComponent
-        showingTitlePrompt = true
-    }
-
-    private func handleInstaller(_ result: Result<URL, Error>) {
-        switch result {
-        case .success(let url):
-            Log.write("Installer picker selected \(url.lastPathComponent)",
-                      category: "installer")
-            pendingInstallerURL = url
-            pendingInstallerTitle = url.deletingPathExtension().lastPathComponent
-            showingInstallerTitlePrompt = true
-        case .failure(let error):
-            Log.write("Installer picker failed: \(error.localizedDescription)",
-                      category: "installer", level: BVNLogLevelError)
-            model.alertMessage = error.localizedDescription
-        }
-    }
-
 }
 
 // MARK: - Game detail
@@ -446,20 +477,6 @@ struct GameDetailView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                Text("A game built on a browser engine already gets the "
-                     + "Chromium switches it needs. Anything typed here is "
-                     + "added to those, and a switch you name yourself wins "
-                     + "over BoxedVN's. Put --bvn-no-default-switches here to "
-                     + "get none of them, or --bvn-boot-diagnostics to make "
-                     + "the game report what its startup is waiting on. "
-                     + "Diagnostics edit the game's index.html, keep the "
-                     + "original beside it, and put it back when you remove "
-                     + "the line. --bvn-interpret=<module> runs one guest "
-                     + "module through the interpreter instead of the JIT, "
-                     + "which is slow but separates an emulator translation "
-                     + "bug from a guest computing a bad value.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 TextField("Working directory (inside the game)",
                           text: $workingDirectory)
                 TextField("Environment (NAME=VALUE, one per line)",
@@ -470,28 +487,11 @@ struct GameDetailView: View {
                 Picker("Virtual desktop", selection: $resolution) {
                     ForEach(resolutions, id: \.self) { Text($0) }
                 }
-                Text("Default is 1366x1024 so a 1280x960 game and its Wine "
-                     + "window decorations both fit. This is saved per game; "
-                     + "choose a larger desktop if a Windows game clips "
-                     + "controls at its right or bottom edge.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Picker("Direct3D renderer", selection: $renderer) {
                     Text("Automatic (recommended)").tag("automatic")
                     Text("WineD3D (D3D8/9 compatibility)").tag("wined3d")
                     Text("DXVK (D3D10/11)").tag("dxvk")
                 }
-                Text("Automatic reads the game's own files and picks DXVK when "
-                     + "anything in it needs Direct3D 10 or 11. Override it "
-                     + "if a game reports that Direct3D could not start.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("Environment entries reach the guest and override "
-                     + "BoxedVN's own. Use LANG for a game that expects a "
-                     + "locale, or WINEDEBUG to make a game that starts but "
-                     + "draws nothing explain itself in the session log.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Button("Save") { save() }
                 if let saveError {
                     Text(saveError).foregroundStyle(.red).font(.caption)

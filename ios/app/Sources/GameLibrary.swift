@@ -387,11 +387,54 @@ enum GameLibrary {
         // or build 73's shared one: those belong to more than this game.
         if let prefixes = Storage.winePrefixes,
            game.winePrefix != Storage.toolsWinePrefixName,
-           game.winePrefix != Storage.build73SharedWinePrefixName {
+           game.winePrefix != Storage.build73SharedWinePrefixName,
+           !game.winePrefix.hasPrefix("container-") {
             let prefix = prefixes.appendingPathComponent(game.winePrefix)
             if FileManager.default.fileExists(atPath: prefix.path) {
                 try? FileManager.default.removeItem(at: prefix)
             }
+        }
+    }
+
+    /// Adds a launcher manifest for a program that remains inside a shared
+    /// container. The shortcut owns only its manifest; deleting it must never
+    /// remove the container prefix or the other programs installed there.
+    static func createContainerShortcut(
+        title: String, contentDirectory: URL,
+        executable: ExecutableDescription, winePrefix: String,
+        renderer: String, width: UInt32, height: UInt32
+    ) throws -> Game {
+        guard let gamesRoot = Storage.games else {
+            throw GameLibraryError.noGamesDirectory
+        }
+        let identifier = uniqueIdentifier(for: title, in: gamesRoot)
+        let directory = gamesRoot.appendingPathComponent(
+            identifier, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        let manifest = directory.appendingPathComponent("manifest.json")
+        do {
+            try writeManifest(
+                to: manifest, identifier: identifier, title: title,
+                contentDirectory: contentDirectory,
+                discovered: [executable], winePrefix: winePrefix)
+            var summary = BVNManifestSummary()
+            BVNManifestRead(manifest.path, &summary)
+            guard summary.ok else {
+                throw GameLibraryError.manifestFailed(
+                    cString(&summary.error, Int(BVN_MAX_DIAGNOSTIC)))
+            }
+            var game = game(from: directory, summary: &summary)
+            try updateLaunchSettings(
+                for: game, selectedExecutable: executable.relativePath,
+                workingDirectory: "", renderer: renderer,
+                arguments: [], environment: [], width: width, height: height)
+            BVNManifestRead(manifest.path, &summary)
+            game = game(from: directory, summary: &summary)
+            return game
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
         }
     }
 
@@ -502,7 +545,8 @@ enum GameLibrary {
 
     private static func writeManifest(
         to url: URL, identifier: String, title: String,
-        contentDirectory: URL, discovered: [ExecutableDescription]
+        contentDirectory: URL, discovered: [ExecutableDescription],
+        winePrefix: String? = nil
     ) throws {
         var entries = discovered.map { description -> BVNDiscoveredExecutable in
             var entry = BVNDiscoveredExecutable()
@@ -534,13 +578,16 @@ enum GameLibrary {
         }
 
         var errorBuffer = [CChar](repeating: 0, count: Int(BVN_MAX_DIAGNOSTIC))
-        let ok = entries.withUnsafeMutableBufferPointer { buffer in
-            BVNManifestWriteForImport(
-                url.path, identifier, title, contentDirectory.path, nil,
-                buffer.baseAddress, buffer.count,
-                Int64(Date().timeIntervalSince1970),
-                &errorBuffer, errorBuffer.count)
+        let write: (UnsafePointer<CChar>?) -> Bool = { prefix in
+            entries.withUnsafeMutableBufferPointer { buffer in
+                BVNManifestWriteForImport(
+                    url.path, identifier, title, contentDirectory.path, prefix,
+                    buffer.baseAddress, buffer.count,
+                    Int64(Date().timeIntervalSince1970),
+                    &errorBuffer, errorBuffer.count)
+            }
         }
+        let ok = winePrefix?.withCString { write($0) } ?? write(nil)
         if !ok {
             throw GameLibraryError.manifestFailed(String(cString: errorBuffer))
         }

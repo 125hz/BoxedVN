@@ -1,5 +1,39 @@
 # BoxedVN — Progress and Handoff
 
+## Build 128: one input coordinate space, selective browser decoding, and containers
+
+The Build-127 Fate trace disproves the remaining monitor-size hypothesis. Its
+Xlib screen is already 1366x1024 and the 1280x960 client ends at y=1013, but a
+tap at guest `(760,646)` is delivered to Wine's decorated ancestor as local
+`(763,694)`: three pixels right and forty-eight pixels down. That is exactly
+the client/ancestor origin difference. `XQueryPointer` publishes virtual guest
+pixels while MotionNotify and ButtonNotify publish decorated-root pixels.
+Build 128 makes all three use the fake-fullscreen client's 0,0-based space.
+This core correction applies equally to direct taps and both trackpad modes.
+
+Summer Memories now reaches the game under broad anonymous-code decoding, but
+that policy also catches the fixed Wine relay at `0x7D400000` and Boxedwine's
+high stub region at `0xF0000000`. Build 128 keeps actual V8/NW.js anonymous
+heaps such as `0x386CBACF` and `0x4350CEF4` on the interpreter path that is
+device-proven to pass the menu, while returning those stable system relay
+bands to the ARM64 JIT. Wine Gecko is not involved: this title bundles NW.js
+and Chromium rather than hosting Internet Explorer through `mshtml`.
+
+The app now persists Winlator-style container profiles. Each container owns a
+private Wine prefix in Application Support and a user-visible
+`Documents/Containers/<id>/Files` directory mounted as D:. Its Windows
+compatibility version, Direct3D renderer, virtual-desktop resolution (800x600
+by default), and shared Documents drive letter are configurable. Opening the
+container runs Wine Explorer as a same-sized virtual desktop so applications
+remain windowed and the Wine shell can provide its desktop/taskbar. Compatible
+programs found on C: or D: can be added to the BoxedVN home screen as shortcuts
+without copying or deleting their shared container prefix.
+
+The attached device logs establish the defects and boundaries; CI compilation
+and packaging remain gates, and physical-device acceptance remains pending.
+
+---
+
 ## Build 127: preserve the Windows monitor and restore reliable browser execution
 
 The Build-126 Fate log proves BoxedVN now delivers the failed lower-screen

@@ -245,6 +245,15 @@ typedef struct {
     // tool. May be NULL, although the app normally supplies Documents/Shared.
     const char* sharedDirectoryHostPath;
 
+    // Guest letters used for the two host mounts. Zero retains D: for the
+    // game/container files and E: for shared files.
+    char gameDriveLetter;
+    char sharedDriveLetter;
+
+    // Wine compatibility version ("win10", "win7", or "winxp"). NULL or
+    // empty retains the root filesystem default.
+    const char* windowsVersion;
+
     // The program to run, as a guest path.  Either a Windows path such as
     // "d:\\game.exe" or a Linux path such as "/bin/wine".  Required.
     const char* executablePath;

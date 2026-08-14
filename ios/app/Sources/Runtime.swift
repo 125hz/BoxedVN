@@ -185,6 +185,22 @@ enum Storage {
     static var rootFilesystems: URL? { directory(BVNPathRootFilesystems()) }
     static var winePrefixes: URL? { directory(BVNPathWinePrefixes()) }
 
+    /// User-managed container definitions and their import folders live in
+    /// Documents so they are visible at On My iPhone > BoxedVN > Containers.
+    static var containers: URL? {
+        guard let documents else { return nil }
+        let root = documents.appendingPathComponent("Containers", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: root, withIntermediateDirectories: true)
+            return root
+        } catch {
+            Log.write("Could not create Containers directory: \(error)",
+                      category: "storage", level: BVNLogLevelError)
+            return nil
+        }
+    }
+
     /// The prefix the built-in tools - the file browser and Notepad - run in.
     ///
     /// Build 73 pointed *everything*, games included, at one shared prefix so
@@ -460,7 +476,10 @@ enum Session {
         height: UInt32,
         soundEnabled: Bool,
         runThroughWine: Bool,
-        wineRenderer: BVNWineRenderer = BVNWineRendererAutomatic
+        wineRenderer: BVNWineRenderer = BVNWineRendererAutomatic,
+        gameDriveLetter: Character = "d",
+        sharedDriveLetter: Character = "e",
+        windowsVersion: String? = nil
     ) throws {
         var errorBuffer = [CChar](repeating: 0, count: 1024)
 
@@ -485,11 +504,17 @@ enum Session {
                     withOptionalCString(gameDirectory?.path) { gamePath in
                         withOptionalCString(sharedDirectory?.path) { sharedPath in
                           withOptionalCString(workingDirectory) { workPath in
+                           withOptionalCString(windowsVersion) { versionPath in
                             var request = BVNLaunchRequest()
                             request.rootFilesystemZipPath = rootPath
                             request.writableRootPath = writablePath
                             request.gameDirectoryHostPath = gamePath
                             request.sharedDirectoryHostPath = sharedPath
+                            request.gameDriveLetter = Int8(
+                                String(gameDriveLetter).lowercased().utf8.first ?? 100)
+                            request.sharedDriveLetter = Int8(
+                                String(sharedDriveLetter).lowercased().utf8.first ?? 101)
+                            request.windowsVersion = versionPath
                             request.executablePath = exePath
                             request.workingDirectory = workPath
                             request.width = width
@@ -509,6 +534,7 @@ enum Session {
                                         &request, &errorBuffer, errorBuffer.count)
                                 }
                             }
+                           }
                           }
                         }
                     }

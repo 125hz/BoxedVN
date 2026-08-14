@@ -6,8 +6,18 @@
 #include "boxedvn_test.h"
 
 #include "BVNLaunchArguments.h"
+#include "../../source/emulation/cpu/common/anonymousCodePolicy.h"
 
 #include <algorithm>
+
+BOXEDVN_TEST(anonymous_browser_policy_keeps_system_relays_on_jit) {
+    CHECK(shouldInterpretAnonymousExecutableAddress(0x386cbacfu));
+    CHECK(shouldInterpretAnonymousExecutableAddress(0x4350cef4u));
+    CHECK(!shouldInterpretAnonymousExecutableAddress(0x7d400000u));
+    CHECK(!shouldInterpretAnonymousExecutableAddress(0x7d401298u));
+    CHECK(!shouldInterpretAnonymousExecutableAddress(0xf0014190u));
+    CHECK(shouldInterpretAnonymousExecutableAddress(0x7d410000u));
+}
 
 BOXEDVN_TEST(imported_game_keeps_wined3d_vulkan_when_profile_disables_dxvk) {
     BVNLaunchConfiguration launch;
@@ -105,6 +115,28 @@ BOXEDVN_TEST(game_command_preserves_mount_environment_and_arguments) {
     };
 
     CHECK(actual == expected);
+}
+
+BOXEDVN_TEST(container_command_uses_configured_drive_letters_and_resolution) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.writableRootPath = "/prefixes/container-vn";
+    launch.gameDirectoryHostPath = "/documents/Containers/vn/Files";
+    launch.sharedDirectoryHostPath = "/documents/Shared";
+    launch.gameDriveLetter = 'd';
+    launch.sharedDriveLetter = 's';
+    launch.executablePath = "explorer";
+    launch.arguments = {"/desktop=shell,800x600", "D:\\"};
+    launch.width = 800;
+    launch.height = 600;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const std::vector<std::string> expectedMount = {
+        "-mount_drive", "/documents/Shared", "s"};
+    CHECK(std::search(actual.begin(), actual.end(),
+                      expectedMount.begin(), expectedMount.end())
+          != actual.end());
+    CHECK(std::find(actual.begin(), actual.end(), "800x600") != actual.end());
 }
 
 BOXEDVN_TEST(explicit_game_resolution_overrides_ios_default_monitor) {

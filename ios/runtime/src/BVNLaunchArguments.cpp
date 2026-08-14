@@ -237,7 +237,10 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
     // title-only stall without ever triggering, because this failure stops
     // forward progress without staying at one dispatcher entry. Keep Wine
     // and every mapped PE/ELF module JIT compiled, but interpret V8's
-    // anonymous executable heaps consistently.
+    // anonymous executable heaps consistently. The CPU policy recognises
+    // Wine's 0x7D400000 relay and Boxedwine's 0xF0000000 callback stubs as
+    // system-generated anonymous code and leaves those hot transitions on
+    // the ARM64 translator.
     launch.interpretAnonymousExecutable = true;
 
     result.applied = merged.added > 0 || merged.mergedFeatures;
@@ -378,12 +381,12 @@ std::vector<std::string> BVNBuildLaunchArguments(
     if (!launch.gameDirectoryHostPath.empty()) {
         argv.push_back("-mount_drive");
         argv.push_back(launch.gameDirectoryHostPath);
-        argv.push_back("d");
+        argv.push_back(std::string(1, launch.gameDriveLetter));
     }
     if (!launch.sharedDirectoryHostPath.empty()) {
         argv.push_back("-mount_drive");
         argv.push_back(launch.sharedDirectoryHostPath);
-        argv.push_back("e");
+        argv.push_back(std::string(1, launch.sharedDriveLetter));
     }
 
     if (launch.width > 0 && launch.height > 0) {

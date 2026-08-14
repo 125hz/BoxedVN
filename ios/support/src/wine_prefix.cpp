@@ -578,7 +578,8 @@ WinePrefixPreparationResult prepareWinePrefix(
     const std::string& rootFilesystemZipPath,
     const std::string& writableRootPath,
     WineRenderer renderer,
-    WineAnsiCodepage codepage) {
+    WineAnsiCodepage codepage,
+    const std::string& windowsVersion) {
     WinePrefixPreparationResult result;
     const fs::path wineDirectory =
         fs::path(writableRootPath) / "home" / "username" / ".wine";
@@ -600,6 +601,12 @@ WinePrefixPreparationResult prepareWinePrefix(
             return result;
         }
         bool userRegistryChanged = false;
+
+        if (!windowsVersion.empty()) {
+            userRegistryChanged |= setWineRegistryValue(
+                contents, "Software\\Wine", "Version",
+                "\"" + windowsVersion + "\"");
+        }
 
         // Wine offers to download Wine Mono and Wine Gecko the first time an
         // application touches mscoree or mshtml, because the root filesystem

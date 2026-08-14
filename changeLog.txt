@@ -1,3 +1,13 @@
+BoxedVN 0.1.0 (128)
+* Unified fake-fullscreen X11 motion, button and pointer-query coordinates, removing decorated-window offsets from Wine input.
+* Kept generated NW.js browser code on the correctness path while returning stable Wine and Boxedwine relay pages to the ARM64 JIT.
+* Added persistent 800x600 Wine containers with configurable Windows version, renderer, resolution and shared-folder drive, plus home shortcuts.
+* Drew Wine cursors with a Windows-style black edge and removed the legacy home-screen Actions section and launch-setting hint paragraphs.
+
+BoxedVN 0.1.0 (127)
+* Expanded the default Wine monitor to contain 1280x960 clients and their decorations without changing the presented game image.
+* Restored the device-proven anonymous browser-code interpreter after adaptive page detection failed to observe the title-screen stall.
+
 BoxedVN 0.1.0 (126)
 * Kept direct presses and releases at one stable guest coordinate and made trackpad taps observable to polling Windows input loops.
 * Restored X11's root/local event-coordinate invariant and forced the optional Wine cursor visible when a game hides it.

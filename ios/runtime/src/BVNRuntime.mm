@@ -213,6 +213,28 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         }
     }
 
+    const auto normalizedDrive = [](char requested, char fallback) {
+        if (requested >= 'A' && requested <= 'Z') {
+            requested = static_cast<char>(requested - 'A' + 'a');
+        }
+        return requested >= 'a' && requested <= 'z' ? requested : fallback;
+    };
+    launch.gameDriveLetter = normalizedDrive(request->gameDriveLetter, 'd');
+    launch.sharedDriveLetter = normalizedDrive(request->sharedDriveLetter, 'e');
+    if (launch.gameDriveLetter == 'c' || launch.sharedDriveLetter == 'c' ||
+        launch.gameDriveLetter == launch.sharedDriveLetter) {
+        error = "Mounted drive letters must be distinct and cannot replace Wine's C: drive.";
+        return false;
+    }
+    if (request->windowsVersion != nullptr) {
+        launch.windowsVersion = request->windowsVersion;
+        if (!launch.windowsVersion.empty() && launch.windowsVersion != "win10" &&
+            launch.windowsVersion != "win7" && launch.windowsVersion != "winxp") {
+            error = "Windows version must be win10, win7, or winxp.";
+            return false;
+        }
+    }
+
     if (request->workingDirectory != nullptr) {
         launch.workingDirectory = request->workingDirectory;
     }
@@ -535,13 +557,19 @@ void runSession(const BVNLaunchConfiguration& launch) {
         const boxedvn::WinePrefixPreparationResult prefix =
             boxedvn::prepareWinePrefix(launch.rootFilesystemZipPath,
                                        launch.writableRootPath,
-                                       renderer, codepage);
+                                       renderer, codepage,
+                                       launch.windowsVersion);
         if (codepage == boxedvn::WineAnsiCodepage::Japanese) {
             BVNLogWrite(BVNLogLevelInfo, "prefix",
                         "Presenting this prefix as a Japanese Windows install "
                         "(ANSI codepage 932). A program that passes CP932 "
                         "filenames can now address its own files; a prefix "
                         "left at 1252 decodes every byte above 0x7F wrongly.");
+        }
+        if (!launch.windowsVersion.empty()) {
+            BVNLogWrite(BVNLogLevelInfo, "prefix",
+                        ("Container reports Windows compatibility version " +
+                         launch.windowsVersion + ".").c_str());
         }
         if (!prefix.ok) {
             setLastError("Could not prepare the writable Wine prefix: " +

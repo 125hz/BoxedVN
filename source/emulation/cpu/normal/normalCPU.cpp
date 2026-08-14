@@ -20,6 +20,7 @@
 
 #include "../decoder.h"
 #include "normalCPU.h"
+#include "../common/anonymousCodePolicy.h"
 #include "../../softmmu/soft_code_page.h"
 #include "../../softmmu/kmemory_soft.h"
 #include "../armv7/armv7CPU.h"
@@ -444,10 +445,12 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                     this->thread->process->getPeImageName(startIp);
                 if (peName.length()) {
                     mappedModule = peName;
-                } else {
+                } else if (shouldInterpretAnonymousExecutableAddress(startIp)) {
                     mappedModule = B("anonymous executable memory");
                     forceInterpreter = true;
                     matchedAnonymousExecutable = true;
+                } else {
+                    mappedModule = B("Wine/Boxedwine executable relay");
                 }
             }
         }

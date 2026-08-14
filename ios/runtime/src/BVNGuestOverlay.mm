@@ -489,6 +489,16 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     UIImageView* guestCursor = [[UIImageView alloc] initWithFrame:CGRectZero];
     guestCursor.contentMode = UIViewContentModeScaleToFill;
     guestCursor.userInteractionEnabled = NO;
+    // Wine cursor themes are allowed to contain a white-only bitmap. That is
+    // usable on a desktop with a contrasting wallpaper but disappears on the
+    // white menus common to visual novels. A tight, zero-offset shadow follows
+    // the bitmap alpha and supplies the black edge of the familiar Windows
+    // cursor without replacing Wine's shape or hotspot.
+    guestCursor.layer.shadowColor = UIColor.blackColor.CGColor;
+    guestCursor.layer.shadowOpacity = 1.0f;
+    guestCursor.layer.shadowRadius = 1.25f;
+    guestCursor.layer.shadowOffset = CGSizeZero;
+    guestCursor.layer.masksToBounds = NO;
     guestCursor.hidden = YES;
     [self addSubview:guestCursor];
     self.guestCursorView = guestCursor;
@@ -1494,6 +1504,30 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (UIImage*)fallbackGuestCursorImageForShape:(int)shape {
+    // Draw the default arrow ourselves. SF Symbols' cursorarrow is a solid
+    // white glyph with no Windows-style black outline, so it vanishes on a
+    // white game screen even though its hotspot is correct.
+    if (shape == 0 || shape == 22 || shape == 68 || shape == 132) {
+        UIGraphicsImageRenderer* renderer = [[UIGraphicsImageRenderer alloc]
+            initWithSize:CGSizeMake(24.0, 30.0)];
+        return [renderer imageWithActions:^(UIGraphicsImageRendererContext* ctx) {
+            UIBezierPath* arrow = [UIBezierPath bezierPath];
+            [arrow moveToPoint:CGPointMake(2.0, 1.0)];
+            [arrow addLineToPoint:CGPointMake(2.0, 24.0)];
+            [arrow addLineToPoint:CGPointMake(8.0, 18.0)];
+            [arrow addLineToPoint:CGPointMake(13.0, 28.0)];
+            [arrow addLineToPoint:CGPointMake(18.0, 25.0)];
+            [arrow addLineToPoint:CGPointMake(13.0, 16.0)];
+            [arrow addLineToPoint:CGPointMake(22.0, 15.0)];
+            [arrow closePath];
+            arrow.lineJoinStyle = kCGLineJoinRound;
+            arrow.lineWidth = 3.0;
+            [UIColor.blackColor setStroke];
+            [arrow stroke];
+            [UIColor.whiteColor setFill];
+            [arrow fill];
+        }];
+    }
     NSString* symbolName = @"cursorarrow";
     if (shape == 152) {
         symbolName = @"character.cursor.ibeam";

@@ -14,6 +14,7 @@ import Foundation
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var games: [Game] = []
+    @Published private(set) var containers: [WineContainer] = []
     // .probeStatus(), never .probeExecuteUnsafe(): this runs at app launch,
     // before the user has done anything, and the unsafe probe can crash the
     // process with no recovery possible. See Runtime.swift / BVNRuntime.h.
@@ -33,6 +34,7 @@ final class AppModel: ObservableObject {
 
     init() {
         reloadGames()
+        reloadContainers()
         startPolling()
         // After the banner, so a session that starts with logging off still
         // records which build turned it off.
@@ -60,6 +62,53 @@ final class AppModel: ObservableObject {
 
     func reloadGames() {
         games = GameLibrary.load()
+    }
+
+    func reloadContainers() {
+        containers = ContainerLibrary.load()
+    }
+
+    func createContainer(named name: String) {
+        do {
+            _ = try ContainerLibrary.create(name: name)
+            reloadContainers()
+        } catch {
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    func updateContainer(_ container: WineContainer) {
+        do {
+            try ContainerLibrary.save(container)
+            reloadContainers()
+        } catch {
+            alertMessage = "Could not save \(container.name): \(error.localizedDescription)"
+        }
+    }
+
+    func deleteContainer(_ container: WineContainer) {
+        do {
+            try ContainerLibrary.delete(container)
+            reloadContainers()
+            reloadGames()
+        } catch {
+            alertMessage = "Could not delete \(container.name): \(error.localizedDescription)"
+        }
+    }
+
+    func addShortcut(_ program: ContainerProgram, from container: WineContainer,
+                     title: String) {
+        do {
+            _ = try GameLibrary.createContainerShortcut(
+                title: title, contentDirectory: program.root,
+                executable: program.executable,
+                winePrefix: container.prefixName,
+                renderer: container.renderer,
+                width: container.width, height: container.height)
+            reloadGames()
+        } catch {
+            alertMessage = "Could not add the shortcut: \(error.localizedDescription)"
+        }
     }
 
     func importGame(from url: URL, title: String) {
@@ -287,6 +336,7 @@ final class AppModel: ObservableObject {
         // still on disk, in the per-game prefix, but not in the prefix the
         // game was now booting from.
         let writableRoot = prefixes.appendingPathComponent(game.winePrefix)
+        let container = containers.first { $0.prefixName == game.winePrefix }
         do {
             try Session.launch(
                 rootFilesystem: rootFilesystem,
@@ -297,12 +347,55 @@ final class AppModel: ObservableObject {
                 arguments: GameLibrary.arguments(for: game),
                 environment: GameLibrary.environment(for: game),
                 workingDirectory: game.guestWorkingDirectory,
-                width: game.requestedWidth,
-                height: game.requestedHeight,
+                width: container?.width ?? game.requestedWidth,
+                height: container?.height ?? game.requestedHeight,
                 soundEnabled: Preferences.soundEnabled,
                 runThroughWine: true,
-                wineRenderer: Self.wineRenderer(for: game.renderer)
+                wineRenderer: Self.wineRenderer(
+                    for: container?.renderer ?? game.renderer),
+                sharedDriveLetter:
+                    container?.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container?.windowsVersion
             )
+        } catch {
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    /// Opens a persistent Wine shell. D: is the container's Files directory
+    /// (visible through the iOS Files app), C: is its private Wine prefix, and
+    /// the chosen shared letter points at Documents/Shared.
+    func launchDesktop(_ container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let writableRoot = ContainerLibrary.prefixRoot(for: container) else {
+            alertMessage = "Could not create the container prefix."
+            return
+        }
+        let files = ContainerLibrary.filesDirectory(for: container)
+        do {
+            try FileManager.default.createDirectory(
+                at: files, withIntermediateDirectories: true)
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                writableRoot: writableRoot,
+                gameDirectory: files,
+                sharedDirectory: Storage.sharedFiles,
+                executablePath: "explorer",
+                arguments: ["/desktop=shell,\(container.width)x\(container.height)",
+                            "D:\\"],
+                environment: [],
+                workingDirectory: "/home/username/.wine/dosdevices/d:/",
+                width: container.width,
+                height: container.height,
+                soundEnabled: Preferences.soundEnabled,
+                runThroughWine: true,
+                wineRenderer: Self.wineRenderer(for: container.renderer),
+                sharedDriveLetter:
+                    container.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container.windowsVersion)
         } catch {
             alertMessage = error.localizedDescription
         }
