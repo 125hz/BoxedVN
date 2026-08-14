@@ -479,7 +479,8 @@ enum Session {
         wineRenderer: BVNWineRenderer = BVNWineRendererAutomatic,
         gameDriveLetter: Character = "d",
         sharedDriveLetter: Character = "e",
-        windowsVersion: String? = nil
+        windowsVersion: String? = nil,
+        compatibilityDirectory: URL? = nil
     ) throws {
         var errorBuffer = [CChar](repeating: 0, count: 1024)
 
@@ -502,40 +503,55 @@ enum Session {
             writableRoot.path.withCString { writablePath in
                 executablePath.withCString { exePath in
                     withOptionalCString(gameDirectory?.path) { gamePath in
-                        withOptionalCString(sharedDirectory?.path) { sharedPath in
-                          withOptionalCString(workingDirectory) { workPath in
-                           withOptionalCString(windowsVersion) { versionPath in
-                            var request = BVNLaunchRequest()
-                            request.rootFilesystemZipPath = rootPath
-                            request.writableRootPath = writablePath
-                            request.gameDirectoryHostPath = gamePath
-                            request.sharedDirectoryHostPath = sharedPath
-                            request.gameDriveLetter = Int8(
-                                String(gameDriveLetter).lowercased().utf8.first ?? 100)
-                            request.sharedDriveLetter = Int8(
-                                String(sharedDriveLetter).lowercased().utf8.first ?? 101)
-                            request.windowsVersion = versionPath
-                            request.executablePath = exePath
-                            request.workingDirectory = workPath
-                            request.width = width
-                            request.height = height
-                            request.bitsPerPixel = 32
-                            request.soundEnabled = soundEnabled
-                            request.runThroughWine = runThroughWine
-                            request.wineRenderer = wineRenderer
-                            request.argumentCount = argumentPointers.count
-                            request.environmentCount = environmentPointers.count
+                        withOptionalCString(compatibilityDirectory?.path) {
+                            profilePath in
+                            withOptionalCString(sharedDirectory?.path) {
+                                sharedPath in
+                                withOptionalCString(workingDirectory) { workPath in
+                                    withOptionalCString(windowsVersion) {
+                                        versionPath in
+                                        var request = BVNLaunchRequest()
+                                        request.rootFilesystemZipPath = rootPath
+                                        request.writableRootPath = writablePath
+                                        request.gameDirectoryHostPath = gamePath
+                                        request.compatibilityDirectoryHostPath =
+                                            profilePath
+                                        request.sharedDirectoryHostPath = sharedPath
+                                        request.gameDriveLetter = Int8(
+                                            String(gameDriveLetter).lowercased()
+                                                .utf8.first ?? 100)
+                                        request.sharedDriveLetter = Int8(
+                                            String(sharedDriveLetter).lowercased()
+                                                .utf8.first ?? 101)
+                                        request.windowsVersion = versionPath
+                                        request.executablePath = exePath
+                                        request.workingDirectory = workPath
+                                        request.width = width
+                                        request.height = height
+                                        request.bitsPerPixel = 32
+                                        request.soundEnabled = soundEnabled
+                                        request.runThroughWine = runThroughWine
+                                        request.wineRenderer = wineRenderer
+                                        request.argumentCount = argumentPointers.count
+                                        request.environmentCount =
+                                            environmentPointers.count
 
-                            return argumentPointers.withUnsafeBufferPointer { args in
-                                environmentPointers.withUnsafeBufferPointer { env in
-                                    request.arguments = args.baseAddress
-                                    request.environment = env.baseAddress
-                                    return BVNRuntimeRequestLaunch(
-                                        &request, &errorBuffer, errorBuffer.count)
+                                        return argumentPointers
+                                            .withUnsafeBufferPointer { args in
+                                                environmentPointers
+                                                    .withUnsafeBufferPointer { env in
+                                                        request.arguments =
+                                                            args.baseAddress
+                                                        request.environment =
+                                                            env.baseAddress
+                                                        return BVNRuntimeRequestLaunch(
+                                                            &request, &errorBuffer,
+                                                            errorBuffer.count)
+                                                    }
+                                            }
+                                    }
                                 }
                             }
-                           }
-                          }
                         }
                     }
                 }

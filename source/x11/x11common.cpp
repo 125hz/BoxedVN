@@ -577,13 +577,17 @@ static void x11_WarpPointer(CPU* cpu) {
 #ifdef BOXEDWINE_IOS
 	XServer* server = XServer::getServer(true);
 	if (server && server->fakeFullScreenWnd && ARG3 &&
-		ARG3 != server->getRoot()->id &&
 		ARG3 != server->fakeFullScreenWnd->id) {
 		XWindowPtr destination = server->getWindow(ARG3);
 		if (destination) {
-			// XWarpPointer's destination is relative to dest_w. Convert from
-			// that physical hierarchy into the virtual presented client.
-			destination->windowToScreen(x, y);
+			// XWarpPointer's destination is relative to dest_w. The root is
+			// already screen-relative; every other destination first needs
+			// promotion through the physical X11 hierarchy. The pointer store
+			// itself remains in the fake client's 0,0-based pixels because that
+			// is the coordinate space iOS presents.
+			if (destination->id != server->getRoot()->id) {
+				destination->windowToScreen(x, y);
+			}
 			server->fakeFullScreenWnd->screenToWindow(x, y);
 		}
 	}
@@ -607,8 +611,13 @@ static void x11_QueryPointer(CPU* cpu) {
     S32 y = 0;
     KNativeSystem::getCurrentInput()->getMousePos(&x, &y);
 #ifdef BOXEDWINE_IOS
-    const S32 rootX = x;
-    const S32 rootY = y;
+    const S32 guestX = x;
+    const S32 guestY = y;
+    S32 rootX = x;
+    S32 rootY = y;
+    if (server->fakeFullScreenWnd) {
+        server->fakeFullScreenWnd->windowToScreen(rootX, rootY);
+    }
 #endif
     memory->writed(ARG3, root->id);
 
@@ -624,17 +633,34 @@ static void x11_QueryPointer(CPU* cpu) {
 		child = root->getWindowFromPoint(x, y);
 	}
 	memory->writed(ARG4, child->id);
+#ifdef BOXEDWINE_IOS
+	// Xlib's root coordinates must describe the real X11 root. Wine subtracts
+	// its decorated window origin from these values when producing Windows
+	// client coordinates. Publishing the fake client's local point as x_root
+	// made that subtraction happen twice, shifting hit testing up and left by
+	// the titlebar/border even though BoxedVN's cursor was drawn correctly.
+    memory->writed(ARG5, rootX);
+    memory->writed(ARG6, rootY);
+	if (server->fakeFullScreenWnd && window->id == root->id) {
+		x = rootX;
+		y = rootY;
+		window->screenToWindow(x, y);
+	} else if (server->fakeFullScreenWnd &&
+			   window->id == server->fakeFullScreenWnd->id) {
+		x = guestX;
+		y = guestY;
+	} else if (server->fakeFullScreenWnd) {
+		x = rootX;
+		y = rootY;
+		window->screenToWindow(x, y);
+	} else {
+		window->screenToWindow(x, y);
+	}
+#else
     memory->writed(ARG5, x);
     memory->writed(ARG6, y);
-	// x/y are virtual root pixels while non-root XWindow geometry remains in
-	// the physical compositor hierarchy. Convert through the active client's
-	// real origin only for a non-root query.
-#ifdef BOXEDWINE_IOS
-	if (server->fakeFullScreenWnd && window->id != root->id) {
-		server->fakeFullScreenWnd->windowToScreen(x, y);
-	}
-#endif
 	window->screenToWindow(x, y);
+#endif
     memory->writed(ARG7, x);
     memory->writed(ARG8, y);
     const U32 inputModifiers = server->getInputModifiers();
@@ -3123,9 +3149,13 @@ void x11_CursorLibraryLoadCursor(CPU* cpu) {
         shape = 134; // XC_top_left_corner
     } else if (fileName == "top_right_corner") {
         shape = 136; // XC_top_right_corner
-    } else if (fileName == "h_double_arrow") {
+    } else if (fileName == "h_double_arrow" || fileName == "col-resize" ||
+               fileName == "ew-resize" || fileName == "e-resize" ||
+               fileName == "w-resize") {
         shape = 108; // XC_sb_h_double_arrow
-    } else if (fileName == "v_double_arrow") {
+    } else if (fileName == "v_double_arrow" || fileName == "row-resize" ||
+               fileName == "ns-resize" || fileName == "n-resize" ||
+               fileName == "s-resize") {
         shape = 116; // XC_sb_v_double_arrow
     } else if (fileName == "not-allowed") {
         shape = 88; // XC_pirate

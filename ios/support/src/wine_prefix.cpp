@@ -279,6 +279,41 @@ bool setWineRegistryValue(std::string& registry,
     return true;
 }
 
+bool removeWineRegistryValue(std::string& registry,
+                             const std::string& section,
+                             const std::string& name) {
+    const std::string sectionLine = escapedSection(section);
+    const std::string keyPrefix = "\"" + name + "\"=";
+    const size_t sectionOffset = registry.find(sectionLine);
+    if (sectionOffset == std::string::npos) {
+        return false;
+    }
+    const size_t sectionEnd = registry.find('\n', sectionOffset);
+    if (sectionEnd == std::string::npos) {
+        return false;
+    }
+    size_t line = sectionEnd + 1;
+    while (line < registry.size()) {
+        const size_t end = registry.find('\n', line);
+        const size_t length = end == std::string::npos
+            ? registry.size() - line : end - line;
+        if (length > 0 && registry[line] == '[') {
+            break;
+        }
+        if (registry.compare(line, keyPrefix.size(), keyPrefix) == 0) {
+            const size_t eraseLength = end == std::string::npos
+                ? registry.size() - line : end + 1 - line;
+            registry.erase(line, eraseLength);
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        line = end + 1;
+    }
+    return false;
+}
+
 bool installBundledDxvk(const std::string& sourceDirectory,
                         const std::string& writableRootPath,
                         bool& changed,
@@ -585,6 +620,9 @@ WinePrefixPreparationResult prepareWinePrefix(
         fs::path(writableRootPath) / "home" / "username" / ".wine";
     const fs::path userRegistry = wineDirectory / "user.reg";
     const fs::path systemRegistry = wineDirectory / "system.reg";
+    std::error_code monoEc;
+    const bool wineMonoInstalled = fs::is_directory(
+        wineDirectory / "drive_c" / "windows" / "mono", monoEc);
 
     bool extracted = false;
     if (!ensureRegistry(rootFilesystemZipPath, kUserRegistryEntry, userRegistry,
@@ -621,9 +659,18 @@ WinePrefixPreparationResult prepareWinePrefix(
         // cannot supply. Everything else is unaffected; these two modules are
         // not used by native Windows code.
         for (const char* missingRuntime : {"mscoree", "mshtml"}) {
-            userRegistryChanged |= setWineRegistryValue(
-                contents, "Software\\Wine\\DllOverrides", missingRuntime,
-                "\"\"");
+            if (wineMonoInstalled && std::strcmp(missingRuntime, "mscoree") == 0) {
+                // Once the user installs Wine Mono in this prefix, mscoree is
+                // no longer missing. Remove only BoxedVN's suppression value;
+                // Gecko/mshtml remains independent and disabled until it has
+                // its own supported installer.
+                userRegistryChanged |= removeWineRegistryValue(
+                    contents, "Software\\Wine\\DllOverrides", missingRuntime);
+            } else {
+                userRegistryChanged |= setWineRegistryValue(
+                    contents, "Software\\Wine\\DllOverrides", missingRuntime,
+                    "\"\"");
+            }
         }
 
         if (renderer != WineRenderer::Default) {

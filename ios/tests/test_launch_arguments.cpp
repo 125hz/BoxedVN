@@ -126,7 +126,7 @@ BOXEDVN_TEST(container_command_uses_configured_drive_letters_and_resolution) {
     launch.gameDriveLetter = 'd';
     launch.sharedDriveLetter = 's';
     launch.executablePath = "explorer";
-    launch.arguments = {"/desktop=shell,800x600", "D:\\"};
+    launch.arguments = {"/desktop=shell,800x600", "winefile", "D:\\"};
     launch.width = 800;
     launch.height = 600;
 
@@ -137,6 +137,7 @@ BOXEDVN_TEST(container_command_uses_configured_drive_letters_and_resolution) {
                       expectedMount.begin(), expectedMount.end())
           != actual.end());
     CHECK(std::find(actual.begin(), actual.end(), "800x600") != actual.end());
+    CHECK(std::find(actual.begin(), actual.end(), "winefile") != actual.end());
 }
 
 BOXEDVN_TEST(explicit_game_resolution_overrides_ios_default_monitor) {

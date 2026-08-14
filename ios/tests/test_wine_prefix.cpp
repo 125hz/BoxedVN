@@ -340,6 +340,20 @@ BOXEDVN_TEST(wine_prefix_suppresses_the_missing_runtime_download_prompts) {
     CHECK_EQ(repeated.ok, true);
     CHECK_EQ(repeated.changed, false);
 
+    // Installing Wine Mono makes mscoree available in this prefix. The next
+    // preparation must lift only that suppression while continuing to prevent
+    // Wine's unrelated Gecko download prompt.
+    fs::create_directories(
+        prefix / "home/username/.wine/drive_c/windows/mono/mono-2.0", ec);
+    const WinePrefixPreparationResult withMono = prepareWinePrefix(
+        archive.string(), prefix.string(), WineRenderer::Default);
+    CHECK_EQ(withMono.ok, true);
+    CHECK_EQ(withMono.changed, true);
+    const std::string monoRegistry =
+        readTestFile(prefix / "home/username/.wine/user.reg");
+    CHECK_EQ(monoRegistry.find("\"mscoree\"=\"\""), std::string::npos);
+    CHECK_CONTAINS(monoRegistry, "\"mshtml\"=\"\"");
+
     fs::remove_all(temporary, ec);
 }
 

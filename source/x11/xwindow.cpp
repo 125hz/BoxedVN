@@ -1253,15 +1253,14 @@ void XWindow::motionNotify(const DisplayDataPtr& data, S32 x, S32 y) {
 	// decorated Wine ancestor (Fate measured +8,+53).  Events often propagate
 	// to that ancestor because it owns Wine's input mask; converting through
 	// the ancestor made the Windows message land a few pixels right and one
-	// title-bar height below the cursor.  XQueryPointer already publishes the
-	// virtual client coordinates, so publish the same coordinate space in
-	// motion/button events regardless of which ancestor selected the event.
+	// title-bar height below the cursor. Publish the local point in the fake
+	// client's coordinate space regardless of which ancestor selected the
+	// event, but retain the physical X11 root point. Wine legitimately combines
+	// x_root with the decorated window origin; making x_root virtual subtracts
+	// that origin twice and moves Windows hit testing one titlebar upward.
 	XServer* server = XServer::getServer(true);
 	if (server && server->fakeFullScreenWnd) {
-		server->fakeFullScreenWnd->screenToWindow(event_root_x,
-											   event_root_y);
-		window_x = event_root_x;
-		window_y = event_root_y;
+		server->fakeFullScreenWnd->screenToWindow(window_x, window_y);
 	} else
 #endif
 	{
@@ -1279,9 +1278,8 @@ void XWindow::motionNotify(const DisplayDataPtr& data, S32 x, S32 y) {
 	event.xmotion.time = XServer::getServer()->getEventTime();
 	event.xmotion.x = window_x;
 	event.xmotion.y = window_y;
-	// The iOS fake-fullscreen branch publishes the same virtual 0,0-based
-	// client coordinates as XQueryPointer. Other hosts retain the physical
-	// X11-root coordinates supplied by their native event source.
+	// Root coordinates always retain the physical X11-root coordinates supplied
+	// by the native event source. The local point above is the presented client.
 	event.xmotion.x_root = event_root_x;
 	event.xmotion.y_root = event_root_y;
 	event.xmotion.state = XServer::getServer()->getInputModifiers();
@@ -1503,10 +1501,7 @@ void XWindow::buttonNotify(const DisplayDataPtr& data, U32 button, S32 x, S32 y,
 #ifdef BOXEDWINE_IOS
 	XServer* server = XServer::getServer(true);
 	if (server && server->fakeFullScreenWnd) {
-		server->fakeFullScreenWnd->screenToWindow(event_root_x,
-											   event_root_y);
-		window_x = event_root_x;
-		window_y = event_root_y;
+		server->fakeFullScreenWnd->screenToWindow(window_x, window_y);
 	} else
 #endif
 	{
@@ -1524,10 +1519,8 @@ void XWindow::buttonNotify(const DisplayDataPtr& data, U32 button, S32 x, S32 y,
 	event.xbutton.time = XServer::getServer()->getEventTime();
 	event.xbutton.x = window_x;
 	event.xbutton.y = window_y;
-	// Keep Button events in the same coordinate space as Motion and
-	// XQueryPointer. Wine combines all three while translating them into
-	// Windows mouse messages; mixing virtual locals with decorated-root
-	// coordinates creates the lower-screen dead zone this branch prevents.
+	// Keep Button events in the same split coordinate spaces as Motion and
+	// XQueryPointer: virtual presented-client locals, physical X11 root.
 	event.xbutton.x_root = event_root_x;
 	event.xbutton.y_root = event_root_y;
 	event.xbutton.state = XServer::getServer()->getInputModifiers();

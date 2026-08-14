@@ -337,6 +337,14 @@ final class AppModel: ObservableObject {
         // game was now booting from.
         let writableRoot = prefixes.appendingPathComponent(game.winePrefix)
         let container = containers.first { $0.prefixName == game.winePrefix }
+        // A shortcut copies its container defaults when it is created, after
+        // which its launch settings are intentionally per-game. Do not let a
+        // later container edit silently override an explicit game renderer or
+        // resolution. "Automatic" is the one value that may inherit the live
+        // container preference.
+        let selectedRenderer = game.renderer == "automatic"
+            ? (container?.renderer ?? game.renderer)
+            : game.renderer
         do {
             try Session.launch(
                 rootFilesystem: rootFilesystem,
@@ -347,15 +355,15 @@ final class AppModel: ObservableObject {
                 arguments: GameLibrary.arguments(for: game),
                 environment: GameLibrary.environment(for: game),
                 workingDirectory: game.guestWorkingDirectory,
-                width: container?.width ?? game.requestedWidth,
-                height: container?.height ?? game.requestedHeight,
+                width: game.requestedWidth,
+                height: game.requestedHeight,
                 soundEnabled: Preferences.soundEnabled,
                 runThroughWine: true,
-                wineRenderer: Self.wineRenderer(
-                    for: container?.renderer ?? game.renderer),
+                wineRenderer: Self.wineRenderer(for: selectedRenderer),
                 sharedDriveLetter:
                     container?.sharedDriveLetter.lowercased().first ?? "e",
-                windowsVersion: container?.windowsVersion
+                windowsVersion: container?.windowsVersion,
+                compatibilityDirectory: game.compatibilityDirectory
             )
         } catch {
             alertMessage = error.localizedDescription
@@ -378,6 +386,7 @@ final class AppModel: ObservableObject {
         do {
             try FileManager.default.createDirectory(
                 at: files, withIntermediateDirectories: true)
+            try ContainerLibrary.prepareDesktopTools(for: container)
             try Session.launch(
                 rootFilesystem: rootFilesystem,
                 writableRoot: writableRoot,
@@ -385,7 +394,7 @@ final class AppModel: ObservableObject {
                 sharedDirectory: Storage.sharedFiles,
                 executablePath: "explorer",
                 arguments: ["/desktop=shell,\(container.width)x\(container.height)",
-                            "D:\\"],
+                            "winefile", "D:\\"],
                 environment: [],
                 workingDirectory: "/home/username/.wine/dosdevices/d:/",
                 width: container.width,

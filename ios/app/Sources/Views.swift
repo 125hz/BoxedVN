@@ -309,8 +309,8 @@ struct ContainerDetailView: View {
                 }
                 Picker("Direct3D renderer", selection: $container.renderer) {
                     Text("Automatic").tag("automatic")
-                    Text("WineD3D").tag("wined3d")
-                    Text("DXVK").tag("dxvk")
+                    Text("WineD3D (Vulkan)").tag("wined3d")
+                    Text("DXVK (Vulkan)").tag("dxvk")
                 }
                 Picker("Shared folder drive", selection: $container.sharedDriveLetter) {
                     ForEach(["e", "f", "g", "h", "i", "j", "k", "l", "m",
@@ -489,8 +489,8 @@ struct GameDetailView: View {
                 }
                 Picker("Direct3D renderer", selection: $renderer) {
                     Text("Automatic (recommended)").tag("automatic")
-                    Text("WineD3D (D3D8/9 compatibility)").tag("wined3d")
-                    Text("DXVK (D3D10/11)").tag("dxvk")
+                    Text("WineD3D Vulkan (D3D8/9)").tag("wined3d")
+                    Text("DXVK Vulkan (D3D10/11)").tag("dxvk")
                 }
                 Button("Save") { save() }
                 if let saveError {

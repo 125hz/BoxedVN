@@ -385,7 +385,7 @@ void KNativeScreenSDL::clear() {
             U32* pixel = (U32*)recordBuffer;
             U32 len = screenWidth() * screenHeight();
             for (U32 i = 0; i < len; i++, pixel++) {
-                *pixel = 165 | (110 << 8) | (58 << 16) | (255 << 24);
+                *pixel = 255u << 24;
             }
         } else {
             memset(recordBuffer, 0, recordBufferSize);
@@ -393,7 +393,10 @@ void KNativeScreenSDL::clear() {
     }
 #endif
     if (KSystem::videoOption != VIDEO_NO_WINDOW && renderer) {
-        SDL_SetRenderDrawColor(renderer, 58, 110, 165, 255);
+        // Anything not painted by Wine is presentation margin, not the Wine
+        // desktop. Black keeps software/GDI sessions consistent with Vulkan's
+        // letterbox instead of exposing Boxedwine's historical blue clear.
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
     }
 }

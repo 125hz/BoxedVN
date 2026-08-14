@@ -172,6 +172,13 @@ bool setWineRegistryValue(std::string& registry,
                           const std::string& name,
                           const std::string& serialisedValue);
 
+// Removes one value from a Wine registry text document. Used when a runtime
+// that BoxedVN previously marked unavailable (currently Wine Mono/mscoree) is
+// installed into that prefix.
+bool removeWineRegistryValue(std::string& registry,
+                             const std::string& section,
+                             const std::string& name);
+
 }  // namespace boxedvn
 
 #endif  // BOXEDVN_WINE_PREFIX_H

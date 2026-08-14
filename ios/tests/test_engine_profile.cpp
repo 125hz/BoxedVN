@@ -268,6 +268,27 @@ BOXEDVN_TEST(engineProfileAppendsSwitchesForAnImportedNwJsGame) {
           argv.end());
 }
 
+BOXEDVN_TEST(containerShortcutScansOnlyItsOwnProgramDirectory) {
+    const TemporaryTree tree("container_scope");
+    tree.addFile("fate/Fate.exe");
+    tree.addFile("summer/Game.exe");
+    tree.addFile("summer/nw.dll");
+
+    BVNLaunchConfiguration fate;
+    fate.runThroughWine = true;
+    fate.gameDirectoryHostPath = tree.string();
+    fate.compatibilityDirectoryHostPath =
+        (tree.path() / "fate").string();
+    fate.executablePath = "d:\\fate\\Fate.exe";
+
+    const BVNEngineProfileResult result =
+        BVNApplyEngineCompatibilityProfile(fate);
+    CHECK(!result.applied);
+    CHECK(result.reason.empty());
+    CHECK(fate.arguments.empty());
+    CHECK(!fate.interpretAnonymousExecutable);
+}
+
 BOXEDVN_TEST(engineProfileAddsToTheUsersOwnSwitchesRatherThanStandingDown) {
     const TemporaryTree tree("launch_merge");
     tree.addFile("Game.exe");

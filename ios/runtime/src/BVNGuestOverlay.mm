@@ -496,7 +496,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     // cursor without replacing Wine's shape or hotspot.
     guestCursor.layer.shadowColor = UIColor.blackColor.CGColor;
     guestCursor.layer.shadowOpacity = 1.0f;
-    guestCursor.layer.shadowRadius = 1.25f;
+    guestCursor.layer.shadowRadius = 2.0f;
     guestCursor.layer.shadowOffset = CGSizeZero;
     guestCursor.layer.masksToBounds = NO;
     guestCursor.hidden = YES;
@@ -1503,6 +1503,37 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     [self positionCursor];
 }
 
+- (UIImage*)outlinedGuestCursorSymbolNamed:(NSString*)name {
+    UIImageSymbolConfiguration* configuration =
+        [UIImageSymbolConfiguration configurationWithPointSize:20.0
+                                                        weight:UIImageSymbolWeightBold];
+    UIImage* source = [UIImage systemImageNamed:name
+                               withConfiguration:configuration];
+    if (source == nil) {
+        return nil;
+    }
+    UIImage* black = [source imageWithTintColor:UIColor.blackColor
+                                  renderingMode:UIImageRenderingModeAlwaysOriginal];
+    UIImage* white = [source imageWithTintColor:UIColor.whiteColor
+                                  renderingMode:UIImageRenderingModeAlwaysOriginal];
+    const CGSize size = CGSizeMake(30.0, 30.0);
+    UIGraphicsImageRenderer* renderer = [[UIGraphicsImageRenderer alloc]
+        initWithSize:size];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext* ctx) {
+        const CGRect base = CGRectMake((size.width - source.size.width) / 2.0,
+                                       (size.height - source.size.height) / 2.0,
+                                       source.size.width, source.size.height);
+        const CGPoint offsets[] = {
+            {-1.5, 0.0}, {1.5, 0.0}, {0.0, -1.5}, {0.0, 1.5},
+            {-1.0, -1.0}, {1.0, -1.0}, {-1.0, 1.0}, {1.0, 1.0},
+        };
+        for (const CGPoint offset : offsets) {
+            [black drawInRect:CGRectOffset(base, offset.x, offset.y)];
+        }
+        [white drawInRect:base];
+    }];
+}
+
 - (UIImage*)fallbackGuestCursorImageForShape:(int)shape {
     // Draw the default arrow ourselves. SF Symbols' cursorarrow is a solid
     // white glyph with no Windows-style black outline, so it vanishes on a
@@ -1535,11 +1566,18 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         symbolName = @"plus";
     } else if (shape == 150 || shape == 1000) {
         symbolName = @"hourglass";
+    } else if (shape == 108) {
+        symbolName = @"arrow.left.and.right";
+    } else if (shape == 116) {
+        symbolName = @"arrow.up.and.down";
+    } else if (shape == 60) {
+        symbolName = @"hand.point.up.left.fill";
+    } else if (shape == 88) {
+        symbolName = @"nosign";
     }
-    UIImage* symbol = [UIImage systemImageNamed:symbolName];
+    UIImage* symbol = [self outlinedGuestCursorSymbolNamed:symbolName];
     if (symbol != nil) {
-        return [symbol imageWithTintColor:UIColor.whiteColor
-                           renderingMode:UIImageRenderingModeAlwaysOriginal];
+        return symbol;
     }
 
     // Old iOS versions do not have cursorarrow. Draw the familiar X11 arrow
@@ -1607,9 +1645,19 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         self.guestCursorPixelSize = CGSizeMake(bitmap.width, bitmap.height);
     }
     if (image == nil) {
+        const int shape =
+            gSelectedGuestCursorShape.load(std::memory_order_relaxed);
         image = [self fallbackGuestCursorImageForShape:
-            gSelectedGuestCursorShape.load(std::memory_order_relaxed)];
-        self.guestCursorHotspot = CGPointMake(2.0, 2.0);
+            shape];
+        if (shape == 108 || shape == 116 || shape == 130 || shape == 150 ||
+            shape == 152 || shape == 88 || shape == 1000) {
+            self.guestCursorHotspot = CGPointMake(image.size.width / 2.0,
+                                                  image.size.height / 2.0);
+        } else if (shape == 60) {
+            self.guestCursorHotspot = CGPointMake(8.0, 3.0);
+        } else {
+            self.guestCursorHotspot = CGPointMake(2.0, 2.0);
+        }
         self.guestCursorPixelSize = image.size;
     }
     self.guestCursorView.image = image;

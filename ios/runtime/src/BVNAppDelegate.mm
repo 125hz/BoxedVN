@@ -688,6 +688,13 @@ extern "C" void BVNAttachGuestWindowToScene(void) {
     }
 
     guestWindow.windowScene = scene;
+    // The SDL renderer/Metal view may preserve aspect ratio inside this
+    // hierarchy. Every ancestor behind it must therefore be black or a blue
+    // UIKit/Boxedwine default leaks through as the letterbox colour.
+    guestWindow.backgroundColor = UIColor.blackColor;
+    guestWindow.rootViewController.view.backgroundColor = UIColor.blackColor;
+    guestWindow.rootViewController.view.superview.backgroundColor =
+        UIColor.blackColor;
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "SDL guest window attached to the active UIWindowScene.");
 
@@ -724,15 +731,12 @@ extern "C" void BVNRegisterGuestVulkanSurface(void* surface) {
     // SDL installs the CAMetalLayer as soon as vkCreateSurface succeeds,
     // before the guest has submitted or presented anything. An untouched
     // CAMetalLayer is opaque black, which made a healthy game still building
-    // its first frame indistinguishable from an emulator freeze. Give it the
-    // Wine desktop colour and a native, non-interactive progress overlay.
-    // The overlay is removed by the first successful vkQueuePresentKHR.
-    const CGFloat red = 59.0 / 255.0;
-    const CGFloat green = 112.0 / 255.0;
-    const CGFloat blue = 164.0 / 255.0;
-    UIColor* wineBlue = [UIColor colorWithRed:red green:green blue:blue alpha:1.0];
-    view.backgroundColor = wineBlue;
-    view.layer.backgroundColor = wineBlue.CGColor;
+    // its first frame indistinguishable from an emulator freeze. Keep the
+    // requested black presentation backing and distinguish startup with a
+    // native, non-interactive progress overlay. It is removed by the first
+    // successful vkQueuePresentKHR.
+    view.backgroundColor = UIColor.blackColor;
+    view.layer.backgroundColor = UIColor.blackColor.CGColor;
 
     UIView* overlay = [[UIView alloc] initWithFrame:view.bounds];
     overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth |
@@ -807,9 +811,8 @@ extern "C" void BVNGuestVulkanSurfaceDidPresent(void* surface) {
     }
     [overlay removeFromSuperview];
     [gGuestVulkanWaitingOverlays removeObjectForKey:key];
-    // The Wine-blue fill set at registration existed to distinguish "still
-    // building the first frame" from a freeze. That question is now answered,
-    // and blue showing through anywhere behind real content reads as a bug.
+    // Keep the presentation backing black after startup as well, so resize or
+    // letterbox gaps never expose a host colour.
     UIView* surfaceView = gGuestVulkanSurfaceViews[key];
     surfaceView.backgroundColor = UIColor.blackColor;
     surfaceView.layer.backgroundColor = UIColor.blackColor.CGColor;

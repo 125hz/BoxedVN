@@ -70,6 +70,20 @@ struct Game: Identifiable, Hashable {
             ? driveRoot
             : driveRoot + trimmedDirectory
     }
+
+    /// Host directory inspected for engine and Direct3D dependencies. A
+    /// container's D: drive may hold many unrelated games; inspecting the
+    /// entire drive lets one game's nw.dll or d3d11.dll change every sibling's
+    /// renderer and launch switches.
+    var compatibilityDirectory: URL {
+        let normalized = selectedExecutable.replacingOccurrences(
+            of: "\\", with: "/")
+        let parent = normalized.split(separator: "/").dropLast()
+            .joined(separator: "/")
+        return parent.isEmpty
+            ? contentDirectory
+            : contentDirectory.appendingPathComponent(parent, isDirectory: true)
+    }
 }
 
 struct PendingGameInstallation: Hashable {

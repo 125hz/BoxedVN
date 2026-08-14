@@ -15,6 +15,11 @@ struct BVNLaunchConfiguration {
     std::string rootFilesystemZipPath;
     std::string writableRootPath;
     std::string gameDirectoryHostPath;
+    // Directory containing the selected executable, used for engine and
+    // Direct3D inspection. In a shared container this is deliberately narrower
+    // than gameDirectoryHostPath, so one installed title cannot donate nw.dll
+    // or d3d11.dll to another title's compatibility decision.
+    std::string compatibilityDirectoryHostPath;
     // One host directory mounted as E: in every Wine session. Games retain
     // independent prefixes for save/registry compatibility while documents
     // intentionally shared between games and the file browser live here.

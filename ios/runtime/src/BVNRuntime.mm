@@ -203,6 +203,26 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         }
     }
 
+    if (request->compatibilityDirectoryHostPath != nullptr &&
+        request->compatibilityDirectoryHostPath[0] != '\0') {
+        launch.compatibilityDirectoryHostPath =
+            request->compatibilityDirectoryHostPath;
+        if (!directoryExists(launch.compatibilityDirectoryHostPath)) {
+            error = std::string("The compatibility scan directory '") +
+                    launch.compatibilityDirectoryHostPath + "' does not exist.";
+            return false;
+        }
+    } else {
+        launch.compatibilityDirectoryHostPath = launch.gameDirectoryHostPath;
+    }
+    if (!launch.compatibilityDirectoryHostPath.empty() &&
+        launch.compatibilityDirectoryHostPath != launch.gameDirectoryHostPath) {
+        BVNLogWrite(BVNLogLevelInfo, "profile",
+                    ("Compatibility inspection scoped to the selected "
+                     "program directory: " +
+                     launch.compatibilityDirectoryHostPath).c_str());
+    }
+
     if (request->sharedDirectoryHostPath != nullptr &&
         request->sharedDirectoryHostPath[0] != '\0') {
         launch.sharedDirectoryHostPath = request->sharedDirectoryHostPath;
@@ -291,7 +311,7 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     // browser-engine game, not only when it is switched on, so that turning
     // it off actually puts the game's own HTML back rather than leaving
     // BoxedVN's script in a file the user thinks is untouched.
-    if (!launch.gameDirectoryHostPath.empty()) {
+    if (!launch.compatibilityDirectoryHostPath.empty()) {
         boxedvn::GuestBootScripts scripts;
         scripts.diagnostics = engineProfile.bootDiagnostics;
         scripts.fontFix = engineProfile.fontGateShim;
@@ -302,7 +322,7 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         // decodeAudioData regardless.
         scripts.silenceAudio = engineProfile.rpgMaker && !launch.soundEnabled;
         const boxedvn::BootDiagnosticsResult diagnostics =
-            boxedvn::setGuestBootScripts(launch.gameDirectoryHostPath,
+            boxedvn::setGuestBootScripts(launch.compatibilityDirectoryHostPath,
                                          scripts);
         if (!diagnostics.ok) {
             BVNLogWrite(BVNLogLevelError, "diagnostics",

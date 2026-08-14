@@ -1,5 +1,67 @@
 # BoxedVN — Progress and Handoff
 
+## Build 129: physical X11 roots, scoped containers, and a useful desktop
+
+The Fate config-screen screenshot and Build-128 trace show a coherent final
+input defect: the rendered cursor is over Cancel while Wine highlights Default,
+approximately one decorated titlebar above it. BoxedVN was publishing the
+fake-fullscreen client's 0,0-based point as both an event-local coordinate and
+an X11 root coordinate. Wine legitimately subtracts the real decorated-window
+origin from the latter, so the origin was effectively removed twice. Motion,
+buttons and `XQueryPointer` now keep client-local coordinates in the presented
+guest space while preserving physical X11-root coordinates separately. Cursor
+warps follow the same rule. This is an X11 invariant rather than a title check,
+so it applies to direct touch and both trackpad modes across games.
+
+The cursor overlay continues to prefer Wine's actual X11 cursor bitmap and its
+hotspot. Missing-theme fallbacks now have a Windows-readable black outline,
+and CSS/X11 `col-resize` and `row-resize` aliases map to the correct horizontal
+and vertical shapes instead of producing an unrecognised white glyph. Software,
+Metal and Vulkan presentation backings now clear to black, so aspect-ratio and
+desktop margins no longer expose Boxedwine's historical blue background.
+
+Container desktops now start `winefile D:\\` inside the configured Wine shell,
+opening File Explorer immediately while retaining the desktop and taskbar. Each
+container receives **Start > Programs > BoxedVN > Install Wine Mono**, which
+installs an official `wine-mono-*-x86.msi` placed in that container's Files/D:
+folder. On the following launch, prefix preparation detects the installed Mono
+directory and removes only BoxedVN's `mscoree` suppression; Gecko's independent
+`mshtml` suppression remains in place.
+
+Container compatibility discovery is now scoped to the selected executable's
+directory. The latest Fate log was incorrectly classified as NW.js because the
+old scan found Summer Memories' `nw.dll` elsewhere on their shared D: drive;
+that donated Chromium switches and anonymous-code interpretation to an
+unrelated game. Direct3D and engine inspection now remain local to each program,
+while the whole container stays mounted and visible. A game's explicit renderer
+and virtual resolution also remain authoritative; only Automatic inherits a
+later container renderer choice.
+
+The renderer logs establish that BoxedVN already has Vulkan on both paths:
+WineD3D translates Direct3D through Vulkan, and DXVK supplies the alternative
+Direct3D 8-11 translation before the same Boxedwine/MoltenVK/Metal backend.
+Fruit of Grisaia's explicit DXVK preference reached `-dxvk 1`, but DXVK then
+repeatedly failed to create its device. The container does not need a duplicate
+DXVK setting; that title should use Automatic or WineD3D. VKD3D is intentionally
+not exposed because it implements Direct3D 12 and does not address these older
+visual-novel rendering paths.
+
+No speculative Summer Memories renderer change is included. Its last known
+working path uses bundled NW.js/Chromium Canvas rendering plus decoded execution
+for anonymous V8 code; earlier attempts to enable Chromium GPU rendering or JIT
+those heaps regressed it before the menu. Its poor frame rate is therefore a
+CPU interpreter/browser-compositing problem, not missing Vulkan or a D3D12
+translation layer. Optimising that path needs a fresh performance trace and a
+correctness-preserving JIT change, while this build deliberately retains the
+device-proven route into the game.
+
+The Windows host-independent suite passes 173/173. Objective-C++, Swift, X11
+and ARM64 compilation remain the iPhoneOS CI gate; exact Fate hit alignment,
+desktop Start-menu discovery, black margins and game performance remain fresh
+physical-device acceptance tests.
+
+---
+
 ## Build 128: one input coordinate space, selective browser decoding, and containers
 
 The Build-127 Fate trace disproves the remaining monitor-size hypothesis. Its

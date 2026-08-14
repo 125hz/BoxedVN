@@ -173,8 +173,12 @@ void BVNApplyDefaultRendererPolicy(BVNLaunchConfiguration& launch) {
     //
     // Ask the binaries instead. They say which Direct3D they link, and that
     // answer covers titles nobody has sat down with.
+    const std::string& compatibilityDirectory =
+        launch.compatibilityDirectoryHostPath.empty()
+            ? launch.gameDirectoryHostPath
+            : launch.compatibilityDirectoryHostPath;
     const boxedvn::Direct3DUsage usage =
-        boxedvn::detectDirect3DUsage(launch.gameDirectoryHostPath);
+        boxedvn::detectDirect3DUsage(compatibilityDirectory);
     if (usage.needsModernDirect3D) {
         launch.enableWineD3DVulkan = true;
         launch.rendererReason =
@@ -195,8 +199,12 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
         return result;
     }
 
+    const std::string& compatibilityDirectory =
+        launch.compatibilityDirectoryHostPath.empty()
+            ? launch.gameDirectoryHostPath
+            : launch.compatibilityDirectoryHostPath;
     const boxedvn::GuestEngineProfile profile =
-        boxedvn::detectGuestEngine(launch.gameDirectoryHostPath);
+        boxedvn::detectGuestEngine(compatibilityDirectory);
     if (!profile.isChromium()) {
         return result;
     }
