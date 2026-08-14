@@ -424,14 +424,14 @@ enum GameLibrary {
                 throw GameLibraryError.manifestFailed(
                     cString(&summary.error, Int(BVN_MAX_DIAGNOSTIC)))
             }
-            var game = game(from: directory, summary: &summary)
+            var shortcut = game(from: directory, summary: &summary)
             try updateLaunchSettings(
-                for: game, selectedExecutable: executable.relativePath,
+                for: shortcut, selectedExecutable: executable.relativePath,
                 workingDirectory: "", renderer: renderer,
                 arguments: [], environment: [], width: width, height: height)
             BVNManifestRead(manifest.path, &summary)
-            game = game(from: directory, summary: &summary)
-            return game
+            shortcut = game(from: directory, summary: &summary)
+            return shortcut
         } catch {
             try? FileManager.default.removeItem(at: directory)
             throw error
