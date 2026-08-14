@@ -1,5 +1,51 @@
 # BoxedVN — Progress and Handoff
 
+## Build 130: ARM64 interpreter throughput and container utilities
+
+The Build-129 Summer Memories trace identifies the remaining frame-rate limit
+more precisely. MoltenVK sees the Apple A19 GPU and 5.4 GB of available GPU
+memory, but only 12 MB is in use while the game is presented through the
+software guest path. At the same time the compatibility profile grows from 32
+to 16,384 interpreted anonymous V8 blocks. That is not a missing Vulkan or DXVK
+path: NW.js is spending its time running generated x86 browser code that cannot
+safely enter the ARM64 JIT. Previous attempts to re-enable Chromium GPU paths
+failed before a useful frame, so this build preserves the proven Canvas route.
+
+The generic ARM64 core now chains interpreted opcodes through the existing
+switch dispatcher instead of performing an indirect function-pointer call for
+every instruction. It still returns to the regular run loop at an actual JIT
+block boundary, preserving the generated-code ABI and mapped PE/ELF JIT path.
+The compatibility heartbeat also stops searching every configured interpreter
+range on every instruction and samples once per 65,536 instructions instead.
+This targets every interpreter-heavy workload rather than Summer Memories by
+name. The iPhoneOS compiler is the authority for this native ARM64 path, and a
+fresh device run is still needed to measure the real frame-rate change.
+
+Container utilities no longer depend on Wine's incomplete Start-menu Programs
+hierarchy or MSI shell association. **Install Wine Mono…** imports an official
+Wine Mono MSI and invokes `msiexec` directly in that exact container prefix.
+**Run Direct3D test** opens Wine's bundled DXDiag using the container's chosen
+renderer, providing a first adapter/feature diagnostic before importing a 3D
+game. It is a diagnostic baseline rather than a rendered triangle benchmark.
+
+The container Programs list hides executables below `C:\windows` by default;
+**Show Windows system programs** exposes them when troubleshooting. Executable
+discovery now sizes its result buffer from the real scan count so system files
+cannot crowd installed programs out of the old 256-entry buffer. Existing
+container JSON remains compatible and receives the hidden-system default.
+
+When Wine supplies only a cursor shape rather than bitmap pixels, the fallback
+cursor now follows the same Size, Outline opacity, Shadow opacity and Cursor
+thickness settings as BoxedVN's ring cursor. Wine-provided bitmap cursors keep
+their native pixel dimensions and hotspot.
+
+The Windows host-independent suite passes 173/173. Objective-C++, Swift and
+native ARM64 compilation remain the iPhoneOS CI gate; Mono setup, DXDiag
+output, cursor appearance and Summer Memories throughput remain physical-device
+acceptance checks.
+
+---
+
 ## Build 129: physical X11 roots, scoped containers, and a useful desktop
 
 The Fate config-screen screenshot and Build-128 trace show a coherent final

@@ -24,7 +24,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "129"
+    CURRENT_PROJECT_VERSION: "130"
     # Overridden by scripts/build-ios.sh with the real git commit.  The
     # default is deliberately "unknown" so a build produced any other way
     # says so instead of claiming a revision it does not have.

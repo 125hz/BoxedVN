@@ -36,6 +36,15 @@ static inline void normalCompatibilityHeartbeat(CPU* cpu) {
     if (KSystem::interpreterRanges.empty()) {
         return;
     }
+    // This is diagnostics, not execution policy. The old implementation
+    // searched every configured range after every interpreted x86 instruction,
+    // which is disproportionately expensive in browser engines that execute
+    // billions of generated instructions. Sample once per 65,536 instructions
+    // and leave the hot interpreter path as a counter increment plus branch.
+    thread_local U16 sampleClock = 0;
+    if (++sampleClock != 0) {
+        return;
+    }
     const U32 eip = cpu->eip.u32;
     bool insideProfile = false;
     for (const auto& range : KSystem::interpreterRanges) {
@@ -47,14 +56,17 @@ static inline void normalCompatibilityHeartbeat(CPU* cpu) {
     if (!insideProfile) {
         return;
     }
-    thread_local U64 profiledInstructions = 0;
-    ++profiledInstructions;
+    constexpr U64 kSampleInterval = 65536;
     constexpr U64 kHeartbeatInterval = 25000000;
-    if (profiledInstructions == 1 ||
-        profiledInstructions % kHeartbeatInterval == 0) {
-        klog_fmt("Compatibility interpreter heartbeat: %llu profiled "
-                 "instruction(s), current EIP %.8X",
-                 (unsigned long long)profiledInstructions, eip);
+    thread_local U64 sampledInstructions = 0;
+    thread_local U64 nextHeartbeat = kHeartbeatInterval;
+    sampledInstructions += kSampleInterval;
+    if (sampledInstructions == kSampleInterval ||
+        sampledInstructions >= nextHeartbeat) {
+        klog_fmt("Compatibility interpreter heartbeat: approximately %llu "
+                 "profiled instruction(s), current EIP %.8X",
+                 (unsigned long long)sampledInstructions, eip);
+        nextHeartbeat += kHeartbeatInterval;
     }
 }
 #else
@@ -79,18 +91,19 @@ static inline void normalCompatibilityHeartbeat(CPU*) {}
 
 // Direct-dispatch builds use normalDispatch so the switch generates direct
 // return_call instructions per opcode rather than one return_call_indirect.
-// WASM JIT interpreter chains also use normalDispatch until they reach a JIT
-// block head, where they return to the regular run loop.
+// WASM and ARMv8 JIT interpreter chains also use normalDispatch until they
+// reach a JIT block head, where they return to the regular run loop.
 #if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH)
 #define NEXT() cpu->eip.u32+=op->len; MUSTTAIL return normalDispatch(cpu, op->next);
-#elif defined(BOXEDWINE_WASM_JIT)
+#elif defined(BOXEDWINE_WASM_JIT) || defined(BOXEDWINE_JIT_ARMV8)
 #ifndef BOXEDWINE_WASM_JIT_NO_DIRECT_INTERP
 // Non-bridge interpreter chains go through normalDispatch's switch (direct
-// tail calls) instead of the indirect nextOp->pfn call. Default on: A/B
-// measured MT 62 -> 82 (beats the 80 interpreter) and ST 27 -> 28 / 30
-// with piped modules; BOXEDWINE_WASM_JIT_NO_DIRECT_INTERP is a diagnostic
-// opt-out. Chains exit to run() at compiled-block heads so wasmStartJITOp
-// keeps its machinery (per-worker readiness, relocBase, runCount counting);
+// tail calls) instead of the indirect nextOp->pfn call. This is especially
+// important for ARM64 workloads that must deliberately interpret large V8
+// heaps: the switch gives the native compiler a predictable branch target for
+// every opcode. BOXEDWINE_WASM_JIT_NO_DIRECT_INTERP remains a diagnostic
+// opt-out. Chains exit to run() at compiled-block heads so startJITOp keeps
+// its machinery (per-worker readiness, relocBase, runCount counting);
 // branches still break chains in NEXT_BRANCH1/2 - that is the stack bound
 // and must stay (the historical branch-through variant overflowed the JS
 // stack). Any DecodedOp whose pfn is not normalOps[inst] must keep an inst
@@ -115,7 +128,8 @@ static inline void normalCompatibilityHeartbeat(CPU*) {}
 #define NEXT_DONE() cpu->nextOp = cpu->getNextOp();
 #define NEXT_DONE_JUMP_OR_CALL() cpu->nextOp = cpu->getNextOp(OP_FLAG2_JUMP_TARGET);
 
-#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
+#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT) || \
+    defined(BOXEDWINE_JIT_ARMV8)
 static inline bool normalGetZF(CPU* cpu) {
     switch (cpu->lazyFlagType) {
     case FLAGS_NONE:
@@ -256,7 +270,8 @@ static inline bool normalGetNLE(CPU* cpu) {
 
 #define NEXT_BRANCH2() cpu->eip.u32+=op->len; if (!op->next) {op->next = cpu->getNextOp(); } cpu->nextOp = op->next;
 
-#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
+#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT) || \
+    defined(BOXEDWINE_JIT_ARMV8)
 static void OPCALL normalDispatch(CPU* cpu, DecodedOp* op);
 #endif
 
@@ -301,8 +316,10 @@ void OPCALL onTestEnd(CPU* cpu, DecodedOp* op) {
 }
 
 // Dispatch the next decoded op by switching on its instruction ID. Using a
-// switch lets WASM emit direct return_call instructions for opcode arms.
-#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
+// switch lets WASM emit direct return_call instructions and ARM64 emit direct
+// tail branches for opcode arms.
+#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT) || \
+    defined(BOXEDWINE_JIT_ARMV8)
 static void OPCALL normalDispatch(CPU* cpu, DecodedOp* op) {
     switch (op->inst) {
 #undef INIT_CPU

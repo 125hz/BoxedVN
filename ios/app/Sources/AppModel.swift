@@ -386,7 +386,6 @@ final class AppModel: ObservableObject {
         do {
             try FileManager.default.createDirectory(
                 at: files, withIntermediateDirectories: true)
-            try ContainerLibrary.prepareDesktopTools(for: container)
             try Session.launch(
                 rootFilesystem: rootFilesystem,
                 writableRoot: writableRoot,
@@ -407,6 +406,103 @@ final class AppModel: ObservableObject {
                 windowsVersion: container.windowsVersion)
         } catch {
             alertMessage = error.localizedDescription
+        }
+    }
+
+    /// Installs an official Wine Mono MSI into this exact container prefix.
+    /// Launching an MSI from Winefile depends on shell file associations that
+    /// are incomplete in the bundled shell, so invoke Wine's installer host
+    /// directly and keep the selected package on the container's D: drive.
+    func installWineMono(from source: URL, in container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let writableRoot = ContainerLibrary.prefixRoot(for: container) else {
+            alertMessage = "Could not create the container prefix."
+            return
+        }
+        let lowerName = source.lastPathComponent.lowercased()
+        guard source.pathExtension.lowercased() == "msi",
+              lowerName.hasPrefix("wine-mono") else {
+            alertMessage = "Select an official wine-mono-*-x86.msi package."
+            return
+        }
+
+        let accessed = source.startAccessingSecurityScopedResource()
+        defer {
+            if accessed { source.stopAccessingSecurityScopedResource() }
+        }
+        let files = ContainerLibrary.filesDirectory(for: container)
+        let target = files.appendingPathComponent("wine-mono.msi")
+        do {
+            try FileManager.default.createDirectory(
+                at: files, withIntermediateDirectories: true)
+            if source.standardizedFileURL != target.standardizedFileURL {
+                if FileManager.default.fileExists(atPath: target.path) {
+                    try FileManager.default.removeItem(at: target)
+                }
+                try FileManager.default.copyItem(at: source, to: target)
+            }
+            Log.write("Launching Wine Mono installer in \(container.name): "
+                      + target.lastPathComponent, category: "container")
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                writableRoot: writableRoot,
+                gameDirectory: files,
+                sharedDirectory: Storage.sharedFiles,
+                executablePath: "msiexec",
+                arguments: ["/i", "d:\\wine-mono.msi"],
+                environment: ["WINEDEBUG=warn+msi"],
+                workingDirectory: "/home/username/.wine/dosdevices/d:/",
+                width: container.width,
+                height: container.height,
+                soundEnabled: Preferences.soundEnabled,
+                runThroughWine: true,
+                wineRenderer: Self.wineRenderer(for: container.renderer),
+                sharedDriveLetter:
+                    container.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container.windowsVersion)
+        } catch {
+            alertMessage = "Wine Mono could not be installed: "
+                         + error.localizedDescription
+        }
+    }
+
+    /// Wine's bundled DXDiag is the first renderer smoke test: it exercises
+    /// DirectDraw/Direct3D discovery inside the selected prefix and reports
+    /// the adapter, driver and feature levels without importing a game.
+    func launchDirect3DTest(_ container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let writableRoot = ContainerLibrary.prefixRoot(for: container) else {
+            alertMessage = "Could not create the container prefix."
+            return
+        }
+        let files = ContainerLibrary.filesDirectory(for: container)
+        do {
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                writableRoot: writableRoot,
+                gameDirectory: files,
+                sharedDirectory: Storage.sharedFiles,
+                executablePath: "dxdiag",
+                arguments: ["/dontskip"],
+                environment: ["WINEDEBUG=warn+d3d_shader,-d3d"],
+                workingDirectory: nil,
+                width: container.width,
+                height: container.height,
+                soundEnabled: Preferences.soundEnabled,
+                runThroughWine: true,
+                wineRenderer: Self.wineRenderer(for: container.renderer),
+                sharedDriveLetter:
+                    container.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container.windowsVersion)
+        } catch {
+            alertMessage = "Direct3D diagnostics could not start: "
+                         + error.localizedDescription
         }
     }
 

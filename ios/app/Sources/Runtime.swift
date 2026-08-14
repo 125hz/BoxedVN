@@ -376,11 +376,17 @@ enum Executables {
 
     /// Scans a directory recursively.  Blocking; call off the main thread.
     static func discover(in directory: URL) -> [ExecutableDescription] {
-        let capacity = 256
+        // Ask for the total first. A Wine C: drive can contain more than 256
+        // shallow system executables, which previously displaced installed
+        // applications before the UI had a chance to hide C:\windows.
+        let total = BVNDiscoverExecutables(directory.path, nil, 0)
+        let capacity = min(Int(total), 4096)
+        guard capacity > 0 else { return [] }
         var buffer = [BVNDiscoveredExecutable](
             repeating: BVNDiscoveredExecutable(), count: capacity)
-        let total = BVNDiscoverExecutables(directory.path, &buffer, capacity)
-        let count = min(Int(total), capacity)
+        let discovered = BVNDiscoverExecutables(
+            directory.path, &buffer, capacity)
+        let count = min(Int(discovered), capacity)
 
         return (0..<count).map { index in
             var entry = buffer[index]

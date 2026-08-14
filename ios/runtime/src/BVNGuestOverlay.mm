@@ -263,6 +263,7 @@ static NSString* const kBVNPerformanceBatteryKey =
 @property (nonatomic, assign) CGPoint guestCursorHotspot;
 @property (nonatomic, assign) CGSize guestCursorPixelSize;
 @property (nonatomic, assign) BOOL guestCursorVisible;
+@property (nonatomic, assign) BOOL guestCursorUsesFallback;
 @property (nonatomic, assign) uint64_t appliedPointerRevision;
 @property (nonatomic, assign) uint64_t appliedGuestCursorRevision;
 @property (nonatomic, strong) UIView* cursorHaloView;
@@ -602,6 +603,15 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         (float)[defaults doubleForKey:kBVNPointerShadowOpacityKey];
     self.cursorView.alpha = [defaults doubleForKey:kBVNPointerOpacityKey];
 
+    // Wine cursor bitmaps keep their native dimensions and hotspot. When Wine
+    // only supplies a cursor shape, BoxedVN draws the fallback and applies the
+    // same size, outline and shadow controls as the trackpad ring.
+    self.guestCursorView.layer.shadowOpacity = self.guestCursorUsesFallback
+        ? (float)[defaults doubleForKey:kBVNPointerShadowOpacityKey]
+        : 1.0f;
+    self.guestCursorView.layer.shadowRadius = self.guestCursorUsesFallback
+        ? MAX(0.5, thickness * 0.75) : 2.0;
+
     const CGFloat haloInset = MAX(1.0, thickness);
     self.cursorHaloView.frame = CGRectMake(-haloInset, -haloInset,
                                            size + haloInset * 2.0,
@@ -619,6 +629,13 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.cursorDotView.layer.cornerRadius = dotSize / 2.0;
     self.cursorDotView.hidden =
         ![defaults boolForKey:kBVNPointerInnerCircleKey];
+
+    // Fallback pixels bake the outline into the image, so regenerate them
+    // when the appearance sliders move. A real Wine bitmap is left untouched.
+    if (self.guestCursorView != nil && self.guestCursorUsesFallback) {
+        self.appliedGuestCursorRevision = UINT64_MAX;
+        [self applyGuestCursorState];
+    }
 }
 
 - (void)pointerSettingChanged:(UIControl*)sender {
@@ -1504,6 +1521,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (UIImage*)outlinedGuestCursorSymbolNamed:(NSString*)name {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    const CGFloat outlineOpacity =
+        [defaults doubleForKey:kBVNPointerOutlineOpacityKey];
+    const CGFloat thickness = MAX(
+        0.5, [defaults doubleForKey:kBVNPointerThicknessKey] * 0.5);
     UIImageSymbolConfiguration* configuration =
         [UIImageSymbolConfiguration configurationWithPointSize:20.0
                                                         weight:UIImageSymbolWeightBold];
@@ -1512,7 +1534,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     if (source == nil) {
         return nil;
     }
-    UIImage* black = [source imageWithTintColor:UIColor.blackColor
+    UIImage* black = [source imageWithTintColor:
+        [UIColor colorWithWhite:0.0 alpha:outlineOpacity]
                                   renderingMode:UIImageRenderingModeAlwaysOriginal];
     UIImage* white = [source imageWithTintColor:UIColor.whiteColor
                                   renderingMode:UIImageRenderingModeAlwaysOriginal];
@@ -1524,8 +1547,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                        (size.height - source.size.height) / 2.0,
                                        source.size.width, source.size.height);
         const CGPoint offsets[] = {
-            {-1.5, 0.0}, {1.5, 0.0}, {0.0, -1.5}, {0.0, 1.5},
-            {-1.0, -1.0}, {1.0, -1.0}, {-1.0, 1.0}, {1.0, 1.0},
+            {-thickness, 0.0}, {thickness, 0.0},
+            {0.0, -thickness}, {0.0, thickness},
+            {-thickness * 0.7, -thickness * 0.7},
+            {thickness * 0.7, -thickness * 0.7},
+            {-thickness * 0.7, thickness * 0.7},
+            {thickness * 0.7, thickness * 0.7},
         };
         for (const CGPoint offset : offsets) {
             [black drawInRect:CGRectOffset(base, offset.x, offset.y)];
@@ -1535,6 +1562,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (UIImage*)fallbackGuestCursorImageForShape:(int)shape {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    const CGFloat outlineOpacity =
+        [defaults doubleForKey:kBVNPointerOutlineOpacityKey];
+    const CGFloat outlineWidth = MAX(
+        0.5, [defaults doubleForKey:kBVNPointerThicknessKey]);
     // Draw the default arrow ourselves. SF Symbols' cursorarrow is a solid
     // white glyph with no Windows-style black outline, so it vanishes on a
     // white game screen even though its hotspot is correct.
@@ -1552,11 +1584,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
             [arrow addLineToPoint:CGPointMake(22.0, 15.0)];
             [arrow closePath];
             arrow.lineJoinStyle = kCGLineJoinRound;
-            arrow.lineWidth = 3.0;
-            [UIColor.blackColor setStroke];
-            [arrow stroke];
+            arrow.lineWidth = outlineWidth;
             [UIColor.whiteColor setFill];
             [arrow fill];
+            [[UIColor colorWithWhite:0.0 alpha:outlineOpacity] setStroke];
+            [arrow stroke];
         }];
     }
     NSString* symbolName = @"cursorarrow";
@@ -1594,11 +1626,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         [arrow addLineToPoint:CGPointMake(13.0, 16.0)];
         [arrow addLineToPoint:CGPointMake(22.0, 15.0)];
         [arrow closePath];
-        arrow.lineWidth = 3.0;
-        [UIColor.blackColor setStroke];
-        [arrow stroke];
+        arrow.lineWidth = outlineWidth;
         [UIColor.whiteColor setFill];
         [arrow fill];
+        [[UIColor colorWithWhite:0.0 alpha:outlineOpacity] setStroke];
+        [arrow stroke];
     }];
 }
 
@@ -1623,6 +1655,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     }
 
     UIImage* image = nil;
+    self.guestCursorUsesFallback = NO;
     if (hasBitmap) {
         NSData* data = [NSData dataWithBytes:bitmap.pixels.data()
                                       length:bitmap.pixels.size()];
@@ -1645,6 +1678,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         self.guestCursorPixelSize = CGSizeMake(bitmap.width, bitmap.height);
     }
     if (image == nil) {
+        self.guestCursorUsesFallback = YES;
         const int shape =
             gSelectedGuestCursorShape.load(std::memory_order_relaxed);
         image = [self fallbackGuestCursorImageForShape:
@@ -1663,6 +1697,14 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.guestCursorView.image = image;
     self.guestCursorVisible =
         gSelectedGuestCursorVisible.load(std::memory_order_relaxed);
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    const CGFloat thickness =
+        [defaults doubleForKey:kBVNPointerThicknessKey];
+    self.guestCursorView.layer.shadowOpacity = self.guestCursorUsesFallback
+        ? (float)[defaults doubleForKey:kBVNPointerShadowOpacityKey]
+        : 1.0f;
+    self.guestCursorView.layer.shadowRadius = self.guestCursorUsesFallback
+        ? MAX(0.5, thickness * 0.75) : 2.0;
 }
 
 - (CGPoint)overlayPointForGuestPoint:(CGPoint)point {
@@ -1711,12 +1753,16 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.guestCursorView.hidden = !self.guestCursorMode ||
                                   self.guestCursorView.image == nil;
     if (!self.guestCursorView.hidden) {
+        NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+        const CGFloat guestScale = self.guestCursorUsesFallback
+            ? MAX(0.5, [defaults doubleForKey:kBVNPointerSizeKey] / 22.0)
+            : 1.0;
         const CGPoint topLeftGuest = CGPointMake(
-            self.cursorGuestPoint.x - self.guestCursorHotspot.x,
-            self.cursorGuestPoint.y - self.guestCursorHotspot.y);
+            self.cursorGuestPoint.x - self.guestCursorHotspot.x * guestScale,
+            self.cursorGuestPoint.y - self.guestCursorHotspot.y * guestScale);
         const CGPoint bottomRightGuest = CGPointMake(
-            topLeftGuest.x + self.guestCursorPixelSize.width,
-            topLeftGuest.y + self.guestCursorPixelSize.height);
+            topLeftGuest.x + self.guestCursorPixelSize.width * guestScale,
+            topLeftGuest.y + self.guestCursorPixelSize.height * guestScale);
         const CGPoint topLeft = [self overlayPointForGuestPoint:topLeftGuest];
         const CGPoint bottomRight =
             [self overlayPointForGuestPoint:bottomRightGuest];

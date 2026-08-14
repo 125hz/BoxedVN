@@ -13,11 +13,13 @@ struct WineContainer: Codable, Identifiable, Hashable {
     var width: UInt32
     var height: UInt32
     var sharedDriveLetter: String
+    var showWindowsPrograms: Bool
     var createdAt: Date
 
     init(id: String, name: String, windowsVersion: String = "win10",
          renderer: String = "automatic", width: UInt32 = 800,
          height: UInt32 = 600, sharedDriveLetter: String = "e",
+         showWindowsPrograms: Bool = false,
          createdAt: Date = Date()) {
         self.id = id
         self.name = name
@@ -26,6 +28,7 @@ struct WineContainer: Codable, Identifiable, Hashable {
         self.width = width
         self.height = height
         self.sharedDriveLetter = sharedDriveLetter
+        self.showWindowsPrograms = showWindowsPrograms
         self.createdAt = createdAt
     }
 
@@ -43,6 +46,8 @@ struct WineContainer: Codable, Identifiable, Hashable {
         height = try values.decodeIfPresent(UInt32.self, forKey: .height) ?? 600
         sharedDriveLetter = try values.decodeIfPresent(
             String.self, forKey: .sharedDriveLetter) ?? "e"
+        showWindowsPrograms = try values.decodeIfPresent(
+            Bool.self, forKey: .showWindowsPrograms) ?? false
         createdAt = try values.decodeIfPresent(
             Date.self, forKey: .createdAt) ?? Date()
     }
@@ -157,46 +162,6 @@ enum ContainerLibrary {
             container.prefixName, isDirectory: true)
     }
 
-    /// Installs small, redistributable desktop helpers into this prefix. The
-    /// Wine Mono runtime itself is not bundled: the user places Wine's official
-    /// MSI in D:, then launches this entry from Wine's Start menu. Keeping the
-    /// helper inside each prefix is important because Wine Mono is installed
-    /// per prefix, just like Windows software.
-    static func prepareDesktopTools(for container: WineContainer) throws {
-        guard let prefix = prefixRoot(for: container) else {
-            throw ContainerLibraryError.storageUnavailable
-        }
-        let tools = prefix.appendingPathComponent(
-            "home/username/.wine/drive_c/users/username/Start Menu/Programs/BoxedVN",
-            isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: tools, withIntermediateDirectories: true)
-        let installer = tools.appendingPathComponent("Install Wine Mono.bat")
-        let script = #"""
-        @echo off
-        setlocal
-        set "MONO_MSI="
-        if exist "D:\wine-mono.msi" set "MONO_MSI=D:\wine-mono.msi"
-        for %%F in ("D:\wine-mono-*-x86.msi") do if exist "%%~fF" set "MONO_MSI=%%~fF"
-        if defined MONO_MSI goto install
-        echo Copy the official wine-mono-*-x86.msi into this container's Files folder, then run this Start menu item again.
-        start "" winefile.exe "D:\"
-        pause
-        exit /b 1
-        :install
-        echo Installing %MONO_MSI% into this Wine container...
-        msiexec.exe /i "%MONO_MSI%"
-        if errorlevel 1 (
-          echo Wine Mono setup did not complete successfully.
-          pause
-          exit /b 1
-        )
-        echo Wine Mono is installed. Restart the desktop before launching the application that needs it.
-        pause
-        """#
-        try Data(script.utf8).write(to: installer, options: .atomic)
-    }
-
     static func programs(in container: WineContainer) -> [ContainerProgram] {
         var programs = Executables.discover(in: filesDirectory(for: container))
             .map { ContainerProgram(drive: "d", root: filesDirectory(for: container),
@@ -207,6 +172,13 @@ enum ContainerLibrary {
                                         isDirectory: true)
             if FileManager.default.fileExists(atPath: driveC.path) {
                 programs += Executables.discover(in: driveC)
+                    .filter { executable in
+                        if container.showWindowsPrograms { return true }
+                        let path = executable.relativePath
+                            .replacingOccurrences(of: "\\", with: "/")
+                            .lowercased()
+                        return path != "windows" && !path.hasPrefix("windows/")
+                    }
                     .map { ContainerProgram(drive: "c", root: driveC,
                                             executable: $0) }
             }

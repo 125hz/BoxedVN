@@ -35,6 +35,12 @@ let windowsInstallerContentTypes: [UTType] = {
     }
     return [executable, .data]
 }()
+let wineMonoContentTypes: [UTType] = {
+    guard let installer = UTType(filenameExtension: "msi") else {
+        return [.data]
+    }
+    return [installer, .data]
+}()
 
 /// A UIKit import-mode picker rather than SwiftUI's `.fileImporter`.
 ///
@@ -269,6 +275,7 @@ struct ContainerDetailView: View {
     @State private var shortcutProgram: ContainerProgram?
     @State private var shortcutTitle = ""
     @State private var showingShortcutPrompt = false
+    @State private var showingMonoImporter = false
 
     private let resolutions = ["640x480", "800x600", "1024x768",
                                "1280x720", "1280x960", "1366x1024",
@@ -286,6 +293,20 @@ struct ContainerDetailView: View {
                     model.launchDesktop(container)
                 } label: {
                     Label("Open desktop", systemImage: "macwindow")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Button {
+                    save()
+                    showingMonoImporter = true
+                } label: {
+                    Label("Install Wine Mono…", systemImage: "shippingbox")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Button {
+                    save()
+                    model.launchDirect3DTest(container)
+                } label: {
+                    Label("Run Direct3D test", systemImage: "cube.transparent")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Picker("Resolution", selection: resolutionBinding) {
@@ -323,6 +344,12 @@ struct ContainerDetailView: View {
             }
 
             Section("Programs") {
+                Toggle("Show Windows system programs",
+                       isOn: $container.showWindowsPrograms)
+                    .onChange(of: container.showWindowsPrograms) { _ in
+                        save()
+                        scan()
+                    }
                 if isScanning {
                     HStack { ProgressView(); Text("Scanning C: and D:…") }
                 } else if programs.isEmpty {
@@ -369,6 +396,20 @@ struct ContainerDetailView: View {
                 }
             }
             Button("Cancel", role: .cancel) {}
+        }
+        .sheet(isPresented: $showingMonoImporter) {
+            DocumentImportPicker(
+                contentTypes: wineMonoContentTypes,
+                onResult: { result in
+                    showingMonoImporter = false
+                    switch result {
+                    case .success(let url):
+                        model.installWineMono(from: url, in: container)
+                    case .failure(let error):
+                        model.alertMessage = error.localizedDescription
+                    }
+                },
+                onCancel: { showingMonoImporter = false })
         }
     }
 
