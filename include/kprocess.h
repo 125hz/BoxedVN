@@ -403,8 +403,6 @@ public:
 #ifdef BOXEDWINE_JIT
     OpCallback startJITOp = nullptr;
     std::atomic<bool> interpreterCompatibilityActivated{false};
-    bool isAdaptiveInterpreterPage(U32 address);
-    bool activateAdaptiveInterpreterPage(U32 address);
     void* emulateSingleOp = nullptr;
 #ifdef BOXEDWINE_POSIX
     void* signalHandler = nullptr;
@@ -419,8 +417,6 @@ public:
 #ifdef BOXEDWINE_MULTI_THREADED    
     BOXEDWINE_MUTEX normalBlockMutex;
 #endif
-    BOXEDWINE_MUTEX adaptiveInterpreterPagesMutex;
-    std::unordered_set<U32> adaptiveInterpreterPages;
     BOXEDWINE_MUTEX fdsMutex;
 
     // x11 stuff

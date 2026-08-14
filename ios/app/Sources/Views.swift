@@ -394,7 +394,8 @@ struct GameDetailView: View {
     @State private var saveError: String?
 
     private let resolutions = ["default", "640x480", "800x600", "1024x576",
-                               "1280x720", "1280x960", "1920x1080"]
+                               "1280x720", "1280x960", "1366x1024",
+                               "1600x1200", "1920x1080"]
     private let renderers = ["automatic", "wined3d", "dxvk"]
 
     var body: some View {
@@ -466,9 +467,15 @@ struct GameDetailView: View {
                     .lineLimit(1...4)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-                Picker("Resolution", selection: $resolution) {
+                Picker("Virtual desktop", selection: $resolution) {
                     ForEach(resolutions, id: \.self) { Text($0) }
                 }
+                Text("Default is 1366x1024 so a 1280x960 game and its Wine "
+                     + "window decorations both fit. This is saved per game; "
+                     + "choose a larger desktop if a Windows game clips "
+                     + "controls at its right or bottom edge.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Picker("Direct3D renderer", selection: $renderer) {
                     Text("Automatic (recommended)").tag("automatic")
                     Text("WineD3D (D3D8/9 compatibility)").tag("wined3d")

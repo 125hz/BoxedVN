@@ -765,17 +765,28 @@ void XServer::setFakeFullScreenWindow(XWindowPtr wnd) {
 			savedRootSizeForFakeFullScreen = true;
 		}
 
-		// iOS presents the Vulkan client as the whole virtual desktop even
-		// while Wine keeps its decorated compositor window at a private,
-		// non-zero X11 position. Root geometry and Xlib's cached Screen must
-		// describe the same 0,0-based space. Expanding the root by the title-bar
-		// offset produced 1288x1013 beside a 1280x960 Screen, so cursor polling
-		// and button events could never agree near the bottom of the game.
+		// iOS presents the Vulkan client as the whole native picture even while
+		// Wine keeps its decorated compositor window at a private, non-zero X11
+		// position. That does NOT make the client the Windows monitor. In
+		// particular, a 1280x960 client at y=53 needs a monitor taller than 960;
+		// publishing the client size as the monitor clips Wine's hit-testing at
+		// the lower edge even though UIKit and X11 delivered the right pixel.
+		//
+		// Preserve an explicitly configured per-game desktop and expand a
+		// smaller default just enough to contain the actual client extent. Root
+		// geometry and every cached Xlib Screen still receive the same values,
+		// which retains the invariant the earlier cursor repair established.
 		S32 clientX = 0;
 		S32 clientY = 0;
 		wnd->windowToScreen(clientX, clientY);
-		const U32 rootWidth = wnd->width();
-		const U32 rootHeight = wnd->height();
+		const U32 clientRight = clientX > 0
+			? (U32)clientX + wnd->width() : wnd->width();
+		const U32 clientBottom = clientY > 0
+			? (U32)clientY + wnd->height() : wnd->height();
+		const U32 rootWidth = std::max(rootWidthBeforeFakeFullScreen,
+			clientRight);
+		const U32 rootHeight = std::max(rootHeightBeforeFakeFullScreen,
+			clientBottom);
 		if (rootWidth != root->width() || rootHeight != root->height()) {
 			root->moveResize(0, 0, rootWidth, rootHeight);
 			U32 rect[] = {0, 0, rootWidth, rootHeight};
@@ -783,13 +794,10 @@ void XServer::setFakeFullScreenWindow(XWindowPtr wnd) {
 			root->setProperty(atom, XA_CARDINAL, 32, sizeof(rect),
 				(U8*)&rect, false);
 		}
-		// Xlib caches WidthOfScreen/HeightOfScreen in every open Display.
-		// These records were created on the 800x600 Wine desktop and changing
-		// only the root XWindow leaves Wine clipping absolute cursor positions
-		// at x=800 even though the presented client and UIKit input are 1280
-		// pixels wide. The client is the native presentation coordinate space;
-		// publish its dimensions to every already-open Xlib Display as well.
-		updateDisplayScreenSize(wnd->width(), wnd->height());
+		// Xlib caches WidthOfScreen/HeightOfScreen in every open Display. Keep
+		// those records identical to the root/work area; changing only one is
+		// precisely how Wine ends up accepting hover but rejecting a click.
+		updateDisplayScreenSize(rootWidth, rootHeight);
 		klog_fmt("iOS fake-fullscreen X11 root synchronized: client 0x%x "
 			"%ux%u at %d,%d, root %ux%u (saved %ux%u)",
 			wnd->id, wnd->width(), wnd->height(), clientX, clientY,

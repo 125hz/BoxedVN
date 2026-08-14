@@ -402,7 +402,7 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
         // order, so nesting getModuleName() under the memory lock could
         // deadlock a concurrent loader thread.
         bool forceInterpreter = false;
-        bool matchedAdaptivePage = false;
+        bool matchedAnonymousExecutable = false;
         BString mappedModule;
         U32 matchedRangeStart = 0;
         U32 matchedRangeEnd = 0;
@@ -435,8 +435,7 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                 }
             }
         }
-        if (!forceInterpreter && KSystem::interpreterAnonymousExecutable &&
-            this->thread->process->isAdaptiveInterpreterPage(startIp)) {
+        if (!forceInterpreter && KSystem::interpreterAnonymousExecutable) {
             if (!mappedModule.length()) {
                 mappedModule = this->thread->process->getModuleName(startIp);
             }
@@ -447,15 +446,10 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                     mappedModule = peName;
                 } else {
                     mappedModule = B("anonymous executable memory");
+                    forceInterpreter = true;
+                    matchedAnonymousExecutable = true;
                 }
             }
-            // The watchdog selects one exact 4 KiB page only after the JIT
-            // dispatcher has returned to one EIP 65,536 consecutive times.
-            // That selected page may be V8-generated memory or a PE browser
-            // dispatch thunk such as nw.dll; mapped ELF/Wine code is excluded
-            // when the watchdog chooses a page below.
-            forceInterpreter = true;
-            matchedAdaptivePage = true;
         }
 #endif
         // Account for what a requested selection actually did. A range or
@@ -537,11 +531,10 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                              "%.8X-%.8X at %.8X; using the interpreter only "
                              "inside that range", matchedRangeStart,
                              matchedRangeEnd, startIp);
-                } else if (matchedAdaptivePage) {
-                    klog_fmt("Compatibility CPU activated for stalled page "
-                             "in %s at %.8X; interpreter remains limited to "
-                             "the selected 4 KiB page", mappedModule.c_str(),
-                             startIp);
+                } else if (matchedAnonymousExecutable) {
+                    klog_fmt("Compatibility CPU activated for anonymous "
+                             "executable memory at %.8X; mapped ELF and PE "
+                             "code remains JIT compiled", startIp);
                 } else {
                     klog_fmt("Compatibility CPU activated for %s at %.8X; "
                              "using the interpreter for this module only",
@@ -580,58 +573,6 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
 }
 
 void NormalCPU::run() {
-#ifdef BOXEDWINE_JIT
-    // Chromium/V8 generates a large amount of healthy x86 code, both in
-    // anonymous executable memory and in browser PE modules. Interpreting all
-    // of it fixed one stale-JIT loop but made an RPG Maker game progressively
-    // crawl. Keep it on the JIT unless the dispatcher returns to exactly the
-    // same guest instruction often enough to prove it is making no forward
-    // progress; then demote only that 4 KiB page. Legitimate frame loops visit
-    // many block entries and reset this counter naturally. ELF/Wine pages are
-    // deliberately ineligible so a normal syscall/poll loop cannot trip this
-    // browser compatibility policy.
-    if (KSystem::interpreterAnonymousExecutable) {
-        constexpr U32 kAdaptiveStallDispatches = 65536;
-        const U32 dispatchEip = getEipAddress();
-        if (dispatchEip == adaptiveWatchdogEip) {
-            if (adaptiveWatchdogRepeats < kAdaptiveStallDispatches) {
-                ++adaptiveWatchdogRepeats;
-            }
-        } else {
-            adaptiveWatchdogEip = dispatchEip;
-            adaptiveWatchdogRepeats = 1;
-        }
-        if (adaptiveWatchdogRepeats == kAdaptiveStallDispatches) {
-            if (!thread->process->isAdaptiveInterpreterPage(dispatchEip)) {
-                BString module = thread->process->getModuleName(dispatchEip);
-                // Unix/ELF mappings resolve to their path. PE mappings and
-                // anonymous executable memory both resolve as Unknown here;
-                // identify a PE for the log, but permit either kind.
-                if (module == "Unknown" &&
-                    thread->process->activateAdaptiveInterpreterPage(dispatchEip)) {
-                    const BString peName =
-                        thread->process->getPeImageName(dispatchEip);
-                    const BString source = peName.length()
-                        ? peName : B("anonymous executable memory");
-                    const U32 page = dispatchEip & ~(K_PAGE_SIZE - 1);
-                    klog_fmt("Browser JIT forward-progress watchdog activated "
-                             "in %s at %.8X after %u identical dispatches; "
-                             "interpreter limited to page %.8X-%.8X",
-                             source.c_str(), dispatchEip,
-                             kAdaptiveStallDispatches, page,
-                             page + K_PAGE_SIZE);
-                    // Do not carry a pointer into the cache generation that is
-                    // about to be retired. The next lookup decodes this page
-                    // with OP_FLAG_NO_JIT while unrelated V8 pages remain
-                    // compiled.
-                    nextOp = nullptr;
-                    memory->removeCode(thread, page, K_PAGE_SIZE, false);
-                }
-            }
-            adaptiveWatchdogRepeats = 0;
-        }
-    }
-#endif
 #ifdef BOXEDWINE_MULTI_THREADED
     // Publish a coherent-enough, read-only heartbeat for the iOS first-frame
     // watchdog. These fields deliberately do not expose live CPU storage to a

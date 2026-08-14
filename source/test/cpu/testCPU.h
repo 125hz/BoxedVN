@@ -49,7 +49,6 @@ void testFail(const char* msg, ...);
 void testRunParallel(const TestEntry* entries, size_t entryCount, U32 workerCount = 0);
 void testJitSignalPendingReset();
 void testJitSignalPendingQueuedSignal();
-void testAdaptiveInterpreterPageSelection();
 void testX87ExceptionSummaryState();
 void testDefaultUserSegmentsUseGdtSelectors();
 void testSignalHandlerSegmentsUseGdtSelectors();

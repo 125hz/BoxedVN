@@ -231,9 +231,13 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
     // otherwise goes through Boxedwine's JIT as a second JIT tier; the device
     // hang snapshot showed the browser main thread spending 97.7% of a core
     // in exactly such a block while Blink's decoded-image callback stopped.
-    // Keep Wine, every PE/ELF module and healthy V8 code JIT compiled. The
-    // core watches generated anonymous code and demotes only a page whose JIT
-    // repeatedly returns to the same guest instruction without progress.
+    // Build 124 proved the renderer completes this path when generated code
+    // uses the decoded interpreter. Builds 125-126 tried to retain JIT for
+    // most V8 pages and detect only a repeated EIP; both regressed to the
+    // title-only stall without ever triggering, because this failure stops
+    // forward progress without staying at one dispatcher entry. Keep Wine
+    // and every mapped PE/ELF module JIT compiled, but interpret V8's
+    // anonymous executable heaps consistently.
     launch.interpretAnonymousExecutable = true;
 
     result.applied = merged.added > 0 || merged.mergedFeatures;
@@ -241,8 +245,8 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
         "): a browser engine draws through Windows facilities Wine only "
         "partly implements, so BoxedVN passes Chromium's own switches for "
         "the sandbox, the GPU process, DirectComposition, occlusion and "
-        "window sizing, and watches anonymous browser code for a stalled "
-        "JIT page. ";
+        "window sizing, and decodes anonymous browser-generated code while "
+        "mapped Wine and browser modules remain JIT compiled. ";
 
     char detail[224];
     snprintf(detail, sizeof(detail),
@@ -395,16 +399,17 @@ std::vector<std::string> BVNBuildLaunchArguments(
         // absolute pointer positions back through that stale monitor, so an
         // otherwise-correct x=1218 arrives at the Windows game near x=761.
         //
-        // Start generic game sessions on a coherent 1280x960 virtual monitor.
-        // Wine caches Windows monitor geometry before a game creates its
-        // rendering client. A 1280x720 desktop still failed for 1280x960
-        // visual novels: their visible client extended below the cached
-        // monitor and Windows pointer conversion rejected or compressed the
-        // otherwise-correct lower-screen coordinates. 1280x960 contains both
-        // common 1280-wide 16:9 clients and 4:3 clients without guessing a
-        // title. A user-selected resolution remains authoritative.
+        // Start generic game sessions on a coherent 1366x1024 virtual
+        // monitor. Wine caches Windows monitor geometry before a game creates
+        // its rendering client. A monitor equal to a 1280x960 client is still
+        // too small for the real decorated window (the measured Fate client
+        // begins at y=53 and ends at y=1013), so Wine rejects lower-screen
+        // input after BoxedVN has delivered it correctly. This desktop
+        // contains common 1280-wide 16:9 and 4:3 windows plus ordinary Wine
+        // decorations. A user-selected per-game resolution remains
+        // authoritative.
         argv.push_back("-resolution");
-        argv.push_back("1280x960");
+        argv.push_back("1366x1024");
     }
     if (launch.bitsPerPixel == 16 || launch.bitsPerPixel == 32) {
         argv.push_back("-bpp");

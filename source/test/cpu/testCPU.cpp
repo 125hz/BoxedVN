@@ -1282,27 +1282,4 @@ void testJitSignalPendingQueuedSignal() {
 #endif
 }
 
-void testAdaptiveInterpreterPageSelection() {
-#ifdef BOXEDWINE_JIT
-    KProcessPtr process = KProcess::create();
-    constexpr U32 selected = 0x38A62833;
-    if (process->isAdaptiveInterpreterPage(selected)) {
-        testFail("adaptive interpreter page selected before activation");
-    }
-    if (!process->activateAdaptiveInterpreterPage(selected)) {
-        testFail("adaptive interpreter page first activation failed");
-    }
-    if (!process->isAdaptiveInterpreterPage(selected) ||
-        !process->isAdaptiveInterpreterPage(selected & ~(K_PAGE_SIZE - 1))) {
-        testFail("adaptive interpreter page did not cover its whole page");
-    }
-    if (process->isAdaptiveInterpreterPage(selected + K_PAGE_SIZE)) {
-        testFail("adaptive interpreter page leaked into adjacent page");
-    }
-    if (process->activateAdaptiveInterpreterPage(selected)) {
-        testFail("adaptive interpreter page duplicate activation succeeded");
-    }
-#endif
-}
-
 #endif

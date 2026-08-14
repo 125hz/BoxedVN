@@ -1,5 +1,43 @@
 # BoxedVN — Progress and Handoff
 
+## Build 127: preserve the Windows monitor and restore reliable browser execution
+
+The Build-126 Fate log proves BoxedVN now delivers the failed lower-screen
+taps: guest `(883,782)` becomes physical root `(891,835)`, reaches the Wine
+top-level window as local `(886,830)`, and carries the correct pre-event
+button state. The remaining contradiction is monitor containment. Fate's
+1280x960 client begins at X11 root `(8,53)`, so it ends at y=1013, but
+fake-fullscreen was replacing both the root and every cached Xlib `Screen`
+with 1280x960. Wine therefore clipped Windows hit-testing below the monitor
+even though the input pipeline had delivered the right coordinate.
+
+The fake-fullscreen core now keeps an explicitly configured virtual desktop
+and expands a smaller one enough to contain the real client extent; root,
+work area and every live Xlib `Screen` receive that one authoritative size.
+Default imported games start on 1366x1024, which contains the measured
+1280x960 client plus ordinary Wine decoration. The game detail screen calls
+this setting **Virtual desktop**, adds 1366x1024 and 1600x1200 choices, and
+continues to save it per game. Vulkan presentation still displays only the
+game client, so the larger monitor does not add bars to Fate's picture.
+
+The Summer log also falsifies Build 126's adaptive recovery. The browser
+reaches `Scene_Map`, reports image readiness true, then its heartbeat stops
+without ever repeating one dispatcher EIP enough to activate the page
+watchdog. The `purged` title bitmap is not the cause: the working Build-124
+run reported the same cache state while advancing through Options and into
+the game. What differs is execution policy. Build 124 decoded anonymous V8
+heaps and kept running; Builds 125-126 JIT-compiled them and both stopped at
+the title. Build 127 restores the engine-wide, title-independent policy that
+is actually device-proven: anonymous browser-generated x86 uses the decoded
+interpreter, while Wine and all mapped ELF/PE browser modules remain on the
+ARM64 JIT. This prioritizes correct execution; its measured frame-rate cost
+remains an open core-optimizer task rather than being hidden behind a page
+watchdog that never fires.
+
+The Windows host-independent suite passes 169/169. Objective-C++, X11 and
+ARM64 compilation remains the iPhoneOS CI gate; neither physical-device
+outcome is claimed from compilation.
+
 ## Build 126: complete X11 clicks and recover mapped browser stalls
 
 The Build-125 Fate log closes an important branch of the input investigation:

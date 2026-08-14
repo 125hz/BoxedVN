@@ -312,9 +312,10 @@ final class AppModel: ObservableObject {
     /// Notepad also runs in, so a file saved from one is visible in the other.
     /// Games keep their own prefixes - see `launch(_:)` for why.
     ///
-    /// Keep the shared Wine desktop at 1280x720. Imported games use the same
-    /// default virtual-monitor size, while an older non-DPI-aware game can
-    /// explicitly select 1024x576 in its own launch settings.
+    /// Keep the shared file-browser desktop at 1280x720. Imported games use a
+    /// 1366x1024 default virtual monitor so their decorations fit too, while
+    /// an older non-DPI-aware game can explicitly select a different desktop
+    /// in its own launch settings.
     ///
     /// Two builds tried to run this inside Wine's virtual desktop
     /// (`explorer /desktop=shell,1280x720`) so it would look like Windows.
