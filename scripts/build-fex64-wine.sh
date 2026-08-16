@@ -84,6 +84,14 @@ fi
 print_tool_versions
 log "Wine at $(git -C "${SOURCE}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+require_mingw() {
+    [[ -x "${MINGW}/bin/aarch64-w64-mingw32-clang" ]] || die \
+"llvm-mingw is missing at '${MINGW}'.
+Run scripts/build-fex64-toolchains.sh --stage llvm-mingw first. Wine builds
+its DLLs as PE binaries whatever the host, so no configuration here avoids
+needing it."
+}
+
 # Wine refuses to configure in its source directory, and both trees have to
 # coexist anyway.
 build_tree() {
@@ -131,13 +139,18 @@ for tree in ${TREES}; do
         macos)
             # Host build. --enable-win64 because the guest is x86-64 and the
             # generated headers have to describe a 64-bit world.
-            build_tree macos --enable-win64 "${COMMON_CONFIGURE[@]}"
+            #
+            # This still needs llvm-mingw. Wine 11 builds its DLLs as PE
+            # binaries on every host, so a cross-compiler is not optional even
+            # for a tree whose only purpose is generating headers - configure
+            # refuses outright without one.
+            require_mingw
+            PATH="${MINGW}/bin:${PATH}" \
+                build_tree macos --enable-win64 --with-mingw \
+                    "${COMMON_CONFIGURE[@]}"
             ;;
         arm64ec)
-            [[ -x "${MINGW}/bin/aarch64-w64-mingw32-clang" ]] || die \
-"llvm-mingw is missing at '${MINGW}'.
-Run scripts/build-fex64-toolchains.sh --stage llvm-mingw first: the ARM64EC
-tree is a PE build and there is no other compiler here that can produce one."
+            require_mingw
 
             # ARM64EC is what makes the whole stack work: the Windows side is
             # ARM64 code that keeps the x86-64 ABI, so a call can cross between
