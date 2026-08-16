@@ -7,6 +7,7 @@
 //  that would imply otherwise.
 
 import SwiftUI
+import UIKit
 
 @main
 struct BoxedVNFexApp: App {
@@ -24,6 +25,7 @@ struct ProbeView: View {
     @State private var pool: (bytes: Int, used: Int)?
     @State private var step = ""
     @State private var stepSeconds = 0.0
+    @State private var copied = false
 
     // The steps that talk to StikDebug cannot be cancelled and can wait
     // forever, so the interface polls instead of waiting for a return value.
@@ -94,8 +96,17 @@ struct ProbeView: View {
             .navigationTitle("BoxedVN fex64")
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
-                    ShareLink(item: report.isEmpty ? "no report yet" : report)
-                        .disabled(report.isEmpty)
+                    // A share sheet is a poor fit for a report you most want
+                    // while something is stuck; the copy is one tap and cannot
+                    // fail to present.
+                    Button {
+                        UIPasteboard.general.string = report
+                        copied = true
+                    } label: {
+                        Label(copied ? "Copied" : "Copy report",
+                              systemImage: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .disabled(report.isEmpty)
                 }
             }
         }
@@ -105,6 +116,7 @@ struct ProbeView: View {
             step = String(cString: BVNFexCurrentStep())
             stepSeconds = BVNFexCurrentStepSeconds()
             report = String(cString: BVNFexReport())
+            copied = false
         }
     }
 

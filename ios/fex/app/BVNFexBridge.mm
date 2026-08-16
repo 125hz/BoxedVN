@@ -13,14 +13,17 @@
 #include "BVNExecMemory.h"
 #include "BVNRuntime.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/DualMap.h>
+#include <FEXCore/Utils/LogManager.h>
 
 #include <libkern/OSCacheControl.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 
 #include <atomic>
 #include <ctime>
@@ -179,6 +182,57 @@ int munmapHook(void* address, size_t length) {
         return 0;
     }
     return munmap(address, length);
+}
+
+// FEX's own diagnostics. Without these it fails silently: everything it would
+// have said about a bad configuration goes nowhere, which is most of why the
+// first stall here was unreadable.
+void fexMessage(LogMan::DebugLevels level, const char* message) {
+    reportf("FEX[%u]: %s", (unsigned)level, message);
+}
+
+void fexThrow(const char* message) {
+    reportf("FEX threw: %s", message);
+}
+
+// FEX cannot probe the host on iOS the way it does on Linux, so these are
+// stated. Everything here is true of every Apple core this can run on - A12
+// and later are ARMv8.3 or better, and the deployment target already excludes
+// anything older - except the vector extensions, which Apple does not
+// implement and which must be off or the translator emits SVE it cannot run.
+FEXCore::HostFeatures hostFeatures() {
+    FEXCore::HostFeatures features {};
+
+    features.DCacheLineSize = 64;
+    features.ICacheLineSize = 64;
+    features.SupportsCacheMaintenanceOps = true;
+
+    features.SupportsAES = true;
+    features.SupportsCRC = true;
+    features.SupportsSHA = true;
+    features.SupportsPMULL_128Bit = true;
+
+    features.SupportsAtomics = true;   // ARMv8.1 LSE
+    features.SupportsRCPC = true;      // ARMv8.3
+    features.SupportsTSOImm9 = true;   // ARMv8.4 RCPC2
+    features.SupportsFCMA = true;
+    features.SupportsFlagM = true;
+    features.SupportsFlagM2 = true;
+
+    features.SupportsAVX = false;
+    features.SupportsSVE128 = false;
+    features.SupportsSVE256 = false;
+
+    // An empty MIDR list means "no cores" to code that iterates it. Take the
+    // real count rather than assuming a core layout that changes every year.
+    int cores = 0;
+    size_t length = sizeof(cores);
+    if (sysctlbyname("hw.ncpu", &cores, &length, nullptr, 0) != 0 || cores <= 0) {
+        cores = 4;
+    }
+    features.CPUMIDRs.resize((size_t)cores, 0x611F0000);
+
+    return features;
 }
 
 bool prepareArena() {
@@ -354,12 +408,29 @@ extern "C" BVNFexStage BVNFexProbe(void) {
     }
 
     if (g_stage.load() < BVNFexStageContextCreated) {
-        // Everything above this line is BoxedVN's own code and is understood.
-        // This is the first call into FEX, and it is also what forces the
-        // translator's archives to be linked at all - a probe that only
-        // touched our own arena would prove nothing about them.
+        {
+            // Install these before anything else touches FEX. Without them
+            // everything FEX would say about a bad configuration goes nowhere,
+            // which is most of why the first stall here was unreadable.
+            Step step("installing FEX log handlers");
+            LogMan::Msg::InstallHandler(fexMessage);
+            LogMan::Throw::InstallHandler(fexThrow);
+        }
+
+        {
+            // Creating a context without this stops dead rather than failing:
+            // the configuration subsystem has to exist before anything reads a
+            // value out of it, and the guest is x86-64, which is not the
+            // default.
+            Step step("initialising FEX configuration");
+            FEXCore::Config::Initialize();
+            FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE, "1");
+            reportf("FEX configuration initialised, 64-bit guest");
+        }
+
         Step step("creating a FEXCore context");
-        FEXCore::HostFeatures features {};
+        FEXCore::HostFeatures features = hostFeatures();
+        reportf("host features stated for %zu cores", features.CPUMIDRs.size());
         auto context = FEXCore::Context::Context::CreateNewContext(features);
         if (!context) {
             reportf("FEXCore refused to create a context");
