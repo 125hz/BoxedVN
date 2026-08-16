@@ -84,8 +84,13 @@ log "source at $(git -C "${SOURCE}" rev-parse HEAD 2>/dev/null || echo unknown)"
 # static libraries that are about to be linked again by Xcode; ccache is off
 # because CI caches the build directory instead. BUILD_TESTING pulls in Catch2
 # and the unit tests, none of which can run on a device from here.
+# CMAKE_SYSTEM_PROCESSOR has to be stated. CMake leaves it empty when it is
+# cross-compiling and the toolchain did not set it, and FEX selects its entire
+# architecture backend from that one string - so an empty value is not a
+# missing optimisation, it is "Unsupported processor type" and no build at all.
 cmake -S "${SOURCE}" -B "${BUILD}" -G Ninja \
     -DCMAKE_SYSTEM_NAME=iOS \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
     -DCMAKE_OSX_SYSROOT="${IPHONEOS_SDK}" \
