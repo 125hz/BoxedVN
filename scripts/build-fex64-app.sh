@@ -106,6 +106,9 @@ WINE_RESOURCE_STAGING="${BOXEDVN_ROOT}/ios/fex/runtime"
 if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
     [[ -n "${WINE_CORE_DIR}" && -n "${WINE_RUNTIME_DIR}" && -n "${MYTHIC_DIR}" ]] || die \
 "Wine-enabled builds require --wine-core-dir, --wine-runtime-dir and --mythic-dir together."
+    WINE_CORE_DIR="$(cd "${WINE_CORE_DIR}" && pwd)"
+    WINE_RUNTIME_DIR="$(cd "${WINE_RUNTIME_DIR}" && pwd)"
+    MYTHIC_DIR="$(cd "${MYTHIC_DIR}" && pwd)"
     require_file "${WINE_CORE_DIR}/lib/libntdll_unix.a"
     require_file "${WINE_CORE_DIR}/lib/libwineserver.a"
     require_file "${WINE_RUNTIME_DIR}/aarch64-windows/wineboot.exe"
