@@ -23,6 +23,7 @@ on:
         options:
           - pins
           - fex
+          - app
           - toolchains
       force_rebuild:
         description: Ignore the toolchain cache and rebuild from scratch
@@ -40,6 +41,10 @@ on:
       - scripts/fetch-fex64-dependencies.sh
       - scripts/build-fex64-toolchains.sh
       - scripts/build-fex64-fex.sh
+      - scripts/build-fex64-app.sh
+      - ios/fex/**
+      - ios/project.yml
+      - patches/**
   pull_request:
     branches:
       - fex64
@@ -136,6 +141,56 @@ jobs:
           path: third_party/fex64/fex-ios
           retention-days: 14
           if-no-files-found: error
+
+  app:
+    name: fex64 app and unsigned IPA
+    needs: fex
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.stage == 'app'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh .github/*.sh
+
+      - name: Fetch FEX
+        run: scripts/fetch-fex64-dependencies.sh --component fex
+
+      # XcodeGen only; the emulator's dependencies are not needed to build this
+      # target, and fetching them would add MoltenVK and SDL to a job that
+      # links neither.
+      - name: Restore third-party cache
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: fex64-app-${{ runner.os }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh') }}
+          restore-keys: fex64-app-${{ runner.os }}-
+
+      - name: Fetch XcodeGen
+        run: scripts/fetch-dependencies.sh --platform ios --configuration Release || true
+
+      - name: Build the app and package the IPA
+        run: scripts/build-fex64-app.sh --configuration Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex64-unsigned-ipa
+          path: build/fex64-Release/artifacts
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish the build log when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex64-app-xcodebuild-log
+          path: build/fex64-Release/xcodebuild.log
+          if-no-files-found: ignore
 
   toolchains:
     name: Cross toolchains for iphoneos

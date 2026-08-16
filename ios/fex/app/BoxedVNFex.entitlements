@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The translator's pool is 64 MiB of a much larger arena, and a real
+	     guest will want gigabytes. Requested here; a sideloader has to sign it
+	     against an App ID that actually has the capability. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<!-- Present for completeness. On iOS 26/27 it does not by itself make a
+	     page executable; StikDebug preparing the arena is what does. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

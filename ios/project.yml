@@ -142,11 +142,82 @@ targets:
       - sdk: libc++.tbd
       - sdk: libiconv.tbd
 
+  # The fex64 stack: a second application, not a mode of the first. It shares
+  # no runtime with the emulator - different CPU, different Windows layer,
+  # different graphics path - and the one thing it does share, the executable
+  # arena, it compiles from the same sources rather than copying.
+  #
+  # Its archives come from scripts/build-fex64-fex.sh, which is a separate
+  # build from CMake's; BVN_FEX_LIBRARY_DIR and BVN_FEX_INCLUDE_DIR are passed
+  # in by scripts/build-fex64-app.sh.
+  BoxedVNFex:
+    type: application
+    platform: iOS
+    sources:
+      - path: fex/app
+      - path: runtime/src/BVNExecMemory.cpp
+      - path: runtime/src/BVNJitArenaPlan.cpp
+      - path: runtime/src/BVNRangeAllocator.cpp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.boxedwine.boxedvn.fex
+        PRODUCT_NAME: BoxedVNFex
+        INFOPLIST_FILE: fex/app/Info.plist
+        CODE_SIGN_ENTITLEMENTS: fex/app/BoxedVNFex.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: fex/app/BoxedVNFex-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/runtime/include
+          - $(SRCROOT)/runtime/src
+          - $(BVN_FEX_INCLUDE_DIR)
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(BVN_FEX_LIBRARY_DIR)
+        # FEXCore is C++20 and its headers are included directly here.
+        CLANG_CXX_LANGUAGE_STANDARD: "c++20"
+        CLANG_CXX_LIBRARY: "libc++"
+        OTHER_LDFLAGS:
+          - $(inherited)
+          # Order matters for static archives: FEXCore first, then what it
+          # draws on.
+          - -lFEXCore
+          - -lFEXCore_Base
+          - -lJemallocLibs
+          - -lfmt
+          - -lxxhash
+          - -lsoftfloat_3e
+          - -lcephes_128bit
+          - -lc++
+        CLANG_ENABLE_MODULES: YES
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        DEVELOPMENT_TEAM: ""
+        PROVISIONING_PROFILE_SPECIFIER: ""
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+    dependencies:
+      - sdk: Foundation.framework
+      - sdk: UIKit.framework
+      - sdk: libc++.tbd
+
 schemes:
   BoxedVN:
     build:
       targets:
         BoxedVN: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  BoxedVNFex:
+    build:
+      targets:
+        BoxedVNFex: all
     run:
       config: Debug
     archive:
