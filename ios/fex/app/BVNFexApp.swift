@@ -22,6 +22,12 @@ struct ProbeView: View {
     @State private var report = ""
     @State private var running = false
     @State private var pool: (bytes: Int, used: Int)?
+    @State private var step = ""
+    @State private var stepSeconds = 0.0
+
+    // The steps that talk to StikDebug cannot be cancelled and can wait
+    // forever, so the interface polls instead of waiting for a return value.
+    private let tick = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
@@ -50,6 +56,26 @@ struct ProbeView: View {
                         }
                     }
                     .disabled(running)
+
+                    if running && !step.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(step)
+                                .font(.footnote)
+                            Text(String(format: "%.0fs", stepSeconds))
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    // Naming the deadline matters more than enforcing one:
+                    // nothing here can interrupt a debugger request, so the
+                    // useful thing is to say which step is stuck and why.
+                    if running && stepSeconds > 15 {
+                        Text("This step has not returned. StikDebug asks the debugger to prepare every page and waits; if its session ended, relaunch through StikDebug and try again.")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
                 } footer: {
                     // Executing generated code is the one step that can take
                     // the process down with no recovery, so it stays behind a
@@ -74,6 +100,12 @@ struct ProbeView: View {
             }
         }
         .onAppear(perform: refresh)
+        .onReceive(tick) { _ in
+            guard running else { return }
+            step = String(cString: BVNFexCurrentStep())
+            stepSeconds = BVNFexCurrentStepSeconds()
+            report = String(cString: BVNFexReport())
+        }
     }
 
     private func run() {
@@ -85,6 +117,8 @@ struct ProbeView: View {
             DispatchQueue.main.async {
                 stage = reached
                 running = false
+                step = ""
+                stepSeconds = 0
                 refresh()
             }
         }

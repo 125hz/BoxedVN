@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 
 #include <atomic>
+#include <ctime>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -72,13 +73,41 @@ constexpr size_t kMinimumPoolBytes = 4u * 1024u * 1024u;
 // with that or the last page is half-owned.
 constexpr size_t kPageBytes = 0x4000;
 
-std::mutex g_mutex;
-BVNFexStage g_stage = BVNFexStageIdle;
+// Two locks, not one. g_probeMutex serialises BVNFexProbe and is held for its
+// whole duration, including the steps that can block indefinitely; anything an
+// interface polls must therefore never touch it, or observing a hang would
+// join it.
+std::mutex g_probeMutex;
+std::mutex g_reportMutex;
+std::atomic<BVNFexStage> g_stage {BVNFexStageIdle};
 std::string g_report;
+
+// Read without any lock, deliberately: an interface that had to take
+// g_probeMutex to ask what was happening would block on exactly the thing it
+// is trying to observe.
+std::atomic<const char*> g_step {""};
+std::atomic<double> g_stepStarted {0.0};
+
+double nowSeconds() {
+    return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9;
+}
+
+// Announces a step before entering it, so a step that never returns is still
+// named. String literals only: the pointer outlives any reader.
+struct Step {
+    explicit Step(const char* description) {
+        g_stepStarted.store(nowSeconds(), std::memory_order_relaxed);
+        g_step.store(description, std::memory_order_release);
+    }
+    ~Step() {
+        g_step.store("", std::memory_order_release);
+        g_stepStarted.store(0.0, std::memory_order_relaxed);
+    }
+};
 
 void* g_poolExecutable = nullptr;
 void* g_poolWritable = nullptr;
-size_t g_poolBytes = 0;
+std::atomic<size_t> g_poolBytes {0};
 std::atomic<size_t> g_poolUsed {0};
 
 void reportf(const char* format, ...) __attribute__((format(printf, 1, 2)));
@@ -111,7 +140,7 @@ void* poolAllocate(size_t length) {
     const size_t aligned = alignUp(length, kPageBytes);
     size_t offset = g_poolUsed.load(std::memory_order_relaxed);
     while (true) {
-        if (offset + aligned > g_poolBytes) {
+        if (offset + aligned > g_poolBytes.load(std::memory_order_relaxed)) {
             return nullptr;
         }
         if (g_poolUsed.compare_exchange_weak(offset, offset + aligned,
@@ -125,7 +154,8 @@ void* poolAllocate(size_t length) {
 bool poolOwns(const void* address) {
     const auto* base = static_cast<const uint8_t*>(g_poolExecutable);
     const auto* candidate = static_cast<const uint8_t*>(address);
-    return base != nullptr && candidate >= base && candidate < base + g_poolBytes;
+    return base != nullptr && candidate >= base &&
+           candidate < base + g_poolBytes.load(std::memory_order_relaxed);
 }
 
 void* mmapHook(void* address, size_t length, int protection, int flags, int fd,
@@ -134,7 +164,7 @@ void* mmapHook(void* address, size_t length, int protection, int flags, int fd,
         void* result = poolAllocate(length);
         if (result == nullptr) {
             reportf("pool exhausted: asked for %zu bytes of %zu", length,
-                    g_poolBytes);
+                    g_poolBytes.load(std::memory_order_relaxed));
             return MAP_FAILED;
         }
         return result;
@@ -155,11 +185,19 @@ bool prepareArena() {
         return true;
     }
 
-    if (!BVNExecMemArenaPrepared() && !BVNExecMemPrepareArena()) {
-        reportf("the executable arena was refused. Is this running through "
-                "StikDebug with universal.js assigned?");
-        return false;
+    if (!BVNExecMemArenaPrepared()) {
+        // The header is explicit that this can be stopped indefinitely when a
+        // debugger is attached without a working script: it asks StikDebug to
+        // prepare every page and waits. There is no way to cancel it from
+        // outside, so the most that can be done is name it while it runs.
+        Step step("asking StikDebug to prepare the executable arena");
+        if (!BVNExecMemPrepareArena()) {
+            reportf("the executable arena was refused. Is this running through "
+                    "StikDebug with universal.js assigned?");
+            return false;
+        }
     }
+    reportf("arena prepared");
 
     // Preparing the arena is not enough to allocate from it. BVNExecMemAlloc
     // refuses until the arena has been *confirmed* - a small function written
@@ -172,6 +210,7 @@ bool prepareArena() {
     // recovery, which is why it is here, behind a deliberate action, and not
     // at launch.
     if (!BVNExecMemExecutionConfirmed()) {
+        Step step("executing the arena's own confirmation code");
         const BVNExecMemStrategy strategy = BVNExecMemProbe(true);
         reportf("arena strategy: %s", BVNExecMemStrategyName(strategy));
         if (!BVNExecMemExecutionConfirmed()) {
@@ -223,7 +262,7 @@ bool prepareArena() {
 
     g_poolExecutable = executable;
     g_poolWritable = writable;
-    g_poolBytes = kJitPoolBytesActual;
+    g_poolBytes.store(kJitPoolBytesActual, std::memory_order_release);
     g_poolUsed.store(0, std::memory_order_relaxed);
 
     // The distance between the two views is what generated code needs in order
@@ -239,27 +278,40 @@ bool prepareArena() {
 } // namespace
 
 extern "C" BVNFexStage BVNFexStageReached(void) {
-    std::lock_guard<std::mutex> guard(g_mutex);
-    return g_stage;
+    return g_stage.load(std::memory_order_acquire);
 }
 
 extern "C" const char* BVNFexReport(void) {
-    std::lock_guard<std::mutex> guard(g_mutex);
-    return g_report.c_str();
+    // Copied under the report lock into storage the caller can read after it
+    // is released; returning g_report.c_str() would hand out a pointer that
+    // the next reportf could reallocate underneath a reader.
+    static std::string snapshot;
+    std::lock_guard<std::mutex> guard(g_reportMutex);
+    snapshot = g_report;
+    return snapshot.c_str();
 }
 
 extern "C" bool BVNFexPoolStatus(size_t* poolBytes, size_t* usedBytes) {
-    std::lock_guard<std::mutex> guard(g_mutex);
-    if (g_poolExecutable == nullptr) {
+    const size_t bytes = g_poolBytes.load(std::memory_order_acquire);
+    if (bytes == 0) {
         return false;
     }
     if (poolBytes != nullptr) {
-        *poolBytes = g_poolBytes;
+        *poolBytes = bytes;
     }
     if (usedBytes != nullptr) {
         *usedBytes = g_poolUsed.load(std::memory_order_relaxed);
     }
     return true;
+}
+
+extern "C" const char* BVNFexCurrentStep(void) {
+    return g_step.load(std::memory_order_acquire);
+}
+
+extern "C" double BVNFexCurrentStepSeconds(void) {
+    const double started = g_stepStarted.load(std::memory_order_relaxed);
+    return started == 0.0 ? 0.0 : nowSeconds() - started;
 }
 
 extern "C" const char* BVNFexStageName(BVNFexStage stage) {
@@ -274,35 +326,36 @@ extern "C" const char* BVNFexStageName(BVNFexStage stage) {
 }
 
 extern "C" BVNFexStage BVNFexProbe(void) {
-    std::lock_guard<std::mutex> guard(g_mutex);
+    std::lock_guard<std::mutex> guard(g_probeMutex);
 
-    if (g_stage < BVNFexStageArenaReady) {
+    if (g_stage.load() < BVNFexStageArenaReady) {
         if (!prepareArena()) {
-            return g_stage;
+            return g_stage.load();
         }
-        g_stage = BVNFexStageArenaReady;
+        g_stage.store(BVNFexStageArenaReady, std::memory_order_release);
     }
 
-    if (g_stage < BVNFexStageHooksInstalled) {
+    if (g_stage.load() < BVNFexStageHooksInstalled) {
         FEXCore::Allocator::mmap = mmapHook;
         FEXCore::Allocator::munmap = munmapHook;
         reportf("allocator hooks point at the arena pool");
-        g_stage = BVNFexStageHooksInstalled;
+        g_stage.store(BVNFexStageHooksInstalled, std::memory_order_release);
     }
 
-    if (g_stage < BVNFexStageContextCreated) {
+    if (g_stage.load() < BVNFexStageContextCreated) {
         // Everything above this line is BoxedVN's own code and is understood.
         // This is the first call into FEX, and it is also what forces the
         // translator's archives to be linked at all - a probe that only
         // touched our own arena would prove nothing about them.
+        Step step("creating a FEXCore context");
         FEXCore::HostFeatures features {};
         auto context = FEXCore::Context::Context::CreateNewContext(features);
         if (!context) {
             reportf("FEXCore refused to create a context");
-            return g_stage;
+            return g_stage.load();
         }
         reportf("FEXCore context created");
-        g_stage = BVNFexStageContextCreated;
+        g_stage.store(BVNFexStageContextCreated, std::memory_order_release);
 
         size_t used = g_poolUsed.load(std::memory_order_relaxed);
         reportf("pool used after context creation: %zu KiB", used / 1024);
@@ -313,6 +366,6 @@ extern "C" BVNFexStage BVNFexProbe(void) {
     // here and saying so is better than a stage that reports success for
     // something it did not do.
     reportf("stopping at '%s'; executing translated code is not wired up yet",
-            BVNFexStageName(g_stage));
-    return g_stage;
+            BVNFexStageName(g_stage.load()));
+    return g_stage.load();
 }
