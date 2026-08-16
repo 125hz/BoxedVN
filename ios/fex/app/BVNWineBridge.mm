@@ -37,12 +37,12 @@ void __wine_main(int argc, char* argv[]);
 
 extern int foreground;
 
-// The iPhoneOS Wine sources replace process-wide exit with a jump back to the
-// thread that entered __wine_main. These definitions satisfy that contract.
-thread_local jmp_buf wine_ios_exit_jmpbuf;
-thread_local volatile int wine_ios_exit_code = 0;
-thread_local pthread_t wine_ios_main_thread;
-thread_local int wine_ios_exit_initialized = 0;
+// Defined in BVNWineRuntimeStubs.c so the TLS ABI exactly matches Wine's C
+// translation units.
+extern thread_local jmp_buf wine_ios_exit_jmpbuf;
+extern thread_local volatile int wine_ios_exit_code;
+extern thread_local pthread_t wine_ios_main_thread;
+extern thread_local int wine_ios_exit_initialized;
 
 // Read by the patched wineserver event loop.
 volatile int g_wineserver_should_stop = 0;

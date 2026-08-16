@@ -219,7 +219,9 @@ targets:
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
           SWIFT_OPTIMIZATION_LEVEL: "-Onone"
     dependencies:
+      - sdk: AudioToolbox.framework
       - sdk: Foundation.framework
+      - sdk: IOKit.framework
       - sdk: UIKit.framework
       - sdk: libc++.tbd
       - sdk: libz.tbd
