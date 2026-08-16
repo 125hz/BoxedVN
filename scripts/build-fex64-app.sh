@@ -62,13 +62,30 @@ mkdir -p "${OUTPUT_DIR}"
 
 FEX_STAGING="${BOXEDVN_THIRD_PARTY}/fex64/fex-ios"
 
-if [[ "${SKIP_FEX}" -eq 0 && ! -f "${FEX_STAGING}/lib/libFEXCore.a" ]]; then
-    log "FEX archives are missing; building them first"
+# The archive alone is not evidence of a usable staging directory. A cached
+# one from before the headers were complete has libFEXCore.a in it and nothing
+# that can include it, and then this job fails on a compile error that looks
+# like a source problem. Check one file from each half.
+fex_staging_is_complete() {
+    [[ -f "${FEX_STAGING}/lib/libFEXCore.a" ]] &&
+    [[ -f "${FEX_STAGING}/include/FEXCore/Config/ConfigValues.inl" ]] &&
+    [[ -f "${FEX_STAGING}/include/fmt/format.h" ]]
+}
+
+if [[ "${SKIP_FEX}" -eq 0 ]] && ! fex_staging_is_complete; then
+    if [[ -d "${FEX_STAGING}" ]]; then
+        warn "the staged FEX is incomplete - probably cached from an older \
+staging step - so it is being rebuilt"
+        rm -rf "${FEX_STAGING}"
+    else
+        log "FEX archives are missing; building them first"
+    fi
     "${BOXEDVN_SCRIPT_DIR}/build-fex64-fex.sh" --configuration "${CONFIGURATION}"
 fi
 
-require_file "${FEX_STAGING}/lib/libFEXCore.a" \
-    "Run scripts/build-fex64-fex.sh, or drop --skip-fex."
+fex_staging_is_complete || die \
+"The staged FEX at '${FEX_STAGING}' is incomplete.
+Run scripts/build-fex64-fex.sh, or drop --skip-fex."
 
 XCODEGEN="${BOXEDVN_THIRD_PARTY}/xcodegen-${BOXEDVN_XCODEGEN_VERSION}/bin/xcodegen"
 [[ -x "${XCODEGEN}" ]] \
