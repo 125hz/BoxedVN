@@ -182,20 +182,22 @@ build_llvm_ios() {
             || die "llvm: clone failed"
     fi
 
-    # Apple's linker has no --gc-sections; it spells that -dead_strip. LLVM's
-    # AddLLVM.cmake picks between them on CMAKE_SYSTEM_NAME, and only knows
-    # "Darwin" - so an iOS build asks Apple ld for a GNU flag and fails to
-    # link. Teach that test about iOS.
+    # Apple's linker has no --gc-sections; it spells that -dead_strip. LLVM
+    # decides between them from CMAKE_SYSTEM_NAME, and its test only knows
+    # "Darwin", so an iOS build hands Apple ld a GNU flag and fails to link.
+    #
+    # Both the system-name test and the flag itself are rewritten. Patching
+    # only the test left a second site that emits the flag unconditionally,
+    # which is what stopped the first attempt at linking llvm-tblgen.
     local add_llvm="${source}/llvm/cmake/modules/AddLLVM.cmake"
     require_file "${add_llvm}" "The LLVM checkout is incomplete."
-    if grep -q 'CMAKE_SYSTEM_NAME MATCHES "Darwin"' "${add_llvm}"; then
-        log "llvm: teaching AddLLVM.cmake that iOS is Darwin-like"
-        /usr/bin/sed -i '' \
-            's/CMAKE_SYSTEM_NAME MATCHES "Darwin"/CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS"/g' \
-            "${add_llvm}" || die "llvm: could not patch AddLLVM.cmake"
-    else
-        ok "llvm: AddLLVM.cmake already patched"
+    /usr/bin/sed -i ''         -e 's/CMAKE_SYSTEM_NAME MATCHES "Darwin"/CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS"/g'         -e 's/-Wl,--gc-sections/-Wl,-dead_strip/g'         "${add_llvm}" || die "llvm: could not patch AddLLVM.cmake"
+
+    if grep -q -- '--gc-sections' "${add_llvm}"; then
+        die "llvm: AddLLVM.cmake still emits --gc-sections after patching.
+Apple's linker rejects it outright, so the build would fail at its first link."
     fi
+    ok "llvm: AddLLVM.cmake uses -dead_strip"
 
     # Stage 1. llvm-tblgen has to run on the build machine, so it is built for
     # macOS and handed to the iOS configure. Nothing else from this tree is
