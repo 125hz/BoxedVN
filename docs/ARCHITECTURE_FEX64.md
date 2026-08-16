@@ -175,7 +175,7 @@ run from a debugger-prepared page on this device".
 | Stage | Goal | Answered by |
 |---|---|---|
 | **B0** | llvm-mingw, FreeType, GnuTLS and LLVM-for-iphoneos build and cache. | CI `toolchains` job. Written; not yet run. |
-| **B1** | Wine's macOS and ARM64EC trees configure and build in CI. | **Recipe not yet established.** The configure lines are in nobody's repository; they have to be derived. Biggest unknown on the branch. |
+| **B1** | Wine's macOS and ARM64EC trees configure and build in CI. | **Done.** Run 31973620692 produced the generated headers and the required ARM64EC PE DLLs. The workflow now publishes both architectures as one runtime-input artifact. |
 | **B2** | Wine's unix side, wineserver and the iOS display driver build for `iphoneos`. | Artefacts in CI. |
 | **B3** | Wine starts in one process; `wineboot` creates a prefix. | Prefix on disk, registry written, clean exit. |
 | **B4** | A console x86-64 PE runs to completion under FEX. | Its output in the session log. |

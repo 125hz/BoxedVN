@@ -235,15 +235,54 @@ jobs:
       - name: Build the Wine trees
         run: scripts/build-fex64-wine.sh --tree all
 
-      - name: Publish the generated headers
+      - name: Collect the Wine runtime inputs
         run: |
           set -eu
-          mkdir -p wine-headers
+          staging=fex64-wine-runtime
+          rm -rf "${staging}"
+          mkdir -p "${staging}/headers"
           for tree in macos arm64ec; do
             src="third_party/fex64/wine/build-${tree}/include"
-            [ -d "$src" ] && cp -R "$src" "wine-headers/${tree}" || true
+            [ -d "$src" ] && cp -R "$src" "${staging}/headers/${tree}" || true
           done
-          du -sh wine-headers/* || true
+
+          build=third_party/fex64/wine/build-arm64ec
+          for arch in arm64ec aarch64; do
+            destination="${staging}/${arch}-windows"
+            mkdir -p "${destination}"
+            while IFS= read -r -d '' binary; do
+              name="$(basename "${binary}")"
+              if [ -e "${destination}/${name}" ] && ! cmp -s "${binary}" "${destination}/${name}"; then
+                echo "duplicate ${arch} runtime name with different contents: ${name}" >&2
+                exit 1
+              fi
+              cp "${binary}" "${destination}/${name}"
+            done < <(find "${build}" -type f \
+              \( -name '*.dll' -o -name '*.exe' \) \
+              -path "*/${arch}-windows/*" -print0)
+            count="$(find "${destination}" -type f | wc -l | tr -d ' ')"
+            [ "${count}" -gt 0 ] || { echo "no ${arch} PE files were collected" >&2; exit 1; }
+            echo "collected ${count} ${arch} PE files"
+          done
+
+          for required in ntdll.dll kernel32.dll win32u.dll; do
+            test -f "${staging}/arm64ec-windows/${required}" || {
+              echo "the runtime artifact is missing ${required}" >&2
+              exit 1
+            }
+          done
+          test -f "${staging}/aarch64-windows/wineboot.exe" || {
+            echo "the runtime artifact is missing wineboot.exe" >&2
+            exit 1
+          }
+          du -sh "${staging}"/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex64-wine-runtime
+          path: fex64-wine-runtime
+          retention-days: 14
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: always()
