@@ -80,35 +80,48 @@ print_tool_versions
 log "FEX -> ${BUILD}"
 log "source at $(git -C "${SOURCE}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
+# FEX_IOS_HOST is the ARM64EC module's define, not this build's. Setting it
+# here compiles first: the iOS diagnostic buffers become declared. Then it
+# fails, because the same define also enables VirtualQuery and
+# MEMORY_BASIC_INFORMATION in Arm64.cpp, which exist only in a Windows PE
+# build. So the host translator library is built without it, and the two
+# diagnostic reporters that reference those buffers outside their guard are
+# guarded by patches/fex-ios-host-diagnostics-guard.patch.
+#
+# That mismatch means the plain iOS host build is broken at the pinned commit -
+# the reference port builds the ARM64EC target from it, and its own host
+# archives predate these lines. Reported upstream rather than carried forever.
+apply_patch() {
+    local patch="${BOXEDVN_ROOT}/patches/$1"
+    require_file "${patch}"
+    if git -C "${SOURCE}" apply --reverse --check "${patch}" 2>/dev/null; then
+        ok "patch already applied: $1"
+        return 0
+    fi
+    git -C "${SOURCE}" apply --check "${patch}" || die "patch $1 no longer applies to FEX at $(git -C "${SOURCE}" rev-parse --short HEAD).
+
+The pin moved or upstream fixed this. Re-cut the patch deliberately."
+    git -C "${SOURCE}" apply "${patch}" || die "could not apply $1"
+    ok "applied patch: $1"
+}
+
+apply_patch fex-ios-host-diagnostics-guard.patch
+
+# CMAKE_SYSTEM_PROCESSOR has to be stated. CMake leaves it empty when cross-
+# compiling unless a toolchain file sets it, and FEX selects its entire
+# architecture backend from that one string - so empty is not a missing
+# optimisation, it is "Unsupported processor type" and no build at all.
+#
 # TUNE_CPU defaults to "native", which on this path runs a Python script over
-# /proc/cpuinfo to pick an -mcpu. There is no /proc on macOS, and the host CPU
-# is not the target anyway: this build runs on whatever iPhone installs it, and
-# FEX detects host features at runtime regardless. "none" skips the tuning.
+# /proc/cpuinfo to pick an -mcpu. There is no /proc on macOS, and the build
+# machine is not the target anyway: this runs on whatever iPhone installs it,
+# and FEX detects host features at runtime regardless.
 #
 # ENABLE_LTO is on by default upstream and costs a great deal of link time for
-# static libraries that are about to be linked again by Xcode; ccache is off
-# because CI caches the build directory instead. BUILD_TESTING pulls in Catch2
-# and the unit tests, none of which can run on a device from here.
-# CMAKE_SYSTEM_PROCESSOR has to be stated. CMake leaves it empty when it is
-# cross-compiling and the toolchain did not set it, and FEX selects its entire
-# architecture backend from that one string - so an empty value is not a
-# missing optimisation, it is "Unsupported processor type" and no build at all.
-# FEX_IOS_HOST is not a CMake option in the fork, it is a compile definition it
-# expects to be set globally - the reference port's own sources say so, in as
-# many words: "FEX_IOS_HOST=1 is global". Without it the iOS-only diagnostic
-# buffers in Core.cpp are declared under a guard while their uses are not, and
-# the translator core does not compile at all.
-#
-# Two of those buffers are defined in the ARM64EC module rather than in
-# FEXCore, so they stay undefined in these archives. That is legal in a static
-# library and is resolved at final application link; if it is not, the
-# application supplies them, and that will be an explicit decision there rather
-# than an accident here.
-IOS_HOST_DEFINE="-DFEX_IOS_HOST=1"
-
+# archives that Xcode is about to link again; ccache is off because CI caches
+# the build directory instead; BUILD_TESTING pulls in Catch2 and unit tests
+# that cannot run from here.
 cmake -S "${SOURCE}" -B "${BUILD}" -G Ninja \
-    -DCMAKE_C_FLAGS="${IOS_HOST_DEFINE}" \
-    -DCMAKE_CXX_FLAGS="${IOS_HOST_DEFINE}" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
