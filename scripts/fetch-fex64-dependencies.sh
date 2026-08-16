@@ -4,7 +4,7 @@
 # Copyright (C) 2026  The BoxedWine Team.  GPLv2; see license.txt.
 #
 # Usage:
-#   scripts/fetch-fex64-dependencies.sh [--component fex|wine|dxmt|all]
+#   scripts/fetch-fex64-dependencies.sh [--component mythic|fex|wine|dxmt|all]
 #                                       [--third-party-dir DIR]
 #                                       [--force]
 #
@@ -44,9 +44,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${COMPONENTS}" in
-    all) COMPONENTS="fex wine dxmt" ;;
-    fex|wine|dxmt) ;;
-    *) die "--component must be fex, wine, dxmt or all, got '${COMPONENTS}'." ;;
+    all) COMPONENTS="mythic fex wine dxmt" ;;
+    mythic|fex|wine|dxmt) ;;
+    *) die "--component must be mythic, fex, wine, dxmt or all, got '${COMPONENTS}'." ;;
 esac
 
 require_command git
@@ -232,6 +232,9 @@ log "fex64 sources -> ${FEX64_DIR}"
 
 for component in ${COMPONENTS}; do
     case "${component}" in
+        mythic)
+            fetch_pinned mythic "${BOXEDVN_MYTHIC_REPOSITORY}" \
+                "${BOXEDVN_MYTHIC_BRANCH}" "${BOXEDVN_MYTHIC_COMMIT}" no ;;
         fex)
             fetch_pinned fex "${BOXEDVN_FEX_REPOSITORY}" \
                 "${BOXEDVN_FEX_BRANCH}" "${BOXEDVN_FEX_COMMIT}" yes ;;

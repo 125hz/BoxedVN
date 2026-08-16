@@ -4,7 +4,7 @@
 #
 # Copyright (C) 2026  The BoxedWine Team.  GPLv2; see license.txt.
 #
-# Usage: .github/fex64-fetch.sh <fex|wine|dxmt>
+# Usage: .github/fex64-fetch.sh <mythic|fex|wine|dxmt>
 #
 # Actions logs require authentication to download. Annotations do not, so on
 # failure the tail of the output is re-emitted as ::error:: lines. That is the
@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-component="${1:?usage: fex64-fetch.sh <fex|wine|dxmt>}"
+component="${1:?usage: .github/fex64-fetch.sh <mythic|fex|wine|dxmt>}"
 output="${RUNNER_TEMP:-/tmp}/fex64-fetch-${component}.log"
 
 set +e

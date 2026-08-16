@@ -24,6 +24,16 @@
 # THIRD_PARTY_NOTICES.md must be updated before anything built from these is
 # distributed.
 
+# --- Mythic integration sources --------------------------------------------
+# The application repository contains the iOS Wine unix-side, wineserver and
+# process-bridge sources that are not part of the Wine fork. Its author granted
+# their use under MIT on 2026-08-16; see docs/ARCHITECTURE_FEX64.md and
+# THIRD_PARTY_NOTICES.md. Pinning this separately keeps those integration
+# sources reproducible without pulling its UI into BoxedVN.
+BOXEDVN_MYTHIC_REPOSITORY="https://github.com/willfaust/mythic.git"
+BOXEDVN_MYTHIC_BRANCH="main"
+BOXEDVN_MYTHIC_COMMIT="69da0545924342b8240b97d6103467a71dde964e"
+
 # --- FEX --------------------------------------------------------------------
 # x86-64 -> ARM64 translation, entered through ARM64EC's xtajit64 interface
 # rather than as a Linux usermode emulator. The fork's iOS work is on

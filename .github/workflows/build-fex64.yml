@@ -95,9 +95,13 @@ jobs:
         if: always()
         run: .github/fex64-fetch.sh dxmt
 
+      - name: Fetch Mythic integration sources
+        if: always()
+        run: .github/fex64-fetch.sh mythic
+
       - name: Report what resolved
         run: |
-          for component in fex wine dxmt; do
+          for component in mythic fex wine dxmt; do
             directory="third_party/fex64/${component}"
             printf '%-6s %s\n' "${component}" \
               "$(git -C "${directory}" rev-parse HEAD)"

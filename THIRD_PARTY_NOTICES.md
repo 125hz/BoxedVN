@@ -69,6 +69,22 @@ licence.
 Pinned in `scripts/dependencies.lock.sh`. Nothing in this repository downloads
 anything that is not listed there, and a checksum mismatch is fatal.
 
+### fex64 stack sources
+
+The `fex64` application is built from exact Git commits pinned in
+`scripts/dependencies.fex64.lock.sh`.
+
+| Component | Commit | Licence | Use |
+|-----------|--------|---------|-----|
+| `willfaust/FEX` | `04cbb90c715519136da771af3cc8f1dac9b821a6` | MIT | x86-64 to ARM64 translation |
+| `willfaust/wine` | `78497aaf2735ae2dbd6b285cdf2b562f333fc8a9` | LGPL-2.1-or-later | Windows API implementation and PE runtime |
+| `willfaust/dxmt` | `d6bd546dc685189f4434f87fd15ea7b21009e64f` | LGPL-2.1-or-later | Direct3D 10/11 to Metal translation |
+| `willfaust/mythic` integration sources | `69da0545924342b8240b97d6103467a71dde964e` | MIT grant from the author, 2026-08-16 | iOS Wine unix-side, wineserver and process bridge sources only |
+
+The Mythic repository does not yet contain a licence file. Its author granted
+MIT use directly on 2026-08-16; BoxedVN records the source and grant here and
+in `docs/ARCHITECTURE_FEX64.md`. The reference UI is not built or distributed.
+
 ### SDL 2.32.10
 
 | | |
