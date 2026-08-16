@@ -29,11 +29,19 @@ echo "::group::${component} fetch output"
 cat "${output}"
 echo "::endgroup::"
 
-# Annotations are capped, so publish the tail rather than everything, and
-# collapse the blank lines that would otherwise spend the budget.
+# Annotations are capped, so spend the budget on the lines that say what went
+# wrong rather than on the last thing that happened to be printed. git reports
+# progress right up to the failure, so a plain tail is mostly noise.
 echo "::error title=fex64 ${component} fetch failed::exit status ${status}"
-grep -v '^[[:space:]]*$' "${output}" | tail -n 15 | while IFS= read -r line; do
+df -h . | tail -n 1 | while IFS= read -r line; do
+    echo "::error title=fex64 ${component} disk::${line}"
+done
+grep -Ei 'error|fatal|denied|not found|no space|cannot|failed' "${output}" \
+    | grep -v '^[[:space:]]*$' | tail -n 20 | while IFS= read -r line; do
     echo "::error title=fex64 ${component}::${line}"
+done
+grep -v '^[[:space:]]*$' "${output}" | tail -n 5 | while IFS= read -r line; do
+    echo "::error title=fex64 ${component} tail::${line}"
 done
 
 exit "${status}"

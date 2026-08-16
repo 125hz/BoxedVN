@@ -53,6 +53,55 @@ require_command git
 
 FEX64_DIR="${BOXEDVN_THIRD_PARTY}/fex64"
 
+# Submodule paths this stack never builds. FEX carries its conformance suites
+# as submodules of prebuilt binaries - gvisor, posixtest, the gcc target tests
+# - and recursing into them costs gigabytes and, on a CI runner, the disk. None
+# of it is reachable from an iOS build.
+#
+# Matched as an extended regular expression against the submodule path.
+SUBMODULE_EXCLUDE_fex='^External/(fex-.*-bins|fex-.*-tests.*)$'
+
+# update_submodules <name> <checkout>
+#
+# Updates every submodule except the excluded ones. Shallow first, because it
+# is far faster when it works; a shallow update only succeeds when each
+# recorded commit is still a branch tip upstream, which nothing guarantees, so
+# it falls back to a full checkout rather than failing.
+update_submodules() {
+    local name="$1"
+    local destination="$2"
+    local exclude_variable="SUBMODULE_EXCLUDE_${name}"
+    local exclude="${!exclude_variable:-}"
+
+    [[ -f "${destination}/.gitmodules" ]] || return 0
+
+    local wanted=()
+    local path
+    while read -r _ path; do
+        if [[ -n "${exclude}" && "${path}" =~ ${exclude} ]]; then
+            ok "${name}: skipping submodule ${path}"
+            continue
+        fi
+        wanted+=("${path}")
+    done < <(git -C "${destination}" config --file .gitmodules \
+                 --get-regexp '^submodule\..*\.path$' || true)
+
+    if [[ "${#wanted[@]}" -eq 0 ]]; then
+        ok "${name}: no submodules to update"
+        return 0
+    fi
+
+    log "${name}: ${#wanted[@]} submodules"
+    if git -C "${destination}" submodule update --init --recursive --depth 1 \
+            -- "${wanted[@]}"; then
+        return 0
+    fi
+
+    warn "${name}: shallow submodule update failed; retrying unshallowed"
+    git -C "${destination}" submodule update --init --recursive \
+        -- "${wanted[@]}" || die "${name}: submodule checkout failed"
+}
+
 # fetch_pinned <name> <repository> <branch> <commit> <submodules:yes|no>
 #
 # Fetches the one commit and leaves the checkout detached on it, so nothing in
@@ -98,18 +147,8 @@ fetch_pinned() {
 The pin in scripts/dependencies.fex64.lock.sh predates a force-push or the
 branch was renamed. Update the pin deliberately, and record why."
 
-    # A shallow submodule update only works when the recorded commit happens
-    # to be a branch tip upstream, which for a tree with a dozen submodules is
-    # not something to rely on. Try it, because it is much faster when it
-    # works, then fall back to a full one.
     if [[ "${submodules}" == "yes" ]]; then
-        log "${name}: submodules"
-        if ! git -C "${destination}" submodule update --init --recursive --depth 1; then
-            warn "${name}: shallow submodule update failed; retrying unshallowed"
-            git -C "${destination}" submodule deinit --all --force >/dev/null 2>&1 || true
-            git -C "${destination}" submodule update --init --recursive \
-                || die "${name}: submodule checkout failed"
-        fi
+        update_submodules "${name}" "${destination}"
     fi
 
     ok "${name}: $(git -C "${destination}" rev-parse HEAD)"
