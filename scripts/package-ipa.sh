@@ -99,8 +99,15 @@ UNPACKED="${SMOKE}/Payload/${APP_NAME}"
 Contents:
 $(cd "${SMOKE}" && find . -maxdepth 2 | head -20)"
 
-[[ -f "${UNPACKED}/BoxedVN" ]] \
-    || die "The unpacked bundle has no BoxedVN executable."
+# The executable is named after the bundle, not after this project: the fex64
+# branch packages BoxedVNFex.app with the same script. Read it from the bundle
+# rather than assuming, so this check keeps testing what it is for - that the
+# archive round trip preserved an executable - instead of the product name.
+EXECUTABLE_NAME="${APP_NAME%.app}"
+[[ -f "${UNPACKED}/${EXECUTABLE_NAME}" ]] \
+    || die "The unpacked bundle has no ${EXECUTABLE_NAME} executable.
+Contents:
+$(cd "${UNPACKED}" && find . -maxdepth 1 | head -20)"
 
 [[ -f "${UNPACKED}/Info.plist" ]] \
     || die "The unpacked bundle has no Info.plist."
