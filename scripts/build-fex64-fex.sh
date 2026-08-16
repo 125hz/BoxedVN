@@ -80,6 +80,11 @@ print_tool_versions
 log "FEX -> ${BUILD}"
 log "source at $(git -C "${SOURCE}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
+# TUNE_CPU defaults to "native", which on this path runs a Python script over
+# /proc/cpuinfo to pick an -mcpu. There is no /proc on macOS, and the host CPU
+# is not the target anyway: this build runs on whatever iPhone installs it, and
+# FEX detects host features at runtime regardless. "none" skips the tuning.
+#
 # ENABLE_LTO is on by default upstream and costs a great deal of link time for
 # static libraries that are about to be linked again by Xcode; ccache is off
 # because CI caches the build directory instead. BUILD_TESTING pulls in Catch2
@@ -95,6 +100,7 @@ cmake -S "${SOURCE}" -B "${BUILD}" -G Ninja \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
     -DCMAKE_OSX_SYSROOT="${IPHONEOS_SDK}" \
     -DCMAKE_BUILD_TYPE="${CONFIGURATION}" \
+    -DTUNE_CPU=none \
     -DBUILD_TESTING=OFF \
     -DBUILD_THUNKS=OFF \
     -DBUILD_FEXCONFIG=OFF \
