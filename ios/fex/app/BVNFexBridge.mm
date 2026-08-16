@@ -15,17 +15,23 @@
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
+#include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Core/SignalDelegator.h>
+#include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/DualMap.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/fextl/memory.h>
 
 #include <libkern/OSCacheControl.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 
 #include <atomic>
+#include <csetjmp>
 #include <ctime>
 #include <cstdarg>
 #include <cstdio>
@@ -122,8 +128,14 @@ void reportf(const char* format, ...) {
     vsnprintf(line, sizeof(line), format, arguments);
     va_end(arguments);
 
-    g_report.append(line);
-    g_report.append("\n");
+    {
+        // Under the report lock, not the probe lock. The interface reads this
+        // while the probe is mid-step, so an unlocked append races a reader
+        // that is polling precisely because the probe may never return.
+        std::lock_guard<std::mutex> guard(g_reportMutex);
+        g_report.append(line);
+        g_report.append("\n");
+    }
     BVNLogWrite(BVNLogLevelInfo, "fex", line);
 }
 
@@ -234,6 +246,73 @@ FEXCore::HostFeatures hostFeatures() {
 
     return features;
 }
+
+// The smallest x86-64 programme that can prove anything: set the exit code,
+// select sys_exit, and leave through a syscall. It has to leave through a
+// syscall rather than simply returning, because a return has nowhere to go -
+// there is no caller in the guest, and no loaded image to return into.
+//
+//   48 C7 C7 2A 00 00 00   mov rdi, 42       ; the value we look for
+//   48 C7 C0 3C 00 00 00   mov rax, 60       ; sys_exit
+//   0F 05                  syscall
+constexpr uint8_t kGuestProgram[] = {
+    0x48, 0xC7, 0xC7, 0x2A, 0x00, 0x00, 0x00,
+    0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+    0x0F, 0x05,
+};
+constexpr uint64_t kGuestExpectedExit = 42;
+
+constexpr size_t kGuestCodeBytes = 0x4000;
+constexpr size_t kGuestStackBytes = 0x40000;
+
+void* g_guestCode = nullptr;
+void* g_guestStack = nullptr;
+std::jmp_buf g_guestExit;
+std::atomic<uint64_t> g_guestExitCode {0};
+std::atomic<bool> g_guestExited {false};
+
+// Linux is the ABI the guest programme is written against, and sys_exit is the
+// only call it makes. Everything else is refused loudly rather than silently
+// returning success, because a syscall this does not implement is a fact worth
+// having and not an error to paper over.
+class GuestSyscalls final : public FEXCore::HLE::SyscallHandler {
+public:
+    GuestSyscalls() {
+        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
+    }
+
+    uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* Frame,
+                           FEXCore::HLE::SyscallArguments* Args) override {
+        const uint64_t number = Args->Argument[0];
+        if (number == 60 || number == 231) { // exit, exit_group
+            g_guestExitCode.store(Args->Argument[1], std::memory_order_release);
+            g_guestExited.store(true, std::memory_order_release);
+            // The only way out. Returning would resume the guest at the
+            // instruction after the syscall, and there is nothing there.
+            std::longjmp(g_guestExit, 1);
+        }
+        reportf("guest made syscall %llu, which this probe does not implement",
+                (unsigned long long)number);
+        return (uint64_t)-1;
+    }
+
+    FEXCore::HLE::AOTIRCacheEntryLookupResult
+    LookupAOTIRCacheEntry(FEXCore::Core::InternalThreadState* Thread,
+                          uint64_t GuestAddr) override {
+        return {nullptr, 0};
+    }
+};
+
+class GuestSignals final : public FEXCore::SignalDelegator {
+};
+
+GuestSyscalls g_syscalls;
+GuestSignals g_signals;
+
+// Held for the life of the process. The thread FEX creates refers to it, and
+// tearing it down while generated code may still be reachable from the arena
+// would be worse than leaking it.
+fextl::unique_ptr<FEXCore::Context::Context> g_context;
 
 bool prepareArena() {
     if (g_poolExecutable != nullptr) {
@@ -431,8 +510,8 @@ extern "C" BVNFexStage BVNFexProbe(void) {
         Step step("creating a FEXCore context");
         FEXCore::HostFeatures features = hostFeatures();
         reportf("host features stated for %zu cores", features.CPUMIDRs.size());
-        auto context = FEXCore::Context::Context::CreateNewContext(features);
-        if (!context) {
+        g_context = FEXCore::Context::Context::CreateNewContext(features);
+        if (!g_context) {
             reportf("FEXCore refused to create a context");
             return g_stage.load();
         }
@@ -443,11 +522,77 @@ extern "C" BVNFexStage BVNFexProbe(void) {
         reportf("pool used after context creation: %zu KiB", used / 1024);
     }
 
-    // BVNFexStageExecuted is not reachable yet: running x86-64 needs a loaded
-    // image and a syscall handler, which is the next piece of work. Stopping
-    // here and saying so is better than a stage that reports success for
-    // something it did not do.
-    reportf("stopping at '%s'; executing translated code is not wired up yet",
-            BVNFexStageName(g_stage.load()));
+    if (g_stage.load() < BVNFexStageExecuted) {
+        {
+            Step step("initialising the translator core");
+            g_context->SetSignalDelegator(&g_signals);
+            g_context->SetSyscallHandler(&g_syscalls);
+            // Apple's cores implement total store ordering in hardware, which
+            // is the single largest reason x86 emulation is viable here: the
+            // alternative is a barrier around every guest memory access.
+            g_context->SetHardwareTSOSupport(true);
+            if (!g_context->InitCore()) {
+                reportf("InitCore refused; the dispatcher was not emitted");
+                return g_stage.load();
+            }
+            size_t used = g_poolUsed.load(std::memory_order_relaxed);
+            reportf("core initialised; pool used %zu KiB", used / 1024);
+        }
+
+        {
+            // Guest memory is ordinary mmap. Only the translator's *output*
+            // has to live in the arena; the x86-64 the guest executes is data
+            // as far as this device is concerned, because FEX reads it rather
+            // than jumping to it.
+            Step step("mapping guest memory");
+            g_guestCode = mmap(nullptr, kGuestCodeBytes, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANON, -1, 0);
+            g_guestStack = mmap(nullptr, kGuestStackBytes, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (g_guestCode == MAP_FAILED || g_guestStack == MAP_FAILED) {
+                reportf("could not map guest code or stack");
+                return g_stage.load();
+            }
+            memcpy(g_guestCode, kGuestProgram, sizeof(kGuestProgram));
+            reportf("guest code at %p, stack at %p", g_guestCode, g_guestStack);
+        }
+
+        Step step("translating and executing x86-64");
+        const uint64_t entry = (uint64_t)(uintptr_t)g_guestCode;
+        const uint64_t stackTop =
+            (uint64_t)(uintptr_t)g_guestStack + kGuestStackBytes - 0x100;
+
+        auto* thread = g_context->CreateThread(entry, stackTop);
+        if (thread == nullptr) {
+            reportf("CreateThread returned nothing");
+            return g_stage.load();
+        }
+
+        // The guest leaves through sys_exit, and the handler longjmps here.
+        // There is no other way back: returning from the handler would resume
+        // the guest after the syscall, where there is nothing.
+        if (setjmp(g_guestExit) == 0) {
+            g_context->ExecuteThread(thread);
+            reportf("ExecuteThread returned without the guest exiting");
+            return g_stage.load();
+        }
+
+        const uint64_t code = g_guestExitCode.load(std::memory_order_acquire);
+        const size_t used = g_poolUsed.load(std::memory_order_relaxed);
+        reportf("guest exited with %llu after translating into %zu KiB",
+                (unsigned long long)code, used / 1024);
+
+        if (code != kGuestExpectedExit) {
+            reportf("expected %llu; the translation ran but produced the wrong "
+                    "value, which is a correctness fault rather than a setup one",
+                    (unsigned long long)kGuestExpectedExit);
+            return g_stage.load();
+        }
+
+        g_stage.store(BVNFexStageExecuted, std::memory_order_release);
+        reportf("x86-64 translated by FEX executed from the arena and returned "
+                "what it should");
+    }
+
     return g_stage.load();
 }
