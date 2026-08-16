@@ -175,9 +175,9 @@ run from a debugger-prepared page on this device".
 | Stage | Goal | Answered by |
 |---|---|---|
 | **B0** | llvm-mingw, FreeType, GnuTLS and LLVM-for-iphoneos build and cache. | CI `toolchains` job. Written; not yet run. |
-| **B1** | Wine's macOS and ARM64EC trees configure and build in CI. | **Done.** Run 31973620692 produced the generated headers and the required ARM64EC PE DLLs. The workflow now publishes both architectures as one runtime-input artifact. |
-| **B2** | Wine's unix side, wineserver and the iOS display driver build for `iphoneos`. | Artefacts in CI. |
-| **B3** | Wine starts in one process; `wineboot` creates a prefix. | Prefix on disk, registry written, clean exit. |
+| **B1** | Wine's macOS and ARM64EC trees configure and build in CI. | **Done.** Run 31973620692 produced the generated headers. The finalized native and ARM64EC runtime sets come from the pinned iOS integration at the exact same Wine commit; the combined build is validated before they are packaged. |
+| **B2** | Wine's unix side, wineserver and the iOS display driver build for `iphoneos`. | **Native core done.** Run 31976822078 built 24 ntdll objects and 47 wineserver objects. The display driver remains part of the graphics ladder. |
+| **B3** | Wine starts in one process; `wineboot` creates a prefix. | **Packaged for device testing.** Run 31978779669 linked the embedded server and native ntdll, bundled the prefix and both PE runtime sets, and produced the unsigned IPA. Prefix/registry/exit acceptance still requires a device log. |
 | **B4** | A console x86-64 PE runs to completion under FEX. | Its output in the session log. |
 | **B5** | Display and input: a GDI program draws and responds to touch. | On device. |
 | **B6** | DXMT builds, initialises and presents. | A D3D11 test program on screen. |
