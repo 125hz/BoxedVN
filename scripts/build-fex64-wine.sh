@@ -124,8 +124,8 @@ COMMON_CONFIGURE=(
     --without-alsa --without-capi --without-coreaudio --without-cups
     --without-dbus --without-fontconfig --without-freetype --without-gettext
     --without-gphoto --without-gnutls --without-gssapi --without-inotify
-    --without-krb5 --without-mingw --without-netapi --without-openal
-    --without-opencl --without-opengl --without-osmesa --without-oss
+    --without-krb5 --without-netapi
+    --without-opencl --without-opengl --without-oss
     --without-pcap --without-pcsclite --without-pthread --without-pulse
     --without-sane --without-sdl --without-udev --without-unwind
     --without-usb --without-v4l2 --without-vulkan --without-wayland
