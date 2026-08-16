@@ -28,6 +28,33 @@
 #include <mutex>
 #include <string>
 
+// Two symbols FEXCore expects the surrounding programme to provide.
+//
+// __clear_cache is a GCC builtin that Apple's toolchain does not supply for
+// iOS. FEX calls it after writing generated code, and on ARM64 getting this
+// wrong does not fail loudly - it executes whatever was in the instruction
+// cache, which is the worst kind of bug to chase. Darwin spells it
+// sys_icache_invalidate.
+//
+// rpm_cas_snapshot_take is a diagnostic in the reference author's own rpmalloc
+// revision - the commit GitHub answers with "not our ref", which is why this
+// port pins upstream's instead. So the function this build needs exists
+// nowhere reachable. It reports allocator compare-and-swap statistics and its
+// caller skips the report when it returns zero, so declining is the correct
+// answer rather than a workaround: the statistics genuinely are unavailable.
+extern "C" {
+
+void __clear_cache(void* start, void* end) {
+    sys_icache_invalidate(start, static_cast<char*>(end) - static_cast<char*>(start));
+}
+
+int rpm_cas_snapshot_take(void* snapshot) {
+    (void)snapshot;
+    return 0;
+}
+
+} // extern "C"
+
 namespace {
 
 // 64 MiB, matching the reference port. The arena BVNExecMemory prepares is far
