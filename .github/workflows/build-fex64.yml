@@ -25,6 +25,7 @@ on:
           - fex
           - app
           - wine
+          - wine-ios
           - toolchains
       force_rebuild:
         description: Ignore the toolchain cache and rebuild from scratch
@@ -44,6 +45,7 @@ on:
       - scripts/build-fex64-fex.sh
       - scripts/build-fex64-app.sh
       - scripts/build-fex64-wine.sh
+      - scripts/build-fex64-wine-ios-core.sh
       - scripts/package-ipa.sh
       - scripts/validate-app.sh
       - ios/fex/**
@@ -295,6 +297,60 @@ jobs:
           path: |
             third_party/fex64/wine/build-*/configure.log
             third_party/fex64/wine/build-*/build.log
+          if-no-files-found: ignore
+
+  wine-ios:
+    name: Wine native core for iphoneos
+    needs: pins
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'wine-ios'
+    runs-on: macos-15
+    timeout-minutes: 220
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install bison flex mingw-w64 || true
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh .github/*.sh
+
+      - name: Fetch Wine and its iOS integration sources
+        run: |
+          scripts/fetch-fex64-dependencies.sh --component wine
+          scripts/fetch-fex64-dependencies.sh --component mythic
+
+      - name: Restore toolchain cache
+        uses: actions/cache/restore@v4
+        with:
+          path: third_party/fex64/toolchains
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
+          restore-keys: fex64-toolchains-${{ runner.os }}-
+
+      - name: Make sure llvm-mingw is present
+        run: scripts/build-fex64-toolchains.sh --stage llvm-mingw
+
+      - name: Generate the Wine trees
+        run: scripts/build-fex64-wine.sh --tree all
+
+      - name: Build the native Wine core
+        run: scripts/build-fex64-wine-ios-core.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex64-wine-ios-core
+          path: third_party/fex64/wine-ios-core
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish iPhoneOS compiler errors
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex64-wine-ios-core-errors
+          path: third_party/fex64/wine-ios-core-objects/**/*.err
           if-no-files-found: ignore
 
   toolchains:
