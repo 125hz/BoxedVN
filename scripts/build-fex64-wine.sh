@@ -84,6 +84,14 @@ fi
 print_tool_versions
 log "Wine at $(git -C "${SOURCE}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+# On PATH for the whole script, not just for configure. Configure records the
+# compiler it found and make invokes it by name later, so putting it on the
+# path for the configure call alone produces a tree that configures cleanly and
+# then cannot compile a single DLL.
+if [[ -d "${MINGW}/bin" ]]; then
+    export PATH="${MINGW}/bin:${PATH}"
+fi
+
 require_mingw() {
     [[ -x "${MINGW}/bin/aarch64-w64-mingw32-clang" ]] || die \
 "llvm-mingw is missing at '${MINGW}'.
