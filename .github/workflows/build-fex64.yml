@@ -42,6 +42,7 @@ on:
       - scripts/build-fex64-toolchains.sh
       - scripts/build-fex64-fex.sh
       - scripts/build-fex64-app.sh
+      - scripts/package-ipa.sh
       - ios/fex/**
       - ios/project.yml
       - patches/**
