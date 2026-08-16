@@ -15,6 +15,7 @@
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
+#include <FEXCore/Core/CodeCache.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Debug/InternalThreadState.h>
@@ -310,7 +311,7 @@ public:
 
     // No files are mapped: the guest was written into anonymous memory rather
     // than loaded from an image, so there is no section to name.
-    std::optional<FEXCore::HLE::ExecutableFileSectionInfo>
+    std::optional<FEXCore::ExecutableFileSectionInfo>
     LookupExecutableFileSection(FEXCore::Core::InternalThreadState* Thread,
                                 uint64_t GuestAddr) override {
         return std::nullopt;
