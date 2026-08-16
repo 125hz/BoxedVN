@@ -192,8 +192,47 @@ That is the translator itself, so this is a configuration failure rather than
 a partial build. Archives that were produced:
 $(ls "${STAGING}/lib" | sed 's/^/  /')"
 
+# FEXCore's public headers are not self-contained: LogManager.h includes
+# <fmt/format.h>, and others reach for FEXHeaderUtils, CodeEmitter,
+# unordered_dense and xxhash. Staging only FEXCore/include produces a set that
+# compiles inside FEX's own build tree and nowhere else, so the whole reachable
+# set is staged into one directory that a consumer can put on its search path.
 mkdir -p "${STAGING}/include"
 cp -R "${SOURCE}/FEXCore/include/." "${STAGING}/include/"
+for headers in \
+    "External/fmt/include" \
+    "External/unordered_dense/include" \
+    "External/xxhash" \
+    "FEXHeaderUtils" \
+    "CodeEmitter"; do
+    if [[ -d "${SOURCE}/${headers}" ]]; then
+        case "${headers}" in
+            */include)
+                # Already namespaced by a directory inside: fmt/, ankerl/.
+                cp -R "${SOURCE}/${headers}/." "${STAGING}/include/" ;;
+            External/xxhash)
+                # A bare header at the top of its repository.
+                cp "${SOURCE}/${headers}"/*.h "${STAGING}/include/" 2>/dev/null || true ;;
+            *)
+                # Included as <FEXHeaderUtils/...> and <CodeEmitter/...>, so the
+                # directory itself has to survive.
+                rm -rf "${STAGING}/include/${headers}"
+                mkdir -p "${STAGING}/include/${headers}"
+                ( cd "${SOURCE}/${headers}" && find . -name '*.h' -o -name '*.inl' ) \
+                    | while IFS= read -r header; do
+                        mkdir -p "${STAGING}/include/${headers}/$(dirname "${header}")"
+                        cp "${SOURCE}/${headers}/${header}" \
+                           "${STAGING}/include/${headers}/${header}"
+                    done ;;
+        esac
+    else
+        warn "no ${headers} to stage; a consumer may fail to include it"
+    fi
+done
+
+[[ -f "${STAGING}/include/fmt/format.h" ]] || die \
+"FEX: fmt headers did not stage, and FEXCore's LogManager.h includes them.
+Anything linking these archives would fail on the first include."
 
 log "Staged ${found} archives in ${STAGING}/lib"
 ( cd "${STAGING}/lib" && ls -lh *.a | awk '{printf "  %-32s %s\n", $9, $5}' )
