@@ -266,9 +266,11 @@ constexpr uint64_t kGuestExpectedExit = 42;
 
 constexpr size_t kGuestCodeBytes = 0x4000;
 constexpr size_t kGuestStackBytes = 0x40000;
+constexpr size_t kCallRetGuardBytes = kPageBytes;
 
 void* g_guestCode = nullptr;
 void* g_guestStack = nullptr;
+void* g_callRetAllocation = nullptr;
 
 std::jmp_buf g_guestExit;
 std::atomic<uint64_t> g_guestExitCode {0};
@@ -582,11 +584,57 @@ extern "C" BVNFexStage BVNFexProbe(void) {
             reportf("CreateThread returned nothing");
             return g_stage.load();
         }
+        reportf("FEX thread created");
+
+        // FEX's Linux thread manager normally supplies these two pieces of
+        // state. This probe talks to FEXCore directly, so it has to do that
+        // manager's work itself before entering the dispatcher.
+        //
+        // The shadow stack is used by translated call/ret instructions. Guard
+        // pages on both ends turn an overflow into a named fault rather than
+        // allowing it to corrupt unrelated application memory.
+        constexpr size_t callRetBytes =
+            FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+        constexpr size_t callRetAllocationBytes =
+            callRetBytes + 2 * kCallRetGuardBytes;
+        g_callRetAllocation = mmap(nullptr, callRetAllocationBytes, PROT_NONE,
+                                   MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (g_callRetAllocation == MAP_FAILED) {
+            g_callRetAllocation = nullptr;
+            reportf("could not map the FEX call/return shadow stack");
+            return g_stage.load();
+        }
+
+        void* callRetBase =
+            static_cast<uint8_t*>(g_callRetAllocation) + kCallRetGuardBytes;
+        if (mprotect(callRetBase, callRetBytes, PROT_READ | PROT_WRITE) != 0) {
+            reportf("could not make the FEX call/return shadow stack writable");
+            return g_stage.load();
+        }
+        thread->CallRetStackBase = callRetBase;
+        thread->CurrentFrame->State.callret_sp =
+            (uint64_t)(uintptr_t)callRetBase + callRetBytes / 4;
+
+        // The decoder reads CS through segment_arrays to select long mode.
+        // CreateThread does not install a GDT when FEXCore is used without its
+        // Linux thread manager; leaving this null makes the first decode read
+        // through a null segment table instead of decoding x86-64.
+        static FEXCore::Core::CPUState::gdt_segment gdt[1] {};
+        gdt[0].L = 1;
+        gdt[0].D = 0;
+        gdt[0].P = 1;
+        gdt[0].S = 1;
+        gdt[0].Type = 0b1011; // executable, readable and accessed
+        thread->CurrentFrame->State.segment_arrays[0] = gdt;
+        thread->CurrentFrame->State.cs_idx = 0;
+        reportf("guest thread state ready: call/return stack at %p, 64-bit GDT installed",
+                callRetBase);
 
         // The guest leaves through sys_exit, and the handler longjmps here.
         // There is no other way back: returning from the handler would resume
         // the guest after the syscall, where there is nothing.
         if (setjmp(g_guestExit) == 0) {
+            reportf("entering FEX ExecuteThread");
             g_context->ExecuteThread(thread);
             reportf("ExecuteThread returned without the guest exiting");
             return g_stage.load();
