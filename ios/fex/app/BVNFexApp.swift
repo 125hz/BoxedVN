@@ -104,10 +104,15 @@ struct ProbeView: View {
                             if wineRunning { ProgressView() }
                         }
                     }
-                    .disabled(!BVNWineAvailable() || wineRunning)
+                    .disabled(!BVNWineAvailable() || wineRunning ||
+                              stage != BVNFexStageExecuted)
 
                     if !BVNWineAvailable() {
                         Text("This IPA contains the FEX probe only. Build the Wine-enabled target to run this stage.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else if stage != BVNFexStageExecuted {
+                        Text("Complete the FEX probe first so Wine can lease a separate executable arena segment.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }

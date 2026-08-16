@@ -8,6 +8,7 @@
 
 #include "BVNWineBridge.h"
 #include "BVNFexBridge.h"
+#include "BVNExecMemory.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -105,6 +106,62 @@ void reportf(const char* format, ...) {
 std::atomic<bool> g_starting {false};
 std::atomic<bool> g_serverRunning {false};
 std::string g_prefix;
+void* g_winePoolExecutable = nullptr;
+void* g_winePoolWritable = nullptr;
+size_t g_winePoolBytes = 0;
+
+bool prepareWineJitPool() {
+    if (g_winePoolExecutable != nullptr) return true;
+    if (BVNFexStageReached() != BVNFexStageExecuted) {
+        reportf("the FEX probe must complete before Wine can lease an executable pool");
+        return false;
+    }
+
+    // The arena is prepared in independent 64 MiB segments. FEX owns the
+    // first segment; Wine leases the next one so its PE-image copier and
+    // FEX's allocator can never advance into each other's executable pages.
+    constexpr size_t poolBytes = 64u * 1024u * 1024u;
+    void* executable = BVNExecMemAlloc(poolBytes);
+    if (executable == nullptr) {
+        size_t capacity = 0;
+        size_t available = 0;
+        size_t segments = 0;
+        BVNExecMemArenaStatus(&capacity, &available, &segments);
+        reportf("could not lease Wine's executable pool (%zu MiB free of %zu MiB across %zu segments)",
+                available / (1024 * 1024), capacity / (1024 * 1024), segments);
+        return false;
+    }
+    void* writable = BVNExecMemWritableAddress(executable, poolBytes);
+    if (writable == nullptr) {
+        BVNExecMemFree(executable, poolBytes);
+        reportf("Wine's executable pool has no writable alias");
+        return false;
+    }
+
+    g_winePoolExecutable = executable;
+    g_winePoolWritable = writable;
+    g_winePoolBytes = poolBytes;
+
+    char rx[32];
+    char rw[32];
+    char size[32];
+    snprintf(rx, sizeof(rx), "0x%llx",
+             (unsigned long long)(uintptr_t)g_winePoolExecutable);
+    snprintf(rw, sizeof(rw), "0x%llx",
+             (unsigned long long)(uintptr_t)g_winePoolWritable);
+    snprintf(size, sizeof(size), "0x%llx",
+             (unsigned long long)g_winePoolBytes);
+    setenv("WINE_IOS_JIT_RX", rx, 1);
+    setenv("WINE_IOS_JIT_RW", rw, 1);
+    setenv("WINE_IOS_JIT_SIZE", size, 1);
+
+    reportf("Wine executable pool %zu MiB at rx=%p rw=%p (rw-rx=%+lld)",
+            g_winePoolBytes / (1024 * 1024), g_winePoolExecutable,
+            g_winePoolWritable,
+            (long long)((intptr_t)g_winePoolWritable -
+                        (intptr_t)g_winePoolExecutable));
+    return true;
+}
 
 bool prepareDiagnostics() {
     NSString* path = diagnosticLogPath();
@@ -257,7 +314,9 @@ void* processThread(void*) {
         setenv("WINEDEBUG", "err+all", 1);
         setenv("MYTHIC_TEST_VAR", "steam-s1", 1);
 
-        const int64_t writeOffset = BVNFexWriteOffset();
+        const int64_t writeOffset =
+            static_cast<int64_t>(static_cast<uint8_t*>(g_winePoolWritable) -
+                                 static_cast<uint8_t*>(g_winePoolExecutable));
         if (writeOffset != 0) {
             char value[32];
             snprintf(value, sizeof(value), "0x%llx", (unsigned long long)writeOffset);
@@ -338,6 +397,11 @@ extern "C" bool BVNWineStart(void) {
     }
     if (!BVNWineAvailable()) {
         reportf("the linked build is missing one or more Wine resources");
+        g_stage.store(BVNWineStageFailed, std::memory_order_release);
+        g_starting.store(false);
+        return false;
+    }
+    if (!prepareWineJitPool()) {
         g_stage.store(BVNWineStageFailed, std::memory_order_release);
         g_starting.store(false);
         return false;
