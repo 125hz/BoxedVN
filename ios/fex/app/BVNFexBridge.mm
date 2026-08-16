@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 
 // Two symbols FEXCore expects the surrounding programme to provide.
@@ -267,6 +268,7 @@ constexpr size_t kGuestStackBytes = 0x40000;
 
 void* g_guestCode = nullptr;
 void* g_guestStack = nullptr;
+
 std::jmp_buf g_guestExit;
 std::atomic<uint64_t> g_guestExitCode {0};
 std::atomic<bool> g_guestExited {false};
@@ -296,10 +298,22 @@ public:
         return (uint64_t)-1;
     }
 
-    FEXCore::HLE::AOTIRCacheEntryLookupResult
-    LookupAOTIRCacheEntry(FEXCore::Core::InternalThreadState* Thread,
-                          uint64_t GuestAddr) override {
-        return {nullptr, 0};
+    // The guest is one page of code this probe wrote itself, so the honest
+    // answer to "what is executable around this address" is that page. Saying
+    // "everything" would let the translator cache across memory it has no
+    // reason to trust; saying "nothing" would stop it translating at all.
+    FEXCore::HLE::ExecutableRangeInfo
+    QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread,
+                              uint64_t Address) override {
+        return {(uint64_t)(uintptr_t)g_guestCode, kGuestCodeBytes, false};
+    }
+
+    // No files are mapped: the guest was written into anonymous memory rather
+    // than loaded from an image, so there is no section to name.
+    std::optional<FEXCore::HLE::ExecutableFileSectionInfo>
+    LookupExecutableFileSection(FEXCore::Core::InternalThreadState* Thread,
+                                uint64_t GuestAddr) override {
+        return std::nullopt;
     }
 };
 
