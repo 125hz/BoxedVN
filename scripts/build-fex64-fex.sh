@@ -139,7 +139,33 @@ cmake -S "${SOURCE}" -B "${BUILD}" -G Ninja \
     -DENABLE_OFFLINE_TELEMETRY=OFF \
     || die "FEX: configure failed for iphoneos"
 
-cmake --build "${BUILD}" -j "${JOBS}" || die "FEX: build failed"
+# Build the static targets by name rather than everything. FEX declares both a
+# static and a shared FEXCore, and "everything" includes the shared one, which
+# has to resolve every symbol at link time - including the ones the ARM64EC
+# module provides and this build does not have. An iOS application links
+# archives, so the dylib is not merely unnecessary here, it is unbuildable and
+# would fail every run.
+#
+# An unknown target is skipped rather than fatal: which support archives exist
+# depends on options the fork resolves itself.
+build_target() {
+    local target="$1"
+    local output
+    if ! output="$(cmake --build "${BUILD}" -j "${JOBS}" --target "${target}" 2>&1)"; then
+        if grep -qi "unknown target" <<<"${output}"; then
+            warn "FEX: no target '${target}' in this configuration; skipping"
+            return 0
+        fi
+        printf '%s\n' "${output}" >&2
+        die "FEX: building '${target}' failed"
+    fi
+    printf '%s\n' "${output}"
+    ok "FEX: built ${target}"
+}
+
+for target in FEXCore FEXCore_Base JemallocLibs; do
+    build_target "${target}"
+done
 
 # Collect whatever archives the build produced rather than asserting a list.
 # The set depends on options the fork resolves itself - the Linux allocators
