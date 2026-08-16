@@ -37,12 +37,12 @@ void __wine_main(int argc, char* argv[]);
 
 extern int foreground;
 
-// Defined in BVNWineRuntimeStubs.c so the TLS ABI exactly matches Wine's C
-// translation units.
-extern thread_local jmp_buf wine_ios_exit_jmpbuf;
-extern thread_local volatile int wine_ios_exit_code;
-extern thread_local pthread_t wine_ios_main_thread;
-extern thread_local int wine_ios_exit_initialized;
+// Implemented in C so the TLS ABI exactly matches Wine's C translation units;
+// Objective-C++ accesses it only through these non-TLS functions.
+jmp_buf* BVNWineExitJumpBuffer(void);
+void BVNWinePrepareExitTrap(void);
+int BVNWineExitCode(void);
+void BVNWineClearExitTrap(void);
 
 // Read by the patched wineserver event loop.
 volatile int g_wineserver_should_stop = 0;
@@ -218,9 +218,7 @@ void* processThread(void*) {
                           @"Documents/fex64-wine.log"];
         wine_log_set_file(log.fileSystemRepresentation);
 
-        wine_ios_main_thread = pthread_self();
-        wine_ios_exit_initialized = 1;
-        wine_ios_exit_code = 0;
+        BVNWinePrepareExitTrap();
         g_stage.store(BVNWineStageProcessStarted, std::memory_order_release);
         reportf("entering Wine through native ntdll");
 
@@ -229,13 +227,13 @@ void* processThread(void*) {
         char initialize[] = "--init";
         char* arguments[] = {loader, target, initialize, nullptr};
 
-        if (setjmp(wine_ios_exit_jmpbuf) == 0) {
+        if (setjmp(*BVNWineExitJumpBuffer()) == 0) {
             __wine_main(3, arguments);
             reportf("Wine returned normally");
         } else {
-            reportf("Wine exited with code %d", (int)wine_ios_exit_code);
+            reportf("Wine exited with code %d", BVNWineExitCode());
         }
-        wine_ios_exit_initialized = 0;
+        BVNWineClearExitTrap();
         g_stage.store(BVNWineStageExited, std::memory_order_release);
         g_starting.store(false, std::memory_order_release);
     }

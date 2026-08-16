@@ -16,6 +16,28 @@ _Thread_local volatile int wine_ios_exit_code;
 _Thread_local pthread_t wine_ios_main_thread;
 _Thread_local int wine_ios_exit_initialized;
 
+jmp_buf *BVNWineExitJumpBuffer(void)
+{
+    return &wine_ios_exit_jmpbuf;
+}
+
+void BVNWinePrepareExitTrap(void)
+{
+    wine_ios_main_thread = pthread_self();
+    wine_ios_exit_code = 0;
+    wine_ios_exit_initialized = 1;
+}
+
+int BVNWineExitCode(void)
+{
+    return wine_ios_exit_code;
+}
+
+void BVNWineClearExitTrap(void)
+{
+    wine_ios_exit_initialized = 0;
+}
+
 const char wine_build[] = "wine-ios-fex64";
 
 void winios_phase(const char *name)
