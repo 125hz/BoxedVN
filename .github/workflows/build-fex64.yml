@@ -263,7 +263,7 @@ jobs:
                 exit 1
               fi
               cp "${binary}" "${destination}/${name}"
-            done < <(find "${build}" -type f \
+            done < <(find -L "${build}" -type f \
               \( -name '*.dll' -o -name '*.exe' \) \
               -path "*/${arch}-windows/*" -print0)
             count="$(find "${destination}" -type f | wc -l | tr -d ' ')"
