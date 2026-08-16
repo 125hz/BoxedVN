@@ -43,6 +43,7 @@ on:
       - scripts/build-fex64-fex.sh
       - scripts/build-fex64-app.sh
       - scripts/package-ipa.sh
+      - scripts/validate-app.sh
       - ios/fex/**
       - ios/project.yml
       - patches/**

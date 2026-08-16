@@ -16,14 +16,17 @@ APP_PATH="$1"
 
 [[ -d "${APP_PATH}" ]] || die "'${APP_PATH}' is not a directory."
 
-EXECUTABLE="${APP_PATH}/BoxedVN"
+# Named after the bundle, not after this project: the fex64 branch validates
+# BoxedVNFex.app with the same script.
+APP_BASENAME="$(basename "${APP_PATH}")"
+EXECUTABLE="${APP_PATH}/${APP_BASENAME%.app}"
 INFO_PLIST="${APP_PATH}/Info.plist"
 
 log "Validating $(basename "${APP_PATH}")"
 
 # --- executable -------------------------------------------------------------
 require_file "${EXECUTABLE}" \
-    "The app bundle has no BoxedVN executable; the link step produced nothing."
+    "The app bundle has no ${APP_BASENAME%.app} executable; the link step produced nothing."
 
 if [[ ! -x "${EXECUTABLE}" ]]; then
     die "'${EXECUTABLE}' is not executable."
