@@ -93,7 +93,22 @@ log "source at $(git -C "${SOURCE}" rev-parse HEAD 2>/dev/null || echo unknown)"
 # cross-compiling and the toolchain did not set it, and FEX selects its entire
 # architecture backend from that one string - so an empty value is not a
 # missing optimisation, it is "Unsupported processor type" and no build at all.
+# FEX_IOS_HOST is not a CMake option in the fork, it is a compile definition it
+# expects to be set globally - the reference port's own sources say so, in as
+# many words: "FEX_IOS_HOST=1 is global". Without it the iOS-only diagnostic
+# buffers in Core.cpp are declared under a guard while their uses are not, and
+# the translator core does not compile at all.
+#
+# Two of those buffers are defined in the ARM64EC module rather than in
+# FEXCore, so they stay undefined in these archives. That is legal in a static
+# library and is resolved at final application link; if it is not, the
+# application supplies them, and that will be an explicit decision there rather
+# than an accident here.
+IOS_HOST_DEFINE="-DFEX_IOS_HOST=1"
+
 cmake -S "${SOURCE}" -B "${BUILD}" -G Ninja \
+    -DCMAKE_C_FLAGS="${IOS_HOST_DEFINE}" \
+    -DCMAKE_CXX_FLAGS="${IOS_HOST_DEFINE}" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
