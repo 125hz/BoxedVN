@@ -1,0 +1,141 @@
+name: Build fex64 toolchains
+
+# The fex64 stack cannot be built on a PC, so CI is the only feedback loop
+# this branch has. It is deliberately split by cost:
+#
+#   pins        seconds   - do the pinned commits still exist and check out?
+#   toolchains  hours     - llvm-mingw, FreeType and LLVM cross-built for
+#                           iphoneos; changes only when the lock file changes,
+#                           so it is cached on that file's hash.
+#
+# Later stages - Wine's macOS and ARM64EC builds, its iphoneos unix side, DXMT,
+# FEX, and the unsigned IPA - land here as separate jobs as each recipe is
+# established. See docs/ARCHITECTURE_FEX64.md for the order and why.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: How far to go
+        required: true
+        default: pins
+        type: choice
+        options:
+          - pins
+          - toolchains
+      force_rebuild:
+        description: Ignore the toolchain cache and rebuild from scratch
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - fex64
+    paths: &fex64_paths
+      - .github/workflows/build-fex64.yml
+      - scripts/common.sh
+      - scripts/dependencies.fex64.lock.sh
+      - scripts/fetch-fex64-dependencies.sh
+      - scripts/build-fex64-toolchains.sh
+  pull_request:
+    branches:
+      - fex64
+    paths: *fex64_paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-fex64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pins:
+    name: Pinned sources resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fetching by commit is the whole point of the pin, and it is also the
+      # thing that breaks silently when a fork force-pushes. Checking it costs
+      # a minute and saves a multi-hour job that would have failed at the end.
+      - name: Fetch pinned forks
+        run: |
+          chmod +x scripts/fetch-fex64-dependencies.sh
+          scripts/fetch-fex64-dependencies.sh --component all
+
+      - name: Report what resolved
+        run: |
+          for component in fex wine dxmt; do
+            directory="third_party/fex64/${component}"
+            printf '%-6s %s\n' "${component}" \
+              "$(git -C "${directory}" rev-parse HEAD)"
+          done
+
+  toolchains:
+    name: Cross toolchains for iphoneos
+    needs: pins
+    # Manual only. A cold run is hours on a macOS runner, which bills at ten
+    # times a Linux minute; nobody should trigger that by editing a comment.
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'toolchains'
+    runs-on: macos-15
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the build machine
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install build tools
+        run: brew install ninja cmake
+
+      # Keyed on the lock file: the toolchains are a pure function of the
+      # pinned versions, so any change to those - and nothing else - should
+      # invalidate hours of work.
+      - name: Restore toolchain cache
+        id: toolchain-cache
+        if: ${{ !inputs.force_rebuild }}
+        uses: actions/cache/restore@v4
+        with:
+          path: third_party/fex64/toolchains
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
+
+      - name: Build toolchains
+        run: |
+          chmod +x scripts/build-fex64-toolchains.sh
+          scripts/build-fex64-toolchains.sh --stage all \
+            ${{ inputs.force_rebuild && '--force' || '' }}
+
+      - name: Save toolchain cache
+        if: always() && steps.toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: third_party/fex64/toolchains
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
+
+      # The LLVM tree is tens of gigabytes of build directory and is not worth
+      # carrying; only the artefacts downstream stages consume are published.
+      - name: Collect what downstream stages need
+        run: |
+          set -eu
+          staging=fex64-toolchains
+          mkdir -p "${staging}"
+          cp -R third_party/fex64/toolchains/freetype-ios "${staging}/" || true
+          mkdir -p "${staging}/llvm-ios-build"
+          cp -R third_party/fex64/toolchains/llvm-ios-build/lib \
+                third_party/fex64/toolchains/llvm-ios-build/include \
+                "${staging}/llvm-ios-build/" || true
+          du -sh "${staging}"/* || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex64-toolchains
+          path: fex64-toolchains
+          retention-days: 14
+          if-no-files-found: error
