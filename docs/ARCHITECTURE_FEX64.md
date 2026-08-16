@@ -66,24 +66,26 @@ Mythic's own history is squashed to a single commit, so it cannot be read as a
 sequence of decisions; the recipes in its `build/` scripts and the constraints
 in its handoff document are the durable part.
 
-### Licensing — read before copying anything
+### Licensing
 
 | Component | Licence | Usable here |
 |---|---|---|
 | `willfaust/FEX` (fork of FEX-Emu) | MIT | yes |
 | `willfaust/wine` (fork of Wine) | LGPL-2.1-or-later | yes |
 | `willfaust/dxmt` (fork of DXMT) | LGPL-2.1-or-later | yes |
-| The `mythic` repository itself | **no LICENSE file** | **no** |
+| The `mythic` repository itself | MIT, granted by its author 2026-08-16 | yes |
 
-The three forks carry their upstream licences and combine with GPLv2. The
-Mythic repository has no licence at all, so its application layer — the
-SwiftUI shell, `JITAllocator.c`, `FEXBridge.mm`, the wineserver and
-process bridges, roughly 7,000 lines — is all-rights-reserved by default and
-must not be copied into this tree, read for reference or not.
+All four combine with GPLv2, so Mythic's application layer — the SwiftUI
+shell, `JITAllocator.c`, `FEXBridge.mm`, the wineserver and process bridges,
+the iOS Wine unix sources under `build/` — can be ported rather than
+re-derived. That is the difference between weeks and months on this branch.
 
-BoxedVN has to supply that layer itself. It largely already has, which is the
-next section. If a licence is what stands between this branch and months of
-re-derivation, **ask the author for one** before writing any of it.
+**The grant arrived by email and the repository still carries no `LICENSE`
+file.** Ask its author to commit one. An email is a real grant but it lives in
+one inbox; a file in the tree is what anyone auditing a GPLv2 project later
+can actually check, and this port is public. Until that file exists, every
+file ported here keeps a header naming its origin and the grant date, and
+THIRD_PARTY_NOTICES.md records both.
 
 ## What BoxedVN brings
 
@@ -149,29 +151,47 @@ The recipes, in dependency order. This is what the CI has to reproduce.
 
 ## Staged plan
 
-Each stage is independently verifiable, and the early ones need no device.
+There are two ladders, and they diverge early. **Testing JIT does not require
+Wine, DXMT, or any of the long toolchain work.** Keeping them apart is what
+stops the first device answer from being three weeks away.
+
+### Ladder A — a testable JIT
+
+Nothing here needs LLVM, llvm-mingw, FreeType, GnuTLS or a Wine tree.
 
 | Stage | Goal | Answered by |
 |---|---|---|
-| **M0a** | Pinned forks resolve and check out. | CI `pins` job. Done. |
-| **M0b** | llvm-mingw, FreeType and LLVM-for-iphoneos build and cache. | CI `toolchains` job. Written; not yet run. |
-| **M0c** | Wine's macOS and ARM64EC trees configure and build in CI. | Recipe not yet established — the configure lines live in the Wine fork. |
-| **M0d** | Wine's unix side, wineserver, DXMT and FEX build for iphoneos. | Artefacts in CI. |
-| **M1** | BoxedVN's own app shell links them and starts Wine, with the arena from `BVNExecMemory`. | `wineboot` completes; prefix on disk. |
-| **M2** | A console x86-64 PE runs to completion. | Its output in the session log. |
-| **M3** | Display driver and input: a GDI program draws and responds to touch. | On device. |
-| **M4** | DXMT presents. | A D3D11 test program on screen. |
-| **M5** | A real 3D title reaches a frame, then a soak. | Frame rate, and memory below the jetsam ceiling. |
+| **A0** | Pinned forks resolve and check out. | CI `pins` job. **Done.** |
+| **A1** | FEX builds for `iphoneos` as a static library. | A green CI job. No device. |
+| **A2** | An app target links FEX and the arena, and reports the handshake. | Installs and shows a runtime status page. |
+| **A3** | FEX translates and executes an x86-64 block **from the arena**. | The known return value in the log, `BVNExecMemExecutionConfirmed()` true, arena used-bytes rising. |
 
-M0 is where the effort is right now, and it is entirely a build-system
-problem. Nothing about it needs a device, and CI is the only way to work on it
-from a PC.
+A3 is the real JIT answer: not "can this process make an executable page" —
+the `ios` branch already proved that — but "does a translator's generated code
+run from a debugger-prepared page on this device".
+
+### Ladder B — games
+
+| Stage | Goal | Answered by |
+|---|---|---|
+| **B0** | llvm-mingw, FreeType, GnuTLS and LLVM-for-iphoneos build and cache. | CI `toolchains` job. Written; not yet run. |
+| **B1** | Wine's macOS and ARM64EC trees configure and build in CI. | **Recipe not yet established.** The configure lines are in nobody's repository; they have to be derived. Biggest unknown on the branch. |
+| **B2** | Wine's unix side, wineserver and the iOS display driver build for `iphoneos`. | Artefacts in CI. |
+| **B3** | Wine starts in one process; `wineboot` creates a prefix. | Prefix on disk, registry written, clean exit. |
+| **B4** | A console x86-64 PE runs to completion under FEX. | Its output in the session log. |
+| **B5** | Display and input: a GDI program draws and responds to touch. | On device. |
+| **B6** | DXMT builds, initialises and presents. | A D3D11 test program on screen. |
+| **B7** | A real 3D title reaches a frame, then a soak. | Frame rate, and memory below the jetsam ceiling. |
+
+B1 is the gate. Everything from B2 onwards includes generated headers and a
+`config.h` from those trees, so nothing downstream can be attempted until a
+Wine build exists.
 
 ## What this branch is not
 
 - It does **not** replace the `ios` branch. 32-bit visual novels stay there;
   this stack is x86-64 and would regress them to nothing.
 - It has **no working runtime yet**. At this commit it is pinned forks, a
-  toolchain build and CI. Nothing past M0a has run.
+  toolchain build and CI. Nothing past A0 has run.
 - Its performance on BoxedVN is **unmeasured**. The 142 FPS figure is Mythic's,
   on its own build, on an A15.
