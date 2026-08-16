@@ -24,6 +24,7 @@ on:
           - pins
           - fex
           - app
+          - wine
           - toolchains
       force_rebuild:
         description: Ignore the toolchain cache and rebuild from scratch
@@ -42,6 +43,7 @@ on:
       - scripts/build-fex64-toolchains.sh
       - scripts/build-fex64-fex.sh
       - scripts/build-fex64-app.sh
+      - scripts/build-fex64-wine.sh
       - scripts/package-ipa.sh
       - scripts/validate-app.sh
       - ios/fex/**
@@ -192,6 +194,61 @@ jobs:
         with:
           name: fex64-app-xcodebuild-log
           path: build/fex64-Release/xcodebuild.log
+          if-no-files-found: ignore
+
+  wine:
+    name: Wine trees for the fex64 stack
+    needs: pins
+    # Manual: this is an unestablished recipe and a long build, so it should
+    # not run on every push while it is being worked out.
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'wine'
+    runs-on: macos-15
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install bison flex mingw-w64 || true
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh .github/*.sh
+
+      - name: Fetch Wine
+        run: scripts/fetch-fex64-dependencies.sh --component wine
+
+      - name: Restore toolchain cache
+        uses: actions/cache/restore@v4
+        with:
+          path: third_party/fex64/toolchains
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
+          restore-keys: fex64-toolchains-${{ runner.os }}-
+
+      - name: Make sure llvm-mingw is present
+        run: scripts/build-fex64-toolchains.sh --stage llvm-mingw
+
+      - name: Build the Wine trees
+        run: scripts/build-fex64-wine.sh --tree all
+
+      - name: Publish the generated headers
+        run: |
+          set -eu
+          mkdir -p wine-headers
+          for tree in macos arm64ec; do
+            src="third_party/fex64/wine/build-${tree}/include"
+            [ -d "$src" ] && cp -R "$src" "wine-headers/${tree}" || true
+          done
+          du -sh wine-headers/* || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fex64-wine-logs
+          path: |
+            third_party/fex64/wine/build-*/configure.log
+            third_party/fex64/wine/build-*/build.log
           if-no-files-found: ignore
 
   toolchains:
