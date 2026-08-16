@@ -72,7 +72,7 @@ struct ProbeView: View {
                     // nothing here can interrupt a debugger request, so the
                     // useful thing is to say which step is stuck and why.
                     if running && stepSeconds > 15 {
-                        Text("This step has not returned. StikDebug asks the debugger to prepare every page and waits; if its session ended, relaunch through StikDebug and try again.")
+                        Text(stallHint)
                             .font(.footnote)
                             .foregroundStyle(.orange)
                     }
@@ -106,6 +106,18 @@ struct ProbeView: View {
             stepSeconds = BVNFexCurrentStepSeconds()
             report = String(cString: BVNFexReport())
         }
+    }
+
+    // The previous version said the same thing whichever step was stuck, which
+    // sent a run that stalled inside the translator looking at StikDebug.
+    private var stallHint: String {
+        if step.contains("StikDebug") {
+            return "This step has not returned. It asks the debugger to prepare every page and then waits; if the StikDebug session ended, relaunch through it and try again."
+        }
+        if step.contains("confirmation") {
+            return "This step has not returned. It executes code from the arena, so a stall here is about the device rather than the debugger — capture this report."
+        }
+        return "This step has not returned. Nothing here can interrupt it; capture this report with the share button and reopen the app."
     }
 
     private func run() {

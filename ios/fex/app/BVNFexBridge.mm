@@ -17,6 +17,7 @@
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
+#include <FEXCore/Utils/DualMap.h>
 
 #include <libkern/OSCacheControl.h>
 #include <sys/mman.h>
@@ -265,10 +266,20 @@ bool prepareArena() {
     g_poolBytes.store(kJitPoolBytesActual, std::memory_order_release);
     g_poolUsed.store(0, std::memory_order_relaxed);
 
-    // The distance between the two views is what generated code needs in order
-    // to write through the alias. It is not a fixed offset - the alias is
-    // placed wherever the kernel puts it - so it is reported rather than
-    // assumed anywhere.
+    // Hand FEX the distance between the two views. This is the whole contract
+    // of a dual-mapped pool: FEX treats the r-x address as canonical and adds
+    // this offset whenever it writes, so with the default of zero every write
+    // of generated code goes to the executable mapping - which is read-only,
+    // and on this device stops the thread rather than returning an error.
+    //
+    // It has to be set before FEXCore initialises, because the dispatcher is
+    // emitted during context creation and captures the value then.
+    FEXCore::DualMap::WriteOffset =
+        static_cast<int64_t>(static_cast<uint8_t*>(writable) -
+                             static_cast<uint8_t*>(executable));
+
+    // The alias is placed wherever the kernel puts it, so this is reported
+    // rather than assumed anywhere.
     reportf("arena pool %zu MiB at rx=%p rw=%p (rw-rx=%+lld)",
             kJitPoolBytesActual / (1024 * 1024), executable, writable,
             (long long)((intptr_t)writable - (intptr_t)executable));
