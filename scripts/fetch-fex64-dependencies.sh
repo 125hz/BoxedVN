@@ -61,6 +61,61 @@ FEX64_DIR="${BOXEDVN_THIRD_PARTY}/fex64"
 # Matched as an extended regular expression against the submodule path.
 SUBMODULE_EXCLUDE_fex='^External/(fex-.*-bins|fex-.*-tests.*)$'
 
+# Submodule commits the recorded one cannot be fetched for, as "<path>=<commit>".
+#
+# The FEX fork records External/rpmalloc at a4d4185f, which GitHub refuses with
+# "upload-pack: not our ref": the commit is not reachable from any ref in
+# FEX-Emu/rpmalloc, so it survives only in clones that already had it. Upstream
+# FEX pins 1d85c246 for the same release - the tip of that repository's `fex`
+# branch - so this is upstream's own choice rather than a guess, and it is the
+# only value that makes the fork clonable by anyone else.
+SUBMODULE_OVERRIDE_fex='External/rpmalloc=1d85c246cd827ead6865f4f880d4fef53f2b1864'
+
+# checkout_submodule_override <name> <checkout> <path> <commit>
+#
+# Places one submodule at a commit other than the one recorded in the tree.
+# 'git submodule update' cannot do this - it exists to enforce the recorded
+# commit - so the working tree is populated directly. The gitlink stays dirty
+# against the superproject, which is correct: it records that this checkout
+# deliberately differs.
+checkout_submodule_override() {
+    local name="$1"
+    local destination="$2"
+    local path="$3"
+    local commit="$4"
+    local target="${destination}/${path}"
+    local url
+
+    local key candidate
+    while read -r key candidate; do
+        if [[ "${candidate}" == "${path}" ]]; then
+            url="$(git -C "${destination}" config --file .gitmodules \
+                     --get "${key%.path}.url")"
+            break
+        fi
+    done < <(git -C "${destination}" config --file .gitmodules \
+                 --get-regexp '^submodule\..*\.path$')
+    [[ -n "${url:-}" ]] || die "${name}: no URL recorded for submodule ${path}"
+
+    if [[ -d "${target}/.git" ]] &&
+       [[ "$(git -C "${target}" rev-parse HEAD 2>/dev/null)" == "${commit}" ]]; then
+        ok "${name}: ${path} already at the override ${commit:0:12}"
+        return 0
+    fi
+
+    log "${name}: ${path} overridden to ${commit:0:12}"
+    mkdir -p "${target}"
+    if [[ ! -d "${target}/.git" ]]; then
+        git -C "${target}" init --quiet
+        git -C "${target}" remote add origin "${url}"
+    fi
+    git -C "${target}" fetch --depth 1 --quiet origin "${commit}" \
+        || die "${name}: could not fetch ${commit} for ${path} from ${url}"
+    git -C "${target}" checkout --quiet --detach "${commit}" \
+        || die "${name}: could not check out ${commit} in ${path}"
+    ok "${name}: ${path} at ${commit}"
+}
+
 # update_submodules <name> <checkout>
 #
 # Updates every submodule except the excluded ones. Shallow first, because it
@@ -72,8 +127,16 @@ update_submodules() {
     local destination="$2"
     local exclude_variable="SUBMODULE_EXCLUDE_${name}"
     local exclude="${!exclude_variable:-}"
+    local override_variable="SUBMODULE_OVERRIDE_${name}"
+    local overrides="${!override_variable:-}"
 
     [[ -f "${destination}/.gitmodules" ]] || return 0
+
+    local override_paths=()
+    local override
+    for override in ${overrides}; do
+        override_paths+=("${override%%=*}")
+    done
 
     local wanted=()
     local path
@@ -82,9 +145,20 @@ update_submodules() {
             ok "${name}: skipping submodule ${path}"
             continue
         fi
+        local overridden=0
+        local candidate
+        for candidate in ${override_paths[@]+"${override_paths[@]}"}; do
+            [[ "${candidate}" == "${path}" ]] && overridden=1
+        done
+        [[ "${overridden}" -eq 1 ]] && continue
         wanted+=("${path}")
     done < <(git -C "${destination}" config --file .gitmodules \
                  --get-regexp '^submodule\..*\.path$' || true)
+
+    for override in ${overrides}; do
+        checkout_submodule_override "${name}" "${destination}" \
+            "${override%%=*}" "${override#*=}"
+    done
 
     if [[ "${#wanted[@]}" -eq 0 ]]; then
         ok "${name}: no submodules to update"
