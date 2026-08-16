@@ -195,18 +195,40 @@ make_target() {
 for tree in ${TREES}; do
     build="${SOURCE}/build-${tree}"
     target="$(make_target "${tree}")"
-    log "wine/${tree}: building ${target:-everything} with ${JOBS} jobs"
-    if ! make -C "${build}" -j "${JOBS}" ${target} > "${build}/build.log" 2>&1; then
+    log "wine/${tree}: building ${target:-the PE side} with ${JOBS} jobs"
+
+    # -k for the ARM64EC tree, and a failure there is not fatal. That tree is
+    # built for its PE DLLs; it also tries to build unix-side .so libraries for
+    # the *host*, and those reference the same iOS glue that lives in the
+    # application rather than in Wine, so win32u.so cannot link here and never
+    # needs to. Stopping at the first such failure would throw away every PE
+    # DLL that builds after it.
+    #
+    # What replaces the exit status as the test is the output itself, below.
+    if [[ "${tree}" == "arm64ec" ]]; then
+        make -C "${build}" -k -j "${JOBS}" > "${build}/build.log" 2>&1 || true
+    elif ! make -C "${build}" -j "${JOBS}" ${target} > "${build}/build.log" 2>&1; then
         warn "wine/${tree}: build failed; last 40 lines"
         tail -40 "${build}/build.log" >&2
         die "wine/${tree}: build failed. Full log: ${build}/build.log"
     fi
 
-    # The point of the macOS tree is its headers, so say whether they exist
-    # rather than trusting that a green make produced them.
-    require_file "${build}/include/config.h" \
-        "The tree built but produced no config.h, which is what the iOS unix side includes."
-    ok "wine/${tree}: built, config.h present"
+    require_file "${build}/include/config.h"         "The tree built but produced no config.h, which is what the iOS unix side includes."
+
+    if [[ "${tree}" == "arm64ec" ]]; then
+        # The PE side is the deliverable, so count it and insist on the three
+        # DLLs without which nothing starts at all.
+        count="$(find "${build}/dlls" -path '*arm64ec-windows*' -name '*.dll' 2>/dev/null | wc -l | tr -d ' ')"
+        log "wine/arm64ec: ${count} ARM64EC PE DLLs built"
+        for required in ntdll kernel32 win32u; do
+            find "${build}/dlls/${required}" -name "${required}.dll" 2>/dev/null                 | grep -q . || die "wine/arm64ec: ${required}.dll was not produced.
+${count} other PE DLLs were, so this is that library specifically rather than a
+broken tree. Its failure is in ${build}/build.log."
+        done
+        ok "wine/arm64ec: ${count} PE DLLs, including the three that must exist"
+    else
+        ok "wine/${tree}: built, config.h present"
+    fi
 done
 
 log "Wine trees"
