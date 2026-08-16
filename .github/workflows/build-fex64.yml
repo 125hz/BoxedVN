@@ -58,7 +58,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-fex64-${{ github.ref }}
+  # Keyed by stage as well as branch. One group per branch meant a push
+  # cancelled a manually started multi-hour toolchain build, which is the one
+  # job on this branch that must never be restarted casually.
+  group: build-fex64-${{ github.ref }}-${{ inputs.stage || github.event_name }}
   cancel-in-progress: true
 
 jobs:
