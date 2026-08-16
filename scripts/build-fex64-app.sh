@@ -7,6 +7,8 @@
 #   scripts/build-fex64-app.sh [--configuration Release|Debug]
 #                              [--output-dir DIR] [--third-party-dir DIR]
 #                              [--skip-fex]
+#                              [--wine-core-dir DIR]
+#                              [--wine-runtime-dir DIR] [--mythic-dir DIR]
 #
 # Stage A2 of docs/ARCHITECTURE_FEX64.md. Builds FEX if its archives are not
 # already present, generates the Xcode project, links the BoxedVNFex target
@@ -24,6 +26,9 @@ source "${BOXEDVN_SCRIPT_DIR}/dependencies.lock.sh"
 CONFIGURATION="Release"
 OUTPUT_DIR=""
 SKIP_FEX=0
+WINE_CORE_DIR=""
+WINE_RUNTIME_DIR=""
+MYTHIC_DIR=""
 
 usage() {
     sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -42,6 +47,15 @@ while [[ $# -gt 0 ]]; do
             BOXEDVN_THIRD_PARTY="$2"; shift 2 ;;
         --skip-fex)
             SKIP_FEX=1; shift ;;
+        --wine-core-dir)
+            [[ $# -ge 2 ]] || die "--wine-core-dir needs a value"
+            WINE_CORE_DIR="$2"; shift 2 ;;
+        --wine-runtime-dir)
+            [[ $# -ge 2 ]] || die "--wine-runtime-dir needs a value"
+            WINE_RUNTIME_DIR="$2"; shift 2 ;;
+        --mythic-dir)
+            [[ $# -ge 2 ]] || die "--mythic-dir needs a value"
+            MYTHIC_DIR="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -87,6 +101,38 @@ fex_staging_is_complete || die \
 "The staged FEX at '${FEX_STAGING}' is incomplete.
 Run scripts/build-fex64-fex.sh, or drop --skip-fex."
 
+WINE_ENABLED=0
+WINE_RESOURCE_STAGING="${BOXEDVN_ROOT}/ios/fex/runtime"
+if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
+    [[ -n "${WINE_CORE_DIR}" && -n "${WINE_RUNTIME_DIR}" && -n "${MYTHIC_DIR}" ]] || die \
+"Wine-enabled builds require --wine-core-dir, --wine-runtime-dir and --mythic-dir together."
+    require_file "${WINE_CORE_DIR}/lib/libntdll_unix.a"
+    require_file "${WINE_CORE_DIR}/lib/libwineserver.a"
+    require_file "${WINE_RUNTIME_DIR}/aarch64-windows/wineboot.exe"
+    require_file "${WINE_RUNTIME_DIR}/arm64ec-windows/ntdll.dll"
+    require_file "${MYTHIC_DIR}/app/Mythic/arm64ec-windows/xtajit64.dll"
+    require_file "${MYTHIC_DIR}/app/Mythic/prefix-template.tar.gz"
+    [[ -d "${MYTHIC_DIR}/app/Mythic/nls" ]] || die "The pinned iOS integration has no NLS directory."
+
+    # This path is generated only for Xcode's resource phase. Keep the large
+    # runtime out of git and remove it when the build exits.
+    rm -rf "${WINE_RESOURCE_STAGING}"
+    mkdir -p "${WINE_RESOURCE_STAGING}"
+    cp -R "${WINE_RUNTIME_DIR}/aarch64-windows" \
+          "${WINE_RESOURCE_STAGING}/aarch64-windows"
+    cp -R "${WINE_RUNTIME_DIR}/arm64ec-windows" \
+          "${WINE_RESOURCE_STAGING}/arm64ec-windows"
+    cp "${MYTHIC_DIR}/app/Mythic/arm64ec-windows/xtajit64.dll" \
+       "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit64.dll"
+    cp -R "${MYTHIC_DIR}/app/Mythic/nls" "${WINE_RESOURCE_STAGING}/nls"
+    mkdir -p "${WINE_RESOURCE_STAGING}/prefix-template"
+    tar -xzf "${MYTHIC_DIR}/app/Mythic/prefix-template.tar.gz" \
+        -C "${WINE_RESOURCE_STAGING}/prefix-template" --strip-components=1
+    trap 'rm -rf "${WINE_RESOURCE_STAGING}"' EXIT
+    WINE_ENABLED=1
+    log "Staged the native and ARM64EC Wine runtime resources"
+fi
+
 XCODEGEN="${BOXEDVN_THIRD_PARTY}/xcodegen-${BOXEDVN_XCODEGEN_VERSION}/bin/xcodegen"
 [[ -x "${XCODEGEN}" ]] \
     || die "XcodeGen is missing at '${XCODEGEN}'. Run scripts/fetch-dependencies.sh."
@@ -103,6 +149,14 @@ DERIVED_DATA="${OUTPUT_DIR}/DerivedData"
 BUILD_LOG="${OUTPUT_DIR}/xcodebuild.log"
 
 log "Building BoxedVNFex.app for generic iOS device"
+XCODE_WINE_SETTINGS=()
+if [[ "${WINE_ENABLED}" -eq 1 ]]; then
+    XCODE_WINE_SETTINGS+=(
+        "BVN_WINE_LIBRARY_DIR=${WINE_CORE_DIR}/lib"
+        "BVN_WINE_LDFLAGS=-lntdll_unix -lwineserver"
+        'GCC_PREPROCESSOR_DEFINITIONS=$(inherited) BVN_WINE_BOOT_ENABLED=1'
+    )
+fi
 set +e
 xcodebuild \
     -project "${XCODE_PROJECT}" \
@@ -113,6 +167,7 @@ xcodebuild \
     BVN_FEX_LIBRARY_DIR="${FEX_STAGING}/lib" \
     BVN_FEX_INCLUDE_DIR="${FEX_STAGING}/include" \
     BVN_BUILD_REVISION="${BUILD_REVISION}" \
+    "${XCODE_WINE_SETTINGS[@]}" \
     CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
     build \
     >"${BUILD_LOG}" 2>&1

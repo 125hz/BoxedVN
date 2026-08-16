@@ -26,6 +26,9 @@ struct ProbeView: View {
     @State private var step = ""
     @State private var stepSeconds = 0.0
     @State private var copied = false
+    @State private var wineStage = BVNWineStageUnavailable
+    @State private var wineReport = ""
+    @State private var wineRunning = false
 
     // The steps that talk to StikDebug cannot be cancelled and can wait
     // forever, so the interface polls instead of waiting for a return value.
@@ -85,6 +88,40 @@ struct ProbeView: View {
                     Text("Prepares the executable arena, points FEX's allocator at it, and creates a translator context. Needs BoxedVN to be running through StikDebug with universal.js assigned.")
                 }
 
+                Section {
+                    LabeledContent("Reached") {
+                        Text(String(cString: BVNWineStageName(wineStage)))
+                            .foregroundStyle(wineStage == BVNWineStageFailed ? Color.red : Color.primary)
+                    }
+
+                    Button {
+                        startWine()
+                    } label: {
+                        HStack {
+                            Text(wineRunning ? "Starting Wine…" : "Start Wine")
+                            Spacer()
+                            if wineRunning { ProgressView() }
+                        }
+                    }
+                    .disabled(!BVNWineAvailable() || wineRunning)
+
+                    if !BVNWineAvailable() {
+                        Text("This IPA contains the FEX probe only. Build the Wine-enabled target to run this stage.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if !wineReport.isEmpty {
+                        Text(wineReport)
+                            .font(.system(.footnote, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                } header: {
+                    Text("Wine bootstrap")
+                } footer: {
+                    Text("Starts the embedded wineserver and enters native Wine with a pre-seeded prefix. The ARM64EC runtime remains bundled for the translated executable path after this first boot succeeds.")
+                }
+
                 if !report.isEmpty {
                     Section("What happened") {
                         Text(report)
@@ -112,11 +149,19 @@ struct ProbeView: View {
         }
         .onAppear(perform: refresh)
         .onReceive(tick) { _ in
-            guard running else { return }
-            step = String(cString: BVNFexCurrentStep())
-            stepSeconds = BVNFexCurrentStepSeconds()
-            report = String(cString: BVNFexReport())
-            copied = false
+            if running {
+                step = String(cString: BVNFexCurrentStep())
+                stepSeconds = BVNFexCurrentStepSeconds()
+                report = String(cString: BVNFexReport())
+                copied = false
+            }
+            if wineRunning {
+                wineStage = BVNWineStageReached()
+                wineReport = String(cString: BVNWineReport())
+                if wineStage == BVNWineStageExited || wineStage == BVNWineStageFailed {
+                    wineRunning = false
+                }
+            }
         }
     }
 
@@ -148,9 +193,23 @@ struct ProbeView: View {
         }
     }
 
+    private func startWine() {
+        wineRunning = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let started = BVNWineStart()
+            DispatchQueue.main.async {
+                if !started { wineRunning = false }
+                wineStage = BVNWineStageReached()
+                wineReport = String(cString: BVNWineReport())
+            }
+        }
+    }
+
     private func refresh() {
         stage = BVNFexStageReached()
         report = String(cString: BVNFexReport())
+        wineStage = BVNWineStageReached()
+        wineReport = String(cString: BVNWineReport())
 
         var bytes = 0
         var used = 0

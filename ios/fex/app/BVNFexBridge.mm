@@ -466,6 +466,14 @@ extern "C" bool BVNFexPoolStatus(size_t* poolBytes, size_t* usedBytes) {
     return true;
 }
 
+extern "C" int64_t BVNFexWriteOffset(void) {
+    if (g_poolExecutable == nullptr || g_poolWritable == nullptr) {
+        return 0;
+    }
+    return static_cast<int64_t>(static_cast<uint8_t*>(g_poolWritable) -
+                                static_cast<uint8_t*>(g_poolExecutable));
+}
+
 extern "C" const char* BVNFexCurrentStep(void) {
     return g_step.load(std::memory_order_acquire);
 }

@@ -60,3 +60,5 @@ project/mac-xcode/Boxedwine/DerivedDataCoverage
 /ios/BoxedVN.xcodeproj/
 /ios/app/Bundled/
 .DS_Store
+# Generated only while packaging the fex64 Wine-enabled app.
+/ios/fex/runtime/

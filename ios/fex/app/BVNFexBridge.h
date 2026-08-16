@@ -69,6 +69,11 @@ const char* BVNFexStageName(BVNFexStage stage);
 /// exists.
 bool BVNFexPoolStatus(size_t* poolBytes, size_t* usedBytes);
 
+/// Distance from the executable view of the arena pool to its writable alias.
+/// The ARM64EC translator publishes this to its own FEXCore instance when Wine
+/// snapshots the process environment. Returns zero until the arena exists.
+int64_t BVNFexWriteOffset(void);
+
 #ifdef __cplusplus
 }
 #endif

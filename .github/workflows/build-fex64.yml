@@ -26,7 +26,16 @@ on:
           - app
           - wine
           - wine-ios
+          - wineboot
           - toolchains
+      wine_runtime_run_id:
+        description: Successful run containing fex64-wine-runtime (wineboot only)
+        required: false
+        type: string
+      wine_core_run_id:
+        description: Successful run containing fex64-wine-ios-core (wineboot only)
+        required: false
+        type: string
       force_rebuild:
         description: Ignore the toolchain cache and rebuild from scratch
         required: false
@@ -58,6 +67,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   # Keyed by stage as well as branch. One group per branch meant a push
@@ -351,6 +361,83 @@ jobs:
         with:
           name: fex64-wine-ios-core-errors
           path: third_party/fex64/wine-ios-core-objects/**/*.err
+          if-no-files-found: ignore
+
+  wineboot:
+    name: Wine bootstrap app and unsigned IPA
+    needs: pins
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'wineboot'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require the proven Wine artifact runs
+        env:
+          RUNTIME_RUN: ${{ inputs.wine_runtime_run_id }}
+          CORE_RUN: ${{ inputs.wine_core_run_id }}
+        run: |
+          test -n "${RUNTIME_RUN}" || { echo "wine_runtime_run_id is required" >&2; exit 1; }
+          test -n "${CORE_RUN}" || { echo "wine_core_run_id is required" >&2; exit 1; }
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh .github/*.sh
+
+      - name: Fetch FEX and the pinned iOS integration
+        run: |
+          scripts/fetch-fex64-dependencies.sh --component fex
+          scripts/fetch-fex64-dependencies.sh --component mythic
+
+      - name: Restore third-party cache
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: fex64-wineboot-${{ runner.os }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh') }}
+          restore-keys: fex64-wineboot-${{ runner.os }}-
+
+      - name: Fetch XcodeGen
+        run: scripts/fetch-dependencies.sh --platform ios --configuration Release || true
+
+      - name: Download the Wine runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: fex64-wine-runtime
+          path: build/wine-inputs/runtime
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.wine_runtime_run_id }}
+
+      - name: Download the native Wine core
+        uses: actions/download-artifact@v4
+        with:
+          name: fex64-wine-ios-core
+          path: build/wine-inputs/core
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.wine_core_run_id }}
+
+      - name: Build the Wine bootstrap app and package the IPA
+        run: |
+          scripts/build-fex64-app.sh \
+            --configuration Release \
+            --wine-core-dir build/wine-inputs/core \
+            --wine-runtime-dir build/wine-inputs/runtime \
+            --mythic-dir third_party/fex64/mythic
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex64-wineboot-unsigned-ipa
+          path: build/fex64-Release/artifacts
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish the build log when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex64-wineboot-xcodebuild-log
+          path: build/fex64-Release/xcodebuild.log
           if-no-files-found: ignore
 
   toolchains:
