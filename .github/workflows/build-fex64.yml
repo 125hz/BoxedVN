@@ -28,10 +28,6 @@ on:
           - wine-ios
           - wineboot
           - toolchains
-      wine_runtime_run_id:
-        description: Successful run containing fex64-wine-runtime (wineboot only)
-        required: false
-        type: string
       wine_core_run_id:
         description: Successful run containing fex64-wine-ios-core (wineboot only)
         required: false
@@ -235,8 +231,10 @@ jobs:
       - name: Make scripts executable
         run: chmod +x scripts/*.sh .github/*.sh
 
-      - name: Fetch Wine
-        run: scripts/fetch-fex64-dependencies.sh --component wine
+      - name: Fetch Wine and the pinned runtime
+        run: |
+          scripts/fetch-fex64-dependencies.sh --component wine
+          scripts/fetch-fex64-dependencies.sh --component mythic
 
       - name: Restore toolchain cache
         uses: actions/cache/restore@v4
@@ -262,23 +260,15 @@ jobs:
             [ -d "$src" ] && cp -R "$src" "${staging}/headers/${tree}" || true
           done
 
-          build=third_party/fex64/wine/build-arm64ec
+          runtime=third_party/fex64/mythic/app/Mythic
           for arch in arm64ec aarch64; do
             destination="${staging}/${arch}-windows"
-            mkdir -p "${destination}"
-            while IFS= read -r -d '' binary; do
-              name="$(basename "${binary}")"
-              if [ -e "${destination}/${name}" ] && ! cmp -s "${binary}" "${destination}/${name}"; then
-                echo "duplicate ${arch} runtime name with different contents: ${name}" >&2
-                exit 1
-              fi
-              cp "${binary}" "${destination}/${name}"
-            done < <(find -L "${build}" -type f \
-              \( -name '*.dll' -o -name '*.exe' \) \
-              -path "*/${arch}-windows/*" -print0)
+            source="${runtime}/${arch}-windows"
+            test -d "${source}" || { echo "the pinned runtime has no ${arch} set" >&2; exit 1; }
+            cp -R "${source}" "${destination}"
             count="$(find "${destination}" -type f | wc -l | tr -d ' ')"
             [ "${count}" -gt 0 ] || { echo "no ${arch} PE files were collected" >&2; exit 1; }
-            echo "collected ${count} ${arch} PE files"
+            echo "collected ${count} pinned ${arch} PE files"
           done
 
           for required in ntdll.dll kernel32.dll win32u.dll; do
@@ -374,10 +364,8 @@ jobs:
 
       - name: Require the proven Wine artifact runs
         env:
-          RUNTIME_RUN: ${{ inputs.wine_runtime_run_id }}
           CORE_RUN: ${{ inputs.wine_core_run_id }}
         run: |
-          test -n "${RUNTIME_RUN}" || { echo "wine_runtime_run_id is required" >&2; exit 1; }
           test -n "${CORE_RUN}" || { echo "wine_core_run_id is required" >&2; exit 1; }
 
       - name: Install build tools
@@ -401,14 +389,6 @@ jobs:
       - name: Fetch XcodeGen
         run: scripts/fetch-dependencies.sh --platform ios --configuration Release || true
 
-      - name: Download the Wine runtime
-        uses: actions/download-artifact@v4
-        with:
-          name: fex64-wine-runtime
-          path: build/wine-inputs/runtime
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ inputs.wine_runtime_run_id }}
-
       - name: Download the native Wine core
         uses: actions/download-artifact@v4
         with:
@@ -422,7 +402,7 @@ jobs:
           scripts/build-fex64-app.sh \
             --configuration Release \
             --wine-core-dir build/wine-inputs/core \
-            --wine-runtime-dir build/wine-inputs/runtime \
+            --wine-runtime-dir third_party/fex64/mythic/app/Mythic \
             --mythic-dir third_party/fex64/mythic
 
       - uses: actions/upload-artifact@v4
