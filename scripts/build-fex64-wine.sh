@@ -174,10 +174,29 @@ for tree in ${TREES}; do
     esac
 done
 
+# What each tree is built *for* decides how much of it to build.
+#
+# The macOS tree is a header generator, and building it all the way through
+# fails on purpose-built iOS code: the fork's win32u references glue that lives
+# in the application rather than in Wine, so win32u.so cannot link on a macOS
+# host and never needs to. Building the include directory alone produces
+# config.h and the widl-generated headers, which is the entire reason this tree
+# exists.
+#
+# The ARM64EC tree is the Windows side that actually runs, so it is built in
+# full.
+make_target() {
+    case "$1" in
+        macos)   echo "include" ;;
+        arm64ec) echo "" ;;
+    esac
+}
+
 for tree in ${TREES}; do
     build="${SOURCE}/build-${tree}"
-    log "wine/${tree}: building with ${JOBS} jobs"
-    if ! make -C "${build}" -j "${JOBS}" > "${build}/build.log" 2>&1; then
+    target="$(make_target "${tree}")"
+    log "wine/${tree}: building ${target:-everything} with ${JOBS} jobs"
+    if ! make -C "${build}" -j "${JOBS}" ${target} > "${build}/build.log" 2>&1; then
         warn "wine/${tree}: build failed; last 40 lines"
         tail -40 "${build}/build.log" >&2
         die "wine/${tree}: build failed. Full log: ${build}/build.log"
