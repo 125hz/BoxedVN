@@ -277,8 +277,8 @@ jobs:
               exit 1
             }
           done
-          test -f "${staging}/aarch64-windows/wineboot.exe" || {
-            echo "the runtime artifact is missing wineboot.exe" >&2
+          test -f "${staging}/aarch64-windows/child-test.exe" || {
+            echo "the runtime artifact is missing the headless acceptance executable" >&2
             exit 1
           }
           du -sh "${staging}"/*

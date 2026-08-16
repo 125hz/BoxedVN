@@ -12,20 +12,20 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
+#include <fcntl.h>
 #include <mutex>
 #include <string>
+#include <unistd.h>
 
 #if BVN_WINE_BOOT_ENABLED
 
 #include <cerrno>
 #include <csetjmp>
 #include <cstdlib>
-#include <cstring>
-#include <fcntl.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 extern "C" {
 int wineserver_main(int argc, char* argv[]);
@@ -60,7 +60,26 @@ std::atomic<BVNWineStage> g_stage {
 #endif
 };
 std::mutex g_reportMutex;
+std::mutex g_snapshotMutex;
 std::string g_report;
+std::string g_logPath;
+
+NSString* diagnosticLogPath() {
+    NSString* documents = [NSFileManager.defaultManager
+        URLsForDirectory:NSDocumentDirectory
+               inDomains:NSUserDomainMask].firstObject.path;
+    return [documents stringByAppendingPathComponent:@"fex64-wine.log"];
+}
+
+void appendDiagnosticLine(const std::string& path, const char* line) {
+    if (path.empty()) return;
+    const int descriptor = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (descriptor == -1) return;
+    const size_t length = strlen(line);
+    (void)write(descriptor, line, length);
+    (void)write(descriptor, "\n", 1);
+    close(descriptor);
+}
 
 void reportf(const char* format, ...) {
     char line[2048];
@@ -69,11 +88,14 @@ void reportf(const char* format, ...) {
     vsnprintf(line, sizeof(line), format, arguments);
     va_end(arguments);
 
+    std::string logPath;
     {
         std::lock_guard<std::mutex> guard(g_reportMutex);
         if (!g_report.empty()) g_report.push_back('\n');
         g_report += line;
+        logPath = g_logPath;
     }
+    appendDiagnosticLine(logPath, line);
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT,
                      "[BoxedVN Wine] %{public}s", line);
 }
@@ -83,6 +105,36 @@ void reportf(const char* format, ...) {
 std::atomic<bool> g_starting {false};
 std::atomic<bool> g_serverRunning {false};
 std::string g_prefix;
+
+bool prepareDiagnostics() {
+    NSString* path = diagnosticLogPath();
+    {
+        std::lock_guard<std::mutex> guard(g_reportMutex);
+        g_report.clear();
+        g_logPath = path.fileSystemRepresentation;
+    }
+
+    const int descriptor = open(path.fileSystemRepresentation,
+                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (descriptor == -1) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[BoxedVN Wine] could not open persistent log: %{public}s",
+                     strerror(errno));
+        return false;
+    }
+
+    static const char separator[] =
+        "\n===== BoxedVN fex64 Wine session =====\n";
+    (void)write(descriptor, separator, sizeof(separator) - 1);
+
+    // Wine's iOS bridge already emits its lowest-level breadcrumbs to stderr.
+    // Redirect before either native thread starts so a fatal signal still
+    // leaves evidence even when Swift and os_log never get another turn.
+    const bool redirected = dup2(descriptor, STDERR_FILENO) != -1 &&
+                            dup2(descriptor, STDOUT_FILENO) != -1;
+    close(descriptor);
+    return redirected;
+}
 
 NSString* bundled(NSString* name) {
     return [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:name];
@@ -180,10 +232,8 @@ void* serverThread(void*) {
         setenv("HOME", g_prefix.c_str(), 1);
 
         NSString* nls = bundled(@"nls");
-        NSString* log = [NSHomeDirectory() stringByAppendingPathComponent:
-                          @"Documents/fex64-wine.log"];
         wineserver_set_nls_dir(nls.fileSystemRepresentation);
-        wineserver_log_set_file(log.fileSystemRepresentation);
+        wineserver_log_set_file(g_logPath.c_str());
         foreground = 1;
         g_serverRunning.store(true, std::memory_order_release);
         reportf("entering the embedded wineserver");
@@ -205,6 +255,7 @@ void* processThread(void*) {
         setenv("WINELOADERNOEXEC", "1", 1);
         setenv("WINEDLLPATH", NSBundle.mainBundle.bundlePath.fileSystemRepresentation, 1);
         setenv("WINEDEBUG", "err+all", 1);
+        setenv("MYTHIC_TEST_VAR", "steam-s1", 1);
 
         const int64_t writeOffset = BVNFexWriteOffset();
         if (writeOffset != 0) {
@@ -214,21 +265,23 @@ void* processThread(void*) {
             reportf("published the runtime JIT alias offset");
         }
 
-        NSString* log = [NSHomeDirectory() stringByAppendingPathComponent:
-                          @"Documents/fex64-wine.log"];
-        wine_log_set_file(log.fileSystemRepresentation);
+        wine_log_set_file(g_logPath.c_str());
 
         BVNWinePrepareExitTrap();
         g_stage.store(BVNWineStageProcessStarted, std::memory_order_release);
         reportf("entering Wine through native ntdll");
 
         char loader[] = "wine";
-        char target[] = "C:\\windows\\system32\\wineboot.exe";
-        char initialize[] = "--init";
-        char* arguments[] = {loader, target, initialize, nullptr};
+        // The bundled prefix was initialized on macOS before packaging. The
+        // iOS ntdll integration also pre-signals Wine's bootstrap event, so a
+        // second wineboot run only pulls unfinished GUI/optional unixlibs into
+        // this headless milestone. This tiny console PE proves the native
+        // loader, kernel32, heap, virtual memory, and orderly exit first.
+        char target[] = "C:\\windows\\system32\\child-test.exe";
+        char* arguments[] = {loader, target, nullptr};
 
         if (setjmp(*BVNWineExitJumpBuffer()) == 0) {
-            __wine_main(3, arguments);
+            __wine_main(2, arguments);
             reportf("Wine returned normally");
         } else {
             reportf("Wine exited with code %d", BVNWineExitCode());
@@ -277,6 +330,11 @@ extern "C" bool BVNWineStart(void) {
     if (!g_starting.compare_exchange_strong(expected, true)) {
         reportf("Wine bootstrap is already running");
         return false;
+    }
+    if (!prepareDiagnostics()) {
+        reportf("persistent logging could not redirect stdout and stderr");
+    } else {
+        reportf("persistent log ready at Documents/fex64-wine.log");
     }
     if (!BVNWineAvailable()) {
         reportf("the linked build is missing one or more Wine resources");
@@ -369,5 +427,33 @@ extern "C" const char* BVNWineReport(void) {
     static std::string snapshot;
     std::lock_guard<std::mutex> guard(g_reportMutex);
     snapshot = g_report;
+    return snapshot.c_str();
+}
+
+extern "C" const char* BVNWineLogPath(void) {
+    static std::string snapshot;
+    std::lock_guard<std::mutex> guard(g_snapshotMutex);
+    snapshot = diagnosticLogPath().fileSystemRepresentation;
+    return snapshot.c_str();
+}
+
+extern "C" const char* BVNWinePersistentLog(void) {
+    static std::string snapshot;
+    constexpr NSUInteger maximumBytes = 256 * 1024;
+    NSData* data = [NSData dataWithContentsOfFile:diagnosticLogPath()];
+    if (data.length > maximumBytes) {
+        data = [data subdataWithRange:NSMakeRange(data.length - maximumBytes,
+                                                  maximumBytes)];
+    }
+    NSString* contents = data.length == 0
+        ? @""
+        : [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!contents && data.length != 0) {
+        contents = [[NSString alloc] initWithData:data
+                                         encoding:NSISOLatin1StringEncoding];
+    }
+
+    std::lock_guard<std::mutex> guard(g_snapshotMutex);
+    snapshot = contents ? contents.UTF8String : "";
     return snapshot.c_str();
 }

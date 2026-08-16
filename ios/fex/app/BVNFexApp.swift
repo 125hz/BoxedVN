@@ -28,11 +28,12 @@ struct ProbeView: View {
     @State private var copied = false
     @State private var wineStage = BVNWineStageUnavailable
     @State private var wineReport = ""
+    @State private var winePersistentLog = ""
     @State private var wineRunning = false
 
     // The steps that talk to StikDebug cannot be cancelled and can wait
     // forever, so the interface polls instead of waiting for a return value.
-    private let tick = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
+    private let tick = Timer.publish(every: 0.75, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
@@ -112,9 +113,21 @@ struct ProbeView: View {
                     }
 
                     if !wineReport.isEmpty {
-                        Text(wineReport)
-                            .font(.system(.footnote, design: .monospaced))
-                            .textSelection(.enabled)
+                        diagnosticPane(wineDisplayText, maximumHeight: 320)
+                    } else if !winePersistentLog.isEmpty {
+                        diagnosticPane(wineDisplayText, maximumHeight: 320)
+                    }
+
+                    if !winePersistentLog.isEmpty {
+                        ShareLink(item: wineLogURL) {
+                            Label("Export Wine log", systemImage: "square.and.arrow.up")
+                        }
+                    }
+
+                    if BVNWineAvailable() {
+                        Text("Persistent log: \(String(cString: BVNWineLogPath()))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 } header: {
                     Text("Wine bootstrap")
@@ -124,26 +137,28 @@ struct ProbeView: View {
 
                 if !report.isEmpty {
                     Section("What happened") {
-                        Text(report)
-                            .font(.system(.footnote, design: .monospaced))
-                            .textSelection(.enabled)
+                        diagnosticPane(report, maximumHeight: 420)
                     }
                 }
             }
             .navigationTitle("BoxedVN fex64")
             .toolbar {
+                if !diagnosticsText.isEmpty {
+                    ToolbarItem(placement: .primaryAction) {
+                        ShareLink(item: diagnosticsText) {
+                            Label("Share diagnostics", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) {
-                    // A share sheet is a poor fit for a report you most want
-                    // while something is stuck; the copy is one tap and cannot
-                    // fail to present.
                     Button {
-                        UIPasteboard.general.string = report
+                        UIPasteboard.general.string = diagnosticsText
                         copied = true
                     } label: {
-                        Label(copied ? "Copied" : "Copy report",
+                        Label(copied ? "Copied" : "Copy diagnostics",
                               systemImage: copied ? "checkmark" : "doc.on.doc")
                     }
-                    .disabled(report.isEmpty)
+                    .disabled(diagnosticsText.isEmpty)
                 }
             }
         }
@@ -157,12 +172,46 @@ struct ProbeView: View {
             }
             if wineRunning {
                 wineStage = BVNWineStageReached()
-                wineReport = String(cString: BVNWineReport())
+                let latestReport = String(cString: BVNWineReport())
+                let latestLog = String(cString: BVNWinePersistentLog())
+                if latestReport != wineReport { wineReport = latestReport }
+                if latestLog != winePersistentLog { winePersistentLog = latestLog }
                 if wineStage == BVNWineStageExited || wineStage == BVNWineStageFailed {
                     wineRunning = false
                 }
             }
         }
+    }
+
+    private var wineDisplayText: String {
+        winePersistentLog.isEmpty ? wineReport : winePersistentLog
+    }
+
+    private var wineLogURL: URL {
+        URL(fileURLWithPath: String(cString: BVNWineLogPath()))
+    }
+
+    private var diagnosticsText: String {
+        var sections: [String] = []
+        if !report.isEmpty {
+            sections.append("FEX probe\n\(report)")
+        }
+        if !wineDisplayText.isEmpty {
+            sections.append("Wine bootstrap\n\(wineDisplayText)")
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func diagnosticPane(_ contents: String,
+                                maximumHeight: CGFloat) -> some View {
+        ScrollView(.vertical) {
+            Text(contents)
+                .font(.system(.footnote, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+        }
+        .frame(maxHeight: maximumHeight)
+        .accessibilityLabel("Diagnostic output")
     }
 
     // The previous version said the same thing whichever step was stuck, which
@@ -201,6 +250,7 @@ struct ProbeView: View {
                 if !started { wineRunning = false }
                 wineStage = BVNWineStageReached()
                 wineReport = String(cString: BVNWineReport())
+                winePersistentLog = String(cString: BVNWinePersistentLog())
             }
         }
     }
@@ -210,6 +260,7 @@ struct ProbeView: View {
         report = String(cString: BVNFexReport())
         wineStage = BVNWineStageReached()
         wineReport = String(cString: BVNWineReport())
+        winePersistentLog = String(cString: BVNWinePersistentLog())
 
         var bytes = 0
         var used = 0

@@ -27,7 +27,7 @@ typedef enum {
 /// runtime inputs.
 bool BVNWineAvailable(void);
 
-/// Starts the embedded wineserver and a headless Wine prefix initialization.
+/// Starts the embedded wineserver and a small headless PE acceptance program.
 /// Returns after the worker threads have been created; progress is reported by
 /// BVNWineStageReached and BVNWineReport.
 bool BVNWineStart(void);
@@ -35,6 +35,11 @@ bool BVNWineStart(void);
 BVNWineStage BVNWineStageReached(void);
 const char* BVNWineStageName(BVNWineStage stage);
 const char* BVNWineReport(void);
+/// Stable Documents path used by both Wine halves and stderr. The file remains
+/// available after a crash and can be exported on the next app launch.
+const char* BVNWineLogPath(void);
+/// Up to the most recent 256 KiB from BVNWineLogPath.
+const char* BVNWinePersistentLog(void);
 
 #ifdef __cplusplus
 }

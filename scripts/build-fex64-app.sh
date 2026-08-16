@@ -111,7 +111,7 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
     MYTHIC_DIR="$(cd "${MYTHIC_DIR}" && pwd)"
     require_file "${WINE_CORE_DIR}/lib/libntdll_unix.a"
     require_file "${WINE_CORE_DIR}/lib/libwineserver.a"
-    require_file "${WINE_RUNTIME_DIR}/aarch64-windows/wineboot.exe"
+    require_file "${WINE_RUNTIME_DIR}/aarch64-windows/child-test.exe"
     require_file "${WINE_RUNTIME_DIR}/arm64ec-windows/ntdll.dll"
     require_file "${MYTHIC_DIR}/app/Mythic/arm64ec-windows/xtajit64.dll"
     require_file "${MYTHIC_DIR}/app/Mythic/prefix-template.tar.gz"
