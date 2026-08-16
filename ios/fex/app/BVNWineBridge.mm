@@ -99,19 +99,19 @@ bool preparePrefix() {
     NSString* documents = [files URLsForDirectory:NSDocumentDirectory
                                          inDomains:NSUserDomainMask].firstObject.path;
     NSString* prefix = [documents stringByAppendingPathComponent:@"fex64-wine"];
-    NSString* template = bundled(@"prefix-template");
+    NSString* prefixTemplate = bundled(@"prefix-template");
     NSString* marker = [prefix stringByAppendingPathComponent:@".update-timestamp"];
     NSError* error = nil;
 
     if (![files fileExistsAtPath:marker]) {
-        if (![files fileExistsAtPath:template]) {
+        if (![files fileExistsAtPath:prefixTemplate]) {
             reportf("prefix template is missing from the app bundle");
             return false;
         }
 
         NSString* staging = [documents stringByAppendingPathComponent:@"fex64-wine-staging"];
         [files removeItemAtPath:staging error:nil];
-        if (![files copyItemAtPath:template toPath:staging error:&error]) {
+        if (![files copyItemAtPath:prefixTemplate toPath:staging error:&error]) {
             reportf("could not stage the Wine prefix: %s",
                     error.localizedDescription.UTF8String);
             return false;
