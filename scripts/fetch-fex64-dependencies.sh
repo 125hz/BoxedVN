@@ -98,10 +98,18 @@ fetch_pinned() {
 The pin in scripts/dependencies.fex64.lock.sh predates a force-push or the
 branch was renamed. Update the pin deliberately, and record why."
 
+    # A shallow submodule update only works when the recorded commit happens
+    # to be a branch tip upstream, which for a tree with a dozen submodules is
+    # not something to rely on. Try it, because it is much faster when it
+    # works, then fall back to a full one.
     if [[ "${submodules}" == "yes" ]]; then
         log "${name}: submodules"
-        git -C "${destination}" submodule update --init --recursive --depth 1 \
-            || die "${name}: submodule checkout failed"
+        if ! git -C "${destination}" submodule update --init --recursive --depth 1; then
+            warn "${name}: shallow submodule update failed; retrying unshallowed"
+            git -C "${destination}" submodule deinit --all --force >/dev/null 2>&1 || true
+            git -C "${destination}" submodule update --init --recursive \
+                || die "${name}: submodule checkout failed"
+        fi
     fi
 
     ok "${name}: $(git -C "${destination}" rev-parse HEAD)"

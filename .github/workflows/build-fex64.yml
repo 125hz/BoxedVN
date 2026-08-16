@@ -33,6 +33,7 @@ on:
       - fex64
     paths: &fex64_paths
       - .github/workflows/build-fex64.yml
+      - .github/fex64-fetch.sh
       - scripts/common.sh
       - scripts/dependencies.fex64.lock.sh
       - scripts/fetch-fex64-dependencies.sh
@@ -57,13 +58,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Make scripts executable
+        run: chmod +x scripts/fetch-fex64-dependencies.sh .github/fex64-fetch.sh
+
       # Fetching by commit is the whole point of the pin, and it is also the
       # thing that breaks silently when a fork force-pushes. Checking it costs
       # a minute and saves a multi-hour job that would have failed at the end.
-      - name: Fetch pinned forks
-        run: |
-          chmod +x scripts/fetch-fex64-dependencies.sh
-          scripts/fetch-fex64-dependencies.sh --component all
+      #
+      # One step per component, and each one republishes its own failure as an
+      # ::error:: annotation. Actions logs need a token to read; annotations do
+      # not, so this is what makes a red run diagnosable by anyone looking at
+      # the repository rather than only by whoever is signed in.
+      - name: Fetch FEX
+        if: always()
+        run: .github/fex64-fetch.sh fex
+
+      - name: Fetch Wine
+        if: always()
+        run: .github/fex64-fetch.sh wine
+
+      - name: Fetch DXMT
+        if: always()
+        run: .github/fex64-fetch.sh dxmt
 
       - name: Report what resolved
         run: |
