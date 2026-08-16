@@ -232,6 +232,7 @@ Support and is deleted with the game. Save export is not implemented yet.
 | [docs/ARCHITECTURE_IOS.md](docs/ARCHITECTURE_IOS.md) | lifecycle, threading, JIT, rendering, the backend seam |
 | [docs/TESTING_IOS.md](docs/TESTING_IOS.md) | the automated suite and the on-device checklist |
 | [docs/KNOWN_LIMITATIONS_IOS.md](docs/KNOWN_LIMITATIONS_IOS.md) | what does not work, and why |
+| [docs/ARCHITECTURE_FEX64.md](docs/ARCHITECTURE_FEX64.md) | the `fex64` branch: native ARM64 Wine, FEX and DXMT — a different emulator, for x86-64 3D titles |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | every dependency and its licence |
 
 ---

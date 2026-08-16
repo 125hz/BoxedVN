@@ -19,6 +19,7 @@ on:
   push:
     branches:
       - ios
+      - fex64
       - main
       - master
     paths: &ios_build_paths
@@ -37,6 +38,7 @@ on:
   pull_request:
     branches:
       - ios
+      - fex64
       - main
       - master
     paths: *ios_build_paths
