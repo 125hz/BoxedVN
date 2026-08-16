@@ -64,6 +64,10 @@ namespace {
 // need opposite responses.
 constexpr size_t kJitPoolBytes = 64u * 1024u * 1024u;
 
+// Below this the translator has no room to be interesting, and a pool this
+// small means something is wrong with the arena rather than merely tight.
+constexpr size_t kMinimumPoolBytes = 4u * 1024u * 1024u;
+
 // iOS pages. The arena is prepared a page at a time and the pool has to align
 // with that or the last page is half-owned.
 constexpr size_t kPageBytes = 0x4000;
@@ -152,34 +156,74 @@ bool prepareArena() {
     }
 
     if (!BVNExecMemArenaPrepared() && !BVNExecMemPrepareArena()) {
-        reportf("the executable arena was refused. Is BoxedVN running through "
+        reportf("the executable arena was refused. Is this running through "
                 "StikDebug with universal.js assigned?");
         return false;
     }
 
-    void* executable = BVNExecMemAlloc(kJitPoolBytes);
+    // Preparing the arena is not enough to allocate from it. BVNExecMemAlloc
+    // refuses until the arena has been *confirmed* - a small function written
+    // through the writable alias, called through the executable address, and
+    // seen to return the value it should. Until that has happened the arena is
+    // memory the debugger says is executable, which is not the same as memory
+    // this device will actually execute.
+    //
+    // That confirmation is the one step that can take the process down with no
+    // recovery, which is why it is here, behind a deliberate action, and not
+    // at launch.
+    if (!BVNExecMemExecutionConfirmed()) {
+        const BVNExecMemStrategy strategy = BVNExecMemProbe(true);
+        reportf("arena strategy: %s", BVNExecMemStrategyName(strategy));
+        if (!BVNExecMemExecutionConfirmed()) {
+            reportf("the arena did not execute its own probe, so nothing can "
+                    "be allocated from it:\n%s", BVNExecMemReport());
+            return false;
+        }
+        reportf("arena confirmed: code written through the alias executed from "
+                "the r-x address");
+    }
+
+    // Segments are a fixed size and an allocation has to fit inside one, so
+    // asking for exactly a segment's worth is the request most likely to be
+    // refused by a byte of bookkeeping. Take the largest pool the arena will
+    // actually give rather than failing on a round number.
+    void* executable = nullptr;
+    size_t poolBytes = 0;
+    for (size_t candidate = kJitPoolBytes; candidate >= kMinimumPoolBytes;
+         candidate /= 2) {
+        executable = BVNExecMemAlloc(candidate);
+        if (executable != nullptr) {
+            poolBytes = candidate;
+            break;
+        }
+        reportf("arena declined %zu MiB; trying half", candidate / (1024 * 1024));
+    }
+
     if (executable == nullptr) {
         size_t capacity = 0;
         size_t available = 0;
-        BVNExecMemArenaStatus(&capacity, &available, nullptr);
-        reportf("the arena is prepared but would not give %zu MiB "
-                "(%zu MiB of %zu MiB free)",
-                kJitPoolBytes / (1024 * 1024), available / (1024 * 1024),
-                capacity / (1024 * 1024));
+        size_t segments = 0;
+        BVNExecMemArenaStatus(&capacity, &available, &segments);
+        reportf("the arena is confirmed but would give nothing down to %zu MiB "
+                "(%zu MiB free of %zu MiB across %zu segments)",
+                kMinimumPoolBytes / (1024 * 1024), available / (1024 * 1024),
+                capacity / (1024 * 1024), segments);
         return false;
     }
 
-    void* writable = BVNExecMemWritableAddress(executable, kJitPoolBytes);
+    const size_t kJitPoolBytesActual = poolBytes;
+
+    void* writable = BVNExecMemWritableAddress(executable, kJitPoolBytesActual);
     if (writable == nullptr) {
         reportf("no writable alias for the pool; generated code could not be "
                 "written");
-        BVNExecMemFree(executable, kJitPoolBytes);
+        BVNExecMemFree(executable, kJitPoolBytesActual);
         return false;
     }
 
     g_poolExecutable = executable;
     g_poolWritable = writable;
-    g_poolBytes = kJitPoolBytes;
+    g_poolBytes = kJitPoolBytesActual;
     g_poolUsed.store(0, std::memory_order_relaxed);
 
     // The distance between the two views is what generated code needs in order
@@ -187,7 +231,7 @@ bool prepareArena() {
     // placed wherever the kernel puts it - so it is reported rather than
     // assumed anywhere.
     reportf("arena pool %zu MiB at rx=%p rw=%p (rw-rx=%+lld)",
-            kJitPoolBytes / (1024 * 1024), executable, writable,
+            kJitPoolBytesActual / (1024 * 1024), executable, writable,
             (long long)((intptr_t)writable - (intptr_t)executable));
     return true;
 }
