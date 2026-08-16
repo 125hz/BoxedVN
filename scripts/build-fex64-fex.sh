@@ -199,6 +199,14 @@ $(ls "${STAGING}/lib" | sed 's/^/  /')"
 # set is staged into one directory that a consumer can put on its search path.
 mkdir -p "${STAGING}/include"
 cp -R "${SOURCE}/FEXCore/include/." "${STAGING}/include/"
+
+# Some of FEXCore's headers are generated into the build tree rather than
+# checked in - Config.h includes ConfigValues.inl, which a script writes during
+# the build - so the source tree alone yields a header set that cannot be
+# included even though every file appears to be present.
+if [[ -d "${BUILD}/include" ]]; then
+    cp -R "${BUILD}/include/." "${STAGING}/include/"
+fi
 for headers in \
     "External/fmt/include" \
     "External/unordered_dense/include" \
@@ -229,6 +237,10 @@ for headers in \
         warn "no ${headers} to stage; a consumer may fail to include it"
     fi
 done
+
+[[ -f "${STAGING}/include/FEXCore/Config/ConfigValues.inl" ]] || die \
+"FEX: the generated configuration header did not stage.
+FEXCore/Config/Config.h includes it, so nothing can initialise FEX without it."
 
 [[ -f "${STAGING}/include/fmt/format.h" ]] || die \
 "FEX: fmt headers did not stage, and FEXCore's LogManager.h includes them.
