@@ -64,6 +64,7 @@ std::mutex g_reportMutex;
 std::mutex g_snapshotMutex;
 std::string g_report;
 std::string g_logPath;
+std::atomic<BVNWineTarget> g_target {BVNWineTargetX64};
 
 NSString* diagnosticLogPath() {
     NSString* documents = [NSFileManager.defaultManager
@@ -249,14 +250,19 @@ bool preparePrefix() {
         return false;
     }
 
-    // The session runtime must be ARM64EC when the main executable is x64:
-    // its hybrid ntdll and xtajit64 bridge are what hand x64 code to FEX.
+    // Translated and graphics probes use ARM64EC so xtajit64 can hand x64
+    // code to FEX. The native probe keeps the aarch64 runtime available as a
+    // control without requiring a different IPA.
     // Recreate every symlink because the app bundle path changes when a
     // sideloader reinstalls the IPA.
-    NSString* runtime = bundled(@"arm64ec-windows");
+    const BVNWineTarget target = g_target.load(std::memory_order_acquire);
+    const bool nativeTarget = target == BVNWineTargetNative;
+    NSString* runtimeName = nativeTarget ? @"aarch64-windows" : @"arm64ec-windows";
+    NSString* runtime = bundled(runtimeName);
     NSArray<NSString*>* names = [files contentsOfDirectoryAtPath:runtime error:&error];
     if (!names) {
-        reportf("could not read the ARM64EC Wine runtime: %s",
+        reportf("could not read the %s Wine runtime: %s",
+                runtimeName.UTF8String,
                 error.localizedDescription.UTF8String);
         return false;
     }
@@ -280,7 +286,8 @@ bool preparePrefix() {
                 withDestinationPath:@"../drive_c" error:nil];
 
     g_prefix = prefix.fileSystemRepresentation;
-    reportf("prefix ready with %lu ARM64EC runtime links", (unsigned long)linked);
+    reportf("prefix ready with %lu %s runtime links", (unsigned long)linked,
+            runtimeName.UTF8String);
     g_stage.store(BVNWineStagePrefixReady, std::memory_order_release);
     return linked != 0;
 }
@@ -333,10 +340,17 @@ void* processThread(void*) {
         reportf("entering Wine through native ntdll");
 
         char loader[] = "wine";
-        // This small x64 console PE performs recursive integer work, writes a
-        // deterministic result, and exits with 232. Reaching that result proves
-        // the ARM64EC loader entered xtajit64 and FEX translated guest code.
-        char target[] = "C:\\windows\\system32\\fib-x64.exe";
+        char nativeTarget[] = "C:\\windows\\system32\\child-test.exe";
+        char x64Target[] = "C:\\windows\\system32\\fib-x64.exe";
+        char dxmtTarget[] = "C:\\windows\\system32\\cube-x64.exe";
+        char* target = x64Target;
+        switch (g_target.load(std::memory_order_acquire)) {
+            case BVNWineTargetNative: target = nativeTarget; break;
+            case BVNWineTargetX64: target = x64Target; break;
+            case BVNWineTargetDXMT: target = dxmtTarget; break;
+        }
+        reportf("selected acceptance target: %s",
+                BVNWineTargetName(g_target.load(std::memory_order_relaxed)));
         char* arguments[] = {loader, target, nullptr};
 
         if (setjmp(*BVNWineExitJumpBuffer()) == 0) {
@@ -381,6 +395,28 @@ extern "C" bool BVNWineAvailable(void) {
 #else
     return false;
 #endif
+}
+
+extern "C" bool BVNWineSetTarget(BVNWineTarget target) {
+    if (target < BVNWineTargetNative || target > BVNWineTargetDXMT) return false;
+#if BVN_WINE_BOOT_ENABLED
+    if (g_starting.load(std::memory_order_acquire)) return false;
+#endif
+    g_target.store(target, std::memory_order_release);
+    return true;
+}
+
+extern "C" BVNWineTarget BVNWineSelectedTarget(void) {
+    return g_target.load(std::memory_order_acquire);
+}
+
+extern "C" const char* BVNWineTargetName(BVNWineTarget target) {
+    switch (target) {
+        case BVNWineTargetNative: return "native control";
+        case BVNWineTargetX64: return "x64 translation";
+        case BVNWineTargetDXMT: return "x64 graphics";
+    }
+    return "unknown";
 }
 
 extern "C" bool BVNWineStart(void) {

@@ -45,6 +45,7 @@ WINE_BUILD="${WINE_SOURCE}/build-macos"
 INTEGRATION="${FEX64_DIR}/mythic"
 NTDLL_IOS="${INTEGRATION}/build/ntdll-unix"
 SERVER_IOS="${INTEGRATION}/build/wineserver"
+JIT_AUTHORITY_PATCH="${BOXEDVN_ROOT}/patches/mythic-jit-pool-authority.patch"
 OUTPUT="${FEX64_DIR}/wine-ios-core"
 OBJECTS="${FEX64_DIR}/wine-ios-core-objects"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -54,6 +55,16 @@ require_file "${WINE_BUILD}/include/config.h" \
 require_file "${NTDLL_IOS}/virtual_ios.c" \
     "Fetch the pinned Mythic integration sources before building the iOS Wine core."
 require_file "${SERVER_IOS}/main_ios.c"
+require_file "${JIT_AUTHORITY_PATCH}"
+
+if git -C "${INTEGRATION}" apply --check "${JIT_AUTHORITY_PATCH}"; then
+    log "Applying JIT-pool data ownership fix"
+    git -C "${INTEGRATION}" apply "${JIT_AUTHORITY_PATCH}"
+elif git -C "${INTEGRATION}" apply --reverse --check "${JIT_AUTHORITY_PATCH}"; then
+    log "JIT-pool data ownership fix is already applied"
+else
+    die "The pinned integration source no longer accepts ${JIT_AUTHORITY_PATCH}; refresh the patch explicitly."
+fi
 
 rm -rf "${OUTPUT}" "${OBJECTS}"
 mkdir -p "${OUTPUT}/lib" "${OBJECTS}/ntdll" "${OBJECTS}/wineserver"

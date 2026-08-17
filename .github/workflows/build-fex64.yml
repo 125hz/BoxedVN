@@ -27,6 +27,7 @@ on:
           - wine
           - wine-ios
           - wineboot
+          - bringup
           - toolchains
       wine_core_run_id:
         description: Successful run containing fex64-wine-ios-core (wineboot only)
@@ -418,6 +419,75 @@ jobs:
         with:
           name: fex64-wineboot-xcodebuild-log
           path: build/fex64-Release/xcodebuild.log
+          if-no-files-found: ignore
+
+  bringup:
+    name: Combined Wine bring-up and unsigned IPA
+    needs: pins
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'bringup'
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install bison flex mingw-w64 ninja || true
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh .github/*.sh
+
+      - name: Fetch the complete bring-up source set
+        run: |
+          scripts/fetch-fex64-dependencies.sh --component wine
+          scripts/fetch-fex64-dependencies.sh --component mythic
+          scripts/fetch-fex64-dependencies.sh --component fex
+          scripts/fetch-dependencies.sh --platform ios --configuration Release || true
+
+      - name: Restore cross-toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/fex64/toolchains
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
+          restore-keys: fex64-toolchains-${{ runner.os }}-
+
+      - name: Restore FEX iPhoneOS staging cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/fex64/fex-ios-staging
+          key: fex64-ios-staging-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh') }}
+          restore-keys: fex64-ios-staging-${{ runner.os }}-
+
+      - name: Build Wine, its iPhoneOS core, and the app in one run
+        run: |
+          scripts/build-fex64-toolchains.sh --stage llvm-mingw
+          scripts/build-fex64-wine.sh --tree all
+          scripts/build-fex64-wine-ios-core.sh
+          scripts/build-fex64-app.sh \
+            --configuration Release \
+            --wine-core-dir third_party/fex64/wine-ios-core \
+            --wine-runtime-dir third_party/fex64/mythic/app/Mythic \
+            --mythic-dir third_party/fex64/mythic
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex64-bringup-unsigned-ipa
+          path: build/fex64-Release/artifacts
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish combined-build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex64-bringup-build-diagnostics
+          path: |
+            third_party/fex64/wine-ios-core-objects/**/*.err
+            third_party/fex64/wine/build-*/configure.log
+            third_party/fex64/wine/build-*/build.log
+            build/fex64-Release/xcodebuild.log
           if-no-files-found: ignore
 
   toolchains:

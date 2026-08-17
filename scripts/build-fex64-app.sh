@@ -113,6 +113,8 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
     require_file "${WINE_CORE_DIR}/lib/libwineserver.a"
     require_file "${WINE_RUNTIME_DIR}/arm64ec-windows/ntdll.dll"
     require_file "${WINE_RUNTIME_DIR}/arm64ec-windows/fib-x64.exe"
+    require_file "${WINE_RUNTIME_DIR}/arm64ec-windows/cube-x64.exe"
+    require_file "${WINE_RUNTIME_DIR}/aarch64-windows/child-test.exe"
     require_file "${MYTHIC_DIR}/app/Mythic/arm64ec-windows/xtajit64.dll"
     require_file "${MYTHIC_DIR}/app/Mythic/prefix-template.tar.gz"
     [[ -d "${MYTHIC_DIR}/app/Mythic/nls" ]] || die "The pinned iOS integration has no NLS directory."

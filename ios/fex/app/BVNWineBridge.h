@@ -23,11 +23,23 @@ typedef enum {
     BVNWineStageFailed = 7,
 } BVNWineStage;
 
+typedef enum {
+    BVNWineTargetNative = 0,
+    BVNWineTargetX64 = 1,
+    BVNWineTargetDXMT = 2,
+} BVNWineTarget;
+
 /// True only in builds that link the native Wine archives and bundle their
 /// runtime inputs.
 bool BVNWineAvailable(void);
 
-/// Starts the embedded wineserver and a small headless PE acceptance program.
+/// Selects the bundled acceptance executable for the next bootstrap. The
+/// selection is locked once Wine starts.
+bool BVNWineSetTarget(BVNWineTarget target);
+BVNWineTarget BVNWineSelectedTarget(void);
+const char* BVNWineTargetName(BVNWineTarget target);
+
+/// Starts the embedded wineserver and the selected PE acceptance program.
 /// Returns after the worker threads have been created; progress is reported by
 /// BVNWineStageReached and BVNWineReport.
 bool BVNWineStart(void);

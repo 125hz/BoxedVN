@@ -1,0 +1,30 @@
+diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
+index 12ca1e8..0e8003a 100644
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -15479,4 +15479,25 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
+ #ifdef WINE_IOS
++        if (ios_jit_orig_addr)
++        {
++            /* The caller is executing from the pool copy, so its mutable data
++             * is authoritative for this protect/write/restore cycle. Returning
++             * the parent address loses that provenance: the restore call then
++             * takes the parent-to-pool sync path and overwrites stores that ran
++             * through the RX/RW aliases. Keep the rounded address in the pool
++             * and skip the parent-to-pool copy below. */
++            uintptr_t page_delta = (uintptr_t)addr - (uintptr_t)base;
++            void *jit_base = (char *)ios_jit_orig_addr - page_delta;
++            static unsigned long jit_owned_protect_count;
++
++            *addr_ptr = jit_base;
++            if (++jit_owned_protect_count <= 32 || !(jit_owned_protect_count % 256))
++                dprintf(2, "[jit-authority] protect #%lu parent=%p pool=%p size=0x%lx "
++                           "old=0x%x new=0x%x; keeping pool ownership\n",
++                        jit_owned_protect_count, base, jit_base, (unsigned long)size,
++                        old, new_prot);
++            return status;
++        }
++
+         /* (Previously: also called mprotect_exec on the JIT-pool RX side
+          * here, but that uses vm_protect+VM_PROT_COPY which makes the page
+          * PRIVATE — breaking the dual-map sharing with the RW alias. We rely

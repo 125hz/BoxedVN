@@ -30,6 +30,7 @@ struct ProbeView: View {
     @State private var wineReport = ""
     @State private var winePersistentLog = ""
     @State private var wineRunning = false
+    @State private var wineTarget = BVNWineTargetX64
 
     // The steps that talk to StikDebug cannot be cancelled and can wait
     // forever, so the interface polls instead of waiting for a return value.
@@ -95,6 +96,13 @@ struct ProbeView: View {
                             .foregroundStyle(wineStage == BVNWineStageFailed ? Color.red : Color.primary)
                     }
 
+                    Picker("Acceptance target", selection: $wineTarget) {
+                        Text("Native control").tag(BVNWineTargetNative)
+                        Text("x64 translation").tag(BVNWineTargetX64)
+                        Text("x64 graphics").tag(BVNWineTargetDXMT)
+                    }
+                    .disabled(wineRunning)
+
                     Button {
                         startWine()
                     } label: {
@@ -130,6 +138,9 @@ struct ProbeView: View {
                     }
 
                     if BVNWineAvailable() {
+                        Text("The on-screen view keeps a recent tail responsive while the full persistent log remains exportable.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         Text("Persistent log: \(String(cString: BVNWineLogPath()))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -137,7 +148,7 @@ struct ProbeView: View {
                 } header: {
                     Text("Wine bootstrap")
                 } footer: {
-                    Text("Starts the embedded wineserver, loads the ARM64EC runtime from a pre-seeded prefix, and runs a small x64 executable through FEX. A successful log prints the expected calculation and exits with code 232.")
+                    Text("One IPA contains a native control, an x64 translation check, and an x64 graphics check. Select one before starting Wine; restart the app to run another target.")
                 }
 
                 if !report.isEmpty {
@@ -189,7 +200,10 @@ struct ProbeView: View {
     }
 
     private var wineDisplayText: String {
-        winePersistentLog.isEmpty ? wineReport : winePersistentLog
+        let contents = winePersistentLog.isEmpty ? wineReport : winePersistentLog
+        let limit = 24_000
+        guard contents.count > limit else { return contents }
+        return "… showing the most recent \(limit) characters …\n" + String(contents.suffix(limit))
     }
 
     private var wineLogURL: URL {
@@ -249,6 +263,10 @@ struct ProbeView: View {
 
     private func startWine() {
         wineRunning = true
+        guard BVNWineSetTarget(wineTarget) else {
+            wineRunning = false
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let started = BVNWineStart()
             DispatchQueue.main.async {
