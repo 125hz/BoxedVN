@@ -2,7 +2,93 @@ diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64
 index 0d0e5fa..93dd756 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,353 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1785,439 @@ static void *ios_mach_exception_thread( void *arg )
++            /* BoxedVN: the pinned ARM64EC FEX binary occasionally reaches
++             * rpmalloc's available-page path with page->size_class replaced
++             * by the low 32 bits of a block pointer.  The allocator detects
++             * this immediately ([rpm-avail] CORRUPT), but the prebuilt DLL
++             * only reports it and then indexes heap->local_free with the bad
++             * value.  That read leaves Wine's address space and the following
++             * exception cannot be dispatched because ThreadInit has not yet
++             * published StateFrame/ThreadState/EnterEC.
++             *
++             * Recover only the pinned instruction whose full relationship is
++             * independently checkable: libarm64ecfex+0x14bef0 is
++             *
++             *   ldr x9,[x20,#0x28] ; page->heap
++             *   ldr w8,[x20]       ; page->size_class
++             *   add x9,x9,#8       ; heap->local_free
++             *   ldr x10,[x9,x8,lsl #3]
++             *
++             * x17 still holds the caller's validated size class.  Require the
++             * exact four instructions, PE RVA, 64 KiB page base, heap pointer,
++             * computed fault address, an implausible current class, and a
++             * small expected class before changing anything.  Repair the
++             * four-byte header and x8, then retry the faulting load.  Any
++             * different allocator fault stays unhandled and visible. */
++            if (!handled && thread_teb)
++            {
++                extern uint64_t ios_jit_reverse_translate(uint64_t addr,
++                                                          uint64_t *module_base);
++                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
++                uint64_t module_base = 0;
++                uint64_t pe_pc = ios_jit_reverse_translate(fault_pc, &module_base);
++                uintptr_t page = (uintptr_t)state.__x[20];
++                uintptr_t heap = 0;
++                uint32_t current_class = 0;
++                uint32_t expected_class = (uint32_t)state.__x[17];
++                uint32_t sequence[4] = {0};
++                uintptr_t cpu_area = 0;
++                uintptr_t emulator_data[3] = {0};
++                mach_vm_size_t class_read = 0, heap_read = 0, sequence_read = 0;
++                mach_vm_size_t area_read = 0, data_read = 0;
++
++                mach_vm_read_overwrite(mach_task_self(),
++                    (mach_vm_address_t)(fault_pc - 12), sizeof(sequence),
++                    (mach_vm_address_t)sequence, &sequence_read);
++                mach_vm_read_overwrite(mach_task_self(),
++                    (mach_vm_address_t)page, sizeof(current_class),
++                    (mach_vm_address_t)&current_class, &class_read);
++                mach_vm_read_overwrite(mach_task_self(),
++                    (mach_vm_address_t)(page + 0x28), sizeof(heap),
++                    (mach_vm_address_t)&heap, &heap_read);
++                mach_vm_read_overwrite(mach_task_self(),
++                    (mach_vm_address_t)(thread_teb + 0x1788), sizeof(cpu_area),
++                    (mach_vm_address_t)&cpu_area, &area_read);
++                if (area_read == sizeof(cpu_area) && cpu_area)
++                    mach_vm_read_overwrite(mach_task_self(),
++                        (mach_vm_address_t)(cpu_area + 0x30), sizeof(emulator_data),
++                        (mach_vm_address_t)emulator_data, &data_read);
++
++                if (pe_pc && module_base && pe_pc - module_base == 0x14bef0 &&
++                    sequence_read == sizeof(sequence) &&
++                    sequence[0] == 0xf9401689u && sequence[1] == 0xb9400288u &&
++                    sequence[2] == 0x91002129u && sequence[3] == 0xf868792au &&
++                    class_read == sizeof(current_class) && heap_read == sizeof(heap) &&
++                    !(page & 0xffff) && page >= 0x100000000ULL &&
++                    heap >= 0x100000000ULL && state.__x[9] == heap + 8 &&
++                    current_class == (uint32_t)state.__x[8] && current_class >= 0x10000 &&
++                    expected_class < 128 &&
++                    fault_addr == state.__x[9] + ((uintptr_t)current_class << 3) &&
++                    !(data_read == sizeof(emulator_data) && emulator_data[0] &&
++                      emulator_data[1] && emulator_data[2]) &&
++                    mach_vm_write(mach_task_self(), (mach_vm_address_t)page,
++                                  (vm_offset_t)(uintptr_t)&expected_class,
++                                  sizeof(expected_class)) == KERN_SUCCESS)
++                {
++                    static volatile int rpm_class_repairs;
++                    int n = __sync_add_and_fetch(&rpm_class_repairs, 1);
++                    state.__x[8] = expected_class;
++                    handled = 1;
++                    if (n <= 8)
++                        dprintf(STDERR_FILENO,
++                            "[rpm-class-repair] #%d page=%p heap=%p bad=%#x class=%u "
++                            "pc=%p -- repaired header and retrying\n",
++                            n, (void *)page, (void *)heap, current_class,
++                            expected_class, (void *)(uintptr_t)fault_pc);
++                }
++            }
++
 +            /* BoxedVN: finish checked ARM64EC calls that FEX's private checker
 +             * deliberately leaves unresolved.
 +             *
