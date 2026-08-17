@@ -1,8 +1,8 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..2a2ce74 100644
+index 0d0e5fa..596dd90 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,285 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1785,309 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* BoxedVN: finish checked ARM64EC calls that FEX's private checker
 +             * deliberately leaves unresolved.
 +             *
@@ -99,6 +99,18 @@ index 0d0e5fa..2a2ce74 100644
 +                        uintptr_t slot_offset = 0;
 +                        uint32_t call_window[7] = {0};
 +                        int call_index;
++                        uintptr_t cpu_area = 0;
++                        uintptr_t emulator_data[3] = {0};
++                        mach_vm_size_t area_read = 0, data_read = 0;
++
++                        if (thread_teb)
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)(thread_teb + 0x1788), sizeof(cpu_area),
++                                (mach_vm_address_t)&cpu_area, &area_read);
++                        if (area_read == sizeof(cpu_area) && cpu_area)
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)(cpu_area + 0x30), sizeof(emulator_data),
++                                (mach_vm_address_t)emulator_data, &data_read);
 +
 +                        if (lr >= rx + sizeof(call_window))
 +                            mach_vm_read_overwrite(mach_task_self(),
@@ -183,13 +195,38 @@ index 0d0e5fa..2a2ce74 100644
 +                        {
 +                            uintptr_t context_target_rva = 0;
 +
++                            /* Context construction can allocate a CodeBuffer while
++                             * OnCodeBufferAllocated holds CodeBufferListLock. Wine's
++                             * synchronous interval callback then re-enters this method
++                             * on the same, still pre-ThreadInit thread and parks forever
++                             * on that non-recursive std::mutex. No translated code can
++                             * exist before EmulatorData is installed, so this one early
++                             * invalidation is empty by construction. Return to the
++                             * tracker and leave all post-ThreadInit invalidations intact. */
 +                            if (slot_offset == 0xe0 &&
++                                state.__x[0] + 0x100 == fault_addr &&
++                                caller_pe - caller_module == 0x128eb4 &&
++                                !(data_read == sizeof(emulator_data) &&
++                                  emulator_data[0] && emulator_data[1] && emulator_data[2]))
++                            {
++                                static volatile int early_invalidation_skips;
++                                int n = __sync_add_and_fetch(&early_invalidation_skips, 1);
++                                __darwin_arm_thread_state64_set_pc_fptr(state, (void *)lr);
++                                handled = 1;
++                                if (n <= 8)
++                                    dprintf(STDERR_FILENO,
++                                        "[ec-check-context-early] #%d skipped empty "
++                                        "pre-thread invalidation object=%p lr=%p\n",
++                                        n, (void *)state.__x[0], (void *)lr);
++                            }
++
++                            if (!handled && slot_offset == 0xe0 &&
 +                                state.__x[0] + 0x100 == fault_addr)
 +                                context_target_rva = 0x1d080;
-+                            else if (slot_offset == 0xe8 &&
++                            else if (!handled && slot_offset == 0xe8 &&
 +                                     state.__x[0] + 0x108 == fault_addr)
 +                                context_target_rva = 0x1d410;
-+                            else if (slot_offset == 0xf0 &&
++                            else if (!handled && slot_offset == 0xf0 &&
 +                                     state.__x[0] + 0x110 == fault_addr)
 +                                context_target_rva = 0x1deb0;
 +
@@ -242,19 +279,6 @@ index 0d0e5fa..2a2ce74 100644
 +
 +                        if (!handled)
 +                        {
-+                        uintptr_t cpu_area = 0;
-+                        uintptr_t emulator_data[3] = {0};
-+                        mach_vm_size_t area_read = 0, data_read = 0;
-+
-+                        if (thread_teb)
-+                            mach_vm_read_overwrite(mach_task_self(),
-+                                (mach_vm_address_t)(thread_teb + 0x1788), sizeof(cpu_area),
-+                                (mach_vm_address_t)&cpu_area, &area_read);
-+                        if (area_read == sizeof(cpu_area) && cpu_area)
-+                            mach_vm_read_overwrite(mach_task_self(),
-+                                (mach_vm_address_t)(cpu_area + 0x30), sizeof(emulator_data),
-+                                (mach_vm_address_t)emulator_data, &data_read);
-+
 +                        if (data_read == sizeof(emulator_data) && emulator_data[0] &&
 +                            emulator_data[1] && emulator_data[2])
 +                        {
