@@ -1,8 +1,8 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..7abd36e 100644
+index 0d0e5fa..2a2ce74 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,232 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1785,285 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* BoxedVN: finish checked ARM64EC calls that FEX's private checker
 +             * deliberately leaves unresolved.
 +             *
@@ -96,31 +96,40 @@ index 0d0e5fa..7abd36e 100644
 +                        uint32_t vtable_load = 0, check_load = 0, check_call = 0;
 +                        mach_vm_size_t object_read = 0, slot_read = 0, cell_read = 0;
 +                        mach_vm_size_t sequence_read = 0;
++                        uintptr_t slot_offset = 0;
++                        uint32_t call_window[7] = {0};
++                        int call_index;
 +
-+                        if (lr >= rx + 16)
++                        if (lr >= rx + sizeof(call_window))
 +                            mach_vm_read_overwrite(mach_task_self(),
-+                                (mach_vm_address_t)(lr - 16), sizeof(vtable_load),
-+                                (mach_vm_address_t)&vtable_load, &sequence_read);
-+                        if (sequence_read == sizeof(vtable_load))
++                                (mach_vm_address_t)(lr - sizeof(call_window)),
++                                sizeof(call_window), (mach_vm_address_t)call_window,
++                                &sequence_read);
++                        if (sequence_read == sizeof(call_window) &&
++                            call_window[6] == 0xd63f0160u)
 +                        {
-+                            mach_vm_size_t got = 0;
-+                            mach_vm_read_overwrite(mach_task_self(),
-+                                (mach_vm_address_t)(lr - 12), sizeof(check_load),
-+                                (mach_vm_address_t)&check_load, &got);
-+                            if (got != sizeof(check_load)) sequence_read = 0;
-+                            got = 0;
-+                            mach_vm_read_overwrite(mach_task_self(),
-+                                (mach_vm_address_t)(lr - 8), sizeof(check_call),
-+                                (mach_vm_address_t)&check_call, &got);
-+                            if (got != sizeof(check_call)) sequence_read = 0;
++                            /* CheckCall may be followed by argument-register moves before
++                             * the actual BLR x11.  Find the ordered three-instruction
++                             * checker sequence in the bounded seven-instruction window. */
++                            for (call_index = 0; call_index <= 3; call_index++)
++                            {
++                                if ((call_window[call_index] & 0xffc003ffu) == 0xf940010bu &&
++                                    call_window[call_index + 1] == 0xf9400348u &&
++                                    call_window[call_index + 2] == 0xd63f0100u)
++                                {
++                                    vtable_load = call_window[call_index];
++                                    check_load = call_window[call_index + 1];
++                                    check_call = call_window[call_index + 2];
++                                    slot_offset = ((vtable_load >> 10) & 0xfffu) * 8;
++                                    break;
++                                }
++                            }
 +                        }
 +
 +                        /* ldr x11,[x8,#imm12*8]; ldr x8,[x26]; blr x8; blr x11 */
-+                        if (sequence_read == sizeof(vtable_load) &&
-+                            (vtable_load & 0xffc003ffu) == 0xf940010bu &&
++                        if (sequence_read == sizeof(call_window) && slot_offset &&
 +                            check_load == 0xf9400348u && check_call == 0xd63f0100u)
 +                        {
-+                            uintptr_t slot_offset = ((vtable_load >> 10) & 0xfffu) * 8;
 +                            mach_vm_read_overwrite(mach_task_self(),
 +                                (mach_vm_address_t)state.__x[0], sizeof(object_vtable),
 +                                (mach_vm_address_t)&object_vtable, &object_read);
@@ -159,14 +168,58 @@ index 0d0e5fa..7abd36e 100644
 +                            }
 +                        }
 +
-+                        /* The bundled runtime's first such call is a two-instruction
-+                         * getter.  Keep a signature-locked fallback so this build still
-+                         * advances if the read-only vtable page was not cloned into the
-+                         * reverse-map ledger. */
++                        /* The clone ledger does not cover the bundled ContextImpl vtable,
++                         * but its three initialization-time slots are fixed by the pinned
++                         * runtime.  The failed cell also sits at object+slot+0x20 and has
++                         * a distinctive two-qword layout.  Resolve all three together so
++                         * process initialization does not require one build per call. */
 +                        caller_pe = ios_jit_reverse_translate(lr, &caller_module);
 +                        mach_vm_read_overwrite(mach_task_self(),
 +                            (mach_vm_address_t)fault_addr, sizeof(cell_words),
 +                            (mach_vm_address_t)cell_words, &cell_read);
++                        if (!handled && caller_pe && caller_module && slot_offset &&
++                            cell_read == sizeof(cell_words) &&
++                            cell_words[0] == fault_addr + 0x10 && !cell_words[1])
++                        {
++                            uintptr_t context_target_rva = 0;
++
++                            if (slot_offset == 0xe0 &&
++                                state.__x[0] + 0x100 == fault_addr)
++                                context_target_rva = 0x1d080;
++                            else if (slot_offset == 0xe8 &&
++                                     state.__x[0] + 0x108 == fault_addr)
++                                context_target_rva = 0x1d410;
++                            else if (slot_offset == 0xf0 &&
++                                     state.__x[0] + 0x110 == fault_addr)
++                                context_target_rva = 0x1deb0;
++
++                            if (context_target_rva)
++                            {
++                                native_entry = caller_module + context_target_rva;
++                                resume_entry = (uintptr_t)ios_jit_translate_addr_for_owner(
++                                    (void *)native_entry,
++                                    thread_teb ? ((TEB *)thread_teb)->Peb : NULL);
++                                if (resume_entry && resume_entry != fault_addr &&
++                                    ios_jit_addr_is_text(resume_entry))
++                                {
++                                    static volatile int context_recoveries;
++                                    int n = __sync_add_and_fetch(&context_recoveries, 1);
++                                    __darwin_arm_thread_state64_set_pc_fptr(
++                                        state, (void *)resume_entry);
++                                    handled = 1;
++                                    if (n <= 16 || !(n & 255))
++                                        dprintf(STDERR_FILENO,
++                                            "[ec-check-context] #%d bad=%p object=%p "
++                                            "slot=%#lx native=%p resume=%p lr=%p\n",
++                                            n, (void *)fault_addr, (void *)state.__x[0],
++                                            (unsigned long)slot_offset, (void *)native_entry,
++                                            (void *)resume_entry, (void *)lr);
++                                }
++                            }
++                        }
++
++                        /* Keep the already-proven getter emulation as a final fallback
++                         * if PE-to-pool translation is unexpectedly unavailable. */
 +                        if (!handled && caller_pe && caller_module &&
 +                            caller_pe - caller_module == 0x128e84 &&
 +                            vtable_load == 0xf940790bu && check_load == 0xf9400348u &&
