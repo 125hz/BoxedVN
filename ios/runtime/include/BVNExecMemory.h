@@ -129,6 +129,11 @@ void* BVNExecMemAlloc(size_t length);
 bool BVNExecMemArenaStatus(size_t* capacityBytes, size_t* availableBytes,
                            size_t* segmentCount);
 
+/// Sends StikDebug's universal-script detach request after every executable
+/// segment needed by the runtime has been prepared. Safe when the debugger
+/// already left: the guarded SIGTRAP path treats that as detached.
+bool BVNExecMemDetachDebugger(void);
+
 void BVNExecMemFree(void* address, size_t length);
 
 /// Returns the writable alias for an executable range.  `address` remains

@@ -156,6 +156,17 @@ void* stikDebugPrepareRegion(void* address, size_t length) {
         "ret\n");
 }
 
+// Command zero asks the universal script to detach. Wine must own its task
+// exception ports before normal thread-control signals begin; leaving the
+// debugger attached makes those signals stop in debugserver instead.
+__attribute__((noinline, optnone, naked))
+void stikDebugDetach(void) {
+    __asm__ volatile(
+        "mov x16, #0\n"
+        "brk #0xf00d\n"
+        "ret\n");
+}
+
 // A reinstall or re-sign creates a new StikDebug target. CS_DEBUGGED can
 // still be present even when universal.js is no longer assigned to that new
 // target. In that state the deliberate brk above becomes an ordinary SIGTRAP
@@ -215,6 +226,30 @@ bool safelyPrepareWithStikDebug(void* address, size_t length,
         return false;
     }
     return true;
+}
+
+bool safelyDetachFromStikDebug() {
+    struct sigaction action{};
+    struct sigaction previous{};
+    action.sa_handler = stikDebugTrapHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    if (sigaction(SIGTRAP, &action, &previous) != 0) {
+        return false;
+    }
+
+    sigjmp_buf recovery;
+    gStikDebugTrapRecovery = &recovery;
+    const int trapped = sigsetjmp(recovery, 1);
+    if (trapped == 0) {
+        stikDebugDetach();
+    }
+    gStikDebugTrapRecovery = nullptr;
+
+    // A local trap means the debugger was already absent, which is the state
+    // this operation is trying to reach. Only failure to restore the prior
+    // handler makes the transition unsafe.
+    return sigaction(SIGTRAP, &previous, nullptr) == 0;
 }
 #endif
 
@@ -668,6 +703,17 @@ extern "C" bool BVNExecMemArenaStatus(size_t* capacityBytes,
         *segmentCount = gSegments.size();
     }
     return !gSegments.empty();
+}
+
+extern "C" bool BVNExecMemDetachDebugger(void) {
+    if (!gPrepared || !gExecutionConfirmed) {
+        return false;
+    }
+#if defined(__aarch64__)
+    return safelyDetachFromStikDebug();
+#else
+    return false;
+#endif
 }
 
 extern "C" void BVNExecMemFree(void* address, size_t length) {

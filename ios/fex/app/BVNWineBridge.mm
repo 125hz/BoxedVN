@@ -406,6 +406,15 @@ extern "C" bool BVNWineStart(void) {
         g_starting.store(false);
         return false;
     }
+    reportf("detaching the debugger after executable pool preparation");
+    if (!BVNExecMemDetachDebugger()) {
+        reportf("could not complete the guarded debugger detach request");
+        g_stage.store(BVNWineStageFailed, std::memory_order_release);
+        g_starting.store(false);
+        return false;
+    }
+    setenv("MYTHIC_DETACHED", "1", 1);
+    reportf("debugger detach request completed");
     g_stage.store(BVNWineStageResourcesReady, std::memory_order_release);
     reportf("Wine runtime resources found");
 
