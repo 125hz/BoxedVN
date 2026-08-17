@@ -2,7 +2,7 @@ diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64
 index 0d0e5fa..93dd756 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,439 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1785,454 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* BoxedVN: the pinned ARM64EC FEX binary occasionally reaches
 +             * rpmalloc's available-page path with page->size_class replaced
 +             * by the low 32 bits of a block pointer.  The allocator detects
@@ -224,6 +224,21 @@ index 0d0e5fa..93dd756 100644
 +                                    break;
 +                                }
 +                            }
++                        }
++
++                        /* This pinned initialization call uses x9 for both the
++                         * vtable and checker and places two address-setup
++                         * instructions between the checker load and BLR.  It
++                         * is the same ContextImpl slot-f0 call, but cannot
++                         * match the consecutive x8 checker sequence above. */
++                        if (!slot_offset && sequence_read == sizeof(call_window) &&
++                            call_window[0] == 0xf90013e8u && call_window[1] == 0xf940792bu &&
++                            call_window[2] == 0xf9400149u && call_window[3] == 0xf000064au &&
++                            call_window[4] == 0x9129914au && call_window[5] == 0xd63f0120u &&
++                            call_window[6] == 0xd63f0160u)
++                        {
++                            vtable_load = call_window[1];
++                            slot_offset = 0xf0;
 +                        }
 +
 +                        /* ldr x11,[x8,#imm12*8]; ldr x8,[x26]; blr x8; blr x11 */
