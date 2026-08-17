@@ -1,11 +1,8 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..3919752 100644
+index 0d0e5fa..7abd36e 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1782,3 +1782,126 @@ static void *ios_mach_exception_thread( void *arg )
-                     }
-                 }
-             }
+@@ -1784,0 +1785,232 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* BoxedVN: finish checked ARM64EC calls that FEX's private checker
 +             * deliberately leaves unresolved.
 +             *
@@ -84,6 +81,114 @@ index 0d0e5fa..3919752 100644
 +                    }
 +                    else
 +                    {
++                        /* The iOS image clone can contain a stale relocated vtable
++                         * entry even though the original PE vtable is correct.  The
++                         * resulting value points into FEX's RW guest band, so executing
++                         * it faults before ThreadInit exists.  Recover the vtable from
++                         * the object, reverse-map its executable clone to the original
++                         * PE page, and re-read the same slot there. */
++                        extern uint64_t ios_jit_reverse_translate(uint64_t addr,
++                                                                  uint64_t *module_base);
++                        uintptr_t object_vtable = 0, pe_vtable = 0, pe_module = 0;
++                        uintptr_t native_entry = 0, resume_entry = 0;
++                        uint64_t caller_pe = 0, caller_module = 0;
++                        uint64_t cell_words[2] = {0};
++                        uint32_t vtable_load = 0, check_load = 0, check_call = 0;
++                        mach_vm_size_t object_read = 0, slot_read = 0, cell_read = 0;
++                        mach_vm_size_t sequence_read = 0;
++
++                        if (lr >= rx + 16)
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)(lr - 16), sizeof(vtable_load),
++                                (mach_vm_address_t)&vtable_load, &sequence_read);
++                        if (sequence_read == sizeof(vtable_load))
++                        {
++                            mach_vm_size_t got = 0;
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)(lr - 12), sizeof(check_load),
++                                (mach_vm_address_t)&check_load, &got);
++                            if (got != sizeof(check_load)) sequence_read = 0;
++                            got = 0;
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)(lr - 8), sizeof(check_call),
++                                (mach_vm_address_t)&check_call, &got);
++                            if (got != sizeof(check_call)) sequence_read = 0;
++                        }
++
++                        /* ldr x11,[x8,#imm12*8]; ldr x8,[x26]; blr x8; blr x11 */
++                        if (sequence_read == sizeof(vtable_load) &&
++                            (vtable_load & 0xffc003ffu) == 0xf940010bu &&
++                            check_load == 0xf9400348u && check_call == 0xd63f0100u)
++                        {
++                            uintptr_t slot_offset = ((vtable_load >> 10) & 0xfffu) * 8;
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)state.__x[0], sizeof(object_vtable),
++                                (mach_vm_address_t)&object_vtable, &object_read);
++                            if (object_read == sizeof(object_vtable))
++                                pe_vtable = (uintptr_t)ios_jit_reverse_translate(
++                                    object_vtable, (uint64_t *)&pe_module);
++                            if (pe_vtable && pe_module && slot_offset < 0x10000)
++                                mach_vm_read_overwrite(mach_task_self(),
++                                    (mach_vm_address_t)(pe_vtable + slot_offset),
++                                    sizeof(native_entry), (mach_vm_address_t)&native_entry,
++                                    &slot_read);
++                            if (slot_read == sizeof(native_entry) &&
++                                native_entry >= pe_module &&
++                                native_entry < pe_module + 0x10000000ULL)
++                            {
++                                resume_entry = (uintptr_t)ios_jit_translate_addr_for_owner(
++                                    (void *)native_entry,
++                                    thread_teb ? ((TEB *)thread_teb)->Peb : NULL);
++                                if (resume_entry && resume_entry != fault_addr &&
++                                    ios_jit_addr_is_text(resume_entry))
++                                {
++                                    static volatile int vtable_recoveries;
++                                    int n = __sync_add_and_fetch(&vtable_recoveries, 1);
++                                    __darwin_arm_thread_state64_set_pc_fptr(
++                                        state, (void *)resume_entry);
++                                    handled = 1;
++                                    if (n <= 16 || !(n & 255))
++                                        dprintf(STDERR_FILENO,
++                                            "[ec-check-vtable] #%d bad=%p vtable=%p pe=%p "
++                                            "slot=%#lx native=%p resume=%p lr=%p\n",
++                                            n, (void *)fault_addr, (void *)object_vtable,
++                                            (void *)pe_vtable, (unsigned long)slot_offset,
++                                            (void *)native_entry, (void *)resume_entry,
++                                            (void *)lr);
++                                }
++                            }
++                        }
++
++                        /* The bundled runtime's first such call is a two-instruction
++                         * getter.  Keep a signature-locked fallback so this build still
++                         * advances if the read-only vtable page was not cloned into the
++                         * reverse-map ledger. */
++                        caller_pe = ios_jit_reverse_translate(lr, &caller_module);
++                        mach_vm_read_overwrite(mach_task_self(),
++                            (mach_vm_address_t)fault_addr, sizeof(cell_words),
++                            (mach_vm_address_t)cell_words, &cell_read);
++                        if (!handled && caller_pe && caller_module &&
++                            caller_pe - caller_module == 0x128e84 &&
++                            vtable_load == 0xf940790bu && check_load == 0xf9400348u &&
++                            check_call == 0xd63f0100u &&
++                            state.__x[0] + 0x110 == fault_addr &&
++                            cell_read == sizeof(cell_words) &&
++                            cell_words[0] == fault_addr + 0x10 && !cell_words[1])
++                        {
++                            static volatile int getter_recoveries;
++                            int n = __sync_add_and_fetch(&getter_recoveries, 1);
++                            state.__x[0] += 0x88;
++                            __darwin_arm_thread_state64_set_pc_fptr(state, (void *)lr);
++                            handled = 1;
++                            if (n <= 4)
++                                dprintf(STDERR_FILENO,
++                                    "[ec-check-getter] #%d object=%p result=%p lr=%p\n",
++                                    n, (void *)(state.__x[0] - 0x88),
++                                    (void *)state.__x[0], (void *)lr);
++                        }
++
++                        if (!handled)
++                        {
 +                        uintptr_t cpu_area = 0;
 +                        uintptr_t emulator_data[3] = {0};
 +                        mach_vm_size_t area_read = 0, data_read = 0;
@@ -125,6 +230,7 @@ index 0d0e5fa..3919752 100644
 +                                    n, (void *)fault_addr, (unsigned long long)ffs_read,
 +                                    (void *)emulator_data[0], (void *)emulator_data[1],
 +                                    (void *)emulator_data[2]);
++                        }
 +                        }
 +                    }
 +                }
