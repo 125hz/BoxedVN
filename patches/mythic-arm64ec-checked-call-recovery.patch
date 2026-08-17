@@ -2,7 +2,12 @@ diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64
 index 0d0e5fa..93dd756 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,454 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1785,525 @@ static void *ios_mach_exception_thread( void *arg )
++            /* Remember the exact ContextImpl object proven by the corrupt
++             * checked-call cell below.  Later null-target recoveries use it
++             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
++            static uintptr_t boxedvn_early_context_object;
++
 +            /* BoxedVN: the pinned ARM64EC FEX binary occasionally reaches
 +             * rpmalloc's available-page path with page->size_class replaced
 +             * by the low 32 bits of a block pointer.  The allocator detects
@@ -297,6 +302,7 @@ index 0d0e5fa..93dd756 100644
 +                            cell_words[0] == fault_addr + 0x10 && !cell_words[1])
 +                        {
 +                            uintptr_t context_target_rva = 0;
++                            boxedvn_early_context_object = state.__x[0];
 +
 +                            /* The bundled ARM64EC objects disagree about the expanded
 +                             * WritePriorityMutex layout: the lock implementation treats
@@ -308,7 +314,6 @@ index 0d0e5fa..93dd756 100644
 +                             * real translated thread exists. */
 +                            if (slot_offset == 0xf0 &&
 +                                state.__x[0] + 0x110 == fault_addr &&
-+                                caller_pe - caller_module == 0x128e84 &&
 +                                !(data_read == sizeof(emulator_data) &&
 +                                  emulator_data[0] && emulator_data[1] && emulator_data[2]))
 +                            {
@@ -454,6 +459,72 @@ index 0d0e5fa..93dd756 100644
 +                                    (void *)emulator_data[2]);
 +                        }
 +                        }
++                    }
++                }
++            }
++
++            /* The same damaged ContextImpl vtable has an initialization-time
++             * RunCPUIDFunction slot at +0xa8.  In the pinned image the caller
++             * at +0x12593c loads that slot, runs arm64x_check_icall, then calls
++             * x11 with (ContextImpl, 1, 0).  Log 8 proves the checker returns
++             * x11=0, producing a literal branch to address zero before
++             * ThreadInit.  Require the previously proven ContextImpl object,
++             * exact seven-instruction caller, exact PE return RVA, null PC and
++             * null x11; then call the pinned native implementation at +0xa6f0.
++             * A different null function pointer remains unhandled. */
++            if (!handled && !fault_addr &&
++                !(uintptr_t)__darwin_arm_thread_state64_get_pc(state) &&
++                !state.__x[11] && boxedvn_early_context_object &&
++                state.__x[0] == boxedvn_early_context_object)
++            {
++                extern uint64_t ios_jit_reverse_translate(uint64_t addr,
++                                                          uint64_t *module_base);
++                extern int ios_jit_addr_is_text(uintptr_t addr);
++                extern void *ios_jit_translate_addr_for_owner(void *addr,
++                                                               void *owner_peb);
++                uintptr_t lr = (uintptr_t)state.__lr;
++                uint64_t caller_module = 0;
++                uint64_t caller_pe = ios_jit_reverse_translate(lr, &caller_module);
++                uint32_t sequence[7] = {0};
++                mach_vm_size_t sequence_read = 0;
++
++                if (lr >= 28)
++                    mach_vm_read_overwrite(mach_task_self(),
++                        (mach_vm_address_t)(lr - 28), sizeof(sequence),
++                        (mach_vm_address_t)sequence, &sequence_read);
++
++                if (caller_pe && caller_module &&
++                    caller_pe - caller_module == 0x125940 &&
++                    sequence_read == sizeof(sequence) &&
++                    sequence[0] == 0xf940550bu && /* ldr x11,[x8,#0xa8] */
++                    sequence[1] == 0xf94002c8u && /* ldr x8,[x22] */
++                    sequence[2] == 0xd63f0100u && /* blr x8 (check) */
++                    sequence[3] == 0xaa0103e0u && /* mov x0,x1 */
++                    sequence[4] == 0x52800021u && /* mov w1,#1 */
++                    sequence[5] == 0x2a1f03e2u && /* mov w2,wzr */
++                    sequence[6] == 0xd63f0160u)   /* blr x11 */
++                {
++                    uintptr_t native_entry = caller_module + 0xa6f0;
++                    uintptr_t resume_entry =
++                        (uintptr_t)ios_jit_translate_addr_for_owner(
++                            (void *)native_entry,
++                            thread_teb ? ((TEB *)thread_teb)->Peb : NULL);
++
++                    if (resume_entry && ios_jit_addr_is_text(resume_entry))
++                    {
++                        static volatile int cpuid_recoveries;
++                        int n = __sync_add_and_fetch(&cpuid_recoveries, 1);
++                        __darwin_arm_thread_state64_set_pc_fptr(
++                            state, (void *)resume_entry);
++                        handled = 1;
++                        if (n <= 8)
++                            dprintf(STDERR_FILENO,
++                                "[ec-check-cpuid] #%d object=%p native=%p "
++                                "resume=%p lr=%p fn=%llu leaf=%llu\n",
++                                n, (void *)state.__x[0], (void *)native_entry,
++                                (void *)resume_entry, (void *)lr,
++                                (unsigned long long)state.__x[1],
++                                (unsigned long long)state.__x[2]);
 +                    }
 +                }
 +            }
