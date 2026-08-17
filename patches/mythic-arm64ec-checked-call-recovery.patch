@@ -1,0 +1,51 @@
+diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
+index 0d0e5fa..781169d 100644
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -1784,0 +1785,46 @@ static void *ios_mach_exception_thread( void *arg )
++            /* BoxedVN: recover a checked ARM64EC indirect call that the normal
++             * checker incorrectly left pointed at a non-executable guest VA.
++             *
++             * The compiler's checked-call sequence loads the prospective target
++             * in x11 and the x64 dispatcher in x10, calls arm64x_check_call, then
++             * executes `blr x11`.  For x64, the checker is meant to rewrite
++             * x9=target and x11=x10.  On iOS we have observed the first FEX
++             * context call reach that final BLR without the rewrite, faulting on
++             * an ordinary RW guest page before a guest RIP exists.  Recreate the
++             * specified checked-call result only when every part of that exact
++             * shape is independently true.  In particular, x10 must name known
++             * executable PE text in the blessed pool and LR-4 must be BLR x11;
++             * real guest AVs and arbitrary indirect branches remain untouched. */
++            if (!handled && fault_addr == (uintptr_t)__darwin_arm_thread_state64_get_pc(state) &&
++                fault_addr >= 0x100000000ULL && state.__x[11] == fault_addr)
++            {
++                extern void *ios_jit_rx_base_global;
++                extern size_t ios_jit_pool_size_global;
++                extern int ios_jit_addr_is_text(uintptr_t addr);
++                uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
++                uintptr_t dispatcher = (uintptr_t)state.__x[10];
++                uintptr_t lr = (uintptr_t)state.__lr;
++                uint32_t caller_insn = 0;
++
++                if (lr >= rx + 4 && lr < rx + ios_jit_pool_size_global)
++                    caller_insn = *(const uint32_t *)(lr - 4);
++
++                if (rx && dispatcher >= rx &&
++                    dispatcher < rx + ios_jit_pool_size_global &&
++                    ios_jit_addr_is_text(dispatcher) &&
++                    caller_insn == 0xd63f0160u)  /* blr x11 */
++                {
++                    static volatile int checked_call_recoveries;
++                    int n = __sync_add_and_fetch(&checked_call_recoveries, 1);
++                    state.__x[9] = fault_addr;
++                    state.__x[11] = dispatcher;
++                    __darwin_arm_thread_state64_set_pc_fptr(state, dispatcher);
++                    handled = 1;
++                    if (n <= 16 || !(n & 255))
++                        dprintf(STDERR_FILENO,
++                            "[ec-check-recover] #%d target=%p dispatcher=%p lr=%p "
++                            "insn=%08x -> x9=target, pc=x10\n",
++                            n, (void *)fault_addr, (void *)dispatcher,
++                            (void *)lr, caller_insn);
++                }
++            }

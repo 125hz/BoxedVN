@@ -31,6 +31,9 @@ struct ProbeView: View {
     @State private var winePersistentLog = ""
     @State private var wineRunning = false
     @State private var wineTarget = BVNWineTargetX64
+    @State private var wineElapsed = 0.0
+    @State private var winePollTick = 0
+    @State private var wineMonitoringTimedOut = false
 
     // The steps that talk to StikDebug cannot be cancelled and can wait
     // forever, so the interface polls instead of waiting for a return value.
@@ -113,7 +116,19 @@ struct ProbeView: View {
                         }
                     }
                     .disabled(!BVNWineAvailable() || wineRunning ||
+                              wineStage == BVNWineStageProcessStarted ||
                               stage != BVNFexStageExecuted)
+
+                    if wineRunning {
+                        Text("Monitoring for \(Int(wineElapsed))s")
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    } else if wineMonitoringTimedOut {
+                        Text("The 30-second monitoring window ended. The process is still wedged; export the log, force-close, and relaunch for the next test.")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
 
                     if !BVNWineAvailable() {
                         Text("This IPA contains the FEX probe only. Build the Wine-enabled target to run this stage.")
@@ -187,12 +202,22 @@ struct ProbeView: View {
                 copied = false
             }
             if wineRunning {
+                wineElapsed += 0.75
+                winePollTick += 1
                 wineStage = BVNWineStageReached()
-                let latestReport = String(cString: BVNWineReport())
-                let latestLog = String(cString: BVNWinePersistentLog())
-                if latestReport != wineReport { wineReport = latestReport }
-                if latestLog != winePersistentLog { winePersistentLog = latestLog }
+                // Replacing a 24k-character Text every timer tick repeatedly
+                // invalidates the List while the user is dragging it. Three
+                // seconds is still live enough for bring-up and leaves scroll
+                // tracking responsive.
+                if winePollTick.isMultiple(of: 4) {
+                    refreshWineDiagnostics()
+                }
                 if wineStage == BVNWineStageExited || wineStage == BVNWineStageFailed {
+                    refreshWineDiagnostics()
+                    wineRunning = false
+                } else if wineElapsed >= 30 {
+                    refreshWineDiagnostics()
+                    wineMonitoringTimedOut = true
                     wineRunning = false
                 }
             }
@@ -263,6 +288,9 @@ struct ProbeView: View {
 
     private func startWine() {
         wineRunning = true
+        wineElapsed = 0
+        winePollTick = 0
+        wineMonitoringTimedOut = false
         guard BVNWineSetTarget(wineTarget) else {
             wineRunning = false
             return
@@ -288,5 +316,12 @@ struct ProbeView: View {
         var bytes = 0
         var used = 0
         pool = BVNFexPoolStatus(&bytes, &used) ? (bytes, used) : nil
+    }
+
+    private func refreshWineDiagnostics() {
+        let latestReport = String(cString: BVNWineReport())
+        let latestLog = String(cString: BVNWinePersistentLog())
+        if latestReport != wineReport { wineReport = latestReport }
+        if latestLog != winePersistentLog { winePersistentLog = latestLog }
     }
 }

@@ -453,12 +453,12 @@ jobs:
           key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
           restore-keys: fex64-toolchains-${{ runner.os }}-
 
-      - name: Restore FEX iPhoneOS staging cache
+      - name: Restore FEX iPhoneOS build cache
         uses: actions/cache@v4
         with:
-          path: third_party/fex64/fex-ios-staging
-          key: fex64-ios-staging-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh') }}
-          restore-keys: fex64-ios-staging-${{ runner.os }}-
+          path: third_party/fex64/fex-build-ios
+          key: fex64-fex-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh') }}
+          restore-keys: fex64-fex-${{ runner.os }}-
 
       - name: Build Wine, its iPhoneOS core, and the app in one run
         run: |
