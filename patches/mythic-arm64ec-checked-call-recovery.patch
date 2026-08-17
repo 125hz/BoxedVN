@@ -1,51 +1,131 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..781169d 100644
+index 0d0e5fa..3919752 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,46 @@ static void *ios_mach_exception_thread( void *arg )
-+            /* BoxedVN: recover a checked ARM64EC indirect call that the normal
-+             * checker incorrectly left pointed at a non-executable guest VA.
+@@ -1782,3 +1782,126 @@ static void *ios_mach_exception_thread( void *arg )
+                     }
+                 }
+             }
++            /* BoxedVN: finish checked ARM64EC calls that FEX's private checker
++             * deliberately leaves unresolved.
 +             *
-+             * The compiler's checked-call sequence loads the prospective target
-+             * in x11 and the x64 dispatcher in x10, calls arm64x_check_call, then
-+             * executes `blr x11`.  For x64, the checker is meant to rewrite
-+             * x9=target and x11=x10.  On iOS we have observed the first FEX
-+             * context call reach that final BLR without the rewrite, faulting on
-+             * an ordinary RW guest page before a guest RIP exists.  Recreate the
-+             * specified checked-call result only when every part of that exact
-+             * shape is independently true.  In particular, x10 must name known
-+             * executable PE text in the blessed pool and LR-4 must be BLR x11;
-+             * real guest AVs and arbitrary indirect branches remain untouched. */
++             * FEX replaces Wine's general arm64x_check_call with CheckCall,
++             * which only redirects ntdll fast-forward sequences through its
++             * redirection LUT. FEXCore's own virtual functions still use the
++             * canonical 14-byte ARM64EC fast-forward sequence. Before ThreadInit
++             * has installed a guest CPU state, sending one of those through the
++             * x64 dispatcher branches through a zero EnterEC pointer and turns a
++             * single call into an exception/stack-overflow loop.
++             *
++             * The fault itself gives us a precise, side-effect-free recovery
++             * point: BLR x11 has already installed the native return address in
++             * LR, x11 is the non-executable FFS, and x10 is the module's x64 exit
++             * thunk. Decode the same FFS form Wine's checker recognizes and
++             * resume at its ARM64EC target, preserving every argument register
++             * and LR. Only genuine x64 targets, and only after ThreadInit made
++             * the dispatcher usable, take the old x9/x10 route. */
 +            if (!handled && fault_addr == (uintptr_t)__darwin_arm_thread_state64_get_pc(state) &&
 +                fault_addr >= 0x100000000ULL && state.__x[11] == fault_addr)
 +            {
 +                extern void *ios_jit_rx_base_global;
 +                extern size_t ios_jit_pool_size_global;
 +                extern int ios_jit_addr_is_text(uintptr_t addr);
++                extern void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb);
 +                uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
 +                uintptr_t dispatcher = (uintptr_t)state.__x[10];
 +                uintptr_t lr = (uintptr_t)state.__lr;
 +                uint32_t caller_insn = 0;
++                unsigned char ffs[14];
++                mach_vm_size_t ffs_read = 0;
 +
 +                if (lr >= rx + 4 && lr < rx + ios_jit_pool_size_global)
-+                    caller_insn = *(const uint32_t *)(lr - 4);
++                {
++                    mach_vm_size_t insn_read = 0;
++                    mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(lr - 4),
++                                           sizeof(caller_insn), (mach_vm_address_t)&caller_insn,
++                                           &insn_read);
++                    if (insn_read != sizeof(caller_insn)) caller_insn = 0;
++                }
 +
 +                if (rx && dispatcher >= rx &&
 +                    dispatcher < rx + ios_jit_pool_size_global &&
 +                    ios_jit_addr_is_text(dispatcher) &&
 +                    caller_insn == 0xd63f0160u)  /* blr x11 */
 +                {
-+                    static volatile int checked_call_recoveries;
-+                    int n = __sync_add_and_fetch(&checked_call_recoveries, 1);
-+                    state.__x[9] = fault_addr;
-+                    state.__x[11] = dispatcher;
-+                    __darwin_arm_thread_state64_set_pc_fptr(state, dispatcher);
-+                    handled = 1;
-+                    if (n <= 16 || !(n & 255))
-+                        dprintf(STDERR_FILENO,
-+                            "[ec-check-recover] #%d target=%p dispatcher=%p lr=%p "
-+                            "insn=%08x -> x9=target, pc=x10\n",
-+                            n, (void *)fault_addr, (void *)dispatcher,
-+                            (void *)lr, caller_insn);
++                    static const unsigned char ffs_prefix[10] = {
++                        0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9
++                    };
++                    mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fault_addr,
++                                           sizeof(ffs), (mach_vm_address_t)ffs, &ffs_read);
++
++                    if (ffs_read == sizeof(ffs) && !memcmp(ffs, ffs_prefix, sizeof(ffs_prefix)))
++                    {
++                        int32_t rel32;
++                        uintptr_t native_target;
++                        uintptr_t resume_target;
++                        static volatile int ffs_recoveries;
++                        int n;
++
++                        memcpy(&rel32, ffs + 10, sizeof(rel32));
++                        native_target = fault_addr + sizeof(ffs) + (intptr_t)rel32;
++                        resume_target = (uintptr_t)ios_jit_translate_addr_for_owner(
++                            (void *)native_target, thread_teb ? ((TEB *)thread_teb)->Peb : NULL);
++                        if (!resume_target) resume_target = native_target;
++
++                        n = __sync_add_and_fetch(&ffs_recoveries, 1);
++                        __darwin_arm_thread_state64_set_pc_fptr(state, (void *)resume_target);
++                        handled = 1;
++                        if (n <= 16 || !(n & 255))
++                            dprintf(STDERR_FILENO,
++                                "[ec-check-ffs] #%d ffs=%p rel=%d native=%p resume=%p "
++                                "lr=%p -- direct ARM64EC call\n",
++                                n, (void *)fault_addr, rel32, (void *)native_target,
++                                (void *)resume_target, (void *)lr);
++                    }
++                    else
++                    {
++                        uintptr_t cpu_area = 0;
++                        uintptr_t emulator_data[3] = {0};
++                        mach_vm_size_t area_read = 0, data_read = 0;
++
++                        if (thread_teb)
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)(thread_teb + 0x1788), sizeof(cpu_area),
++                                (mach_vm_address_t)&cpu_area, &area_read);
++                        if (area_read == sizeof(cpu_area) && cpu_area)
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)(cpu_area + 0x30), sizeof(emulator_data),
++                                (mach_vm_address_t)emulator_data, &data_read);
++
++                        if (data_read == sizeof(emulator_data) && emulator_data[0] &&
++                            emulator_data[1] && emulator_data[2])
++                        {
++                            static volatile int x64_recoveries;
++                            int n = __sync_add_and_fetch(&x64_recoveries, 1);
++                            state.__x[9] = fault_addr;
++                            state.__x[11] = dispatcher;
++                            __darwin_arm_thread_state64_set_pc_fptr(state, (void *)dispatcher);
++                            handled = 1;
++                            if (n <= 16 || !(n & 255))
++                                dprintf(STDERR_FILENO,
++                                    "[ec-check-x64] #%d target=%p dispatcher=%p lr=%p "
++                                    "state=%p thread=%p enter=%p\n",
++                                    n, (void *)fault_addr, (void *)dispatcher, (void *)lr,
++                                    (void *)emulator_data[0], (void *)emulator_data[1],
++                                    (void *)emulator_data[2]);
++                        }
++                        else
++                        {
++                            static volatile int unready_calls;
++                            int n = __sync_add_and_fetch(&unready_calls, 1);
++                            if (n <= 8 || !(n & 255))
++                                dprintf(STDERR_FILENO,
++                                    "[ec-check-unready] #%d target=%p ffs-read=%llu "
++                                    "state=%p thread=%p enter=%p -- refusing x64 dispatch\n",
++                                    n, (void *)fault_addr, (unsigned long long)ffs_read,
++                                    (void *)emulator_data[0], (void *)emulator_data[1],
++                                    (void *)emulator_data[2]);
++                        }
++                    }
 +                }
 +            }
