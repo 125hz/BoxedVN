@@ -249,12 +249,14 @@ bool preparePrefix() {
         return false;
     }
 
-    // Prefix initialization is native ARM64. Recreate every symlink because
-    // the app bundle path changes when a sideloader reinstalls the IPA.
-    NSString* runtime = bundled(@"aarch64-windows");
+    // The session runtime must be ARM64EC when the main executable is x64:
+    // its hybrid ntdll and xtajit64 bridge are what hand x64 code to FEX.
+    // Recreate every symlink because the app bundle path changes when a
+    // sideloader reinstalls the IPA.
+    NSString* runtime = bundled(@"arm64ec-windows");
     NSArray<NSString*>* names = [files contentsOfDirectoryAtPath:runtime error:&error];
     if (!names) {
-        reportf("could not read the native Wine runtime: %s",
+        reportf("could not read the ARM64EC Wine runtime: %s",
                 error.localizedDescription.UTF8String);
         return false;
     }
@@ -278,7 +280,7 @@ bool preparePrefix() {
                 withDestinationPath:@"../drive_c" error:nil];
 
     g_prefix = prefix.fileSystemRepresentation;
-    reportf("prefix ready with %lu native runtime links", (unsigned long)linked);
+    reportf("prefix ready with %lu ARM64EC runtime links", (unsigned long)linked);
     g_stage.store(BVNWineStagePrefixReady, std::memory_order_release);
     return linked != 0;
 }
@@ -331,12 +333,10 @@ void* processThread(void*) {
         reportf("entering Wine through native ntdll");
 
         char loader[] = "wine";
-        // The bundled prefix was initialized on macOS before packaging. The
-        // iOS ntdll integration also pre-signals Wine's bootstrap event, so a
-        // second wineboot run only pulls unfinished GUI/optional unixlibs into
-        // this headless milestone. This tiny console PE proves the native
-        // loader, kernel32, heap, virtual memory, and orderly exit first.
-        char target[] = "C:\\windows\\system32\\child-test.exe";
+        // This small x64 console PE performs recursive integer work, writes a
+        // deterministic result, and exits with 232. Reaching that result proves
+        // the ARM64EC loader entered xtajit64 and FEX translated guest code.
+        char target[] = "C:\\windows\\system32\\fib-x64.exe";
         char* arguments[] = {loader, target, nullptr};
 
         if (setjmp(*BVNWineExitJumpBuffer()) == 0) {

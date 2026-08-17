@@ -137,7 +137,7 @@ struct ProbeView: View {
                 } header: {
                     Text("Wine bootstrap")
                 } footer: {
-                    Text("Starts the embedded wineserver and enters native Wine with a pre-seeded prefix. The ARM64EC runtime remains bundled for the translated executable path after this first boot succeeds.")
+                    Text("Starts the embedded wineserver, loads the ARM64EC runtime from a pre-seeded prefix, and runs a small x64 executable through FEX. A successful log prints the expected calculation and exits with code 232.")
                 }
 
                 if !report.isEmpty {

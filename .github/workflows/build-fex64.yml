@@ -277,8 +277,8 @@ jobs:
               exit 1
             }
           done
-          test -f "${staging}/aarch64-windows/child-test.exe" || {
-            echo "the runtime artifact is missing the headless acceptance executable" >&2
+          test -f "${staging}/arm64ec-windows/fib-x64.exe" || {
+            echo "the runtime artifact is missing the x64 acceptance executable" >&2
             exit 1
           }
           du -sh "${staging}"/*
