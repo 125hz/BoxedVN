@@ -1,9 +1,101 @@
 diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
-index 12ca1e8..0e8003a 100644
+index 12ca1e8..b5ccb4d 100644
 --- a/build/ntdll-unix/virtual_ios.c
 +++ b/build/ntdll-unix/virtual_ios.c
-@@ -15479,4 +15479,25 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
- #ifdef WINE_IOS
+@@ -9138,0 +9139,84 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
++/***********************************************************************
++ *           ios_rpm_header_poll        (iOS-Mythic BoxedVN ml700)
++ *
++ * Bracket the first change of an emulator allocator page header.
++ *
++ * The emulator's allocator ships as a prebuilt binary that this project
++ * copies verbatim, so its own stores cannot be instrumented. What can be
++ * observed from here is the memory itself. Every 64 KiB guest region is
++ * committed exactly once and reads back zero -- [commit-zero] reported
++ * recommit=0 for the whole run, and no decommit touched the band -- so any
++ * later change to a page's first eight bytes came from inside the emulator
++ * rather than from this VM layer.
++ *
++ * The page descriptor starts with size_class then block_size, and the
++ * allocator's own size-class table makes block_size exactly size_class * 16
++ * for every small class. That pair is therefore self-checking: it is either
++ * still zero (not yet initialised), consistent (valid), or neither. Poll the
++ * tracked pages at the few ntdll entry points that run often during startup
++ * and report the first page that leaves the consistent state.
++ *
++ * The decisive output is ever-valid. If a descriptor is reported without
++ * ever having been seen consistent, the damage belongs to page
++ * initialisation itself rather than to a later overwrite, and the two
++ * cases call for completely different fixes.
++ */
++#define IOS_RPM_TRACK_MAX 64
++
++static struct {
++    uintptr_t page;
++    unsigned  valid;
++    unsigned  reported;
++    unsigned  cls;
++    unsigned  bsz;
++} ios_rpm_track[IOS_RPM_TRACK_MAX];
++static unsigned ios_rpm_track_n;
++static unsigned long ios_rpm_poll_seq;
++
++static void ios_rpm_track_commit( const void *base, SIZE_T size )
++{
++    uintptr_t p = (uintptr_t)base;
++
++    if (size != 0x10000 || (p & 0xffff)) return;
++    if (p < 0x7000000000ULL || p >= 0x7100000000ULL) return;
++    if (ios_rpm_track_n >= IOS_RPM_TRACK_MAX) return;
++    ios_rpm_track[ios_rpm_track_n].page     = p;
++    ios_rpm_track[ios_rpm_track_n].valid    = 0;
++    ios_rpm_track[ios_rpm_track_n].reported = 0;
++    ios_rpm_track[ios_rpm_track_n].cls      = 0;
++    ios_rpm_track[ios_rpm_track_n].bsz      = 0;
++    ios_rpm_track_n++;
++}
++
++static void ios_rpm_header_poll( const char *where )
++{
++    unsigned long seq = ++ios_rpm_poll_seq;
++    unsigned i;
++
++    for (i = 0; i < ios_rpm_track_n; i++)
++    {
++        unsigned cls, bsz;
++
++        if (ios_rpm_track[i].reported) continue;
++        cls = *(volatile unsigned *)ios_rpm_track[i].page;
++        bsz = *(volatile unsigned *)(ios_rpm_track[i].page + 4);
++        if (!cls && !bsz) continue;                 /* not initialised yet */
++        if (cls && cls < 128 && bsz == cls * 16u)
++        {
++            ios_rpm_track[i].valid = 1;
++            ios_rpm_track[i].cls   = cls;
++            ios_rpm_track[i].bsz   = bsz;
++            continue;
++        }
++        ios_rpm_track[i].reported = 1;
++        dprintf( 2, "[rpm-class-first-change] seq=%lu at=%s page=%p ever-valid=%u "
++                 "was=%u/%u now=%u/%u hdr=%016llx,%016llx tracked=%u rev=ml700\n",
++                 seq, where, (void *)ios_rpm_track[i].page, ios_rpm_track[i].valid,
++                 ios_rpm_track[i].cls, ios_rpm_track[i].bsz, cls, bsz,
++                 (unsigned long long)*(volatile unsigned long long *)ios_rpm_track[i].page,
++                 (unsigned long long)*(volatile unsigned long long *)(ios_rpm_track[i].page + 8),
++                 ios_rpm_track_n );
++    }
++}
++
++
+@@ -9211,0 +9296,3 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
++    ios_rpm_track_commit( base, size );
++    ios_rpm_header_poll( "commit" );
++
+@@ -13660,0 +13748 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
++    ios_rpm_header_poll( "ntalloc" );
+@@ -14644,0 +14733 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
++    ios_rpm_header_poll( "ntallocex" );
+@@ -15479,0 +15569,21 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
 +        if (ios_jit_orig_addr)
 +        {
 +            /* The caller is executing from the pool copy, so its mutable data
@@ -25,6 +117,3 @@ index 12ca1e8..0e8003a 100644
 +            return status;
 +        }
 +
-         /* (Previously: also called mprotect_exec on the JIT-pool RX side
-          * here, but that uses vm_protect+VM_PROT_COPY which makes the page
-          * PRIVATE — breaking the dual-map sharing with the RW alias. We rely
