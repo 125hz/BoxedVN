@@ -1,5 +1,5 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..50eeb59 100644
+index 0d0e5fa..62f95fb 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
 @@ -1696,0 +1697,46 @@ static void *ios_mach_exception_thread( void *arg )
@@ -49,7 +49,7 @@ index 0d0e5fa..50eeb59 100644
 +                                        (void *)(uintptr_t)state.__lr);
 +                            }
 +                        }
-@@ -1784,0 +1831,829 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1831,872 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* Remember the exact ContextImpl object proven by the corrupt
 +             * checked-call cell below.  Later null-target recoveries use it
 +             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
@@ -90,6 +90,10 @@ index 0d0e5fa..50eeb59 100644
 +                uint32_t current_class = 0;
 +                uint32_t expected_class = 0;
 +                int class_matches = 0;
++                uint64_t header[8] = {0};
++                mach_vm_size_t header_read = 0;
++                uintptr_t free_head = 0;
++                int free_ok = 0, heap_ok = 0, corrupt_detected = 0;
 +                uint32_t sequence[4] = {0};
 +                uintptr_t cpu_area = 0;
 +                uintptr_t emulator_data[3] = {0};
@@ -141,18 +145,42 @@ index 0d0e5fa..50eeb59 100644
 +                        (mach_vm_address_t)(cpu_area + 0x30), sizeof(emulator_data),
 +                        (mach_vm_address_t)emulator_data, &data_read);
 +
-+                if (pe_pc && module_base && pe_pc - module_base == 0x14bef0 &&
-+                    sequence_read == sizeof(sequence) &&
-+                    sequence[0] == 0xf9401689u && sequence[1] == 0xb9400288u &&
-+                    sequence[2] == 0x91002129u && sequence[3] == 0xf868792au &&
-+                    class_read == sizeof(current_class) && heap_read == sizeof(heap) &&
-+                    !(page & 0xffff) && page >= 0x100000000ULL &&
-+                    heap >= 0x100000000ULL && state.__x[9] == heap + 8 &&
-+                    current_class == (uint32_t)state.__x[8] && current_class >= 0x10000 &&
-+                    class_matches == 1 && expected_class < 128 &&
-+                    fault_addr == state.__x[9] + ((uintptr_t)current_class << 3) &&
-+                    !(data_read == sizeof(emulator_data) && emulator_data[0] &&
-+                      emulator_data[1] && emulator_data[2]) &&
++                /* The repaired class alone does not make the page usable. The
++                 * consumer immediately pops page->free_list (page+0x20, read
++                 * into x21 at +0x14bd80) and clears its first word at
++                 * +0x14bfb0, so a page whose free-list head is also damaged
++                 * turns a repaired header straight into a wild store. Read the
++                 * whole descriptor and require the head to be null or a
++                 * correctly aligned block inside this same 64 KiB page, and the
++                 * heap word to agree, before touching anything. */
++                mach_vm_read_overwrite(mach_task_self(),
++                    (mach_vm_address_t)page, sizeof(header),
++                    (mach_vm_address_t)header, &header_read);
++                if (header_read == sizeof(header))
++                {
++                    free_head = (uintptr_t)header[4];
++                    free_ok = (!free_head ||
++                               (free_head >= page + 0x20 &&
++                                free_head < page + 0x10000 &&
++                                !(free_head & 0xf)));
++                    heap_ok = ((uintptr_t)header[5] == heap);
++                }
++
++                corrupt_detected =
++                    (pe_pc && module_base && pe_pc - module_base == 0x14bef0 &&
++                     sequence_read == sizeof(sequence) &&
++                     sequence[0] == 0xf9401689u && sequence[1] == 0xb9400288u &&
++                     sequence[2] == 0x91002129u && sequence[3] == 0xf868792au &&
++                     class_read == sizeof(current_class) && heap_read == sizeof(heap) &&
++                     !(page & 0xffff) && page >= 0x100000000ULL &&
++                     heap >= 0x100000000ULL && state.__x[9] == heap + 8 &&
++                     current_class == (uint32_t)state.__x[8] && current_class >= 0x10000 &&
++                     fault_addr == state.__x[9] + ((uintptr_t)current_class << 3) &&
++                     !(data_read == sizeof(emulator_data) && emulator_data[0] &&
++                       emulator_data[1] && emulator_data[2]));
++
++                if (corrupt_detected && class_matches == 1 && expected_class < 128 &&
++                    header_read == sizeof(header) && free_ok && heap_ok &&
 +                    mach_vm_write(mach_task_self(), (mach_vm_address_t)page,
 +                                  (vm_offset_t)(uintptr_t)&expected_class,
 +                                  sizeof(expected_class)) == KERN_SUCCESS)
@@ -164,32 +192,47 @@ index 0d0e5fa..50eeb59 100644
 +                    if (n <= 8)
 +                        dprintf(STDERR_FILENO,
 +                            "[rpm-class-repair] #%d page=%p heap=%p bad=%#x class=%u "
-+                            "pc=%p -- repaired header and retrying\n",
++                            "head=%p pc=%p -- repaired header and retrying\n",
 +                            n, (void *)page, (void *)heap, current_class,
-+                            expected_class, (void *)(uintptr_t)fault_pc);
++                            expected_class, (void *)free_head,
++                            (void *)(uintptr_t)fault_pc);
 +
-+                    /* Keep the shape of the damage visible: the header words
-+                     * around the class field say whether only size_class was
-+                     * clobbered or the whole descriptor was overwritten, and
-+                     * every corrupt value seen so far looks like the low half
-+                     * of a pointer into the same guest band. */
-+                    if (n == 1)
-+                    {
-+                        uint64_t hdr[8] = {0};
-+                        mach_vm_size_t hdr_read = 0;
-+                        mach_vm_read_overwrite(mach_task_self(),
-+                            (mach_vm_address_t)page, sizeof(hdr),
-+                            (mach_vm_address_t)hdr, &hdr_read);
++                    /* Print the descriptor for every repaired page, not just the
++                     * first: the run that reached PassManager repaired two pages
++                     * and only the first was dumped, which is exactly the one
++                     * whose free list turned out to be intact. */
++                    if (n <= 4)
 +                        dprintf(STDERR_FILENO,
 +                            "[rpm-first-corrupt] page=%p heap=%p bad=%#x class=%u "
 +                            "slots=%d read=%llu hdr=%p,%p,%p,%p,%p,%p,%p,%p\n",
 +                            (void *)page, (void *)heap, current_class, expected_class,
-+                            class_matches, (unsigned long long)hdr_read,
-+                            (void *)(uintptr_t)hdr[0], (void *)(uintptr_t)hdr[1],
-+                            (void *)(uintptr_t)hdr[2], (void *)(uintptr_t)hdr[3],
-+                            (void *)(uintptr_t)hdr[4], (void *)(uintptr_t)hdr[5],
-+                            (void *)(uintptr_t)hdr[6], (void *)(uintptr_t)hdr[7]);
-+                    }
++                            class_matches, (unsigned long long)header_read,
++                            (void *)(uintptr_t)header[0], (void *)(uintptr_t)header[1],
++                            (void *)(uintptr_t)header[2], (void *)(uintptr_t)header[3],
++                            (void *)(uintptr_t)header[4], (void *)(uintptr_t)header[5],
++                            (void *)(uintptr_t)header[6], (void *)(uintptr_t)header[7]);
++                }
++                else if (corrupt_detected)
++                {
++                    /* The class is wrong and so is something structural. Repairing
++                     * only the class would hand the consumer a free-list head it
++                     * cannot use. Report the whole descriptor and leave the fault
++                     * unhandled so the allocator failure stays at its own first
++                     * boundary instead of becoming a wild store further on. */
++                    static volatile int rpm_refusals;
++                    int n = __sync_add_and_fetch(&rpm_refusals, 1);
++                    if (n <= 4)
++                        dprintf(STDERR_FILENO,
++                            "[rpm-repair-refused] #%d page=%p heap=%p bad=%#x class=%u "
++                            "slots=%d free-ok=%d heap-ok=%d head=%p read=%llu "
++                            "hdr=%p,%p,%p,%p,%p,%p,%p,%p\n",
++                            n, (void *)page, (void *)heap, current_class, expected_class,
++                            class_matches, free_ok, heap_ok, (void *)free_head,
++                            (unsigned long long)header_read,
++                            (void *)(uintptr_t)header[0], (void *)(uintptr_t)header[1],
++                            (void *)(uintptr_t)header[2], (void *)(uintptr_t)header[3],
++                            (void *)(uintptr_t)header[4], (void *)(uintptr_t)header[5],
++                            (void *)(uintptr_t)header[6], (void *)(uintptr_t)header[7]);
 +                }
 +            }
 +
