@@ -1,5 +1,5 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..9d0e32d 100644
+index 0d0e5fa..50eeb59 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
 @@ -1696,0 +1697,46 @@ static void *ios_mach_exception_thread( void *arg )
@@ -49,7 +49,7 @@ index 0d0e5fa..9d0e32d 100644
 +                                        (void *)(uintptr_t)state.__lr);
 +                            }
 +                        }
-@@ -1784,0 +1831,777 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1831,829 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* Remember the exact ContextImpl object proven by the corrupt
 +             * checked-call cell below.  Later null-target recoveries use it
 +             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
@@ -88,7 +88,8 @@ index 0d0e5fa..9d0e32d 100644
 +                uintptr_t page = (uintptr_t)state.__x[20];
 +                uintptr_t heap = 0;
 +                uint32_t current_class = 0;
-+                uint32_t expected_class = (uint32_t)state.__x[17];
++                uint32_t expected_class = 0;
++                int class_matches = 0;
 +                uint32_t sequence[4] = {0};
 +                uintptr_t cpu_area = 0;
 +                uintptr_t emulator_data[3] = {0};
@@ -104,6 +105,34 @@ index 0d0e5fa..9d0e32d 100644
 +                mach_vm_read_overwrite(mach_task_self(),
 +                    (mach_vm_address_t)(page + 0x28), sizeof(heap),
 +                    (mach_vm_address_t)&heap, &heap_read);
++
++                /* The class index is not live in any register by the time this
++                 * load faults. heap_allocate_block_small_to_large keeps it in
++                 * w21 only until +0x14bd80, where w21 is reused for the page's
++                 * free-list head, so the earlier x17 reading was a register
++                 * coincidence of one caller and left the second corrupt page
++                 * unrepaired. Recover it structurally instead: the page was
++                 * fetched at +0x14bd68 as heap->size_class_pages[class] from the
++                 * table at heap+0x3b0, which the same function re-derives at
++                 * +0x14bf2c, so the unique table slot still pointing at this
++                 * page names its class. Require exactly one match -- a missing
++                 * or duplicated entry means that table is damaged as well and
++                 * the header must not be rewritten from it. */
++                if (heap_read == sizeof(heap) && heap >= 0x100000000ULL)
++                {
++                    int ci;
++                    for (ci = 0; ci < 128; ci++)
++                    {
++                        uintptr_t slot = 0;
++                        mach_vm_size_t slot_read = 0;
++                        mach_vm_read_overwrite(mach_task_self(),
++                            (mach_vm_address_t)(heap + 0x3b0 + (uintptr_t)ci * 8),
++                            sizeof(slot), (mach_vm_address_t)&slot, &slot_read);
++                        if (slot_read != sizeof(slot) || slot != page) continue;
++                        expected_class = (uint32_t)ci;
++                        class_matches++;
++                    }
++                }
 +                mach_vm_read_overwrite(mach_task_self(),
 +                    (mach_vm_address_t)(thread_teb + 0x1788), sizeof(cpu_area),
 +                    (mach_vm_address_t)&cpu_area, &area_read);
@@ -120,7 +149,7 @@ index 0d0e5fa..9d0e32d 100644
 +                    !(page & 0xffff) && page >= 0x100000000ULL &&
 +                    heap >= 0x100000000ULL && state.__x[9] == heap + 8 &&
 +                    current_class == (uint32_t)state.__x[8] && current_class >= 0x10000 &&
-+                    expected_class < 128 &&
++                    class_matches == 1 && expected_class < 128 &&
 +                    fault_addr == state.__x[9] + ((uintptr_t)current_class << 3) &&
 +                    !(data_read == sizeof(emulator_data) && emulator_data[0] &&
 +                      emulator_data[1] && emulator_data[2]) &&
@@ -138,6 +167,29 @@ index 0d0e5fa..9d0e32d 100644
 +                            "pc=%p -- repaired header and retrying\n",
 +                            n, (void *)page, (void *)heap, current_class,
 +                            expected_class, (void *)(uintptr_t)fault_pc);
++
++                    /* Keep the shape of the damage visible: the header words
++                     * around the class field say whether only size_class was
++                     * clobbered or the whole descriptor was overwritten, and
++                     * every corrupt value seen so far looks like the low half
++                     * of a pointer into the same guest band. */
++                    if (n == 1)
++                    {
++                        uint64_t hdr[8] = {0};
++                        mach_vm_size_t hdr_read = 0;
++                        mach_vm_read_overwrite(mach_task_self(),
++                            (mach_vm_address_t)page, sizeof(hdr),
++                            (mach_vm_address_t)hdr, &hdr_read);
++                        dprintf(STDERR_FILENO,
++                            "[rpm-first-corrupt] page=%p heap=%p bad=%#x class=%u "
++                            "slots=%d read=%llu hdr=%p,%p,%p,%p,%p,%p,%p,%p\n",
++                            (void *)page, (void *)heap, current_class, expected_class,
++                            class_matches, (unsigned long long)hdr_read,
++                            (void *)(uintptr_t)hdr[0], (void *)(uintptr_t)hdr[1],
++                            (void *)(uintptr_t)hdr[2], (void *)(uintptr_t)hdr[3],
++                            (void *)(uintptr_t)hdr[4], (void *)(uintptr_t)hdr[5],
++                            (void *)(uintptr_t)hdr[6], (void *)(uintptr_t)hdr[7]);
++                    }
 +                }
 +            }
 +
