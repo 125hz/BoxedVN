@@ -2,7 +2,7 @@ diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64
 index 0d0e5fa..93dd756 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,525 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1785,529 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* Remember the exact ContextImpl object proven by the corrupt
 +             * checked-call cell below.  Later null-target recoveries use it
 +             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
@@ -465,12 +465,13 @@ index 0d0e5fa..93dd756 100644
 +
 +            /* The same damaged ContextImpl vtable has an initialization-time
 +             * RunCPUIDFunction slot at +0xa8.  In the pinned image the caller
-+             * at +0x12593c loads that slot, runs arm64x_check_icall, then calls
-+             * x11 with (ContextImpl, 1, 0).  Log 8 proves the checker returns
-+             * x11=0, producing a literal branch to address zero before
-+             * ThreadInit.  Require the previously proven ContextImpl object,
-+             * exact seven-instruction caller, exact PE return RVA, null PC and
-+             * null x11; then call the pinned native implementation at +0xa6f0.
++             * at +0x12593c and +0x125980 loads that slot, runs
++             * arm64x_check_icall, then calls x11 for CPUID leaves 1 and 7.
++             * Logs 8/9 prove the checker returns x11=0, producing a literal
++             * branch to address zero before ThreadInit. Require the previously
++             * proven ContextImpl object, either exact seven-instruction caller,
++             * its exact PE return RVA, null PC and null x11; then call the
++             * pinned native implementation at +0xa6f0.
 +             * A different null function pointer remains unhandled. */
 +            if (!handled && !fault_addr &&
 +                !(uintptr_t)__darwin_arm_thread_state64_get_pc(state) &&
@@ -494,15 +495,18 @@ index 0d0e5fa..93dd756 100644
 +                        (mach_vm_address_t)sequence, &sequence_read);
 +
 +                if (caller_pe && caller_module &&
-+                    caller_pe - caller_module == 0x125940 &&
 +                    sequence_read == sizeof(sequence) &&
 +                    sequence[0] == 0xf940550bu && /* ldr x11,[x8,#0xa8] */
 +                    sequence[1] == 0xf94002c8u && /* ldr x8,[x22] */
 +                    sequence[2] == 0xd63f0100u && /* blr x8 (check) */
-+                    sequence[3] == 0xaa0103e0u && /* mov x0,x1 */
-+                    sequence[4] == 0x52800021u && /* mov w1,#1 */
 +                    sequence[5] == 0x2a1f03e2u && /* mov w2,wzr */
-+                    sequence[6] == 0xd63f0160u)   /* blr x11 */
++                    sequence[6] == 0xd63f0160u && /* blr x11 */
++                    ((caller_pe - caller_module == 0x125940 &&
++                      sequence[3] == 0xaa0103e0u && /* mov x0,x1 */
++                      sequence[4] == 0x52800021u) || /* mov w1,#1 */
++                     (caller_pe - caller_module == 0x125984 &&
++                      sequence[3] == 0xaa1403e0u && /* mov x0,x20 */
++                      sequence[4] == 0x528000e1u))) /* mov w1,#7 */
 +                {
 +                    uintptr_t native_entry = caller_module + 0xa6f0;
 +                    uintptr_t resume_entry =
