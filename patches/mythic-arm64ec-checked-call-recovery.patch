@@ -1,8 +1,55 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..93dd756 100644
+index 0d0e5fa..46687a3 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,631 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1696,0 +1697,46 @@ static void *ios_mach_exception_thread( void *arg )
++
++                        /* BoxedVN: an ARM64EC fast-forward sequence must never
++                         * be redirected into the pool.
++                         *
++                         * Every ARM64EC export is published as a 14-byte x86_64
++                         * thunk in `.hexpthk`, and FEX's private CheckCall only
++                         * fast-forwards ntdll's redirection LUT, so a checked
++                         * call to any other module's export arrives here as a
++                         * plain image-VA exec fault with x11 still holding the
++                         * thunk. Redirecting it to the pool copy makes those x64
++                         * bytes executable as ARM64: `48 8b c4 48` is an LDARH
++                         * whose SBO fields the hardware ignores, so the CPU runs
++                         * it and dies one instruction later on the unallocated
++                         * `89 58 20 55`. Leave the fault alone and the checked-
++                         * call decoder below reads the same 14-byte form Wine's
++                         * arm64x_check_call recognizes and resumes at the real
++                         * ARM64EC entry. Keep it off the stale-VA heal queue as
++                         * well: healing would rewrite the caller's cached
++                         * pointer to the pool copy, and the thunk would then run
++                         * as ARM64 with no fault left to recover from. */
++                        if (jit_pc != (void *)(uintptr_t)fault_pc && is_exec_fault &&
++                            state.__x[11] == (uintptr_t)fault_pc)
++                        {
++                            static const unsigned char ffs_prefix[10] = {
++                                0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9
++                            };
++                            unsigned char ffs[10];
++                            mach_vm_size_t ffs_read = 0;
++
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)fault_pc, sizeof(ffs),
++                                (mach_vm_address_t)ffs, &ffs_read);
++                            if (ffs_read == sizeof(ffs) &&
++                                !memcmp(ffs, ffs_prefix, sizeof(ffs_prefix)))
++                            {
++                                static volatile int ffs_no_redirect;
++                                int n = __sync_add_and_fetch(&ffs_no_redirect, 1);
++                                jit_pc = (void *)(uintptr_t)fault_pc;
++                                if (n <= 8 || !(n & 255))
++                                    dprintf(STDERR_FILENO,
++                                        "[ec-ffs-noredirect] #%d ffs=%p lr=%p -- left for the "
++                                        "ARM64EC checked-call decoder\n",
++                                        n, (void *)(uintptr_t)fault_pc,
++                                        (void *)(uintptr_t)state.__lr);
++                            }
++                        }
+@@ -1784,0 +1831,631 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* Remember the exact ContextImpl object proven by the corrupt
 +             * checked-call cell below.  Later null-target recoveries use it
 +             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
