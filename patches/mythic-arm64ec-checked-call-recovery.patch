@@ -2,7 +2,7 @@ diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64
 index 0d0e5fa..93dd756 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
-@@ -1784,0 +1785,529 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1785,631 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* Remember the exact ContextImpl object proven by the corrupt
 +             * checked-call cell below.  Later null-target recoveries use it
 +             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
@@ -427,6 +427,81 @@ index 0d0e5fa..93dd756 100644
 +                                    (void *)state.__x[0], (void *)lr);
 +                        }
 +
++                        /* BoxedVN: finish ThreadInit's CreateThread dispatch.
++                         *
++                         * ThreadInit prints TI:stack and then, at
++                         * libarm64ecfex+0x65f8 (ThreadInit+0x174), runs
++                         *
++                         *   ldr x11,[x8,#0x80]  ; x8 = *(ContextImpl *)CTX
++                         *   ldr x8,[x9]         ; __os_arm64x_check_icall
++                         *   blr x8
++                         *   mov x1,xzr / mov x2,xzr / mov x3,xzr
++                         *   blr x11
++                         *
++                         * i.e. CTX->CreateThread(0, 0, nullptr), whose result
++                         * ThreadInit immediately stores before printing
++                         * TI:createthread.  x8 is the same damaged vtable pointer
++                         * that already forced the CPUID and invalidation recoveries
++                         * above, so x11 arrives as an interior address of the
++                         * ContextImpl object rather than a function, and the checker
++                         * leaves it alone.  The pinned ContextImpl vtable resolves
++                         * vptr+0x80 to ContextImpl::CreateThread at RVA 0x176a0; the
++                         * slots recovered above (0xa8 RunCPUIDFunction,
++                         * 0xe0 InvalidateCodeBuffersCodeRange,
++                         * 0xe8 InvalidateThreadCachedCodeRange,
++                         * 0xf0 GetCodeInvalidationMutex) come from that same table
++                         * at the same pin, which is what makes the slot readable.
++                         *
++                         * Require the exact return RVA, the exact seven-instruction
++                         * caller window, the ContextImpl object proven by the earlier
++                         * recoveries, the exact interior target, its two-qword cell
++                         * layout, the null argument triple, and a thread whose
++                         * EmulatorData this call has not yet published.  Then run the
++                         * pinned native implementation with x0-x3 and LR untouched, so
++                         * it returns into ThreadInit at +0x65fc exactly as the checked
++                         * call would have.  Any other slot stays unhandled. */
++                        if (!handled && caller_pe && caller_module &&
++                            caller_pe - caller_module == 0x65fc &&
++                            boxedvn_early_context_object &&
++                            state.__x[0] == boxedvn_early_context_object &&
++                            fault_addr == state.__x[0] + 0xa0 &&
++                            !state.__x[1] && !state.__x[2] && !state.__x[3] &&
++                            sequence_read == sizeof(call_window) &&
++                            call_window[0] == 0xf940410bu && /* ldr x11,[x8,#0x80] */
++                            call_window[1] == 0xf9400128u && /* ldr x8,[x9] */
++                            call_window[2] == 0xd63f0100u && /* blr x8 (check) */
++                            call_window[3] == 0xaa1f03e1u && /* mov x1,xzr */
++                            call_window[4] == 0xaa1f03e2u && /* mov x2,xzr */
++                            call_window[5] == 0xaa1f03e3u && /* mov x3,xzr */
++                            call_window[6] == 0xd63f0160u && /* blr x11 */
++                            cell_read == sizeof(cell_words) &&
++                            cell_words[0] == fault_addr + 0x10 && !cell_words[1] &&
++                            !(data_read == sizeof(emulator_data) && emulator_data[0] &&
++                              emulator_data[1] && emulator_data[2]))
++                        {
++                            uintptr_t create_native = caller_module + 0x176a0;
++                            uintptr_t create_resume =
++                                (uintptr_t)ios_jit_translate_addr_for_owner(
++                                    (void *)create_native,
++                                    thread_teb ? ((TEB *)thread_teb)->Peb : NULL);
++
++                            if (create_resume && ios_jit_addr_is_text(create_resume))
++                            {
++                                static volatile int create_thread_recoveries;
++                                int n = __sync_add_and_fetch(&create_thread_recoveries, 1);
++                                __darwin_arm_thread_state64_set_pc_fptr(
++                                    state, (void *)create_resume);
++                                handled = 1;
++                                if (n <= 8)
++                                    dprintf(STDERR_FILENO,
++                                        "[ec-check-createthread] #%d object=%p bad=%p "
++                                        "native=%p resume=%p lr=%p ret=%p\n",
++                                        n, (void *)state.__x[0], (void *)fault_addr,
++                                        (void *)create_native, (void *)create_resume,
++                                        (void *)lr, (void *)(uintptr_t)caller_pe);
++                            }
++                        }
++
 +                        if (!handled)
 +                        {
 +                        if (data_read == sizeof(emulator_data) && emulator_data[0] &&
@@ -450,13 +525,40 @@ index 0d0e5fa..93dd756 100644
 +                        {
 +                            static volatile int unready_calls;
 +                            int n = __sync_add_and_fetch(&unready_calls, 1);
++                            unsigned long long caller_rva =
++                                (caller_pe && caller_module) ? caller_pe - caller_module : 0;
++                            uintptr_t object_vptr = 0;
++                            uint64_t vptr_pe = 0, vptr_module = 0;
++                            mach_vm_size_t vptr_read = 0;
++
++                            /* Enough to resolve the next unhandled ContextImpl
++                             * dispatch in one step: the caller RVA names the site,
++                             * call_window[0] encodes the vtable slot, the target's
++                             * distance from the object shows which interior cell the
++                             * slot read produced, and the object's stored vtable
++                             * pointer shows whether the damaged pre-thread vptr is
++                             * the reason it is not a function at all. */
++                            mach_vm_read_overwrite(mach_task_self(),
++                                (mach_vm_address_t)state.__x[0], sizeof(object_vptr),
++                                (mach_vm_address_t)&object_vptr, &vptr_read);
++                            if (vptr_read == sizeof(object_vptr) && object_vptr)
++                                vptr_pe = ios_jit_reverse_translate(object_vptr,
++                                                                    &vptr_module);
 +                            if (n <= 8 || !(n & 255))
 +                                dprintf(STDERR_FILENO,
 +                                    "[ec-check-unready] #%d target=%p ffs-read=%llu "
-+                                    "state=%p thread=%p enter=%p -- refusing x64 dispatch\n",
++                                    "state=%p thread=%p enter=%p -- refusing x64 dispatch\n"
++                                    "[ec-check-unready] #%d caller=+%#llx object=%p "
++                                    "delta=%#llx vptr=%p vptr-rva=%#llx load=%08x\n",
 +                                    n, (void *)fault_addr, (unsigned long long)ffs_read,
 +                                    (void *)emulator_data[0], (void *)emulator_data[1],
-+                                    (void *)emulator_data[2]);
++                                    (void *)emulator_data[2],
++                                    n, caller_rva, (void *)state.__x[0],
++                                    (unsigned long long)(fault_addr - state.__x[0]),
++                                    (void *)object_vptr,
++                                    (unsigned long long)(vptr_module ? vptr_pe - vptr_module : 0),
++                                    sequence_read == sizeof(call_window) ?
++                                        call_window[0] : 0u);
 +                        }
 +                        }
 +                    }
