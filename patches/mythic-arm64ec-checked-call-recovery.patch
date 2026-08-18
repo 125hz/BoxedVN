@@ -1,5 +1,5 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..62f95fb 100644
+index 0d0e5fa..3dfaddb 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
 @@ -1696,0 +1697,46 @@ static void *ios_mach_exception_thread( void *arg )
@@ -49,7 +49,7 @@ index 0d0e5fa..62f95fb 100644
 +                                        (void *)(uintptr_t)state.__lr);
 +                            }
 +                        }
-@@ -1784,0 +1831,872 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1831,901 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* Remember the exact ContextImpl object proven by the corrupt
 +             * checked-call cell below.  Later null-target recoveries use it
 +             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
@@ -93,7 +93,11 @@ index 0d0e5fa..62f95fb 100644
 +                uint64_t header[8] = {0};
 +                mach_vm_size_t header_read = 0;
 +                uintptr_t free_head = 0;
-+                int free_ok = 0, heap_ok = 0, corrupt_detected = 0;
++                int free_ok = 0, heap_ok = 0, corrupt_detected = 0, geometry_ok = 0;
++                uint32_t page_type = 0, block_count = 0;
++                uint32_t expected_block_size = 0, expected_block_count = 0;
++                uintptr_t block_base = 0, block_end = 0, clobber = 0;
++                int clobber_index = -1;
 +                uint32_t sequence[4] = {0};
 +                uintptr_t cpu_area = 0;
 +                uintptr_t emulator_data[3] = {0};
@@ -145,25 +149,56 @@ index 0d0e5fa..62f95fb 100644
 +                        (mach_vm_address_t)(cpu_area + 0x30), sizeof(emulator_data),
 +                        (mach_vm_address_t)emulator_data, &data_read);
 +
-+                /* The repaired class alone does not make the page usable. The
-+                 * consumer immediately pops page->free_list (page+0x20, read
-+                 * into x21 at +0x14bd80) and clears its first word at
-+                 * +0x14bfb0, so a page whose free-list head is also damaged
-+                 * turns a repaired header straight into a wild store. Read the
-+                 * whole descriptor and require the head to be null or a
-+                 * correctly aligned block inside this same 64 KiB page, and the
-+                 * heap word to agree, before touching anything. */
++                /* Structural check, from the pinned allocator's own geometry
++                 * rather than a guessed same-page rule.
++                 *
++                 * FEX pins its own rpmalloc fork (FEX-Emu/rpmalloc submodule of
++                 * the pinned FEX commit), whose page_t is
++                 *   +0x00 size_class   +0x04 block_size   +0x08 block_count
++                 *   +0x0c block_initialized  +0x10 block_used  +0x14 page_type
++                 *   +0x18 flags  +0x1c local_free_count  +0x20 local_free
++                 *   +0x28 heap   +0x30 next  +0x38 prev
++                 * matching every offset this consumer touches. PAGE_HEADER_SIZE
++                 * is 128, SMALL_GRANULARITY is 16, PAGE_SMALL is 64 KiB, and
++                 * page_block(page, i) is page + 128 + block_size * i, so for a
++                 * small page every block -- and therefore every local_free node
++                 * -- lies inside that one 64 KiB page by construction.
++                 *
++                 * block_count is the independent witness: for class n it is
++                 * (65536 - 128) / (n * 16). The device shows 0x7fc = 2044, which
++                 * is exactly the class-2 value, so the page really is class 2 and
++                 * only the first 8 bytes are wrong. Those 8 bytes cover both
++                 * size_class and block_size, and the observed values reassemble
++                 * into one pointer-shaped quantity, so treat them as a single
++                 * clobbered word rather than repairing the class alone. */
 +                mach_vm_read_overwrite(mach_task_self(),
 +                    (mach_vm_address_t)page, sizeof(header),
 +                    (mach_vm_address_t)header, &header_read);
-+                if (header_read == sizeof(header))
++                if (header_read == sizeof(header) && class_matches == 1 &&
++                    expected_class && expected_class < 128)
 +                {
++                    page_type = (uint32_t)(header[2] >> 32);
++                    block_count = (uint32_t)header[1];
 +                    free_head = (uintptr_t)header[4];
-+                    free_ok = (!free_head ||
-+                               (free_head >= page + 0x20 &&
-+                                free_head < page + 0x10000 &&
-+                                !(free_head & 0xf)));
++                    expected_block_size = expected_class * 16u;
++                    expected_block_count = (0x10000u - 128u) / expected_block_size;
++                    block_base = page + 128;
++                    block_end = block_base +
++                        (uintptr_t)expected_block_size * expected_block_count;
++
++                    geometry_ok = (!page_type && block_count == expected_block_count);
 +                    heap_ok = ((uintptr_t)header[5] == heap);
++                    free_ok = (!free_head ||
++                               (free_head >= block_base && free_head < block_end &&
++                                !((free_head - block_base) % expected_block_size)));
++                    /* If the clobbering value is itself a legal block of this
++                     * page, the header was written as though it were a block --
++                     * page+0 is exactly PAGE_HEADER_SIZE below block 0. */
++                    clobber = (uintptr_t)header[0];
++                    if (clobber >= block_base && clobber < block_end &&
++                        !((clobber - block_base) % expected_block_size))
++                        clobber_index =
++                            (int)((clobber - block_base) / expected_block_size);
 +                }
 +
 +                corrupt_detected =
@@ -179,56 +214,50 @@ index 0d0e5fa..62f95fb 100644
 +                     !(data_read == sizeof(emulator_data) && emulator_data[0] &&
 +                       emulator_data[1] && emulator_data[2]));
 +
-+                if (corrupt_detected && class_matches == 1 && expected_class < 128 &&
-+                    header_read == sizeof(header) && free_ok && heap_ok &&
-+                    mach_vm_write(mach_task_self(), (mach_vm_address_t)page,
-+                                  (vm_offset_t)(uintptr_t)&expected_class,
-+                                  sizeof(expected_class)) == KERN_SUCCESS)
++                if (corrupt_detected && geometry_ok && heap_ok && free_ok)
 +                {
-+                    static volatile int rpm_class_repairs;
-+                    int n = __sync_add_and_fetch(&rpm_class_repairs, 1);
-+                    state.__x[8] = expected_class;
-+                    handled = 1;
-+                    if (n <= 8)
-+                        dprintf(STDERR_FILENO,
-+                            "[rpm-class-repair] #%d page=%p heap=%p bad=%#x class=%u "
-+                            "head=%p pc=%p -- repaired header and retrying\n",
-+                            n, (void *)page, (void *)heap, current_class,
-+                            expected_class, (void *)free_head,
-+                            (void *)(uintptr_t)fault_pc);
++                    uint64_t restored = (uint64_t)expected_class |
++                                        ((uint64_t)expected_block_size << 32);
 +
-+                    /* Print the descriptor for every repaired page, not just the
-+                     * first: the run that reached PassManager repaired two pages
-+                     * and only the first was dumped, which is exactly the one
-+                     * whose free list turned out to be intact. */
-+                    if (n <= 4)
-+                        dprintf(STDERR_FILENO,
-+                            "[rpm-first-corrupt] page=%p heap=%p bad=%#x class=%u "
-+                            "slots=%d read=%llu hdr=%p,%p,%p,%p,%p,%p,%p,%p\n",
-+                            (void *)page, (void *)heap, current_class, expected_class,
-+                            class_matches, (unsigned long long)header_read,
-+                            (void *)(uintptr_t)header[0], (void *)(uintptr_t)header[1],
-+                            (void *)(uintptr_t)header[2], (void *)(uintptr_t)header[3],
-+                            (void *)(uintptr_t)header[4], (void *)(uintptr_t)header[5],
-+                            (void *)(uintptr_t)header[6], (void *)(uintptr_t)header[7]);
++                    if (mach_vm_write(mach_task_self(), (mach_vm_address_t)page,
++                                      (vm_offset_t)(uintptr_t)&restored,
++                                      sizeof(restored)) == KERN_SUCCESS)
++                    {
++                        static volatile int rpm_class_repairs;
++                        int n = __sync_add_and_fetch(&rpm_class_repairs, 1);
++                        state.__x[8] = expected_class;
++                        handled = 1;
++                        if (n <= 8)
++                            dprintf(STDERR_FILENO,
++                                "[rpm-class-repair] #%d page=%p heap=%p bad=%#x class=%u "
++                                "bsize=%u count=%u head=%p pc=%p -- restored header word\n",
++                                n, (void *)page, (void *)heap, current_class,
++                                expected_class, expected_block_size, block_count,
++                                (void *)free_head, (void *)(uintptr_t)fault_pc);
++                    }
 +                }
 +                else if (corrupt_detected)
 +                {
-+                    /* The class is wrong and so is something structural. Repairing
-+                     * only the class would hand the consumer a free-list head it
-+                     * cannot use. Report the whole descriptor and leave the fault
-+                     * unhandled so the allocator failure stays at its own first
-+                     * boundary instead of becoming a wild store further on. */
++                    /* Name the invariant that failed and the geometry it was
++                     * judged against, so the next run reads without re-deriving
++                     * the layout. clobber-index is the decisive field: a legal
++                     * block index means the page header itself was written
++                     * through as if it were a block. */
 +                    static volatile int rpm_refusals;
 +                    int n = __sync_add_and_fetch(&rpm_refusals, 1);
 +                    if (n <= 4)
 +                        dprintf(STDERR_FILENO,
 +                            "[rpm-repair-refused] #%d page=%p heap=%p bad=%#x class=%u "
-+                            "slots=%d free-ok=%d heap-ok=%d head=%p read=%llu "
++                            "geometry-ok=%d heap-ok=%d free-ok=%d slots=%d "
++                            "bsize=%u/%u count=%u/%u blocks=%p..%p head=%p "
++                            "clobber=%p clobber-index=%d "
 +                            "hdr=%p,%p,%p,%p,%p,%p,%p,%p\n",
 +                            n, (void *)page, (void *)heap, current_class, expected_class,
-+                            class_matches, free_ok, heap_ok, (void *)free_head,
-+                            (unsigned long long)header_read,
++                            geometry_ok, heap_ok, free_ok, class_matches,
++                            (uint32_t)(header[0] >> 32), expected_block_size,
++                            block_count, expected_block_count,
++                            (void *)block_base, (void *)block_end, (void *)free_head,
++                            (void *)clobber, clobber_index,
 +                            (void *)(uintptr_t)header[0], (void *)(uintptr_t)header[1],
 +                            (void *)(uintptr_t)header[2], (void *)(uintptr_t)header[3],
 +                            (void *)(uintptr_t)header[4], (void *)(uintptr_t)header[5],
