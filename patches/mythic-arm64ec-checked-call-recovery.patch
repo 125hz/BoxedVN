@@ -1,5 +1,5 @@
 diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
-index 0d0e5fa..46687a3 100644
+index 0d0e5fa..9d0e32d 100644
 --- a/build/ntdll-unix/signal_arm64_ios.c
 +++ b/build/ntdll-unix/signal_arm64_ios.c
 @@ -1696,0 +1697,46 @@ static void *ios_mach_exception_thread( void *arg )
@@ -49,7 +49,7 @@ index 0d0e5fa..46687a3 100644
 +                                        (void *)(uintptr_t)state.__lr);
 +                            }
 +                        }
-@@ -1784,0 +1831,631 @@ static void *ios_mach_exception_thread( void *arg )
+@@ -1784,0 +1831,777 @@ static void *ios_mach_exception_thread( void *arg )
 +            /* Remember the exact ContextImpl object proven by the corrupt
 +             * checked-call cell below.  Later null-target recoveries use it
 +             * to avoid treating an unrelated ARM64EC indirect call as FEX. */
@@ -350,6 +350,58 @@ index 0d0e5fa..46687a3 100644
 +                        {
 +                            uintptr_t context_target_rva = 0;
 +                            boxedvn_early_context_object = state.__x[0];
++
++                            /* BoxedVN: one-shot report on the arena this object
++                             * lives in. Every field read out of it comes back as
++                             * (field address + 0x10) at 16-byte-aligned offsets
++                             * and 0 at +8 -- an allocator free list threaded
++                             * through the object, not a C++ layout. Print the
++                             * owning rpmalloc page header and how far the cell
++                             * chain runs so the next run shows whether this is
++                             * the same size-class corruption [rpm-class-repair]
++                             * already repairs elsewhere in this guest band. */
++                            {
++                                static volatile int arena_reported;
++                                if (!__sync_val_compare_and_swap(&arena_reported, 0, 1))
++                                {
++                                    uintptr_t obj = state.__x[0];
++                                    uintptr_t page = obj & ~(uintptr_t)0xffff;
++                                    uint32_t page_class = 0;
++                                    uintptr_t page_heap = 0;
++                                    uint64_t head[4] = {0};
++                                    mach_vm_size_t cr = 0, hr = 0, dr = 0;
++                                    int cells = 0, k;
++
++                                    mach_vm_read_overwrite(mach_task_self(),
++                                        (mach_vm_address_t)page, sizeof(page_class),
++                                        (mach_vm_address_t)&page_class, &cr);
++                                    mach_vm_read_overwrite(mach_task_self(),
++                                        (mach_vm_address_t)(page + 0x28), sizeof(page_heap),
++                                        (mach_vm_address_t)&page_heap, &hr);
++                                    mach_vm_read_overwrite(mach_task_self(),
++                                        (mach_vm_address_t)obj, sizeof(head),
++                                        (mach_vm_address_t)head, &dr);
++                                    for (k = 0; k < 256; k++)
++                                    {
++                                        uintptr_t cell = obj + (uintptr_t)k * 0x10;
++                                        uint64_t link = 0;
++                                        mach_vm_size_t lr2 = 0;
++                                        mach_vm_read_overwrite(mach_task_self(),
++                                            (mach_vm_address_t)cell, sizeof(link),
++                                            (mach_vm_address_t)&link, &lr2);
++                                        if (lr2 != sizeof(link) || link != cell + 0x10) break;
++                                        cells++;
++                                    }
++                                    dprintf(STDERR_FILENO,
++                                        "[ctx-arena] object=%p page=%p class=%#x heap=%p "
++                                        "head=%p,%p,%p,%p freelist-cells=%d reads=%llu/%llu/%llu\n",
++                                        (void *)obj, (void *)page, page_class, (void *)page_heap,
++                                        (void *)(uintptr_t)head[0], (void *)(uintptr_t)head[1],
++                                        (void *)(uintptr_t)head[2], (void *)(uintptr_t)head[3],
++                                        cells, (unsigned long long)cr,
++                                        (unsigned long long)hr, (unsigned long long)dr);
++                                }
++                            }
 +
 +                            /* The bundled ARM64EC objects disagree about the expanded
 +                             * WritePriorityMutex layout: the lock implementation treats
@@ -678,6 +730,100 @@ index 0d0e5fa..46687a3 100644
 +                                (void *)resume_entry, (void *)lr,
 +                                (unsigned long long)state.__x[1],
 +                                (unsigned long long)state.__x[2]);
++                    }
++                }
++            }
++
++            /* BoxedVN: complete LookupCache's MarkOvercommitRange call.
++             *
++             * LookupCache::LookupCache reserves its L1 table and then runs, at
++             * libarm64ecfex+0xac68 (LookupCache::LookupCache+0x278):
++             *
++             *   ldr x0,[x20,#0x200]  ; CTX->SyscallHandler
++             *   ldr x8,[x0]          ; its vtable
++             *   ldp x1,x2,[x19,#0x50]; AllocationBase, AllocationSize
++             *   ldr x11,[x8,#0x28]   ; vptr+0x28
++             *   ldr x8,[x25]         ; __os_arm64x_check_icall
++             *   blr x8
++             *   blr x11
++             *
++             * The ContextImpl arena is threaded with a 16-byte allocator free
++             * list, so CTX->SyscallHandler reads back as its own field address
++             * plus 0x10 and the slot load lands on a zero cell: x11 arrives
++             * null and there is no real handler object to call. The pinned
++             * concrete method is Exception::ECSyscallHandler::MarkOvercommitRange
++             * at +0x8530, and it never reads `this` -- it overwrites x0 with the
++             * address of a global overcommit tracker's lock at +0x854c before
++             * any use, then inserts [base, base+size) under that lock. So the
++             * bookkeeping can still be performed exactly, from the two argument
++             * registers alone, instead of being skipped.
++             *
++             * Require the exact caller RVA, the exact four-instruction tail, a
++             * null target, and an x0 that is literally the value stored at
++             * CTX+0x200 for the ContextImpl these recoveries already proved.
++             * The method returns void, so resume at LR with x1/x2 untouched. */
++            if (!handled && !fault_addr &&
++                !(uintptr_t)__darwin_arm_thread_state64_get_pc(state) &&
++                !state.__x[11] && boxedvn_early_context_object)
++            {
++                extern uint64_t ios_jit_reverse_translate(uint64_t addr,
++                                                          uint64_t *module_base);
++                extern int ios_jit_addr_is_text(uintptr_t addr);
++                extern void *ios_jit_translate_addr_for_owner(void *addr,
++                                                               void *owner_peb);
++                uintptr_t lr = (uintptr_t)state.__lr;
++                uint64_t caller_module = 0;
++                uint64_t caller_pe = ios_jit_reverse_translate(lr, &caller_module);
++                uint64_t thunk_module = 0;
++                uint64_t thunk_pe = ios_jit_reverse_translate(state.__x[10],
++                                                              &thunk_module);
++                uint32_t tail[4] = {0};
++                uintptr_t handler_slot = 0;
++                mach_vm_size_t tail_read = 0, slot_read = 0;
++
++                if (lr >= 16)
++                    mach_vm_read_overwrite(mach_task_self(),
++                        (mach_vm_address_t)(lr - 16), sizeof(tail),
++                        (mach_vm_address_t)tail, &tail_read);
++                mach_vm_read_overwrite(mach_task_self(),
++                    (mach_vm_address_t)(boxedvn_early_context_object + 0x200),
++                    sizeof(handler_slot), (mach_vm_address_t)&handler_slot,
++                    &slot_read);
++
++                if (caller_pe && caller_module &&
++                    caller_pe - caller_module == 0xac6c &&
++                    tail_read == sizeof(tail) &&
++                    tail[0] == 0xf940150bu && /* ldr x11,[x8,#0x28] */
++                    tail[1] == 0xf9400328u && /* ldr x8,[x25] */
++                    tail[2] == 0xd63f0100u && /* blr x8 (check) */
++                    tail[3] == 0xd63f0160u && /* blr x11 */
++                    slot_read == sizeof(handler_slot) && handler_slot &&
++                    state.__x[0] == handler_slot &&
++                    state.__x[1] && !(state.__x[1] & 0xffff) &&
++                    state.__x[2] == 0x200000)
++                {
++                    uintptr_t native_entry = caller_module + 0x8530;
++                    uintptr_t resume_entry =
++                        (uintptr_t)ios_jit_translate_addr_for_owner(
++                            (void *)native_entry,
++                            thread_teb ? ((TEB *)thread_teb)->Peb : NULL);
++
++                    if (resume_entry && ios_jit_addr_is_text(resume_entry))
++                    {
++                        static volatile int overcommit_recoveries;
++                        int n = __sync_add_and_fetch(&overcommit_recoveries, 1);
++                        __darwin_arm_thread_state64_set_pc_fptr(
++                            state, (void *)resume_entry);
++                        handled = 1;
++                        if (n <= 8)
++                            dprintf(STDERR_FILENO,
++                                "[ec-check-overcommit] #%d handler=%p base=%p size=%#llx "
++                                "native=%p resume=%p lr=%p thunk=%#llx\n",
++                                n, (void *)state.__x[0], (void *)state.__x[1],
++                                (unsigned long long)state.__x[2],
++                                (void *)native_entry, (void *)resume_entry, (void *)lr,
++                                (unsigned long long)(thunk_module ?
++                                    thunk_pe - thunk_module : 0));
 +                    }
 +                }
 +            }
