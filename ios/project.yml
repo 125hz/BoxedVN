@@ -222,6 +222,8 @@ targets:
       - sdk: AudioToolbox.framework
       - sdk: Foundation.framework
       - sdk: IOKit.framework
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
       - sdk: UIKit.framework
       - sdk: libc++.tbd
       - sdk: libz.tbd

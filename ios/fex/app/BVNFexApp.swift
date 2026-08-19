@@ -6,6 +6,8 @@
 //  debugger-prepared page on this device - and an interface any bigger than
 //  that would imply otherwise.
 
+import Metal
+import QuartzCore
 import SwiftUI
 import UIKit
 
@@ -106,6 +108,15 @@ struct ProbeView: View {
                         Text("Wine desktop").tag(BVNWineTargetDesktop)
                     }
                     .disabled(wineRunning)
+
+                    // DXMT presents onto this layer directly. It is shown for
+                    // the graphics target only, because that is the one path
+                    // that renders; the others report through the log.
+                    if wineTarget == BVNWineTargetDXMT {
+                        BVNMetalSurface()
+                            .frame(height: 220)
+                            .background(Color.black)
+                    }
 
                     Button {
                         startWine()
@@ -325,4 +336,36 @@ struct ProbeView: View {
         if latestReport != wineReport { wineReport = latestReport }
         if latestLog != winePersistentLog { winePersistentLog = latestLog }
     }
+}
+
+/// A CAMetalLayer-backed view handed to DXMT.
+///
+/// DXMT presents D3D11 frames straight onto this layer through the macdrv
+/// shim, so nothing here draws: the view exists to own a layer and hand it
+/// over before Wine starts. Without it the swapchain has nowhere to present
+/// and the run produces no picture however far it otherwise gets.
+struct BVNMetalSurface: UIViewRepresentable {
+    func makeUIView(context: Context) -> BVNMetalView {
+        let view = BVNMetalView()
+        bvn_display_set_layer(view.metalLayer)
+        return view
+    }
+
+    func updateUIView(_ uiView: BVNMetalView, context: Context) {}
+}
+
+final class BVNMetalView: UIView {
+    override class var layerClass: AnyClass { CAMetalLayer.self }
+
+    var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
 }

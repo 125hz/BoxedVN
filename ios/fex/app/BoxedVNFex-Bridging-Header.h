@@ -6,3 +6,4 @@
 #import "BVNFexBridge.h"
 #import "BVNWineBridge.h"
 #import "BVNExecMemory.h"
+#import "IOSDisplayShim.h"

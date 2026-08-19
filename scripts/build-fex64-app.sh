@@ -244,6 +244,23 @@ log "Linked binary"
 otool -L "${APP_PATH}/BoxedVNFex" | sed 's/^/  /' | head -20
 ls -lh "${APP_PATH}/BoxedVNFex" | awk '{printf "  binary %s\n", $5}'
 
+# DXMT finds the display shim with dlsym(RTLD_DEFAULT, "macdrv_functions"),
+# which the linker cannot see, so under -dead_strip the symbol is a candidate
+# for removal however it is declared. The source marks it used, but that is an
+# assumption about the toolchain rather than a fact about this binary, and when
+# it fails DXMT reports only that Wine lacks the symbols it needs and shows a
+# white screen. Verify by content instead.
+if ! xcrun dyld_info -exports "${APP_PATH}/BoxedVNFex" 2>/dev/null \
+        | grep -q "macdrv_functions"; then
+    die "The built app does not export macdrv_functions.
+
+DXMT resolves the display shim by name at runtime, so without it every D3D11
+swapchain fails and the graphics target renders nothing. Check that
+IOSDisplayShim.m is in the target and that its __attribute__((used)) survived
+the link."
+fi
+ok "macdrv_functions is exported"
+
 "${BOXEDVN_SCRIPT_DIR}/package-ipa.sh" \
     --app "${APP_PATH}" \
     --output-dir "${OUTPUT_DIR}/artifacts" \
