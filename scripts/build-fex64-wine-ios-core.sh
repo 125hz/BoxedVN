@@ -47,6 +47,7 @@ NTDLL_IOS="${INTEGRATION}/build/ntdll-unix"
 SERVER_IOS="${INTEGRATION}/build/wineserver"
 JIT_AUTHORITY_PATCH="${BOXEDVN_ROOT}/patches/mythic-jit-pool-authority.patch"
 CHECKED_CALL_PATCH="${BOXEDVN_ROOT}/patches/mythic-arm64ec-checked-call-recovery.patch"
+DEAD_VA_PATCH="${BOXEDVN_ROOT}/patches/mythic-dead-va-window.patch"
 OUTPUT="${FEX64_DIR}/wine-ios-core"
 OBJECTS="${FEX64_DIR}/wine-ios-core-objects"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -58,14 +59,22 @@ require_file "${NTDLL_IOS}/virtual_ios.c" \
 require_file "${SERVER_IOS}/main_ios.c"
 require_file "${JIT_AUTHORITY_PATCH}"
 require_file "${CHECKED_CALL_PATCH}"
+require_file "${DEAD_VA_PATCH}"
 
+# The third argument selects the matching mode. The first two patches carry no
+# context and need --unidiff-zero, which switches off the context check; the
+# cost of that is a patch already applied can look appliable again and land a
+# second copy. A patch generated with context is applied with git's normal
+# matching instead, which is stricter, tolerates line drift from whatever was
+# applied before it, and tells "already applied" from "fresh" reliably.
 apply_integration_patch() {
     local patch="$1"
     local description="$2"
-    if git -C "${INTEGRATION}" apply --unidiff-zero --check "${patch}"; then
+    local mode="${3---unidiff-zero}"
+    if git -C "${INTEGRATION}" apply ${mode} --check "${patch}"; then
         log "Applying ${description}"
-        git -C "${INTEGRATION}" apply --unidiff-zero "${patch}"
-    elif git -C "${INTEGRATION}" apply --unidiff-zero --reverse --check "${patch}"; then
+        git -C "${INTEGRATION}" apply ${mode} "${patch}"
+    elif git -C "${INTEGRATION}" apply ${mode} --reverse --check "${patch}"; then
         log "${description} is already applied"
     else
         die "The pinned integration source no longer accepts ${patch}; refresh the patch explicitly."
@@ -74,6 +83,9 @@ apply_integration_patch() {
 
 apply_integration_patch "${JIT_AUTHORITY_PATCH}" "JIT-pool data ownership fix"
 apply_integration_patch "${CHECKED_CALL_PATCH}" "ARM64EC checked-call recovery"
+# Applied last, and generated against the two above, so it is the one that has
+# to survive their line numbers.
+apply_integration_patch "${DEAD_VA_PATCH}" "dead VA window short-circuit" ""
 
 rm -rf "${OUTPUT}" "${OBJECTS}"
 mkdir -p "${OUTPUT}/lib" "${OBJECTS}/ntdll" "${OBJECTS}/wineserver"
