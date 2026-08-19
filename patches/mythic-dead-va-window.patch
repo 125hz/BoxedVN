@@ -1,6 +1,6 @@
 --- a/build/ntdll-unix/virtual_ios.c
 +++ b/build/ntdll-unix/virtual_ios.c
-@@ -4236,6 +4236,29 @@
+@@ -4236,6 +4236,45 @@
   * genuinely tight. */
  static int ios_va_pressure;
  
@@ -27,18 +27,37 @@
 + * this only changes how long it takes to say no. */
 +static void *ios_va_dead_floor;
 +
++/* bvn2: smallest request size the floor above has actually been proven at.
++ *
++ * A band that cannot satisfy a 512MB reservation may still have room for 4KB,
++ * so a failure at one size does not license refusing every smaller one. The
++ * first cut of this got that backwards: both learning scans were 512MB
++ * requests and it then refused 4KB ones on that evidence. It caused no harm on
++ * the device that produced it, where the small requests were failing anyway,
++ * but the reasoning does not hold on a merely fragmented band.
++ *
++ * The implication runs the other way. If a request for N bytes fails at every
++ * address in a band, any request LARGER than N fails too, because it needs
++ * strictly more contiguous space. So remember the smallest size ever disproven
++ * and refuse only requests at least that large; anything smaller is still
++ * walked, and may lower this in turn. */
++static size_t ios_va_dead_min_size;
++
  /* ml116 ROOT CAUSE of the ceiling regressions (disassembly + code-path proof,
   * no device run needed):
   *
-@@ -9738,15 +9761,36 @@
+@@ -9738,15 +9777,39 @@
          {
              unsigned int tries0 = ios_va_scan_tries;
              unsigned int skips0 = ios_va_scan_skips;
 +            /* bvn1: see ios_va_dead_floor. Only when the WHOLE window is above
 +             * the proven floor — a window straddling it may still hold a
-+             * usable gap below, so that one is walked as before. */
++             * usable gap below, so that one is walked as before. bvn2: and
++             * only at or above the size the floor was proven at, since a
++             * smaller request is not covered by that proof. */
 +            int dead_window = ios_va_dead_floor &&
-+                              (char *)start >= (char *)ios_va_dead_floor;
++                              (char *)start >= (char *)ios_va_dead_floor &&
++                              size >= ios_va_dead_min_size;
 +
 +            if (dead_window)
 +            {
@@ -69,7 +88,7 @@
              {
                  static int described;
                  char what[128];
-@@ -9763,6 +9807,26 @@
+@@ -9763,6 +9826,32 @@
                      if (!censused) { censused = 1; ios_furniture_census(); }
                  }
  
@@ -84,13 +103,19 @@
 +                    ios_scan_fail_errno == ENOMEM &&
 +                    ios_va_scan_tries - tries0 >= 1024 &&
 +                    (!ios_va_dead_floor ||
-+                     (char *)start < (char *)ios_va_dead_floor))
++                     (char *)start < (char *)ios_va_dead_floor ||
++                     size < ios_va_dead_min_size))
 +                {
-+                    ios_va_dead_floor = start;
-+                    dprintf( 2, "[va-scan] dead floor learned: %p (this window cost "
-+                                "%u failing mmaps; later requests above it are refused "
-+                                "without a scan) rev=bvn1\n",
-+                             ios_va_dead_floor, ios_va_scan_tries - tries0 );
++                    if (!ios_va_dead_floor ||
++                        (char *)start < (char *)ios_va_dead_floor)
++                        ios_va_dead_floor = start;
++                    if (!ios_va_dead_min_size || size < ios_va_dead_min_size)
++                        ios_va_dead_min_size = size;
++                    dprintf( 2, "[va-scan] dead floor learned: %p at size %p (this window "
++                                "cost %u failing mmaps; later requests above it and at "
++                                "least that large are refused without a scan) rev=bvn2\n",
++                             ios_va_dead_floor, (void *)ios_va_dead_min_size,
++                             ios_va_scan_tries - tries0 );
 +                }
 +
                  /* ml118 discriminator — see ios_scan_fail_addr. Rate-limited:

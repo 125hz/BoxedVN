@@ -149,4 +149,26 @@ cp "${DLL}" "${OUTPUT}/libarm64ecfex.dll"
 log "ARM64EC emulator DLL: ${OUTPUT}/libarm64ecfex.dll"
 log "  size   $(wc -c < "${OUTPUT}/libarm64ecfex.dll") bytes"
 log "  sha256 $(shasum -a 256 "${OUTPUT}/libarm64ecfex.dll" | cut -d' ' -f1)"
+
+# Emit a sorted symbol map beside the DLL.
+#
+# Device faults report an offset into this module and nothing else, and every
+# one of them costs a build round trip to guess at. The wedge this was added
+# for is a `blr x11` at libarm64ecfex+0x198774 that branched into an x86-64
+# import thunk instead of routing the call through the emulator; naming that
+# call site is the difference between fixing it in the source we now build and
+# working around it in the fault handler.
+#
+# Addresses here are file/preferred-image relative, so subtract the module base
+# reported by the loader, not the JIT-pool copy address.
+if nm -C --defined-only --numeric-sort "${DLL}" > "${OUTPUT}/libarm64ecfex.symbols" 2>/dev/null &&
+   [[ -s "${OUTPUT}/libarm64ecfex.symbols" ]]; then
+    log "  symbols $(wc -l < "${OUTPUT}/libarm64ecfex.symbols") entries -> libarm64ecfex.symbols"
+else
+    # Not fatal: the DLL is what the build exists to produce, and a missing map
+    # only costs the next fault an extra round trip.
+    rm -f "${OUTPUT}/libarm64ecfex.symbols"
+    warn "could not emit a symbol map; device fault offsets will not resolve"
+fi
+
 ok "arm64ecfex built from source"
