@@ -84,6 +84,10 @@ const void *ws2_32_unix_call_funcs[1] = {0};
 // worth knowing before building the unix half of win32u the way DXMT's was
 // built. Counted rather than printed once, because a message loop would ask
 // repeatedly and the count says whether it kept trying.
+// Gone once the real unix side is linked: the archive defines this symbol,
+// and two definitions would let this object file win while the archive sat
+// unused - the same trap the graphics unix-call table had.
+#ifndef BVN_WINE_WIN32U_ENABLED
 int win32u_unix_lib_init(void)
 {
     static int refusals;
@@ -96,5 +100,6 @@ int win32u_unix_lib_init(void)
     }
     return (int)0xc00000bb; /* STATUS_NOT_SUPPORTED */
 }
+#endif
 
 #endif

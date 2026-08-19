@@ -9,7 +9,7 @@
 #                              [--skip-fex]
 #                              [--wine-core-dir DIR]
 #                              [--wine-runtime-dir DIR] [--mythic-dir DIR]
-#                              [--dxmt-lib PATH]
+#                              [--dxmt-lib PATH] [--win32u-lib PATH]
 #
 # Stage A2 of docs/ARCHITECTURE_FEX64.md. Builds FEX if its archives are not
 # already present, generates the Xcode project, links the BoxedVNFex target
@@ -32,6 +32,7 @@ WINE_RUNTIME_DIR=""
 WINE_PE_DIR=""
 MYTHIC_DIR=""
 DXMT_LIB=""
+WIN32U_LIB=""
 
 usage() {
     sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -65,6 +66,9 @@ while [[ $# -gt 0 ]]; do
         --dxmt-lib)
             [[ $# -ge 2 ]] || die "--dxmt-lib needs a value"
             DXMT_LIB="$2"; shift 2 ;;
+        --win32u-lib)
+            [[ $# -ge 2 ]] || die "--win32u-lib needs a value"
+            WIN32U_LIB="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -194,6 +198,13 @@ if [[ -n "${DXMT_LIB}" ]]; then
     DXMT_LIB="$(cd "$(dirname "${DXMT_LIB}")" && pwd)/$(basename "${DXMT_LIB}")"
 fi
 
+# The window subsystem is reachable only through Wine for the same reason.
+if [[ -n "${WIN32U_LIB}" ]]; then
+    [[ "${WINE_ENABLED}" -eq 1 ]] || die "--win32u-lib needs a Wine-enabled build."
+    require_file "${WIN32U_LIB}" "Build it with scripts/build-fex64-win32u.sh."
+    WIN32U_LIB="$(cd "$(dirname "${WIN32U_LIB}")" && pwd)/$(basename "${WIN32U_LIB}")"
+fi
+
 XCODEGEN="${BOXEDVN_THIRD_PARTY}/xcodegen-${BOXEDVN_XCODEGEN_VERSION}/bin/xcodegen"
 [[ -x "${XCODEGEN}" ]] \
     || die "XcodeGen is missing at '${XCODEGEN}'. Run scripts/fetch-dependencies.sh."
@@ -225,6 +236,15 @@ if [[ "${WINE_ENABLED}" -eq 1 ]]; then
         log "Linking DXMT's unix side ($(wc -c < "${DXMT_LIB}" | tr -d ' ') bytes)"
     else
         warn "no --dxmt-lib: the graphics target will branch to zero on its first unix call, because winemetal.dll resolves through the null stub table"
+    fi
+    if [[ -n "${WIN32U_LIB}" ]]; then
+        # Same pairing rule as the graphics archive: the define is what
+        # removes the stub, so it travels with the library replacing it.
+        dxmt_ldflags="${dxmt_ldflags} ${WIN32U_LIB}"
+        wine_definitions="${wine_definitions} BVN_WINE_WIN32U_ENABLED=1"
+        log "Linking win32u's unix side ($(wc -c < "${WIN32U_LIB}" | tr -d ' ') bytes)"
+    else
+        warn "no --win32u-lib: the window subsystem keeps answering STATUS_NOT_SUPPORTED, so a guest message loop gets a zeroed MSG"
     fi
     XCODE_WINE_SETTINGS+=(
         "BVN_WINE_LIBRARY_DIR=${WINE_CORE_DIR}/lib"
