@@ -1,0 +1,71 @@
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -4865,6 +4865,68 @@
+                             else
+                                 dprintf( STDERR_FILENO, "[rsp-trunc]   x86 @rip UNREADABLE\n" );
+ 
++                            /* bvn7: the guest RIP landed inside the guest's own stack.
++                             *
++                             * A device run reached this with guest_rip=0x700880f7d0 and
++                             * rsp=0x700880f608, and the eight bytes at that RIP were a
++                             * stack pointer with a cube-x64.exe code pointer immediately
++                             * after it. That is the shape of a return that took the
++                             * wrong slot - the saved frame pointer instead of the
++                             * return address - so the interesting quantity is not the
++                             * RIP itself but WHERE the real return address is sitting
++                             * relative to RSP.
++                             *
++                             * Print the window and let the offsets answer it. A code
++                             * pointer at rsp+8 says the stack is one slot deep, at
++                             * rsp-8 one slot shallow, and a module name on the line
++                             * says whose frame it belongs to. Guessing at the skew from
++                             * a single RIP value is what made the previous two readings
++                             * of this crash wrong.
++                             *
++                             * Only when the RIP is genuinely stack-resident: a normal
++                             * fault in module code has nothing to learn here, and this
++                             * is inside the existing rate limit. */
++                            if (cs[0] && rsp && cs[0] > rsp && cs[0] - rsp < 0x2000)
++                            {
++                                extern uint64_t ios_jit_reverse_translate(uint64_t addr,
++                                                                          uint64_t *module_base);
++                                uint64_t win[24];
++                                mach_vm_size_t wg = 0;
++
++                                if (mach_vm_read_overwrite( mach_task_self(),
++                                        (mach_vm_address_t)(rsp - 0x40), sizeof(win),
++                                        (mach_vm_address_t)win, &wg ) == KERN_SUCCESS &&
++                                    wg == sizeof(win))
++                                {
++                                    unsigned wi;
++
++                                    dprintf( STDERR_FILENO,
++                                             "[rsp-window] guest rip is 0x%llx above rsp and inside the "
++                                             "stack; dumping [rsp-0x40,rsp+0x140) rev=bvn7\n",
++                                             (unsigned long long)(cs[0] - rsp) );
++
++                                    for (wi = 0; wi < 24; wi++)
++                                    {
++                                        uint64_t mod = 0;
++                                        uint64_t va = ios_jit_reverse_translate( win[wi], &mod );
++
++                                        if (va && mod)
++                                            dprintf( STDERR_FILENO,
++                                                     "[rsp-window]   %p: %016llx = mod %p +0x%llx%s\n",
++                                                     (void *)(uintptr_t)(rsp - 0x40 + wi * 8),
++                                                     (unsigned long long)win[wi], (void *)(uintptr_t)mod,
++                                                     (unsigned long long)(va - mod),
++                                                     win[wi] == cs[0] ? "   <== the guest RIP" : "" );
++                                        else
++                                            dprintf( STDERR_FILENO,
++                                                     "[rsp-window]   %p: %016llx%s\n",
++                                                     (void *)(uintptr_t)(rsp - 0x40 + wi * 8),
++                                                     (unsigned long long)win[wi],
++                                                     win[wi] == cs[0] ? "   <== the guest RIP" : "" );
++                                    }
++                                }
++                            }
++
+                             /* iOS-Mythic ml333: is the guest code we EXECUTE the guest code that was
+                              * LOADED?
+                              *
