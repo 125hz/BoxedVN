@@ -99,11 +99,21 @@ log "  rpmalloc  $(git -C "${FEX_SOURCE}/External/rpmalloc" rev-parse HEAD 2>/de
 # times sane. BUILD_TESTING off: nothing here runs on the host. TUNE_CPU none
 # so the build does not tune for the macOS host it is cross-compiling on.
 # FEX_IOS_HOST_BUILD selects the link rules the fork added for this host.
+#
+# FEX_IOS_HOST is a separate thing: a compile define no CMake file in the fork
+# ever sets, yet 24 sources depend on it, and in Core.cpp it guards the
+# declarations of iOS log buffers whose uses a hundred lines later are not
+# guarded at all. The prebuilt plainly had it, since the shipped DLL carries
+# all of that iOS behaviour, so the author passed it in the environment. Pass
+# it explicitly rather than depending on an undocumented local setting.
 cmake -S "${FEX_SOURCE}" -B "${BUILD}" -G Ninja \
     -DCMAKE_BUILD_TYPE="${CONFIGURATION}" \
     -DCMAKE_TOOLCHAIN_FILE="${FEX_SOURCE}/Data/CMake/toolchain_mingw.cmake" \
     -DMINGW_TRIPLE="${TRIPLE}" \
     -DFEX_IOS_HOST_BUILD=True \
+    -DCMAKE_C_FLAGS="-DFEX_IOS_HOST" \
+    -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST" \
+    -DCMAKE_ASM_FLAGS="-DFEX_IOS_HOST" \
     -DENABLE_LTO=False \
     -DBUILD_TESTING=False \
     -DBUILD_THUNKS=False \
