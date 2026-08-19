@@ -18,6 +18,13 @@
 
 #ifdef __OBJC__
 #import <QuartzCore/CAMetalLayer.h>
+#include <stdbool.h>
+
+// The implementation is Objective-C, so these keep C linkage for the
+// Objective-C++ bridge that reports whether a layer arrived.
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /// Registers the layer DXMT-rendered frames are presented into. Must be called
 /// before the first D3D11 swapchain is created, which in practice means before
@@ -26,7 +33,11 @@ void bvn_display_set_layer(CAMetalLayer *layer);
 
 /// True once a layer has been registered. The Swift side reports this so a run
 /// that would have produced no picture says so before it starts.
-_Bool bvn_display_has_layer(void);
+bool bvn_display_has_layer(void);
+
+#ifdef __cplusplus
+}
+#endif
 #endif
 
 #endif

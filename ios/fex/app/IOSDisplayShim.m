@@ -58,9 +58,9 @@ void bvn_display_set_layer(CAMetalLayer *layer) {
     fflush(stderr);
 }
 
-_Bool bvn_display_has_layer(void) {
+bool bvn_display_has_layer(void) {
     pthread_mutex_lock(&g_lock);
-    _Bool present = g_layer != nil;
+    bool present = g_layer != nil;
     pthread_mutex_unlock(&g_lock);
     return present;
 }

@@ -10,6 +10,7 @@
 #include "BVNFexBridge.h"
 #include "BVNExecMemory.h"
 #include "BVNJitArenaPlan.h"
+#include "IOSDisplayShim.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -456,6 +457,14 @@ extern "C" bool BVNWineStart(void) {
     } else {
         reportf("persistent log ready at Documents/fex64-wine.log");
     }
+
+    // The shim registers its layer when SwiftUI builds the view, which is
+    // before this log exists and before prepareDiagnostics truncates it, so
+    // the shim's own stderr line can never appear here and its absence
+    // proves nothing. Report the latched state instead: a run that would
+    // have produced no picture says so before the graphics stack loads.
+    reportf("display layer registered before start: %s",
+            bvn_display_has_layer() ? "yes" : "no - swapchains will fail");
     if (!BVNWineAvailable()) {
         reportf("the linked build is missing one or more Wine resources");
         g_stage.store(BVNWineStageFailed, std::memory_order_release);
