@@ -49,6 +49,7 @@ JIT_AUTHORITY_PATCH="${BOXEDVN_ROOT}/patches/mythic-jit-pool-authority.patch"
 CHECKED_CALL_PATCH="${BOXEDVN_ROOT}/patches/mythic-arm64ec-checked-call-recovery.patch"
 DEAD_VA_PATCH="${BOXEDVN_ROOT}/patches/mythic-dead-va-window.patch"
 EC_THUNK_PATCH="${BOXEDVN_ROOT}/patches/mythic-ec-import-thunk.patch"
+SOFT_RESERVE_PATCH="${BOXEDVN_ROOT}/patches/mythic-soft-reserve.patch"
 OUTPUT="${FEX64_DIR}/wine-ios-core"
 OBJECTS="${FEX64_DIR}/wine-ios-core-objects"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -62,6 +63,7 @@ require_file "${JIT_AUTHORITY_PATCH}"
 require_file "${CHECKED_CALL_PATCH}"
 require_file "${DEAD_VA_PATCH}"
 require_file "${EC_THUNK_PATCH}"
+require_file "${SOFT_RESERVE_PATCH}"
 
 # The third argument selects the matching mode. The first two patches carry no
 # context and need --unidiff-zero, which switches off the context check; the
@@ -89,6 +91,7 @@ apply_integration_patch "${CHECKED_CALL_PATCH}" "ARM64EC checked-call recovery"
 # to survive their line numbers.
 apply_integration_patch "${DEAD_VA_PATCH}" "dead VA window short-circuit" ""
 apply_integration_patch "${EC_THUNK_PATCH}" "ARM64EC import-thunk routing" ""
+apply_integration_patch "${SOFT_RESERVE_PATCH}" "bounded soft reservation" ""
 
 rm -rf "${OUTPUT}" "${OBJECTS}"
 mkdir -p "${OUTPUT}/lib" "${OBJECTS}/ntdll" "${OBJECTS}/wineserver"

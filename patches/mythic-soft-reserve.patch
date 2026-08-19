@@ -1,0 +1,89 @@
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -4217,6 +4217,60 @@
+  * So stop trying to name the caller and fix the placement instead. */
+ static unsigned long long ios_bigres_reserved_total;
+ 
++/* bvn4: BOUNDED SOFT RESERVATION for the 512MB reserves ml128/ml166 chase above.
++ *
++ * Those notes end by saying which FEX subsystem asks decides the fix — smaller
++ * per-thread arena, relocation above the ceiling, or soft reservation. On this
++ * device the first two cannot reach it, so this is the third.
++ *
++ * The failure here is NOT the furniture window filling, which is what those
++ * notes were measuring (13.8GB of 15.1GB used, maxgap down to 28MB). A device
++ * run refused a 512MB PROT_NONE mapping while the window still reported
++ * maxgap=0x27fff0000 — 10.7GB contiguous and free — and the unclamped retry
++ * failed too, on a plain anon mmap. The ceiling is a process-wide cap on
++ * reserved address space, met at roughly 6GB, not a placement problem. A
++ * smaller per-thread arena only changes which thread arrives at 6GB, and
++ * relocating above the ceiling needs the high slots, which this device refuses
++ * outright — see ios_va_dead_floor, where 0x74, 0x78 and 0x7c are all dead.
++ *
++ * So grant less than asked and let the caller keep believing it has the rest.
++ * The same run measured ranges=10 reserved=5120MB committed=54MB — one percent
++ * — with the largest single range ever reaching 31MB. The cap is four times
++ * that, which is the whole safety argument: a caller that stays inside its
++ * first 128MB never learns, and one that walks past it faults immediately on
++ * address space nobody owns rather than quietly overlapping a neighbour.
++ *
++ * Reserve-only requests, because asking to commit up front means meaning to
++ * touch what was asked for. And applied from the very first request rather
++ * than once a budget runs low: a cap that engages partway through makes the
++ * arena size depend on thread creation order, which is how a bug reproduces on
++ * one run in five.
++ *
++ * If a device log ever shows a fault just past a granted range, this cap is the
++ * first thing to raise — the [soft-reserve] line records what was asked for. */
++static void ios_soft_reserve_clamp( SIZE_T *size_ptr, ULONG type )
++{
++    enum { IOS_SOFT_RESERVE_CAP = 0x8000000 };  /* 128MB */
++    static unsigned soft_n;
++    static unsigned long long soft_saved;
++    SIZE_T want = *size_ptr;
++
++    if (type & MEM_COMMIT) return;
++    if (want <= IOS_SOFT_RESERVE_CAP) return;
++
++    soft_n++;
++    soft_saved += (unsigned long long)(want - IOS_SOFT_RESERVE_CAP);
++    if (soft_n <= 16 || !(soft_n & 63))
++        dprintf( 2, "[soft-reserve] #%u granting 0x%lx of 0x%lx requested "
++                    "(reserve-only, cap %luMB, %lluMB withheld so far) rev=bvn4\n",
++                 soft_n, (unsigned long)IOS_SOFT_RESERVE_CAP,
++                 (unsigned long)want,
++                 (unsigned long)(IOS_SOFT_RESERVE_CAP >> 20),
++                 soft_saved >> 20 );
++
++    *size_ptr = IOS_SOFT_RESERVE_CAP;
++}
++
+ /* ml207: furniture-window PRESSURE LATCH.
+  *
+  * The big-reserve steer valve used to arm only at ios_bigres_reserved_total > 8GB, chosen
+@@ -14095,6 +14149,12 @@
+         {
+             static unsigned bigres_n;
+             static unsigned long long bigres_tot;
++
++            /* bvn4: clamp before the counters, so every total below reflects
++             * what was actually reserved rather than what was asked for. */
++            ios_soft_reserve_clamp( size_ptr, type );
++            jumbo_size = *size_ptr;
++
+             bigres_n++;
+             bigres_tot += jumbo_size;
+             ios_bigres_reserved_total += jumbo_size;
+@@ -15196,6 +15256,12 @@
+         {
+             static unsigned bigres_n;
+             static unsigned long long bigres_tot;
++
++            /* bvn4: clamp before the counters, so every total below reflects
++             * what was actually reserved rather than what was asked for. */
++            ios_soft_reserve_clamp( size_ptr, type );
++            jumbo_size = *size_ptr;
++
+             bigres_n++;
+             bigres_tot += jumbo_size;
+             ios_bigres_reserved_total += jumbo_size;
