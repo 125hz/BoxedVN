@@ -1,8 +1,8 @@
 diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
-index 12ca1e8..b5ccb4d 100644
+index 12ca1e8..f64cee9 100644
 --- a/build/ntdll-unix/virtual_ios.c
 +++ b/build/ntdll-unix/virtual_ios.c
-@@ -9138,0 +9139,84 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
+@@ -9138,0 +9139,98 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
 +/***********************************************************************
 + *           ios_rpm_header_poll        (iOS-Mythic BoxedVN ml700)
 + *
@@ -68,13 +68,27 @@ index 12ca1e8..b5ccb4d 100644
 +        cls = *(volatile unsigned *)ios_rpm_track[i].page;
 +        bsz = *(volatile unsigned *)(ios_rpm_track[i].page + 4);
 +        if (!cls && !bsz) continue;                 /* not initialised yet */
-+        if (cls && cls < 128 && bsz == cls * 16u)
++
++        /* ml701: the first version judged the pair by block_size ==
++         * size_class * 16, which only holds for the small classes. A medium
++         * descriptor read 66/1536 and was reported as never-valid, which was
++         * this check misfiring, and worse, it retired the page so the real
++         * later change went unseen. Judge a change instead of an absolute:
++         * remember the first plausible pair and report only when a remembered
++         * pair is replaced. That needs no size-class table and cannot invent
++         * a corruption, at the cost of saying nothing about a descriptor that
++         * was never seen intact. */
++        if (!ios_rpm_track[i].valid)
 +        {
-+            ios_rpm_track[i].valid = 1;
-+            ios_rpm_track[i].cls   = cls;
-+            ios_rpm_track[i].bsz   = bsz;
++            if (cls && cls < 4096 && bsz >= 16 && bsz <= (0x10000u - 128u) && !(bsz & 15))
++            {
++                ios_rpm_track[i].valid = 1;
++                ios_rpm_track[i].cls   = cls;
++                ios_rpm_track[i].bsz   = bsz;
++            }
 +            continue;
 +        }
++        if (cls == ios_rpm_track[i].cls && bsz == ios_rpm_track[i].bsz) continue;
 +        ios_rpm_track[i].reported = 1;
 +        dprintf( 2, "[rpm-class-first-change] seq=%lu at=%s page=%p ever-valid=%u "
 +                 "was=%u/%u now=%u/%u hdr=%016llx,%016llx tracked=%u rev=ml700\n",
@@ -87,15 +101,15 @@ index 12ca1e8..b5ccb4d 100644
 +}
 +
 +
-@@ -9211,0 +9296,3 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
+@@ -9211,0 +9310,3 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
 +    ios_rpm_track_commit( base, size );
 +    ios_rpm_header_poll( "commit" );
 +
-@@ -13660,0 +13748 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
+@@ -13660,0 +13762 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
 +    ios_rpm_header_poll( "ntalloc" );
-@@ -14644,0 +14733 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
+@@ -14644,0 +14747 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
 +    ios_rpm_header_poll( "ntallocex" );
-@@ -15479,0 +15569,21 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
+@@ -15479,0 +15583,21 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
 +        if (ios_jit_orig_addr)
 +        {
 +            /* The caller is executing from the pool copy, so its mutable data
