@@ -253,10 +253,17 @@ bool preparePrefix() {
     // Translated and graphics probes use ARM64EC so xtajit64 can hand x64
     // code to FEX. The native probe keeps the aarch64 runtime available as a
     // control without requiring a different IPA.
+    //
+    // The desktop probe belongs with the native one. Wine ships explorer as
+    // an ARM64 PE and only the aarch64 runtime carries a matching DLL set;
+    // pairing it with the ARM64EC system32 loads an x86-64 kernel32 into an
+    // ARM64 process, which fails as STATUS_INVALID_IMAGE_FORMAT before any
+    // of the window or graphics code it is meant to exercise ever runs.
     // Recreate every symlink because the app bundle path changes when a
     // sideloader reinstalls the IPA.
     const BVNWineTarget target = g_target.load(std::memory_order_acquire);
-    const bool nativeTarget = target == BVNWineTargetNative;
+    const bool nativeTarget = target == BVNWineTargetNative ||
+                              target == BVNWineTargetDesktop;
     NSString* runtimeName = nativeTarget ? @"aarch64-windows" : @"arm64ec-windows";
     NSString* runtime = bundled(runtimeName);
     NSArray<NSString*>* names = [files contentsOfDirectoryAtPath:runtime error:&error];
