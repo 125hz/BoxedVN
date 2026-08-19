@@ -1,0 +1,35 @@
+diff --git a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+index d0ec376..fd00c78 100644
+--- a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
++++ b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+@@ -58,6 +58,30 @@ FEX_DEFAULT_VISIBILITY void ClearHooks();
+ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
+   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
+   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
++#ifdef FEX_IOS_HOST
++  /* bvn5: name whoever asks for the oversized reserves.
++   *
++   * Two 512MB reserve-only requests arrive per thread and about one percent of
++   * each is ever committed. On iOS they run the process out of reservable
++   * address space at roughly 6GB, the allocation fails, and the NULL is stored
++   * through - which wedges the process. The integration has chased this from
++   * the wine side twice (ml128, ml166) without naming the subsystem, because
++   * everything visible from there is this function and an exit thunk.
++   *
++   * The evidence says it is native and it is FEX: there is no guest context at
++   * the reservation (guest rsp and rip both read zero), and the stack carries
++   * FEX allocator frames. But it is not any FEX region that names itself -
++   * every FEXMem_* range in a device log is 16MB or smaller - so the caller is
++   * one that never passes a name. Log the return address here, where the
++   * symbols are ours, and read it off the map the build already publishes.
++   *
++   * Only return_address(0). Deeper frames are documented as unreliable and a
++   * bad walk faults, which would trade a diagnostic for a new crash. */
++  if (Size >= 0x10000000) {
++    LogMan::Msg::EFmt("[bvn-bigres] size=0x{:x} exec={} commit={} base={} ra0={}", Size, Execute, Commit, Base,
++                      __builtin_return_address(0));
++  }
++#endif
+ #ifdef ARCHITECTURE_arm64ec
+ #ifdef FEX_IOS_HOST
+   /* iOS-Mythic ml321: keep FEX's host structures OUT of the guest VA band.

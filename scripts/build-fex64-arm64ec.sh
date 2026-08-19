@@ -102,6 +102,26 @@ else
     die "The pinned FEX source no longer accepts ${STUB_PATCH}; refresh it explicitly."
 fi
 
+# Name the caller of the oversized reserves. Two 512MB reserve-only requests
+# arrive per thread, one percent of each is ever committed, and on iOS they run
+# the process out of reservable address space at about 6GB - after which the
+# NULL is stored through and the process wedges. The wine side cannot see past
+# its own allocator frames, so the probe goes here, where the symbols are ours
+# and the build already publishes a map to resolve them against.
+#
+# Carries context rather than zero context lines, so it survives the stub patch
+# above landing in a different file. Idempotent the same way.
+PROBE_PATCH="${BOXEDVN_ROOT}/patches/fex-bigres-caller-probe.patch"
+require_file "${PROBE_PATCH}"
+if git -C "${FEX_SOURCE}" apply --check "${PROBE_PATCH}" 2>/dev/null; then
+    log "Applying the oversized-reserve caller probe"
+    git -C "${FEX_SOURCE}" apply "${PROBE_PATCH}"         || die "The oversized-reserve caller probe failed to apply."
+elif git -C "${FEX_SOURCE}" apply --reverse --check "${PROBE_PATCH}" 2>/dev/null; then
+    log "The oversized-reserve caller probe is already applied"
+else
+    die "The pinned FEX source no longer accepts ${PROBE_PATCH}; refresh it explicitly."
+fi
+
 if [[ "${FORCE}" == "1" ]]; then
     rm -rf "${BUILD}"
 fi
