@@ -54,7 +54,7 @@ void bvn_display_set_layer(CAMetalLayer *layer) {
     pthread_mutex_lock(&g_lock);
     g_layer = layer;
     pthread_mutex_unlock(&g_lock);
-    fprintf(stderr, "[bvn-display] layer registered: %p\n", (void *)layer);
+    fprintf(stderr, "[bvn-display] layer registered: %p\n", (__bridge void *)layer);
     fflush(stderr);
 }
 
