@@ -1,0 +1,121 @@
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -1722,21 +1722,48 @@
+                             };
+                             unsigned char ffs[10];
+                             mach_vm_size_t ffs_read = 0;
++                            /* bvn3: the fast-forward sequence is not the only
++                             * x86_64 shape reachable this way. An ARM64EC module
++                             * publishes its imports as `ff 25 rel32`
++                             * (jmp qword ptr [rip+rel32]) in the x64 range its
++                             * CodeMap declares, and a native EC caller that
++                             * loads one of those into x11 arrives here exactly
++                             * like an FFS does. The reasoning above then applies
++                             * verbatim: redirecting it into the pool makes the
++                             * x64 bytes executable as ARM64, the core runs
++                             * `ff 25 rel32` as an instruction and dies on the
++                             * next word, which is 0x00000001 and decodes as
++                             * nothing.
++                             *
++                             * That is the wedge this was written for. The device
++                             * log faulted at an import thunk +4 — one
++                             * instruction past the start, precisely as the
++                             * comment above predicts — inside kernel32's x64
++                             * range, called from libarm64ecfex's
++                             * std::chrono::system_clock::now() by way of
++                             * GetSystemTimePreciseAsFileTime. The thread froze
++                             * there holding FEX's shared lock and every other
++                             * thread parked behind it. */
++                            int is_x64_thunk;
+ 
+                             mach_vm_read_overwrite(mach_task_self(),
+                                 (mach_vm_address_t)fault_pc, sizeof(ffs),
+                                 (mach_vm_address_t)ffs, &ffs_read);
++                            is_x64_thunk = ffs_read == sizeof(ffs) &&
++                                           ffs[0] == 0xff && ffs[1] == 0x25;
+                             if (ffs_read == sizeof(ffs) &&
+-                                !memcmp(ffs, ffs_prefix, sizeof(ffs_prefix)))
++                                (is_x64_thunk ||
++                                 !memcmp(ffs, ffs_prefix, sizeof(ffs_prefix))))
+                             {
+                                 static volatile int ffs_no_redirect;
+                                 int n = __sync_add_and_fetch(&ffs_no_redirect, 1);
+                                 jit_pc = (void *)(uintptr_t)fault_pc;
+                                 if (n <= 8 || !(n & 255))
+                                     dprintf(STDERR_FILENO,
+-                                        "[ec-ffs-noredirect] #%d ffs=%p lr=%p -- left for the "
++                                        "[ec-ffs-noredirect] #%d %s=%p lr=%p -- left for the "
+                                         "ARM64EC checked-call decoder\n",
+-                                        n, (void *)(uintptr_t)fault_pc,
++                                        n, is_x64_thunk ? "import-thunk" : "ffs",
++                                        (void *)(uintptr_t)fault_pc,
+                                         (void *)(uintptr_t)state.__lr);
+                             }
+                         }
+@@ -2119,6 +2146,66 @@
+                                 n, (void *)fault_addr, rel32, (void *)native_target,
+                                 (void *)resume_target, (void *)lr);
+                     }
++                    /* bvn3: the other x86_64 shape a native EC caller can put in
++                     * x11 — an import thunk, `ff 25 rel32` = jmp qword ptr
++                     * [rip+rel32]. Resolve it the way the processor would: the
++                     * slot sits rel32 past the end of the 6-byte instruction,
++                     * and holds the address the loader bound.
++                     *
++                     * Read the slot at the image VA rather than the pool copy.
++                     * The original is the one Wine fills, and the pool copy's is
++                     * a synced duplicate that can lag it.
++                     *
++                     * If the bound address is itself another x64 thunk this
++                     * resolves one link and faults again on the next, which
++                     * walks the chain one recovery at a time rather than
++                     * guessing at its end. */
++                    else if (ffs_read >= 6 && ffs[0] == 0xff && ffs[1] == 0x25)
++                    {
++                        int32_t rel32;
++                        uintptr_t slot;
++                        uintptr_t bound = 0;
++                        mach_vm_size_t slot_read = 0;
++
++                        memcpy(&rel32, ffs + 2, sizeof(rel32));
++                        slot = fault_addr + 6 + (intptr_t)rel32;
++                        mach_vm_read_overwrite(mach_task_self(),
++                                               (mach_vm_address_t)slot, sizeof(bound),
++                                               (mach_vm_address_t)&bound, &slot_read);
++
++                        if (slot_read == sizeof(bound) && bound)
++                        {
++                            uintptr_t resume_target;
++                            static volatile int thunk_recoveries;
++                            int n;
++
++                            resume_target = (uintptr_t)ios_jit_translate_addr_for_owner(
++                                (void *)bound, thread_teb ? ((TEB *)thread_teb)->Peb : NULL);
++                            if (!resume_target) resume_target = bound;
++
++                            n = __sync_add_and_fetch(&thunk_recoveries, 1);
++                            __darwin_arm_thread_state64_set_pc_fptr(state, (void *)resume_target);
++                            handled = 1;
++                            if (n <= 16 || !(n & 255))
++                                dprintf(STDERR_FILENO,
++                                    "[ec-check-thunk] #%d thunk=%p rel=%d slot=%p bound=%p "
++                                    "resume=%p lr=%p -- import routed\n",
++                                    n, (void *)fault_addr, rel32, (void *)slot,
++                                    (void *)bound, (void *)resume_target, (void *)lr);
++                        }
++                        else
++                        {
++                            static volatile int thunk_unresolved;
++                            int n = __sync_add_and_fetch(&thunk_unresolved, 1);
++                            if (n <= 8)
++                                dprintf(STDERR_FILENO,
++                                    "[ec-check-thunk] #%d thunk=%p slot=%p UNREADABLE "
++                                    "(read %llu of %lu) -- left unhandled\n",
++                                    n, (void *)fault_addr, (void *)slot,
++                                    (unsigned long long)slot_read,
++                                    (unsigned long)sizeof(bound));
++                        }
++                    }
+                     else
+                     {
+                         /* The iOS image clone can contain a stale relocated vtable
