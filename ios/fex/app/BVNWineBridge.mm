@@ -177,8 +177,16 @@ bool prepareDiagnostics() {
         g_logPath = path.fileSystemRepresentation;
     }
 
+    // O_APPEND is load-bearing, not tidiness. dup2 below makes stderr share
+    // this open file description, including its file OFFSET, which sits just
+    // past the separator. reportf appends through a separate descriptor, so
+    // without O_APPEND every reportf line is silently overwritten by the next
+    // Wine stderr write, which resumes from the stale offset. Logs 10 and 11
+    // begin with the separator followed immediately by Wine output: every
+    // app-side line, including the layer report, had been written and then
+    // clobbered. O_APPEND makes each write land at end-of-file instead.
     const int descriptor = open(path.fileSystemRepresentation,
-                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (descriptor == -1) {
         os_log_error(OS_LOG_DEFAULT,
                      "[BoxedVN Wine] could not open persistent log: %{public}s",
