@@ -469,6 +469,17 @@ jobs:
           key: fex64-fex-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh') }}
           restore-keys: fex64-fex-${{ runner.os }}-
 
+      # Wine dominates this job: 20 of its 25 minutes, rebuilt from scratch
+      # every run while the toolchains and the FEX build are already cached.
+      # The tree is deterministic given the pin, and both configure and make
+      # are skipped when it is restored intact.
+      - name: Restore the Wine trees
+        uses: actions/cache@v4
+        with:
+          path: third_party/fex64/wine
+          key: fex64-wine-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-wine.sh') }}
+          restore-keys: fex64-wine-${{ runner.os }}-
+
       - name: Build the ARM64EC emulator DLL from source
         if: inputs.xtajit == 'source'
         run: scripts/build-fex64-arm64ec.sh
@@ -485,7 +496,8 @@ jobs:
             --configuration Release \
             --wine-core-dir third_party/fex64/wine-ios-core \
             --wine-runtime-dir third_party/fex64/mythic/app/Mythic \
-            --mythic-dir third_party/fex64/mythic
+            --mythic-dir third_party/fex64/mythic \
+            --wine-pe-dir third_party/fex64/wine/build-arm64ec
 
       - uses: actions/upload-artifact@v4
         with:

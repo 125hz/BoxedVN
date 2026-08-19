@@ -28,6 +28,7 @@ OUTPUT_DIR=""
 SKIP_FEX=0
 WINE_CORE_DIR=""
 WINE_RUNTIME_DIR=""
+WINE_PE_DIR=""
 MYTHIC_DIR=""
 
 usage() {
@@ -53,6 +54,9 @@ while [[ $# -gt 0 ]]; do
         --wine-runtime-dir)
             [[ $# -ge 2 ]] || die "--wine-runtime-dir needs a value"
             WINE_RUNTIME_DIR="$2"; shift 2 ;;
+        --wine-pe-dir)
+            [[ $# -ge 2 ]] || die "--wine-pe-dir needs a value"
+            WINE_PE_DIR="$2"; shift 2 ;;
         --mythic-dir)
             [[ $# -ge 2 ]] || die "--mythic-dir needs a value"
             MYTHIC_DIR="$2"; shift 2 ;;
@@ -147,6 +151,26 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
             "${MYTHIC_DIR}/app/Mythic/arm64ec-windows/xtajit64.dll" \
             "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit64.dll" \
             || die "Patching the ARM64EC emulator DLL failed."
+    fi
+    # The integration is a game launcher, so its ARM64EC runtime ships a full
+    # DLL set and the display driver but none of Wine's own programs. A desktop
+    # needs explorer, and it has to be ARM64EC: the display driver is built
+    # only for that architecture, so an ARM64 explorer can never load it while
+    # an ARM64EC one runs beside the same wineios.drv the x64 path already
+    # uses. Wine is configured here with --enable-archs=arm64ec,aarch64, so
+    # that build already produced one; copy it in alongside rather than
+    # replacing anything.
+    if [[ -n "${WINE_PE_DIR}" ]]; then
+        for program in explorer; do
+            built="${WINE_PE_DIR}/programs/${program}/arm64ec-windows/${program}.exe"
+            if [[ -f "${built}" ]]; then
+                cp "${built}" \
+                   "${WINE_RESOURCE_STAGING}/arm64ec-windows/${program}.exe"
+                log "Staged the ARM64EC ${program}.exe"
+            else
+                warn "No ARM64EC ${program}.exe at ${built}; the desktop target will not start."
+            fi
+        done
     fi
     cp -R "${MYTHIC_DIR}/app/Mythic/nls" "${WINE_RESOURCE_STAGING}/nls"
     mkdir -p "${WINE_RESOURCE_STAGING}/prefix-template"
