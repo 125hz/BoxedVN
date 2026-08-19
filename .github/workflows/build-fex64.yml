@@ -28,6 +28,7 @@ on:
           - wine-ios
           - wineboot
           - bringup
+          - arm64ec
           - toolchains
       wine_core_run_id:
         description: Successful run containing fex64-wine-ios-core (wineboot only)
@@ -489,6 +490,55 @@ jobs:
             third_party/fex64/wine/build-*/build.log
             build/fex64-Release/xcodebuild.log
           if-no-files-found: ignore
+
+  arm64ec:
+    name: ARM64EC emulator DLL from source
+    needs: pins
+    # Manual only, and deliberately independent of the bring-up job: the app
+    # keeps using the prebuilt DLL until a source-built one is proven on device.
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'arm64ec'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh .github/*.sh
+
+      - name: Fetch the pinned FEX source
+        run: scripts/fetch-fex64-dependencies.sh --component fex
+
+      - name: Restore cross-toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/fex64/toolchains
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
+          restore-keys: fex64-toolchains-${{ runner.os }}-
+
+      - name: Install llvm-mingw
+        run: scripts/build-fex64-toolchains.sh --stage llvm-mingw
+
+      - name: Report the toolchain targets
+        run: ls third_party/fex64/toolchains/*/bin | grep -E 'clang$' | sort
+
+      - name: Build the ARM64EC emulator DLL
+        run: scripts/build-fex64-arm64ec.sh
+
+      - name: Describe the resulting PE
+        run: |
+          ls -l third_party/fex64/arm64ec-fex/
+          shasum -a 256 third_party/fex64/arm64ec-fex/libarm64ecfex.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex64-arm64ec-dll
+          path: third_party/fex64/arm64ec-fex
+          retention-days: 14
+          if-no-files-found: error
+
 
   toolchains:
     name: Cross toolchains for iphoneos
