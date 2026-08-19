@@ -588,6 +588,20 @@ jobs:
           path: third_party/fex64/dxmt-ios
           key: fex64-dxmt-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-dxmt.sh') }}
 
+      # A device fault reports an offset into the emulator and nothing else,
+      # and the map that resolves one is written on the runner and thrown away
+      # with it. Kept separate from the IPA artifact so it is diagnostic data
+      # rather than something to install.
+      - name: Publish the emulator symbol map
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex64-arm64ecfex-symbols
+          path: third_party/fex64/arm64ec-fex/libarm64ecfex.symbols
+          retention-days: 14
+          if-no-files-found: ignore
+
       - uses: actions/upload-artifact@v4
         with:
           name: fex64-bringup-unsigned-ipa
