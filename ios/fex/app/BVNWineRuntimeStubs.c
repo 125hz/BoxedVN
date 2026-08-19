@@ -6,6 +6,7 @@
 
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdio.h>
 
 #if BVN_WINE_BOOT_ENABLED
 
@@ -67,8 +68,32 @@ const void *nsi_unix_call_funcs[1] = {0};
 const void *secur32_unix_call_funcs[1] = {0};
 const void *ws2_32_unix_call_funcs[1] = {0};
 
+// Report the refusal rather than just returning it.
+//
+// The graphics target now reaches the guest's message loop: a device log shows
+// cube-x64.exe calling PeekMessage and being told a message is waiting while
+// the MSG it gets back is entirely zero - no window, no message id - after
+// which the guest branches through the address of its own stack buffer and
+// dies. A window subsystem whose unix half refuses to initialise is the
+// obvious suspect for a message queue that answers like that, and this is the
+// refusal.
+//
+// Whether it is the cause depends on something this file cannot see: whether
+// win32u asks at all. If the line never appears, the PE side never got as far
+// as its unixlib and the message behaviour comes from somewhere else, which is
+// worth knowing before building the unix half of win32u the way DXMT's was
+// built. Counted rather than printed once, because a message loop would ask
+// repeatedly and the count says whether it kept trying.
 int win32u_unix_lib_init(void)
 {
+    static int refusals;
+
+    refusals++;
+    if (refusals <= 4 || (refusals % 256) == 0) {
+        fprintf(stderr, "[win32u-stub] refusing unixlib init, call #%d "
+                        "(STATUS_NOT_SUPPORTED) rev=bvn8\n", refusals);
+        fflush(stderr);
+    }
     return (int)0xc00000bb; /* STATUS_NOT_SUPPORTED */
 }
 
