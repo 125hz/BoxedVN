@@ -122,6 +122,27 @@ else
     die "The pinned FEX source no longer accepts ${PROBE_PATCH}; refresh it explicitly."
 fi
 
+# rpmalloc reserves size + alignment, so its 256MB span costs a 512MB
+# reservation every time. Two arrive per thread, one percent of each is ever
+# committed, and on iOS the process runs out of reservable address space at
+# about 6GB - after which the allocation fails and the NULL is stored through.
+# Make the constant overridable, then pick the value the shipped prebuilt
+# emulator was built with.
+#
+# Applied to the submodule, not to FEX: rpmalloc is its own repository, so
+# git -C the FEX tree cannot reach inside it.
+SPAN_PATCH="${BOXEDVN_ROOT}/patches/rpmalloc-span-size-override.patch"
+RPMALLOC_SOURCE="${FEX_SOURCE}/External/rpmalloc"
+require_file "${SPAN_PATCH}"
+if git -C "${RPMALLOC_SOURCE}" apply --check "${SPAN_PATCH}" 2>/dev/null; then
+    log "Applying the rpmalloc span-size override"
+    git -C "${RPMALLOC_SOURCE}" apply "${SPAN_PATCH}" || die "The rpmalloc span-size override failed to apply."
+elif git -C "${RPMALLOC_SOURCE}" apply --reverse --check "${SPAN_PATCH}" 2>/dev/null; then
+    log "The rpmalloc span-size override is already applied"
+else
+    die "The pinned rpmalloc no longer accepts ${SPAN_PATCH}; refresh it explicitly."
+fi
+
 if [[ "${FORCE}" == "1" ]]; then
     rm -rf "${BUILD}"
 fi
@@ -146,7 +167,7 @@ cmake -S "${FEX_SOURCE}" -B "${BUILD}" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="${FEX_SOURCE}/Data/CMake/toolchain_mingw.cmake" \
     -DMINGW_TRIPLE="${TRIPLE}" \
     -DFEX_IOS_HOST_BUILD=True \
-    -DCMAKE_C_FLAGS="-DFEX_IOS_HOST" \
+    -DCMAKE_C_FLAGS="-DFEX_IOS_HOST -DSPAN_SIZE=16777216" \
     -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST" \
     -DCMAKE_ASM_FLAGS="-DFEX_IOS_HOST" \
     -DENABLE_LTO=False \

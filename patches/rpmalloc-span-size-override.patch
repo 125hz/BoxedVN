@@ -1,0 +1,34 @@
+diff --git a/rpmalloc/rpmalloc.c b/rpmalloc/rpmalloc.c
+index 20ab541..647af2f 100644
+--- a/rpmalloc/rpmalloc.c
++++ b/rpmalloc/rpmalloc.c
+@@ -185,7 +185,29 @@ madvise(caddr_t, size_t, int);
+ #define LARGE_PAGE_SIZE (1 << LARGE_PAGE_SIZE_SHIFT)
+ #define LARGE_PAGE_MASK (~((uintptr_t)LARGE_PAGE_SIZE - 1))
+ 
++/* bvn6: let the build choose the span size.
++ *
++ * os_mmap reserves size + alignment, so a 256MB span costs a 512MB reservation
++ * every time. On iOS that is fatal rather than merely wasteful: two arrive per
++ * thread, about one percent of each is ever committed, and the process runs out
++ * of reservable address space at roughly 6GB - after which the allocation fails,
++ * the NULL is stored through, and everything parks behind the emulator's lock.
++ *
++ * This is the reservation the integration chased from the wine side at ml125,
++ * ml128 and ml166 without naming it. It could not be found by searching FEX,
++ * because it is not in FEX: rpmalloc calls VirtualAlloc directly, so it bypasses
++ * FEXCore::Allocator::VirtualAlloc, which is why a probe on that function logged
++ * nothing while the reservations kept arriving. Its signature matches what the
++ * device reports exactly - MEM_RESERVE|MEM_TOP_DOWN, PAGE_READWRITE, no commit,
++ * unnamed, per thread heap, committed later in small pieces.
++ *
++ * Keeping the stock value as the default means an unset build behaves as
++ * upstream does. The shipped prebuilt emulator was built with 16MiB here, so a
++ * smaller span is this allocator's own proven configuration rather than a guess.
++ * Must stay a power of two: SPAN_MASK depends on it. */
++#ifndef SPAN_SIZE
+ #define SPAN_SIZE (256 * 1024 * 1024)
++#endif
+ #define SPAN_MASK (~((uintptr_t)(SPAN_SIZE - 1)))
+ 
+ ////////////
