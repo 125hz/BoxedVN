@@ -33,7 +33,7 @@ on:
       xtajit:
         description: Emulator DLL for the bring-up IPA
         required: false
-        default: prebuilt
+        default: source
         type: choice
         options:
           - prebuilt

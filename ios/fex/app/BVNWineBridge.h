@@ -27,6 +27,7 @@ typedef enum {
     BVNWineTargetNative = 0,
     BVNWineTargetX64 = 1,
     BVNWineTargetDXMT = 2,
+    BVNWineTargetDesktop = 3,
 } BVNWineTarget;
 
 /// True only in builds that link the native Wine archives and bundle their

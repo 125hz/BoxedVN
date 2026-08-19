@@ -343,18 +343,31 @@ void* processThread(void*) {
         char nativeTarget[] = "C:\\windows\\system32\\child-test.exe";
         char x64Target[] = "C:\\windows\\system32\\fib-x64.exe";
         char dxmtTarget[] = "C:\\windows\\system32\\cube-x64.exe";
+        /* The desktop target is a native ARM64 PE, so it exercises Wine's own
+         * window, graphics and server stack without going through translation
+         * at all -- the part of the road to a visible desktop that the x64
+         * acceptance programs never touch. explorer needs the /desktop switch
+         * or it attaches to a shell that does not exist here. */
+        char desktopTarget[] = "C:\\windows\\system32\\explorer.exe";
+        char desktopArgument[] = "/desktop=shell,1024x768";
         char* target = x64Target;
+        char* extraArgument = nullptr;
         switch (g_target.load(std::memory_order_acquire)) {
             case BVNWineTargetNative: target = nativeTarget; break;
             case BVNWineTargetX64: target = x64Target; break;
             case BVNWineTargetDXMT: target = dxmtTarget; break;
+            case BVNWineTargetDesktop:
+                target = desktopTarget;
+                extraArgument = desktopArgument;
+                break;
         }
         reportf("selected acceptance target: %s",
                 BVNWineTargetName(g_target.load(std::memory_order_relaxed)));
-        char* arguments[] = {loader, target, nullptr};
+        char* arguments[] = {loader, target, extraArgument, nullptr};
+        const int argumentCount = extraArgument ? 3 : 2;
 
         if (setjmp(*BVNWineExitJumpBuffer()) == 0) {
-            __wine_main(2, arguments);
+            __wine_main(argumentCount, arguments);
             reportf("Wine returned normally");
         } else {
             reportf("Wine exited with code %d", BVNWineExitCode());
@@ -398,7 +411,7 @@ extern "C" bool BVNWineAvailable(void) {
 }
 
 extern "C" bool BVNWineSetTarget(BVNWineTarget target) {
-    if (target < BVNWineTargetNative || target > BVNWineTargetDXMT) return false;
+    if (target < BVNWineTargetNative || target > BVNWineTargetDesktop) return false;
 #if BVN_WINE_BOOT_ENABLED
     if (g_starting.load(std::memory_order_acquire)) return false;
 #endif
@@ -415,6 +428,7 @@ extern "C" const char* BVNWineTargetName(BVNWineTarget target) {
         case BVNWineTargetNative: return "native control";
         case BVNWineTargetX64: return "x64 translation";
         case BVNWineTargetDXMT: return "x64 graphics";
+        case BVNWineTargetDesktop: return "Wine desktop";
     }
     return "unknown";
 }

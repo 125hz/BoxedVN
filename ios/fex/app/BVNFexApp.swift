@@ -103,6 +103,7 @@ struct ProbeView: View {
                         Text("Native control").tag(BVNWineTargetNative)
                         Text("x64 translation").tag(BVNWineTargetX64)
                         Text("x64 graphics").tag(BVNWineTargetDXMT)
+                        Text("Wine desktop").tag(BVNWineTargetDesktop)
                     }
                     .disabled(wineRunning)
 
