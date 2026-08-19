@@ -473,7 +473,8 @@ jobs:
       # LLVM source tree nor the LLVM build - the longest item in the project -
       # to be present at all.
       - name: Restore the DXMT unix archive
-        uses: actions/cache@v4
+        id: dxmt-cache
+        uses: actions/cache/restore@v4
         with:
           path: third_party/fex64/dxmt-ios
           key: fex64-dxmt-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-dxmt.sh') }}
@@ -483,17 +484,26 @@ jobs:
       # has to hold llvm-ios too, and an exact hit on the old key would restore
       # a tree without it and then refuse to save, rebuilding LLVM every single
       # run. Changing the key costs one miss, then it sticks.
+      # Restore/save rather than the combined action, with a run-unique key.
+      # actions/cache only writes in a post step on success, so the first
+      # attempt at llvm-ios threw away 50 minutes of finished libraries when a
+      # later target failed. Saving under a fresh key on every run - and
+      # restoring the newest matching prefix - lets ninja resume instead.
       - name: Restore cross-toolchain cache
-        uses: actions/cache@v4
+        id: toolchains-cache
+        uses: actions/cache/restore@v4
         with:
           path: third_party/fex64/toolchains
-          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-fex64-dxmt.sh') }}
-          restore-keys: fex64-toolchains-${{ runner.os }}-
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-fex64-dxmt.sh') }}-${{ github.run_id }}
+          restore-keys: |
+            fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-fex64-dxmt.sh') }}-
+            fex64-toolchains-${{ runner.os }}-
 
       # Only the headers are still needed once llvm-ios is built, but the clone
       # is large enough that re-fetching it dwarfs the restore.
       - name: Restore the LLVM source tree
-        uses: actions/cache@v4
+        id: llvm-src-cache
+        uses: actions/cache/restore@v4
         with:
           path: third_party/fex64/llvm-project
           key: fex64-llvm-src-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh') }}
@@ -544,6 +554,32 @@ jobs:
             --mythic-dir third_party/fex64/mythic \
             --wine-pe-dir third_party/fex64/wine/build-arm64ec \
             --dxmt-lib "$dxmt_lib"
+
+      # if: always() is the whole point: the run this was written for failed
+      # with 1656 of 1674 LLVM targets built.
+      - name: Save cross-toolchain cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: third_party/fex64/toolchains
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-fex64-dxmt.sh') }}-${{ github.run_id }}
+
+      - name: Save the LLVM source tree
+        if: always() && steps.llvm-src-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: third_party/fex64/llvm-project
+          key: fex64-llvm-src-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh') }}
+
+      - name: Save the DXMT unix archive
+        if: always() && steps.dxmt-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: third_party/fex64/dxmt-ios
+          key: fex64-dxmt-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-dxmt.sh') }}
 
       - uses: actions/upload-artifact@v4
         with:

@@ -199,6 +199,37 @@ Apple's linker rejects it outright, so the build would fail at its first link."
     fi
     ok "llvm: AddLLVM.cmake uses -dead_strip"
 
+    # LLVMHello is a demo pass plugin - MODULE, BUILDTREE_ONLY, wanted by
+    # nothing here - and it is the only loadable module this configuration
+    # builds, since tools, utils and examples are all off. It is also the one
+    # target that fails.
+    #
+    # Its CMakeLists sets LLVM_EXPORTED_SYMBOL_FILE, and
+    # add_llvm_symbol_exports picks a format per platform with
+    # `if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")`. That is the same class of
+    # bug as --gc-sections above, and it slips past the same fix: the sed
+    # pattern has no brace, so the dereferenced spelling never matches, iOS
+    # falls through to the final else(), and LLVM generates a Windows .def and
+    # hands it to Apple's ld, which says "unknown file type in LLVMHello.def"
+    # at target 1656 of 1674 - after every library airconv actually needs has
+    # already linked.
+    #
+    # Drop the subdirectory instead of teaching that test about iOS. Widening
+    # the platform test changes every Darwin-gated branch in AddLLVM.cmake to
+    # make a plugin we then throw away link correctly; removing one
+    # unconditional add_subdirectory cannot affect a library we keep.
+    local transforms="${source}/llvm/lib/Transforms/CMakeLists.txt"
+    require_file "${transforms}" "The LLVM checkout is incomplete."
+    /usr/bin/sed -i '' -e '/^add_subdirectory(Hello)$/d' "${transforms}" \
+        || die "llvm: could not drop the Hello plugin"
+
+    if grep -q 'add_subdirectory(Hello)' "${transforms}"; then
+        die "llvm: lib/Transforms still builds the Hello plugin.
+It is the only loadable module in this configuration and it cannot link for
+iOS, so the build would fail after every library we need has been built."
+    fi
+    ok "llvm: Hello plugin excluded"
+
     # Stage 1. llvm-tblgen has to run on the build machine, so it is built for
     # macOS and handed to the iOS configure. Nothing else from this tree is
     # used.
