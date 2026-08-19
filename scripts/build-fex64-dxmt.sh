@@ -236,15 +236,39 @@ require_file "${COMBINED_LIB}"
 
 # This symbol is the entire point of the archive: it is the table winemetal.dll
 # reaches through, and the null stub it replaces. Verify it by content rather
-# than trusting that the compile produced it, the same way the app build
-# checks its own display exports.
-if ! xcrun -sdk iphoneos nm -g "${COMBINED_LIB}" 2>/dev/null \
-        | grep -q "dxmt_winemetal_unix_call_funcs"; then
-    die "dxmt: built ${COMBINED_LIB}, but it does not define
-dxmt_winemetal_unix_call_funcs. Linking it would leave the null stub in
-BVNWineRuntimeStubs.c in place and the graphics target would still branch to
-zero on its first unix call."
+# than trusting that the compile produced it, the same way the app build checks
+# its own display exports.
+#
+# Read the one object that defines it, into a file, and grep the file. Doing
+# this as `nm archive | grep -q` instead is actively wrong here: grep -q exits
+# at the first match and closes the pipe while nm is still streaming the
+# million-odd symbols LLVM contributes, nm dies on SIGPIPE, and common.sh's
+# `set -o pipefail` turns that into a failed check - so the gate fires
+# precisely when the symbol IS present. It did, on the first green build.
+SYMBOLS="${OBJ_DIR}/winemetal_unix.symbols"
+xcrun -sdk iphoneos nm -g "${OBJ_DIR}/winemetal_unix.o" > "${SYMBOLS}" \
+    || die "dxmt: could not read the symbol table of winemetal_unix.o"
+
+if ! grep -q "dxmt_winemetal_unix_call_funcs" "${SYMBOLS}"; then
+    warn "dxmt: winemetal_unix.o defines no renamed unix-call table"
+    die "dxmt: built ${COMBINED_LIB}, but winemetal_unix.o does not define
+dxmt_winemetal_unix_call_funcs. The rename is guarded by TARGET_OS_IOS, so a
+miss here means the iOS branch was not taken. Linking this would leave the
+null stub in BVNWineRuntimeStubs.c in place and the graphics target would
+still branch to zero on its first unix call."
 fi
+
+# ... and that the archive actually carries that object. Written to a file for
+# the same reason.
+MEMBERS="${OUTPUT_DIR}/members.txt"
+ar -t "${COMBINED_LIB}" > "${MEMBERS}" \
+    || die "dxmt: could not list the members of ${COMBINED_LIB}"
+
+if ! grep -qx "winemetal_unix.o" "${MEMBERS}"; then
+    die "dxmt: ${COMBINED_LIB} does not contain winemetal_unix.o, so the table
+it defines cannot reach the link."
+fi
+ok "dxmt: unix-call table present"
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "${STAMP}"
 ok "dxmt: ${COMBINED_LIB} ($(wc -c < "${COMBINED_LIB}" | tr -d ' ') bytes)"
