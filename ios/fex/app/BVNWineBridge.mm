@@ -9,6 +9,7 @@
 #include "BVNWineBridge.h"
 #include "BVNFexBridge.h"
 #include "BVNExecMemory.h"
+#include "BVNJitArenaPlan.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -118,10 +119,13 @@ bool prepareWineJitPool() {
         return false;
     }
 
-    // The arena is prepared in independent 64 MiB segments. FEX owns the
-    // first segment; Wine leases the next one so its PE-image copier and
-    // FEX's allocator can never advance into each other's executable pages.
-    constexpr size_t poolBytes = 64u * 1024u * 1024u;
+    // The arena is prepared in independent segments. FEX owns the first one;
+    // Wine leases the next so its PE-image copier and FEX's allocator can
+    // never advance into each other's executable pages. This has to match the
+    // arena segment size exactly: a lease is first fit within one segment and
+    // never spans two, so asking for more than a segment fails no matter how
+    // much of the arena is free.
+    constexpr size_t poolBytes = kBVNJitArenaSegmentBytes;
     void* executable = BVNExecMemAlloc(poolBytes);
     if (executable == nullptr) {
         size_t capacity = 0;

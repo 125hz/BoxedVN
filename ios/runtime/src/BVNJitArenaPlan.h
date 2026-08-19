@@ -35,16 +35,26 @@ struct BVNJitArenaPlan {
 // Direct3D 9 visual novel plus a fully attached WineDbg, and it is what every
 // device result up to build 89 was measured against, so it stays the floor
 // even when the memory probe reports nothing usable.
-inline constexpr std::size_t kBVNJitArenaMinimumBytes = 128u * 1024u * 1024u;
+inline constexpr std::size_t kBVNJitArenaMinimumBytes = 256u * 1024u * 1024u;
 
 // The largest arena BoxedVN will attempt. Preparation writes through
 // debugserver page by page, so this is paid in startup time and in resident
 // memory that the guest can then never use.
 inline constexpr std::size_t kBVNJitArenaMaximumBytes = 512u * 1024u * 1024u;
 
-// One segment. Small enough that a partial failure loses little, large enough
-// that a game needing hundreds of megabytes does not accumulate a long list.
-inline constexpr std::size_t kBVNJitArenaSegmentBytes = 64u * 1024u * 1024u;
+// One segment, and also the largest single lease: allocation is first fit
+// within a segment and never spans two, so a caller that needs more than this
+// cannot be served however much of the arena is free.
+//
+// The fex64 Wine side leases one segment for its PE-image copier, and 64 MiB
+// stopped being enough as soon as the graphics stack loaded. That run had
+// 0x2fc4000 in use and 0x1004000 held back for the dispatcher tail, so d3d11
+// asking for 0x460000 overflowed a 64 MiB segment by a few megabytes -- about
+// 70 MiB wanted against 64 available. Trimming the tail would have fit that
+// one image and broken on the next, so size the segment for the whole stack
+// instead. The floor rises with it, because a single-segment arena leaves the
+// Wine side nothing once the emulator has taken the first one.
+inline constexpr std::size_t kBVNJitArenaSegmentBytes = 128u * 1024u * 1024u;
 
 // Fraction of the process memory budget the arena may claim. The guest still
 // needs the rest: BVNGuestReportedTotalMemory advertises up to 3 GB to a
