@@ -206,6 +206,10 @@ targets:
           - -lcephes_128bit
           - -lc++
           - $(BVN_WINE_LDFLAGS)
+          # DXMT's unix side, by absolute path and last: it resolves against
+          # Wine's ntdll_unix and carries its own LLVM, so it has to come
+          # after both. Empty unless the app build was given --dxmt-lib.
+          - $(BVN_DXMT_LDFLAGS)
         CLANG_ENABLE_MODULES: YES
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         CODE_SIGN_STYLE: Manual
@@ -225,7 +229,13 @@ targets:
       - sdk: Metal.framework
       - sdk: QuartzCore.framework
       - sdk: UIKit.framework
+      # DXMT's unix side reaches past Metal itself: CGColorSpace for swapchain
+      # colour handling and IOSurface for shared texture backing. Its shader
+      # cache is SQLite. Harmless when the archive is not linked.
+      - sdk: CoreGraphics.framework
+      - sdk: IOSurface.framework
       - sdk: libc++.tbd
+      - sdk: libsqlite3.tbd
       - sdk: libz.tbd
 
 schemes:

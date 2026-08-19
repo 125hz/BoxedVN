@@ -59,6 +59,7 @@ on:
       - scripts/build-fex64-toolchains.sh
       - scripts/build-fex64-fex.sh
       - scripts/build-fex64-app.sh
+      - scripts/build-fex64-dxmt.sh
       - scripts/build-fex64-wine.sh
       - scripts/build-fex64-wine-ios-core.sh
       - scripts/package-ipa.sh
@@ -445,6 +446,18 @@ jobs:
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
 
+      # airconv's three shader headers are compiled with the Metal compiler,
+      # which recent Xcode ships as a separate download. Settle it in the first
+      # minute: the alternative is discovering it after the LLVM build, which is
+      # the better part of an hour away.
+      - name: Ensure the Metal toolchain is present
+        run: |
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "Metal compiler absent; downloading the component"
+            xcodebuild -downloadComponent MetalToolchain || true
+          fi
+          xcrun -sdk macosx metal --version             || { echo "::error::The Metal compiler is unavailable, so DXMT's shader headers cannot be generated."; exit 1; }
+
       - name: Make scripts executable
         run: chmod +x scripts/*.sh .github/*.sh
 
@@ -453,14 +466,38 @@ jobs:
           scripts/fetch-fex64-dependencies.sh --component wine
           scripts/fetch-fex64-dependencies.sh --component mythic
           scripts/fetch-fex64-dependencies.sh --component fex
+          scripts/fetch-fex64-dependencies.sh --component dxmt
           scripts/fetch-dependencies.sh --platform ios --configuration Release || true
 
+      # DXMT's finished archive is cached on its own so a hit needs neither the
+      # LLVM source tree nor the LLVM build - the longest item in the project -
+      # to be present at all.
+      - name: Restore the DXMT unix archive
+        uses: actions/cache@v4
+        with:
+          path: third_party/fex64/dxmt-ios
+          key: fex64-dxmt-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-dxmt.sh') }}
+          restore-keys: fex64-dxmt-${{ runner.os }}-
+
+      # build-fex64-dxmt.sh is in this key on purpose. The toolchains cache now
+      # has to hold llvm-ios too, and an exact hit on the old key would restore
+      # a tree without it and then refuse to save, rebuilding LLVM every single
+      # run. Changing the key costs one miss, then it sticks.
       - name: Restore cross-toolchain cache
         uses: actions/cache@v4
         with:
           path: third_party/fex64/toolchains
-          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}
+          key: fex64-toolchains-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-fex64-dxmt.sh') }}
           restore-keys: fex64-toolchains-${{ runner.os }}-
+
+      # Only the headers are still needed once llvm-ios is built, but the clone
+      # is large enough that re-fetching it dwarfs the restore.
+      - name: Restore the LLVM source tree
+        uses: actions/cache@v4
+        with:
+          path: third_party/fex64/llvm-project
+          key: fex64-llvm-src-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh') }}
+          restore-keys: fex64-llvm-src-${{ runner.os }}-
 
       - name: Restore FEX iPhoneOS build cache
         uses: actions/cache@v4
@@ -490,6 +527,14 @@ jobs:
             export BOXEDVN_XTAJIT_DLL="$PWD/third_party/fex64/arm64ec-fex/libarm64ecfex.dll"
           fi
           scripts/build-fex64-toolchains.sh --stage llvm-mingw
+          # Skip LLVM entirely when the DXMT archive already exists: it is the
+          # only consumer, and building it takes longer than everything else in
+          # this job put together.
+          dxmt_lib="$PWD/third_party/fex64/dxmt-ios/libdxmt_combined.a"
+          if [ ! -f "$dxmt_lib" ]; then
+            scripts/build-fex64-toolchains.sh --stage llvm-ios
+          fi
+          scripts/build-fex64-dxmt.sh
           scripts/build-fex64-wine.sh --tree all
           scripts/build-fex64-wine-ios-core.sh
           scripts/build-fex64-app.sh \
@@ -497,7 +542,8 @@ jobs:
             --wine-core-dir third_party/fex64/wine-ios-core \
             --wine-runtime-dir third_party/fex64/mythic/app/Mythic \
             --mythic-dir third_party/fex64/mythic \
-            --wine-pe-dir third_party/fex64/wine/build-arm64ec
+            --wine-pe-dir third_party/fex64/wine/build-arm64ec \
+            --dxmt-lib "$dxmt_lib"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -513,6 +559,7 @@ jobs:
           name: fex64-bringup-build-diagnostics
           path: |
             third_party/fex64/wine-ios-core-objects/**/*.err
+            third_party/fex64/dxmt-ios/obj/*.err
             third_party/fex64/wine/build-*/configure.log
             third_party/fex64/wine/build-*/build.log
             build/fex64-Release/xcodebuild.log

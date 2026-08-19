@@ -49,7 +49,17 @@ void winios_phase(const char *name)
 // null tables satisfies ntdll's static registry without claiming that a
 // subsystem exists; loading one before its real archive lands will fail at
 // its first unix call instead of silently invoking the wrong implementation.
+
+// DXMT's archive defines the real table, so the stub has to step aside when it
+// is linked. Without the guard the two definitions collide: the linker prefers
+// this object file's copy and never loads the archive member, which is the
+// silent-wrong-implementation case the note above warns about - the graphics
+// target would keep branching to zero with the real code sitting in the
+// binary. scripts/build-fex64-dxmt.sh verifies the archive really exports it,
+// and the app build defines BVN_WINE_DXMT_ENABLED only when linking it.
+#ifndef BVN_WINE_DXMT_ENABLED
 const void *dxmt_winemetal_unix_call_funcs[1] = {0};
+#endif
 const void *bcrypt_unix_call_funcs[1] = {0};
 const void *crypt32_unix_call_funcs[1] = {0};
 const void *dwrite_unix_call_funcs[1] = {0};

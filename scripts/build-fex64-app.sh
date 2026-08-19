@@ -9,6 +9,7 @@
 #                              [--skip-fex]
 #                              [--wine-core-dir DIR]
 #                              [--wine-runtime-dir DIR] [--mythic-dir DIR]
+#                              [--dxmt-lib PATH]
 #
 # Stage A2 of docs/ARCHITECTURE_FEX64.md. Builds FEX if its archives are not
 # already present, generates the Xcode project, links the BoxedVNFex target
@@ -30,9 +31,10 @@ WINE_CORE_DIR=""
 WINE_RUNTIME_DIR=""
 WINE_PE_DIR=""
 MYTHIC_DIR=""
+DXMT_LIB=""
 
 usage() {
-    sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -60,6 +62,9 @@ while [[ $# -gt 0 ]]; do
         --mythic-dir)
             [[ $# -ge 2 ]] || die "--mythic-dir needs a value"
             MYTHIC_DIR="$2"; shift 2 ;;
+        --dxmt-lib)
+            [[ $# -ge 2 ]] || die "--dxmt-lib needs a value"
+            DXMT_LIB="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -180,6 +185,15 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
     log "Staged the native and ARM64EC Wine runtime resources"
 fi
 
+# DXMT is only reachable through Wine, so an archive supplied without a Wine
+# runtime would link in dead weight and quietly drop the stub that the rest of
+# the build still needs.
+if [[ -n "${DXMT_LIB}" ]]; then
+    [[ "${WINE_ENABLED}" -eq 1 ]] || die "--dxmt-lib needs a Wine-enabled build; pass --wine-core-dir, --wine-runtime-dir and --mythic-dir too."
+    require_file "${DXMT_LIB}" "Build it with scripts/build-fex64-dxmt.sh."
+    DXMT_LIB="$(cd "$(dirname "${DXMT_LIB}")" && pwd)/$(basename "${DXMT_LIB}")"
+fi
+
 XCODEGEN="${BOXEDVN_THIRD_PARTY}/xcodegen-${BOXEDVN_XCODEGEN_VERSION}/bin/xcodegen"
 [[ -x "${XCODEGEN}" ]] \
     || die "XcodeGen is missing at '${XCODEGEN}'. Run scripts/fetch-dependencies.sh."
@@ -198,10 +212,25 @@ BUILD_LOG="${OUTPUT_DIR}/xcodebuild.log"
 log "Building BoxedVNFex.app for generic iOS device"
 XCODE_WINE_SETTINGS=()
 if [[ "${WINE_ENABLED}" -eq 1 ]]; then
+    wine_definitions='$(inherited) BVN_WINE_BOOT_ENABLED=1'
+    dxmt_ldflags=""
+    if [[ -n "${DXMT_LIB}" ]]; then
+        # Linked by absolute path rather than -l: the archive lives outside
+        # every library search path and carries LLVM inside it, so there is
+        # nothing to resolve by name. Defining BVN_WINE_DXMT_ENABLED is what
+        # removes the null unix-call stub in BVNWineRuntimeStubs.c; the two
+        # must move together or the stub silently wins the link.
+        dxmt_ldflags="${DXMT_LIB}"
+        wine_definitions="${wine_definitions} BVN_WINE_DXMT_ENABLED=1"
+        log "Linking DXMT's unix side ($(wc -c < "${DXMT_LIB}" | tr -d ' ') bytes)"
+    else
+        warn "no --dxmt-lib: the graphics target will branch to zero on its first unix call, because winemetal.dll resolves through the null stub table"
+    fi
     XCODE_WINE_SETTINGS+=(
         "BVN_WINE_LIBRARY_DIR=${WINE_CORE_DIR}/lib"
         "BVN_WINE_LDFLAGS=-lntdll_unix -lwineserver"
-        'GCC_PREPROCESSOR_DEFINITIONS=$(inherited) BVN_WINE_BOOT_ENABLED=1'
+        "BVN_DXMT_LDFLAGS=${dxmt_ldflags}"
+        "GCC_PREPROCESSOR_DEFINITIONS=${wine_definitions}"
     )
 fi
 set +e
