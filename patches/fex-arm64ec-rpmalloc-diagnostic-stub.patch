@@ -1,0 +1,19 @@
+diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
+index b4dc86cce..343336b84 100644
+--- a/Source/Windows/ARM64EC/IosJitAlias.cpp
++++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
+@@ -282,0 +283,14 @@ uint64_t IosJitReverseTranslate(uint64_t Addr) {
++
++/* BoxedVN: the allocator revision this fork records was force-pushed out of its
++ * repository, so the build uses the one upstream FEX pins for the same release.
++ * That revision carries none of the integration's private diagnostic hooks, and
++ * rpm_cas_snapshot_take is one of them: its only caller fills this struct for a
++ * single [rpm-cas] log line. Report "no snapshot" so the reporter skips, rather
++ * than inventing allocator internals to satisfy a linker. */
++extern "C" {
++struct rpm_cas_snapshot;
++int rpm_cas_snapshot_take(struct rpm_cas_snapshot* Out) {
++  (void)Out;
++  return 0;
++}
++}

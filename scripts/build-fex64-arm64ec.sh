@@ -87,6 +87,21 @@ the pin in scripts/dependencies.fex64.lock.sh needs raising deliberately."
 
 export PATH="${TOOLCHAIN}/bin:${PATH}"
 
+# The fork calls one diagnostic hook that only existed in the allocator
+# revision it records, which is unreachable. Supply a stub that reports "no
+# snapshot" so the reporter skips it. Idempotent: already-applied is fine.
+STUB_PATCH="${BOXEDVN_ROOT}/patches/fex-arm64ec-rpmalloc-diagnostic-stub.patch"
+require_file "${STUB_PATCH}"
+if git -C "${FEX_SOURCE}" apply --unidiff-zero --check "${STUB_PATCH}" 2>/dev/null; then
+    log "Applying the allocator diagnostic stub"
+    git -C "${FEX_SOURCE}" apply --unidiff-zero "${STUB_PATCH}" \
+        || die "The allocator diagnostic stub failed to apply."
+elif git -C "${FEX_SOURCE}" apply --unidiff-zero --reverse --check "${STUB_PATCH}" 2>/dev/null; then
+    log "The allocator diagnostic stub is already applied"
+else
+    die "The pinned FEX source no longer accepts ${STUB_PATCH}; refresh it explicitly."
+fi
+
 if [[ "${FORCE}" == "1" ]]; then
     rm -rf "${BUILD}"
 fi
