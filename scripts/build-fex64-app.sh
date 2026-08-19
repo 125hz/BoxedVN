@@ -160,29 +160,17 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
     # uses. Wine is configured here with --enable-archs=arm64ec,aarch64, so
     # that build already produced one; copy it in alongside rather than
     # replacing anything.
-    # Wine builds every program for the native architecture only -- explorer,
-    # cmd, wineboot are all aarch64 even when --enable-archs names arm64ec too,
-    # because ARM64EC exists for DLLs that x64 code has to call, which Wine's
-    # own programs are not. So a desktop cannot run in the ARM64EC world: it
-    # has the display driver but will never have a program.
+    # No display driver is staged, because none exists for iOS. wineios.drv is
+    # the CoreAudio/CoreMIDI driver, not a display one; the fork carries only
+    # the usual winex11, winemac, winewayland and wineandroid, none of which
+    # run here. The integration reaches the screen through DXMT instead, whose
+    # unix side resolves macdrv_* to a CAMetalLayer the app owns -- a surface
+    # for D3D11 output, not a window manager. It is a game launcher and never
+    # needed a desktop.
     #
-    # It can run in the aarch64 world, which has explorer and a full DLL set
-    # and lacks only a driver, because the integration ships wineios.drv built
-    # for ARM64EC alone. Wine builds DLLs for both architectures, so stage the
-    # aarch64 form of the driver next to the programs that can load it.
-    if [[ -n "${WINE_PE_DIR}" ]]; then
-        driver="$(find "${WINE_PE_DIR}" -name "wineios.drv" \
-                  -path "*/aarch64-windows/*" -print -quit 2>/dev/null || true)"
-        if [[ -n "${driver}" && -f "${driver}" ]]; then
-            cp "${driver}" "${WINE_RESOURCE_STAGING}/aarch64-windows/wineios.drv"
-            log "Staged the aarch64 wineios.drv from ${driver}"
-        else
-            warn "No aarch64 wineios.drv under ${WINE_PE_DIR}; the desktop has no display driver."
-            warn "  wineios built, any architecture:"
-            find "${WINE_PE_DIR}" -name "wineios.drv" 2>/dev/null \
-                | head -10 | sed "s/^/    /" >&2 || true
-        fi
-    fi
+    # So the desktop target loads Wine's window stack and then stops for want
+    # of a driver. Reaching a visible desktop means writing one, or teaching
+    # winemac.drv to speak UIKit instead of Cocoa.
     cp -R "${MYTHIC_DIR}/app/Mythic/nls" "${WINE_RESOURCE_STAGING}/nls"
     mkdir -p "${WINE_RESOURCE_STAGING}/prefix-template"
     tar -xzf "${MYTHIC_DIR}/app/Mythic/prefix-template.tar.gz" \
