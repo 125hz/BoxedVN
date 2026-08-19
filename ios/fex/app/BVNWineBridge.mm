@@ -254,15 +254,16 @@ bool preparePrefix() {
     // code to FEX. The native probe keeps the aarch64 runtime available as a
     // control without requiring a different IPA.
     //
-    // The desktop probe stays on ARM64EC. wineios.drv is built only for that
-    // architecture, so an ARM64 explorer can never load a display driver at
-    // all -- it looks for winex11.drv, finds nothing, and wedges with no
-    // graphics. The ARM64EC runtime has the driver, and the app build stages
-    // an ARM64EC explorer beside it.
+    // The desktop probe runs in the aarch64 world. Wine builds programs for
+    // the native architecture only, so explorer exists there and nowhere
+    // else, and the app build stages an aarch64 wineios.drv beside it because
+    // the integration ships that driver for ARM64EC alone. This world cannot
+    // run x86, which the translation target covers separately.
     // Recreate every symlink because the app bundle path changes when a
     // sideloader reinstalls the IPA.
     const BVNWineTarget target = g_target.load(std::memory_order_acquire);
-    const bool nativeTarget = target == BVNWineTargetNative;
+    const bool nativeTarget = target == BVNWineTargetNative ||
+                              target == BVNWineTargetDesktop;
     NSString* runtimeName = nativeTarget ? @"aarch64-windows" : @"arm64ec-windows";
     NSString* runtime = bundled(runtimeName);
     NSArray<NSString*>* names = [files contentsOfDirectoryAtPath:runtime error:&error];

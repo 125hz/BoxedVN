@@ -160,34 +160,28 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
     # uses. Wine is configured here with --enable-archs=arm64ec,aarch64, so
     # that build already produced one; copy it in alongside rather than
     # replacing anything.
+    # Wine builds every program for the native architecture only -- explorer,
+    # cmd, wineboot are all aarch64 even when --enable-archs names arm64ec too,
+    # because ARM64EC exists for DLLs that x64 code has to call, which Wine's
+    # own programs are not. So a desktop cannot run in the ARM64EC world: it
+    # has the display driver but will never have a program.
+    #
+    # It can run in the aarch64 world, which has explorer and a full DLL set
+    # and lacks only a driver, because the integration ships wineios.drv built
+    # for ARM64EC alone. Wine builds DLLs for both architectures, so stage the
+    # aarch64 form of the driver next to the programs that can load it.
     if [[ -n "${WINE_PE_DIR}" ]]; then
-        for program in explorer; do
-            # Wine places multi-arch PE output under a per-architecture
-            # directory, but which one a program lands in depends on how the
-            # module is declared, so search rather than assume a path. Match
-            # the architecture directory itself: the build directory is called
-            # build-arm64ec, so a looser pattern matches every architecture
-            # under it and happily stages an ARM64 binary into the ARM64EC
-            # runtime -- the same machine mismatch, just inverted.
-            built="$(find "${WINE_PE_DIR}" -name "${program}.exe" \
-                     -path "*/arm64ec-windows/*" \
-                     -print -quit 2>/dev/null || true)"
-            if [[ -n "${built}" && -f "${built}" ]]; then
-                cp "${built}" \
-                   "${WINE_RESOURCE_STAGING}/arm64ec-windows/${program}.exe"
-                log "Staged the ARM64EC ${program}.exe from ${built}"
-            else
-                warn "No ARM64EC ${program}.exe under ${WINE_PE_DIR}."
-                # Say what the tree did build, so the next run does not have to
-                # guess again. Programs first, then any arm64ec output at all.
-                warn "  arm64ec programs built:"
-                find "${WINE_PE_DIR}/programs" -name "*.exe" -path "*arm64ec*" \
-                    2>/dev/null | head -20 | sed "s/^/    /" >&2 || true
-                warn "  any ${program} built, any architecture:"
-                find "${WINE_PE_DIR}" -name "${program}.exe" \
-                    2>/dev/null | head -10 | sed "s/^/    /" >&2 || true
-            fi
-        done
+        driver="$(find "${WINE_PE_DIR}" -name "wineios.drv" \
+                  -path "*/aarch64-windows/*" -print -quit 2>/dev/null || true)"
+        if [[ -n "${driver}" && -f "${driver}" ]]; then
+            cp "${driver}" "${WINE_RESOURCE_STAGING}/aarch64-windows/wineios.drv"
+            log "Staged the aarch64 wineios.drv from ${driver}"
+        else
+            warn "No aarch64 wineios.drv under ${WINE_PE_DIR}; the desktop has no display driver."
+            warn "  wineios built, any architecture:"
+            find "${WINE_PE_DIR}" -name "wineios.drv" 2>/dev/null \
+                | head -10 | sed "s/^/    /" >&2 || true
+        fi
     fi
     cp -R "${MYTHIC_DIR}/app/Mythic/nls" "${WINE_RESOURCE_STAGING}/nls"
     mkdir -p "${WINE_RESOURCE_STAGING}/prefix-template"
