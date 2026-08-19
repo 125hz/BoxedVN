@@ -230,10 +230,14 @@ targets:
       - sdk: QuartzCore.framework
       - sdk: UIKit.framework
       # DXMT's unix side reaches past Metal itself: CGColorSpace for swapchain
-      # colour handling and IOSurface for shared texture backing. Its shader
-      # cache is SQLite. Harmless when the archive is not linked.
+      # colour handling, IOSurface for shared texture backing, and MetalFX for
+      # its spatial and temporal upscalers - the two MTLFX*ScalerDescriptor
+      # classes were the only symbols missing from the first link that carried
+      # the archive. Its shader cache is SQLite. All harmless when the archive
+      # is not linked.
       - sdk: CoreGraphics.framework
       - sdk: IOSurface.framework
+      - sdk: MetalFX.framework
       - sdk: libc++.tbd
       - sdk: libsqlite3.tbd
       - sdk: libz.tbd
