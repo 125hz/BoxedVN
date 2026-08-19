@@ -93,6 +93,37 @@ IPHONEOS_MIN="17.0"
 rm -rf "${OBJ_DIR}" "${LIB}" "${STAMP}"
 mkdir -p "${OBJ_DIR}"
 
+# Wine generates its IDL headers on demand, as prerequisites of whichever DLL
+# needs them, and the macOS tree here is built with `make include` only - for
+# its generated headers, never for a DLL. So nothing ever asks for these, and
+# the first build failed on every unit that reaches ntuser_private.h, which
+# pulls shlobj.h -> ole2.h -> objbase.h -> combaseapi.h -> objidlbase.h.
+#
+# Ask for them by name. Done here rather than in build-fex64-wine.sh on
+# purpose: that script's hash is the Wine cache key, and changing it would
+# throw away a tree that takes twenty minutes to rebuild in order to add a
+# step that takes seconds.
+if [[ ! -f "${WINE_BUILD}/include/objidlbase.h" ]]; then
+    require_command make
+    idl_targets=()
+    for idl in "${WINE_SOURCE}"/include/*.idl; do
+        [[ -e "${idl}" ]] || continue
+        idl_targets+=("include/$(basename "${idl}" .idl).h")
+    done
+
+    if [[ "${#idl_targets[@]}" -gt 0 ]]; then
+        log "win32u: generating ${#idl_targets[@]} Wine IDL headers"
+        # -k because not every .idl yields a header - some describe only a type
+        # library - and a miss there is not a failure of this step.
+        make -C "${WINE_BUILD}" -k -j "${JOBS}" "${idl_targets[@]}" \
+            > "${OUTPUT_DIR}/idl-headers.log" 2>&1 || true
+    fi
+
+    require_file "${WINE_BUILD}/include/objidlbase.h" \
+        "Wine did not generate its IDL headers. See ${OUTPUT_DIR}/idl-headers.log."
+    ok "win32u: Wine IDL headers present"
+fi
+
 FAILED_FILES=()
 
 # Serial, matching the other iphoneos compiles here: macOS ships bash 3.2 and
