@@ -162,13 +162,25 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
     # replacing anything.
     if [[ -n "${WINE_PE_DIR}" ]]; then
         for program in explorer; do
-            built="${WINE_PE_DIR}/programs/${program}/arm64ec-windows/${program}.exe"
-            if [[ -f "${built}" ]]; then
+            # Wine places multi-arch PE output under a per-architecture
+            # directory, but which one a program lands in depends on how the
+            # module is declared, so search rather than assume a path.
+            built="$(find "${WINE_PE_DIR}" -name "${program}.exe" -path "*arm64ec*" \
+                     -print -quit 2>/dev/null || true)"
+            if [[ -n "${built}" && -f "${built}" ]]; then
                 cp "${built}" \
                    "${WINE_RESOURCE_STAGING}/arm64ec-windows/${program}.exe"
-                log "Staged the ARM64EC ${program}.exe"
+                log "Staged the ARM64EC ${program}.exe from ${built}"
             else
-                warn "No ARM64EC ${program}.exe at ${built}; the desktop target will not start."
+                warn "No ARM64EC ${program}.exe under ${WINE_PE_DIR}."
+                # Say what the tree did build, so the next run does not have to
+                # guess again. Programs first, then any arm64ec output at all.
+                warn "  arm64ec programs built:"
+                find "${WINE_PE_DIR}/programs" -name "*.exe" -path "*arm64ec*" \
+                    2>/dev/null | head -20 | sed "s/^/    /" >&2 || true
+                warn "  any ${program} built, any architecture:"
+                find "${WINE_PE_DIR}" -name "${program}.exe" \
+                    2>/dev/null | head -10 | sed "s/^/    /" >&2 || true
             fi
         done
     fi
