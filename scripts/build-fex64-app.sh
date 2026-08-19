@@ -164,8 +164,13 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
         for program in explorer; do
             # Wine places multi-arch PE output under a per-architecture
             # directory, but which one a program lands in depends on how the
-            # module is declared, so search rather than assume a path.
-            built="$(find "${WINE_PE_DIR}" -name "${program}.exe" -path "*arm64ec*" \
+            # module is declared, so search rather than assume a path. Match
+            # the architecture directory itself: the build directory is called
+            # build-arm64ec, so a looser pattern matches every architecture
+            # under it and happily stages an ARM64 binary into the ARM64EC
+            # runtime -- the same machine mismatch, just inverted.
+            built="$(find "${WINE_PE_DIR}" -name "${program}.exe" \
+                     -path "*/arm64ec-windows/*" \
                      -print -quit 2>/dev/null || true)"
             if [[ -n "${built}" && -f "${built}" ]]; then
                 cp "${built}" \
