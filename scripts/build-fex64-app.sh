@@ -127,14 +127,24 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
           "${WINE_RESOURCE_STAGING}/aarch64-windows"
     cp -R "${WINE_RUNTIME_DIR}/arm64ec-windows" \
           "${WINE_RESOURCE_STAGING}/arm64ec-windows"
-    # The emulator DLL is a prebuilt whose allocator source was force-pushed
-    # out of existence, so it is patched in place on the way into the bundle
-    # rather than rebuilt. The patcher verifies the input hash and the exact
-    # bytes it replaces, and fails the build if either has moved.
-    "${PYTHON:-python3}" "${BOXEDVN_ROOT}/scripts/patch-xtajit64.py" \
-        "${MYTHIC_DIR}/app/Mythic/arm64ec-windows/xtajit64.dll" \
-        "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit64.dll" \
-        || die "Patching the ARM64EC emulator DLL failed."
+    # Two ways to supply the emulator DLL. By default the prebuilt is patched
+    # in place on the way into the bundle, because its allocator source was
+    # force-pushed out of existence and cannot be rebuilt. Set
+    # BOXEDVN_XTAJIT_DLL to stage a source-built one instead; that path needs
+    # no patching because the defect is fixed in source, and it is staged
+    # verbatim so the binary under test is exactly what CI produced.
+    if [[ -n "${BOXEDVN_XTAJIT_DLL:-}" ]]; then
+        require_file "${BOXEDVN_XTAJIT_DLL}"
+        log "Staging the source-built emulator DLL"
+        cp "${BOXEDVN_XTAJIT_DLL}" \
+           "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit64.dll"
+        shasum -a 256 "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit64.dll"
+    else
+        "${PYTHON:-python3}" "${BOXEDVN_ROOT}/scripts/patch-xtajit64.py" \
+            "${MYTHIC_DIR}/app/Mythic/arm64ec-windows/xtajit64.dll" \
+            "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit64.dll" \
+            || die "Patching the ARM64EC emulator DLL failed."
+    fi
     cp -R "${MYTHIC_DIR}/app/Mythic/nls" "${WINE_RESOURCE_STAGING}/nls"
     mkdir -p "${WINE_RESOURCE_STAGING}/prefix-template"
     tar -xzf "${MYTHIC_DIR}/app/Mythic/prefix-template.tar.gz" \
