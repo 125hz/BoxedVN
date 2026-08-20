@@ -10,15 +10,9 @@
 #ifndef __REG64_H__
 #define __REG64_H__
 
-// cpu.h (32-bit guest path) defines preprocessor macros named u8/h8/u16/
-// h16 that expand to byte[0]/byte[1]/word[0]/word[1]. If a TU includes
-// cpu.h before reg64.h those macros corrupt the fields below. Defensively
-// undo them here; the 32-bit Reg union doesn't need them in this file's
-// scope.
-#undef u8
-#undef h8
-#undef u16
-#undef h16
+// The IA-32 CPU exposes u8/h8/u16/h16 as macros over byte[] and word[]. Keep
+// the same storage names here so both register types can coexist in one
+// translation unit without changing those established macros globally.
 
 // 64-bit guest register slot. Used by CPU64 (the x86-64 interpreter) for
 // the 16 general-purpose registers RAX..R15.
@@ -39,20 +33,15 @@ struct Reg64 {
     union {
         U64 u64;
         U32 u32;
-        union {
-            U16 u16;
-            struct {
-                U8 u8;
-                U8 h8;
-            };
-        };
+        U16 word[4];
+        U8 byte[8];
     };
 
     inline void setU64(U64 v) { u64 = v; }
     inline void setU32(U32 v) { u64 = v; }      // zero-extends, per x86-64
-    inline void setU16(U16 v) { u16 = v; }      // preserves upper 48 bits
-    inline void setU8(U8 v)   { u8 = v; }       // preserves upper 56 bits
-    inline void setH8(U8 v)   { h8 = v; }       // AH/CH/DH/BH style — only valid for RAX..RBX without REX
+    inline void setU16(U16 v) { word[0] = v; }  // preserves upper 48 bits
+    inline void setU8(U8 v)   { byte[0] = v; }  // preserves upper 56 bits
+    inline void setH8(U8 v)   { byte[1] = v; }  // AH/CH/DH/BH style — only valid for RAX..RBX without REX
 };
 
 #endif
