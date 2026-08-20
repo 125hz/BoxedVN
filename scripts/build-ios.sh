@@ -124,9 +124,10 @@ if [[ ${ENABLE_FEX64} -eq 1 ]]; then
         "Run scripts/build-fex64-fex.sh before enabling the optional FEX backend."
     cmake_options+=(
         -DBOXEDVN_ENABLE_FEX64=ON
+        -DBOXEDVN_ENABLE_GUEST_X64=ON
         -DBOXEDVN_FEX64_ROOT="${FEX64_PREFIX}"
     )
-    log "Optional FEX x86-64 translator enabled"
+    log "Optional BoxedWine x86-64 guest ABI and FEX translator enabled"
 fi
 
 log "Configuring the native build (${CONFIGURATION})"

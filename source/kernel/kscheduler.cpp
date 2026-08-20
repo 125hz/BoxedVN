@@ -19,6 +19,9 @@
 #include "boxedwine.h"
 #include "../x11/x11.h"
 #include "knativeaudio.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#endif
 
 #ifdef BOXEDWINE_MULTI_THREADED
 static KList<KTimerCallback*> timers;
@@ -172,6 +175,20 @@ bool recoverRunSliceException() {
 #endif
 
 void runThreadSlice(KThread* thread) {
+#ifdef BOXEDWINE_GUEST_X64
+    if (thread->process && thread->process->is64Bit) {
+        CPU64* cpu64 = thread->cpu64 ? thread->cpu64 : thread->process->cpu64;
+        if (cpu64) {
+            cpu64->yield = false;
+            cpu64->deliverPendingSignals();
+            try {
+                cpu64->runBounded(static_cast<U64>(contextTimeRemaining));
+            } catch (...) {
+            }
+            return;
+        }
+    }
+#endif
     CPU* cpu;
 
     cpu = thread->cpu;

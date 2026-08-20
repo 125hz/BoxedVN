@@ -23,6 +23,10 @@
 #include "../io/fsfilenode.h"
 #include "bufferaccess.h"
 #include "kstat.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#include "kmemory64.h"
+#endif
 
 #ifdef BOXEDWINE_VULKAN
 void logVkMemoryFaultContext(U32 processId, U32 address, bool writeFault);
@@ -58,6 +62,12 @@ KThread::~KThread() {
     CPU* cpu = this->cpu;
     this->cpu = nullptr;
     delete cpu;
+#ifdef BOXEDWINE_GUEST_X64
+    if (cpu64 && (!process || cpu64 != process->cpu64)) {
+        delete cpu64;
+    }
+    cpu64 = nullptr;
+#endif
 }
 
 void KThread::cleanup() {
@@ -75,6 +85,14 @@ void KThread::internalCleanup() {
         this->futex(this->clear_child_tid, 1, 0xffffffff, 0, 0, 0, false);        
     }
 	this->clear_child_tid = 0;
+#ifdef BOXEDWINE_GUEST_X64
+    if (!KSystem::shutingDown && this->clear_child_tid64 && this->process &&
+        this->process->memory64) {
+        this->process->memory64->writed(this->clear_child_tid64, 0);
+        this->futex64(this->clear_child_tid64, 1, 0xffffffff, 0, 0);
+    }
+    this->clear_child_tid64 = 0;
+#endif
 #ifndef BOXEDWINE_MULTI_THREADED
     if (this->waitingCond) {
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(*this->waitingCond);
@@ -580,6 +598,125 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
         return -1;
     }
 }
+
+#ifdef BOXEDWINE_GUEST_X64
+S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
+                     U32 val3) {
+    KMemory64* guestMemory = process ? process->memory64 : nullptr;
+    if (!guestMemory) {
+        return -K_ENOSYS;
+    }
+    U8* ram = guestMemory->getRamPtr(addr, sizeof(U32));
+    if (!ram) {
+        return -K_EFAULT;
+    }
+    const U64 ramAddress = reinterpret_cast<U64>(ram);
+    const U32 command = op & FUTEX_CMD_MASK;
+
+    if (command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET) {
+        U32 expires = 0xffffffff;
+        if (timeoutAddress) {
+            const U64 seconds = guestMemory->readq(timeoutAddress);
+            const U64 nanos = guestMemory->readq(timeoutAddress + 8);
+            U64 millis = seconds * 1000 + nanos / 1000000;
+            if (command == FUTEX_WAIT_BITSET &&
+                (op & FUTEX_CLOCK_REALTIME) != 0) {
+                const U64 realtime = KSystem::getSystemTimeAsMicroSeconds() / 1000;
+                millis = millis > realtime ? millis - realtime : 0;
+            }
+            expires = static_cast<U32>(millis) +
+                      KSystem::getMilliesSinceStart();
+        }
+
+        struct futex* wait = getFutex(this, ramAddress);
+        if (!wait) {
+            if (guestMemory->readd(addr) != value) {
+                return -K_EWOULDBLOCK;
+            }
+            wait = allocFutex(this, ramAddress, static_cast<U32>(addr), value,
+                              command, expires);
+            if (command == FUTEX_WAIT_BITSET) {
+                wait->mask = val3;
+            }
+        }
+
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(wait->cond);
+        if (guestMemory->readd(addr) != value) {
+            freeFutex(wait);
+            return -K_EWOULDBLOCK;
+        }
+        wait->waiting = true;
+#ifdef BOXEDWINE_MULTI_THREADED
+        while (true) {
+            if (this->pendingSignals) {
+                bool delivered = cpu64 ? cpu64->deliverPendingSignals()
+                                       : runSignals();
+                if (delivered) {
+                    freeFutex(wait);
+                    return -K_EINTR;
+                }
+            }
+            if (wait->wake) {
+                freeFutex(wait);
+                return 0;
+            }
+            if (wait->expireTimeInMillies < 0x7fffffff) {
+                S32 remaining = wait->expireTimeInMillies -
+                                KSystem::getMilliesSinceStart();
+                if (remaining <= 0) {
+                    freeFutex(wait);
+                    return -K_ETIMEDOUT;
+                }
+                BOXEDWINE_CONDITION_WAIT_TIMEOUT(wait->cond,
+                                                  static_cast<U32>(remaining));
+            } else {
+                BOXEDWINE_CONDITION_WAIT(wait->cond);
+            }
+            if (terminating) {
+                freeFutex(wait);
+                return -K_EINTR;
+            }
+        }
+#else
+        if (wait->expireTimeInMillies < 0x7fffffff) {
+            U32 remaining = wait->expireTimeInMillies -
+                            KSystem::getMilliesSinceStart();
+            (void)wait->cond->waitWithTimeout(remaining);
+        } else {
+            (void)wait->cond->wait();
+        }
+        return K_FUTEX64_PARKED;
+#endif
+    }
+
+    if (command == FUTEX_WAKE || command == FUTEX_WAKE_BITSET) {
+        U32 count = 0;
+        SystemFutexesLock futexesLock;
+        for (auto& entry : systemFutexes) {
+            if (count >= value) {
+                break;
+            }
+            struct futex* wait = entry.get();
+            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(wait->cond);
+            if (!wait->thread || wait->address != ramAddress || wait->wake) {
+                continue;
+            }
+            if (command == FUTEX_WAKE_BITSET && !(wait->mask & val3)) {
+                continue;
+            }
+            wait->wake = true;
+            BOXEDWINE_CONDITION_SIGNAL(wait->cond);
+            ++count;
+        }
+        return count;
+    }
+
+    if (command == 3 || command == 4 || command == 5) {
+        return 0;
+    }
+    return -K_ENOSYS;
+}
+#endif
 
 /*
 struct robust_list {

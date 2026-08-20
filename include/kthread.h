@@ -48,6 +48,9 @@ typedef std::shared_ptr<OpenGLVetexPointer> OpenGLVetexPointerPtr;
 class KProcess;
 class Memory;
 class Wnd;
+#ifdef BOXEDWINE_GUEST_X64
+class CPU64;
+#endif
 
 class KThreadGlContext {
 public:
@@ -102,6 +105,9 @@ public:
 
     // syscalls
     U32 futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, bool time64) ;
+#ifdef BOXEDWINE_GUEST_X64
+    S64 futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress, U32 val3);
+#endif
     U32 modify_ldt(U32 func, U32 ptr, U32 count);
     U32 signalstack(U32 ss, U32 oss);
     U32 sigprocmask(U32 how, U32 set, U32 oset, U32 sigsetSize);
@@ -121,6 +127,9 @@ public:
     U32 alternateStack = 0;
     U32 alternateStackSize = 0;
     CPU* cpu = nullptr;
+#ifdef BOXEDWINE_GUEST_X64
+    CPU64* cpu64 = nullptr;
+#endif
     KProcessPtr process;
     KMemory* const memory;
     bool interrupted = false;
@@ -134,6 +143,9 @@ public:
 #endif
     bool terminating = false;
     U32 clear_child_tid = 0;
+#ifdef BOXEDWINE_GUEST_X64
+    U64 clear_child_tid64 = 0;
+#endif
     U32 debugRegs[8] = {};
     bool ptraceStopPending = false;
     U32 ptraceStopSignal = 0;

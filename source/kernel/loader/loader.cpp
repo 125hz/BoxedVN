@@ -19,7 +19,11 @@
 #include "boxedwine.h"
 
 #include "kelf.h"
+#include "kelf64.h"
 #include "loader.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "loader64.h"
+#endif
 
 #include <string.h>
 
@@ -37,17 +41,21 @@
 #  error "Big-Endian Arch is not supported"
 #endif
 
+static bool hasElfMagic(const U8* ident) {
+    return ident[0] == 0x7f && ident[1] == 'E' && ident[2] == 'L' &&
+           ident[3] == 'F';
+}
+
+static bool isElf32Ident(const U8* ident) {
+    return hasElfMagic(ident) && ident[4] == k_ELFCLASS32 && ident[5] == 1;
+}
+
+static bool isElf64Ident(const U8* ident) {
+    return hasElfMagic(ident) && ident[4] == k_ELFCLASS64 && ident[5] == 1;
+}
+
 bool isValidElf(struct k_Elf32_Ehdr* hdr) {
-    if (hdr->e_ident[0] != 0x7F || hdr->e_ident[1] != 'E' || hdr->e_ident[2] != 'L' || hdr->e_ident[3] != 'F') {
-        return false;
-    }
-    if (hdr->e_ident[4] != 1) {
-        return false;
-    }
-    if (hdr->e_ident[5] != 1) {
-        return false;
-    }
-    return true;
+    return isElf32Ident(hdr->e_ident);
 }
 
 BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf) {
@@ -60,8 +68,8 @@ BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf) {
     if (len!=sizeof(buffer)) {
         *isElf=true;
     }
-    if (*isElf) {		
-        *isElf = isValidElf(hdr);
+    if (*isElf) {
+        *isElf = isElf32Ident(buffer) || isElf64Ident(buffer);
     }
     if (!*isElf) {
         if (buffer[0]=='#') {
@@ -85,11 +93,19 @@ BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf) {
             shell_interp[pos++]=0;
             return BString::copy(shell_interp);
         }
+    } else if (isElf64Ident(buffer)) {
+#ifdef BOXEDWINE_GUEST_X64
+        openNode->seek(0);
+        Elf64ParseResult parsed = ElfLoader64::parse(openNode);
+        return parsed.valid ? parsed.interpreter : B("");
+#else
+        return B("");
+#endif
     } else {
         U32 i;
 
-        openNode->seek(hdr->e_phoff);	
-        for (i=0;i<hdr->e_phoff;i++) {
+        openNode->seek(hdr->e_phoff);
+        for (i=0;i<hdr->e_phnum;i++) {
             struct k_Elf32_Phdr phdr;		
             openNode->seek(hdr->e_phoff+i*hdr->e_phentsize);	
             openNode->readNative((U8*)&phdr, sizeof(struct k_Elf32_Phdr));
@@ -231,14 +247,28 @@ U32 getPELoadAddress(struct FsOpenNode* openNode, U32* section, U32* numberOfSec
 }
 #endif
 bool ElfLoader::loadProgram(KThread* thread, FsOpenNode* openNode, U32* eip) {
-    U8 buffer[sizeof(struct k_Elf32_Ehdr)] = { 0 };
+    U8 buffer[sizeof(struct k_Elf64_Ehdr)] = { 0 };
     struct k_Elf32_Ehdr* hdr = (struct k_Elf32_Ehdr*)buffer;
-    U32 len = openNode->readNative(buffer, sizeof(buffer));
+    U32 len = openNode->readNative(buffer, sizeof(struct k_Elf32_Ehdr));
     U32 address=0xFFFFFFFF;
     U32 reloc = 0;
 
-    if (len!=sizeof(buffer)) {
+    if (len!=sizeof(struct k_Elf32_Ehdr)) {
         return false;
+    }
+    if (isElf64Ident(buffer)) {
+#ifdef BOXEDWINE_GUEST_X64
+        openNode->seek(0);
+        U64 rip = 0;
+        bool loaded = ElfLoader64::loadProgram(thread, openNode, &rip);
+        if (loaded) {
+            *eip = static_cast<U32>(rip);
+        }
+        return loaded;
+#else
+        klog("loadProgram: x86-64 ELF requires BOXEDWINE_GUEST_X64");
+        return false;
+#endif
     }
     if (!isValidElf(hdr))
         return false;    

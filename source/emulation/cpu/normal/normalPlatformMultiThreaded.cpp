@@ -24,6 +24,9 @@
 #ifdef BOXEDWINE_JIT
 #include "../jit/jitCodeLifecycle.h"
 #endif
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#endif
 
 #if defined(BOXEDWINE_MULTI_THREADED)
 
@@ -64,30 +67,63 @@ static void platformThread(CPU* cpu) {
     KThread::setCurrentThread(cpu->thread);
     KProcessPtr process = KSystem::getProcess(cpu->thread->process->id);
 
-    cpu->nextOp = cpu->getNextOp();
-    if (!cpu->nextOp) {
-        cpu->thread->seg_instructionFetch(cpu->getEipAddress(), false);
-        cpu->nextOp = cpu->getNextOp();
-        if (!cpu->nextOp) {
-			kpanic_fmt("Failed to get first op for thread %d of process %d at address %x", cpu->thread->id, process->id, cpu->getEipAddress());
-		}
-    }
-    while (true) {
-        try {
-            platformThreadRun(cpu);
-#ifdef __TEST
-            if (cpu->nextOp && cpu->nextOp->inst == TestEnd) {
-                return;
+    bool ran64BitGuest = false;
+#ifdef BOXEDWINE_GUEST_X64
+    if (process->is64Bit && (cpu->thread->cpu64 || process->cpu64)) {
+        ran64BitGuest = true;
+        while (!cpu->thread->terminating) {
+            CPU64* cpu64 = cpu->thread->cpu64 ? cpu->thread->cpu64
+                                               : process->cpu64;
+            if (!cpu64) {
+                break;
             }
-#endif
-            break;
-        } catch (...) {
-            if (!cpu->thread->terminating) {
-                cpu->nextOp = cpu->getNextOp();
+            cpu64->yield = false;
+            cpu64->deliverPendingSignals();
+            try {
+                cpu64->run();
+            } catch (...) {
+                if (cpu->thread->terminating) {
+                    break;
+                }
             }
             cpu->thread->waitForPtraceResume();
-            if (platformThreadShouldStop(cpu)) {
+            if (process->terminated) {
+                BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cpu->memory->mutex);
+                cpu->memory->cleanup();
+            }
+            if (cpu64->yield) {
                 break;
+            }
+        }
+    }
+#endif
+    if (!ran64BitGuest) {
+        cpu->nextOp = cpu->getNextOp();
+        if (!cpu->nextOp) {
+            cpu->thread->seg_instructionFetch(cpu->getEipAddress(), false);
+            cpu->nextOp = cpu->getNextOp();
+            if (!cpu->nextOp) {
+                kpanic_fmt("Failed to get first op for thread %d of process %d at address %x",
+                           cpu->thread->id, process->id, cpu->getEipAddress());
+            }
+        }
+        while (true) {
+            try {
+                platformThreadRun(cpu);
+#ifdef __TEST
+                if (cpu->nextOp && cpu->nextOp->inst == TestEnd) {
+                    return;
+                }
+#endif
+                break;
+            } catch (...) {
+                if (!cpu->thread->terminating) {
+                    cpu->nextOp = cpu->getNextOp();
+                }
+                cpu->thread->waitForPtraceResume();
+                if (platformThreadShouldStop(cpu)) {
+                    break;
+                }
             }
         }
     }

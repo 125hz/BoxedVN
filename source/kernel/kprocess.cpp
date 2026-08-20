@@ -39,6 +39,10 @@
 #include "../io/fsfilenode.h"
 #include "../x11/x11.h"
 #include "kunixsocket.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#include "kmemory64.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -344,6 +348,12 @@ void KProcess::onExec(KThread* thread) {
 KProcess::~KProcess() {
     killAllThreads(KThread::currentThread());
     this->cleanupProcess();
+#ifdef BOXEDWINE_GUEST_X64
+    delete cpu64;
+    cpu64 = nullptr;
+    delete memory64;
+    memory64 = nullptr;
+#endif
     if (memory) {
         delete memory;
     }
@@ -1108,7 +1118,19 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
     FsOpenNode* openNode=ElfLoader::inspectNode(currentDirectory, node, loader, interpreter, interpreterArgs);
     if (!openNode) {
         return nullptr;
-    }    
+    }
+#ifdef BOXEDWINE_GUEST_X64
+    // ElfLoader64 constructs the complete SysV initial stack while it maps the
+    // program, so make the final program argv and environment available before
+    // architecture detection enters that loader.
+    this->startupArgs64.clear();
+    this->startupArgs64.push_back(BString(Fs::getFullPath(currentDirectory,
+                                                          argValues[0])));
+    for (U32 i = 1; i < argValues.size(); ++i) {
+        this->startupArgs64.push_back(argValues[i]);
+    }
+    this->startupEnv64 = envValues;
+#endif
     if (ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {        
         if (loader.length())
             args.push_back(loader);
@@ -1123,7 +1145,9 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
         for (U32 i=0;i<envValues.size();i++) {
             env.push_back(envValues[i]);
         }
-        setupThreadStack(thread, thread->cpu, this->name, args, env);
+        if (!this->is64Bit) {
+            setupThreadStack(thread, thread->cpu, this->name, args, env);
+        }
 
         this->currentDirectory = currentDirectory;
 
@@ -2580,6 +2604,126 @@ U32 KProcess::clone(KThread* thread, U32 flags, U32 child_stack, U32 ptid, U32 t
         return 0;
     }
 }
+
+#ifdef BOXEDWINE_GUEST_X64
+U32 KProcess::clone64(KThread* thread, U64 flags, U64 childStack,
+                      U64 parentTid, U64 tls, U64 childTid) {
+    const U64 threadFlags = K_CLONE_VM | K_CLONE_THREAD | K_CLONE_SIGHAND;
+    if ((flags & threadFlags) != threadFlags) {
+        return forkProcess64(thread, flags, childTid, parentTid);
+    }
+    if (!memory64 || !childStack) {
+        return -K_EINVAL;
+    }
+
+    CPU64* parentCpu = thread->cpu64 ? thread->cpu64 : cpu64;
+    if (!parentCpu) {
+        return -K_EINVAL;
+    }
+    KThread* child = createThread();
+    CPU64* childCpu = nullptr;
+    try {
+        childCpu = new CPU64(memory64);
+        childCpu->cloneRegistersFrom(parentCpu);
+        childCpu->thread = child;
+        child->cpu64 = childCpu;
+        childCpu->reg[X64_RAX].setU64(0);
+        childCpu->reg[X64_RSP].setU64(childStack);
+        if (flags & K_CLONE_SETTLS) {
+            childCpu->fsbase = tls;
+        }
+        if (flags & K_CLONE_CHILD_CLEARTID) {
+            child->clear_child_tid64 = childTid;
+        }
+        if ((flags & K_CLONE_CHILD_SETTID) && childTid) {
+            memory64->writed(childTid, child->id);
+        }
+        if ((flags & K_CLONE_PARENT_SETTID) && parentTid) {
+            memory64->writed(parentTid, child->id);
+        }
+    } catch (...) {
+        if (childCpu) {
+            delete childCpu;
+            child->cpu64 = nullptr;
+        }
+        deleteThread(child);
+        return -K_ENOMEM;
+    }
+    scheduleThread(child);
+    return child->id;
+}
+
+U32 KProcess::clone364(KThread* thread, U64 argsAddress, U64 size) {
+    if (!memory64 || size < 64) {
+        return -K_EINVAL;
+    }
+    const U64 flags = memory64->readq(argsAddress);
+    const U64 childTid = memory64->readq(argsAddress + 16);
+    const U64 parentTid = memory64->readq(argsAddress + 24);
+    const U64 stack = memory64->readq(argsAddress + 40);
+    const U64 stackSize = memory64->readq(argsAddress + 48);
+    const U64 tls = memory64->readq(argsAddress + 56);
+    return clone64(thread, flags, stack + stackSize, parentTid, tls, childTid);
+}
+
+U32 KProcess::forkProcess64(KThread* thread, U64 flags, U64 childTid,
+                            U64 parentTid) {
+    if (!memory64) {
+        return -K_ENOSYS;
+    }
+    CPU64* parentCpu = thread->cpu64 ? thread->cpu64 : cpu64;
+    if (!parentCpu) {
+        return -K_EINVAL;
+    }
+
+    KProcessPtr childProcess;
+    KThread* childThread = nullptr;
+    try {
+        childProcess = KProcess::createUnpublished();
+        childProcess->memory = KMemory::create(childProcess.get());
+        childProcess->parentId = id;
+        childProcess->cloneMemoryAndProcess(shared_from_this(), false);
+        childProcess->is64Bit = true;
+        childProcess->brkEnd64 = brkEnd64;
+        childProcess->entry64 = entry64;
+        childProcess->phdr64 = phdr64;
+        childProcess->phnum64 = phnum64;
+        childProcess->phentsize64 = phentsize64;
+        childProcess->startupArgs64 = startupArgs64;
+        childProcess->startupEnv64 = startupEnv64;
+        childProcess->memory64 = new KMemory64(childProcess.get());
+        childProcess->memory64->cloneFrom(memory64);
+
+        childThread = childProcess->createThread();
+        childThread->clone(thread);
+        CPU64* childCpu = new CPU64(childProcess->memory64);
+        childCpu->cloneRegistersFrom(parentCpu);
+        childCpu->thread = childThread;
+        childCpu->reg[X64_RAX].setU64(0);
+        childProcess->cpu64 = childCpu;
+        childThread->cpu64 = childCpu;
+        if ((flags & K_CLONE_CHILD_SETTID) && childTid) {
+            childProcess->memory64->writed(childTid, childThread->id);
+        }
+        if (flags & K_CLONE_CHILD_CLEARTID) {
+            childThread->clear_child_tid64 = childTid;
+        }
+        childProcess->publish();
+    } catch (const std::bad_alloc&) {
+        childProcess.reset();
+        return -K_ENOMEM;
+    } catch (...) {
+        childProcess.reset();
+        return -K_EIO;
+    }
+
+    if ((flags & K_CLONE_PARENT_SETTID) && parentTid) {
+        memory64->writed(parentTid, childProcess->id);
+    }
+    scheduleThread(childThread);
+    return childProcess->id;
+}
+#endif
 
 void KProcess::killAllThreads(KThread* exceptThisThread) {
     iterateThreadIds([this, exceptThisThread](U32 id) {

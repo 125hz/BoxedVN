@@ -285,6 +285,13 @@ public:
     U32 chmod(BString path, U32 mode);
     U32 clone3(KThread* thread, U32 args, U32 size);
     U32 clone(KThread* thread, U32 flags, U32 child_stack, U32 ptid, U32 tls, U32 ctid);
+#ifdef BOXEDWINE_GUEST_X64
+    U32 clone64(KThread* thread, U64 flags, U64 childStack, U64 parentTid,
+                U64 tls, U64 childTid);
+    U32 clone364(KThread* thread, U64 argsAddress, U64 size);
+    U32 forkProcess64(KThread* thread, U64 flags, U64 childTid,
+                      U64 parentTid);
+#endif
     U32 close(FD fildes);
     U32 dup(U32 fildes);    
     U32 dup2(FD fildes, FD fildes2);
@@ -394,6 +401,32 @@ public:
 
     bool hasSetStackMask = false;
     bool hasSetSeg[8] = { false }; // 8 just to prevent bounds checking
+
+    // The x86-64 guest ABI is parallel to the established IA-32 ABI. This
+    // flag selects process-local loader, memory, CPU, and syscall state; it
+    // never changes how an existing 32-bit process is represented.
+    bool is64Bit = false;
+    bool isWow64 = false;
+
+#ifdef BOXEDWINE_GUEST_X64
+    class KMemory64* memory64 = nullptr;
+    class CPU64* cpu64 = nullptr;
+    U64 brkEnd64 = 0;
+    U64 entry64 = 0;
+    U64 phdr64 = 0;
+    U32 phnum64 = 0;
+    U32 phentsize64 = 0;
+    std::vector<BString> startupArgs64;
+    std::vector<BString> startupEnv64;
+
+    struct ShmSeg64 {
+        U64 size = 0;
+        U64 address = 0;
+        bool markedForDelete = false;
+    };
+    std::map<S32, ShmSeg64> shm64;
+    S32 nextShm64Id = 1;
+#endif
 
     BHashTable<U32, U32> glStrings;    
     U32 glStringsiExtensions = 0;
