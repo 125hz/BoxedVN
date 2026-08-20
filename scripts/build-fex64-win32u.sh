@@ -223,14 +223,36 @@ require_file "${LIB}"
 # The point of the archive is this symbol: it is what the stub in
 # BVNWineRuntimeStubs.c answers with STATUS_NOT_SUPPORTED today, and the two
 # have to change together or the stub silently wins the link.
-if ! xcrun -sdk iphoneos nm -g "${OBJ_DIR}/message.o" > "${OBJ_DIR}/message.symbols" 2>/dev/null; then
-    warn "win32u: could not read symbols from message.o"
+#
+# Two things this check got wrong the first time, both of which hid a success.
+#
+# `nm | grep -q` fails on its own terms: grep -q exits at the first match and
+# closes the pipe, nm dies on SIGPIPE, and common.sh's `set -o pipefail` turns
+# that into a failed check. The graphics build had exactly this bug and it was
+# fixed there; writing it again here is not a coincidence worth repeating a
+# third time, so this reads the table to a file and greps the file.
+#
+# And `nm -g` is the wrong list. These objects are compiled -fvisibility=hidden,
+# which on Mach-O makes the definition a private extern; it still resolves when
+# the archives are linked into one binary, but it is not an external symbol and
+# -g does not print it. Ask for every symbol.
+SYMBOLS="${OUTPUT_DIR}/libwin32u_unix.symbols"
+if ! xcrun -sdk iphoneos nm "${LIB}" > "${SYMBOLS}" 2>"${OUTPUT_DIR}/nm.err"; then
+    warn "win32u: nm could not read ${LIB}; see ${OUTPUT_DIR}/nm.err"
 fi
-if ! xcrun -sdk iphoneos nm -g "${LIB}" 2>/dev/null | grep -q "win32u_unix_lib_init"; then
+
+if ! grep -q "win32u_unix_lib_init" "${SYMBOLS}"; then
+    warn "win32u: ${SYMBOLS} holds $(grep -c . "${SYMBOLS}" || echo 0) lines"
+    warn "win32u: unix-entry symbols that ARE present:"
+    grep -E "unix_lib_init|unix_call_funcs|wine_unix" "${SYMBOLS}" | head -12 >&2 || true
     die "win32u: built ${LIB}, but it does not define win32u_unix_lib_init.
-That symbol is the whole point: without it the stub keeps answering
-STATUS_NOT_SUPPORTED and the message queue stays broken."
+
+Wine renames its unix entry through -D__wine_unix_lib_init=win32u_unix_lib_init,
+and dlls/win32u/syscall.c is what defines it, so that translation unit has to be
+among the ones compiled here. The symbols listed above say which entry points
+did make it in."
 fi
+ok "win32u: defines win32u_unix_lib_init"
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "${STAMP}"
 ok "win32u: ${LIB} ($(wc -c < "${LIB}" | tr -d ' ') bytes)"
