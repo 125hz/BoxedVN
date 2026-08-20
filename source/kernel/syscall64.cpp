@@ -19,7 +19,6 @@
 #include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
 #include "kunixsocket.h"
 #include "kpoll.h"
-#include "ripSampler.h"
 #ifdef BOXEDWINE_OPENGL
 #include "../opengl/gl64bridge.h"
 #include "../opengl/gl64bridge_abi.h"
@@ -345,34 +344,6 @@ static void crashRingDump(const char* why) {
                  e.hdr[0],e.hdr[1],e.hdr[2],e.hdr[3],e.hdr[4],e.hdr[5],e.hdr[6],e.hdr[7],
                  e.hdr[8],e.hdr[9],e.hdr[10],e.hdr[11],e.hdr[12],e.hdr[13],e.hdr[14],e.hdr[15]);
     }
-}
-
-// BW64_RIPSAMPLE module registration for PE DLLs.
-//
-// Modern wine ships its DLLs (wined3d.dll, d3d9.dll, ...) as native PE32+ files,
-// NOT winelib .so halves. wine's PE loader does NOT mmap those section bodies
-// from an fd — it `read()`/`pread()`s an entire section in one call into an
-// ANONYMOUS guest mapping (see the long comments in sys_read64/sys_pread64 about
-// "wine's PE loader reads whole multi-MB sections in one read()"). Because that
-// path never touches sys_mmap64_file, the PE image range is never handed to
-// ripSamplerNoteModule — so a sampled RIP inside wined3d.dll resolves to nothing
-// and any stack backtrace through it is blank. (The fd-mmap registration at
-// sys_mmap64_file only covers ELF .so DLLs and a PE's *header* page.)
-//
-// Fix: whenever a read/pread fills guest memory FROM a file whose path ends in a
-// PE image extension, register the destination range [dst, dst+len) under that
-// file's basename. Each section read registers its own slice; the newest-wins
-// resolver in ripSampler stitches them so an address in any section resolves to
-// "wined3d.dll+0xNNN". Gated by ripSamplerEnabled() — zero cost in normal runs.
-static void ripSamplerNotePeRead(CPU64* cpu, const KFileDescriptorPtr& fdesc,
-                                 U64 dst, U64 len) {
-    if (!ripSamplerEnabled() || len == 0 || !cpu->thread || !cpu->thread->process) return;
-    std::shared_ptr<KFile> kf = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
-    if (!kf || !kf->openFile || !kf->openFile->node) return;
-    const BString& path = kf->openFile->node->path;
-    // Match PE images by extension (case-insensitive): .dll / .exe.
-    if (!path.endsWith(".dll", true) && !path.endsWith(".exe", true)) return;
-    ripSamplerNoteModule((int)cpu->thread->process->id, dst, len, path.c_str());
 }
 
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
@@ -954,9 +925,6 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     }
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
-        // PE DLL section bodies arrive here (read-into-anonymous, not fd-mmap) —
-        // register the range so a sampled RIP resolves to wined3d.dll+off, etc.
-        ripSamplerNotePeRead(cpu, fdesc, buf, got);
     }
     if (wsSock) {
         size_t recvAfter = wsSock->debugRecvUsed();
@@ -1249,9 +1217,6 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     if (got < 0) return (U64)got;
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), (U64)got);
-        // PE DLL section bodies arrive here too (the loader preads whole sections
-        // into anonymous guest memory) — register for RIP resolution.
-        ripSamplerNotePeRead(cpu, fdesc, buf, (U64)got);
     }
     return (U64)got;
 }
@@ -1467,10 +1432,6 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
                                             kfile->openFile->node->path.c_str(),
                                             fileBase, seedBuf.data(), (U64)seedBuf.size());
         if ((S64)r < 0) return r;
-        if (ripSamplerEnabled() && kfile->openFile->node) {
-            ripSamplerNoteModule((int)cpu->thread->process->id, aligned, mapLen,
-                                 kfile->openFile->node->path.c_str());
-        }
         return addr;
     }
     // The page that contains `addr` may already hold valid bytes from a PRIOR
@@ -1567,14 +1528,6 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         cpu->memory->memcpyToGuest(addr, buf.data(), got);
     }
     (void)flags;
-    // BW64_RIPSAMPLE: record this DSO/PE segment so a sampled spinning RIP can be
-    // resolved to file+offset. This is where wine's x86_64-unix .so halves (where
-    // the C code that busy-loops lives) become known. Use the same aligned/mapLen
-    // span the BW64_FMMAP trace prints above.
-    if (ripSamplerEnabled() && kfile->openFile->node) {
-        ripSamplerNoteModule((int)cpu->thread->process->id, aligned, mapLen,
-                             kfile->openFile->node->path.c_str());
-    }
     return addr;
 }
 
@@ -1665,10 +1618,6 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     if (!pathAddr) return (U64)-K_EFAULT;
     BString path = readGuestString64(cpu, pathAddr);
-    // BW64_RIPSAMPLE: a re-exec replaces this pid's address space, so its old
-    // module ranges would mis-attribute the next image's RIPs. Drop them; the
-    // new image's segment maps re-populate the table.
-    ripSamplerClearPid((int)cpu->thread->process->id);
     std::vector<BString> args;
     std::vector<BString> envs;
     readStringArray64(cpu, argvAddr, args);
