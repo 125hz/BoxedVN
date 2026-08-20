@@ -129,7 +129,7 @@ jobs:
   x64-graphics-assets:
     name: Build x86-64 DXMT graphics resources
     runs-on: macos-15
-    # The first uncached run builds host, Windows, and iPhoneOS LLVM libraries.
+    # The first uncached run builds Windows and iPhoneOS LLVM libraries.
     # Subsequent runs restore them from the pinned cache, but the initial build
     # needs enough room to finish instead of producing a misleading timeout.
     timeout-minutes: 300

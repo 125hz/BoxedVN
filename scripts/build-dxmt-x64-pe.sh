@@ -54,11 +54,9 @@ for tool in x86_64-w64-mingw32-clang x86_64-w64-mingw32-clang++ \
 done
 
 TOOLCHAIN_ROOT="$(dirname "${MINGW_ROOT}")"
-LLVM_HOST="${TOOLCHAIN_ROOT}/llvm-darwin-x64"
  # DXMT's airconv Meson file includes ../../toolchains/llvm/include from the
  # source tree, so the Windows LLVM install must live at this exact path.
 LLVM_WIN="${DXMT_SOURCE}/toolchains/llvm"
-LLVM_HOST_BUILD="${TOOLCHAIN_ROOT}/llvm-darwin-x64-build"
 LLVM_WIN_BUILD="${TOOLCHAIN_ROOT}/llvm-windows-x64-build"
 
 build_llvm() {
@@ -78,23 +76,43 @@ build_llvm() {
         -DLLVM_INCLUDE_BENCHMARKS=OFF
         -DLLVM_ENABLE_PROJECTS=""
     )
-    if [[ "${kind}" == "host" ]]; then
-        args+=( -DCMAKE_OSX_ARCHITECTURES="$(uname -m)"
-                -DLLVM_HOST_TRIPLE="$(uname -m)-apple-darwin" )
-    else
-        args+=( -DCMAKE_SYSTEM_NAME=Windows
-                -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32
-                -DCMAKE_SYSROOT="${MINGW_ROOT}"
-                -DCMAKE_C_COMPILER="${MINGW_BIN}/x86_64-w64-mingw32-gcc"
-                -DCMAKE_CXX_COMPILER="${MINGW_BIN}/x86_64-w64-mingw32-g++" )
-    fi
+    args+=( -DCMAKE_SYSTEM_NAME=Windows
+            -DLLVM_HOST_TRIPLE=x86_64-w64-mingw32
+            -DCMAKE_SYSROOT="${MINGW_ROOT}"
+            -DCMAKE_C_COMPILER="${MINGW_BIN}/x86_64-w64-mingw32-gcc"
+            -DCMAKE_CXX_COMPILER="${MINGW_BIN}/x86_64-w64-mingw32-g++" )
     cmake "${args[@]}"; cmake --build "${build}" --parallel "${JOBS}"
     cmake --install "${build}"
     [[ -f "${prefix}/lib/libLLVMCore.a" ]] || die "LLVM ${kind} produced no libLLVMCore.a."
     ok "LLVM ${kind}: ${prefix}"
 }
-build_llvm host "${LLVM_HOST_BUILD}" "${LLVM_HOST}"
 build_llvm windows "${LLVM_WIN_BUILD}" "${LLVM_WIN}"
+
+# This job produces only the guest PE DLLs. The pinned project otherwise also
+# builds its macOS x86-64 airconv executable and Wine unixlib because the cross
+# target is x86-64. Neither artifact enters the IPA: build-dxmt-ios-native.sh
+# compiles the corresponding native half directly for iphoneos arm64. Disable
+# those two host-only subdirectories so an Apple Silicon runner never attempts
+# to link x86-64 helpers against ARM64 LLVM or the desktop Wine SDK.
+AIRCONV_MESON="${DXMT_SOURCE}/src/airconv/meson.build"
+WINEMETAL_MESON="${DXMT_SOURCE}/src/winemetal/meson.build"
+require_file "${AIRCONV_MESON}"
+require_file "${WINEMETAL_MESON}"
+if grep -q "if cpu_family == 'x86_64' or dxmt_native" "${AIRCONV_MESON}"; then
+    /usr/bin/sed -i '' \
+        -e "s/if cpu_family == 'x86_64' or dxmt_native/if dxmt_native/" \
+        "${AIRCONV_MESON}"
+elif ! grep -q '^if dxmt_native$' "${AIRCONV_MESON}"; then
+    die "Pinned DXMT airconv host-build condition changed."
+fi
+if grep -q "if cpu_family == 'x86_64'" "${WINEMETAL_MESON}"; then
+    /usr/bin/sed -i '' \
+        -e "s/if cpu_family == 'x86_64'/if dxmt_native/" \
+        "${WINEMETAL_MESON}"
+elif ! grep -q '^if dxmt_native$' "${WINEMETAL_MESON}"; then
+    die "Pinned DXMT winemetal host-build condition changed."
+fi
+ok "DXMT PE build: desktop-native helper targets excluded"
 
 CROSS_FILE="${OUTPUT_DIR}/dxmt-win64.cross"
 NATIVE_FILE="${OUTPUT_DIR}/dxmt-host.native"
@@ -125,7 +143,7 @@ if [[ ! -f "${BUILD_DIR}/build.ninja" ]]; then
     meson setup "${BUILD_DIR}" "${DXMT_SOURCE}" \
         --cross-file "${CROSS_FILE}" --native-file "${NATIVE_FILE}" \
         --buildtype release -Dwine_builtin_dll=true \
-        -Dnative_llvm_path="${LLVM_HOST}" -Dwine_install_path="${WINE_INSTALL}" \
+        -Dwine_install_path="${WINE_INSTALL}" \
         -Dbuild_airconv_for_windows=true -Ddxmt_native=false \
         -Denable_nvapi=false -Denable_nvngx=false
 fi
