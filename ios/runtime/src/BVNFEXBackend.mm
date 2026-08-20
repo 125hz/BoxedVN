@@ -32,10 +32,6 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "boxedvn/fex64_kernel.h"
 #include "boxedvn/guest_address_space.h"
 #include "boxedvn/elf_inspector.h"
-#include "boxedwine.h"
-#include "cpu64.h"
-#include "kmemory64.h"
-#include "syscall64.h"
 
 #import <Foundation/Foundation.h>
 
@@ -51,6 +47,13 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <FEXCore/Utils/DualMap.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/memory.h>
+
+// BoxedWine exposes FD as a legacy macro, so its umbrella header must come
+// after FEX's public headers have parsed their ordinary `FD` parameter names.
+#include "boxedwine.h"
+#include "cpu64.h"
+#include "kmemory64.h"
+#include "syscall64.h"
 
 #include <libkern/OSCacheControl.h>
 #include <sys/mman.h>
