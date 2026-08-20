@@ -198,6 +198,75 @@ if [[ -n "${DXMT_LIB}" ]]; then
     DXMT_LIB="$(cd "$(dirname "${DXMT_LIB}")" && pwd)/$(basename "${DXMT_LIB}")"
 fi
 
+# win32u's unix side and the wineserver both define a handful of the same
+# global names, and both are linked into this one binary because the server
+# runs in-process. On a static link the two land in a single namespace and the
+# linker silently picks one, so a win32u call site can end up in server code
+# with unrelated arguments. That is not hypothetical: get_virtual_screen_rect
+# resolved to server/window.c's three-argument version and the first NtGdi
+# syscall the guest ever made faulted reading 0x48 off a dpi value of zero.
+#
+# scripts/build-fex64-win32u.sh renames the ten that exist today. This re-
+# derives the set from the archives actually being linked and fails if it has
+# grown, because the failure mode of missing one is a wild jump on some later
+# device run rather than anything visible here.
+#
+# Read to files and compared with comm rather than piped into grep: these
+# objects are compiled -fvisibility=hidden, so the definitions are Mach-O
+# private externs that plain `nm` prints and `nm -g` does not.
+check_win32u_server_collisions() {
+    local work="${OUTPUT_DIR}/symbol-collisions"
+    rm -rf "${work}"
+    mkdir -p "${work}"
+
+    local nm_ok=1
+
+    # `nm -m` rather than plain `nm` because the three spellings have to be
+    # told apart. A file-static and a hidden-visibility global are both
+    # "lowercase t" to plain nm, but only the second one can collide across
+    # translation units - and these objects are built -fvisibility=hidden, so
+    # nearly everything is the second one. `nm -m` spells it out:
+    #
+    #   (__TEXT,__text) external _foo
+    #   (__TEXT,__text) non-external (was a private external) _foo
+    #   (__TEXT,__text) non-external _foo                      <- file static
+    #
+    # Take the first two, drop the third, and drop (undefined) entirely.
+    defined_globals() {
+        xcrun -sdk iphoneos nm -m "$1" 2>/dev/null | awk '
+            /\(undefined\)/                   { next }
+            /was a private external/          { print $NF; next }
+            !/non-external/ && / external /   { print $NF }
+        ' | sed 's/^_//' | sort -u
+    }
+
+    defined_globals "${WIN32U_LIB}" > "${work}/win32u.txt" || nm_ok=0
+    defined_globals "${WINE_CORE_DIR}/lib/libwineserver.a" > "${work}/server.txt" || nm_ok=0
+
+    if [[ "${nm_ok}" -eq 0 || ! -s "${work}/win32u.txt" || ! -s "${work}/server.txt" ]]; then
+        warn "symbol-collision check skipped: could not read both symbol tables"
+        return 0
+    fi
+
+    comm -12 "${work}/win32u.txt" "${work}/server.txt" > "${work}/shared.txt"
+
+    # Anything already renamed carries the win32u_ prefix and cannot collide.
+    local count
+    count="$(grep -c . "${work}/shared.txt" || true)"
+    if [[ "${count}" -gt 0 ]]; then
+        warn "win32u and the wineserver both define ${count} symbol(s):"
+        sed 's/^/    /' "${work}/shared.txt" >&2
+        die "win32u/wineserver symbol collision.
+
+Add each name above to WIN32U_COLLISIONS in scripts/build-fex64-win32u.sh, which
+renames win32u's copy at compile time. Leaving one in place lets the linker bind
+a win32u call to the server function of the same name, which does not fail here
+- it fails on device, as a wild jump, whenever that call site is first reached."
+    fi
+
+    ok "win32u shares no global names with the wineserver"
+}
+
 # The window subsystem is reachable only through Wine for the same reason.
 if [[ -n "${WIN32U_LIB}" ]]; then
     [[ "${WINE_ENABLED}" -eq 1 ]] || die "--win32u-lib needs a Wine-enabled build."
@@ -243,6 +312,7 @@ if [[ "${WINE_ENABLED}" -eq 1 ]]; then
         dxmt_ldflags="${dxmt_ldflags} ${WIN32U_LIB}"
         wine_definitions="${wine_definitions} BVN_WINE_WIN32U_ENABLED=1"
         log "Linking win32u's unix side ($(wc -c < "${WIN32U_LIB}" | tr -d ' ') bytes)"
+        check_win32u_server_collisions
     else
         warn "no --win32u-lib: the window subsystem keeps answering STATUS_NOT_SUPPORTED, so a guest message loop gets a zeroed MSG"
     fi

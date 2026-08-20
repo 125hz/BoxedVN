@@ -124,6 +124,61 @@ if [[ ! -f "${WINE_BUILD}/include/objidlbase.h" ]]; then
     ok "win32u: Wine IDL headers present"
 fi
 
+# Eleven names win32u shares with the wineserver, which is linked into the same
+# binary because it runs in-process.
+#
+# Both sides define these as globals, so on a static link they land in one
+# namespace and the linker picks one - and it picked the wineserver's every
+# time. The signatures are unrelated, so every win32u call site that names one
+# of them reaches server code with the wrong arguments. The last of the eleven
+# is not a function: shared_session is the pointer to the session shared-memory
+# block, which the server allocates and win32u maps, so the two sides own it
+# from opposite ends and the survivor holds whichever address was written last.
+#
+# The first device run with win32u active died on exactly this. win32u's
+# get_display_bitmap calls get_virtual_screen_rect( 0, MDT_DEFAULT ) and the
+# link sent it to server/window.c's
+#
+#     void get_virtual_screen_rect( struct desktop *desktop,
+#                                   struct rectangle *rect, int is_raw )
+#
+# whose first act is desktop->winstation at offset 0x48. dpi 0 arrives as the
+# desktop pointer, so the process faults reading address 0x48 - which is the
+# fault the log reports, on the first NtGdi syscall the guest ever made.
+#
+# The other ten had not been reached yet; two of them are the user-handle
+# allocator, so they would have been worse.
+#
+# Renaming here rather than in the wineserver keeps the change inside the
+# subsystem that is new to this link. Every win32u translation unit is compiled
+# with these flags, so the definition and all of its uses move together, and
+# nothing outside win32u names any of them - win32u reaches the server through
+# the wine_server_call protocol, never by calling its functions. The same
+# problem was solved the same way for the ntdll/win32u pair (init_startup_info,
+# renamed in build/ntdll-unix/env_ios.c).
+#
+# scripts/build-fex64-app.sh re-derives this set from the built archives and
+# fails the build if it grows, so a pin bump cannot add a twelfth silently.
+WIN32U_COLLISIONS="
+alloc_user_handle
+destroy_thread_windows
+free_user_handle
+get_virtual_screen_rect
+get_window_thread
+is_desktop_class
+is_message_class
+is_window_visible
+mirror_region
+send_notify_message
+shared_session
+"
+
+WIN32U_RENAMES=()
+for symbol in ${WIN32U_COLLISIONS}
+do
+    WIN32U_RENAMES+=("-D${symbol}=win32u_${symbol}")
+done
+
 FAILED_FILES=()
 
 # Serial, matching the other iphoneos compiles here: macOS ships bash 3.2 and
@@ -149,6 +204,7 @@ compile_one() {
         -DSYSTEMDLLPATH=\"\" \
         -DWINE_UNIX_LIB -DWINE_IOS=1 \
         -D__wine_unix_lib_init=win32u_unix_lib_init \
+        "${WIN32U_RENAMES[@]}" \
         -USONAME_LIBFREETYPE -USONAME_LIBFONTCONFIG \
         -USONAME_LIBEGL -USONAME_LIBVULKAN -USONAME_LIBGNUTLS \
         -UHAVE_FT2BUILD_H \

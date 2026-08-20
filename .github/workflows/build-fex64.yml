@@ -478,7 +478,6 @@ jobs:
         with:
           path: third_party/fex64/dxmt-ios
           key: fex64-dxmt-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-dxmt.sh') }}
-          restore-keys: fex64-dxmt-${{ runner.os }}-
 
       # build-fex64-dxmt.sh is in this key on purpose. The toolchains cache now
       # has to hold llvm-ios too, and an exact hit on the old key would restore
@@ -489,13 +488,20 @@ jobs:
       # attempt at llvm-ios threw away 50 minutes of finished libraries when a
       # later target failed. Saving under a fresh key on every run - and
       # restoring the newest matching prefix - lets ninja resume instead.
+      #
+      # No restore-keys on this one or on DXMT above, unlike the toolchain
+      # caches. Those two hold one finished archive and their build scripts
+      # short-circuit on the stamp file beside it, so a prefix fallback hands
+      # back an archive built from different sources and the script then
+      # reports "cached" and skips the rebuild. That is not theoretical: it
+      # would have swallowed the win32u symbol renames, since the whole point
+      # of putting the script in the key is that changing it forces a rebuild.
       - name: Restore the win32u unix archive
         id: win32u-cache
         uses: actions/cache/restore@v4
         with:
           path: third_party/fex64/win32u-ios
           key: fex64-win32u-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-win32u.sh') }}
-          restore-keys: fex64-win32u-${{ runner.os }}-
 
       - name: Restore cross-toolchain cache
         id: toolchains-cache
