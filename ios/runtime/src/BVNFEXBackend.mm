@@ -32,6 +32,10 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "boxedvn/fex64_kernel.h"
 #include "boxedvn/guest_address_space.h"
 #include "boxedvn/elf_inspector.h"
+#include "boxedwine.h"
+#include "cpu64.h"
+#include "kmemory64.h"
+#include "syscall64.h"
 
 #import <Foundation/Foundation.h>
 
@@ -111,6 +115,11 @@ boxedvn::FEX64Kernel gKernel(gAddressSpace,
 
 std::jmp_buf gExitJump;
 std::atomic<bool> gCanJump {false};
+std::unique_ptr<KMemory64> gProbeMemory;
+std::unique_ptr<CPU64> gProbeCPU;
+CPU64* gActiveCPU = nullptr;
+std::atomic<bool> gProbeExited {false};
+std::atomic<uint64_t> gProbeExitCode {0};
 
 void reportf(const char* format, ...) __attribute__((format(printf, 1, 2)));
 void reportf(const char* format, ...) {
@@ -205,6 +214,31 @@ public:
 
     uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame*,
                            FEXCore::HLE::SyscallArguments* arguments) override {
+        if (gActiveCPU != nullptr) {
+            CPU64* cpu = gActiveCPU;
+            cpu->reg[X64_RAX].setU64(arguments->Argument[0]);
+            cpu->reg[X64_RDI].setU64(arguments->Argument[1]);
+            cpu->reg[X64_RSI].setU64(arguments->Argument[2]);
+            cpu->reg[X64_RDX].setU64(arguments->Argument[3]);
+            cpu->reg[X64_R10].setU64(arguments->Argument[4]);
+            cpu->reg[X64_R8].setU64(arguments->Argument[5]);
+            cpu->reg[X64_R9].setU64(arguments->Argument[6]);
+            const uint64_t syscallNumber = arguments->Argument[0];
+            const uint64_t exitCode = arguments->Argument[1];
+            ksyscall64(cpu);
+            if (cpu->yield) {
+                if (syscallNumber == 60 || syscallNumber == 231) {
+                    gProbeExitCode.store(exitCode, std::memory_order_release);
+                    gProbeExited.store(true, std::memory_order_release);
+                }
+                if (!gCanJump.load(std::memory_order_acquire)) {
+                    reportf("BoxedWine requested a guest stop outside the guarded execution window");
+                    return static_cast<uint64_t>(-1);
+                }
+                std::longjmp(gExitJump, 1);
+            }
+            return cpu->reg[X64_RAX].u64;
+        }
         boxedvn::Linux64Syscall syscall;
         syscall.number = arguments->Argument[0];
         for (size_t index = 0; index < syscall.arguments.size(); ++index) {
@@ -398,28 +432,27 @@ bool mapRawGuestProbe() {
         reportf("direct guest mappings overlapped or could not be registered");
         return false;
     }
+    gProbeMemory = std::make_unique<KMemory64>(nullptr);
+    gProbeCPU = std::make_unique<CPU64>(gProbeMemory.get());
+    gProbeMemory->mmapAnonymousFixed(
+        reinterpret_cast<uint64_t>(gGuestCode), kGuestCodeBytes, 0x5);
+    gProbeMemory->mmapAnonymousFixed(
+        reinterpret_cast<uint64_t>(gGuestStack), kGuestStackBytes, 0x3);
+    gProbeMemory->mmapAnonymousFixed(
+        reinterpret_cast<uint64_t>(gGuestMessage), kPageBytes, 0x1);
+    gProbeMemory->memcpyToGuest(
+        reinterpret_cast<uint64_t>(gGuestCode), code.data(), code.size());
+    gProbeMemory->memcpyToGuest(
+        reinterpret_cast<uint64_t>(gGuestMessage), message, sizeof(message) - 1);
+    gProbeCPU->rip = reinterpret_cast<uint64_t>(gGuestCode);
+    gProbeCPU->reg[X64_RSP].setU64(
+        reinterpret_cast<uint64_t>(gGuestStack) + kGuestStackBytes - 0x100);
     gGuestEntry = reinterpret_cast<uint64_t>(gGuestCode);
     return true;
 }
 
 bool mapGuestProbe() {
-    if (mapBundledELFProbe()) {
-        // The real ELF process owns its write buffer, so only a stack remains
-        // to be supplied by the BoxedWine process bootstrap.
-        gGuestStack = mmap(nullptr, kGuestStackBytes, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (gGuestStack == MAP_FAILED ||
-            !gAddressSpace.add({reinterpret_cast<uint64_t>(gGuestStack),
-                                kGuestStackBytes,
-                                reinterpret_cast<uintptr_t>(gGuestStack),
-                                boxedvn::GuestMemoryRead |
-                                boxedvn::GuestMemoryWrite})) {
-            reportf("the ELF64 process stack could not be registered");
-            return false;
-        }
-        return true;
-    }
-    reportf("bundled ELF64 process absent; using the instruction-stream fallback");
+    reportf("preparing a translated process against BoxedWine's CPU64 kernel state");
     return mapRawGuestProbe();
 }
 
@@ -518,21 +551,27 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     thread->CurrentFrame->State.cs_idx = 0;
 
     gCanJump.store(true, std::memory_order_release);
+    gProbeExited.store(false, std::memory_order_release);
+    gProbeExitCode.store(0, std::memory_order_release);
+    gActiveCPU = gProbeCPU.get();
     if (setjmp(gExitJump) == 0) {
         gContext->ExecuteThread(thread);
+        gActiveCPU = nullptr;
         gCanJump.store(false, std::memory_order_release);
         reportf("FEX returned without the guest issuing exit");
         return gStage.load();
     }
+    gActiveCPU = nullptr;
     gCanJump.store(false, std::memory_order_release);
     gStage.store(BVNFEXBackendStageKernelEntered, std::memory_order_release);
-    if (!gKernel.exited() || gKernel.exitCode() != kExpectedExitCode) {
+    if (!gProbeExited.load(std::memory_order_acquire) ||
+        gProbeExitCode.load(std::memory_order_acquire) != kExpectedExitCode) {
         reportf("BoxedWine kernel exit mismatch: expected 42, observed %d",
-                gKernel.exitCode());
+                static_cast<int>(gProbeExitCode.load(std::memory_order_acquire)));
         return gStage.load();
     }
     reportf("x86-64 executed through FEX and returned through BoxedWine's "
-            "Linux64 syscall adapter (translated pool used %zu KiB)",
+            "CPU64 syscall dispatcher (translated pool used %zu KiB)",
             gPoolUsed.load() / 1024);
     gStage.store(BVNFEXBackendStageExecuted, std::memory_order_release);
     return BVNFEXBackendStageExecuted;

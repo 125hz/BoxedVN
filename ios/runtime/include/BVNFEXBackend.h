@@ -27,7 +27,7 @@ bool BVNFEXBackendBuilt(void);
 
 // Deliberate device-only self-test. It executes an x86-64 Linux instruction
 // stream through FEX and requires its write/exit syscalls to return through
-// BoxedWine's 64-bit kernel adapter. It does not claim Wine64 is ready.
+// BoxedWine's CPU64/KMemory64 syscall path. It does not claim Wine64 is ready.
 BVNFEXBackendStage BVNFEXBackendProbe(void);
 BVNFEXBackendStage BVNFEXBackendStageReached(void);
 const char* BVNFEXBackendStageName(BVNFEXBackendStage stage);
