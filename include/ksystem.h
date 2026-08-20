@@ -213,6 +213,9 @@ public:
     static U32 ugetrlimit(KThread* thread, U32 resource, U32 rlim);
     static U32 uname(KThread* thread, U32 address);
     static U32 waitpid(KThread* thread, S32 pid, U32 statusAddress, U32 options);
+#ifdef BOXEDVN_ENABLE_GUEST_X64
+    static U32 reapChild(KThread* thread, S32 pid, U32 options, int* status);
+#endif
 
     static BOXEDWINE_CONDITION processesCond;
     

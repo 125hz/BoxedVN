@@ -617,6 +617,76 @@ U32 KSystem::waitpid(KThread* thread, S32 pid, U32 statusAddress, U32 options) {
     return result;
 }
 
+#ifdef BOXEDVN_ENABLE_GUEST_X64
+U32 KSystem::reapChild(KThread* thread, S32 pid, U32 options, int* status) {
+    KProcessPtr process;
+    U32 parentId = thread->process->id;
+    U32 parentGroupId = thread->process->groupId;
+
+    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(processesCond);
+
+    while (!process) {
+        bool hasChild = false;
+        if (pid > 0) {
+            process = KSystem::processes[pid];
+            if (!process || process->parentId != parentId) {
+                return -K_ECHILD;
+            }
+            hasChild = true;
+            if (!process->isStopped() && !process->isTerminated()) {
+                process = nullptr;
+            }
+        } else {
+            for (auto& entry : KSystem::processes) {
+                KProcessPtr candidate = entry.value;
+                if (!candidate || candidate->parentId != parentId) {
+                    continue;
+                }
+                if (waitSelectionMatchesProcess(pid, candidate, parentGroupId)) {
+                    hasChild = true;
+                    if (candidate->isStopped() || candidate->isTerminated()) {
+                        process = candidate;
+                        break;
+                    }
+                }
+            }
+            if (!hasChild) {
+                return -K_ECHILD;
+            }
+        }
+        if (!process) {
+            if (options & 1) {
+                return 0;
+            }
+            BOXEDWINE_CONDITION_WAIT(processesCond);
+#ifdef BOXEDWINE_MULTI_THREADED
+            if (KThread::currentThread()->terminating) {
+                return -K_EINTR;
+            }
+            if (KThread::currentThread()->startSignal) {
+                KThread::currentThread()->startSignal = false;
+                return -K_CONTINUE;
+            }
+#endif
+        }
+    }
+    if (status) {
+        int value = 0;
+        if (process->isStopped()) {
+            value |= 0x7f;
+            value |= ((process->signaled & 0xff) << 8);
+        } else if (process->isTerminated()) {
+            value |= ((process->exitCode & 0xff) << 8);
+            value |= (process->signaled & 0x7f);
+        }
+        *status = value;
+    }
+    U32 result = process->id;
+    KSystem::internalEraseProcess(result);
+    return result;
+}
+#endif
+
 U32 KSystem::times(KThread* thread, U32 buf) {
     if (buf) {
         KMemory* memory = thread->memory;

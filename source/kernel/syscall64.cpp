@@ -861,36 +861,6 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     // return, so capping left section tails zero-filled -> the HxD 0x937b30 crash).
     if (count > (256ULL << 20)) count = 256ULL << 20;
     std::vector<U8> tmp((size_t)count);
-    // BW64_WSREAD witness: for a wineserver (record-oriented, non-XWire) unix
-    // socket, capture the recv-buffer fill before/after the read so the dump can
-    // reveal a read that returns N>0 without the cursor advancing by N (a
-    // re-read of the same request bytes — the suspected double-free driver).
-    KUnixSocketObject* wsSock = nullptr;
-    size_t recvBefore = 0;
-    if (wsReadEnabled() && cpu->thread && cpu->thread->process) {
-        KUnixSocketObject* us = dynamic_cast<KUnixSocketObject*>(fdesc->kobject.get());
-        if (us && !us->isXWire()) { wsSock = us; recvBefore = us->debugRecvUsed(); }
-    }
-    // BW64_WSCONC concurrency witness: for a wineserver process, log this read
-    // with the guest thread id. If two different thread ids show overlapping
-    // reads of the SAME socket, wineserver is processing requests on >1 thread —
-    // the teardown double-release race. We log the live thread count for pid so
-    // ">1 thread for wineserver" is visible directly.
-    bool wsConcThis = false;
-    if (wsConcEnabled() && cpu->thread && cpu->thread->process &&
-        cpu->thread->process->exe.contains("wineserver")) {
-        KUnixSocketObject* us = dynamic_cast<KUnixSocketObject*>(fdesc->kobject.get());
-        if (us && !us->isXWire()) {
-            wsConcThis = true;
-            int now = ++g_wsConcInflight;
-            int prevMax = g_wsConcMax.load();
-            while (now > prevMax && !g_wsConcMax.compare_exchange_weak(prevMax, now)) {}
-            if (now > 1) {
-                klog_fmt("WSCONC: %d host threads concurrently in wineserver socket read! pid=%d tid=%d fd=%d",
-                         now, (int)cpu->thread->process->id, (int)cpu->thread->id, (int)fd);
-            }
-        }
-    }
     // Serialize against sys_mmap64_file (and other reads) on the shared per-zip
     // stream — see g_fileReadMutex. A KFile read that repositions a zip's shared
     // unzFile must not interleave with another thread's read/mmap of the same zip.
@@ -919,17 +889,11 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
             got = fdesc->kobject->readNative(tmp.data(), (U32)count);
         }
     }
-    if (wsConcThis) { --g_wsConcInflight; }
     if ((S32)got < 0) {
         return (U64)(S64)(S32)got; // sign-extend kernel errno
     }
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
-    }
-    if (wsSock) {
-        size_t recvAfter = wsSock->debugRecvUsed();
-        crashRingRecordRead('R', cpu->thread->process->id, (U32)fd, tmp.data(), got,
-                            (U32)recvBefore, (U32)recvAfter);
     }
     if (getenv("BW64_IPCDUMP")) {
         // First bytes help identify wineserver reply headers vs pipe wakeup
@@ -1012,19 +976,6 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
     if (getenv("BW64_DIRTRACE") && ((flags & 0x10000) != 0)) {
         klog_fmt("DIRTRACE pid=%d OPENDIR '%s' -> fd %d (flags=0x%llx)",
                  (int)process->id, path, (int)result->handle, (unsigned long long)flags);
-    }
-    // Feed the GUI loading screen's activity log: surface the meaningful things
-    // wine loads during the boot storm (DLLs/EXEs, the graphics/font stack) so
-    // the user can SEE what's loading instead of a stuck bar. Cheap string
-    // checks; only fires while the loading screen is active (percent >= 0).
-    if (KSystem::bootProgressPercent >= 0) {
-        const char* base = strrchr(path, '/');
-        base = base ? base + 1 : path;
-        if (strstr(path, ".dll") || strstr(path, ".exe") ||
-            strstr(path, "winex11") || strstr(path, "freetype") ||
-            strstr(path, "fontconfig") || strstr(path, ".so")) {
-            KSystem::noteBootLog(B("Loading ") + BString::copy(base));
-        }
     }
     if (getenv("BW64_SCDUMP")) {
         // Log successful opens of the GUI driver modules so we can see whether
@@ -1652,14 +1603,6 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
             klog_fmt("sys_execve64:   env %s", e.c_str());
         if (getenv("BW64_ENVDUMP"))
             klog_fmt("sys_execve64:   ENV %s", e.c_str());
-    }
-    // Drive the GUI loading-screen progress: the wine boot chain re-execs
-    // wine64 with the next PE in argv (e.g. ".../services.exe", "winedevice.exe",
-    // the target GUI executable). Feed each .exe basename to the boot-stage
-    // tracker so the XWire present tick can render a labeled progress bar until
-    // the guest paints its real window.
-    for (auto& a : args) {
-        if (a.contains(".exe")) { KSystem::noteBootStage(a); break; }
     }
     return (U64)(S64)(S32)cpu->thread->process->execve(cpu->thread, path, args, envs);
 }
@@ -2801,52 +2744,6 @@ void ksyscall64(CPU64* cpu) {
         }
     }
 
-    // BW64_MEMSTATS=1 — periodically log the guest-memory footprint + host RSS so
-    // we can SEE the leak (mapped pages climb monotonically while munmap is a
-    // no-op) and the boot slowdown (per-syscall cost rises with the page map).
-    // Throttled to once per ~2s wall so it never perturbs the timing-sensitive
-    // race. Env read once (static cache); near-zero cost when off.
-    {
-        static const bool memStats = getenv("BW64_MEMSTATS") != nullptr;
-        if (memStats && cpu->memory && cpu->thread && cpu->thread->process) {
-            // Per-pid syscall accounting for the livelock (Mode 2) diagnosis: a
-            // busy-poll storm shows one pid spinning the SAME syscall thousands of
-            // times between ticks while no real progress is logged. pids stay
-            // small during boot; cap the table and fold the rest into slot 0.
-            static std::atomic<U32> sysCount[256];
-            static std::atomic<U32> lastNr[256];
-            int mypid = (int)cpu->thread->process->id;
-            U32 slot = (mypid >= 0 && mypid < 256) ? (U32)mypid : 0;
-            sysCount[slot].fetch_add(1, std::memory_order_relaxed);
-            lastNr[slot].store((U32)nr, std::memory_order_relaxed);
-
-            static std::atomic<U64> lastUs{0};
-            U64 nowUs = KSystem::getSystemTimeAsMicroSeconds();
-            U64 prev = lastUs.load(std::memory_order_relaxed);
-            if (nowUs - prev >= 2000000ULL &&
-                lastUs.compare_exchange_strong(prev, nowUs, std::memory_order_relaxed)) {
-                KMemory64* mem = cpu->memory;
-                U64 mapped = mem->mappedPageCount();
-                U64 committed = mem->committedPageCount();
-                U64 rss = KSystem::getHostResidentBytes();
-                // Find the busiest pid this interval (the livelock suspect) and
-                // reset all counters for the next window.
-                U32 topPid = 0, topCount = 0, topNr = 0;
-                for (U32 i = 0; i < 256; i++) {
-                    U32 c = sysCount[i].exchange(0, std::memory_order_relaxed);
-                    if (c > topCount) { topCount = c; topPid = i; topNr = lastNr[i].load(std::memory_order_relaxed); }
-                }
-                klog_fmt("MEMSTATS pid=%d pages=%llu committedKB=%llu rssKB=%llu "
-                         "busiest=pid%u/%usc/last=%s",
-                         (int)cpu->thread->process->id,
-                         (unsigned long long)mapped,
-                         (unsigned long long)(committed * 4),
-                         (unsigned long long)(rss / 1024),
-                         topPid, topCount, x64SyscallName(topNr));
-            }
-        }
-    }
-
     switch (nr) {
 #ifdef BOXEDWINE_OPENGL
         case GL64_SYSCALL_NR:
@@ -3294,7 +3191,8 @@ void ksyscall64(CPU64* cpu) {
             cpu->memory->memcpyFromGuest(path, pathArg, sizeof(path) - 1);
             BString full = Fs::getFullPath(cpu->thread->process->currentDirectory,
                                            BString::copy(path));
-            ret = (U64)(S64)(S32)cpu->thread->process->mkdir(full);
+            U32 mode = (U32)((nr == X64_SYS_mkdir) ? a2 : a3);
+            ret = (U64)(S64)(S32)cpu->thread->process->mkdir(full, mode);
             if (getenv("BW64_SYSTRACE")) {
                 klog_fmt("sys_mkdir64: '%s' full='%s' -> %d", path, full.c_str(),
                          (int)(S32)ret);
@@ -4125,16 +4023,11 @@ void ksyscall64(CPU64* cpu) {
                     U64 data = cpu->thread->memory->readq(ev32 + i*12 + 4);
                     KFileDescriptorPtr rfd = cpu->thread->process->getFileDescriptor((FD)data);
                     const char* kind = "none";
-                    long recvUsed = -1, msgsN = -1; int inClosed = -1;
-                    long pendTot = -1, pendLive = -1;
                     if (rfd && rfd->kobject) {
                         switch (rfd->kobject->type) {
                             case KTYPE_FILE: kind="file"; break;
                             case KTYPE_UNIX_SOCKET: {
                                 kind="unixsock";
-                                std::shared_ptr<KUnixSocketObject> us =
-                                    std::dynamic_pointer_cast<KUnixSocketObject>(rfd->kobject);
-                                if (us) { recvUsed=(long)us->debugRecvUsed(); msgsN=(long)us->debugMsgsSize(); inClosed=us->debugInClosed()?1:0; pendTot=(long)us->debugPendingTotal(); pendLive=(long)us->debugPendingLive(); }
                                 break;
                             }
                             case KTYPE_NATIVE_SOCKET: kind="natsock"; break;
@@ -4145,9 +4038,9 @@ void ksyscall64(CPU64* cpu) {
                             default: kind="other"; break;
                         }
                     }
-                    klog_fmt("EPSPIN pid=%d epfd=%d to=%d readyfd=%llu ev=0x%x kind=%s recvUsed=%ld msgs=%ld inClosed=%d pendTot=%ld pendLive=%ld",
+                    klog_fmt("EPSPIN pid=%d epfd=%d to=%d readyfd=%llu ev=0x%x kind=%s",
                              (int)cpu->thread->process->id, (int)a1, (int)(S32)a4,
-                             (unsigned long long)data, ev, kind, recvUsed, msgsN, inClosed, pendTot, pendLive);
+                             (unsigned long long)data, ev, kind);
                 }
             }
             ret = (U64)(S64)(S32)rc;

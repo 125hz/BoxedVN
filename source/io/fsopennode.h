@@ -46,7 +46,10 @@ public:
     virtual S64  seek(S64 pos)=0;	    
     virtual U32  map(KThread* thread, U32 address, U32 len, S32 prot, S32 flags, U64 off)=0;
     virtual bool canMap()=0;
-    virtual U32  ioctl(KThread* thread, U32 request)=0;	
+    virtual U32  ioctl(KThread* thread, U32 request)=0;
+#ifdef BOXEDVN_ENABLE_GUEST_X64
+    virtual U32  ioctl64(U32 request, U64 argAddress, class KMemory64* memory) { return (U32)-25; }
+#endif
     virtual void setAsync(bool isAsync)=0;
     virtual bool isAsync()=0;
     virtual void waitForEvents(BOXEDWINE_CONDITION& parentCondition, U32 events)=0;
