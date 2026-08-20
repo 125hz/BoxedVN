@@ -196,10 +196,10 @@ if [[ -d /usr/share/X11/locale ]]; then
     mkdir -p "${STAGE}/usr/share/X11"
     cp -aL /usr/share/X11/locale "${STAGE}/usr/share/X11/"
 fi
-if [[ -d /usr/share/locale ]]; then
-    mkdir -p "${STAGE}/usr/share"
-    cp -aL /usr/share/locale "${STAGE}/usr/share/"
-fi
+# Do not stage /usr/share/locale wholesale. Ubuntu ships translation aliases
+# whose optional targets are absent in the minimal runner image; following
+# those aliases makes cp fail and the message catalogs are not needed for Wine
+# startup. The actual glibc C.UTF-8 locale archive is copied below.
 if [[ -d /usr/lib/locale/C.utf8 ]]; then
     mkdir -p "${STAGE}/usr/lib/locale"
     cp -aL /usr/lib/locale/C.utf8 "${STAGE}/usr/lib/locale/"
