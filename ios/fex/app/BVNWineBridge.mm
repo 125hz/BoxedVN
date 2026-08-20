@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -349,6 +350,7 @@ bool preparePrefix() {
 std::mutex g_installedMutex;
 std::vector<std::string> g_installedWindows;   // "Games\\Some Game\\game.exe"
 std::vector<std::string> g_installedUnixDirs;  // absolute, the exe's own folder
+std::vector<std::string> g_installedUnixPaths; // absolute path to the PE image
 std::atomic<int> g_installedIndex {0};
 std::string g_installRoot;
 
@@ -377,7 +379,8 @@ bool isRedistributableDirectory(NSString* name) {
 
 void collectExecutables(NSString* root, NSString* relative, int depth,
                         std::vector<std::string>& windows,
-                        std::vector<std::string>& unixDirs) {
+                        std::vector<std::string>& unixDirs,
+                        std::vector<std::string>& unixPaths) {
     // Three levels below the drop directory reaches <game>/<subdir>/<subdir>,
     // which is past where a launcher has ever been found. Deeper is engine
     // data, and walking it on the main thread is what the user would feel.
@@ -400,7 +403,8 @@ void collectExecutables(NSString* root, NSString* relative, int depth,
 
         if (directory) {
             if (isRedistributableDirectory(name)) continue;
-            collectExecutables(root, childRelative, depth + 1, windows, unixDirs);
+            collectExecutables(root, childRelative, depth + 1, windows, unixDirs,
+                               unixPaths);
             continue;
         }
         if ([name.pathExtension caseInsensitiveCompare:@"exe"] != NSOrderedSame) continue;
@@ -411,6 +415,7 @@ void collectExecutables(NSString* root, NSString* relative, int depth,
         }
         windows.push_back(std::move(windowsPath));
         unixDirs.push_back(child.stringByDeletingLastPathComponent.fileSystemRepresentation);
+        unixPaths.push_back(child.fileSystemRepresentation);
     }
 }
 
@@ -462,7 +467,8 @@ int scanInstalled() {
     // the path Wine will see either way.
     std::vector<std::string> windows;
     std::vector<std::string> unixDirs;
-    collectExecutables(drop, @"", 0, windows, unixDirs);
+    std::vector<std::string> unixPaths;
+    collectExecutables(drop, @"", 0, windows, unixDirs, unixPaths);
 
     int count;
     {
@@ -470,6 +476,7 @@ int scanInstalled() {
         g_installRoot = drop.fileSystemRepresentation;
         g_installedWindows = std::move(windows);
         g_installedUnixDirs = std::move(unixDirs);
+        g_installedUnixPaths = std::move(unixPaths);
         count = (int)g_installedWindows.size();
         if (g_installedIndex.load(std::memory_order_relaxed) >= count) {
             g_installedIndex.store(0, std::memory_order_relaxed);
@@ -488,6 +495,40 @@ bool selectedInstalled(std::string& windowsPath, std::string& unixDir) {
     windowsPath = "C:\\" + g_installedWindows[(size_t)index];
     unixDir = g_installedUnixDirs[(size_t)index];
     return true;
+}
+
+bool selectedInstalledUnixPath(std::string& unixPath) {
+    std::lock_guard<std::mutex> guard(g_installedMutex);
+    const int index = g_installedIndex.load(std::memory_order_relaxed);
+    if (index < 0 || index >= (int)g_installedUnixPaths.size()) return false;
+    unixPath = g_installedUnixPaths[(size_t)index];
+    return true;
+}
+
+uint16_t peMachine(const std::string& path) {
+    const int descriptor = open(path.c_str(), O_RDONLY);
+    if (descriptor == -1) return 0;
+
+    uint8_t dosHeader[64] {};
+    if (pread(descriptor, dosHeader, sizeof(dosHeader), 0) != sizeof(dosHeader) ||
+        dosHeader[0] != 'M' || dosHeader[1] != 'Z') {
+        close(descriptor);
+        return 0;
+    }
+    const uint32_t peOffset = (uint32_t)dosHeader[0x3c] |
+                              ((uint32_t)dosHeader[0x3d] << 8) |
+                              ((uint32_t)dosHeader[0x3e] << 16) |
+                              ((uint32_t)dosHeader[0x3f] << 24);
+    uint8_t signatureAndMachine[6] {};
+    const bool valid = peOffset <= 64 * 1024 * 1024 &&
+        pread(descriptor, signatureAndMachine, sizeof(signatureAndMachine), peOffset) ==
+            sizeof(signatureAndMachine) &&
+        signatureAndMachine[0] == 'P' && signatureAndMachine[1] == 'E' &&
+        signatureAndMachine[2] == 0 && signatureAndMachine[3] == 0;
+    close(descriptor);
+    if (!valid) return 0;
+    return (uint16_t)signatureAndMachine[4] |
+           ((uint16_t)signatureAndMachine[5] << 8);
 }
 
 void* serverThread(void*) {
@@ -808,6 +849,18 @@ extern "C" bool BVNWineStart(void) {
             g_stage.store(BVNWineStageFailed, std::memory_order_release);
             g_starting.store(false);
             return false;
+        }
+        std::string unixPath;
+        if (selectedInstalledUnixPath(unixPath)) {
+            const uint16_t machine = peMachine(unixPath);
+            if (machine == 0x014c) {
+                reportf("the selected executable is 32-bit x86 (PE machine 0x014c); "
+                        "this build contains only the x86-64 translator. Select an "
+                        "x86-64 executable.");
+                g_stage.store(BVNWineStageFailed, std::memory_order_release);
+                g_starting.store(false);
+                return false;
+            }
         }
     }
     if (!prepareWineJitPool()) {

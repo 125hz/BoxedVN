@@ -1,0 +1,19 @@
+diff --git a/rpmalloc/rpmalloc.c b/rpmalloc/rpmalloc.c
+index 647af2f..b610138 100644
+--- a/rpmalloc/rpmalloc.c
++++ b/rpmalloc/rpmalloc.c
+@@ -792,3 +792,13 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
+ #if ENABLE_DECOMMIT
+-	DWORD do_commit = 0;
++#if defined(FEX_IOS_HOST)
++	/* This host has no Windows commit-charge limit, and its virtual-memory
++	 * bridge can otherwise leave an aligned span inaccessible between reserve
++	 * and header initialization. Initial commit remains demand-paged and later
++	 * decommit/recommit behavior is unchanged. */
++	DWORD do_commit = MEM_COMMIT;
++#else
++	/* If the runtime disables decommit, os_mcommit deliberately becomes a
++	 * no-op. The initial mapping must therefore be committed here. */
++	DWORD do_commit = global_config.disable_decommit ? MEM_COMMIT : 0;
++#endif
+ #else

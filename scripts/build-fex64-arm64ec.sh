@@ -132,6 +132,7 @@ fi
 # Applied to the submodule, not to FEX: rpmalloc is its own repository, so
 # git -C the FEX tree cannot reach inside it.
 SPAN_PATCH="${BOXEDVN_ROOT}/patches/rpmalloc-span-size-override.patch"
+COMMIT_MODE_PATCH="${BOXEDVN_ROOT}/patches/rpmalloc-runtime-commit-mode.patch"
 RPMALLOC_SOURCE="${FEX_SOURCE}/External/rpmalloc"
 require_file "${SPAN_PATCH}"
 if git -C "${RPMALLOC_SOURCE}" apply --check "${SPAN_PATCH}" 2>/dev/null; then
@@ -141,6 +142,20 @@ elif git -C "${RPMALLOC_SOURCE}" apply --reverse --check "${SPAN_PATCH}" 2>/dev/
     log "The rpmalloc span-size override is already applied"
 else
     die "The pinned rpmalloc no longer accepts ${SPAN_PATCH}; refresh it explicitly."
+fi
+
+# With decommit compiled in, rpmalloc reserves spans first and commits their
+# first page separately. Its runtime disable_decommit switch used to suppress
+# that separate commit without changing the reserve-only mapping, leaving the
+# span header inaccessible. Make the initial mapping match the runtime mode.
+require_file "${COMMIT_MODE_PATCH}"
+if git -C "${RPMALLOC_SOURCE}" apply --check "${COMMIT_MODE_PATCH}" 2>/dev/null; then
+    log "Applying the rpmalloc runtime commit-mode fix"
+    git -C "${RPMALLOC_SOURCE}" apply "${COMMIT_MODE_PATCH}" || die "The rpmalloc runtime commit-mode fix failed to apply."
+elif git -C "${RPMALLOC_SOURCE}" apply --reverse --check "${COMMIT_MODE_PATCH}" 2>/dev/null; then
+    log "The rpmalloc runtime commit-mode fix is already applied"
+else
+    die "The pinned rpmalloc no longer accepts ${COMMIT_MODE_PATCH}; refresh it explicitly."
 fi
 
 if [[ "${FORCE}" == "1" ]]; then
