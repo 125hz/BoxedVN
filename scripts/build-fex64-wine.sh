@@ -124,9 +124,8 @@ build_tree() {
     ok "wine/${name}: configured"
 }
 
-# Everything optional is off. This tree primarily generates headers, plus a
-# deliberately small pair of x86-64 compatibility DLLs used by translated
-# programs. Every other dependency enabled here is one more thing to
+# Everything optional is off. This tree is a header generator rather than a
+# Wine runtime, and every dependency enabled here is one more thing to
 # cross-build later for no benefit.
 COMMON_CONFIGURE=(
     --disable-tests
@@ -177,11 +176,12 @@ done
 
 # What each tree is built *for* decides how much of it to build.
 #
-# The macOS tree is mostly a header generator, and building it all the way
-# through fails on purpose-built iOS code: the fork's win32u references glue
-# that lives in the application rather than in Wine, so win32u.so cannot link
-# on a macOS host and never needs to. Build the include directory, then only
-# the two x86-64 controller compatibility DLLs needed by translated programs.
+# The macOS tree is a header generator, and building it all the way through
+# fails on purpose-built iOS code: the fork's win32u references glue that lives
+# in the application rather than in Wine, so win32u.so cannot link on a macOS
+# host and never needs to. Building the include directory alone produces
+# config.h and the widl-generated headers, which is the entire reason this tree
+# exists.
 #
 # The ARM64EC tree is the Windows side that actually runs, so it is built in
 # full.
@@ -215,24 +215,6 @@ for tree in ${TREES}; do
 
     require_file "${build}/include/config.h"         "The tree built but produced no config.h, which is what the iOS unix side includes."
 
-    if [[ "${tree}" == "macos" ]]; then
-        compatibility_targets=(
-            dlls/xinput1_4/xinput1_4.dll
-            dlls/xinput9_1_0/xinput9_1_0.dll
-        )
-        log "wine/macos: building the x86-64 controller compatibility DLLs"
-        if ! make -C "${build}" -j "${JOBS}" "${compatibility_targets[@]}" \
-                >> "${build}/build.log" 2>&1; then
-            warn "wine/macos: compatibility DLL build failed; last 40 lines"
-            tail -40 "${build}/build.log" >&2
-            die "wine/macos: controller compatibility DLLs failed to build. Full log: ${build}/build.log"
-        fi
-        for required in "${compatibility_targets[@]}"; do
-            require_file "${build}/${required}"
-        done
-        ok "wine/macos: built the x86-64 controller compatibility DLLs"
-    fi
-
     if [[ "${tree}" == "arm64ec" ]]; then
         # The PE side is the deliverable, so count it and insist on the three
         # DLLs without which nothing starts at all.
@@ -253,3 +235,31 @@ log "Wine trees"
 for tree in ${TREES}; do
     printf '  %-8s %s\n' "${tree}" "${SOURCE}/build-${tree}"
 done
+
+# The integration runtime has no XInput DLL, while many ordinary x86-64
+# programs import the Windows 8 compatibility name before entering main. The
+# host-only Wine tree deliberately disables almost every DLL target, so build
+# a small guest-side facade directly with the same pinned llvm-mingw toolchain.
+# It reports no controller until a host input bridge exists; that is preferable
+# to failing the process loader before the program can choose keyboard input.
+COMPAT_SOURCE="${BOXEDVN_ROOT}/scripts/fex64-guest/xinput_compat.c"
+COMPAT_OUTPUT="${FEX64_DIR}/wine-compat-x64"
+COMPAT_COMPILER="${MINGW}/bin/x86_64-w64-mingw32-clang"
+require_file "${COMPAT_SOURCE}"
+require_file "${BOXEDVN_ROOT}/scripts/fex64-guest/xinput1_4.def"
+require_file "${BOXEDVN_ROOT}/scripts/fex64-guest/xinput9_1_0.def"
+require_file "${COMPAT_COMPILER}"
+
+rm -rf "${COMPAT_OUTPUT}"
+mkdir -p "${COMPAT_OUTPUT}"
+for module in xinput1_4 xinput9_1_0; do
+    "${COMPAT_COMPILER}" -O2 -shared \
+        "${COMPAT_SOURCE}" \
+        "${BOXEDVN_ROOT}/scripts/fex64-guest/${module}.def" \
+        -o "${COMPAT_OUTPUT}/${module}.dll" \
+        || die "Building ${module}.dll for the translated guest failed."
+    require_file "${COMPAT_OUTPUT}/${module}.dll"
+    file "${COMPAT_OUTPUT}/${module}.dll" | grep -q 'PE32+.*x86-64' \
+        || die "${module}.dll is not an x86-64 PE image."
+done
+ok "Wine controller compatibility: staged two x86-64 PE DLLs"

@@ -575,7 +575,7 @@ jobs:
             --wine-core-dir third_party/fex64/wine-ios-core \
             --wine-runtime-dir third_party/fex64/mythic/app/Mythic \
             --mythic-dir third_party/fex64/mythic \
-            --wine-pe-dir third_party/fex64/wine/build-macos \
+            --wine-pe-dir third_party/fex64/wine-compat-x64 \
             --dxmt-lib "$dxmt_lib"             --win32u-lib "$PWD/third_party/fex64/win32u-ios/libwin32u_unix.a"
 
       # if: always() is the whole point: the run this was written for failed
