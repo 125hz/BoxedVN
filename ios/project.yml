@@ -57,6 +57,9 @@ targets:
       - path: ../build/guest-probes/boxedvn-d3d9-cube.exe
         optional: true
         buildPhase: resources
+      - path: ../build/guest-probes/boxedvn-fex64-kernel-probe
+        optional: true
+        buildPhase: resources
       # Populated by scripts/fetch-rootfs.sh when BOXEDVN_BUNDLE_ROOTFS is on.
       # Optional so a clean clone builds without the multi-hundred-megabyte
       # root filesystem archive.

@@ -69,7 +69,9 @@ jobs:
 
       - name: Build and validate graphics probe
         shell: bash
-        run: bash scripts/build-guest-graphics-probe.sh
+        run: |
+          bash scripts/build-guest-graphics-probe.sh
+          bash scripts/build-guest-fex64-probe.sh
 
       - name: Upload graphics probe
         uses: actions/upload-artifact@v7
@@ -78,6 +80,8 @@ jobs:
           path: |
             build/guest-probes/boxedvn-d3d9-cube.exe
             build/guest-probes/boxedvn-d3d9-cube.exe.sha256
+            build/guest-probes/boxedvn-fex64-kernel-probe
+            build/guest-probes/boxedvn-fex64-kernel-probe.sha256
           if-no-files-found: error
           retention-days: 14
 

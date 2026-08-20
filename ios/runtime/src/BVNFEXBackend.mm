@@ -31,6 +31,9 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 
 #include "boxedvn/fex64_kernel.h"
 #include "boxedvn/guest_address_space.h"
+#include "boxedvn/elf_inspector.h"
+
+#import <Foundation/Foundation.h>
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
@@ -50,6 +53,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <sys/sysctl.h>
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <csetjmp>
 #include <cstdarg>
@@ -95,6 +99,7 @@ void* gGuestCode = nullptr;
 void* gGuestStack = nullptr;
 void* gGuestMessage = nullptr;
 void* gCallRetMapping = nullptr;
+uint64_t gGuestEntry = 0;
 
 boxedvn::GuestAddressSpace64 gAddressSpace;
 boxedvn::FEX64Kernel gKernel(gAddressSpace,
@@ -278,7 +283,79 @@ bool preparePool() {
     return true;
 }
 
-bool mapGuestProbe() {
+bool mapBundledELFProbe() {
+    NSString* path = [[NSBundle mainBundle]
+        pathForResource:@"boxedvn-fex64-kernel-probe" ofType:nil];
+    if (path == nil) {
+        return false;
+    }
+    NSData* data = [NSData dataWithContentsOfFile:path];
+    if (data == nil) {
+        reportf("the bundled ELF64 kernel process could not be read");
+        return false;
+    }
+    const boxedvn::ELFImageInfo image = boxedvn::inspectELF(
+        static_cast<const uint8_t*>(data.bytes), data.length);
+    if (!image.valid ||
+        image.architecture != boxedvn::ELFGuestArchitecture::X86_64) {
+        reportf("the bundled ELF64 kernel process is invalid: %s",
+                image.error.c_str());
+        return false;
+    }
+
+    uint64_t first = std::numeric_limits<uint64_t>::max();
+    uint64_t last = 0;
+    for (const boxedvn::ELFLoadSegment& segment : image.loadSegments) {
+        const uint64_t start = segment.virtualAddress & ~(uint64_t(kPageBytes) - 1);
+        const uint64_t end = alignUp(segment.virtualAddress + segment.memorySize,
+                                     kPageBytes);
+        first = std::min(first, start);
+        last = std::max(last, end);
+    }
+    if (first >= last || last - first > 16u * 1024u * 1024u) {
+        reportf("the bundled ELF64 load span is invalid or unexpectedly large");
+        return false;
+    }
+    const size_t mappingSize = static_cast<size_t>(last - first);
+    void* mapping = mmap(nullptr, mappingSize, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mapping == MAP_FAILED) {
+        reportf("the bundled ELF64 load span could not be mapped");
+        return false;
+    }
+    std::memset(mapping, 0, mappingSize);
+    for (const boxedvn::ELFLoadSegment& segment : image.loadSegments) {
+        const uint64_t destinationOffset = segment.virtualAddress - first;
+        if (destinationOffset > mappingSize ||
+            segment.fileSize > mappingSize - destinationOffset) {
+            reportf("the bundled ELF64 segment escaped its checked load span");
+            return false;
+        }
+        std::memcpy(static_cast<uint8_t*>(mapping) + destinationOffset,
+                    static_cast<const uint8_t*>(data.bytes) + segment.fileOffset,
+                    static_cast<size_t>(segment.fileSize));
+    }
+    const uint64_t entryOffset = image.entry - first;
+    if (image.entry < first || entryOffset >= mappingSize) {
+        reportf("the bundled ELF64 entry lies outside its load span");
+        return false;
+    }
+    if (!gAddressSpace.add({reinterpret_cast<uint64_t>(mapping), mappingSize,
+                            reinterpret_cast<uintptr_t>(mapping),
+                            boxedvn::GuestMemoryRead |
+                            boxedvn::GuestMemoryWrite |
+                            boxedvn::GuestMemoryExecute})) {
+        reportf("the bundled ELF64 mapping could not be registered");
+        return false;
+    }
+    gGuestCode = mapping;
+    gGuestEntry = reinterpret_cast<uint64_t>(mapping) + entryOffset;
+    reportf("loaded bundled PIE ELF64 process: %zu segments, entry=%p",
+            image.loadSegments.size(), reinterpret_cast<void*>(gGuestEntry));
+    return true;
+}
+
+bool mapRawGuestProbe() {
     static constexpr char message[] = "BoxedWine x86-64 kernel entry reached";
     gGuestCode = mmap(nullptr, kGuestCodeBytes, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -321,7 +398,29 @@ bool mapGuestProbe() {
         reportf("direct guest mappings overlapped or could not be registered");
         return false;
     }
+    gGuestEntry = reinterpret_cast<uint64_t>(gGuestCode);
     return true;
+}
+
+bool mapGuestProbe() {
+    if (mapBundledELFProbe()) {
+        // The real ELF process owns its write buffer, so only a stack remains
+        // to be supplied by the BoxedWine process bootstrap.
+        gGuestStack = mmap(nullptr, kGuestStackBytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (gGuestStack == MAP_FAILED ||
+            !gAddressSpace.add({reinterpret_cast<uint64_t>(gGuestStack),
+                                kGuestStackBytes,
+                                reinterpret_cast<uintptr_t>(gGuestStack),
+                                boxedvn::GuestMemoryRead |
+                                boxedvn::GuestMemoryWrite})) {
+            reportf("the ELF64 process stack could not be registered");
+            return false;
+        }
+        return true;
+    }
+    reportf("bundled ELF64 process absent; using the instruction-stream fallback");
+    return mapRawGuestProbe();
 }
 
 } // namespace
@@ -385,10 +484,9 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     if (!mapGuestProbe()) {
         return gStage.load();
     }
-    const uint64_t entry = reinterpret_cast<uint64_t>(gGuestCode);
     const uint64_t stack = reinterpret_cast<uint64_t>(gGuestStack) +
                            kGuestStackBytes - 0x100;
-    auto* thread = gContext->CreateThread(entry, stack);
+    auto* thread = gContext->CreateThread(gGuestEntry, stack);
     if (thread == nullptr) {
         reportf("FEX failed to create the x86-64 guest thread");
         return gStage.load();
