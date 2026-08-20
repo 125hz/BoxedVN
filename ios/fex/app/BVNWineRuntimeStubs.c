@@ -41,10 +41,13 @@ void BVNWineClearExitTrap(void)
 
 const char wine_build[] = "wine-ios-fex64";
 
+// Winios.m defines this for real once the display driver is linked.
+#ifndef BVN_WINE_WIN32U_ENABLED
 void winios_phase(const char *name)
 {
     (void)name;
 }
+#endif
 
 // Native first boot does not call these unix libraries. Publishing one-entry
 // null tables satisfies ntdll's static registry without claiming that a

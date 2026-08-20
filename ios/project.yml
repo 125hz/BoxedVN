@@ -238,6 +238,7 @@ targets:
       - sdk: CoreGraphics.framework
       - sdk: IOSurface.framework
       - sdk: MetalFX.framework
+      - sdk: ImageIO.framework
       - sdk: libc++.tbd
       - sdk: libsqlite3.tbd
       - sdk: libz.tbd
