@@ -97,7 +97,7 @@ BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf) {
 #ifdef BOXEDWINE_GUEST_X64
         openNode->seek(0);
         Elf64ParseResult parsed = ElfLoader64::parse(openNode);
-        return parsed.valid ? parsed.interpreter : B("");
+        return parsed.ok ? parsed.interpreter : B("");
 #else
         return B("");
 #endif

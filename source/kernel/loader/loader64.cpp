@@ -14,7 +14,6 @@
 #ifdef BOXEDWINE_GUEST_X64
 #include "kmemory64.h"
 #include "cpu64.h"
-#include "ripSampler.h"
 #endif
 // ELF p_type values reused from loader.cpp. Kept local here to avoid a
 // cross-file include just for two constants.
@@ -253,11 +252,6 @@ static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
             klog_fmt("loadProgram64[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
                      tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
             return false;
-        }
-        // BW64_RIPSAMPLE: the initial wine64/ld.so/glibc images are mapped here
-        // (not through sys_mmap64_file), so record them too for RIP resolution.
-        if (ripSamplerEnabled() && modPath) {
-            ripSamplerNoteModule(pid, alignedAddr, mapLen, modPath);
         }
         if (seg.filesz > 0) {
             std::vector<U8> buf((size_t)seg.filesz);
