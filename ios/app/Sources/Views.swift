@@ -309,6 +309,13 @@ struct ContainerDetailView: View {
                     Label("Run Direct3D test", systemImage: "cube.transparent")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Button {
+                    save()
+                    model.launchGraphicsProbe(container)
+                } label: {
+                    Label("Run 32-bit 3D cube", systemImage: "cube.fill")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Picker("Resolution", selection: resolutionBinding) {
                     ForEach(resolutions, id: \.self) { Text($0) }
                     if !resolutions.contains(resolutionBinding.wrappedValue) {

@@ -53,6 +53,34 @@ env:
   REQUESTED_XCODE: ${{ inputs.xcode_version || vars.BOXEDVN_XCODE_VERSION || '' }}
 
 jobs:
+  guest-probe:
+    name: Build IA-32 graphics probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out BoxedVN
+        uses: actions/checkout@v6
+
+      - name: Install IA-32 PE compiler
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends g++-mingw-w64-i686
+
+      - name: Build and validate graphics probe
+        shell: bash
+        run: bash scripts/build-guest-graphics-probe.sh
+
+      - name: Upload graphics probe
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-graphics-probe
+          path: |
+            build/guest-probes/boxedvn-d3d9-cube.exe
+            build/guest-probes/boxedvn-d3d9-cube.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   tests:
     name: Host-independent tests
     runs-on: ubuntu-24.04
@@ -79,7 +107,9 @@ jobs:
 
   ipa:
     name: Unsigned IPA (${{ inputs.configuration || 'Release' }})
-    needs: tests
+    needs:
+      - guest-probe
+      - tests
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -138,6 +168,12 @@ jobs:
       - name: Fetch pinned dependencies
         shell: bash
         run: scripts/fetch-dependencies.sh --platform ios --configuration Release
+
+      - name: Download IA-32 graphics probe
+        uses: actions/download-artifact@v7
+        with:
+          name: guest-graphics-probe
+          path: build/guest-probes
 
       - name: Build unsigned app
         shell: bash

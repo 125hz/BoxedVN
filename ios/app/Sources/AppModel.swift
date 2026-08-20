@@ -516,6 +516,61 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Runs the app-bundled IA-32 D3D9 cube through the same persistent Wine
+    /// prefix and Vulkan-backed WineD3D path used by classic 3D software.
+    func launchGraphicsProbe(_ container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let writableRoot = ContainerLibrary.prefixRoot(for: container) else {
+            alertMessage = "Could not create the container prefix."
+            return
+        }
+        guard let source = Bundle.main.url(
+            forResource: "boxedvn-d3d9-cube", withExtension: "exe") else {
+            alertMessage = "This build does not include the 32-bit graphics probe."
+            return
+        }
+
+        let files = ContainerLibrary.filesDirectory(for: container)
+        let diagnostics = files.appendingPathComponent(
+            ".boxedvn-diagnostics", isDirectory: true)
+        let target = diagnostics.appendingPathComponent(source.lastPathComponent)
+        do {
+            try FileManager.default.createDirectory(
+                at: diagnostics, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: target.path) {
+                try FileManager.default.removeItem(at: target)
+            }
+            try FileManager.default.copyItem(at: source, to: target)
+            Log.write("Launching bundled IA-32 Direct3D 9 graphics probe",
+                      category: "container")
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                writableRoot: writableRoot,
+                gameDirectory: files,
+                sharedDirectory: Storage.sharedFiles,
+                executablePath:
+                    "d:\\.boxedvn-diagnostics\\boxedvn-d3d9-cube.exe",
+                arguments: [],
+                environment: ["WINEDEBUG=warn+d3d_shader,-d3d"],
+                workingDirectory: "d:\\.boxedvn-diagnostics\\",
+                width: container.width,
+                height: container.height,
+                soundEnabled: false,
+                runThroughWine: true,
+                wineRenderer: BVNWineRendererWineD3D,
+                sharedDriveLetter:
+                    container.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container.windowsVersion,
+                compatibilityDirectory: diagnostics)
+        } catch {
+            alertMessage = "The 32-bit graphics probe could not start: "
+                         + error.localizedDescription
+        }
+    }
+
     /// Browse the emulated PC: Wine's file manager, in the tools prefix that
     /// Notepad also runs in, so a file saved from one is visible in the other.
     /// Games keep their own prefixes - see `launch(_:)` for why.
