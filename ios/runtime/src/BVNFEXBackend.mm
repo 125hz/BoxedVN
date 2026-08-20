@@ -50,6 +50,11 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 
 // BoxedWine exposes FD as a legacy macro, so its umbrella header must come
 // after FEX's public headers have parsed their ordinary `FD` parameter names.
+// Apple's sys/param.h does the reverse with FSCALE, which is also the name of
+// BoxedWine's x87 instruction handler.
+#ifdef FSCALE
+#undef FSCALE
+#endif
 #include "boxedwine.h"
 #include "cpu64.h"
 #include "kmemory64.h"
