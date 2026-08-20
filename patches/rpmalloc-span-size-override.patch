@@ -2,7 +2,7 @@ diff --git a/rpmalloc/rpmalloc.c b/rpmalloc/rpmalloc.c
 index 20ab541..647af2f 100644
 --- a/rpmalloc/rpmalloc.c
 +++ b/rpmalloc/rpmalloc.c
-@@ -185,7 +185,29 @@ madvise(caddr_t, size_t, int);
+@@ -185,7 +185,32 @@ madvise(caddr_t, size_t, int);
  #define LARGE_PAGE_SIZE (1 << LARGE_PAGE_SIZE_SHIFT)
  #define LARGE_PAGE_MASK (~((uintptr_t)LARGE_PAGE_SIZE - 1))
  
@@ -23,11 +23,14 @@ index 20ab541..647af2f 100644
 + * unnamed, per thread heap, committed later in small pieces.
 + *
 + * Keeping the stock value as the default means an unset build behaves as
-+ * upstream does. The shipped prebuilt emulator was built with 16MiB here, so a
-+ * smaller span is this allocator's own proven configuration rather than a guess.
-+ * Must stay a power of two: SPAN_MASK depends on it. */
++ * upstream does. An override must remain a power of two and cannot be smaller
++ * than LARGE_PAGE_SIZE: large-page blocks derive their owning page by applying
++ * LARGE_PAGE_MASK, which must not round outside the containing span. */
 +#ifndef SPAN_SIZE
  #define SPAN_SIZE (256 * 1024 * 1024)
++#endif
++#if SPAN_SIZE < LARGE_PAGE_SIZE
++#error "SPAN_SIZE must be at least LARGE_PAGE_SIZE"
 +#endif
  #define SPAN_MASK (~((uintptr_t)(SPAN_SIZE - 1)))
  

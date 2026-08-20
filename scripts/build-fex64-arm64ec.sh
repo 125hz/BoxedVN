@@ -126,8 +126,8 @@ fi
 # reservation every time. Two arrive per thread, one percent of each is ever
 # committed, and on iOS the process runs out of reservable address space at
 # about 6GB - after which the allocation fails and the NULL is stored through.
-# Make the constant overridable, then pick the value the shipped prebuilt
-# emulator was built with.
+# Make the constant overridable, then use the smallest span compatible with
+# this pinned allocator's 64MB large-page class.
 #
 # Applied to the submodule, not to FEX: rpmalloc is its own repository, so
 # git -C the FEX tree cannot reach inside it.
@@ -182,7 +182,7 @@ cmake -S "${FEX_SOURCE}" -B "${BUILD}" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="${FEX_SOURCE}/Data/CMake/toolchain_mingw.cmake" \
     -DMINGW_TRIPLE="${TRIPLE}" \
     -DFEX_IOS_HOST_BUILD=True \
-    -DCMAKE_C_FLAGS="-DFEX_IOS_HOST -DSPAN_SIZE=16777216" \
+    -DCMAKE_C_FLAGS="-DFEX_IOS_HOST -DSPAN_SIZE=67108864" \
     -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST" \
     -DCMAKE_ASM_FLAGS="-DFEX_IOS_HOST" \
     -DENABLE_LTO=False \
