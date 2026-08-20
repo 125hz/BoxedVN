@@ -135,7 +135,7 @@ if [[ -n "${MANIFEST}" ]]; then
         "Copy scripts/wine64-runtime-manifest.example and fill in both layer SHA-256 values."
     while IFS='=' read -r key value; do
         [[ -z "${key}" || "${key}" == \#* ]] && continue
-        [[ "${key}" =~ ^[a-z_]+$ && -n "${value}" ]] \
+        [[ "${key}" =~ ^[a-z_][a-z0-9_]*$ && -n "${value}" ]] \
             || die "Malformed Wine64 manifest line (expected key=value): '${key}=${value}'"
         case "${key}" in
             format)         MANIFEST_FORMAT="${value}" ;;

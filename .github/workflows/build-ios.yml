@@ -144,11 +144,25 @@ jobs:
           python3 -m pip install --user meson==1.10.0 --break-system-packages
           echo "$(python3 -m site --user-base)/bin" >> "${GITHUB_PATH}"
 
-      - name: Restore pinned DXMT build inputs
-        uses: actions/cache@v5
+      - name: Restore DXMT cross-toolchain cache
+        id: dxmt-toolchains-cache
+        uses: actions/cache/restore@v5
         with:
-          path: third_party/fex64
-          key: boxedvn-dxmt-x64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh') }}
+          path: third_party/fex64/toolchains
+          key: boxedvn-dxmt-toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}-${{ github.run_id }}
+          restore-keys: |
+            boxedvn-dxmt-toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}-
+            fex64-toolchains-${{ runner.os }}-
+
+      - name: Restore pinned LLVM source cache
+        id: dxmt-llvm-source-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: third_party/fex64/llvm-project
+          key: boxedvn-dxmt-llvm-source-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh') }}
+          restore-keys: |
+            boxedvn-dxmt-llvm-source-${{ runner.os }}-
+            fex64-llvm-src-${{ runner.os }}-
 
       - name: Fetch and verify DXMT build inputs
         shell: bash
@@ -187,6 +201,25 @@ jobs:
           path: build/x64-graphics
           if-no-files-found: error
           retention-days: 14
+
+      # LLVM is the long pole in the first DXMT build. Save its partial Ninja
+      # tree even when a later compiler or staging step fails so the next
+      # manually dispatched run resumes instead of discarding completed work.
+      - name: Save DXMT cross-toolchain cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: third_party/fex64/toolchains
+          key: boxedvn-dxmt-toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}-${{ github.run_id }}
+
+      - name: Save pinned LLVM source cache
+        if: always() && steps.dxmt-llvm-source-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: third_party/fex64/llvm-project
+          key: boxedvn-dxmt-llvm-source-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh') }}
 
   tests:
     name: Host-independent tests
