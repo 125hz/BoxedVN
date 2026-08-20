@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 #if BVN_WINE_BOOT_ENABLED
 
@@ -217,6 +218,10 @@ bool isDirectory(NSString* path) {
            directory;
 }
 
+// Defined below, beside the rest of the user-supplied-executable handling;
+// preparePrefix calls it so a start always republishes the links.
+int scanInstalled();
+
 bool preparePrefix() {
     NSFileManager* files = NSFileManager.defaultManager;
     NSString* documents = [files URLsForDirectory:NSDocumentDirectory
@@ -308,8 +313,181 @@ bool preparePrefix() {
     g_prefix = prefix.fileSystemRepresentation;
     reportf("prefix ready with %lu %s runtime links", (unsigned long)linked,
             runtimeName.UTF8String);
+    // Republished here as well as on demand: the container path changes when
+    // a sideloader reinstalls the IPA, and a start is the last moment the
+    // links can be corrected before something tries to open through them.
+    scanInstalled();
     g_stage.store(BVNWineStagePrefixReady, std::memory_order_release);
     return linked != 0;
+}
+
+// --- user-supplied executables ---------------------------------------------
+//
+// Everything else this app can start ships inside the IPA. This is the path
+// for a program the user copied in themselves, which means two problems the
+// bundled targets never have: where it lives, and where it runs from.
+//
+// Where it lives. The drop directory is Documents/games, which iOS shows in
+// Files because the Info.plist asks for it, and which sits outside the Wine
+// prefix. Outside matters: the prefix is disposable and is reinstalled from
+// the bundled template whenever that template changes, and nothing the user
+// spent an hour copying over a cable should be inside something disposable.
+// Each top-level entry is then published as a symbolic link under
+// drive_c/Games, so Wine addresses it as C:\Games\... - an ordinary drive C
+// path, resolved the same way as everything else. That is deliberate rather
+// than a second DOS drive: the integration's ntdll notes that
+// unix_to_nt_file_name cannot resolve drives through dosdevices on iOS, so a
+// D: mapping would look right and fail at the first file open. Links inside
+// drive_c are already the mechanism the runtime DLLs use.
+//
+// Where it runs from. A game finds its data relative to the working
+// directory, so the process has to start in the executable's own folder, and
+// on both sides: chdir for the unix half, and MYTHIC_INITIAL_CWD for the
+// Windows half, which env_ios.c reads because the usual conversion goes
+// through the same dosdevices path that does not work here.
+
+std::mutex g_installedMutex;
+std::vector<std::string> g_installedWindows;   // "Games\\Some Game\\game.exe"
+std::vector<std::string> g_installedUnixDirs;  // absolute, the exe's own folder
+std::atomic<int> g_installedIndex {0};
+std::string g_installRoot;
+
+NSString* documentsDirectory() {
+    return [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory
+                                                inDomains:NSUserDomainMask]
+        .firstObject.path;
+}
+
+// Redistributable payloads sit beside a game and are full of installers -
+// DirectX, the VC runtimes, .NET. Every one of them is an .exe, and listing
+// them would bury the two or three that are actually the program. Publishers
+// mark these directories by convention; the leading underscore is the most
+// common spelling and the named ones cover the rest.
+bool isRedistributableDirectory(NSString* name) {
+    if ([name hasPrefix:@"_"]) return true;
+    static NSArray<NSString*>* const known = @[
+        @"redist", @"redists", @"commonredist", @"directx", @"vcredist",
+        @"dotnet", @"drivers", @"support"
+    ];
+    for (NSString* candidate in known) {
+        if ([name caseInsensitiveCompare:candidate] == NSOrderedSame) return true;
+    }
+    return false;
+}
+
+void collectExecutables(NSString* root, NSString* relative, int depth,
+                        std::vector<std::string>& windows,
+                        std::vector<std::string>& unixDirs) {
+    // Three levels below the drop directory reaches <game>/<subdir>/<subdir>,
+    // which is past where a launcher has ever been found. Deeper is engine
+    // data, and walking it on the main thread is what the user would feel.
+    if (depth > 3) return;
+
+    NSFileManager* files = NSFileManager.defaultManager;
+    NSString* here = relative.length
+        ? [root stringByAppendingPathComponent:relative] : root;
+    NSArray<NSString*>* entries = [files contentsOfDirectoryAtPath:here error:nil];
+
+    for (NSString* name in [entries sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
+        if ([name hasPrefix:@"."]) continue;
+        NSString* childRelative = relative.length
+            ? [relative stringByAppendingPathComponent:name] : name;
+        NSString* child = [root stringByAppendingPathComponent:childRelative];
+
+        // Follows links on purpose: every entry directly below the root is one.
+        BOOL directory = NO;
+        if (![files fileExistsAtPath:child isDirectory:&directory]) continue;
+
+        if (directory) {
+            if (isRedistributableDirectory(name)) continue;
+            collectExecutables(root, childRelative, depth + 1, windows, unixDirs);
+            continue;
+        }
+        if ([name.pathExtension caseInsensitiveCompare:@"exe"] != NSOrderedSame) continue;
+
+        std::string windowsPath = std::string("Games\\") + childRelative.UTF8String;
+        for (char& character : windowsPath) {
+            if (character == '/') character = '\\';
+        }
+        windows.push_back(std::move(windowsPath));
+        unixDirs.push_back(child.stringByDeletingLastPathComponent.fileSystemRepresentation);
+    }
+}
+
+int scanInstalled() {
+    NSFileManager* files = NSFileManager.defaultManager;
+    NSString* documents = documentsDirectory();
+    NSString* drop = [documents stringByAppendingPathComponent:@"games"];
+    NSString* prefix = [documents stringByAppendingPathComponent:@"fex64-wine"];
+    NSString* marker = [prefix stringByAppendingPathComponent:@".update-timestamp"];
+
+    // The drop directory is created unconditionally so it appears in Files
+    // before Wine has ever run - that is where the user has to put something
+    // for any of this to have an answer.
+    [files createDirectoryAtPath:drop
+     withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Publishing is the part that touches the prefix, and it waits for the
+    // prefix to exist. Creating drive_c early would be worse than useless:
+    // preparePrefix refuses to install over a directory it did not create,
+    // reading it as a half-finished prefix that might hold user files, so a
+    // scan before the first start would wedge the first start permanently.
+    NSUInteger published = 0;
+    if ([files fileExistsAtPath:marker]) {
+        NSString* publish = [prefix stringByAppendingPathComponent:@"drive_c/Games"];
+        [files createDirectoryAtPath:publish
+         withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // Relinked every time. A sideloader reinstalling the IPA moves the
+        // container, which leaves every absolute link pointing at a path that
+        // no longer exists - the same reason the runtime links are recreated
+        // on every prefix preparation.
+        for (NSString* stale in [files contentsOfDirectoryAtPath:publish error:nil]) {
+            [files removeItemAtPath:[publish stringByAppendingPathComponent:stale]
+                              error:nil];
+        }
+        for (NSString* name in [files contentsOfDirectoryAtPath:drop error:nil]) {
+            if ([name hasPrefix:@"."]) continue;
+            if ([files createSymbolicLinkAtPath:[publish stringByAppendingPathComponent:name]
+                            withDestinationPath:[drop stringByAppendingPathComponent:name]
+                                          error:nil]) {
+                published++;
+            }
+        }
+    }
+
+    // Listed from the drop directory rather than through the links, so the
+    // interface can show what is there before the prefix exists. Each
+    // top-level entry is published under the same name, so the path below is
+    // the path Wine will see either way.
+    std::vector<std::string> windows;
+    std::vector<std::string> unixDirs;
+    collectExecutables(drop, @"", 0, windows, unixDirs);
+
+    int count;
+    {
+        std::lock_guard<std::mutex> guard(g_installedMutex);
+        g_installRoot = drop.fileSystemRepresentation;
+        g_installedWindows = std::move(windows);
+        g_installedUnixDirs = std::move(unixDirs);
+        count = (int)g_installedWindows.size();
+        if (g_installedIndex.load(std::memory_order_relaxed) >= count) {
+            g_installedIndex.store(0, std::memory_order_relaxed);
+        }
+    }
+    reportf("Documents/games: %d executable(s) found, %lu folder(s) published to C:\\Games%s",
+            count, (unsigned long)published,
+            [files fileExistsAtPath:marker] ? "" : " (deferred: no prefix yet)");
+    return count;
+}
+
+bool selectedInstalled(std::string& windowsPath, std::string& unixDir) {
+    std::lock_guard<std::mutex> guard(g_installedMutex);
+    const int index = g_installedIndex.load(std::memory_order_relaxed);
+    if (index < 0 || index >= (int)g_installedWindows.size()) return false;
+    windowsPath = "C:\\" + g_installedWindows[(size_t)index];
+    unixDir = g_installedUnixDirs[(size_t)index];
+    return true;
 }
 
 void* serverThread(void*) {
@@ -401,6 +579,9 @@ void* processThread(void*) {
         char desktopArgument[] = "/desktop=shell,1024x768";
         char* target = x64Target;
         char* extraArgument = nullptr;
+        // Outlives the argument vector: __wine_main is handed the pointer.
+        std::string installedPath;
+        std::string installedDir;
         switch (g_target.load(std::memory_order_acquire)) {
             case BVNWineTargetNative: target = nativeTarget; break;
             case BVNWineTargetX64: target = x64Target; break;
@@ -409,9 +590,44 @@ void* processThread(void*) {
                 target = desktopTarget;
                 extraArgument = desktopArgument;
                 break;
+            case BVNWineTargetInstalled:
+                if (!selectedInstalled(installedPath, installedDir)) {
+                    reportf("no executable is selected. Copy a game folder into "
+                            "%s using Files, then rescan.",
+                            BVNWineInstallRoot());
+                    g_stage.store(BVNWineStageFailed, std::memory_order_release);
+                    g_starting.store(false, std::memory_order_release);
+                    return nullptr;
+                }
+                target = const_cast<char*>(installedPath.c_str());
+                break;
         }
         reportf("selected acceptance target: %s",
                 BVNWineTargetName(g_target.load(std::memory_order_relaxed)));
+
+        // A game reads its data relative to the working directory, so the
+        // process has to start in the executable's own folder. Both halves
+        // need telling: chdir for the unix side, MYTHIC_INITIAL_CWD for the
+        // Windows side, because the integration's get_initial_directory
+        // cannot derive one from the other on iOS.
+        if (!installedDir.empty()) {
+            const std::string::size_type separator = installedPath.rfind('\\');
+            const std::string windowsDir = installedPath.substr(0, separator + 1);
+
+            if (chdir(installedDir.c_str()) != 0) {
+                reportf("could not enter %s (errno %d); the program will start "
+                        "in the prefix root and probably not find its data",
+                        installedDir.c_str(), errno);
+            } else {
+                setenv("PWD", installedDir.c_str(), 1);
+                setenv("MYTHIC_INITIAL_CWD", windowsDir.c_str(), 1);
+                // Storefront shims shipped beside a game treat this as the
+                // asset root and ask for it repeatedly during start-up. It
+                // costs nothing when no such shim is present.
+                setenv("SteamAppPath", windowsDir.substr(0, windowsDir.size() - 1).c_str(), 1);
+                reportf("running %s from %s", target, windowsDir.c_str());
+            }
+        }
         char* arguments[] = {loader, target, extraArgument, nullptr};
         const int argumentCount = extraArgument ? 3 : 2;
 
@@ -460,7 +676,7 @@ extern "C" bool BVNWineAvailable(void) {
 }
 
 extern "C" bool BVNWineSetTarget(BVNWineTarget target) {
-    if (target < BVNWineTargetNative || target > BVNWineTargetDesktop) return false;
+    if (target < BVNWineTargetNative || target > BVNWineTargetInstalled) return false;
 #if BVN_WINE_BOOT_ENABLED
     if (g_starting.load(std::memory_order_acquire)) return false;
 #endif
@@ -478,8 +694,79 @@ extern "C" const char* BVNWineTargetName(BVNWineTarget target) {
         case BVNWineTargetX64: return "x64 translation";
         case BVNWineTargetDXMT: return "x64 graphics";
         case BVNWineTargetDesktop: return "Wine desktop";
+        case BVNWineTargetInstalled: return "installed program";
     }
     return "unknown";
+}
+
+extern "C" int BVNWineScanInstalled(void) {
+#if BVN_WINE_BOOT_ENABLED
+    @autoreleasepool {
+        return scanInstalled();
+    }
+#else
+    return 0;
+#endif
+}
+
+extern "C" int BVNWineInstalledCount(void) {
+#if BVN_WINE_BOOT_ENABLED
+    std::lock_guard<std::mutex> guard(g_installedMutex);
+    return (int)g_installedWindows.size();
+#else
+    return 0;
+#endif
+}
+
+extern "C" const char* BVNWineInstalledName(int index) {
+#if BVN_WINE_BOOT_ENABLED
+    std::lock_guard<std::mutex> guard(g_installedMutex);
+    if (index < 0 || index >= (int)g_installedWindows.size()) return nullptr;
+    // Below the publishing directory, so the "Games\" the Windows path needs
+    // is noise on screen.
+    return g_installedWindows[(size_t)index].c_str() + strlen("Games\\");
+#else
+    (void)index;
+    return nullptr;
+#endif
+}
+
+extern "C" bool BVNWineSelectInstalled(int index) {
+#if BVN_WINE_BOOT_ENABLED
+    if (g_starting.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> guard(g_installedMutex);
+    if (index < 0 || index >= (int)g_installedWindows.size()) return false;
+    g_installedIndex.store(index, std::memory_order_relaxed);
+    return true;
+#else
+    (void)index;
+    return false;
+#endif
+}
+
+extern "C" int BVNWineSelectedInstalled(void) {
+#if BVN_WINE_BOOT_ENABLED
+    return g_installedIndex.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
+extern "C" const char* BVNWineInstallRoot(void) {
+#if BVN_WINE_BOOT_ENABLED
+    {
+        std::lock_guard<std::mutex> guard(g_installedMutex);
+        if (!g_installRoot.empty()) return g_installRoot.c_str();
+    }
+    @autoreleasepool {
+        NSString* drop = [documentsDirectory() stringByAppendingPathComponent:@"games"];
+        std::lock_guard<std::mutex> guard(g_installedMutex);
+        g_installRoot = drop.fileSystemRepresentation;
+        return g_installRoot.c_str();
+    }
+#else
+    return "";
+#endif
 }
 
 extern "C" bool BVNWineStart(void) {
@@ -507,6 +794,21 @@ extern "C" bool BVNWineStart(void) {
         g_stage.store(BVNWineStageFailed, std::memory_order_release);
         g_starting.store(false);
         return false;
+    }
+    // Checked before anything is leased or detached, because the debugger
+    // detach below is one-way: a run that stops after it cannot be retried
+    // without relaunching the app, and "you did not pick a program" is not
+    // worth spending that on.
+    if (g_target.load(std::memory_order_acquire) == BVNWineTargetInstalled) {
+        std::string windowsPath;
+        std::string unixDir;
+        if (!selectedInstalled(windowsPath, unixDir)) {
+            reportf("no executable is selected. Copy a folder into %s with the "
+                    "Files app, then rescan.", BVNWineInstallRoot());
+            g_stage.store(BVNWineStageFailed, std::memory_order_release);
+            g_starting.store(false);
+            return false;
+        }
     }
     if (!prepareWineJitPool()) {
         g_stage.store(BVNWineStageFailed, std::memory_order_release);

@@ -36,6 +36,8 @@ struct ProbeView: View {
     @State private var wineElapsed = 0.0
     @State private var winePollTick = 0
     @State private var wineMonitoringTimedOut = false
+    @State private var installedPrograms: [String] = []
+    @State private var installedIndex = 0
 
     // The steps that talk to StikDebug cannot be cancelled and can wait
     // forever, so the interface polls instead of waiting for a return value.
@@ -106,13 +108,20 @@ struct ProbeView: View {
                         Text("x64 translation").tag(BVNWineTargetX64)
                         Text("x64 graphics").tag(BVNWineTargetDXMT)
                         Text("Wine desktop").tag(BVNWineTargetDesktop)
+                        Text("Installed program").tag(BVNWineTargetInstalled)
                     }
                     .disabled(wineRunning)
+                    .onChange(of: wineTarget) { _, target in
+                        if target == BVNWineTargetInstalled { scanInstalled() }
+                    }
 
-                    // DXMT presents onto this layer directly. It is shown for
-                    // the graphics target only, because that is the one path
-                    // that renders; the others report through the log.
-                    if wineTarget == BVNWineTargetDXMT {
+                    if wineTarget == BVNWineTargetInstalled {
+                        installedSection
+                    }
+
+                    // DXMT presents onto this layer directly. Shown for the
+                    // two paths that render; the rest report through the log.
+                    if wineTarget == BVNWineTargetDXMT || wineTarget == BVNWineTargetInstalled {
                         BVNMetalSurface()
                             .frame(height: 220)
                             .background(Color.black)
@@ -175,7 +184,7 @@ struct ProbeView: View {
                 } header: {
                     Text("Wine bootstrap")
                 } footer: {
-                    Text("One IPA contains a native control, an x64 translation check, and an x64 graphics check. Select one before starting Wine; restart the app to run another target.")
+                    Text("One IPA contains a native control, an x64 translation check, an x64 graphics check, and whatever you copy in yourself. Select one before starting Wine; restart the app to run another target.")
                 }
 
                 if !report.isEmpty {
@@ -298,6 +307,49 @@ struct ProbeView: View {
         }
     }
 
+    /// The list of executables found under the drop directory, plus enough
+    /// instruction to get one there. Copying a folder in through Files takes
+    /// minutes and there is no feedback while it happens, so the empty state
+    /// says exactly where to put it rather than only that nothing was found.
+    @ViewBuilder
+    private var installedSection: some View {
+        if installedPrograms.isEmpty {
+            Text("No executable found. In Files, open On My iPhone → BoxedVNFex → games and copy the program's whole folder in, then rescan.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } else {
+            Picker("Program", selection: $installedIndex) {
+                ForEach(installedPrograms.indices, id: \.self) { index in
+                    Text(installedPrograms[index]).tag(index)
+                }
+            }
+            .disabled(wineRunning)
+        }
+
+        Button {
+            scanInstalled()
+        } label: {
+            Label("Rescan", systemImage: "arrow.clockwise")
+        }
+        .disabled(wineRunning)
+
+        // A game folder holds several executables and only one of them is the
+        // right one. Nothing here can tell which, so say what decides it.
+        Text("Pick the build that uses Direct3D 11 — the graphics path here translates D3D11 to Metal, so a D3D9 or D3D12 build will not start. 32-bit programs will not start either; this stack runs x86-64 only.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private func scanInstalled() {
+        _ = BVNWineScanInstalled()
+        let count = Int(BVNWineInstalledCount())
+        installedPrograms = (0..<count).compactMap { index in
+            guard let name = BVNWineInstalledName(Int32(index)) else { return nil }
+            return String(cString: name)
+        }
+        if installedIndex >= installedPrograms.count { installedIndex = 0 }
+    }
+
     private func startWine() {
         wineRunning = true
         wineElapsed = 0
@@ -306,6 +358,16 @@ struct ProbeView: View {
         guard BVNWineSetTarget(wineTarget) else {
             wineRunning = false
             return
+        }
+        // Refused here rather than in the bridge because starting is one-way:
+        // the debugger detach that precedes Wine cannot be undone, so a run
+        // that fails for want of a selection costs a relaunch.
+        if wineTarget == BVNWineTargetInstalled {
+            guard !installedPrograms.isEmpty,
+                  BVNWineSelectInstalled(Int32(installedIndex)) else {
+                wineRunning = false
+                return
+            }
         }
         DispatchQueue.global(qos: .userInitiated).async {
             let started = BVNWineStart()
