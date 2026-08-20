@@ -617,7 +617,7 @@ U32 KSystem::waitpid(KThread* thread, S32 pid, U32 statusAddress, U32 options) {
     return result;
 }
 
-#ifdef BOXEDVN_ENABLE_GUEST_X64
+#ifdef BOXEDWINE_GUEST_X64
 U32 KSystem::reapChild(KThread* thread, S32 pid, U32 options, int* status) {
     KProcessPtr process;
     U32 parentId = thread->process->id;

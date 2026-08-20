@@ -131,7 +131,7 @@ U32 klisten(KThread* thread, U32 socket, U32 backog);
 U32 kaccept(KThread* thread, U32 socket, U32 address, U32 len, U32 flags);
 U32 kgetsockname(KThread* thread, U32 socket, U32 address, U32 len);
 U32 kgetpeername(KThread* thread, U32 socket, U32 address, U32 len);
-#ifdef BOXEDVN_ENABLE_GUEST_X64
+#ifdef BOXEDWINE_GUEST_X64
 S32 ksocketpairFds(KThread* thread, U32 af, U32 type, U32 protocol, U32 flags, FD& fd1, FD& fd2);
 #endif
 U32 ksocketpair(KThread* thread, U32 af, U32 type, U32 protocol, U32 socks, U32 flags);

@@ -204,7 +204,7 @@ static S32 createSocketPair(KThread* thread, U32 af, U32 type, U32 protocol, U32
     return 0;
 }
 
-#ifdef BOXEDVN_ENABLE_GUEST_X64
+#ifdef BOXEDWINE_GUEST_X64
 S32 ksocketpairFds(KThread* thread, U32 af, U32 type, U32 protocol, U32 flags, FD& fd1, FD& fd2) {
     return createSocketPair(thread, af, type, protocol, flags, fd1, fd2);
 }
