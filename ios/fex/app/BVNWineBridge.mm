@@ -340,8 +340,37 @@ void* processThread(void*) {
         setenv("HOME", g_prefix.c_str(), 1);
         setenv("WINELOADERNOEXEC", "1", 1);
         setenv("WINEDLLPATH", NSBundle.mainBundle.bundlePath.fileSystemRepresentation, 1);
-        setenv("WINEDEBUG", "err+all", 1);
+        // warn+module on purpose: the unixlib resolver in ntdll's virtual_ios.c
+        // announces which table each builtin got through WARN_(module), and
+        // with err+all alone every one of those lines is invisible. A device
+        // log then cannot distinguish "win32u's unix side is active" from
+        // "it is linked but dormant" from "the resolver never ran" - which is
+        // exactly the ambiguity that cost a build. Thirteen modules load, so
+        // the added volume is a dozen lines.
+        setenv("WINEDEBUG", "err+all,warn+module", 1);
         setenv("MYTHIC_TEST_VAR", "steam-s1", 1);
+
+        // Activate win32u's unix side.
+        //
+        // scripts/build-fex64-win32u.sh builds libwin32u_unix.a and the app
+        // link pulls it in, but linking it is not enough: load_builtin_unixlib
+        // in ntdll's virtual_ios.c calls win32u_unix_lib_init() only when this
+        // variable is set, and takes a "linked but dormant" branch otherwise.
+        // Dormant means slot 1 of KeServiceDescriptorTable is never populated,
+        // so every NtUser/NtGdi entry point the guest reaches through
+        // user32 dispatches into an unregistered table.
+        //
+        // That is what the last device run shows. The guest's message loop
+        // calls PeekMessage, is told a message is waiting, and gets a MSG that
+        // is entirely zero; it then calls DispatchMessage, user32 reaches its
+        // window-procedure call site (user32+0x60528, the __os_arm64x_check_icall
+        // sequence) and dispatches to x64 through the exit thunk at
+        // user32+0x949b4 with a target of 0x700880f7d0 - the address of the
+        // guest's own MSG local. FEX finds that page non-executable and raises,
+        // which is the "Unhandled page fault on execute access" the run ends on.
+        //
+        // The integration's own bridge sets this (app/Mythic/WineProcessBridge.m).
+        setenv("MYTHIC_WIN32U", "1", 1);
 
         const int64_t writeOffset =
             static_cast<int64_t>(static_cast<uint8_t*>(g_winePoolWritable) -
