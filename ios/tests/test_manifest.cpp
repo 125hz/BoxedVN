@@ -154,10 +154,11 @@ BOXEDVN_TEST(no_backend_claims_to_run_x86_64) {
     }
 }
 
-BOXEDVN_TEST(the_reserved_x64_backend_reports_itself_as_unimplemented) {
-    const RuntimeBackendCapabilities caps = futureX64Capabilities();
+BOXEDVN_TEST(the_boxedwine_fex64_backend_reports_component_readiness) {
+    const RuntimeBackendCapabilities caps = boxedwineFEX64Capabilities();
     CHECK_EQ(caps.implemented, false);
     CHECK_EQ(caps.executableArchitectures.empty(), true);
+    CHECK_EQ(std::string(toString(caps.id)), std::string("boxedwine-fex64"));
 }
 
 // --- Identifier derivation -------------------------------------------------

@@ -41,7 +41,7 @@ const char* toString(RuntimeBackendID backend) {
     switch (backend) {
         case RuntimeBackendID::None:         return "none";
         case RuntimeBackendID::BoxedwineX86: return "boxedwine-x86";
-        case RuntimeBackendID::FutureX64:    return "future-x64";
+        case RuntimeBackendID::BoxedwineFEX64: return "boxedwine-fex64";
     }
     return "none";
 }
@@ -83,19 +83,36 @@ RuntimeBackendCapabilities boxedwineX86Capabilities() {
     return caps;
 }
 
-RuntimeBackendCapabilities futureX64Capabilities() {
+RuntimeBackendCapabilities boxedwineFEX64Capabilities() {
     RuntimeBackendCapabilities caps;
-    caps.id = RuntimeBackendID::FutureX64;
-    caps.implemented = false;
-    caps.executableArchitectures = {};
+    caps.id = RuntimeBackendID::BoxedwineFEX64;
+#if defined(BOXEDVN_FEX64_TRANSLATOR_AVAILABLE)
+    caps.translatorAvailable = true;
+#endif
+#if defined(BOXEDVN_FEX64_KERNEL_AVAILABLE)
+    caps.guestKernelAvailable = true;
+#endif
+#if defined(BOXEDVN_FEX64_WINE_AVAILABLE)
+    caps.wineAvailable = true;
+#endif
+#if defined(BOXEDVN_FEX64_DXMT_AVAILABLE)
+    caps.dxmtAvailable = true;
+#endif
+    caps.implemented = caps.translatorAvailable && caps.guestKernelAvailable &&
+                       caps.wineAvailable && caps.dxmtAvailable;
+    if (caps.implemented) {
+        caps.executableArchitectures = {GuestArchitecture::X86_64};
+    }
     caps.requiresJIT = true;
     caps.hasInterpreterFallback = false;
-    caps.rendererIDs = {};
+    if (caps.dxmtAvailable) {
+        caps.rendererIDs = {"dxmt-metal"};
+    }
     return caps;
 }
 
 std::vector<RuntimeBackendCapabilities> allBackends() {
-    return {boxedwineX86Capabilities(), futureX64Capabilities()};
+    return {boxedwineX86Capabilities(), boxedwineFEX64Capabilities()};
 }
 
 RuntimeBackendID selectBackend(GuestArchitecture arch) {
@@ -113,9 +130,10 @@ std::string unsupportedArchitectureMessage(GuestArchitecture arch) {
     }
     switch (arch) {
         case GuestArchitecture::X86_64:
-            return "x64 is not supported by the current runtime. BoxedVN runs "
-                   "16-bit and 32-bit Windows programs through Boxedwine's "
-                   "32-bit Wine; a 64-bit backend has not been implemented.";
+            return "x64 is not supported by the current runtime. The BoxedWine "
+                   "FEX64 backend is not complete in this build. "
+                   "It requires the FEX translator, BoxedWine's x86-64 Linux "
+                   "kernel ABI, Wine64, and the DXMT Metal bridge.";
         case GuestArchitecture::Unknown:
             return "The architecture of this file could not be determined, so "
                    "it cannot be run.";

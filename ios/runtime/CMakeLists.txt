@@ -22,6 +22,7 @@ add_library(boxedvn_runtime STATIC
     src/BVNMain.mm
     src/BVNAppDelegate.mm
     src/BVNGuestOverlay.mm
+    src/BVNFEXBackend.mm
 )
 
 # Read BOXEDWINE_VERSION_STR straight out of the upstream header so the value
@@ -54,6 +55,31 @@ target_compile_definitions(boxedvn_runtime PRIVATE
 target_include_directories(boxedvn_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+set(BOXEDVN_FEX64_ARCHIVES "")
+if(BOXEDVN_ENABLE_FEX64)
+    if(NOT BOXEDVN_FEX64_ROOT)
+        message(FATAL_ERROR
+            "BOXEDVN_ENABLE_FEX64=ON requires BOXEDVN_FEX64_ROOT to point "
+            "at the staged FEX iPhoneOS prefix.")
+    endif()
+    if(NOT EXISTS "${BOXEDVN_FEX64_ROOT}/include/FEXCore/Core/Context.h")
+        message(FATAL_ERROR
+            "FEX public headers were not found under ${BOXEDVN_FEX64_ROOT}/include")
+    endif()
+    if(NOT EXISTS "${BOXEDVN_FEX64_ROOT}/lib/libFEXCore.a")
+        message(FATAL_ERROR
+            "libFEXCore.a was not found under ${BOXEDVN_FEX64_ROOT}/lib")
+    endif()
+    file(GLOB BOXEDVN_FEX64_ARCHIVES CONFIGURE_DEPENDS
+        "${BOXEDVN_FEX64_ROOT}/lib/*.a")
+    target_include_directories(boxedvn_runtime PRIVATE
+        "${BOXEDVN_FEX64_ROOT}/include")
+    target_compile_definitions(boxedvn_runtime PRIVATE
+        BOXEDVN_ENABLE_FEX64=1)
+    target_link_libraries(boxedvn_runtime PUBLIC ${BOXEDVN_FEX64_ARCHIVES})
+    message(STATUS "BoxedVN: optional FEX64 translator enabled")
+endif()
 
 target_link_libraries(boxedvn_runtime PUBLIC
     boxedwine_core
@@ -117,6 +143,7 @@ add_custom_command(
             $<TARGET_FILE:boxedwine_pugixml>
             "${BOXEDVN_SDL2_LIBRARY}"
             "${BOXEDVN_MOLTENVK_LIBRARY}"
+            ${BOXEDVN_FEX64_ARCHIVES}
     DEPENDS boxedvn_runtime boxedwine_core boxedvn_support
             boxedwine_zlib boxedwine_softfloat boxedwine_asmjit
             boxedwine_pugixml

@@ -20,6 +20,8 @@ final class AppModel: ObservableObject {
     // process with no recovery possible. See Runtime.swift / BVNRuntime.h.
     @Published private(set) var jit: JITReport = .probeStatus()
     @Published private(set) var memory: MemoryReport = .probe()
+    @Published private(set) var fexBackend: FEXBackendReport = .status()
+    @Published private(set) var isProbingFEX = false
     @Published private(set) var runtimeState: RuntimeState = .idle
     @Published private(set) var isImporting = false
     @Published var importProgressMessage = ""
@@ -755,6 +757,21 @@ final class AppModel: ObservableObject {
             updated.debuggerAttached != jit.debuggerAttached ||
             updated.executableMemoryAvailable != jit.executableMemoryAvailable {
             jit = updated
+        }
+    }
+
+    /// Deliberate device-only translator test. Like the executable-memory
+    /// probe, this can terminate the process if JIT setup is invalid, so it is
+    /// never run by startup or polling code.
+    func runFEXBackendProbe() {
+        guard fexBackend.built, !isProbingFEX else { return }
+        isProbingFEX = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = FEXBackendReport.executeProbe()
+            DispatchQueue.main.async {
+                self.fexBackend = result
+                self.isProbingFEX = false
+            }
         }
     }
 }

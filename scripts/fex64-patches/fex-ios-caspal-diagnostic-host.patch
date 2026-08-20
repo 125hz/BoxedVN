@@ -1,0 +1,29 @@
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+index 7fb119c..04304b0 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -704,6 +704,7 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
+    * which we DUAL-MAP (RW alias + RX alias). Aliased mappings are exactly where atomics
+    * can fault despite correct alignment. Report what the region actually is, so "guest
+    * data in a dual-mapped pool page" is distinguishable from ordinary private memory. */
++#ifdef _WIN32
+   MEMORY_BASIC_INFORMATION mbi {};
+   const char* type = "?";
+   if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+@@ -714,6 +715,16 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
+                     Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                     (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                     mbi.Protect, type, mbi.State);
++#else
++  /* BoxedVN: VirtualQuery is a Windows API and this file also builds for the
++   * iOS host. The region classification is what needs it; the address and its
++   * misalignment are the part that decides whether the guest really emitted an
++   * unaligned CAS, and those are available everywhere. */
++  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
++                    "crosses16B={} | region query unavailable on this host",
++                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
++                    (GPRs[AddressReg] & 15) ? "yes" : "no");
++#endif
+ }
+ 
+ static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {

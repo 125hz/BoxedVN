@@ -56,6 +56,13 @@ option(BOXEDVN_BUILD_RUNTIME    "Build the Objective-C++ runtime bridge (iOS)"  
 option(BOXEDVN_BUILD_MACOS_HOST "Build a runnable macOS emulator host"          OFF)
 option(BOXEDVN_ENABLE_UI        "Build Boxedwine's built-in Dear ImGui launcher" OFF)
 option(BOXEDVN_ENABLE_MIDI      "Build CoreMIDI support"                       OFF)
+option(BOXEDVN_ENABLE_FEX64     "Build the optional FEX x86-64 translator"     OFF)
+
+# FEX is deliberately an optional backend.  A normal BoxedWine build does not
+# fetch or link it, which keeps the interpreter, native JIT, and WebAssembly
+# configurations independent of the iOS-only bring-up work.
+set(BOXEDVN_FEX64_ROOT "" CACHE PATH
+    "Staged FEX iPhoneOS prefix (contains include/ and lib/)")
 
 set(BOXEDVN_SDL2_ROOT "" CACHE PATH
     "Root of a prebuilt SDL2 for the target platform (contains include/ and lib/)")

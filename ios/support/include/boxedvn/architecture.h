@@ -30,7 +30,7 @@ enum class GuestArchitecture {
     Unknown = 0,
     X86_16,   // real-mode / Win16 segmented x86
     X86_32,   // IA-32
-    X86_64,   // AMD64 - recognised, not executable by any current backend
+    X86_64,   // AMD64
 };
 
 const char* toString(GuestArchitecture arch);
@@ -51,15 +51,13 @@ const char* toString(ExecutableFormat format);
 
 // Identifies which emulation backend would be responsible for an executable.
 //
-// Only BoxedwineX86 exists today.  FutureX64 is a reserved identifier so that
-// the game library, importer and frontend can be written against a backend
-// abstraction now, and so that a manifest written today records *which* backend
-// it was created for.  Nothing in BoxedVN implements FutureX64, and
-// isImplemented() returns false for it.
+// Both IDs describe execution owned by BoxedWine.  The FEX identifier is an
+// optional CPU/backend path for a 64-bit BoxedWine process; it must never mean
+// the separate native-Wine application from the historical reference branch.
 enum class RuntimeBackendID {
     None = 0,
     BoxedwineX86,  // Boxedwine: emulated Linux kernel + 32-bit Wine + x86 CPU
-    FutureX64,     // reserved; no implementation exists
+    BoxedwineFEX64, // Boxedwine kernel + x86-64 Linux ABI + optional FEX CPU
 };
 
 const char* toString(RuntimeBackendID backend);
@@ -81,6 +79,14 @@ struct RuntimeBackendCapabilities {
     // True when an interpreter fallback exists and is deliberately supported.
     bool hasInterpreterFallback = false;
 
+    // Bring-up is intentionally represented component-by-component.  An x64
+    // executable is selectable only once every required layer is linked; a
+    // translator-only build must not advertise that it can run Wine64.
+    bool translatorAvailable = false;
+    bool guestKernelAvailable = false;
+    bool wineAvailable = false;
+    bool dxmtAvailable = false;
+
     // Renderer identifiers the backend can present through, most preferred
     // first.  See renderer.h.
     std::vector<std::string> rendererIDs;
@@ -93,8 +99,10 @@ struct RuntimeBackendCapabilities {
 // reports requiresJIT/hasInterpreterFallback honestly.
 RuntimeBackendCapabilities boxedwineX86Capabilities();
 
-// The reserved x64 backend.  Always reports implemented == false.
-RuntimeBackendCapabilities futureX64Capabilities();
+// Optional FEX backend behind BoxedWine's 64-bit guest ABI.  During bring-up
+// this reports the individual compiled components while implemented remains
+// false until the full runtime is present.
+RuntimeBackendCapabilities boxedwineFEX64Capabilities();
 
 std::vector<RuntimeBackendCapabilities> allBackends();
 

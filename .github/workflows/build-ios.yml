@@ -111,7 +111,7 @@ jobs:
       - guest-probe
       - tests
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out BoxedVN
         uses: actions/checkout@v6
@@ -163,11 +163,17 @@ jobs:
         uses: actions/cache@v5
         with:
           path: third_party
-          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh') }}
+          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex64-patches/**') }}
 
       - name: Fetch pinned dependencies
         shell: bash
         run: scripts/fetch-dependencies.sh --platform ios --configuration Release
+
+      - name: Build optional FEX x86-64 translator
+        shell: bash
+        run: |
+          bash scripts/fetch-fex64-dependencies.sh --component fex
+          bash scripts/build-fex64-fex.sh --configuration Release
 
       - name: Download IA-32 graphics probe
         uses: actions/download-artifact@v7
@@ -182,6 +188,7 @@ jobs:
           --configuration "${BUILD_CONFIGURATION}"
           --output-dir build/ci
           --skip-dependencies
+          --enable-fex64
           --no-bundled-rootfs
 
       - name: Validate unsigned app

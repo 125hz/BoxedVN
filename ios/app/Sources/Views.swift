@@ -838,6 +838,22 @@ struct StatusView: View {
                         }
                     }
                 }
+                if model.fexBackend.built {
+                    VStack(alignment: .leading, spacing: 4) {
+                        LabeledContent("FEX translator self-test",
+                                       value: model.fexBackend.stageName)
+                        if !model.fexBackend.detail.isEmpty {
+                            Text(model.fexBackend.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Button(model.isProbingFEX ? "Testing…" : "Run x86-64 backend test") {
+                            model.runFEXBackendProbe()
+                        }
+                        .disabled(model.isProbingFEX || model.fexBackend.completed)
+                    }
+                }
             }
         }
         .navigationTitle("Runtime status")

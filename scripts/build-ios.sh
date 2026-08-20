@@ -9,6 +9,7 @@
 #                        [--sign]
 #                        [--skip-dependencies]
 #                        [--no-bundled-rootfs]
+#                        [--enable-fex64]
 #
 # --no-bundled-rootfs omits the ~160 MB root filesystem archive, producing a
 # small IPA for fast sign/install iterations.  The app then asks the user to
@@ -31,6 +32,7 @@ OUTPUT_DIR=""
 SIGN=0
 SKIP_DEPENDENCIES=0
 NO_BUNDLED_ROOTFS=0
+ENABLE_FEX64=0
 
 usage() {
     sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --sign)          SIGN=1; shift ;;
         --skip-dependencies) SKIP_DEPENDENCIES=1; shift ;;
         --no-bundled-rootfs) NO_BUNDLED_ROOTFS=1; shift ;;
+        --enable-fex64) ENABLE_FEX64=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "Unknown argument '$1'. Run with --help." ;;
     esac
@@ -86,6 +89,7 @@ fi
 SDL2_PREFIX="${BOXEDVN_THIRD_PARTY}/prefix/ios"
 MOLTENVK_ROOT="${BOXEDVN_THIRD_PARTY}/src/MoltenVK-ios-${BOXEDVN_MOLTENVK_VERSION}"
 XCODEGEN="${BOXEDVN_THIRD_PARTY}/xcodegen-${BOXEDVN_XCODEGEN_VERSION}/bin/xcodegen"
+FEX64_PREFIX="${BOXEDVN_THIRD_PARTY}/fex64/fex-ios"
 
 if [[ ${SKIP_DEPENDENCIES} -eq 0 ]]; then
     log "Fetching dependencies"
@@ -105,16 +109,29 @@ require_file "${MOLTENVK_ROOT}/MoltenVK/static/MoltenVK.xcframework/ios-arm64/li
 # ---------------------------------------------------------------------------
 CMAKE_BUILD_DIR="${OUTPUT_DIR}/cmake"
 
+cmake_options=(
+    -DCMAKE_SYSTEM_NAME=iOS
+    -DCMAKE_OSX_ARCHITECTURES=arm64
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0
+    -DCMAKE_OSX_SYSROOT=iphoneos
+    -DCMAKE_BUILD_TYPE="${CONFIGURATION}"
+    -DBOXEDVN_BUILD_TESTS=OFF
+    -DBOXEDVN_SDL2_ROOT="${SDL2_PREFIX}"
+    -DBOXEDVN_MOLTENVK_ROOT="${MOLTENVK_ROOT}"
+)
+if [[ ${ENABLE_FEX64} -eq 1 ]]; then
+    require_file "${FEX64_PREFIX}/lib/libFEXCore.a" \
+        "Run scripts/build-fex64-fex.sh before enabling the optional FEX backend."
+    cmake_options+=(
+        -DBOXEDVN_ENABLE_FEX64=ON
+        -DBOXEDVN_FEX64_ROOT="${FEX64_PREFIX}"
+    )
+    log "Optional FEX x86-64 translator enabled"
+fi
+
 log "Configuring the native build (${CONFIGURATION})"
 cmake -S "${BOXEDVN_ROOT}" -B "${CMAKE_BUILD_DIR}" -G Ninja \
-    -DCMAKE_SYSTEM_NAME=iOS \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
-    -DCMAKE_OSX_SYSROOT=iphoneos \
-    -DCMAKE_BUILD_TYPE="${CONFIGURATION}" \
-    -DBOXEDVN_BUILD_TESTS=OFF \
-    -DBOXEDVN_SDL2_ROOT="${SDL2_PREFIX}" \
-    -DBOXEDVN_MOLTENVK_ROOT="${MOLTENVK_ROOT}" \
+    "${cmake_options[@]}" \
     || die "CMake configure failed."
 
 log "Building the native targets"

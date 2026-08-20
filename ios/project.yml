@@ -24,7 +24,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "132"
+    CURRENT_PROJECT_VERSION: "133"
     # Overridden by scripts/build-ios.sh with the real git commit.  The
     # default is deliberately "unknown" so a build produced any other way
     # says so instead of claiming a revision it does not have.
@@ -73,6 +73,9 @@ targets:
       - path: ../THIRD_PARTY_NOTICES.md
         buildPhase: resources
       - path: ../third_party/src/MoltenVK-ios-1.4.2/LICENSE
+        buildPhase: resources
+      - path: ../third_party/fex64/fex/LICENSE
+        optional: true
         buildPhase: resources
     # No `info:` or `entitlements:` blocks here on purpose.  Those make
     # XcodeGen *generate* the files at those paths, silently overwriting the

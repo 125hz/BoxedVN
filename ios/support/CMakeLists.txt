@@ -6,6 +6,8 @@ add_library(boxedvn_support STATIC
     src/boot_diagnostics.cpp
     src/direct3d_profile.cpp
     src/engine_profile.cpp
+    src/fex64_kernel.cpp
+    src/guest_address_space.cpp
     src/json.cpp
     src/manifest.cpp
     src/path_safety.cpp
@@ -37,4 +39,9 @@ endif()
 # boxedwineX86Capabilities() reports what was actually built.
 if(BOXEDVN_TARGET_IOS)
     target_compile_definitions(boxedvn_support PRIVATE BOXEDWINE_JIT)
+endif()
+
+if(BOXEDVN_ENABLE_FEX64)
+    target_compile_definitions(boxedvn_support PRIVATE
+        BOXEDVN_FEX64_TRANSLATOR_AVAILABLE=1)
 endif()

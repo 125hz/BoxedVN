@@ -68,6 +68,31 @@ struct JITReport {
     }
 }
 
+// MARK: - Optional FEX CPU backend
+
+struct FEXBackendReport {
+    var built: Bool
+    var stage: BVNFEXBackendStage
+    var stageName: String
+    var detail: String
+
+    var completed: Bool { stage == BVNFEXBackendStageExecuted }
+
+    static func status() -> FEXBackendReport {
+        let stage = BVNFEXBackendStageReached()
+        return FEXBackendReport(
+            built: BVNFEXBackendBuilt(),
+            stage: stage,
+            stageName: String(cString: BVNFEXBackendStageName(stage)),
+            detail: String(cString: BVNFEXBackendReport()))
+    }
+
+    static func executeProbe() -> FEXBackendReport {
+        _ = BVNFEXBackendProbe()
+        return status()
+    }
+}
+
 // MARK: - Memory entitlement
 
 /// Settings that apply to every session rather than to one game.

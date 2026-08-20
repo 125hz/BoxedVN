@@ -114,6 +114,21 @@ creates its `CAMetalLayer` surface and Boxedwine forwards guest Vulkan calls to
 MoltenVK. No dynamic framework is embedded or separately signed. The official
 MoltenVK `LICENSE` and this notice file are copied into the app resources.
 
+### FEX
+
+| | |
+|---|---|
+| Source | https://github.com/willfaust/FEX.git |
+| Revision | `04cbb90c715519136da771af3cc8f1dac9b821a6` |
+| Licence | MIT |
+| Copyright | FEX contributors |
+| In the iOS build | **yes**, when the optional x86-64 translator is enabled; statically linked |
+
+The iOS build uses the pinned FEX fork only as an optional x86-64 CPU
+translator. Linux syscalls and guest-process services remain owned by
+BoxedWine. The FEX licence file is copied into the app resources when the
+source checkout is present.
+
 ---
 
 ## Root filesystem archives
@@ -143,7 +158,7 @@ warning when used.
 ## Not used
 
 For the avoidance of doubt, BoxedVN contains no code from, and no dependency
-on: VKD3D, D3DMetal, Box64, FEX, Hangover, UTM, or the
+on: VKD3D, D3DMetal, Box64, Hangover, UTM, or the
 experimental `zaiahgaming/boxedwine-ios` repository. UTM's public
 documentation of iOS JIT behaviour informed the design of
 `ios/runtime/src/BVNJIT.mm` and the entitlement set; no UTM code was copied.
