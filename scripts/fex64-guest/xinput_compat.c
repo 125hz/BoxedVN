@@ -29,10 +29,11 @@ DWORD WINAPI XInputGetState(DWORD index, XINPUT_STATE *state)
     return ERROR_DEVICE_NOT_CONNECTED;
 }
 
-DWORD WINAPI XInputGetStateEx(DWORD index, void *state)
+DWORD WINAPI XInputGetStateEx(DWORD index, XINPUT_STATE *state)
 {
     (void)index;
     if (!state) return ERROR_BAD_ARGUMENTS;
+    ZeroMemory(state, sizeof(*state));
     return ERROR_DEVICE_NOT_CONNECTED;
 }
 
@@ -54,12 +55,13 @@ DWORD WINAPI XInputGetCapabilities(DWORD index, DWORD flags,
 }
 
 DWORD WINAPI XInputGetCapabilitiesEx(DWORD reserved, DWORD index, DWORD flags,
-                                     void *capabilities)
+                                     XINPUT_CAPABILITIES_EX *capabilities)
 {
     (void)reserved;
     (void)index;
     (void)flags;
     if (!capabilities) return ERROR_BAD_ARGUMENTS;
+    ZeroMemory(capabilities, sizeof(*capabilities));
     return ERROR_DEVICE_NOT_CONNECTED;
 }
 
