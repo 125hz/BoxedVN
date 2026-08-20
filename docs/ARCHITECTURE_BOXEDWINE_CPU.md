@@ -1,6 +1,8 @@
 # BoxedWine CPU architecture and Phase 0 plan
 
-Status: Phase 0 investigation only. This document changes no runtime behaviour.
+Status: Phase 0 is complete. The optional x86-64 implementation programme is
+tracked on `codex/boxedwine-fex64-backend`; the existing IA-32 paths remain the
+default and are not replaced.
 
 Audit baseline:
 
@@ -10,6 +12,10 @@ Audit baseline:
   below are identical at those two revisions. The `fex64` branch remains a
   reference for executable memory and FEX integration; it is not the product
   direction.
+- The parallel x86-64 guest core is being selectively ported from the GPLv2+
+  Boxedwine64 fork at revision
+  `dee2ff3f08d9b5bdfe78c15bdefbf8f89b4f1639`. Whole-tree replacement is
+  intentionally avoided so current BoxedWine and iOS fixes remain intact.
 
 ## Executive conclusion
 

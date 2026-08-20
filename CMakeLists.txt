@@ -57,6 +57,7 @@ option(BOXEDVN_BUILD_MACOS_HOST "Build a runnable macOS emulator host"          
 option(BOXEDVN_ENABLE_UI        "Build Boxedwine's built-in Dear ImGui launcher" OFF)
 option(BOXEDVN_ENABLE_MIDI      "Build CoreMIDI support"                       OFF)
 option(BOXEDVN_ENABLE_FEX64     "Build the optional FEX x86-64 translator"     OFF)
+option(BOXEDVN_ENABLE_GUEST_X64 "Build BoxedWine's parallel x86-64 guest ABI"  OFF)
 
 # FEX is deliberately an optional backend.  A normal BoxedWine build does not
 # fetch or link it, which keeps the interpreter, native JIT, and WebAssembly
@@ -257,6 +258,12 @@ target_compile_definitions(boxedwine_core PUBLIC
     BOXEDWINE_RECORDER
     BOXEDWINE_MAC_JIT
 )
+
+if(BOXEDVN_ENABLE_GUEST_X64)
+    # The x86-64 guest is a parallel BoxedWine ABI. It deliberately leaves the
+    # IA-32 CPU, KMemory, loader, and WebAssembly configurations intact.
+    target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_GUEST_X64=1)
+endif()
 
 if(NOT BOXEDVN_TARGET_IOS)
     # Wine's CoreAudio driver.  On iOS the SDL audio backend is used instead;
