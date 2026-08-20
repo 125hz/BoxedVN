@@ -8,7 +8,8 @@
 #                              [--output-dir DIR] [--third-party-dir DIR]
 #                              [--skip-fex]
 #                              [--wine-core-dir DIR]
-#                              [--wine-runtime-dir DIR] [--mythic-dir DIR]
+#                              [--wine-runtime-dir DIR] [--wine-pe-dir DIR]
+#                              [--mythic-dir DIR]
 #                              [--dxmt-lib PATH] [--win32u-lib PATH]
 #
 # Stage A2 of docs/ARCHITECTURE_FEX64.md. Builds FEX if its archives are not
@@ -143,6 +144,30 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
           "${WINE_RESOURCE_STAGING}/aarch64-windows"
     cp -R "${WINE_RUNTIME_DIR}/arm64ec-windows" \
           "${WINE_RESOURCE_STAGING}/arm64ec-windows"
+
+    # The integration's prebuilt runtime is intentionally smaller than a full
+    # Wine installation. Add the compatibility DLLs that ordinary Windows
+    # programs may import before their entry point runs from the pinned Wine
+    # tree the combined build has already produced. Keep this list explicit:
+    # copying every built DLL would substantially grow the IPA and could
+    # replace integration-tested binaries with a different build wholesale.
+    if [[ -n "${WINE_PE_DIR}" ]]; then
+        [[ -d "${WINE_PE_DIR}" ]] || die \
+            "The Wine PE build directory '${WINE_PE_DIR}' does not exist."
+        WINE_PE_DIR="$(cd "${WINE_PE_DIR}" && pwd)"
+        for runtime_dll in xinput1_4.dll xinput9_1_0.dll; do
+            runtime_source="$(find "${WINE_PE_DIR}/dlls" \
+                -path "*/arm64ec-windows/${runtime_dll}" -print -quit 2>/dev/null)"
+            [[ -n "${runtime_source}" ]] || die \
+"The ARM64EC Wine build at '${WINE_PE_DIR}' did not produce ${runtime_dll}.
+The bundled runtime needs this system compatibility DLL before programs that
+import it can enter their main function. Check ${WINE_PE_DIR}/build.log."
+            cp "${runtime_source}" \
+               "${WINE_RESOURCE_STAGING}/arm64ec-windows/${runtime_dll}"
+            log "Staged ARM64EC Wine compatibility DLL ${runtime_dll}"
+        done
+    fi
+
     # Two ways to supply the emulator DLL. By default the prebuilt is patched
     # in place on the way into the bundle, because its allocator source was
     # force-pushed out of existence and cannot be rebuilt. Set
