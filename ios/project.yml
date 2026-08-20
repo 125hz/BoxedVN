@@ -74,9 +74,6 @@ targets:
         buildPhase: resources
       - path: ../third_party/src/MoltenVK-ios-1.4.2/LICENSE
         buildPhase: resources
-      - path: ../third_party/fex64/fex/LICENSE
-        optional: true
-        buildPhase: resources
     # No `info:` or `entitlements:` blocks here on purpose.  Those make
     # XcodeGen *generate* the files at those paths, silently overwriting the
     # hand-written ones on every run.  Pointing the build settings at the

@@ -121,13 +121,13 @@ MoltenVK `LICENSE` and this notice file are copied into the app resources.
 | Source | https://github.com/willfaust/FEX.git |
 | Revision | `04cbb90c715519136da771af3cc8f1dac9b821a6` |
 | Licence | MIT |
-| Copyright | FEX contributors |
+| Copyright | © 2019 Ryan Houdek and FEX contributors |
 | In the iOS build | **yes**, when the optional x86-64 translator is enabled; statically linked |
 
 The iOS build uses the pinned FEX fork only as an optional x86-64 CPU
 translator. Linux syscalls and guest-process services remain owned by
-BoxedWine. The FEX licence file is copied into the app resources when the
-source checkout is present.
+BoxedWine. The FEX licence is copied into the app resources as
+`FEX-LICENSE.txt`.
 
 ---
 

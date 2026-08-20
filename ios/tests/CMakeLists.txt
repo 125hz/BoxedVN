@@ -12,6 +12,7 @@ add_executable(boxedvn_tests
     test_jit_arena_plan.cpp
     test_direct3d_profile.cpp
     test_engine_profile.cpp
+    test_elf_inspector.cpp
     test_fex64_kernel.cpp
     test_guest_address_space.cpp
     test_boot_diagnostics.cpp

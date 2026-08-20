@@ -6,6 +6,7 @@ add_library(boxedvn_support STATIC
     src/boot_diagnostics.cpp
     src/direct3d_profile.cpp
     src/engine_profile.cpp
+    src/elf_inspector.cpp
     src/fex64_kernel.cpp
     src/guest_address_space.cpp
     src/json.cpp
