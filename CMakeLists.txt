@@ -64,6 +64,8 @@ option(BOXEDVN_ENABLE_GUEST_X64 "Build BoxedWine's parallel x86-64 guest ABI"  O
 # configurations independent of the iOS-only bring-up work.
 set(BOXEDVN_FEX64_ROOT "" CACHE PATH
     "Staged FEX iPhoneOS prefix (contains include/ and lib/)")
+set(BOXEDVN_DXMT_NATIVE_ARCHIVE "" CACHE FILEPATH
+    "Native iPhoneOS DXMT archive containing the winemetal unix-call table")
 
 set(BOXEDVN_SDL2_ROOT "" CACHE PATH
     "Root of a prebuilt SDL2 for the target platform (contains include/ and lib/)")
@@ -263,6 +265,38 @@ if(BOXEDVN_ENABLE_GUEST_X64)
     # The x86-64 guest is a parallel BoxedWine ABI. It deliberately leaves the
     # IA-32 CPU, KMemory, loader, and WebAssembly configurations intact.
     target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_GUEST_X64=1)
+endif()
+
+if(BOXEDVN_ENABLE_FEX64)
+    if(NOT BOXEDVN_ENABLE_GUEST_X64)
+        message(FATAL_ERROR
+            "BOXEDVN_ENABLE_FEX64 requires BOXEDVN_ENABLE_GUEST_X64. "
+            "FEX is an optional CPU backend for BoxedWine's x86-64 ABI.")
+    endif()
+    if(NOT BOXEDVN_TARGET_IOS)
+        message(FATAL_ERROR
+            "The current FEX backend requires the iOS executable-memory and "
+            "fault-bridge runtime. Leave BOXEDVN_ENABLE_FEX64=OFF on other "
+            "platforms; the BoxedWine interpreter and other CPU backends remain available.")
+    endif()
+    # The core uses this only to select a process at CPU dispatch. FEX headers
+    # and libraries remain confined to boxedvn_runtime.
+    target_compile_definitions(boxedwine_core PUBLIC
+        BOXEDWINE_FEX64_BACKEND=1
+        BOXEDWINE_KMEMORY64_NATIVE_IDENTITY=1)
+endif()
+
+if(BOXEDVN_DXMT_NATIVE_ARCHIVE)
+    if(NOT BOXEDVN_ENABLE_FEX64)
+        message(FATAL_ERROR
+            "BOXEDVN_DXMT_NATIVE_ARCHIVE requires the optional FEX64 backend.")
+    endif()
+    if(NOT EXISTS "${BOXEDVN_DXMT_NATIVE_ARCHIVE}")
+        message(FATAL_ERROR
+            "Native DXMT archive not found at ${BOXEDVN_DXMT_NATIVE_ARCHIVE}.")
+    endif()
+    target_compile_definitions(boxedwine_core PUBLIC BOXEDWINE_DXMT_NATIVE=1)
+    message(STATUS "BoxedVN: native DXMT archive = ${BOXEDVN_DXMT_NATIVE_ARCHIVE}")
 endif()
 
 if(NOT BOXEDVN_TARGET_IOS)

@@ -28,12 +28,14 @@ class KThread;
 // the priority is: enough surface to back ElfLoader64 segment mapping and
 // 64-bit stack setup, with simple correctness over performance.
 //
-// Deliberately NOT supported in v1:
+// Deliberately NOT supported in sparse v1:
 //   - file-backed mappings (mmap with fd)
 //   - MAP_SHARED, copy-on-write
 //   - futex pages, JIT page-write tracking
-//   - native host memory mapping
-// These will be added incrementally once the basics work end-to-end.
+//   - native host memory mapping (opt in with BOXEDWINE_KMEMORY64_NATIVE_IDENTITY)
+// The native mode is intentionally narrow: it is for a single address space
+// whose guest addresses must also be valid host addresses for a direct FEX
+// load/store. Sparse mode remains the default.
 
 #define K64_PAGE_SIZE  4096
 #define K64_PAGE_SHIFT 12
@@ -52,6 +54,41 @@ class KThread;
 // numbering — a 64-bit-only internal bit.
 #define K64_PAGE_PINNED  0x40
 
+// Windows reserves this 64 KiB region for KUSER_SHARED_DATA. iOS keeps the
+// entire low 4 GiB behind __PAGEZERO, so native-identity FEX guests use a
+// process-shared high host alias and repair the base register in the signal
+// context before retrying the faulting instruction.
+#define K64_KUSER_SHARED_BASE 0x7ffe0000ULL
+#define K64_KUSER_SHARED_SIZE 0x10000ULL
+
+// Native-identity guests are directly dereferenced by the ARM64 translator,
+// so their guest addresses must be host-mappable.  On iOS the malloc xzone
+// reserves the broad 4 GiB..64 GiB band, while the executable arena occupies
+// the range immediately below this window.  Keep all native guest mappings in
+// the empirically safe interval below.  Sparse/interpreter guests retain
+// their normal Linux-style addresses and do not use these limits.
+#define K64_NATIVE_GUEST_WINDOW_START 0x7048000000ULL
+#define K64_NATIVE_GUEST_WINDOW_END   0x7fffff0000ULL
+#define K64_NATIVE_GUEST_MMAP_BASE    K64_NATIVE_GUEST_WINDOW_START
+#define K64_NATIVE_GUEST_IMAGE_BASE  (K64_NATIVE_GUEST_WINDOW_START)
+#define K64_NATIVE_GUEST_INTERP_BASE (K64_NATIVE_GUEST_WINDOW_END - 0x200000000ULL)
+#define K64_NATIVE_GUEST_STACK_TOP   (K64_NATIVE_GUEST_WINDOW_END - 0x100000ULL)
+#define K64_NATIVE_GUEST_TLS_BASE    (K64_NATIVE_GUEST_STACK_TOP - 0x900000ULL)
+
+#if defined(__cplusplus)
+static_assert((K64_NATIVE_GUEST_WINDOW_START & K64_PAGE_MASK) == 0,
+              "native guest window start must be guest-page aligned");
+static_assert((K64_NATIVE_GUEST_WINDOW_END & K64_PAGE_MASK) == 0,
+              "native guest window end must be guest-page aligned");
+static_assert((K64_NATIVE_GUEST_WINDOW_START & 0x3FFFULL) == 0 &&
+              (K64_NATIVE_GUEST_WINDOW_END & 0x3FFFULL) == 0,
+              "native guest window must be 16 KiB host-page aligned");
+static_assert(K64_NATIVE_GUEST_WINDOW_START < K64_NATIVE_GUEST_WINDOW_END,
+              "native guest window must have positive size");
+static_assert(K64_NATIVE_GUEST_INTERP_BASE > K64_NATIVE_GUEST_MMAP_BASE,
+              "native interpreter base must follow the mmap region");
+#endif
+
 // A guest page slot. `data` is allocated lazily: a freshly reserved page (mmap
 // of an address wine may never touch — its huge PROT_NONE reservations) carries
 // no backing buffer (data==nullptr) and reads as zero, so host RAM tracks pages
@@ -67,36 +104,91 @@ struct K64Page {
     // same file page, so wineserver's writes are visible to clients and vice
     // versa. We must NOT delete[] or reallocate a borrowed buffer.
     bool dataShared = false;
-    ~K64Page() { if (!dataShared) delete[] data; }
+    // Shared mappings keep an indirection slot so an interpreter-backed page
+    // can be promoted to the FEX process's fixed identity address later. All
+    // sparse aliases then observe the new backing without retaining pointers
+    // to destroyed K64Page objects.
+    std::shared_ptr<std::atomic<U8*>> sharedData;
+    // Stable canonical heap page for a shared-file mapping. Native identity
+    // promotion temporarily points sharedData at a fixed host address; this
+    // lets MAP_FIXED/munmap copy the page back before that address is reused.
+    U8* sharedCanonical = nullptr;
+    // When set, `data` points into an OS mmap at the guest address and is not
+    // owned by this slot. The KMemory64 owner unmaps native ranges first.
+    bool dataNative = false;
+    ~K64Page() { if (!dataShared && !dataNative) delete[] data; }
+    U8* hostData() const { return sharedData ? sharedData->load(std::memory_order_acquire) : data; }
     // Allocate + zero the backing buffer on first write/commit. Idempotent.
     U8* commit() {
-        if (!data) {
+        if (!hostData()) {
             data = new U8[K64_PAGE_SIZE];
             ::memset(data, 0, K64_PAGE_SIZE);
         }
-        return data;
+        return hostData();
     }
     // Point this page at a process-shared backing buffer (not owned here).
-    void adoptShared(U8* shared) {
-        if (data && !dataShared) delete[] data;
-        data = shared;
+    void adoptShared(const std::shared_ptr<std::atomic<U8*>>& shared, bool native = false,
+                     U8* canonical = nullptr) {
+        if (data && !dataShared && !dataNative) delete[] data;
+        sharedData = shared;
+        data = shared ? shared->load(std::memory_order_acquire) : nullptr;
         dataShared = true;
+        dataNative = native;
+        sharedCanonical = canonical;
     }
-    // Drop the backing buffer (munmap / PROT_NONE). The slot survives; a later
-    // read returns zero, a later write re-commits a fresh zero page. A borrowed
-    // shared buffer is detached (not freed — the registry owns it).
+    // Point this page at its identity-mapped host address (not owned here).
+    void adoptNative(U8* native) {
+        if (data && !dataShared && !dataNative) delete[] data;
+        data = native;
+        dataShared = false;
+        dataNative = true;
+        sharedData.reset();
+        sharedCanonical = nullptr;
+    }
+    // Drop the backing buffer (native munmap or sparse PROT_NONE). The slot
+    // survives; sparse mode later reads zero and re-commits on write. A
+    // borrowed shared buffer is detached (not freed — the registry owns it).
     void decommit() {
-        if (!dataShared) delete[] data;
+        if (!dataShared && !dataNative) delete[] data;
         data = nullptr;
         dataShared = false;
+        dataNative = false;
+        sharedData.reset();
+        sharedCanonical = nullptr;
     }
-    bool committed() const { return data != nullptr; }
+    // Copy an identity-promoted shared page back to its canonical heap page
+    // before the fixed host mapping is unmapped or replaced.
+    void demoteNativeShared() {
+        if (!dataShared || !dataNative || !sharedData || !sharedCanonical) return;
+        U8* current = sharedData->load(std::memory_order_acquire);
+        if (current && current != sharedCanonical) {
+            ::memcpy(sharedCanonical, current, K64_PAGE_SIZE);
+        }
+        sharedData->store(sharedCanonical, std::memory_order_release);
+        data = sharedCanonical;
+        dataNative = false;
+    }
+    bool committed() const { return hostData() != nullptr; }
 };
 
 class KMemory64 {
 public:
-    explicit KMemory64(KProcess* process);
+    explicit KMemory64(KProcess* process, bool nativeIdentity = false);
     ~KMemory64();
+
+    // True only when this build was explicitly compiled with native identity
+    // mappings. The default sparse implementation returns false.
+    bool nativeIdentityMode() const;
+
+    // Guard a host MAP_FIXED operation before it reaches the OS. Sparse mode
+    // accepts every canonical guest range; native identity mode accepts only
+    // the proven iOS window (plus the special KUSER shared-data alias).
+    bool nativeGuestRangeAllowed(U64 addr, U64 len) const;
+
+    // Return the host alias for a canonical KUSER_SHARED_DATA address, or 0
+    // when this address space is sparse / has not mapped the alias. This is
+    // intentionally narrow; it is not a general guest-pointer translation.
+    U64 nativeAliasForGuest(U64 guestAddress) const;
 
     // mmap subset: anonymous + fixed only in v1. Returns the mapped guest
     // address, or (U64)-errno on failure. addr MUST be page-aligned and
@@ -133,13 +225,14 @@ public:
     // only invoke this against fully-mapped ranges — RELRO enforcement on
     // the GOT, and eventually JIT page-write tracking).
     //
-    // Returns the requested addr on success, (U64)-errno on failure (only
-    // failure mode today is addr not page-aligned). Does NOT touch page
-    // data. Used by the loader to honor PT_GNU_RELRO after relocations.
+    // Returns the requested addr on success, (U64)-errno on failure. Does NOT
+    // create missing mappings. Used by the loader to honor PT_GNU_RELRO after
+    // relocations.
     U64 mprotect(U64 addr, U64 len, U32 prot);
 
     // Unmap [addr, addr+len): drop the backing pages so the address range is
-    // genuinely free for reuse. A no-op munmap (the old behaviour) breaks wine:
+    // genuinely free for reuse. A no-op sparse munmap (the old behaviour)
+    // breaks wine:
     // wine munmaps a view, removes it from its own views_tree, then maps a fresh
     // view at the SAME address — but if the pages are still mapped, wine's
     // create_view finds an overlapping NON-system view and aborts
@@ -155,7 +248,7 @@ public:
     // is absent/uncommitted. Used by the CPU64 instruction-fetch cache to grab a
     // stable per-page pointer once (under the lock) and then read bytes from it
     // directly. The returned pointer stays valid until the page is decommitted
-    // (which munmap does NOT do) or the process tears down. Does NOT commit a
+    // (native logical munmap may clear it) or the process tears down. Does NOT commit a
     // fresh page — an uncommitted page reads as zero, and code never executes
     // from a never-written page, so returning nullptr (caller falls back to
     // readb) is correct.
@@ -244,6 +337,7 @@ public:
 
 private:
     KProcess* process;
+    bool nativeIdentity = false;
     std::unordered_map<U64, std::unique_ptr<K64Page>> pages;
     // Guards every mutation/lookup of `pages`. In the multi-threaded build all
     // guest threads share one KMemory64 and fault in pages concurrently; an
@@ -264,7 +358,8 @@ private:
     BOXEDWINE_MUTEX mmapMutex;
     U64 mmapNext = 0;
 
-    // Reserved address-space ranges drawn from the mmap region (>= K64_MMAP_BASE).
+    // Reserved address-space ranges drawn from the active mmap region (the
+    // historical sparse base or K64_NATIVE_GUEST_MMAP_BASE).
     // Keyed by start PAGE number, ordered, so a gap search is O(log n + ranges
     // scanned) instead of the old O(pages) per-page isPageMapped() scan that
     // degraded badly as the page map grew (the boot slowdown). munmap removes /
@@ -275,6 +370,19 @@ private:
     enum MMapKind : U8 { MMAP_ANON = 0, MMAP_FILE = 1, MMAP_RESERVED = 2 };
     struct MMapRange { U64 startPage; U64 pageCount; U32 prot; U8 kind; };
     std::map<U64, MMapRange> ranges;
+
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    struct NativeRange { U64 hostStart; U64 hostLength; U32 prot; };
+    std::map<U64, NativeRange> nativeRanges;
+    bool nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh);
+    bool nativeRangeCovers(U64 start, U64 end) const;
+    void nativeForgetRange(U64 start, U64 length);
+    void nativeDemoteSharedPages();
+    void nativeUnmapAll();
+    bool nativeMapKuserAlias(U64 addr, U64 len, bool& fresh);
+    void nativeReleaseKuserAlias();
+    bool nativeKuserAliasHeld = false;
+#endif
 
     // Add/trim/remove range bookkeeping. Callers must hold mmapMutex.
     void rangeInsertLocked(U64 startPage, U64 pageCount, U32 prot, U8 kind);

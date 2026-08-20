@@ -10,6 +10,10 @@
 #                        [--skip-dependencies]
 #                        [--no-bundled-rootfs]
 #                        [--enable-fex64]
+#                        [--wine64-runtime DIR|ARCHIVE.zip]
+#                        [--wine64-runtime-manifest FILE]
+#                        [--x64-graphics-runtime DIR]
+#                        [--dxmt-native-archive FILE]
 #
 # --no-bundled-rootfs omits the ~160 MB root filesystem archive, producing a
 # small IPA for fast sign/install iterations.  The app then asks the user to
@@ -33,6 +37,10 @@ SIGN=0
 SKIP_DEPENDENCIES=0
 NO_BUNDLED_ROOTFS=0
 ENABLE_FEX64=0
+WINE64_RUNTIME_INPUT=""
+WINE64_RUNTIME_MANIFEST=""
+X64_GRAPHICS_RUNTIME_INPUT=""
+DXMT_NATIVE_ARCHIVE=""
 
 usage() {
     sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -48,6 +56,14 @@ while [[ $# -gt 0 ]]; do
         --skip-dependencies) SKIP_DEPENDENCIES=1; shift ;;
         --no-bundled-rootfs) NO_BUNDLED_ROOTFS=1; shift ;;
         --enable-fex64) ENABLE_FEX64=1; shift ;;
+        --wine64-runtime) [[ $# -ge 2 ]] || die "--wine64-runtime needs a value"
+                           WINE64_RUNTIME_INPUT="$2"; shift 2 ;;
+        --wine64-runtime-manifest) [[ $# -ge 2 ]] || die "--wine64-runtime-manifest needs a value"
+                                   WINE64_RUNTIME_MANIFEST="$2"; shift 2 ;;
+        --x64-graphics-runtime) [[ $# -ge 2 ]] || die "--x64-graphics-runtime needs a value"
+                                X64_GRAPHICS_RUNTIME_INPUT="$2"; shift 2 ;;
+        --dxmt-native-archive) [[ $# -ge 2 ]] || die "--dxmt-native-archive needs a value"
+                               DXMT_NATIVE_ARCHIVE="$2"; shift 2 ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "Unknown argument '$1'. Run with --help." ;;
     esac
@@ -61,6 +77,40 @@ esac
 OUTPUT_DIR="${OUTPUT_DIR:-${BOXEDVN_ROOT}/build/ios-${CONFIGURATION}}"
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
+
+if [[ -n "${WINE64_RUNTIME_INPUT}" && ${ENABLE_FEX64} -ne 1 ]]; then
+    die "--wine64-runtime requires --enable-fex64. The existing iOS runtime has
+no 64-bit guest loader when the optional FEX64 backend is disabled."
+fi
+if [[ -n "${WINE64_RUNTIME_MANIFEST}" && -z "${WINE64_RUNTIME_INPUT}" ]]; then
+    die "--wine64-runtime-manifest requires --wine64-runtime."
+fi
+if [[ -n "${X64_GRAPHICS_RUNTIME_INPUT}" && ${ENABLE_FEX64} -ne 1 ]]; then
+    die "--x64-graphics-runtime requires --enable-fex64."
+fi
+if [[ -n "${X64_GRAPHICS_RUNTIME_INPUT}" && -z "${WINE64_RUNTIME_INPUT}" ]]; then
+    die "--x64-graphics-runtime requires --wine64-runtime."
+fi
+if [[ -n "${X64_GRAPHICS_RUNTIME_INPUT}" ]]; then
+    [[ -d "${X64_GRAPHICS_RUNTIME_INPUT}" ]] || die \
+        "x64 graphics resources must be supplied as a directory."
+    require_file "${X64_GRAPHICS_RUNTIME_INPUT}/boxedvn-d3d11-cube-x64.exe"
+    require_file "${X64_GRAPHICS_RUNTIME_INPUT}/x64-graphics.manifest"
+    require_file "${X64_GRAPHICS_RUNTIME_INPUT}/libdxmt_combined.a"
+    [[ -d "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x64" ]] || die \
+        "x64 graphics resources are missing dxmt-x64/."
+    for dxmt_dll in d3d11 dxgi d3d10core winemetal; do
+        require_file "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x64/${dxmt_dll}.dll"
+    done
+    if [[ -z "${DXMT_NATIVE_ARCHIVE}" ]]; then
+        DXMT_NATIVE_ARCHIVE="${X64_GRAPHICS_RUNTIME_INPUT}/libdxmt_combined.a"
+    fi
+fi
+if [[ -n "${DXMT_NATIVE_ARCHIVE}" ]]; then
+    [[ ${ENABLE_FEX64} -eq 1 ]] || die "--dxmt-native-archive requires --enable-fex64."
+    require_file "${DXMT_NATIVE_ARCHIVE}" \
+        "Build the native iPhoneOS DXMT archive before this step."
+fi
 
 require_macos
 require_command cmake "Install with 'brew install cmake'."
@@ -127,7 +177,24 @@ if [[ ${ENABLE_FEX64} -eq 1 ]]; then
         -DBOXEDVN_ENABLE_GUEST_X64=ON
         -DBOXEDVN_FEX64_ROOT="${FEX64_PREFIX}"
     )
+    [[ -n "${DXMT_NATIVE_ARCHIVE}" ]] && cmake_options+=(
+        -DBOXEDVN_DXMT_NATIVE_ARCHIVE="${DXMT_NATIVE_ARCHIVE}"
+    )
     log "Optional BoxedWine x86-64 guest ABI and FEX translator enabled"
+fi
+
+WINE64_PREPARED_DIR=""
+if [[ -n "${WINE64_RUNTIME_INPUT}" ]]; then
+    WINE64_PREPARED_DIR="${OUTPUT_DIR}/wine64-runtime-validated"
+    log "Validating CI-produced BoxedWine64 Wine64 layers"
+    wine64_prepare_args=(
+        --input "${WINE64_RUNTIME_INPUT}"
+        --output-dir "${WINE64_PREPARED_DIR}"
+    )
+    [[ -n "${WINE64_RUNTIME_MANIFEST}" ]] \
+        && wine64_prepare_args+=(--manifest "${WINE64_RUNTIME_MANIFEST}")
+    bash "${BOXEDVN_SCRIPT_DIR}/prepare-wine64-runtime.sh" "${wine64_prepare_args[@]}"
+    ok "Wine64 layers validated; they will be staged as optional app resources"
 fi
 
 log "Configuring the native build (${CONFIGURATION})"
@@ -161,18 +228,81 @@ ok "libboxedvn.a: $(lipo -info "${MERGED_LIBRARY}")"
 # interrupted build can never lose a 160 MB download.
 BUNDLED_ROOTFS="${BOXEDVN_ROOT}/ios/app/Bundled/boxedwine.zip"
 STASHED_ROOTFS=""
-restore_bundled_rootfs() {
+WINE64_BUNDLE_DIR="${BOXEDVN_ROOT}/ios/app/Bundled/boxedwine64-runtime"
+STASHED_WINE64_BUNDLE=""
+CREATED_WINE64_BUNDLE=0
+CREATED_BUNDLED_DIR=0
+restore_bundled_resources() {
     if [[ -n "${STASHED_ROOTFS}" && -f "${STASHED_ROOTFS}" ]]; then
         mv "${STASHED_ROOTFS}" "${BUNDLED_ROOTFS}"
         STASHED_ROOTFS=""
     fi
+    if [[ -n "${STASHED_WINE64_BUNDLE}" && -d "${STASHED_WINE64_BUNDLE}" ]]; then
+        if [[ -d "${WINE64_BUNDLE_DIR}" ]]; then
+            # This is the exact temporary staging directory created below.
+            # Remove it before restoring the developer's original bundle;
+            # otherwise mv nests the stash inside the staged directory.
+            rm -rf "${WINE64_BUNDLE_DIR}"
+        fi
+        mv "${STASHED_WINE64_BUNDLE}" "${WINE64_BUNDLE_DIR}"
+        STASHED_WINE64_BUNDLE=""
+        CREATED_WINE64_BUNDLE=0
+    elif [[ ${CREATED_WINE64_BUNDLE} -eq 1 && -d "${WINE64_BUNDLE_DIR}" ]]; then
+        # This exact directory was created by this invocation; do not leave
+        # runtime material in the source tree after a build.
+        rm -rf "${WINE64_BUNDLE_DIR}"
+        CREATED_WINE64_BUNDLE=0
+    fi
+    if [[ ${CREATED_BUNDLED_DIR} -eq 1 && -d "$(dirname "${WINE64_BUNDLE_DIR}")" ]]; then
+        rmdir "$(dirname "${WINE64_BUNDLE_DIR}")" 2>/dev/null || true
+        CREATED_BUNDLED_DIR=0
+    fi
 }
-trap restore_bundled_rootfs EXIT
+trap restore_bundled_resources EXIT
 if [[ ${NO_BUNDLED_ROOTFS} -eq 1 && -f "${BUNDLED_ROOTFS}" ]]; then
     STASHED_ROOTFS="${BOXEDVN_ROOT}/build/boxedwine.zip.stashed"
     mkdir -p "$(dirname "${STASHED_ROOTFS}")"
     mv "${BUNDLED_ROOTFS}" "${STASHED_ROOTFS}"
     log "Building without the bundled root filesystem; the app will require an imported runtime ZIP"
+fi
+
+if [[ -n "${WINE64_PREPARED_DIR}" ]]; then
+    if [[ -e "${WINE64_BUNDLE_DIR}" ]]; then
+        [[ -d "${WINE64_BUNDLE_DIR}" ]] \
+            || die "Refusing to replace non-directory '${WINE64_BUNDLE_DIR}'."
+        STASHED_WINE64_BUNDLE="${OUTPUT_DIR}/boxedwine64-runtime.stashed"
+        [[ ! -e "${STASHED_WINE64_BUNDLE}" ]] \
+            || die "Refusing to overwrite existing '${STASHED_WINE64_BUNDLE}'."
+        mv "${WINE64_BUNDLE_DIR}" "${STASHED_WINE64_BUNDLE}"
+    fi
+    if [[ ! -d "$(dirname "${WINE64_BUNDLE_DIR}")" ]]; then
+        mkdir -p "$(dirname "${WINE64_BUNDLE_DIR}")"
+        CREATED_BUNDLED_DIR=1
+    fi
+    mkdir -p "${WINE64_BUNDLE_DIR}"
+    CREATED_WINE64_BUNDLE=1
+    cp "${WINE64_PREPARED_DIR}/glibc-rootfs64.zip" \
+       "${WINE64_BUNDLE_DIR}/glibc-rootfs64.zip"
+    cp "${WINE64_PREPARED_DIR}/wine64.zip" \
+       "${WINE64_BUNDLE_DIR}/wine64.zip"
+    cp "${WINE64_PREPARED_DIR}/wine64-runtime.manifest" \
+       "${WINE64_BUNDLE_DIR}/wine64-runtime.manifest"
+    log "Staged optional BoxedWine64 runtime resources in the app bundle"
+fi
+
+if [[ -n "${X64_GRAPHICS_RUNTIME_INPUT}" ]]; then
+    if [[ ! -d "${WINE64_BUNDLE_DIR}" ]]; then
+        mkdir -p "${WINE64_BUNDLE_DIR}"
+        CREATED_WINE64_BUNDLE=1
+    fi
+    cp "${X64_GRAPHICS_RUNTIME_INPUT}/boxedvn-d3d11-cube-x64.exe" \
+       "${WINE64_BUNDLE_DIR}/boxedvn-d3d11-cube-x64.exe"
+    rm -rf "${WINE64_BUNDLE_DIR}/dxmt-x64"
+    cp -R "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x64" \
+          "${WINE64_BUNDLE_DIR}/dxmt-x64"
+    cp "${X64_GRAPHICS_RUNTIME_INPUT}/x64-graphics.manifest" \
+       "${WINE64_BUNDLE_DIR}/x64-graphics.manifest"
+    log "Staged validated x86-64 graphics probe and DXMT PE resources"
 fi
 
 log "Generating the application project"
@@ -247,6 +377,9 @@ ok "Built ${APP_PATH}"
 # ---------------------------------------------------------------------------
 # 4. Validate the product before anyone tries to install it
 # ---------------------------------------------------------------------------
+if [[ -n "${DXMT_NATIVE_ARCHIVE}" ]]; then
+    export BOXEDVN_REQUIRE_DXMT_NATIVE=1
+fi
 "${BOXEDVN_SCRIPT_DIR}/validate-app.sh" "${APP_PATH}"
 
 printf '\n'

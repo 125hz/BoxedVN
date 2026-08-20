@@ -62,6 +62,26 @@ minimum="$(otool -l "${EXECUTABLE}" \
     | awk '/LC_BUILD_VERSION/{found=1} found && /minos/{print $2; exit}')"
 ok "minimum iOS version: ${minimum:-unknown}"
 
+# DXMT locates the host display table with dlsym(RTLD_DEFAULT, ...). A source
+# declaration is not evidence that Release linking kept it in the export trie,
+# so reject an IPA that could execute D3D11 but has nowhere to present it.
+exports="$(xcrun dyld_info -exports "${EXECUTABLE}" 2>/dev/null || true)"
+if [[ "${exports}" != *"macdrv_functions"* ]]; then
+    die "The app does not export macdrv_functions. DXMT resolves this table by
+name at runtime; check BVNDXMTDisplay.m and the force-link setting."
+fi
+ok "DXMT host display table exported"
+if [[ "${BOXEDVN_REQUIRE_DXMT_NATIVE:-0}" == "1" && \
+      "${exports}" != *"dxmt_winemetal_unix_call_funcs" ]]; then
+    die "The x86-64 build does not retain dxmt_winemetal_unix_call_funcs.
+Check the native DXMT archive and its force-link setting."
+fi
+if [[ "${exports}" == *"dxmt_winemetal_unix_call_funcs" ]]; then
+    ok "DXMT native unix-call table retained"
+elif [[ "${BOXEDVN_REQUIRE_DXMT_NATIVE:-0}" != "1" ]]; then
+    warn "No native DXMT unix-call table in this non-x86-64 build"
+fi
+
 # --- Info.plist -------------------------------------------------------------
 require_file "${INFO_PLIST}" "The app bundle has no Info.plist."
 

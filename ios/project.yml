@@ -63,6 +63,9 @@ targets:
       # Populated by scripts/fetch-rootfs.sh when BOXEDVN_BUNDLE_ROOTFS is on.
       # Optional so a clean clone builds without the multi-hundred-megabyte
       # root filesystem archive.
+      # The iOS build stages validated Wine64/FEX/DXMT resources here when the
+      # x86-64 acceptance target is enabled. The directory remains optional so
+      # the ordinary 32-bit build can still be produced from a clean clone.
       - path: app/Bundled
         optional: true
         buildPhase: resources
@@ -104,6 +107,7 @@ targets:
           - $(inherited)
           - -lboxedvn
           - -lc++
+          - -lsqlite3
           # libboxedvn.a contains BVNAppDelegate, which nothing references by
           # symbol - SDL looks it up by name at runtime - so the linker would
           # otherwise drop it.  ObjC keeps every Objective-C class; all_load
@@ -112,6 +116,10 @@ targets:
           # MoltenVK is discovered by SDL with dlsym(RTLD_DEFAULT), so force
           # its loader entry point out of the merged static archive.
           - -Wl,-u,_vkGetInstanceProcAddr
+          # DXMT resolves this table by name from the main executable. Force
+          # the object out of libboxedvn.a even before an x64 launch requests
+          # the presentation surface, then verify the export after linking.
+          - -Wl,-u,_macdrv_functions
         CLANG_ENABLE_MODULES: YES
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         # Sideloading tools re-sign the IPA, so CI produces it unsigned.
@@ -131,6 +139,8 @@ targets:
       # application target has to name them again.
       - sdk: AudioToolbox.framework
       - sdk: AVFoundation.framework
+      - sdk: CoreFoundation.framework
+      - sdk: MetalFX.framework
       - sdk: CoreAudio.framework
       # SDL2's HIDAPI backend (src/hidapi/ios/hid.m) talks to Steam
       # Controllers over BLE and references CBCentralManager.

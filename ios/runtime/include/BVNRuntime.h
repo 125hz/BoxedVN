@@ -217,6 +217,13 @@ const char* BVNPathBundledRootFilesystemZip(void);
 // NULL when the build did not include them.
 const char* BVNPathBundledDxvkDirectory(void);
 
+// Optional BoxedWine x86-64 runtime resources. These return NULL unless the
+// validated glibc/Wine64 layers were bundled by scripts/build-ios.sh.
+const char* BVNPathBundledWine64GlibcZip(void);
+const char* BVNPathBundledWine64Zip(void);
+const char* BVNPathBundledX64GraphicsProbe(void);
+const char* BVNPathBundledDXMTDirectory(void);
+
 // ---------------------------------------------------------------------------
 // Launching a guest
 // ---------------------------------------------------------------------------
@@ -231,6 +238,12 @@ typedef struct {
     // Absolute host path of the Boxedwine root filesystem ZIP.  Mounted
     // read-only at '/'; writes land in writableRootPath.  Required.
     const char* rootFilesystemZipPath;
+
+    // Additional read-only root filesystem layers. x86-64 launches mount the
+    // validated glibc and Wine64 archives here after the ordinary BoxedWine
+    // archive. May be NULL when count is zero.
+    const char* const* rootFilesystemOverlayZipPaths;
+    size_t rootFilesystemOverlayZipCount;
 
     // Absolute host path of the writable overlay for this session.  Created if
     // missing.  Required.
@@ -291,6 +304,11 @@ typedef struct {
     // executablePath directly.  Windows programs need this; Linux programs
     // such as /bin/wine itself do not.
     bool runThroughWine;
+
+    // Per-launch optional 64-bit CPU and renderer selection. Neither changes
+    // the default IA-32 path for other sessions.
+    bool useFEX64;
+    bool useDXMT;
 } BVNLaunchRequest;
 
 // Records a launch request.  Returns false and fills errorBuffer when the

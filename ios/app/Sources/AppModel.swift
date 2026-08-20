@@ -573,6 +573,95 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Runs the bundled AMD64 Direct3D 11 probe through Wine64 and the
+    /// BoxedWine-owned FEX/DXMT path. Every resource is checked here so a
+    /// packaging omission becomes an actionable alert instead of a guest
+    /// loader failure several seconds later.
+    func launchX64GraphicsProbe(_ container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let prefixes = Storage.winePrefixes else {
+            alertMessage = "Could not create the Wine prefix directory."
+            return
+        }
+        guard let glibcPointer = BVNPathBundledWine64GlibcZip(),
+              let winePointer = BVNPathBundledWine64Zip(),
+              let probePointer = BVNPathBundledX64GraphicsProbe(),
+              let dxmtPointer = BVNPathBundledDXMTDirectory() else {
+            alertMessage = "This build does not contain the validated Wine64, "
+                         + "DXMT, and AMD64 graphics-probe resources."
+            return
+        }
+
+        let glibc = URL(fileURLWithPath: String(cString: glibcPointer))
+        let wine64 = URL(fileURLWithPath: String(cString: winePointer))
+        let probe = URL(fileURLWithPath: String(cString: probePointer))
+        let dxmt = URL(fileURLWithPath: String(cString: dxmtPointer))
+        let writableRoot = prefixes.appendingPathComponent(
+            container.prefixName + "-x64", isDirectory: true)
+        let files = ContainerLibrary.filesDirectory(for: container)
+        let diagnostics = files.appendingPathComponent(
+            ".boxedvn-x64-diagnostics", isDirectory: true)
+
+        do {
+            try FileManager.default.createDirectory(
+                at: diagnostics, withIntermediateDirectories: true)
+            let probeTarget = diagnostics.appendingPathComponent(
+                "boxedvn-d3d11-cube-x64.exe")
+            if FileManager.default.fileExists(atPath: probeTarget.path) {
+                try FileManager.default.removeItem(at: probeTarget)
+            }
+            try FileManager.default.copyItem(at: probe, to: probeTarget)
+
+            for name in ["d3d11.dll", "dxgi.dll", "d3d10core.dll",
+                         "winemetal.dll"] {
+                let source = dxmt.appendingPathComponent(name)
+                let target = diagnostics.appendingPathComponent(name)
+                guard FileManager.default.fileExists(atPath: source.path) else {
+                    throw LaunchFailure(message: "The bundled DXMT runtime is "
+                        + "missing \(name).")
+                }
+                if FileManager.default.fileExists(atPath: target.path) {
+                    try FileManager.default.removeItem(at: target)
+                }
+                try FileManager.default.copyItem(at: source, to: target)
+            }
+
+            Log.write("Launching bundled AMD64 Direct3D 11 graphics probe "
+                      + "through BoxedWine FEX and DXMT", category: "container")
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                rootFilesystemOverlays: [glibc, wine64],
+                writableRoot: writableRoot,
+                gameDirectory: files,
+                sharedDirectory: Storage.sharedFiles,
+                executablePath:
+                    "d:\\.boxedvn-x64-diagnostics\\boxedvn-d3d11-cube-x64.exe",
+                arguments: [],
+                environment: [
+                    "WINEDEBUG=warn+module,warn+seh",
+                    "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
+                ],
+                workingDirectory: "d:\\.boxedvn-x64-diagnostics\\",
+                width: container.width,
+                height: container.height,
+                soundEnabled: false,
+                runThroughWine: true,
+                useFEX64: true,
+                useDXMT: true,
+                wineRenderer: BVNWineRendererAutomatic,
+                sharedDriveLetter:
+                    container.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container.windowsVersion,
+                compatibilityDirectory: diagnostics)
+        } catch {
+            alertMessage = "The 64-bit graphics probe could not start: "
+                         + error.localizedDescription
+        }
+    }
+
     /// Browse the emulated PC: Wine's file manager, in the tools prefix that
     /// Notepad also runs in, so a file saved from one is visible in the other.
     /// Games keep their own prefixes - see `launch(_:)` for why.

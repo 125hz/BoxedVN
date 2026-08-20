@@ -374,6 +374,10 @@ std::vector<std::string> BVNBuildLaunchArguments(
 
     argv.push_back("-zip");
     argv.push_back(launch.rootFilesystemZipPath);
+    for (const std::string& overlay : launch.rootFilesystemOverlayZipPaths) {
+        argv.push_back("-zip");
+        argv.push_back(overlay);
+    }
 
     // StartUpArgs::parseStartupArgs treats -nozip as a valueless switch.
     // Supplying "1" here leaves it unconsumed, making Boxedwine launch a
@@ -488,6 +492,10 @@ std::vector<std::string> BVNBuildLaunchArguments(
         argv.push_back("WINEDEBUG=warn+d3d_shader,-d3d");
     }
 
+    if (launch.useFEX64) {
+        argv.push_back("-env");
+        argv.push_back("BOXEDWINE_CPU64=fex");
+    }
     for (const std::string& entry : launch.environment) {
         argv.push_back("-env");
         argv.push_back(entry);
@@ -508,7 +516,7 @@ std::vector<std::string> BVNBuildLaunchArguments(
     }
 
     if (launch.runThroughWine) {
-        argv.push_back("/bin/wine");
+        argv.push_back(launch.useFEX64 ? "/usr/bin/wine64" : "/bin/wine");
     }
     argv.push_back(launch.executablePath);
     for (const std::string& argument : launch.arguments) {

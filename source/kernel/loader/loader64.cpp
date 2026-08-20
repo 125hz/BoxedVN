@@ -23,6 +23,9 @@
 #ifndef PT_INTERP
 #define PT_INTERP 3
 #endif
+#ifndef PT_PHDR
+#define PT_PHDR 6
+#endif
 // GNU extensions — not in the SysV phdr set but every modern toolchain
 // emits them. PT_GNU_RELRO marks the region the linker should mprotect
 // to read-only after relocations complete (typically .got + .got.plt).
@@ -74,10 +77,12 @@ Elf64ParseResult ElfLoader64::parseBuffer(const U8* data, U64 length) {
         return result;
     }
     // Bounds check: phdr table must fit inside the buffer.
-    U64 phdrEnd = ehdr.e_phoff + (U64)ehdr.e_phnum * ehdr.e_phentsize;
-    if (phdrEnd > length) {
-        klog_fmt("ElfLoader64::parseBuffer: phdr table extends past buffer (%llu > %llu)",
-                 (unsigned long long)phdrEnd,
+    const U64 phdrBytes = (U64)ehdr.e_phnum * ehdr.e_phentsize;
+    if (ehdr.e_phoff > length || phdrBytes > length - ehdr.e_phoff) {
+        klog_fmt("ElfLoader64::parseBuffer: phdr table extends past buffer "
+                 "(offset=%llu size=%llu length=%llu)",
+                 (unsigned long long)ehdr.e_phoff,
+                 (unsigned long long)phdrBytes,
                  (unsigned long long)length);
         return result;
     }
@@ -96,6 +101,14 @@ Elf64ParseResult ElfLoader64::parseBuffer(const U8* data, U64 length) {
         memcpy(&phdr, data + phdrOff, sizeof(phdr));
 
         if (phdr.p_type == PT_LOAD) {
+            if (phdr.p_filesz > phdr.p_memsz ||
+                phdr.p_offset > length ||
+                phdr.p_filesz > length - phdr.p_offset ||
+                phdr.p_vaddr > UINT64_MAX - phdr.p_memsz) {
+                klog("ElfLoader64::parseBuffer: invalid PT_LOAD bounds");
+                return result;
+            }
+            if (phdr.p_memsz == 0) continue;
             Elf64LoadSegment seg;
             seg.vaddr  = phdr.p_vaddr;
             seg.memsz  = phdr.p_memsz;
@@ -105,14 +118,19 @@ Elf64ParseResult ElfLoader64::parseBuffer(const U8* data, U64 length) {
             seg.align  = phdr.p_align;
             result.segments.push_back(seg);
             if (phdr.p_vaddr < lo) lo = phdr.p_vaddr;
-            if (phdr.p_vaddr + phdr.p_memsz > hi) hi = phdr.p_vaddr + phdr.p_memsz;
+            const U64 segmentEnd = phdr.p_vaddr + phdr.p_memsz;
+            if (segmentEnd > hi) hi = segmentEnd;
+        } else if (phdr.p_type == PT_PHDR) {
+            result.phdrVaddr = phdr.p_vaddr;
+            result.phdrPresent = true;
         } else if (phdr.p_type == PT_INTERP) {
             if (phdr.p_filesz == 0 || phdr.p_filesz > INTERP_PATH_MAX) {
                 klog_fmt("ElfLoader64::parseBuffer: PT_INTERP filesz %llu out of range",
                          (unsigned long long)phdr.p_filesz);
                 return result;
             }
-            if (phdr.p_offset + phdr.p_filesz > length) {
+            if (phdr.p_offset > length ||
+                phdr.p_filesz > length - phdr.p_offset) {
                 klog("ElfLoader64::parseBuffer: PT_INTERP extends past buffer");
                 return result;
             }
@@ -146,6 +164,22 @@ Elf64ParseResult ElfLoader64::parseBuffer(const U8* data, U64 length) {
     }
     result.baseAddrLow = lo;
     result.baseAddrHigh = hi;
+    if (!result.phdrPresent) {
+        // PT_PHDR is optional. When absent, derive the in-memory address from
+        // the PT_LOAD segment that contains the file's program-header table.
+        // AT_PHDR is a virtual address, not baseAddrLow + e_phoff: the latter
+        // is wrong whenever the first load segment has a non-zero p_offset or
+        // a vaddr that does not equal its file offset.
+        for (const Elf64LoadSegment& seg : result.segments) {
+            if (ehdr.e_phoff >= seg.offset &&
+                ehdr.e_phoff - seg.offset <= seg.filesz &&
+                phdrBytes <= seg.filesz - (ehdr.e_phoff - seg.offset)) {
+                result.phdrVaddr = seg.vaddr + (ehdr.e_phoff - seg.offset);
+                result.phdrPresent = true;
+                break;
+            }
+        }
+    }
     result.ok = true;
     return result;
 }
@@ -214,7 +248,8 @@ bool ElfLoader64::mapSegmentsFromBuffer(KMemory64* mem,
         U64 trailing = vaddr - alignedAddr;
         U64 mapLen = (seg.memsz + trailing + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
         U32 prot = phdrFlagsToProt(seg.flags);
-        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, prot);
+        const U32 loadProt = prot | K_PROT_READ | K_PROT_WRITE;
+        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, loadProt);
         if (mapped != alignedAddr) {
             klog_fmt("mapSegmentsFromBuffer[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
                      tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
@@ -230,6 +265,11 @@ bool ElfLoader64::mapSegmentsFromBuffer(KMemory64* mem,
                 return false;
             }
             mem->memcpyToGuest(vaddr, buffer + seg.offset, seg.filesz);
+        }
+        if (mem->mprotect(alignedAddr, mapLen, prot) != alignedAddr) {
+            klog_fmt("mapSegmentsFromBuffer[%s]: final mprotect failed at 0x%llx",
+                     tag, (unsigned long long)alignedAddr);
+            return false;
         }
     }
     return true;
@@ -247,7 +287,8 @@ static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
         U64 trailing = vaddr - alignedAddr;
         U64 mapLen = (seg.memsz + trailing + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
         U32 prot = phdrFlagsToProt(seg.flags);
-        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, prot);
+        const U32 loadProt = prot | K_PROT_READ | K_PROT_WRITE;
+        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, loadProt);
         if (mapped != alignedAddr) {
             klog_fmt("loadProgram64[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
                      tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
@@ -263,6 +304,11 @@ static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
                 return false;
             }
             mem->memcpyToGuest(vaddr, buf.data(), seg.filesz);
+        }
+        if (mem->mprotect(alignedAddr, mapLen, prot) != alignedAddr) {
+            klog_fmt("loadProgram64[%s]: final mprotect failed at 0x%llx",
+                     tag, (unsigned long long)alignedAddr);
+            return false;
         }
         klog_fmt("loadProgram64[%s]:   mapped seg vaddr=0x%llx len=0x%llx prot=0x%x filesz=0x%llx",
                  tag,
@@ -853,11 +899,29 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     }
     KProcess* process = thread->process.get();
     if (!process->memory64) {
-        process->memory64 = new KMemory64(process);
+        process->memory64 = new KMemory64(process,
+#ifdef BOXEDWINE_FEX64_BACKEND
+                                          process->useFEX64
+#else
+                                          false
+#endif
+        );
     }
     KMemory64* mem = process->memory64;
 
-    U64 reloc = r.isPie ? X64_PIE_BASE : 0;
+    // Native-identity FEX code dereferences guest pointers as host pointers.
+    // The historical low PIE base is inside iOS's reserved malloc-xzone band,
+    // so relocate the image into the proven native guest window. This is also
+    // deliberately applied to ET_EXEC: a non-PIE image with absolute low
+    // addresses is not safe to map on this host and will be rejected by the
+    // guarded KMemory64 mapping path if its relocations cannot be honored.
+    U64 reloc = mem->nativeIdentityMode()
+        ? K64_NATIVE_GUEST_IMAGE_BASE
+        : (r.isPie ? X64_PIE_BASE : 0);
+    if (mem->nativeIdentityMode()) {
+        klog_fmt("loadProgram64: native guest image base=0x%llx (elf=%s)",
+                 (unsigned long long)reloc, r.isPie ? "PIE" : "ET_EXEC");
+    }
 
     if (!mapSegments(mem, openNode, r, reloc, "exe", (int)process->id,
                      process->name.length() ? process->name.c_str() : "exe")) {
@@ -890,7 +954,11 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // Populate process bookkeeping. ld-linux reads phdr via AT_PHDR; brk
     // syscall reads brkEnd64.
     process->entry64 = r.entry + reloc;
-    process->phdr64 = r.baseAddrLow + reloc + r.phoff;
+    if (!r.phdrPresent || r.phdrVaddr > UINT64_MAX - reloc) {
+        klog("loadProgram64: program-header table is not present in the loaded image");
+        return false;
+    }
+    process->phdr64 = r.phdrVaddr + reloc;
     process->phnum64 = r.phnum;
     process->phentsize64 = r.phentsize;
     process->brkEnd64 = (r.baseAddrHigh + reloc + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
@@ -923,7 +991,9 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         }
         // Pick a base well away from the exe and stack. ld-linux is ET_DYN
         // and small (~200 KiB), so any free high address is fine.
-        interpBase = 0x7FFFF7FCE000ULL & ~K64_PAGE_MASK;
+        interpBase = mem->nativeIdentityMode()
+            ? K64_NATIVE_GUEST_INTERP_BASE
+            : (0x7FFFF7FCE000ULL & ~K64_PAGE_MASK);
         if (!mapSegments(mem, interpNode, interpR, interpBase, "interp",
                          (int)process->id, r.interpreter.c_str())) {
             interpNode->close();
@@ -961,7 +1031,16 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // means RSP must be 16-byte aligned when _start begins. _start expects
     // argc at [RSP], argv at [RSP+8], etc.
     // -------------------------------------------------------------------
-    const U64 STACK_TOP   = 0x7FFFFFFFE000ULL; // well below 0x7FFFFFFFFFFF
+    // A normal x86-64 Linux process puts its stack near the top of the
+    // canonical 47-bit user range.  FEX's iOS backend directly dereferences
+    // guest addresses, however, and an iOS process only has the lower host VA
+    // window available for arbitrary fixed mappings.  The proven iOS FEX
+    // layout keeps its host-only allocator furniture below the proven native
+    // guest window, so place the BoxedWine guest stack inside that window.
+    // Sparse/interpreter guests retain the conventional Linux address.
+    const U64 STACK_TOP = mem->nativeIdentityMode()
+        ? K64_NATIVE_GUEST_STACK_TOP
+        : 0x7FFFFFFFE000ULL;
     const U64 STACK_SIZE  = 8ULL * 1024 * 1024;
     const U64 STACK_BASE  = STACK_TOP - STACK_SIZE;
     U64 mapped = mem->mmapAnonymousFixed(STACK_BASE, STACK_SIZE,
@@ -1082,13 +1161,15 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // init) read random memory at offset zero.
     //
     // Place the TLS block in the gap between stack-top-minus-8MB and the
-    // interpreter at 0x7FFFF7FCE000 — 1 MB at 0x7FFFF7800000 is well clear
-    // of both. Skip this step when no PT_TLS segment is present (static
+    // interpreter — a 1 MiB block below the native stack is well clear of
+    // both. Skip this step when no PT_TLS segment is present (static
     // hello-world ELFs don't have one).
     // -------------------------------------------------------------------
     U64 fsBaseToSet = 0;
     if (r.tls.present && r.tls.memsz) {
-        const U64 TLS_BLOCK_BASE = 0x7FFFF7800000ULL;
+        const U64 TLS_BLOCK_BASE = mem->nativeIdentityMode()
+            ? K64_NATIVE_GUEST_TLS_BASE
+            : 0x7FFFF7800000ULL;
         const U64 TLS_BLOCK_SIZE = 0x100000ULL; // 1 MiB — far more than enough
         U64 tlsMapped = mem->mmapAnonymousFixed(TLS_BLOCK_BASE, TLS_BLOCK_SIZE,
                                                 K_PROT_READ | K_PROT_WRITE);

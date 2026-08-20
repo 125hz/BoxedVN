@@ -1130,6 +1130,14 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
         this->startupArgs64.push_back(argValues[i]);
     }
     this->startupEnv64 = envValues;
+#ifdef BOXEDWINE_FEX64_BACKEND
+    for (const BString& value : envValues) {
+        if (value == "BOXEDWINE_CPU64=fex") {
+            this->useFEX64 = true;
+            break;
+        }
+    }
+#endif
 #endif
     if (ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {        
         if (loader.length())
@@ -1601,10 +1609,74 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         }
     }
 
+    // Linux exec removes every sibling thread before replacing the address
+    // space. Native x86-64 pages are real fixed host mappings, so deleting
+    // KMemory64 first would let a sibling FEX thread execute from unmapped
+    // memory. Quiesce siblings here; onExec below still performs the common
+    // descriptor/signal/thread-table reset after the memory replacement.
+#ifdef BOXEDWINE_GUEST_X64
+    if (this->is64Bit) {
+        std::vector<U32> siblingIds;
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
+            for (const auto& processThread : this->threads) {
+                if (processThread.value != thread) {
+                    siblingIds.push_back(processThread.key);
+                }
+            }
+        }
+        for (U32 siblingId : siblingIds) {
+            terminateOtherThread(shared_from_this(), siblingId);
+        }
+    }
+#endif
+
     // reset memory must come after we grab the args and env
     this->heap.freeAll(this->memory);
-    this->memory->execvReset(cloneVM);    
+    this->memory->execvReset(cloneVM);
     cloneVM = false;
+
+#ifdef BOXEDWINE_GUEST_X64
+    // KMemory holds the per-thread socket bounce pages used by syscall64.
+    // execvReset invalidated them, so force their next use to allocate fresh
+    // storage in the replacement image.
+    {
+        extern void bw64InvalidateScratchForThread(U32 threadId);
+        for (auto& processThread : this->threads) {
+            bw64InvalidateScratchForThread(processThread.key);
+        }
+    }
+
+    if (this->is64Bit) {
+        // The SYSCALL implementing execve is still running on cpu64's native
+        // call stack. Keep that CPU object alive, replace only its address
+        // space, and let ElfLoader64 reseed the architectural entry state.
+        const bool preserveNativeIdentity =
+            this->memory64 && this->memory64->nativeIdentityMode();
+        KMemory64* replacementMemory =
+            new KMemory64(this, preserveNativeIdentity);
+        delete this->memory64;
+        this->memory64 = replacementMemory;
+        if (this->cpu64) {
+            this->cpu64->memory = replacementMemory;
+            this->cpu64->invalidateFetchCache();
+            for (int i = 0; i < X64_REG_COUNT; ++i) {
+                this->cpu64->reg[i].setU64(0);
+            }
+            this->cpu64->rflags = 0x202;
+            this->cpu64->fsbase = 0;
+            this->cpu64->gsbase = 0;
+            this->cpu64->mmapNext = 0;
+            this->cpu64->sigMask = 0;
+            this->cpu64->futexWaiters.clear();
+            for (CPU64::SigAction& action : this->cpu64->sigActions) {
+                action = CPU64::SigAction{};
+            }
+        }
+        this->startupArgs64 = args;
+        this->startupEnv64 = envs;
+    }
+#endif
 
     thread->reset();
     this->onExec(thread);
@@ -1621,8 +1693,14 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         // :TODO: maybe alloc a new memory object and keep the old one until we know we are loaded
         kpanic("program failed to load, but memory was already reset");
     }	
-    // must come after loadProgram because of process->phdr
-    setupThreadStack(thread, thread->cpu, this->name, args, envs);
+    // ElfLoader64 builds its own SysV stack and aux vector. Keep the legacy
+    // 32-bit stack builder isolated from that address space.
+#ifdef BOXEDWINE_GUEST_X64
+    if (!this->is64Bit)
+#endif
+    {
+        setupThreadStack(thread, thread->cpu, this->name, args, envs);
+    }
     openNode->close();
     delete openNode;
 
@@ -2684,6 +2762,10 @@ U32 KProcess::forkProcess64(KThread* thread, U64 flags, U64 childTid,
         childProcess->parentId = id;
         childProcess->cloneMemoryAndProcess(shared_from_this(), false);
         childProcess->is64Bit = true;
+        // A fork child cannot own a second identity mapping at the same guest
+        // addresses inside this iOS process. It starts on the sparse CPU64
+        // path and may exec a helper without clobbering its FEX parent.
+        childProcess->useFEX64 = false;
         childProcess->brkEnd64 = brkEnd64;
         childProcess->entry64 = entry64;
         childProcess->phdr64 = phdr64;
@@ -2691,7 +2773,7 @@ U32 KProcess::forkProcess64(KThread* thread, U64 flags, U64 childTid,
         childProcess->phentsize64 = phentsize64;
         childProcess->startupArgs64 = startupArgs64;
         childProcess->startupEnv64 = startupEnv64;
-        childProcess->memory64 = new KMemory64(childProcess.get());
+        childProcess->memory64 = new KMemory64(childProcess.get(), false);
         childProcess->memory64->cloneFrom(memory64);
 
         childThread = childProcess->createThread();

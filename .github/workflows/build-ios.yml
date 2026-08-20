@@ -85,6 +85,109 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  wine64-runtime:
+    name: Build x86-64 Wine runtime layers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out BoxedVN
+        uses: actions/checkout@v6
+
+      - name: Install Wine64 and X11 runtime packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            wine64 wine64-tools zip unzip gcc \
+            libx11-6 libxext6 libxrender1 libxfixes3 libxcursor1 \
+            libxcomposite1 libxi6 libxinerama1 libxxf86vm1 libxrandr2 \
+            libx11-data
+
+      - name: Build and validate Wine64 layers
+        shell: bash
+        env:
+          CI: true
+        run: |
+          set -euo pipefail
+          bash scripts/build-boxedwine-dxmt-unixlib.sh build/winemetal.so
+          bash scripts/build-wine64-runtime-ci.sh \
+            --output-dir build/wine64-runtime \
+            --dxmt-unixlib build/winemetal.so
+          bash scripts/validate-wine64-runtime.sh \
+            --input build/wine64-runtime \
+            --manifest build/wine64-runtime/wine64-runtime.manifest
+
+      - name: Upload Wine64 runtime layers
+        uses: actions/upload-artifact@v7
+        with:
+          name: wine64-runtime
+          path: build/wine64-runtime
+          if-no-files-found: error
+          retention-days: 14
+
+  x64-graphics-assets:
+    name: Build x86-64 DXMT graphics resources
+    runs-on: macos-15
+    # The first uncached run builds host, Windows, and iPhoneOS LLVM libraries.
+    # Subsequent runs restore them from the pinned cache, but the initial build
+    # needs enough room to finish instead of producing a misleading timeout.
+    timeout-minutes: 300
+    steps:
+      - name: Check out BoxedVN
+        uses: actions/checkout@v6
+
+      - name: Install DXMT build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user meson==1.10.0 --break-system-packages
+          echo "$(python3 -m site --user-base)/bin" >> "${GITHUB_PATH}"
+
+      - name: Restore pinned DXMT build inputs
+        uses: actions/cache@v5
+        with:
+          path: third_party/fex64
+          key: boxedvn-dxmt-x64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh') }}
+
+      - name: Fetch and verify DXMT build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-fex64-dependencies.sh --component mythic
+          bash scripts/prepare-dxmt-x64-dependencies.sh
+
+      - name: Build and stage x86-64 DXMT resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/dependencies.fex64.lock.sh
+          mingw="third_party/fex64/toolchains/llvm-mingw-${BOXEDVN_LLVM_MINGW_VERSION}-ucrt-macos-universal"
+          wine_sdk="third_party/fex64/toolchains/wine-sdk"
+          llvm="third_party/fex64/llvm-project"
+          bash scripts/validate-boxedwine-dxmt-unixlib.sh
+          bash scripts/build-dxmt-x64-pe.sh \
+            --source third_party/fex64/dxmt \
+            --toolchain "${mingw}" \
+            --wine-install "${wine_sdk}" \
+            --llvm-source "${llvm}" \
+            --output-dir build/dxmt-pe
+          bash scripts/build-fex64-toolchains.sh --stage llvm-ios
+          bash scripts/build-dxmt-ios-native.sh
+          bash scripts/stage-x64-graphics-assets.sh \
+            --mythic third_party/fex64/mythic \
+            --dxmt build/dxmt-pe \
+            --native-archive third_party/fex64/dxmt-ios/libdxmt_combined.a \
+            --output-dir build/x64-graphics
+
+      - name: Upload x86-64 graphics resources
+        uses: actions/upload-artifact@v7
+        with:
+          name: x64-graphics-assets
+          path: build/x64-graphics
+          if-no-files-found: error
+          retention-days: 14
+
   tests:
     name: Host-independent tests
     runs-on: ubuntu-24.04
@@ -114,8 +217,12 @@ jobs:
     needs:
       - guest-probe
       - tests
+      - wine64-runtime
+      - x64-graphics-assets
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 180
+    env:
+      BOXEDVN_REQUIRE_DXMT_NATIVE: 1
     steps:
       - name: Check out BoxedVN
         uses: actions/checkout@v6
@@ -167,7 +274,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: third_party
-          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex64-patches/**') }}
+          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/stage-x64-graphics-assets.sh', 'scripts/wine64-runtime-manifest.example') }}
 
       - name: Fetch pinned dependencies
         shell: bash
@@ -185,15 +292,53 @@ jobs:
           name: guest-graphics-probe
           path: build/guest-probes
 
+      - name: Download Wine64 runtime layers
+        uses: actions/download-artifact@v7
+        with:
+          name: wine64-runtime
+          path: build/wine64-runtime
+
+      - name: Download x86-64 graphics resources
+        uses: actions/download-artifact@v7
+        with:
+          name: x64-graphics-assets
+          path: build/x64-graphics
+
+      - name: Validate downloaded x86-64 runtime inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/validate-wine64-runtime.sh \
+            --input build/wine64-runtime \
+            --manifest build/wine64-runtime/wine64-runtime.manifest
+          for path in \
+            build/x64-graphics/boxedvn-d3d11-cube-x64.exe \
+            build/x64-graphics/dxmt-x64/d3d11.dll \
+            build/x64-graphics/dxmt-x64/dxgi.dll \
+            build/x64-graphics/dxmt-x64/d3d10core.dll \
+            build/x64-graphics/dxmt-x64/winemetal.dll; do
+            file "${path}" | grep -Eqi 'PE32\\+.*x86-64' || {
+              echo "::error::${path} is not an x86-64 PE image."
+              exit 1
+            }
+          done
+
       - name: Build unsigned app
         shell: bash
-        run: >-
-          scripts/build-ios.sh
-          --configuration "${BUILD_CONFIGURATION}"
-          --output-dir build/ci
-          --skip-dependencies
-          --enable-fex64
-          --no-bundled-rootfs
+        run: |
+          set -euo pipefail
+          args=(
+            scripts/build-ios.sh
+            --configuration "${BUILD_CONFIGURATION}"
+            --output-dir build/ci
+            --skip-dependencies
+            --enable-fex64
+            --no-bundled-rootfs
+            --wine64-runtime build/wine64-runtime
+            --x64-graphics-runtime build/x64-graphics
+            --dxmt-native-archive build/x64-graphics/libdxmt_combined.a
+          )
+          "${args[@]}"
 
       - name: Validate unsigned app
         shell: bash
@@ -209,6 +354,19 @@ jobs:
             echo "::error::The CI app contains signing metadata; refusing to package it as unsigned."
             exit 1
           fi
+          if [[ ! -f "${app}/boxedwine64-runtime/glibc-rootfs64.zip" || \
+                  ! -f "${app}/boxedwine64-runtime/wine64.zip" || \
+                  ! -f "${app}/boxedwine64-runtime/wine64-runtime.manifest" || \
+                  ! -f "${app}/boxedwine64-runtime/boxedvn-d3d11-cube-x64.exe" || \
+                  ! -f "${app}/boxedwine64-runtime/x64-graphics.manifest" || \
+                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/d3d11.dll" || \
+                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/dxgi.dll" || \
+                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/d3d10core.dll" || \
+                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/winemetal.dll" ]]; then
+            echo "::error::The validated x86-64 runtime and DXMT resources were not copied into the app bundle."
+            exit 1
+          fi
+          echo "Wine64 and x86-64 DXMT resources present in app bundle."
 
       - name: Package increased-memory entitlement template
         shell: bash

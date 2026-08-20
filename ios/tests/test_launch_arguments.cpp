@@ -86,6 +86,30 @@ BOXEDVN_TEST(wine_notepad_command_uses_valueless_nozip_switch) {
     CHECK(actual == expected);
 }
 
+BOXEDVN_TEST(fex64_launch_mounts_runtime_layers_and_enters_wine64) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs/boxedwine.zip";
+    launch.rootFilesystemOverlayZipPaths = {
+        "/runtime/glibc-rootfs64.zip",
+        "/runtime/wine64.zip",
+    };
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\probe.exe";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const std::vector<std::string> expected = {
+        "boxedvn", "-root", "/prefixes/x64",
+        "-zip", "/rootfs/boxedwine.zip",
+        "-zip", "/runtime/glibc-rootfs64.zip",
+        "-zip", "/runtime/wine64.zip",
+        "-nozip", "-env", "BOXEDWINE_CPU64=fex",
+        "/usr/bin/wine64", "d:\\probe.exe",
+    };
+    CHECK(actual == expected);
+}
+
 BOXEDVN_TEST(game_command_preserves_mount_environment_and_arguments) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs.zip";

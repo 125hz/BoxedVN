@@ -117,6 +117,44 @@ CachedPath gLogs;
 CachedPath gFonts;
 CachedPath gCaches;
 CachedPath gBundledRootfs;
+CachedPath gBundledWine64Glibc;
+CachedPath gBundledWine64;
+CachedPath gBundledX64Probe;
+CachedPath gBundledDXMT;
+
+const char* cachedBundleFile(CachedPath& cache, NSString* relativePath) {
+    if (cache.resolved) {
+        return cache.value.empty() ? nullptr : cache.value.c_str();
+    }
+    cache.resolved = true;
+    NSString* path = [NSBundle.mainBundle.resourcePath
+        stringByAppendingPathComponent:relativePath];
+    BOOL isDirectory = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:path
+                                            isDirectory:&isDirectory] ||
+        isDirectory) {
+        return nullptr;
+    }
+    cache.value = path.UTF8String;
+    return cache.value.c_str();
+}
+
+const char* cachedBundleDirectory(CachedPath& cache, NSString* relativePath) {
+    if (cache.resolved) {
+        return cache.value.empty() ? nullptr : cache.value.c_str();
+    }
+    cache.resolved = true;
+    NSString* path = [NSBundle.mainBundle.resourcePath
+        stringByAppendingPathComponent:relativePath];
+    BOOL isDirectory = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:path
+                                            isDirectory:&isDirectory] ||
+        !isDirectory) {
+        return nullptr;
+    }
+    cache.value = path.UTF8String;
+    return cache.value.c_str();
+}
 
 }  // namespace
 
@@ -195,4 +233,24 @@ extern "C" const char* BVNPathBundledDxvkDirectory(void) {
     }
     gBundledDxvk.value = path.UTF8String;
     return gBundledDxvk.value.c_str();
+}
+
+extern "C" const char* BVNPathBundledWine64GlibcZip(void) {
+    return cachedBundleFile(gBundledWine64Glibc,
+                            @"boxedwine64-runtime/glibc-rootfs64.zip");
+}
+
+extern "C" const char* BVNPathBundledWine64Zip(void) {
+    return cachedBundleFile(gBundledWine64,
+                            @"boxedwine64-runtime/wine64.zip");
+}
+
+extern "C" const char* BVNPathBundledX64GraphicsProbe(void) {
+    return cachedBundleFile(gBundledX64Probe,
+                            @"boxedwine64-runtime/boxedvn-d3d11-cube-x64.exe");
+}
+
+extern "C" const char* BVNPathBundledDXMTDirectory(void) {
+    return cachedBundleDirectory(gBundledDXMT,
+                                 @"boxedwine64-runtime/dxmt-x64");
 }

@@ -412,6 +412,10 @@ public:
 #ifdef BOXEDWINE_GUEST_X64
     class KMemory64* memory64 = nullptr;
     class CPU64* cpu64 = nullptr;
+    // Selects FEX for this process only. Other x86-64 processes retain the
+    // interpreter and sparse address space, so the backend stays optional.
+    bool useFEX64 = false;
+    std::atomic<bool> fexLiveSyscallReported {false};
     U64 brkEnd64 = 0;
     U64 entry64 = 0;
     U64 phdr64 = 0;

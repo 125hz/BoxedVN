@@ -43,6 +43,8 @@
 #include <SDL.h>
 
 #include "BVNExecMemory.h"
+#include "BVNDXMTDisplay.h"
+#include "BVNFEXBackend.h"
 #include "BVNLaunchArguments.h"
 #include "boxedvn/boot_diagnostics.h"
 #include "boxedvn/engine_profile.h"
@@ -178,6 +180,21 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
                 launch.rootFilesystemZipPath + "' does not exist.";
         return false;
     }
+    for (size_t i = 0; i < request->rootFilesystemOverlayZipCount; ++i) {
+        if (request->rootFilesystemOverlayZipPaths == nullptr ||
+            request->rootFilesystemOverlayZipPaths[i] == nullptr ||
+            request->rootFilesystemOverlayZipPaths[i][0] == '\0') {
+            error = "A root filesystem overlay path is empty.";
+            return false;
+        }
+        std::string overlay = request->rootFilesystemOverlayZipPaths[i];
+        if (!fileExists(overlay)) {
+            error = "The root filesystem overlay '" + overlay +
+                    "' does not exist.";
+            return false;
+        }
+        launch.rootFilesystemOverlayZipPaths.push_back(std::move(overlay));
+    }
 
     if (request->writableRootPath == nullptr ||
         request->writableRootPath[0] == '\0') {
@@ -275,6 +292,22 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     launch.bitsPerPixel = request->bitsPerPixel;
     launch.soundEnabled = request->soundEnabled;
     launch.runThroughWine = request->runThroughWine;
+    launch.useFEX64 = request->useFEX64;
+    launch.useDXMT = request->useDXMT;
+    if (launch.useFEX64) {
+        if (!BVNFEXBackendBuilt()) {
+            error = "This build does not contain the optional FEX x86-64 backend.";
+            return false;
+        }
+        if (launch.rootFilesystemOverlayZipPaths.size() < 2) {
+            error = "The x86-64 launch needs validated glibc and Wine64 root layers.";
+            return false;
+        }
+    }
+    if (launch.useDXMT && !launch.useFEX64) {
+        error = "DXMT is currently available only to an x86-64 FEX launch.";
+        return false;
+    }
     launch.requestedWineRenderer = static_cast<int>(request->wineRenderer);
     // Before everything else: these lines are BoxedVN's own vocabulary and
     // must be out of the argument list before anything reasons about it.
@@ -295,14 +328,17 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
                      "value.").c_str());
     }
 
-    BVNApplyDefaultRendererPolicy(launch);
+    if (!launch.useFEX64) {
+        BVNApplyDefaultRendererPolicy(launch);
+    }
 
     // Before the per-title profile, so a title profile can still override
     // anything decided here, and after the user's own arguments have been
     // copied in, because whether they already carry Chromium switches is what
     // decides if BoxedVN adds its own.
-    const BVNEngineProfileResult engineProfile =
-        BVNApplyEngineCompatibilityProfile(launch);
+    const BVNEngineProfileResult engineProfile = launch.useFEX64
+        ? BVNEngineProfileResult{}
+        : BVNApplyEngineCompatibilityProfile(launch);
     if (!engineProfile.reason.empty()) {
         BVNLogWrite(BVNLogLevelInfo, "engine", engineProfile.reason.c_str());
     }
@@ -359,7 +395,7 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     //
     // Inspect both the requested executable and wrapper arguments so a profile
     // remains correct if a future launcher delegates through Wine.
-    if (BVNApplyKnownCompatibilityProfile(launch)) {
+    if (!launch.useFEX64 && BVNApplyKnownCompatibilityProfile(launch)) {
         BVNLogWrite(BVNLogLevelInfo, "compatibility",
                     "A per-title compatibility profile was applied; see the "
                     "boxedmain command line below for what it changed.");
@@ -566,7 +602,7 @@ void runSession(const BVNLaunchConfiguration& launch) {
     // future controllers.
     // Setting a service to disabled alone is insufficient because Wine 10
     // auto-starts associated root PnP services regardless of Start.
-    if (launch.runThroughWine) {
+    if (launch.runThroughWine && !launch.useFEX64) {
         const boxedvn::WineRenderer renderer =
             launch.useWineD3DVulkanRenderer
             ? boxedvn::WineRenderer::Vulkan
@@ -893,6 +929,15 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
             // loop can service the library UI, the pump has to be turned back
             // on here or SDL_PumpEvents would be a no-op for the whole session.
             SDL_iPhoneSetEventPump(SDL_TRUE);
+            if (launch.useDXMT &&
+                !BVNDXMTDisplayPrepare(launch.width ? launch.width : 1280,
+                                       launch.height ? launch.height : 720)) {
+                setLastError("The DXMT Metal presentation layer could not be prepared.");
+                setState(BVNRuntimeStateFailed);
+                SDL_iPhoneSetEventPump(SDL_FALSE);
+                BVNFinishGuestPresentation();
+                return;
+            }
             runSession(launch);
             SDL_iPhoneSetEventPump(SDL_FALSE);
             BVNFinishGuestPresentation();

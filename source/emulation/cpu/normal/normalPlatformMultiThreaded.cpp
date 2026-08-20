@@ -27,6 +27,9 @@
 #ifdef BOXEDWINE_GUEST_X64
 #include "cpu64.h"
 #endif
+#ifdef BOXEDWINE_FEX64_BACKEND
+#include "BVNFEXBackend.h"
+#endif
 
 #if defined(BOXEDWINE_MULTI_THREADED)
 
@@ -80,7 +83,20 @@ static void platformThread(CPU* cpu) {
             cpu64->yield = false;
             cpu64->deliverPendingSignals();
             try {
-                cpu64->run();
+#ifdef BOXEDWINE_FEX64_BACKEND
+                if (process->useFEX64) {
+                    if (!BVNFEXCPU64Run(process.get(), cpu->thread)) {
+                        klog_fmt("FEX CPU64 dispatch failed for process %d; "
+                                 "terminating the explicitly translated launch",
+                                 process->id);
+                        cpu->thread->terminating = true;
+                        break;
+                    }
+                } else
+#endif
+                {
+                    cpu64->run();
+                }
             } catch (...) {
                 if (cpu->thread->terminating) {
                     break;

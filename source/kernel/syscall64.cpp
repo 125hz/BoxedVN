@@ -14,6 +14,7 @@
 #include "syscall64.h"
 #include "cpu64.h"
 #include "kmemory64.h"
+#include "boxedwine_x64_hostcall.h"
 #include "ksocket.h"
 #include <thread>   // std::this_thread::yield() for sched_yield
 #include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
@@ -22,6 +23,9 @@
 #ifdef BOXEDWINE_OPENGL
 #include "../opengl/gl64bridge.h"
 #include "../opengl/gl64bridge_abi.h"
+#endif
+#if defined(BOXEDWINE_DXMT_NATIVE)
+extern "C" const void *dxmt_winemetal_unix_call_funcs[];
 #endif
 
 // x86-64 Linux syscall numbers used here. The canonical table lives in
@@ -247,9 +251,8 @@
 #define K_MAP_FIXED 0x10
 #endif
 
-// Base address for mmap(NULL, ...) placements. High enough to never collide
-// with PIE-loaded segments (X64_PIE_BASE=0x400000000) or the program break.
-#define MMAP64_BASE 0x700000000ULL
+// mmap(NULL, ...) placement is selected by KMemory64. Sparse guests retain
+// the historical base; native-identity guests use the guarded iOS window.
 
 // Address-space allocation for mmap(NULL,...) now lives in
 // KMemory64::mmapReserveAndMap, which scans for a free gap and maps it as ONE
@@ -603,7 +606,20 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
     bool fixed = (flags & K_MAP_FIXED) != 0;
     if (addr != 0 && fixed) {
         // MAP_FIXED: caller demands this exact address and expects any existing
-        // mapping there to be replaced. Honor it verbatim.
+        // mapping there to be replaced. Native identity deliberately refuses a
+        // low PE preferred base here; Wine must retry without MAP_FIXED so the
+        // loader can relocate into the guarded host window.
+        const U64 fixedMapLen =
+            length <= UINT64_MAX - 0xFFFULL
+                ? ((length + 0xFFFULL) & ~0xFFFULL)
+                : 0;
+        if (cpu->memory->nativeIdentityMode() &&
+            !cpu->memory->nativeGuestRangeAllowed(addr & ~0xFFFULL,
+                                                  fixedMapLen)) {
+            klog_fmt("sys_mmap64: reject native fixed mapping at 0x%llx len=0x%llx; "
+                     "caller must relocate",
+                     (unsigned long long)addr, (unsigned long long)length);
+        }
         ret = cpu->memory->mmapAnonymousFixed(addr & ~0xFFFULL, length, (U32)prot);
     } else if (addr != 0) {
         // addr is a HINT (no MAP_FIXED). Linux may place elsewhere if the hint
@@ -630,9 +646,22 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
         for (U64 i = 0; i < pageCount; i++) {
             if (cpu->memory->getPageFlags(pageStart + i) & accessible) { rangeFree = false; break; }
         }
-        if (rangeFree) {
+        // A non-fixed hint outside the native host window is not a reason to
+        // issue MAP_FIXED there: Linux treats it as a hint and may relocate.
+        // Let the bounded allocator choose a safe address instead.
+        const bool hintAllowed =
+            !cpu->memory->nativeIdentityMode() ||
+            cpu->memory->nativeGuestRangeAllowed(
+                alignedAddr, pageCount << 12);
+        if (rangeFree && hintAllowed) {
             ret = cpu->memory->mmapAnonymousFixed(alignedAddr, length, (U32)prot);
         } else {
+            if (!hintAllowed) {
+                klog_fmt("sys_mmap64: relocating native hint 0x%llx len=0x%llx "
+                         "into the guarded guest window",
+                         (unsigned long long)alignedAddr,
+                         (unsigned long long)length);
+            }
             ret = cpu->memory->mmapReserveAndMap(length, (U32)prot);
         }
     } else {
@@ -1318,13 +1347,38 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         return (U64)-K_ENOSYS;
     }
     bool reserved = false;
+    const bool fixed = (flags & K_MAP_FIXED) != 0;
+    const U32 loadProt = (U32)prot | 0x3u;
+    if (length == 0 || addr > UINT64_MAX - length) {
+        return (U64)-K_EINVAL;
+    }
+    // Wine passes low preferred-address hints for DSOs. They are relocatable
+    // when MAP_FIXED is absent, but cannot be used as host identity addresses
+    // on iOS. Relocate those hints through the same bounded allocator used by
+    // anonymous mappings; an explicit MAP_FIXED remains a hard failure in
+    // KMemory64 rather than risking host VA destruction.
+    if (addr != 0 && !fixed && cpu->memory->nativeIdentityMode()) {
+        const U64 hintAligned = addr & ~0xFFFULL;
+        const U64 hintOffset = addr - hintAligned;
+        if (length > UINT64_MAX - hintOffset - 0xFFFULL) {
+            return (U64)-K_EINVAL;
+        }
+        const U64 hintMapLen = (length + hintOffset + 0xFFFULL) & ~0xFFFULL;
+        if (!cpu->memory->nativeGuestRangeAllowed(hintAligned, hintMapLen)) {
+            addr = cpu->memory->mmapReserveAndMap(length, loadProt);
+            if ((S64)addr < 0) return addr;
+            reserved = true;
+            klog_fmt("sys_mmap64_file: relocated native hint to 0x%llx",
+                     (unsigned long long)addr);
+        }
+    }
     if (addr == 0) {
         // ld.so's DSO-span reservation (mmap(NULL, span, PROT_NONE, fd)) comes
         // through here; it MUST draw from the same process-wide cursor as
         // anonymous maps so the FIXED sub-segment maps that follow land on
         // disjoint, uncorrupted pages. Atomically reserve+map (closes the
         // MT TOCTOU race two sibling threads hit via the old scan-then-map).
-        addr = cpu->memory->mmapReserveAndMap(length, (U32)prot);
+        addr = cpu->memory->mmapReserveAndMap(length, loadProt);
         reserved = true; // pages already mapped under the lock; don't re-map/zero
     }
     U64 aligned = addr & ~0xFFFULL;
@@ -1419,7 +1473,7 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
             tailSave.resize((size_t)tail);
             cpu->memory->memcpyFromGuest(tailSave.data(), fileEnd, tail);
         }
-        U64 mapped = cpu->memory->mmapAnonymousFixed(aligned, mapLen, (U32)prot);
+        U64 mapped = cpu->memory->mmapAnonymousFixed(aligned, mapLen, loadProt);
         if ((S64)mapped < 0) {
             return mapped;
         }
@@ -1477,6 +1531,10 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     }
     if (got > 0) {
         cpu->memory->memcpyToGuest(addr, buf.data(), got);
+    }
+    U64 protectedAddress = cpu->memory->mprotect(aligned, mapLen, (U32)prot);
+    if (protectedAddress != aligned) {
+        return protectedAddress;
     }
     (void)flags;
     return addr;
@@ -2578,6 +2636,9 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
 // gaps that are most likely to surface during early Wine/glibc bring-up.
 // Returns "?" for unknown numbers; the caller still logs the raw #N.
 static const char* x64SyscallName(U64 nr) {
+#ifdef BOXEDWINE_GUEST_X64
+    if (nr == BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL) return "boxedwine_dxmt_unix_call";
+#endif
 #ifdef BOXEDWINE_OPENGL
     if (nr == GL64_SYSCALL_NR) return "gl64_trap";
 #endif
@@ -2705,6 +2766,48 @@ static const char* x64SyscallName(U64 nr) {
     }
 }
 
+/*
+ * Forward a guest winemetal unix-call to the host-native DXMT table.  The
+ * call is intentionally available only to an identity-mapped FEX process:
+ * DXMT's parameter blocks contain host Objective-C handles and pointers, so
+ * translating a sparse BoxedWine address here would be both incorrect and a
+ * security boundary violation.  Builds without the native DXMT archive keep
+ * the syscall reserved but return ENOSYS, preserving the optional-backend
+ * property of the core.
+ */
+static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
+    if (!cpu || !cpu->memory || !cpu->memory->nativeIdentityMode()) {
+        return (U64)(S64)-K_ENOSYS;
+    }
+    if (callIndex >= BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT) {
+        return (U64)(S64)-K_EINVAL;
+    }
+    // The native table dereferences the unix-call parameter block directly.
+    // Accept only a mapped address from the guarded identity window; otherwise
+    // a guest could present an arbitrary host pointer to Objective-C/Metal code.
+    if (args < K64_NATIVE_GUEST_WINDOW_START ||
+        args >= K64_NATIVE_GUEST_WINDOW_END ||
+        !(cpu->memory->getPageFlags(args >> K64_PAGE_SHIFT) &
+          K64_PAGE_MAPPED)) {
+        return (U64)(S64)-K_EFAULT;
+    }
+
+#if defined(BOXEDWINE_DXMT_NATIVE)
+    using DxmtUnixEntry = S32 (*)(void*);
+    const void* raw = dxmt_winemetal_unix_call_funcs[callIndex];
+    if (!raw) {
+        return (U64)(S64)(S32)BOXEDWINE_X64_HOSTCALL_STATUS_NOT_IMPLEMENTED;
+    }
+    const auto entry = reinterpret_cast<DxmtUnixEntry>(const_cast<void*>(raw));
+    const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
+    return (U64)(S64)status;
+#else
+    (void)callIndex;
+    (void)args;
+    return (U64)(S64)-K_ENOSYS;
+#endif
+}
+
 void ksyscall64(CPU64* cpu) {
     if (!cpu) return;
     U64 nr   = cpu->reg[X64_RAX].u64;
@@ -2745,6 +2848,10 @@ void ksyscall64(CPU64* cpu) {
     }
 
     switch (nr) {
+        case BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL:
+            // RDI = DXMT unix-call index, RSI = identity-mapped args block.
+            ret = boxedwineDxmtUnixCall64(cpu, a1, a2);
+            break;
 #ifdef BOXEDWINE_OPENGL
         case GL64_SYSCALL_NR:
             // Private guest->host OpenGL trap (see source/opengl/gl64bridge*).

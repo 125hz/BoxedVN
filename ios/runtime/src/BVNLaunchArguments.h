@@ -13,6 +13,10 @@
 
 struct BVNLaunchConfiguration {
     std::string rootFilesystemZipPath;
+    // Additional read-only root layers, mounted after the ordinary IA-32
+    // archive. The x86-64 runtime uses these for glibc and Wine64 while the
+    // writable overlay and BoxedWine kernel remain the same.
+    std::vector<std::string> rootFilesystemOverlayZipPaths;
     std::string writableRootPath;
     std::string gameDirectoryHostPath;
     // Directory containing the selected executable, used for engine and
@@ -47,6 +51,12 @@ struct BVNLaunchConfiguration {
     uint32_t bitsPerPixel = 0;
     bool soundEnabled = true;
     bool runThroughWine = true;
+    // Select the x86-64 process path and its optional FEX CPU backend. This is
+    // deliberately per launch; IA-32 sessions continue to use BoxedWine's
+    // existing CPU/JIT and root filesystem.
+    bool useFEX64 = false;
+    // Present Direct3D through the native DXMT Metal bridge for this launch.
+    bool useDXMT = false;
     // 0 automatic, 1 force WineD3D, 2 force DXVK. Mirrors the C launch ABI
     // without making this host-independent unit dependent on Objective-C.
     int requestedWineRenderer = 0;

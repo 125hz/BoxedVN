@@ -23,6 +23,7 @@ extern "C" BVNFEXBackendStage BVNFEXBackendStageReached(void) {
 extern "C" const char* BVNFEXBackendReport(void) {
     return "FEX was not linked into this build.";
 }
+extern "C" bool BVNFEXCPU64Run(void*, void*) { return false; }
 extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
     return stage == BVNFEXBackendStageUnavailable ? "not linked" : "unknown";
 }
@@ -61,6 +62,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "syscall64.h"
 
 #include <libkern/OSCacheControl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 
@@ -72,9 +74,11 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 extern "C" {
 void __clear_cache(void* start, void* end) {
@@ -99,6 +103,7 @@ constexpr uint64_t kExpectedExitCode = 42;
 
 std::mutex gProbeMutex;
 std::mutex gReportMutex;
+std::mutex gPoolMutex;
 std::atomic<BVNFEXBackendStage> gStage {BVNFEXBackendStageIdle};
 std::string gReport;
 
@@ -121,13 +126,42 @@ boxedvn::FEX64Kernel gKernel(gAddressSpace,
                     "fex64-guest", message.c_str());
     });
 
-std::jmp_buf gExitJump;
-std::atomic<bool> gCanJump {false};
+thread_local std::jmp_buf gExitJump;
+thread_local bool gCanJump = false;
 std::unique_ptr<KMemory64> gProbeMemory;
 std::unique_ptr<CPU64> gProbeCPU;
-CPU64* gActiveCPU = nullptr;
+thread_local CPU64* gActiveCPU = nullptr;
 std::atomic<bool> gProbeExited {false};
 std::atomic<uint64_t> gProbeExitCode {0};
+
+struct LiveThreadState {
+    FEXCore::Core::InternalThreadState* fexThread = nullptr;
+    void* callRetMapping = nullptr;
+    size_t callRetMappingSize = 0;
+    FEXCore::Core::CPUState::gdt_segment gdt[1] {};
+    // Context::ExecuteThread mutates CurrentFrame, the JIT backend, and the
+    // call/return stack. A KThread must therefore have at most one active
+    // FEX execution at a time, even if a scheduler bug attempts to dispatch
+    // the same opaque thread concurrently.
+    bool active = false;
+};
+
+struct LiveProcessState {
+    fextl::unique_ptr<FEXCore::Context::Context> context;
+    std::unordered_map<void*, std::unique_ptr<LiveThreadState>> threads;
+    std::atomic<size_t> activeRuns {0};
+    std::atomic<bool> retiring {false};
+    std::atomic<bool> entryReported {false};
+};
+
+std::mutex gLiveMutex;
+std::unordered_map<void*, std::unique_ptr<LiveProcessState>> gLiveProcesses;
+std::unordered_map<FEXCore::Core::InternalThreadState*,
+                   FEXCore::Context::Context*> gLiveThreadContexts;
+
+FEXCore::HLE::ExecutableRangeInfo queryLiveExecutableRange(uint64_t address);
+void invalidateLiveExecutableRange(FEXCore::Core::InternalThreadState* thread,
+                                   uint64_t start, uint64_t length);
 
 void reportf(const char* format, ...) __attribute__((format(printf, 1, 2)));
 void reportf(const char* format, ...) {
@@ -220,8 +254,27 @@ public:
         OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
     }
 
-    uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame*,
+    uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame,
                            FEXCore::HLE::SyscallArguments* arguments) override {
+        if (BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent()) {
+            const uint64_t result = BVNFEXCPU64AdapterHandleSyscall(
+                adapter, frame, arguments->Argument);
+            const BVNFEXCPU64AdapterAction action =
+                BVNFEXCPU64AdapterLastAction(adapter);
+            if (action == BVNFEXCPU64AdapterActionYield ||
+                action == BVNFEXCPU64AdapterActionThreadExit ||
+                action == BVNFEXCPU64AdapterActionProcessExit ||
+                action == BVNFEXCPU64AdapterActionExec ||
+                action == BVNFEXCPU64AdapterActionInvalid) {
+                if (!gCanJump) {
+                    reportf("BoxedWine requested a guest stop outside the guarded execution window");
+                    return static_cast<uint64_t>(-1);
+                }
+                frame->InSyscallInfo = 0;
+                std::longjmp(gExitJump, 1);
+            }
+            return result;
+        }
         if (gActiveCPU != nullptr) {
             CPU64* cpu = gActiveCPU;
             cpu->reg[X64_RAX].setU64(arguments->Argument[0]);
@@ -239,10 +292,11 @@ public:
                     gProbeExitCode.store(exitCode, std::memory_order_release);
                     gProbeExited.store(true, std::memory_order_release);
                 }
-                if (!gCanJump.load(std::memory_order_acquire)) {
+                if (!gCanJump) {
                     reportf("BoxedWine requested a guest stop outside the guarded execution window");
                     return static_cast<uint64_t>(-1);
                 }
+                frame->InSyscallInfo = 0;
                 std::longjmp(gExitJump, 1);
             }
             return cpu->reg[X64_RAX].u64;
@@ -254,10 +308,11 @@ public:
         }
         const boxedvn::Linux64SyscallResult result = gKernel.dispatch(syscall);
         if (result.action != boxedvn::Linux64SyscallAction::Continue) {
-            if (!gCanJump.load(std::memory_order_acquire)) {
+            if (!gCanJump) {
                 reportf("guest exit arrived outside the guarded execution window");
                 return static_cast<uint64_t>(-1);
             }
+            frame->InSyscallInfo = 0;
             std::longjmp(gExitJump, 1);
         }
         return static_cast<uint64_t>(result.value);
@@ -265,11 +320,19 @@ public:
 
     FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(
         FEXCore::Core::InternalThreadState*, uint64_t address) override {
+        if (BVNFEXCPU64AdapterCurrent() != nullptr) {
+            return queryLiveExecutableRange(address);
+        }
         const auto range = gAddressSpace.executableRange(address);
         if (!range.has_value()) {
             return {0, 0, false};
         }
         return {range->guestBase, range->size, false};
+    }
+
+    void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* thread,
+                                  uint64_t start, uint64_t length) override {
+        invalidateLiveExecutableRange(thread, start, length);
     }
 
     std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(
@@ -284,7 +347,90 @@ BoxedWineSyscalls gSyscalls;
 BoxedWineSignals gSignals;
 fextl::unique_ptr<FEXCore::Context::Context> gContext;
 
+constexpr std::array<int, 4> kFEXHostSignals {
+    SIGSEGV, SIGBUS, SIGILL, SIGFPE,
+};
+std::array<struct sigaction, kFEXHostSignals.size()> gPreviousFEXSignals {};
+std::once_flag gFEXSignalInstallOnce;
+std::atomic<bool> gFEXSignalHandlersInstalled {false};
+std::atomic<uint64_t> gFEXHostFaultCount {0};
+std::atomic<uint64_t> gFEXKuserFaultCount {0};
+
+size_t fexSignalIndex(int signal) {
+    for (size_t index = 0; index < kFEXHostSignals.size(); ++index) {
+        if (kFEXHostSignals[index] == signal) return index;
+    }
+    return kFEXHostSignals.size();
+}
+
+void chainFEXHostSignal(int signal, siginfo_t* info, void* ucontext) {
+    const size_t index = fexSignalIndex(signal);
+    if (index == kFEXHostSignals.size()) return;
+    const struct sigaction& previous = gPreviousFEXSignals[index];
+    const uintptr_t previousAction =
+        reinterpret_cast<uintptr_t>(previous.sa_sigaction);
+    if ((previous.sa_flags & SA_SIGINFO) != 0 && previousAction > 1) {
+        previous.sa_sigaction(signal, info, ucontext);
+        return;
+    }
+    if (previous.sa_handler == SIG_IGN) return;
+    if (previous.sa_handler != SIG_DFL && previous.sa_handler != nullptr) {
+        previous.sa_handler(signal);
+        return;
+    }
+    // Restore the action that was installed before FEX and re-raise so a
+    // non-FEX fault retains BoxedWine/Darwin's original default semantics.
+    sigaction(signal, &previous, nullptr);
+    raise(signal);
+}
+
+void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
+    gFEXHostFaultCount.fetch_add(1, std::memory_order_relaxed);
+    if (info && info->si_addr) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(info->si_addr);
+        if (address >= K64_KUSER_SHARED_BASE &&
+            address < K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE) {
+            gFEXKuserFaultCount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent();
+    if (adapter && BVNFEXCPU64AdapterHandleHostFault(
+            adapter, &gSignals.GetConfig(), signal, info, ucontext)) {
+        return;
+    }
+    chainFEXHostSignal(signal, info, ucontext);
+}
+
+bool installFEXHostSignalHandlers() {
+    std::call_once(gFEXSignalInstallOnce, [] {
+        bool installed = true;
+        size_t installedCount = 0;
+        for (size_t index = 0; index < kFEXHostSignals.size(); ++index) {
+            struct sigaction action {};
+            sigemptyset(&action.sa_mask);
+            action.sa_sigaction = fexHostSignalHandler;
+            action.sa_flags = SA_SIGINFO;
+            if (sigaction(kFEXHostSignals[index], &action,
+                          &gPreviousFEXSignals[index]) != 0) {
+                installed = false;
+                break;
+            }
+            ++installedCount;
+        }
+        if (!installed) {
+            for (size_t index = 0; index < installedCount; ++index) {
+                sigaction(kFEXHostSignals[index], &gPreviousFEXSignals[index],
+                          nullptr);
+            }
+            return;
+        }
+        gFEXSignalHandlersInstalled.store(true, std::memory_order_release);
+    });
+    return gFEXSignalHandlersInstalled.load(std::memory_order_acquire);
+}
+
 bool preparePool() {
+    std::lock_guard<std::mutex> guard(gPoolMutex);
     if (gPoolRX != nullptr) {
         return true;
     }
@@ -323,6 +469,23 @@ bool preparePool() {
     reportf("shared arena assigned %zu MiB to FEX (rx=%p rw=%p)",
             gPoolSize / (1024 * 1024), gPoolRX, gPoolRW);
     return true;
+}
+
+std::once_flag gFEXGlobalsOnce;
+bool gFEXGlobalsReady = false;
+
+bool initializeFEXGlobals() {
+    if (!preparePool()) return false;
+    std::call_once(gFEXGlobalsOnce, [] {
+        FEXCore::Allocator::mmap = fexMmap;
+        FEXCore::Allocator::munmap = fexMunmap;
+        LogMan::Msg::InstallHandler(fexLog);
+        LogMan::Throw::InstallHandler(fexThrow);
+        FEXCore::Config::Initialize();
+        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE, "1");
+        gFEXGlobalsReady = true;
+    });
+    return gFEXGlobalsReady;
 }
 
 bool mapBundledELFProbe() {
@@ -464,6 +627,210 @@ bool mapGuestProbe() {
     return mapRawGuestProbe();
 }
 
+FEXCore::HLE::ExecutableRangeInfo queryLiveExecutableRange(uint64_t address) {
+    BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent();
+    uint64_t base = 0;
+    uint64_t size = 0;
+    bool writable = false;
+    if (!adapter || !BVNFEXCPU64AdapterQueryExecutableRange(
+            adapter, address, &base, &size, &writable)) {
+        return {0, 0, false};
+    }
+    return {base, size, writable};
+}
+
+void invalidateLiveExecutableRange(FEXCore::Core::InternalThreadState* thread,
+                                   uint64_t start, uint64_t length) {
+    std::lock_guard<std::mutex> guard(gLiveMutex);
+    auto it = gLiveThreadContexts.find(thread);
+    if (it != gLiveThreadContexts.end() && it->second != nullptr) {
+        it->second->InvalidateThreadCachedCodeRange(thread, start, length);
+        return;
+    }
+    // The probe uses the original global context rather than the live process
+    // table. Preserve FEX's SMC invalidation semantics there as well; silently
+    // dropping this callback leaves stale translated blocks after self-modifying
+    // guest code.
+    if (gContext != nullptr) {
+        gContext->InvalidateThreadCachedCodeRange(thread, start, length);
+    }
+}
+
+LiveProcessState* getLiveProcessState(void* process) {
+    std::lock_guard<std::mutex> guard(gLiveMutex);
+    auto it = gLiveProcesses.find(process);
+    if (it != gLiveProcesses.end()) {
+        if (it->second->retiring.load(std::memory_order_acquire)) return nullptr;
+        it->second->activeRuns.fetch_add(1, std::memory_order_relaxed);
+        return it->second.get();
+    }
+
+    auto state = std::make_unique<LiveProcessState>();
+    state->context = FEXCore::Context::Context::CreateNewContext(appleHostFeatures());
+    if (!state->context) return nullptr;
+    state->context->SetSignalDelegator(&gSignals);
+    state->context->SetSyscallHandler(&gSyscalls);
+    state->context->SetHardwareTSOSupport(true);
+    if (!state->context->InitCore()) return nullptr;
+    if (!installFEXHostSignalHandlers()) {
+        reportf("FEX host fault handlers could not be installed");
+        return nullptr;
+    }
+    LiveProcessState* result = state.get();
+    result->activeRuns.store(1, std::memory_order_relaxed);
+    gLiveProcesses.emplace(process, std::move(state));
+    return result;
+}
+
+LiveThreadState* getLiveThreadState(LiveProcessState* processState,
+                                    void* thread) {
+    std::lock_guard<std::mutex> guard(gLiveMutex);
+    auto it = processState->threads.find(thread);
+    if (it != processState->threads.end()) {
+        if (it->second->active) return nullptr;
+        it->second->active = true;
+        return it->second.get();
+    }
+
+    auto state = std::make_unique<LiveThreadState>();
+    state->fexThread = processState->context->CreateThread(0, 0);
+    if (!state->fexThread) return nullptr;
+
+    constexpr size_t shadowBytes =
+        FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+    state->callRetMappingSize = shadowBytes + 2 * kPageBytes;
+    state->callRetMapping = mmap(nullptr, state->callRetMappingSize, PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (state->callRetMapping == MAP_FAILED) {
+        processState->context->DestroyThread(state->fexThread);
+        state->callRetMapping = nullptr;
+        state->fexThread = nullptr;
+        return nullptr;
+    }
+    void* shadow = static_cast<uint8_t*>(state->callRetMapping) + kPageBytes;
+    if (mprotect(shadow, shadowBytes, PROT_READ | PROT_WRITE) != 0) {
+        munmap(state->callRetMapping, state->callRetMappingSize);
+        processState->context->DestroyThread(state->fexThread);
+        state->callRetMapping = nullptr;
+        state->fexThread = nullptr;
+        return nullptr;
+    }
+    state->fexThread->CallRetStackBase = shadow;
+    state->fexThread->CurrentFrame->State.callret_sp =
+        reinterpret_cast<uint64_t>(shadow) + shadowBytes / 4;
+    state->fexThread->CurrentFrame->State.callret_sp_base =
+        reinterpret_cast<uint64_t>(shadow);
+    state->gdt[0].L = 1;
+    state->gdt[0].P = 1;
+    state->gdt[0].S = 1;
+    state->gdt[0].Type = 0b1011;
+    state->fexThread->CurrentFrame->State.segment_arrays[0] = state->gdt;
+    state->fexThread->CurrentFrame->State.cs_idx = 0;
+    gLiveThreadContexts.emplace(state->fexThread, processState->context.get());
+    state->active = true;
+    LiveThreadState* result = state.get();
+    processState->threads.emplace(thread, std::move(state));
+    return result;
+}
+
+void releaseLiveThreadRun(LiveProcessState* processState,
+                          LiveThreadState* threadState,
+                          bool retire) {
+    if (!processState || !threadState) return;
+    std::unique_ptr<LiveThreadState> retiredState;
+    {
+        std::lock_guard<std::mutex> guard(gLiveMutex);
+        for (auto it = processState->threads.begin();
+             it != processState->threads.end(); ++it) {
+            if (it->second.get() != threadState) continue;
+            if (!retire) {
+                it->second->active = false;
+                return;
+            }
+            if (it->second->fexThread) {
+                gLiveThreadContexts.erase(it->second->fexThread);
+            }
+            retiredState = std::move(it->second);
+            processState->threads.erase(it);
+            break;
+        }
+    }
+    if (!retiredState) return;
+    if (retiredState->fexThread) {
+        processState->context->DestroyThread(retiredState->fexThread);
+        retiredState->fexThread = nullptr;
+    }
+    if (retiredState->callRetMapping) {
+        munmap(retiredState->callRetMapping,
+               retiredState->callRetMappingSize);
+        retiredState->callRetMapping = nullptr;
+    }
+}
+
+void releaseLiveProcessRun(void* process, LiveProcessState* expected,
+                           bool retire) {
+    std::unique_ptr<LiveProcessState> state;
+    {
+        std::lock_guard<std::mutex> guard(gLiveMutex);
+        auto it = gLiveProcesses.find(process);
+        if (it == gLiveProcesses.end() || it->second.get() != expected) return;
+        if (retire) {
+            it->second->retiring.store(true, std::memory_order_release);
+        }
+        const size_t previous = it->second->activeRuns.fetch_sub(
+            1, std::memory_order_acq_rel);
+        if (previous != 1 ||
+            !it->second->retiring.load(std::memory_order_acquire)) {
+            return;
+        }
+        state = std::move(it->second);
+        gLiveProcesses.erase(it);
+        for (const auto& entry : state->threads) {
+            if (entry.second && entry.second->fexThread) {
+                gLiveThreadContexts.erase(entry.second->fexThread);
+            }
+        }
+    }
+
+    // ExecuteThread has already returned through the guarded handoff when
+    // this is called. Destroy every FEX thread before releasing its context;
+    // otherwise a later process reusing the same opaque KProcess address could
+    // accidentally inherit stale translated blocks and call-ret state.
+    for (auto& entry : state->threads) {
+        LiveThreadState* thread = entry.second.get();
+        if (thread->fexThread) {
+            state->context->DestroyThread(thread->fexThread);
+            thread->fexThread = nullptr;
+        }
+        if (thread->callRetMapping) {
+            munmap(thread->callRetMapping, thread->callRetMappingSize);
+            thread->callRetMapping = nullptr;
+        }
+    }
+    state->threads.clear();
+}
+
+void resetLiveThreadAfterExec(LiveProcessState* processState,
+                              LiveThreadState* threadState) {
+    if (!processState || !threadState || !threadState->fexThread) return;
+    processState->context->ClearCodeCache(threadState->fexThread, true);
+    if (threadState->callRetMapping && threadState->callRetMappingSize > 0) {
+        void* shadow = static_cast<uint8_t*>(threadState->callRetMapping) +
+                       kPageBytes;
+        const size_t shadowBytes =
+            FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+        // ClearCodeCache() already invokes FEX's ResetCallRetStack(), which
+        // decommits the full reservation and lets the VM supply zero-fill-on-
+        // demand pages. Do not memset the reservation here: that would make
+        // every exec transition resident again and defeat FEX's reclaim path.
+        threadState->fexThread->CallRetStackBase = shadow;
+        threadState->fexThread->CurrentFrame->State.callret_sp =
+            reinterpret_cast<uint64_t>(shadow) + shadowBytes / 4;
+        threadState->fexThread->CurrentFrame->State.callret_sp_base =
+            reinterpret_cast<uint64_t>(shadow);
+    }
+}
+
 } // namespace
 
 extern "C" bool BVNFEXBackendBuilt(void) { return true; }
@@ -476,6 +843,16 @@ extern "C" const char* BVNFEXBackendReport(void) {
     static std::string snapshot;
     std::lock_guard<std::mutex> guard(gReportMutex);
     snapshot = gReport;
+    const uint64_t hostFaults = gFEXHostFaultCount.load(std::memory_order_relaxed);
+    const uint64_t kuserFaults = gFEXKuserFaultCount.load(std::memory_order_relaxed);
+    if (hostFaults != 0 || kuserFaults != 0) {
+        char diagnostics[160];
+        snprintf(diagnostics, sizeof(diagnostics),
+                 "host_faults=%llu kuser_faults=%llu\n",
+                 static_cast<unsigned long long>(hostFaults),
+                 static_cast<unsigned long long>(kuserFaults));
+        snapshot.append(diagnostics);
+    }
     return snapshot.c_str();
 }
 
@@ -491,22 +868,129 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
     return "unknown";
 }
 
+extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
+    BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterAttach(process, thread);
+    if (!adapter) {
+        return false;
+    }
+    LiveProcessState* processState = nullptr;
+    LiveThreadState* threadState = nullptr;
+    bool adapterEntered = false;
+    auto finish = [&](bool retireThread, bool retireProcess) {
+        gCanJump = false;
+        gActiveCPU = nullptr;
+        if (adapterEntered) {
+            BVNFEXCPU64AdapterLeave(adapter);
+            adapterEntered = false;
+        }
+        BVNFEXCPU64AdapterDetach(adapter);
+        adapter = nullptr;
+        if (processState) {
+            releaseLiveThreadRun(processState, threadState, retireThread);
+            releaseLiveProcessRun(process, processState, retireProcess);
+        }
+    };
+
+    if (!initializeFEXGlobals()) {
+        finish(false, false);
+        return false;
+    }
+    bool cleanReturn = false;
+    BVNFEXCPU64AdapterAction terminalAction =
+        BVNFEXCPU64AdapterActionInvalid;
+    try {
+        processState = getLiveProcessState(process);
+        threadState = processState
+            ? getLiveThreadState(processState, thread)
+            : nullptr;
+        if (!threadState || !BVNFEXCPU64AdapterBindFEX(
+                adapter, processState->context.get(), threadState->fexThread) ||
+            !BVNFEXCPU64AdapterEnter(adapter)) {
+            reportf("FEX could not attach a live BoxedWine CPU64 thread");
+            finish(true, true);
+            return false;
+        }
+        adapterEntered = true;
+        cleanReturn = true;
+        gCanJump = true;
+        gActiveCPU = nullptr;
+
+        while (true) {
+            if (!BVNFEXCPU64AdapterSyncToFEX(
+                    adapter, threadState->fexThread->CurrentFrame)) {
+                cleanReturn = false;
+                reportf("BoxedWine CPU64 state became invalid before FEX entry");
+                break;
+            }
+            if (!processState->entryReported.exchange(
+                    true, std::memory_order_acq_rel)) {
+                reportf("BOXEDWINE_FEX64_LIVE_ENTER rip=0x%llx",
+                        static_cast<unsigned long long>(
+                            threadState->fexThread->CurrentFrame->State.rip));
+            }
+            bool returnedByGuard = false;
+            const int jumpResult = setjmp(gExitJump);
+            if (jumpResult == 0) {
+                processState->context->ExecuteThread(threadState->fexThread);
+            } else {
+                returnedByGuard = true;
+            }
+
+            const BVNFEXCPU64AdapterAction action =
+                BVNFEXCPU64AdapterLastAction(adapter);
+            terminalAction = action;
+            if (action == BVNFEXCPU64AdapterActionInvalid) {
+                cleanReturn = false;
+                reportf("FEX live CPU64 execution returned an invalid action");
+                break;
+            }
+            if (action == BVNFEXCPU64AdapterActionThreadExit ||
+                action == BVNFEXCPU64AdapterActionProcessExit) {
+                break;
+            }
+            if (!BVNFEXCPU64AdapterSyncFromFEX(
+                    adapter, threadState->fexThread->CurrentFrame)) {
+                cleanReturn = false;
+                reportf("FEX returned with an invalid BoxedWine CPU64 state");
+                break;
+            }
+            if (action == BVNFEXCPU64AdapterActionExec) {
+                resetLiveThreadAfterExec(processState, threadState);
+                BVNFEXCPU64AdapterResetAction(adapter);
+                continue;
+            }
+            if (returnedByGuard || action == BVNFEXCPU64AdapterActionYield) {
+                break;
+            }
+            break;
+        }
+    } catch (...) {
+        cleanReturn = false;
+        reportf("FEX live CPU64 execution raised an exception");
+    }
+
+    const bool retireThread =
+        !cleanReturn ||
+        terminalAction == BVNFEXCPU64AdapterActionThreadExit ||
+        terminalAction == BVNFEXCPU64AdapterActionProcessExit ||
+        static_cast<KThread*>(thread)->terminating;
+    const bool retireProcess =
+        !cleanReturn ||
+        terminalAction == BVNFEXCPU64AdapterActionProcessExit ||
+        static_cast<KProcess*>(process)->terminated;
+    finish(retireThread, retireProcess);
+    return cleanReturn;
+}
+
 extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     std::lock_guard<std::mutex> guard(gProbeMutex);
     if (gStage.load() == BVNFEXBackendStageExecuted) {
         return BVNFEXBackendStageExecuted;
     }
-    if (!preparePool()) {
+    if (!initializeFEXGlobals()) {
         return gStage.load();
     }
     gStage.store(BVNFEXBackendStageArenaReady, std::memory_order_release);
-
-    FEXCore::Allocator::mmap = fexMmap;
-    FEXCore::Allocator::munmap = fexMunmap;
-    LogMan::Msg::InstallHandler(fexLog);
-    LogMan::Throw::InstallHandler(fexThrow);
-    FEXCore::Config::Initialize();
-    FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE, "1");
 
     gContext = FEXCore::Context::Context::CreateNewContext(appleHostFeatures());
     if (!gContext) {
@@ -518,6 +1002,10 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     gContext->SetHardwareTSOSupport(true);
     if (!gContext->InitCore()) {
         reportf("FEX failed to initialise its dispatcher");
+        return gStage.load();
+    }
+    if (!installFEXHostSignalHandlers()) {
+        reportf("FEX host fault handlers could not be installed");
         return gStage.load();
     }
     gStage.store(BVNFEXBackendStageContextReady, std::memory_order_release);
@@ -549,6 +1037,8 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     thread->CallRetStackBase = shadow;
     thread->CurrentFrame->State.callret_sp =
         reinterpret_cast<uint64_t>(shadow) + shadowBytes / 4;
+    thread->CurrentFrame->State.callret_sp_base =
+        reinterpret_cast<uint64_t>(shadow);
 
     static FEXCore::Core::CPUState::gdt_segment gdt[1] {};
     gdt[0].L = 1;
@@ -558,19 +1048,19 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     thread->CurrentFrame->State.segment_arrays[0] = gdt;
     thread->CurrentFrame->State.cs_idx = 0;
 
-    gCanJump.store(true, std::memory_order_release);
+    gCanJump = true;
     gProbeExited.store(false, std::memory_order_release);
     gProbeExitCode.store(0, std::memory_order_release);
     gActiveCPU = gProbeCPU.get();
     if (setjmp(gExitJump) == 0) {
         gContext->ExecuteThread(thread);
         gActiveCPU = nullptr;
-        gCanJump.store(false, std::memory_order_release);
+        gCanJump = false;
         reportf("FEX returned without the guest issuing exit");
         return gStage.load();
     }
     gActiveCPU = nullptr;
-    gCanJump.store(false, std::memory_order_release);
+    gCanJump = false;
     gStage.store(BVNFEXBackendStageKernelEntered, std::memory_order_release);
     if (!gProbeExited.load(std::memory_order_acquire) ||
         gProbeExitCode.load(std::memory_order_acquire) != kExpectedExitCode) {

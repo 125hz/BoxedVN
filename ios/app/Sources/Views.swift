@@ -316,6 +316,13 @@ struct ContainerDetailView: View {
                     Label("Run 32-bit 3D cube", systemImage: "cube.fill")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Button {
+                    save()
+                    model.launchX64GraphicsProbe(container)
+                } label: {
+                    Label("Run 64-bit DXMT cube", systemImage: "cube.fill")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Picker("Resolution", selection: resolutionBinding) {
                     ForEach(resolutions, id: \.self) { Text($0) }
                     if !resolutions.contains(resolutionBinding.wrappedValue) {

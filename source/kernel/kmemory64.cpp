@@ -21,6 +21,18 @@
 #include <mutex>
 #include <atomic>
 
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdint.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
+
 // ---------------------------------------------------------------------------
 // Process-shared file mappings (MAP_SHARED). A single host buffer per
 // (file path, page-aligned file offset) is aliased by every process that maps
@@ -34,7 +46,9 @@
 // ---------------------------------------------------------------------------
 namespace {
 struct SharedFilePage {
-    U8 data[K64_PAGE_SIZE];
+    U8 localData[K64_PAGE_SIZE];
+    std::shared_ptr<std::atomic<U8*>> data;
+    SharedFilePage() : data(std::make_shared<std::atomic<U8*>>(localData)) {}
 };
 std::mutex g_sharedFileMutex;
 // key: path + "\0" + decimal page-aligned file offset -> one shared page buffer.
@@ -49,14 +63,23 @@ std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 o
     auto it = g_sharedFileRegistry.find(key);
     if (it != g_sharedFileRegistry.end()) { created = false; return it->second; }
     auto page = std::make_shared<SharedFilePage>();
-    ::memset(page->data, 0, K64_PAGE_SIZE);
+    ::memset(page->localData, 0, K64_PAGE_SIZE);
     if (seed && seedLen) {
         U64 n = seedLen < K64_PAGE_SIZE ? seedLen : K64_PAGE_SIZE;
-        ::memcpy(page->data, seed, (size_t)n);
+        ::memcpy(page->localData, seed, (size_t)n);
     }
     g_sharedFileRegistry[key] = page;
     created = true;
     return page;
+}
+
+std::shared_ptr<SharedFilePage> findSharedFilePage(const std::string& path, U64 offsetPage) {
+    std::string key = path;
+    key.push_back('\0');
+    key += std::to_string(offsetPage);
+    std::lock_guard<std::mutex> lk(g_sharedFileMutex);
+    auto it = g_sharedFileRegistry.find(key);
+    return it == g_sharedFileRegistry.end() ? nullptr : it->second;
 }
 } // namespace
 
@@ -68,6 +91,170 @@ std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 o
 #ifndef K_ENOMEM
 #define K_ENOMEM 12
 #endif
+#ifndef K_EBUSY
+#define K_EBUSY 16
+#endif
+#ifndef K_ENOSYS
+#define K_ENOSYS 38
+#endif
+
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+namespace {
+static U64 k64NativeHostPageSize() {
+    static U64 size = []() -> U64 {
+        long value = ::sysconf(_SC_PAGESIZE);
+        return value > 0 ? (U64)value : 4096;
+    }();
+    return size;
+}
+
+static U64 k64NativeAlignDown(U64 value, U64 alignment) {
+    return value & ~(alignment - 1);
+}
+
+static U64 k64NativeAlignUp(U64 value, U64 alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static int k64NativeProt(U32 prot) {
+    int result = 0;
+    if (prot & 0x1) result |= PROT_READ;
+    if (prot & 0x2) result |= PROT_READ | PROT_WRITE;
+    // Guest EXEC is metadata for FEX's decoder. The translated ARM64 lives
+    // in the separate executable arena; never request host PROT_EXEC for a
+    // guest page (iOS W^X/debug policy rejects or constrains that transition).
+    return result;
+}
+
+static U32 k64GuestProtFromPageFlags(U32 flags) {
+    U32 prot = 0;
+    if (flags & K64_PAGE_READ) prot |= 0x1;
+    if (flags & K64_PAGE_WRITE) prot |= 0x2;
+    // K64_PAGE_EXEC intentionally remains guest metadata only.
+    return prot;
+}
+
+// Reserve a previously unused host interval without overwriting an existing
+// VM region. On Darwin vm_allocate(VM_FLAGS_FIXED) is the atomic ownership
+// check; the following mmap replaces only that reservation. Linux uses
+// MAP_FIXED_NOREPLACE when available. Older POSIX hosts have no non-clobbering
+// primitive, so the native identity backend remains opt-in there and relies on
+// the platform's preflight result.
+static bool k64NativeReserveHostRange(U64 start, U64 length) {
+    if (!length || start > UINT64_MAX - length) return false;
+#if defined(__APPLE__)
+    vm_address_t address = (vm_address_t)start;
+    const kern_return_t result = vm_allocate(mach_task_self(), &address,
+                                             (vm_size_t)length, VM_FLAGS_FIXED);
+    if (result != KERN_SUCCESS || address != (vm_address_t)start) {
+        if (result == KERN_SUCCESS) {
+            vm_deallocate(mach_task_self(), address, (vm_size_t)length);
+        }
+        return false;
+    }
+    return true;
+#elif defined(MAP_FIXED_NOREPLACE)
+    void* mapped = ::mmap((void*)(uintptr_t)start, (size_t)length,
+                          PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                          -1, 0);
+    if (mapped == MAP_FAILED || (U64)(uintptr_t)mapped != start) {
+        if (mapped != MAP_FAILED) ::munmap(mapped, (size_t)length);
+        return false;
+    }
+    return true;
+#else
+    // This fallback is retained only for non-Darwin POSIX build hosts that do
+    // not expose MAP_FIXED_NOREPLACE. It cannot close the preflight race, but
+    // still rejects ranges already known to be occupied by the OS.
+    return true;
+#endif
+}
+
+static void k64NativeReleaseReservedHostRange(U64 start, U64 length) {
+#if defined(__APPLE__)
+    vm_deallocate(mach_task_self(), (vm_address_t)start, (vm_size_t)length);
+#else
+    (void)start;
+    (void)length;
+#endif
+}
+
+// Check whether the interval is free before asking the fixed reservation
+// primitive for it. vm_region_64 returns the next region when the cursor is in
+// a hole, so a region beginning before the requested end is sufficient proof
+// that this interval cannot be claimed safely.
+static bool k64NativeHostRangeFree(U64 start, U64 length) {
+    if (!length || start > UINT64_MAX - length) return false;
+#if defined(__APPLE__)
+    const U64 end = start + length;
+    vm_address_t cursor = (vm_address_t)start;
+    while ((U64)cursor < end) {
+        vm_size_t regionSize = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t objectName = MACH_PORT_NULL;
+        vm_address_t regionStart = cursor;
+        const kern_return_t result = vm_region_64(
+            mach_task_self(), &regionStart, &regionSize,
+            VM_REGION_BASIC_INFO_64,
+            reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+            &objectName);
+        if (objectName != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), objectName);
+        }
+        if (result == KERN_INVALID_ADDRESS) return true;
+        if (result != KERN_SUCCESS || regionSize == 0) return false;
+        const U64 region = (U64)regionStart;
+        if (region >= end) return true;
+        // The query starts at cursor. Any returned region that begins at or
+        // before cursor and extends into the interval is occupied. A region
+        // beginning in the requested interval is occupied as well.
+        return false;
+    }
+    return true;
+#else
+    (void)start;
+    (void)length;
+    return true;
+#endif
+}
+
+// The canonical Windows shared-data VA is below iOS's mandatory __PAGEZERO.
+// All emulated processes live in this host process, so one high anonymous
+// mapping can be shared by every KMemory64 instance. The signal bridge rewrites
+// a faulting ARM64 base register from 0x7ffe* into this alias and retries the
+// exact instruction; guest-visible page metadata remains canonical.
+struct K64KuserAlias {
+    std::atomic<void*> host {nullptr};
+    U32 refs = 0;
+};
+std::mutex g_k64KuserAliasMutex;
+K64KuserAlias g_k64KuserAlias;
+
+static bool k64IsKuserRange(U64 addr, U64 len) {
+    return addr >= K64_KUSER_SHARED_BASE &&
+           addr <= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE &&
+           len <= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE - addr;
+}
+
+static U8* k64KuserAliasFor(U64 guestAddress) {
+    if (guestAddress < K64_KUSER_SHARED_BASE ||
+        guestAddress >= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE) {
+        return nullptr;
+    }
+    // This helper is also called from the Darwin SA_SIGINFO path. The alias
+    // lifetime is protected by each owning KMemory64 and the release path
+    // publishes nullptr only after the last owner has stopped executing, so a
+    // lock-free acquire is required here: taking a pthread mutex in a signal
+    // handler can deadlock if the interrupted thread held it.
+    void* host = g_k64KuserAlias.host.load(std::memory_order_acquire);
+    if (!host) return nullptr;
+    return static_cast<U8*>(host) +
+           (guestAddress - K64_KUSER_SHARED_BASE);
+}
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Per-thread data-page TLB. Every guest DATA access (operand reads/writes,
@@ -78,15 +265,16 @@ std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 o
 // this is the data-side equivalent: a small direct-mapped, thread-local
 // page -> host-buffer cache consulted before the locked slow path.
 //
-// Why so little invalidation is needed (all verified against this file):
-//   - munmap frees ADDRESS SPACE only; page buffers deliberately survive.
-//   - mprotect only rewrites flags; reads ignore flags entirely and writes
-//     commit-on-write regardless, so cached data* stays behaviorally exact.
+// Why so little invalidation is needed in sparse mode (all verified against this file):
+//   - sparse munmap frees ADDRESS SPACE only; page buffers deliberately survive.
+//   - sparse mprotect only rewrites flags; native mode also updates host
+//     protections, while guest metadata remains the 4 KiB source of truth.
 //   - mmap over an existing committed page zeroes IN PLACE (buffer stable).
 //   - K64Page::commit() never reallocates an existing buffer.
 // The only events that free/replace a committed buffer are the KMemory64
 // destructor (execve reset, process exit — also covers heap-address reuse of
-// the KMemory64* tag) and K64Page::adoptShared (the shared-file mmap path).
+// the KMemory64* tag), native logical unmap, and K64Page::adoptShared (the
+// shared-file mmap path).
 // Both bump the global generation; a TLB hit requires a generation match.
 // Entries are tagged with the owning KMemory64* because kernel code on one
 // thread can touch another process's memory (fork ctid writes, ptrace-style
@@ -181,12 +369,67 @@ void KMemory64::noteGuestWriteRange(U64 addr, U64 len) {
 }
 #endif // BOXEDWINE_BLOCK_CACHE_INFRA
 
-KMemory64::KMemory64(KProcess* process) : process(process) {}
+static void k64InvalidateProcessFetchCaches(KProcess* process) {
+    if (!process) return;
+    process->iterateThreads([](KThread* thread) {
+        if (thread && thread->cpu64) {
+            thread->cpu64->invalidateFetchCache();
+        }
+        return true;
+    });
+    // The initial thread normally aliases this object, but invalidate the
+    // process-owned CPU explicitly as well so early-loader mappings are safe
+    // before the thread has been bound to it.
+    if (process->cpu64) {
+        process->cpu64->invalidateFetchCache();
+    }
+}
+
+KMemory64::KMemory64(KProcess* process, bool nativeIdentity) : process(process) {
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    this->nativeIdentity = nativeIdentity;
+#else
+    (void)nativeIdentity;
+#endif
+}
 KMemory64::~KMemory64() {
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    nativeDemoteSharedPages();
+    nativeUnmapAll();
+#endif
     // Page buffers die with the object — invalidate every thread's data TLB
     // (execve gives the process a fresh KMemory64; a later allocation could
     // also reuse this heap address as a tag).
     k64DTlbInvalidateAll();
+}
+
+bool KMemory64::nativeIdentityMode() const {
+    return nativeIdentity;
+}
+
+bool KMemory64::nativeGuestRangeAllowed(U64 addr, U64 len) const {
+    if (!nativeIdentityMode()) return true;
+    if (len == 0 || addr > UINT64_MAX - len) return false;
+    const U64 end = addr + len;
+    // KUSER_SHARED_DATA is deliberately backed by a high host alias because
+    // iOS leaves the canonical low address below __PAGEZERO unavailable.
+    if (addr >= K64_KUSER_SHARED_BASE &&
+        end <= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE) {
+        return true;
+    }
+    return addr >= K64_NATIVE_GUEST_WINDOW_START &&
+           end <= K64_NATIVE_GUEST_WINDOW_END;
+}
+
+U64 KMemory64::nativeAliasForGuest(U64 guestAddress) const {
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    if (!nativeIdentityMode() || !nativeKuserAliasHeld) return 0;
+    U8* alias = k64KuserAliasFor(guestAddress);
+    return reinterpret_cast<U64>(alias);
+#else
+    (void)guestAddress;
+    return 0;
+#endif
 }
 
 // BW64_STRAYWRITE tripwire: ASan cannot see writes that land inside the
@@ -217,6 +460,15 @@ void KMemory64::strayWriteCheck(U64 dstGuest, U64 len) {
 }
 
 void KMemory64::cloneFrom(const KMemory64* from) {
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    // Two KMemory64 objects in this host process cannot own independent
+    // snapshots at the same fixed guest addresses. Sharing the pointers would
+    // violate fork isolation, while MAP_FIXED would clobber the parent.
+    if (nativeIdentityMode()) {
+        kpanic("KMemory64 native identity mode does not support cloneFrom");
+        return;
+    }
+#endif
     // Lock both sides: `from` may be a live address space (the forking parent),
     // and we're populating `this` (the fresh child). The parent could fault new
     // pages concurrently in MT mode; take its lock for a consistent snapshot.
@@ -234,8 +486,19 @@ void KMemory64::cloneFrom(const KMemory64* from) {
         copy->flags = kv.second->flags;
         // Only copy backing store for committed pages; an uncommitted page in
         // the parent (reserved but never touched) stays uncommitted in the child.
-        if (kv.second->committed()) {
-            ::memcpy(copy->commit(), kv.second->data, K64_PAGE_SIZE);
+        if ((kv.second->flags & K64_PAGE_MAPPED) && kv.second->committed()) {
+            // A native identity page must never be shared into the child:
+            // its backing pointer is an address in the parent's fixed host
+            // mapping, so aliasing it would make fork writes cross-process.
+            // Plain sparse shared pages retain the registry alias.
+            if ((kv.second->flags & K64_PAGE_SHARED) && kv.second->sharedData &&
+                !kv.second->dataNative) {
+                copy->adoptShared(kv.second->sharedData, false, kv.second->sharedCanonical);
+                copy->flags &= ~K64_PAGE_PINNED;
+            } else {
+                copy->flags &= ~(K64_PAGE_SHARED | K64_PAGE_PINNED);
+                ::memcpy(copy->commit(), kv.second->hostData(), K64_PAGE_SIZE);
+            }
         }
         pages.emplace(kv.first, std::move(copy));
     }
@@ -281,6 +544,14 @@ K64Page* KMemory64::getOrAllocPage(U64 pageNum, U32 flagsIfNew) {
 U8* KMemory64::commitPageLocked(U64 pageNum, U32 flagsIfNew) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
     K64Page* page = getOrAllocPage(pageNum, flagsIfNew); // recursive mutex: re-enter OK
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    if (nativeIdentityMode() && (!page->hostData() || !page->dataNative)) {
+        // A native address space has no lazy heap buffers. A missing mapping
+        // must remain a host fault rather than becoming a non-identity buffer.
+        kpanic("KMemory64 native identity write to an unmapped page");
+        return nullptr;
+    }
+#endif
     return page->commit();
 }
 
@@ -304,7 +575,7 @@ bool KMemory64::isPageMapped(U64 pageNum) const {
 
 U8* KMemory64::getCommittedPagePtr(U64 pageNum) {
     K64Page* p = getPage(pageNum);
-    return (p && p->committed()) ? p->data : nullptr;
+    return (p && p->committed()) ? p->hostData() : nullptr;
 }
 
 U32 KMemory64::getPageFlags(U64 pageNum) const {
@@ -312,44 +583,355 @@ U32 KMemory64::getPageFlags(U64 pageNum) const {
     return p ? p->flags : 0;
 }
 
-// Process-wide mmap base — must match MMAP64_BASE in syscall64.cpp. Anonymous
-// and file-backed mmap(NULL,...) both draw from here so they can't collide.
-#define K64_MMAP_BASE 0x700000000ULL
-#define K64_MMAP_BASE_PAGE (K64_MMAP_BASE >> K64_PAGE_SHIFT)
+// Process-wide mmap base. Sparse mode retains its historical address; native
+// identity mode starts in the proven iOS host window. Anonymous and file-backed
+// mmap(NULL,...) both draw from the same per-process cursor.
+#define K64_SPARSE_MMAP_BASE 0x700000000ULL
+#define K64_SPARSE_MMAP_BASE_PAGE (K64_SPARSE_MMAP_BASE >> K64_PAGE_SHIFT)
+
+static U64 k64MmapBase(const KMemory64* memory) {
+    return memory->nativeIdentityMode()
+        ? K64_NATIVE_GUEST_MMAP_BASE
+        : K64_SPARSE_MMAP_BASE;
+}
+
+static U64 k64MmapBasePage(const KMemory64* memory) {
+    return k64MmapBase(memory) >> K64_PAGE_SHIFT;
+}
+
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+bool KMemory64::nativeRangeCovers(U64 start, U64 end) const {
+    if (end <= start) return true;
+    U64 cursor = start;
+    auto it = nativeRanges.upper_bound(start);
+    if (it != nativeRanges.begin()) --it;
+    for (; it != nativeRanges.end() && cursor < end; ++it) {
+        const NativeRange& range = it->second;
+        const U64 rangeEnd = range.hostStart + range.hostLength;
+        if (rangeEnd <= cursor) continue;
+        if (range.hostStart > cursor) return false;
+        cursor = rangeEnd > cursor ? rangeEnd : cursor;
+    }
+    return cursor >= end;
+}
+
+void KMemory64::nativeForgetRange(U64 start, U64 length) {
+    if (!length) return;
+    const U64 end = start + length;
+    auto it = nativeRanges.upper_bound(start);
+    if (it != nativeRanges.begin()) --it;
+    while (it != nativeRanges.end() && it->second.hostStart < end) {
+        const U64 rangeStart = it->second.hostStart;
+        const U64 rangeEnd = rangeStart + it->second.hostLength;
+        if (rangeEnd <= start) { ++it; continue; }
+        const U32 prot = it->second.prot;
+        it = nativeRanges.erase(it);
+        if (rangeStart < start) {
+            nativeRanges.emplace(rangeStart,
+                                 NativeRange{rangeStart, start - rangeStart, prot});
+        }
+        if (rangeEnd > end) {
+            nativeRanges.emplace(end, NativeRange{end, rangeEnd - end, prot});
+            break;
+        }
+    }
+}
+
+bool KMemory64::nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh) {
+    if (!nativeGuestRangeAllowed(addr, len)) {
+        klog_fmt("KMemory64: native host MAP_FIXED refused outside guest "
+                 "window addr=0x%llx len=0x%llx",
+                 (unsigned long long)addr, (unsigned long long)len);
+        return false;
+    }
+    const U64 hostPage = k64NativeHostPageSize();
+    if ((hostPage & (hostPage - 1)) != 0 || hostPage < K64_PAGE_SIZE) return false;
+    if (addr > UINT64_MAX - len) return false;
+    const U64 guestEnd = addr + len;
+    if (guestEnd > UINT64_MAX - (hostPage - 1)) return false;
+    const U64 hostStart = k64NativeAlignDown(addr, hostPage);
+    const U64 hostEnd = k64NativeAlignUp(guestEnd, hostPage);
+    const U64 hostLength = hostEnd - hostStart;
+
+    if (nativeRangeCovers(hostStart, hostEnd)) {
+        // MAP_FIXED|MAP_ANONYMOUS replaces the requested guest bytes with
+        // zeroes, even when the requested protection is PROT_NONE.  Temporarily
+        // make the enclosing host pages writable so this remains correct on a
+        // 16 KiB host page when only one 4 KiB guest subpage is remapped.
+        if (::mprotect((void*)(uintptr_t)hostStart, (size_t)hostLength,
+                       PROT_READ | PROT_WRITE) != 0) {
+            return false;
+        }
+        ::memset((void*)(uintptr_t)addr, 0, (size_t)len);
+        // A partial 4 KiB remap shares this host page with neighboring guest
+        // pages. Keep the host page readable/writable in that case; guest
+        // permissions remain in the per-4 KiB flags and enforcing PROT_NONE
+        // here would revoke access from the neighboring subpages.
+        const bool partialHostPage = (hostStart != addr || hostEnd != guestEnd);
+        const int finalProt = partialHostPage ? (PROT_READ | PROT_WRITE)
+                                              : k64NativeProt(prot);
+        if (::mprotect((void*)(uintptr_t)hostStart, (size_t)hostLength,
+                       finalProt) != 0) {
+            return false;
+        }
+        for (auto& entry : nativeRanges) {
+            NativeRange& range = entry.second;
+            if (range.hostStart < hostEnd && range.hostStart + range.hostLength > hostStart) {
+                range.prot = prot;
+            }
+        }
+        fresh = false;
+        return true;
+    }
+
+    // Do not issue Darwin MAP_FIXED against an untracked address: it can
+    // replace the executable arena, the app image, or another runtime region.
+    // The Mach reservation is retained until mmap consumes it, closing the
+    // preflight-to-map race for the first identity mapping in this process.
+    bool reservedHostRange = false;
+    if (!nativeRangeCovers(hostStart, hostEnd)) {
+        // A partially tracked overlap cannot be safely replaced as one
+        // MAP_FIXED operation: it might contain an untracked host region in
+        // the gap. Native mappings are host-page aligned, so a partial overlap
+        // is a bookkeeping error and is rejected rather than guessed around.
+        for (const auto& entry : nativeRanges) {
+            const U64 rangeStart = entry.second.hostStart;
+            const U64 rangeEnd = rangeStart + entry.second.hostLength;
+            if (rangeStart < hostEnd && rangeEnd > hostStart) {
+                klog_fmt("KMemory64: refusing partially tracked native map "
+                         "[0x%llx,0x%llx)", (unsigned long long)hostStart,
+                         (unsigned long long)hostEnd);
+                return false;
+            }
+        }
+        if (!k64NativeHostRangeFree(hostStart, hostLength)) {
+            klog_fmt("KMemory64: native host range is occupied, refusing map "
+                     "[0x%llx,0x%llx)", (unsigned long long)hostStart,
+                     (unsigned long long)hostEnd);
+            return false;
+        }
+        if (!k64NativeReserveHostRange(hostStart, hostLength)) {
+            klog_fmt("KMemory64: native host reservation failed for "
+                     "[0x%llx,0x%llx)", (unsigned long long)hostStart,
+                     (unsigned long long)hostEnd);
+            return false;
+        }
+        reservedHostRange = true;
+    }
+
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_BOXEDWINE;
+    void* mapped = ::mmap((void*)(uintptr_t)hostStart, (size_t)hostLength,
+                          PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (mapped == MAP_FAILED || (U64)(uintptr_t)mapped != hostStart) {
+        if (mapped != MAP_FAILED) ::munmap(mapped, (size_t)hostLength);
+        if (reservedHostRange) {
+            k64NativeReleaseReservedHostRange(hostStart, hostLength);
+        }
+        return false;
+    }
+    ::memset(mapped, 0, (size_t)hostLength);
+    const int finalProt = k64NativeProt(prot);
+    if (finalProt != (PROT_READ | PROT_WRITE) &&
+        ::mprotect(mapped, (size_t)hostLength, finalProt) != 0) {
+        ::munmap(mapped, (size_t)hostLength);
+        return false;
+    }
+    // MAP_FIXED may have replaced a partially overlapping tracked range. Do
+    // not leave stale/overlapping NativeRange entries behind (emplace would
+    // silently retain an old entry with the same key).
+    nativeForgetRange(hostStart, hostLength);
+    nativeRanges.emplace(hostStart, NativeRange{hostStart, hostLength, prot});
+    fresh = true;
+    return true;
+}
+
+bool KMemory64::nativeMapKuserAlias(U64 addr, U64 len, bool& fresh) {
+    if (!k64IsKuserRange(addr, len)) return false;
+    std::lock_guard<std::mutex> lock(g_k64KuserAliasMutex);
+    if (!g_k64KuserAlias.host.load(std::memory_order_acquire)) {
+        void* mapped = ::mmap(nullptr, (size_t)K64_KUSER_SHARED_SIZE,
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped == MAP_FAILED || (uintptr_t)mapped < 0x100000000ULL) {
+            if (mapped != MAP_FAILED) {
+                ::munmap(mapped, (size_t)K64_KUSER_SHARED_SIZE);
+            }
+            return false;
+        }
+        g_k64KuserAlias.host.store(mapped, std::memory_order_release);
+        fresh = true;
+    } else {
+        fresh = false;
+    }
+    if (!nativeKuserAliasHeld) {
+        ++g_k64KuserAlias.refs;
+        nativeKuserAliasHeld = true;
+    }
+    return true;
+}
+
+void KMemory64::nativeReleaseKuserAlias() {
+    if (!nativeKuserAliasHeld) return;
+    std::lock_guard<std::mutex> lock(g_k64KuserAliasMutex);
+    nativeKuserAliasHeld = false;
+    if (g_k64KuserAlias.refs > 0) --g_k64KuserAlias.refs;
+    void* host = g_k64KuserAlias.host.load(std::memory_order_acquire);
+    if (g_k64KuserAlias.refs == 0 && host) {
+        // Shared-file registry entries outlive individual address spaces. Do
+        // not leave them pointing into an alias that is about to disappear;
+        // copy the final bytes back to the canonical process-shared page and
+        // publish that pointer before unmapping the alias.
+        {
+            std::lock_guard<std::mutex> sharedLock(g_sharedFileMutex);
+            const uintptr_t aliasStart = (uintptr_t)host;
+            const uintptr_t aliasEnd = aliasStart + K64_KUSER_SHARED_SIZE;
+            for (auto& entry : g_sharedFileRegistry) {
+                SharedFilePage& shared = *entry.second;
+                U8* current = shared.data->load(std::memory_order_acquire);
+                const uintptr_t currentAddress = (uintptr_t)current;
+                if (currentAddress >= aliasStart &&
+                    currentAddress + K64_PAGE_SIZE <= aliasEnd) {
+                    const size_t offset = currentAddress - aliasStart;
+                    ::memcpy(shared.localData,
+                             static_cast<const U8*>(host) + offset,
+                             K64_PAGE_SIZE);
+                    shared.data->store(shared.localData, std::memory_order_release);
+                }
+            }
+        }
+        ::munmap(host, (size_t)K64_KUSER_SHARED_SIZE);
+        g_k64KuserAlias.host.store(nullptr, std::memory_order_release);
+    }
+}
+
+void KMemory64::nativeUnmapAll() {
+    for (const auto& entry : nativeRanges) {
+        ::munmap((void*)(uintptr_t)entry.second.hostStart,
+                 (size_t)entry.second.hostLength);
+    }
+    nativeRanges.clear();
+    nativeReleaseKuserAlias();
+}
+
+void KMemory64::nativeDemoteSharedPages() {
+    if (!nativeIdentityMode() || nativeRanges.empty()) return;
+    std::lock_guard<std::mutex> lock(g_sharedFileMutex);
+    for (auto& entry : g_sharedFileRegistry) {
+        SharedFilePage& shared = *entry.second;
+        U8* current = shared.data->load(std::memory_order_acquire);
+        if (!current || current == shared.localData) continue;
+        const U64 address = (U64)(uintptr_t)current;
+        bool owned = false;
+        for (const auto& native : nativeRanges) {
+            const U64 end = native.second.hostStart + native.second.hostLength;
+            if (address >= native.second.hostStart && address < end) {
+                owned = true;
+                break;
+            }
+        }
+        if (!owned) continue;
+        const U64 hostPage = k64NativeHostPageSize();
+        const U64 hostStart = k64NativeAlignDown(address, hostPage);
+        ::mprotect((void*)(uintptr_t)hostStart, (size_t)hostPage,
+                   PROT_READ | PROT_WRITE);
+        ::memcpy(shared.localData, current, K64_PAGE_SIZE);
+        shared.data->store(shared.localData, std::memory_order_release);
+    }
+    k64DTlbInvalidateAll();
+}
+#endif
 
 U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
     if (len == 0) return (U64)-K_EINVAL;
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
+    if (len > (U64)-1 - K64_PAGE_MASK ||
+        addr > (U64)-1 - len) return (U64)-K_EINVAL;
 
     U64 pageStart = addr >> K64_PAGE_SHIFT;
     U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+
+    if (nativeIdentityMode() &&
+        !nativeGuestRangeAllowed(addr, pageCount << K64_PAGE_SHIFT)) {
+        klog_fmt("KMemory64: reject native MAP_FIXED anon outside guest window "
+                 "addr=0x%llx len=0x%llx window=[0x%llx,0x%llx)",
+                 (unsigned long long)addr, (unsigned long long)len,
+                 (unsigned long long)K64_NATIVE_GUEST_WINDOW_START,
+                 (unsigned long long)K64_NATIVE_GUEST_WINDOW_END);
+        return (U64)-K_EINVAL;
+    }
 
     U32 flags = K64_PAGE_MAPPED;
     if (prot & 0x1) flags |= K64_PAGE_READ;
     if (prot & 0x2) flags |= K64_PAGE_WRITE | K64_PAGE_READ; // x86: write implies read
     if (prot & 0x4) flags |= K64_PAGE_EXEC;
 
-    for (U64 i = 0; i < pageCount; i++) {
-        K64Page* page = getOrAllocPage(pageStart + i, flags);
-        page->flags = flags;
-        // Lazy commit: a FRESH reservation gets NO backing buffer — it reads as
-        // zero (memcpyFromGuest zero-fills an uncommitted page) and only commits
-        // on first write. This is the leak fix: wine's huge PROT_NONE spans no
-        // longer cost a 4 KB buffer per page. An ALREADY-COMMITTED page being
-        // re-mapped (overlap) is zeroed in place to preserve MAP_ANONYMOUS
-        // semantics and keep the file-mmap head/tail preservation logic valid.
-        if (page->committed()) {
-            noteGuestWrite(pageStart + i); // zero-in-place = content change
-            ::memset(page->data, 0, K64_PAGE_SIZE);
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    bool nativeFresh = false;
+    if (nativeIdentityMode()) {
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+            for (U64 i = 0; i < pageCount; i++) {
+                auto it = pages.find(pageStart + i);
+                if (it != pages.end() && (it->second->flags & K64_PAGE_PINNED)) {
+                    // A host pointer handed to a futex/atomic caller cannot be
+                    // invalidated by MAP_FIXED while that caller may use it.
+                    return (U64)-K_EBUSY;
+                }
+                if (it != pages.end()) it->second->demoteNativeShared();
+            }
+        }
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+        const U64 nativeLen = pageCount << K64_PAGE_SHIFT;
+        const bool kuserRange = k64IsKuserRange(addr, nativeLen);
+        if (kuserRange
+                ? !nativeMapKuserAlias(addr, nativeLen, nativeFresh)
+                : !nativeMapAnonymous(addr, nativeLen, prot, nativeFresh)) {
+            return (U64)-K_ENOMEM;
         }
     }
+#endif
+
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        for (U64 i = 0; i < pageCount; i++) {
+            K64Page* page = getOrAllocPage(pageStart + i, flags);
+            page->flags = flags;
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+            if (nativeIdentityMode()) {
+                const U64 guestPageAddress = addr + (i << K64_PAGE_SHIFT);
+                U8* nativeAddress = k64KuserAliasFor(guestPageAddress);
+                if (prot && nativeAddress) page->adoptNative(nativeAddress);
+                else if (prot) page->adoptNative((U8*)(uintptr_t)guestPageAddress);
+                else if (page->dataNative || page->dataShared) page->decommit();
+                if (prot && !nativeFresh && (prot & 0x2)) {
+                    ::memset(page->hostData(), 0, K64_PAGE_SIZE);
+                }
+            }
+            if (!nativeIdentityMode()) {
+#endif
+            // Lazy commit: a FRESH reservation gets NO backing buffer — it reads as
+            // zero (memcpyFromGuest zero-fills an uncommitted page) and only commits
+            // on first write. This is the leak fix: wine's huge PROT_NONE spans no
+            // longer cost a 4 KB buffer per page. An ALREADY-COMMITTED page being
+            // re-mapped (overlap) is zeroed in place to preserve MAP_ANONYMOUS
+            // semantics and keep the file-mmap head/tail preservation logic valid.
+            if (page->committed()) {
+                noteGuestWrite(pageStart + i); // zero-in-place = content change
+                ::memset(page->hostData(), 0, K64_PAGE_SIZE);
+            }
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+            }
+#endif
+        }
+    }
+    k64InvalidateProcessFetchCaches(process);
     // Keep the reservation map authoritative for the mmap region. A MAP_FIXED
     // landing here (wine remapping inside an earlier reservation, or the
     // allocator's own commit) updates `ranges` so later gap searches see the
     // real occupancy. rangeInsertLocked ignores addresses below the base and
     // splits any range this one overwrites. mmapMutex is recursive, so this is
     // safe whether or not the caller (mmapReserveAndMap) already holds it.
-    if (pageStart >= K64_MMAP_BASE_PAGE) {
+    if (pageStart >= k64MmapBasePage(this)) {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
         rangeInsertLocked(pageStart, pageCount, prot,
                           prot ? (U8)MMAP_ANON : (U8)MMAP_RESERVED);
@@ -362,9 +944,61 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
     if (len == 0) return (U64)-K_EINVAL;
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
     if (!path) return (U64)-K_EINVAL;
+    if (len > (U64)-1 - K64_PAGE_MASK ||
+        addr > (U64)-1 - len) return (U64)-K_EINVAL;
 
     U64 pageStart = addr >> K64_PAGE_SHIFT;
     U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+
+    if (nativeIdentityMode() &&
+        !nativeGuestRangeAllowed(addr, pageCount << K64_PAGE_SHIFT)) {
+        klog_fmt("KMemory64: reject native shared map outside guest window "
+                 "addr=0x%llx len=0x%llx", (unsigned long long)addr,
+                 (unsigned long long)len);
+        return (U64)-K_EINVAL;
+    }
+
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);
+    if (nativeIdentityMode()) {
+        // One registry page can have only one direct host pointer. Refuse a
+        // second identity mapping at a different guest address rather than
+        // retargeting the pointer and silently redirecting the first mapping.
+        // Sparse aliases continue to use the canonical shared page.
+        const std::string requestedPath(path);
+        for (U64 i = 0; i < pageCount && !kuserRange; i++) {
+            const U64 fpage = (fileOffset >> K64_PAGE_SHIFT) + i;
+            std::shared_ptr<SharedFilePage> shared = findSharedFilePage(requestedPath, fpage);
+            if (!shared) continue;
+            const U8* current = shared->data->load(std::memory_order_acquire);
+            const U8* fixed = (const U8*)(uintptr_t)((pageStart + i) << K64_PAGE_SHIFT);
+            if (current != shared->localData && current != fixed) {
+                return (U64)-K_EBUSY;
+            }
+        }
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+            for (U64 i = 0; i < pageCount; i++) {
+                auto it = pages.find(pageStart + i);
+                if (it != pages.end() && (it->second->flags & K64_PAGE_PINNED)) {
+                    return (U64)-K_EBUSY;
+                }
+                if (it != pages.end()) it->second->demoteNativeShared();
+            }
+        }
+    }
+    bool nativeFresh = false;
+    if (nativeIdentityMode()) {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+        if (kuserRange
+                ? !nativeMapKuserAlias(addr, pageCount << K64_PAGE_SHIFT,
+                                       nativeFresh)
+                : !nativeMapAnonymous(addr, pageCount << K64_PAGE_SHIFT,
+                                      prot | 0x3u, nativeFresh)) {
+            return (U64)-K_ENOMEM;
+        }
+    }
+#endif
 
     U32 flags = K64_PAGE_MAPPED | K64_PAGE_SHARED;
     if (prot & 0x1) flags |= K64_PAGE_READ;
@@ -372,38 +1006,89 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
     if (prot & 0x4) flags |= K64_PAGE_EXEC;
 
     std::string p(path);
-    for (U64 i = 0; i < pageCount; i++) {
-        K64Page* page = getOrAllocPage(pageStart + i, flags);
-        page->flags = flags;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        for (U64 i = 0; i < pageCount; i++) {
+            K64Page* page = getOrAllocPage(pageStart + i, flags);
+            page->flags = flags;
         // Each guest page adopts the one shared buffer for this file page. The
         // FIRST process to map a given file page seeds it from the file bytes we
         // were handed; later processes (and later maps) alias the same buffer and
         // must NOT re-seed (that would clobber writes already made through it,
         // e.g. wineserver's live server section). So only the registry-created
         // buffer takes the seed.
-        U64 fpage = (fileOffset >> K64_PAGE_SHIFT) + i;
-        const U8* seed = nullptr; U64 seedLen = 0;
-        U64 thisPageFileStart = (U64)i * K64_PAGE_SIZE;
-        if (fileBytes && fileBytesLen > thisPageFileStart) {
-            seed = fileBytes + thisPageFileStart;
-            seedLen = fileBytesLen - thisPageFileStart;
-            if (seedLen > K64_PAGE_SIZE) seedLen = K64_PAGE_SIZE;
-        }
-        bool created = false;
-        std::shared_ptr<SharedFilePage> shared = getSharedFilePage(p, fpage, seed, seedLen, created);
-        noteGuestWrite(pageStart + i); // buffer replaced = cached blocks stale
+            U64 fpage = (fileOffset >> K64_PAGE_SHIFT) + i;
+            const U8* seed = nullptr; U64 seedLen = 0;
+            U64 thisPageFileStart = (U64)i * K64_PAGE_SIZE;
+            if (fileBytes && fileBytesLen > thisPageFileStart) {
+                seed = fileBytes + thisPageFileStart;
+                seedLen = fileBytesLen - thisPageFileStart;
+                if (seedLen > K64_PAGE_SIZE) seedLen = K64_PAGE_SIZE;
+            }
+            bool created = false;
+            std::shared_ptr<SharedFilePage> shared = getSharedFilePage(p, fpage, seed, seedLen, created);
+            noteGuestWrite(pageStart + i); // buffer replaced = cached blocks stale
         // adoptShared REPLACES (and may free) the page's buffer — stale data
         // TLB entries for this page must not survive.
-        page->adoptShared(shared->data);
-        k64DTlbInvalidateAll();
-        if (std::getenv("BW64_SHAREMAP")) {
-            klog_fmt("SHAREMAP: pid=%u %s fpage=%llu guest=0x%llx path='%s'",
-                     (unsigned)(process ? process->id : 0), created ? "CREATE" : "ALIAS ",
-                     (unsigned long long)fpage,
-                     (unsigned long long)((pageStart + i) << K64_PAGE_SHIFT), p.c_str());
+            bool nativeShared = false;
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+            if (nativeIdentityMode()) {
+                U8* fixed = kuserRange
+                    ? k64KuserAliasFor((pageStart + i) << K64_PAGE_SHIFT)
+                    : (U8*)(uintptr_t)((pageStart + i) << K64_PAGE_SHIFT);
+                {
+                    std::lock_guard<std::mutex> sharedLock(g_sharedFileMutex);
+                    U8* previous = shared->data->load(std::memory_order_acquire);
+                    if (previous != fixed) {
+                        ::memcpy(fixed, previous, K64_PAGE_SIZE);
+                        shared->data->store(fixed, std::memory_order_release);
+                        k64DTlbInvalidateAll();
+                    }
+                }
+                nativeShared = true;
+                // A sparse wineserver can retain this alias after the FEX client
+                // logically unmaps it. Keep the host page until the identity
+                // address space itself is destroyed.
+                page->flags |= K64_PAGE_PINNED;
+            }
+#endif
+            page->adoptShared(shared->data, nativeShared, shared->localData);
+            k64DTlbInvalidateAll();
+            if (std::getenv("BW64_SHAREMAP")) {
+                klog_fmt("SHAREMAP: pid=%u %s fpage=%llu guest=0x%llx path='%s'",
+                         (unsigned)(process ? process->id : 0), created ? "CREATE" : "ALIAS ",
+                         (unsigned long long)fpage,
+                         (unsigned long long)((pageStart + i) << K64_PAGE_SHIFT), p.c_str());
+            }
         }
     }
-    if (pageStart >= K64_MMAP_BASE_PAGE) {
+    k64InvalidateProcessFetchCaches(process);
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    if (nativeIdentityMode()) {
+        if (!kuserRange) {
+            const U64 hostPage = k64NativeHostPageSize();
+            const U64 hostStart = k64NativeAlignDown(addr, hostPage);
+            const U64 hostEnd = k64NativeAlignUp(addr + len, hostPage);
+            // Native shared pages can be reached through the canonical pointer
+            // by sparse aliases. Keep their host backing writable even when the
+            // guest requested read-only/execute permissions.
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+            if (::mprotect((void*)(uintptr_t)hostStart,
+                           (size_t)(hostEnd - hostStart),
+                           k64NativeProt(prot | 0x3u)) != 0) {
+                return (U64)-K_EINVAL;
+            }
+            for (auto& entry : nativeRanges) {
+                NativeRange& range = entry.second;
+                if (range.hostStart < hostEnd &&
+                    range.hostStart + range.hostLength > hostStart) {
+                    range.prot = prot | 0x3u;
+                }
+            }
+        }
+    }
+#endif
+    if (pageStart >= k64MmapBasePage(this)) {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
         rangeInsertLocked(pageStart, pageCount, prot, (U8)MMAP_ANON);
     }
@@ -414,10 +1099,10 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
 // Splits/clamps any pre-existing ranges that the new one overwrites so the map
 // stays a non-overlapping cover of the live mmap-region reservations (wine
 // MAP_FIXED-remaps inside an earlier reservation constantly). Only the mmap
-// region (>= K64_MMAP_BASE) is tracked; the loader's fixed low maps don't need
+// region (>= the active mmap base) is tracked; the loader's fixed low maps don't need
 // allocation bookkeeping because the gap search never looks below the base.
 void KMemory64::rangeInsertLocked(U64 startPage, U64 pageCount, U32 prot, U8 kind) {
-    if (pageCount == 0 || startPage < K64_MMAP_BASE_PAGE) return;
+    if (pageCount == 0 || startPage < k64MmapBasePage(this)) return;
     rangeRemoveLocked(startPage, pageCount); // clear any overlap first
     ranges[startPage] = MMapRange{ startPage, pageCount, prot, kind };
 }
@@ -447,13 +1132,16 @@ void KMemory64::rangeRemoveLocked(U64 startPage, U64 pageCount) {
 }
 
 U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
+    if (length > (U64)-1 - K64_PAGE_MASK) return (U64)-K_EINVAL;
     U64 pageCount = (length + K64_PAGE_MASK) >> K64_PAGE_SHIFT;
     if (pageCount == 0) pageCount = 1;
 
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
-    if (mmapNext == 0) mmapNext = K64_MMAP_BASE;
+    const U64 mmapBase = k64MmapBase(this);
+    const U64 mmapBasePage = mmapBase >> K64_PAGE_SHIFT;
+    if (mmapNext == 0) mmapNext = mmapBase;
     U64 cursor = mmapNext >> K64_PAGE_SHIFT;
-    if (cursor < K64_MMAP_BASE_PAGE) cursor = K64_MMAP_BASE_PAGE;
+    if (cursor < mmapBasePage) cursor = mmapBasePage;
 
     // Gap search over the ordered reservation map: O(log n + ranges scanned),
     // not O(pages). Walk ranges from `cursor`; the first hole of `pageCount`
@@ -475,11 +1163,17 @@ U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
     }
     // `candidate` now points at a hole large enough (either before `it` or past
     // the last range — address space above is effectively unbounded for us).
+    const U64 windowEndPage = K64_NATIVE_GUEST_WINDOW_END >> K64_PAGE_SHIFT;
+    if (nativeIdentityMode() &&
+        (candidate > windowEndPage || pageCount > windowEndPage - candidate)) {
+        return (U64)-K_ENOMEM;
+    }
     U64 addr = candidate << K64_PAGE_SHIFT;
     // Map the pages NOW, under mmapMutex (recursive), so a concurrent sibling's
     // allocation sees them taken. mmapAnonymousFixed registers the reservation
     // in `ranges` itself, so the gap is claimed before we drop the lock.
-    mmapAnonymousFixed(addr, pageCount << K64_PAGE_SHIFT, prot);
+    U64 mapped = mmapAnonymousFixed(addr, pageCount << K64_PAGE_SHIFT, prot);
+    if (mapped != addr) return mapped;
     mmapNext = (candidate + pageCount) << K64_PAGE_SHIFT;
     return addr;
 }
@@ -487,31 +1181,173 @@ U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
 U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
     if (len == 0) return addr;
+    if (addr > (U64)-1 - len) return (U64)-K_EINVAL;
+    if (len > (U64)-1 - K64_PAGE_MASK) return (U64)-K_EINVAL;
+    U64 pageStart = addr >> K64_PAGE_SHIFT;
+    U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    if (nativeIdentityMode()) {
+        if (!nativeGuestRangeAllowed(addr, pageCount << K64_PAGE_SHIFT)) {
+            klog_fmt("KMemory64: reject native mprotect outside guest window "
+                     "addr=0x%llx len=0x%llx", (unsigned long long)addr,
+                     (unsigned long long)len);
+            return (U64)-K_EINVAL;
+        }
+        const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);
+        const U64 hostPage = k64NativeHostPageSize();
+        const U64 hostStart = k64NativeAlignDown(addr, hostPage);
+        if (addr + len > UINT64_MAX - (hostPage - 1)) return (U64)-K_EINVAL;
+        const U64 hostEnd = k64NativeAlignUp(addr + len, hostPage);
+        U32 hostProtFlags = prot & 0x3u;
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+            for (U64 i = 0; i < pageCount; i++) {
+                auto it = pages.find(pageStart + i);
+                if (it == pages.end() || !(it->second->flags & K64_PAGE_MAPPED)) {
+                    // mprotect changes permissions; it never creates a mapping.
+                    return (U64)-K_ENOMEM;
+                }
+                if (!prot && (it->second->flags & K64_PAGE_PINNED)) {
+                    // getRamPtr may have handed this backing page to a futex or
+                    // atomic waiter. Removing its host access would leave that
+                    // caller with a dangling or faulting pointer.
+                    return (U64)-K_EBUSY;
+                }
+                if (it->second->dataShared) hostProtFlags |= 0x3u;
+            }
+            // Host pages are 16 KiB on current iOS devices. Preserve the
+            // permissions of mapped guest subpages that share the first or
+            // last host page, and keep a shared-file page writable so sparse
+            // aliases that use its canonical pointer cannot fault. Guest EXEC
+            // remains only in K64_PAGE_EXEC metadata.
+            auto includePage = [&](U64 pageNum, bool target) {
+                auto it = pages.find(pageNum);
+                if (it == pages.end() || !(it->second->flags & K64_PAGE_MAPPED)) return;
+                if (!target) hostProtFlags |= k64GuestProtFromPageFlags(it->second->flags);
+                if (it->second->dataShared) hostProtFlags |= 0x3u;
+            };
+            const U64 hostPages = hostPage >> K64_PAGE_SHIFT;
+            for (U64 sub = 0; sub < hostPages; sub++) {
+                const U64 firstPage = (hostStart >> K64_PAGE_SHIFT) + sub;
+                includePage(firstPage, firstPage >= pageStart && firstPage < pageStart + pageCount);
+                if (hostEnd > hostStart + hostPage) {
+                    const U64 lastPage = ((hostEnd - hostPage) >> K64_PAGE_SHIFT) + sub;
+                    includePage(lastPage, lastPage >= pageStart && lastPage < pageStart + pageCount);
+                }
+            }
+        }
+        if (!kuserRange) {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+            if (!nativeRangeCovers(hostStart, hostEnd) ||
+                ::mprotect((void*)(uintptr_t)hostStart, (size_t)(hostEnd - hostStart),
+                           k64NativeProt(hostProtFlags)) != 0) {
+                return (U64)-K_EINVAL;
+            }
+            for (auto& entry : nativeRanges) {
+                NativeRange& range = entry.second;
+                if (range.hostStart < hostEnd && range.hostStart + range.hostLength > hostStart) {
+                    range.prot = hostProtFlags;
+                }
+            }
+        }
+    }
+#endif
 
     U32 newFlags = K64_PAGE_MAPPED;
     if (prot & 0x1) newFlags |= K64_PAGE_READ;
     if (prot & 0x2) newFlags |= K64_PAGE_WRITE | K64_PAGE_READ; // write implies read
     if (prot & 0x4) newFlags |= K64_PAGE_EXEC;
 
-    U64 pageStart = addr >> K64_PAGE_SHIFT;
-    U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
-    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
-    for (U64 i = 0; i < pageCount; i++) {
-        // Preserve SHARED bit if it was set; everything else is replaced
-        // wholesale. Holes (no page) are skipped — see header comment.
-        auto it = pages.find(pageStart + i);
-        if (it == pages.end()) continue;
-        U32 preserved = it->second->flags & (K64_PAGE_SHARED | K64_PAGE_PINNED);
-        it->second->flags = newFlags | preserved;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        for (U64 i = 0; i < pageCount; i++) {
+            // Preserve SHARED bit if it was set; everything else is replaced
+            // wholesale. Holes (no page) are skipped — see header comment.
+            auto it = pages.find(pageStart + i);
+            if (it == pages.end()) continue;
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+            if (nativeIdentityMode()) {
+                if (prot && !it->second->dataShared) {
+                    it->second->adoptNative((U8*)(uintptr_t)(addr + (i << K64_PAGE_SHIFT)));
+                } else if (!prot && it->second->dataNative && !it->second->dataShared) {
+                    it->second->decommit();
+                }
+            }
+#endif
+            U32 preserved = it->second->flags & (K64_PAGE_SHARED | K64_PAGE_PINNED);
+            it->second->flags = newFlags | preserved;
+        }
     }
+    k64InvalidateProcessFetchCaches(process);
     return addr;
 }
 
 U64 KMemory64::munmap(U64 addr, U64 len) {
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
     if (len == 0) return 0;
+    if (addr > (U64)-1 - len) return (U64)-K_EINVAL;
+    if (len > (U64)-1 - K64_PAGE_MASK) return (U64)-K_EINVAL;
     U64 pageStart = addr >> K64_PAGE_SHIFT;
     U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    if (nativeIdentityMode()) {
+        if (!nativeGuestRangeAllowed(addr, pageCount << K64_PAGE_SHIFT)) {
+            klog_fmt("KMemory64: reject native munmap outside guest window "
+                     "addr=0x%llx len=0x%llx", (unsigned long long)addr,
+                     (unsigned long long)len);
+            return (U64)-K_EINVAL;
+        }
+        const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);
+        const U64 hostPage = k64NativeHostPageSize();
+        if ((hostPage % K64_PAGE_SIZE) != 0) return (U64)-K_EINVAL;
+        if (addr + len > UINT64_MAX - (hostPage - 1)) return (U64)-K_EINVAL;
+        const U64 hostStart = k64NativeAlignDown(addr, hostPage);
+        const U64 hostEnd = k64NativeAlignUp(addr + len, hostPage);
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+            for (U64 i = 0; i < pageCount; i++) {
+                auto it = pages.find(pageStart + i);
+                if (it != pages.end()) {
+                    const bool pinned = (it->second->flags & K64_PAGE_PINNED) != 0;
+                    if (!pinned) {
+                        it->second->demoteNativeShared();
+                        it->second->decommit();
+                    }
+                    it->second->flags = pinned ? K64_PAGE_PINNED : 0;
+                }
+            }
+        }
+        // A host page can contain four guest pages on iOS. Keep it mapped while
+        // any guest subpage (or pinned native pointer) still owns that host page;
+        // otherwise release exactly one host page and split the tracking range.
+        if (!kuserRange) {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+            for (U64 host = hostStart; host < hostEnd; host += hostPage) {
+                bool keepHostPage = false;
+                {
+                    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+                    for (U64 sub = 0; sub < hostPage; sub += K64_PAGE_SIZE) {
+                        auto it = pages.find((host + sub) >> K64_PAGE_SHIFT);
+                        if (it != pages.end() &&
+                            (it->second->flags & (K64_PAGE_MAPPED | K64_PAGE_PINNED))) {
+                            keepHostPage = true;
+                            break;
+                        }
+                    }
+                }
+                if (!keepHostPage && nativeRangeCovers(host, host + hostPage)) {
+                    if (::munmap((void*)(uintptr_t)host, (size_t)hostPage) == 0) {
+                        nativeForgetRange(host, hostPage);
+                    }
+                }
+            }
+        }
+        k64DTlbInvalidateAll();
+        k64InvalidateProcessFetchCaches(process);
+    }
+#endif
 
     // Free the ADDRESS SPACE only — drop/trim the reservation record so the
     // range is reusable and the gap search stays fast.
@@ -659,8 +1495,9 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
         if (chunk > len) chunk = len;
         K64Page* page = getPage(pageNum);
         if (page && page->committed()) {
-            k64DTlbInsert(this, pageNum, page->data);
-            ::memcpy(d, page->data + offsetInPage, (size_t)chunk);
+            U8* host = page->hostData();
+            k64DTlbInsert(this, pageNum, host);
+            ::memcpy(d, host + offsetInPage, (size_t)chunk);
         } else {
             // Absent slot OR reserved-but-uncommitted page → reads as zero.
             // (Not cached: a later write commits a buffer the TLB must see.)
@@ -692,8 +1529,9 @@ U8 KMemory64::readb(U64 addr) {
     if (U8* hit = k64DTlbLookup(this, pageNum)) return hit[addr & K64_PAGE_MASK];
     K64Page* p = getPage(pageNum);
     if (p && p->committed()) {
-        k64DTlbInsert(this, pageNum, p->data);
-        return p->data[addr & K64_PAGE_MASK];
+        U8* host = p->hostData();
+        k64DTlbInsert(this, pageNum, host);
+        return host[addr & K64_PAGE_MASK];
     }
     return 0;
 }
@@ -749,6 +1587,12 @@ U8* KMemory64::getRamPtr(U64 addr, U32 len) {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
         K64Page* page = getOrAllocPage(addr >> K64_PAGE_SHIFT,
                                        K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+        if (nativeIdentityMode() && (!page->hostData() || !page->dataNative)) {
+            kpanic("KMemory64 native identity getRamPtr on an unmapped page");
+            return nullptr;
+        }
+#endif
         page->flags |= K64_PAGE_PINNED;
         data = page->commit();
     }

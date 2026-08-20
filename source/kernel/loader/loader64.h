@@ -68,6 +68,8 @@ struct Elf64ParseResult {
     bool ok = false;
     U64 entry = 0;            // e_entry
     U64 phoff = 0;            // e_phoff (file offset of phdr table)
+    U64 phdrVaddr = 0;        // runtime vaddr of program-header table
+    bool phdrPresent = false; // explicit PT_PHDR or derived from containing PT_LOAD
     U16 phentsize = 0;
     U16 phnum = 0;
     U64 baseAddrLow = 0;      // lowest p_vaddr across PT_LOAD

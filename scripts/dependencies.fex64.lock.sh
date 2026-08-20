@@ -61,9 +61,17 @@ BOXEDVN_DXMT_COMMIT="d6bd546dc685189f4434f87fd15ea7b21009e64f"
 
 # --- llvm-mingw -------------------------------------------------------------
 # Builds DXMT's PE side (d3d11.dll, dxgi.dll, winemetal.dll, d3d10core.dll)
-# for aarch64-windows. Prebuilt macOS universal toolchain; no source build.
+# for x86_64-w64-mingw32. Prebuilt macOS universal toolchain; no source build.
 BOXEDVN_LLVM_MINGW_VERSION="20260421"
 BOXEDVN_LLVM_MINGW_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz"
+BOXEDVN_LLVM_MINGW_SHA256="bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7"
+
+# DXMT's x86-64 PE build needs a Wine import-library SDK. This archive is
+# consumed only during the reproducible CI build and is never shipped in the
+# iOS bundle.
+BOXEDVN_DXMT_WINE_SDK_VERSION="8.16-3shain"
+BOXEDVN_DXMT_WINE_SDK_URL="https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz"
+BOXEDVN_DXMT_WINE_SDK_SHA256="289c7f19e270a3d3d0a6fdb07691b176c70a0795f6811e5255cba82425de4f10"
 
 # --- LLVM -------------------------------------------------------------------
 # DXMT's airconv translates DXBC to Metal AIR through LLVM, so LLVM itself has

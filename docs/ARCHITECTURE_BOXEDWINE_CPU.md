@@ -357,6 +357,32 @@ The existing design already preserves the right boundary:
 - `NormalCPU` remains the shared interpreter and fallback.
 
 Phase 1 must not make BoxedWine depend on UIKit, Metal, the iOS arena, or FEX.
+
+### Wine64 address contract for the native-identity path
+
+The Ubuntu CI runtime is a reproducible *stock Wine64* layer, not a claim that
+Wine's ordinary Linux address policy is suitable for iOS by itself.  The Wine
+9.0 source used for the audit makes the incompatibility explicit:
+
+- `dlls/ntdll/unix/virtual.c:161-168` starts the 64-bit virtual allocator at
+  `0x10000` and keeps the normal user-space ceiling;
+- `dlls/ntdll/unix/virtual.c:3656-3675` allocates the first TEB block with the
+  `limit_2g - 1` hint on Win64;
+- `dlls/ntdll/unix/virtual.c:180` and `dlls/ntdll/thread.c:39` publish
+  `KUSER_SHARED_DATA` at the canonical `0x7ffe0000` address; and
+- `dlls/ntdll/unix/virtual.c:3894-3897` remaps the server section at that
+  pointer with `MAP_FIXED`.
+
+The native BoxedWine64 allocator deliberately places identity mappings in its
+high iOS-safe window (`include/kmemory64.h:63-78`).  Therefore the Wine64
+layer is marked `stock-low-teb-hint-fixed-kuser-v1` in its manifest.  This is a
+compatibility contract, not a waiver: the native path must ignore the low TEB
+hint, provide the shared KUSER high alias, and repair native translator faults
+that still use the canonical KUSER guest VA.  The CI validator requires that
+contract to be recorded, so a future source-built Wine64 can replace the stock
+layer only after its address policy is audited.  Until the KUSER fault bridge is
+present and device-tested, the runtime artifact is packaging evidence, not a
+claim that a 64-bit guest boots on iOS.
 Only the `Platform` executable-memory hook and optional diagnostics may remain
 iOS-specific.
 

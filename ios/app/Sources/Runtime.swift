@@ -496,6 +496,7 @@ enum Session {
     /// request is refused; never reports a generic failure.
     static func launch(
         rootFilesystem: URL,
+        rootFilesystemOverlays: [URL] = [],
         writableRoot: URL,
         gameDirectory: URL?,
         sharedDirectory: URL?,
@@ -507,6 +508,8 @@ enum Session {
         height: UInt32,
         soundEnabled: Bool,
         runThroughWine: Bool,
+        useFEX64: Bool = false,
+        useDXMT: Bool = false,
         wineRenderer: BVNWineRenderer = BVNWineRendererAutomatic,
         gameDriveLetter: Character = "d",
         sharedDriveLetter: Character = "e",
@@ -519,9 +522,11 @@ enum Session {
         // and only pointers are handed across.
         let argumentStorage = arguments.map { strdup($0) }
         let environmentStorage = environment.map { strdup($0) }
+        let overlayStorage = rootFilesystemOverlays.map { strdup($0.path) }
         defer {
             argumentStorage.forEach { free($0) }
             environmentStorage.forEach { free($0) }
+            overlayStorage.forEach { free($0) }
         }
 
         // Immutable buffers, because BVNLaunchRequest's fields are
@@ -529,6 +534,7 @@ enum Session {
         // assignment to a struct field the way it does for call arguments.
         let argumentPointers = argumentStorage.map { UnsafePointer<CChar>($0) }
         let environmentPointers = environmentStorage.map { UnsafePointer<CChar>($0) }
+        let overlayPointers = overlayStorage.map { UnsafePointer<CChar>($0) }
 
         let accepted = rootFilesystem.path.withCString { rootPath in
             writableRoot.path.withCString { writablePath in
@@ -543,6 +549,8 @@ enum Session {
                                         versionPath in
                                         var request = BVNLaunchRequest()
                                         request.rootFilesystemZipPath = rootPath
+                                        request.rootFilesystemOverlayZipCount =
+                                            overlayPointers.count
                                         request.writableRootPath = writablePath
                                         request.gameDirectoryHostPath = gamePath
                                         request.compatibilityDirectoryHostPath =
@@ -562,22 +570,30 @@ enum Session {
                                         request.bitsPerPixel = 32
                                         request.soundEnabled = soundEnabled
                                         request.runThroughWine = runThroughWine
+                                        request.useFEX64 = useFEX64
+                                        request.useDXMT = useDXMT
                                         request.wineRenderer = wineRenderer
                                         request.argumentCount = argumentPointers.count
                                         request.environmentCount =
                                             environmentPointers.count
 
-                                        return argumentPointers
-                                            .withUnsafeBufferPointer { args in
-                                                environmentPointers
-                                                    .withUnsafeBufferPointer { env in
-                                                        request.arguments =
-                                                            args.baseAddress
-                                                        request.environment =
-                                                            env.baseAddress
-                                                        return BVNRuntimeRequestLaunch(
-                                                            &request, &errorBuffer,
-                                                            errorBuffer.count)
+                                        return overlayPointers
+                                            .withUnsafeBufferPointer { overlays in
+                                                argumentPointers
+                                                    .withUnsafeBufferPointer { args in
+                                                        environmentPointers
+                                                            .withUnsafeBufferPointer { env in
+                                                                request.rootFilesystemOverlayZipPaths =
+                                                                    overlays.baseAddress
+                                                                request.arguments =
+                                                                    args.baseAddress
+                                                                request.environment =
+                                                                    env.baseAddress
+                                                                return BVNRuntimeRequestLaunch(
+                                                                    &request,
+                                                                    &errorBuffer,
+                                                                    errorBuffer.count)
+                                                            }
                                                     }
                                             }
                                     }

@@ -1,0 +1,21 @@
+# BoxedVN Wine64 runtime manifest v1.
+#
+# This file is deliberately an example, not a redistributable runtime. Copy it
+# beside the two archives produced by the audited BoxedWine64 rootfs builder,
+# replace the two SHA-256 placeholders, and pass the containing directory (or
+# an outer ZIP containing these three files) to --wine64-runtime.
+#
+# The hashes are the reproducibility boundary for developer-supplied assets.
+# Do not replace them with a mutable URL or with "latest" metadata.
+format=boxedvn-wine64-v1
+source=third_party/boxedwine64-audit/tools/rootfs64/build-wine64-zip.sh
+source_image=boxedwine64/wine64-debian:bookworm
+# Stock Wine64 keeps the Windows-compatible low TEB hint and fixed KUSER
+# address. Native-identity BoxedWine must provide the corresponding high
+# window and KUSER alias/fault bridge before this layer is device-usable.
+wine_address_contract=stock-low-teb-hint-fixed-kuser-v1
+boxedwine_bridge_required=K64_NATIVE_IDENTITY_KUSER_ALIAS
+glibc_archive=glibc-rootfs64.zip
+glibc_sha256=REPLACE_WITH_64_HEX_SHA256
+wine_archive=wine64.zip
+wine_sha256=REPLACE_WITH_64_HEX_SHA256

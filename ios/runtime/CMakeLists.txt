@@ -22,7 +22,9 @@ add_library(boxedvn_runtime STATIC
     src/BVNMain.mm
     src/BVNAppDelegate.mm
     src/BVNGuestOverlay.mm
+    src/BVNDXMTDisplay.m
     src/BVNFEXBackend.mm
+    src/BVNFEXCPU64Adapter.mm
 )
 
 # Read BOXEDWINE_VERSION_STR straight out of the upstream header so the value
@@ -81,6 +83,15 @@ if(BOXEDVN_ENABLE_FEX64)
     message(STATUS "BoxedVN: optional FEX64 translator enabled")
 endif()
 
+if(BOXEDVN_DXMT_NATIVE_ARCHIVE)
+    # The archive contains the iPhoneOS winemetal unix-call implementation;
+    # keep it adjacent to FEX in the merged archive so the core's reserved
+    # x86-64 host-call dispatcher can resolve the table at link time.
+    list(APPEND BOXEDVN_FEX64_ARCHIVES "${BOXEDVN_DXMT_NATIVE_ARCHIVE}")
+    target_link_libraries(boxedvn_runtime PUBLIC
+        "${BOXEDVN_DXMT_NATIVE_ARCHIVE}")
+endif()
+
 target_link_libraries(boxedvn_runtime PUBLIC
     boxedwine_core
     boxedvn_support
@@ -90,6 +101,7 @@ find_library(UIKIT_FRAMEWORK UIKit REQUIRED)
 find_library(AVFAUDIO_FRAMEWORK AVFoundation REQUIRED)
 find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
+find_library(METALFX_FRAMEWORK MetalFX REQUIRED)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 find_library(COREMOTION_FRAMEWORK CoreMotion REQUIRED)
@@ -99,12 +111,14 @@ find_library(IMAGEIO_FRAMEWORK ImageIO REQUIRED)
 find_library(IOSURFACE_FRAMEWORK IOSurface REQUIRED)
 find_library(UNIFORMTYPE_FRAMEWORK UniformTypeIdentifiers REQUIRED)
 find_library(SECURITY_FRAMEWORK Security REQUIRED)
+find_library(SQLITE3_LIBRARY sqlite3 REQUIRED)
 
 target_link_libraries(boxedvn_runtime PUBLIC
     ${UIKIT_FRAMEWORK}
     ${AVFAUDIO_FRAMEWORK}
     ${GAMECONTROLLER_FRAMEWORK}
     ${METAL_FRAMEWORK}
+    ${METALFX_FRAMEWORK}
     ${QUARTZCORE_FRAMEWORK}
     ${COREGRAPHICS_FRAMEWORK}
     ${COREMOTION_FRAMEWORK}
@@ -114,6 +128,7 @@ target_link_libraries(boxedvn_runtime PUBLIC
     ${IOSURFACE_FRAMEWORK}
     ${UNIFORMTYPE_FRAMEWORK}
     ${SECURITY_FRAMEWORK}
+    ${SQLITE3_LIBRARY}
 )
 
 target_compile_options(boxedvn_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -146,7 +161,7 @@ add_custom_command(
             ${BOXEDVN_FEX64_ARCHIVES}
     DEPENDS boxedvn_runtime boxedwine_core boxedvn_support
             boxedwine_zlib boxedwine_softfloat boxedwine_asmjit
-            boxedwine_pugixml
+            boxedwine_pugixml ${BOXEDVN_FEX64_ARCHIVES}
     COMMENT "Merging BoxedVN static libraries into libboxedvn.a"
     VERBATIM
 )

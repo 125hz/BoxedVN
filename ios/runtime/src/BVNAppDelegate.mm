@@ -41,6 +41,7 @@
 #include <cmath>
 #include <dispatch/dispatch.h>
 
+#include "BVNDXMTDisplay.h"
 #include "BVNRuntime.h"
 #import "BVNGuestOverlay.h"
 
@@ -607,6 +608,7 @@ extern "C" void BVNFinishGuestPresentation(void) {
     [gGuestVulkanSurfaceViews removeAllObjects];
     [gGuestVulkanWaitingOverlays removeAllObjects];
     BVNForgetGuestPresentationAspect(nullptr);
+    BVNDXMTDisplayFinish();
     [gAppDelegate finishGuestPresentation];
 }
 
@@ -695,6 +697,7 @@ extern "C" void BVNAttachGuestWindowToScene(void) {
     guestWindow.rootViewController.view.backgroundColor = UIColor.blackColor;
     guestWindow.rootViewController.view.superview.backgroundColor =
         UIColor.blackColor;
+    BVNDXMTDisplayAttach();
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "SDL guest window attached to the active UIWindowScene.");
 
