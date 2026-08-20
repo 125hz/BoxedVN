@@ -124,8 +124,9 @@ build_tree() {
     ok "wine/${name}: configured"
 }
 
-# Everything optional is off. This tree is a header generator, not a Wine
-# anyone runs, and every dependency enabled here is one more thing to
+# Everything optional is off. This tree primarily generates headers, plus a
+# deliberately small pair of x86-64 compatibility DLLs used by translated
+# programs. Every other dependency enabled here is one more thing to
 # cross-build later for no benefit.
 COMMON_CONFIGURE=(
     --disable-tests
@@ -176,12 +177,11 @@ done
 
 # What each tree is built *for* decides how much of it to build.
 #
-# The macOS tree is a header generator, and building it all the way through
-# fails on purpose-built iOS code: the fork's win32u references glue that lives
-# in the application rather than in Wine, so win32u.so cannot link on a macOS
-# host and never needs to. Building the include directory alone produces
-# config.h and the widl-generated headers, which is the entire reason this tree
-# exists.
+# The macOS tree is mostly a header generator, and building it all the way
+# through fails on purpose-built iOS code: the fork's win32u references glue
+# that lives in the application rather than in Wine, so win32u.so cannot link
+# on a macOS host and never needs to. Build the include directory, then only
+# the two x86-64 controller compatibility DLLs needed by translated programs.
 #
 # The ARM64EC tree is the Windows side that actually runs, so it is built in
 # full.
@@ -214,6 +214,24 @@ for tree in ${TREES}; do
     fi
 
     require_file "${build}/include/config.h"         "The tree built but produced no config.h, which is what the iOS unix side includes."
+
+    if [[ "${tree}" == "macos" ]]; then
+        compatibility_targets=(
+            dlls/xinput1_4/x86_64-windows/xinput1_4.dll
+            dlls/xinput9_1_0/x86_64-windows/xinput9_1_0.dll
+        )
+        log "wine/macos: building the x86-64 controller compatibility DLLs"
+        if ! make -C "${build}" -j "${JOBS}" "${compatibility_targets[@]}" \
+                >> "${build}/build.log" 2>&1; then
+            warn "wine/macos: compatibility DLL build failed; last 40 lines"
+            tail -40 "${build}/build.log" >&2
+            die "wine/macos: controller compatibility DLLs failed to build. Full log: ${build}/build.log"
+        fi
+        for required in "${compatibility_targets[@]}"; do
+            require_file "${build}/${required}"
+        done
+        ok "wine/macos: built the x86-64 controller compatibility DLLs"
+    fi
 
     if [[ "${tree}" == "arm64ec" ]]; then
         # The PE side is the deliverable, so count it and insist on the three

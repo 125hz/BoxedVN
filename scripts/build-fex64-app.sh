@@ -157,14 +157,14 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
         WINE_PE_DIR="$(cd "${WINE_PE_DIR}" && pwd)"
         for runtime_dll in xinput1_4.dll xinput9_1_0.dll; do
             runtime_source="$(find "${WINE_PE_DIR}/dlls" \
-                -path "*/arm64ec-windows/${runtime_dll}" -print -quit 2>/dev/null)"
+                -path "*/x86_64-windows/${runtime_dll}" -print -quit 2>/dev/null)"
             [[ -n "${runtime_source}" ]] || die \
-"The ARM64EC Wine build at '${WINE_PE_DIR}' did not produce ${runtime_dll}.
+"The x86-64 Wine build at '${WINE_PE_DIR}' did not produce ${runtime_dll}.
 The bundled runtime needs this system compatibility DLL before programs that
 import it can enter their main function. Check ${WINE_PE_DIR}/build.log."
             cp "${runtime_source}" \
                "${WINE_RESOURCE_STAGING}/arm64ec-windows/${runtime_dll}"
-            log "Staged ARM64EC Wine compatibility DLL ${runtime_dll}"
+            log "Staged x86-64 Wine compatibility DLL ${runtime_dll}"
         done
     fi
 
