@@ -156,9 +156,9 @@ if [[ -n "${WINE_CORE_DIR}${WINE_RUNTIME_DIR}${MYTHIC_DIR}" ]]; then
             "The Wine PE build directory '${WINE_PE_DIR}' does not exist."
         WINE_PE_DIR="$(cd "${WINE_PE_DIR}" && pwd)"
         for runtime_dll in xinput1_4.dll xinput9_1_0.dll; do
-            runtime_source="$(find "${WINE_PE_DIR}/dlls" \
-                -path "*/x86_64-windows/${runtime_dll}" -print -quit 2>/dev/null)"
-            [[ -n "${runtime_source}" ]] || die \
+            runtime_module="${runtime_dll%.dll}"
+            runtime_source="${WINE_PE_DIR}/dlls/${runtime_module}/${runtime_dll}"
+            [[ -f "${runtime_source}" ]] || die \
 "The x86-64 Wine build at '${WINE_PE_DIR}' did not produce ${runtime_dll}.
 The bundled runtime needs this system compatibility DLL before programs that
 import it can enter their main function. Check ${WINE_PE_DIR}/build.log."

@@ -217,8 +217,8 @@ for tree in ${TREES}; do
 
     if [[ "${tree}" == "macos" ]]; then
         compatibility_targets=(
-            dlls/xinput1_4/x86_64-windows/xinput1_4.dll
-            dlls/xinput9_1_0/x86_64-windows/xinput9_1_0.dll
+            dlls/xinput1_4/xinput1_4.dll
+            dlls/xinput9_1_0/xinput9_1_0.dll
         )
         log "wine/macos: building the x86-64 controller compatibility DLLs"
         if ! make -C "${build}" -j "${JOBS}" "${compatibility_targets[@]}" \
