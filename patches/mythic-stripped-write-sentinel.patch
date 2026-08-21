@@ -1,0 +1,59 @@
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -10496,13 +10496,32 @@
+                 mach_port_t ro = MACH_PORT_NULL;
+                 int host_prot = -1;
+ 
++                int host_max = -1;
+                 if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                     (vm_region_info_t)&rbi, &rc, &ro ) == KERN_SUCCESS)
++                {
+                     host_prot = rbi.protection;
++                    host_max = rbi.max_protection;
++                }
+ 
+                 {
+                     static unsigned long wr_seen, wr_healed;
+-                    int stripped = (is_write && (want & PROT_WRITE) &&
++                    /* BoxedVN: want >= 0 is not decoration.
++                     *
++                     * ios_page_expected_prot returns -1 for "this page is not
++                     * committed in Wine's bookkeeping" -- a sentinel, not a
++                     * protection. Without the guard, (want & PROT_WRITE) is
++                     * true for -1 because every bit is set, so a write fault
++                     * on any address Wine does not own was classified as a
++                     * stripped write and then repaired with
++                     * mprotect(page, size, -1). A device log has that exact
++                     * pair: "wine_want=-1 host_prot=1 <== HOST STRIPPED
++                     * WRITE" followed by "mprotect(0x300904000, -1) FAILED
++                     * errno=1", on a system region at a pc inside the dyld
++                     * shared cache. The repair could not have worked and the
++                     * classification was wrong; both came from reading a
++                     * sentinel as a bitmask. */
++                    int stripped = (is_write && want >= 0 && (want & PROT_WRITE) &&
+                                     host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
+                     ++wr_seen;
+                     if (wr_seen <= 12 || (wr_seen % 4096) == 0)
+@@ -10513,6 +10532,22 @@
+                             stripped ? "<== HOST STRIPPED WRITE" : "(not a strip)",
+                             wr_seen, wr_healed);
+ 
++                    /* The case the guard above now excludes, reported rather
++                     * than silently dropped. max_protection is the number
++                     * that decides whether a repair is even possible: a
++                     * region whose maximum is r-- can never be made writable,
++                     * so a healer that tried would fail however correct its
++                     * arguments were. Say which of the two it is before
++                     * anyone writes code to raise the maximum. */
++                    if (is_write && want < 0 && (wr_seen <= 12 || (wr_seen % 4096) == 0))
++                        ERR("[wr-strip] #%lu no wine view for %p — not a strip and not "
++                            "repairable from here; host prot=%d max=%d (%s) rev=bvn3
++",
++                            wr_seen, siginfo->si_addr, host_prot, host_max,
++                            (host_max >= 0 && !(host_max & VM_PROT_WRITE))
++                                ? "maximum forbids write: unrepairable"
++                                : "maximum allows write: a repair could be attempted");
++
+                     if (stripped)
+                     {
+                         enum { WR_HPAGE = 0x4000 };

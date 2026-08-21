@@ -360,12 +360,54 @@ the `.entitlements` file in the tree. Those are different facts, and a
 sideloader that strips the entitlement turns a 4 GB ceiling into a fraction of
 one while the repository still claims to have asked for it.
 
-Read that line before tuning anything. If the entitlement is not signed in,
-the fix is in the signing and no amount of arena tuning substitutes for it. If
-it is signed in and the run still dies at 1.6 GB, then the per-thread cost of
-sixteen threads is the thing to attack, and the JIT pool's tail — capped at
-half the pool, NOP-prefilled, and therefore dirty whether or not it is used —
-is where to start looking.
+That line has now been read, and it says memory was the wrong suspect:
+
+```
+memory: 2797 MiB available now, 7672 MiB physical, increased-memory-limit NOT signed in
+```
+
+The entitlement really is being stripped — worth fixing in the signing setup,
+because it costs roughly a gigabyte of ceiling. But it is **not** what ends
+the run. The footprint peaks at 1653 MB and then *flattens* at 1608 MB for the
+last several samples, against a ceiling of about 3 GB. There was headroom, and
+the process was not growing into it.
+
+### What actually ends the run
+
+The session lasts 29.3 seconds, and the last thing the guest's main thread
+does is take a bus fault:
+
+```
+0024: BUS #1: pc=0x18c8cb204 addr=0x300905a60 x18=0x0 insn=0xf9000e7f
+[bus-rgn] region=0x300000000+0x2000000 prot=1 max=1 share_mode=1 user_tag=35
+[wr-strip] #1 wine_want=-1 host_prot=1 <== HOST STRIPPED WRITE
+[wr-strip] mprotect(0x300904000, -1) FAILED errno=1 — falling to AV
+[tsd275] tid=0024 CLEAR at pthread_exit
+[srv-own] read_request EOF tid=0024 -> kill_thread
+```
+
+A write, from a pc inside the dyld shared cache, to a read-only system region.
+The main thread dies on it, the wineserver sees its request pipe close, and
+everything downstream is teardown — the remaining 700 log lines are the server
+spinning on fds with no client left.
+
+Two separate things are wrong there, and only one of them is ours.
+
+**Ours is the repair attempt.** `ios_page_expected_prot` returns `-1` for "not
+committed in Wine's bookkeeping" — a sentinel. The stripped-write healer tests
+`want & PROT_WRITE`, which is true for `-1` because every bit is set, so a
+write fault on *any* address Wine does not own is classified as a stripped
+write and then repaired with `mprotect(page, size, -1)`. That call cannot
+succeed. `patches/mythic-stripped-write-sentinel.patch` requires `want >= 0`
+before classifying, and reports the excluded case with the region's
+`max_protection` — the number that decides whether a repair is possible at
+all, since a region whose maximum is `r--` can never be made writable however
+correct the arguments are.
+
+**What is not ours** is why system code writes to that region at all. It is
+not repaired by the above; the fault still falls through to an access
+violation. The new line says which of the two situations it is, and that is
+what the next run should be read for.
 
 ## 32-bit guests
 

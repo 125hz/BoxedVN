@@ -50,6 +50,7 @@ CHECKED_CALL_PATCH="${BOXEDVN_ROOT}/patches/mythic-arm64ec-checked-call-recovery
 DEAD_VA_PATCH="${BOXEDVN_ROOT}/patches/mythic-dead-va-window.patch"
 EC_THUNK_PATCH="${BOXEDVN_ROOT}/patches/mythic-ec-import-thunk.patch"
 STORM_PATCH="${BOXEDVN_ROOT}/patches/mythic-redelivery-storm-threshold.patch"
+WRSTRIP_PATCH="${BOXEDVN_ROOT}/patches/mythic-stripped-write-sentinel.patch"
 RSP_WINDOW_PATCH="${BOXEDVN_ROOT}/patches/mythic-rsp-window-diagnostic.patch"
 OUTPUT="${FEX64_DIR}/wine-ios-core"
 OBJECTS="${FEX64_DIR}/wine-ios-core-objects"
@@ -65,6 +66,7 @@ require_file "${CHECKED_CALL_PATCH}"
 require_file "${DEAD_VA_PATCH}"
 require_file "${EC_THUNK_PATCH}"
 require_file "${STORM_PATCH}"
+require_file "${WRSTRIP_PATCH}"
 require_file "${RSP_WINDOW_PATCH}"
 
 # The third argument selects the matching mode. The first two patches carry no
@@ -99,6 +101,9 @@ apply_integration_patch "${EC_THUNK_PATCH}" "ARM64EC import-thunk routing" ""
 # order applies, but generating and applying against the same state is the
 # property worth keeping.
 apply_integration_patch "${STORM_PATCH}" "redelivery-storm terminal threshold" ""
+# Generated against the tree carrying the storm patch, which is why it
+# follows it. Both edit signal_arm64_ios.c, thousands of lines apart.
+apply_integration_patch "${WRSTRIP_PATCH}" "stripped-write sentinel guard" ""
 apply_integration_patch "${RSP_WINDOW_PATCH}" "guest stack-window diagnostic" ""
 
 rm -rf "${OUTPUT}" "${OBJECTS}"
