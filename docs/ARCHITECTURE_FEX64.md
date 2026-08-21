@@ -230,6 +230,47 @@ The `[phys-map] bands` line in a session log is what says whether arena
 growth is paid in address space or in resident memory; read it before
 raising the segment again.
 
+### What the guest does next
+
+Removing the poll and capping the storm stopped the crash, and the run that
+followed showed two more things worth writing down.
+
+**A launcher exiting is not a session ending.** The selected executable starts
+a second guest process and then calls `NtTerminateProcess(0)` immediately.
+Nothing is torn down when that happens — the embedded server and every other
+guest thread keep running — but the shell waits on the first process, so its
+status read "Wine exited" while the actual game was still starting. That is a
+status line, not a fault, and it has already sent one investigation down the
+wrong path; it now says which program exited.
+
+**The guest process then wedged, and the cause was a third inert
+diagnostic.** The faulting pc resolves to `FEX_MythicIRCapClear+0xc`, called
+from `GenerateIR` — the targeted IR-capture facility, disarmed unless
+`MYTHIC_IRCAP_MOD`/`RVA` are set. It writes a `thread_local`, which on Windows
+is a TEB lookup through `x18`, and the thread that reached it had `x18 == 0`
+and no TEB at all. The read went through a NULL TLS array at address 0.
+
+The hang is what that fault became rather than the fault itself. With no TEB,
+the exception was delivered "best-effort" onto another thread's guest stack
+while the thread held the FEX shared lock, and the delivery leaked it: the
+watchdog reports the thread alive, holding the lock, going nowhere. No crash,
+no window, nothing to read.
+
+`patches/fex-ircap-disarmed-no-tls.patch` gates the three accessors on the
+target being armed. `FEX_MythicIRCapTarget` is a plain global and safe to read
+with no TEB, so a disarmed run never touches the thread-local at all, and an
+armed one behaves exactly as before. This does not make a thread with
+`x18 == 0` safe — the port repairs `x18` hundreds of times per run and this
+one was not repaired because the faulting access was two indirections away
+from the register. It removes one disarmed diagnostic's reason to be the first
+thing that trips over it.
+
+Three crashes in a row have now been our own instrumentation: a page poll that
+read freed memory, an unchecked redelivery threshold, and a disarmed capture
+hook touching TLS. The pattern is worth naming — diagnostics here run on the
+hottest paths in the system, on threads with no TEB, in a second emulator
+instance nobody designed them for.
+
 ## 32-bit guests
 
 The stack is x86-64 by construction, and older visual novels are i386. There

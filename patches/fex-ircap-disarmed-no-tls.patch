@@ -1,0 +1,49 @@
+diff --git a/FEXCore/Source/Interface/IR/PassManager.cpp b/FEXCore/Source/Interface/IR/PassManager.cpp
+index f8d57d486..e416447b8 100644
+--- a/FEXCore/Source/Interface/IR/PassManager.cpp
++++ b/FEXCore/Source/Interface/IR/PassManager.cpp
+@@ -412,13 +412,44 @@ void IRCapEmit(IREmitter* IREmit, const char* Stage, uint64_t GuestRIP, uint32_t
+ 
+ } // namespace
+ 
++/* BoxedVN: do not touch the thread-local unless the facility is armed.
++ *
++ * IRCapRIP is thread_local, and on Windows that is a TEB-relative lookup: read
++ * the TLS array through x18, index it, then the slot. GenerateIR calls Clear()
++ * on every compile, so a thread that reaches the emulator with x18 == 0 faults
++ * here on the very first block it compiles -- reading through a NULL TLS array
++ * at address 0.
++ *
++ * A device log caught exactly that, and the shape of the failure is why this
++ * matters more than the fault itself. The faulting thread had no TEB at all,
++ * so the exception was delivered "best-effort" onto another thread's guest
++ * stack while the FEX shared lock was held; the delivery leaked the lock and
++ * the guest process wedged with the watchdog reporting it alive and stuck. No
++ * crash, no window, nothing to read but a hang.
++ *
++ * FEX_MythicIRCapTarget is a plain global -- safe to read with no TEB -- and
++ * is zero unless MYTHIC_IRCAP_MOD/RVA armed it, which no ordinary run does.
++ * Gating on it keeps the armed behaviour identical and removes the TLS access
++ * from every disarmed run, which is all of them.
++ *
++ * This does not make a thread with x18 == 0 safe in general; it removes one
++ * diagnostic's reason to be the first thing that trips over it. */
+ extern "C" void FEX_MythicIRCapMark(uint64_t GuestRIP) {
++  if (!FEX_MythicIRCapTarget) {
++    return;
++  }
+   IRCapRIP = GuestRIP;
+ }
+ extern "C" void FEX_MythicIRCapClear() {
++  if (!FEX_MythicIRCapTarget) {
++    return;
++  }
+   IRCapRIP = 0;
+ }
+ extern "C" uint64_t FEX_MythicIRCapCurrentRIP() {
++  if (!FEX_MythicIRCapTarget) {
++    return 0;
++  }
+   return IRCapRIP;
+ }
+ 

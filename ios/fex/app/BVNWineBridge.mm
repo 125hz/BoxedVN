@@ -738,11 +738,23 @@ void* processThread(void*) {
         char* arguments[] = {loader, target, extraArgument, nullptr};
         const int argumentCount = extraArgument ? 3 : 2;
 
+        // What exits here is the program that was launched, which is not
+        // always the program that matters. A device log has one title whose
+        // selected executable is a launcher: it starts a second guest process
+        // and immediately calls NtTerminateProcess(0), so this reports an
+        // orderly exit seconds into a session whose actual game is still
+        // starting. Nothing is torn down when that happens -- the embedded
+        // server and every other guest thread keep running -- but a status
+        // line reading "Wine exited" while the guest is mid-launch has sent
+        // one investigation down the wrong path already. Say which it was.
         if (setjmp(*BVNWineExitJumpBuffer()) == 0) {
             __wine_main(argumentCount, arguments);
-            reportf("Wine returned normally");
+            reportf("the launched program returned normally; any guest process "
+                    "it started keeps running");
         } else {
-            reportf("Wine exited with code %d", BVNWineExitCode());
+            reportf("the launched program exited with code %d; any guest "
+                    "process it started keeps running",
+                    BVNWineExitCode());
         }
         BVNWineClearExitTrap();
         g_stage.store(BVNWineStageExited, std::memory_order_release);

@@ -158,6 +158,29 @@ else
     die "The pinned rpmalloc no longer accepts ${COMMIT_MODE_PATCH}; refresh it explicitly."
 fi
 
+
+# The targeted IR-capture diagnostic touches a thread-local on every compile,
+# which on Windows is a TEB lookup through x18. A thread that reaches the
+# emulator with x18 == 0 faults on its first block, and because that thread has
+# no TEB the exception is delivered onto another thread's guest stack while the
+# FEX shared lock is held -- leaking it and wedging the guest process. The
+# facility is disarmed unless MYTHIC_IRCAP_MOD/RVA say otherwise, so gate its
+# accessors on that and the access disappears from every ordinary run.
+#
+# Applied here rather than in the wow64 script because both emulator DLLs are
+# built from this one tree and CI runs this first. Idempotent either way.
+IRCAP_PATCH="${BOXEDVN_ROOT}/patches/fex-ircap-disarmed-no-tls.patch"
+require_file "${IRCAP_PATCH}"
+if git -C "${FEX_SOURCE}" apply --check "${IRCAP_PATCH}" 2>/dev/null; then
+    log "Applying the disarmed IR-capture TLS guard"
+    git -C "${FEX_SOURCE}" apply "${IRCAP_PATCH}" \
+        || die "The disarmed IR-capture TLS guard failed to apply."
+elif git -C "${FEX_SOURCE}" apply --reverse --check "${IRCAP_PATCH}" 2>/dev/null; then
+    log "The disarmed IR-capture TLS guard is already applied"
+else
+    die "The pinned FEX source no longer accepts ${IRCAP_PATCH}; refresh it explicitly."
+fi
+
 if [[ "${FORCE}" == "1" ]]; then
     rm -rf "${BUILD}"
 fi
