@@ -88,6 +88,29 @@ if [[ ! -f "${APP_PATH}/${bundle_executable}" ]]; then
 file exists in the bundle."
 fi
 
+# --- __PAGEZERO, when the build asked for a smaller one ---------------------
+#
+# A 64-bit Mach-O reserves the low 4 GiB as __PAGEZERO unless it is linked with
+# -pagezero_size. The fex64 app asks for one page instead, because that low
+# range is the entire address space of a 32-bit Windows guest and WoW64 has
+# nowhere to put one without it.
+#
+# Report it either way. A dropped or ignored linker flag looks exactly like an
+# iOS kernel refusing the low range once the app is running -- the app's own
+# "low address space:" line cannot tell those apart -- and concluding the wrong
+# one costs a device cycle and points the next fix at the wrong layer.
+pagezero="$(otool -l "${EXECUTABLE}" 2>/dev/null     | awk '/__PAGEZERO/{found=1} found && /vmsize/{print $2; exit}')"
+if [[ -z "${pagezero}" ]]; then
+    warn "No __PAGEZERO segment found. Unusual, but not fatal on its own."
+elif [[ "${pagezero}" == "0x0000000100000000" ]]; then
+    warn "__PAGEZERO is the full 4 GiB (${pagezero}).
+32-bit guests cannot run in this build: the low range a WoW64 guest needs is
+reserved. If that is deliberate, ignore this. If not, -Wl,-pagezero_size is
+missing from the app target's OTHER_LDFLAGS, or the linker dropped it."
+else
+    ok "__PAGEZERO ${pagezero} (the low range is free for a 32-bit guest)"
+fi
+
 # --- root filesystem, when the build was told to bundle one -----------------
 if [[ "${BOXEDVN_EXPECT_ROOTFS:-0}" == "1" ]]; then
     if ! find "${APP_PATH}" -name 'boxedwine.zip' -print -quit | grep -q .; then
