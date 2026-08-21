@@ -201,7 +201,7 @@ pieces, and where each lives:
 
 | Piece | Where |
 |---|---|
-| The emulator DLL | `scripts/build-fex64-wow64.sh` — same FEX tree and toolchain as the ARM64EC one, configured for plain `aarch64` so its CMake descends into `WOW64` instead of `ARM64EC` |
+| The emulator DLL | `scripts/build-fex64-wow64.sh` — same FEX tree and toolchain as the ARM64EC one, configured for plain `aarch64` so its CMake descends into `WOW64` instead of `ARM64EC`. Descending into one means the other's iOS-host symbols are missing, so the patch adds an `IosHostStubs.cpp` supplying them |
 | The i386 Wine PE side | `--enable-archs=arm64ec,aarch64,i386` in `scripts/build-fex64-wine.sh`; gathered out of Wine's per-DLL layout by `scripts/collect-fex64-i386.sh` |
 | Staging | `scripts/build-fex64-app.sh` puts the emulator in the ARM64EC set as `xtajit.dll` and the i386 set in its own directory |
 | The prefix | the same script rewrites `Software\Microsoft\Wow64\x86` from `wow64cpu.dll` to `xtajit.dll`. The pinned template value is correct for an x86-64 host, where 32-bit code runs on the hardware; on ARM64 it has to name an emulator |
@@ -209,7 +209,13 @@ pieces, and where each lives:
 
 Every one of those is additive: a build where the i386 arch or the emulator
 DLL fails still ships, still runs x86-64 exactly as before, and reports which
-half is missing when a 32-bit program is selected.
+half is missing when a 32-bit program is selected. That property is load
+bearing and was got wrong once — the `i386-windows` resource is declared
+optional in `ios/project.yml`, but XcodeGen's `optional` only stops it
+refusing to *generate*; the resource still reaches the build phase and Xcode
+fails the whole package on a path it cannot `lstat`. The directory is now
+always staged, empty when there is nothing to put in it, and the app decides
+whether a 32-bit side exists by looking for the i386 `ntdll.dll` inside it.
 
 What is **not** settled is the address space. A 32-bit guest's pointers are 32
 bits, so its images, heaps and stacks must all live below 4 GiB — and a 64-bit

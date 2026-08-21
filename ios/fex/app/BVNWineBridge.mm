@@ -339,8 +339,11 @@ bool preparePrefix() {
     //
     // Absent i386-windows the loop simply does not run, which is the state
     // every build before this one shipped in.
+    // Keyed on the same file BVNWineThirtyTwoBitAvailable tests, not on the
+    // directory: the directory ships empty when there is no 32-bit side.
     NSString* guest32 = bundled(@"i386-windows");
-    if (isDirectory(guest32)) {
+    if ([files fileExistsAtPath:
+            [guest32 stringByAppendingPathComponent:@"ntdll.dll"]]) {
         NSString* syswow64 = [prefix stringByAppendingPathComponent:
                                @"drive_c/windows/syswow64"];
         if ([files createDirectoryAtPath:syswow64
@@ -791,10 +794,21 @@ extern "C" bool BVNWineThirtyTwoBitAvailable(void) {
     // xtajit64.dll. It lives beside that one, in the ARM64EC directory that
     // becomes system32: the CPU backend is loaded by the 64-bit loader, not
     // by the 32-bit world it serves.
+    //
+    // The i386 half is tested by its ntdll, not by its directory. The
+    // directory is always in the bundle -- an absent resource fails the
+    // packaging step outright, so it ships empty when there is no 32-bit
+    // side -- and an empty one is exactly the case this has to answer no to.
+    // ntdll is the right file to ask for: it is what a 32-bit process maps
+    // before anything else, and the collector already refuses to publish a
+    // set without it.
+    NSFileManager* files = NSFileManager.defaultManager;
     NSString* backend = [bundled(@"arm64ec-windows")
         stringByAppendingPathComponent:@"xtajit.dll"];
-    return isDirectory(bundled(@"i386-windows")) &&
-           [NSFileManager.defaultManager fileExistsAtPath:backend];
+    NSString* guestNtdll = [bundled(@"i386-windows")
+        stringByAppendingPathComponent:@"ntdll.dll"];
+    return [files fileExistsAtPath:guestNtdll] &&
+           [files fileExistsAtPath:backend];
 #else
     return false;
 #endif
@@ -948,7 +962,10 @@ extern "C" bool BVNWineStart(void) {
                         "xtajit.dll %s. Select an x86-64 executable, or build with "
                         "scripts/build-fex64-wow64.sh and a Wine tree configured "
                         "for i386.",
-                        isDirectory(bundled(@"i386-windows")) ? "present" : "missing",
+                        [NSFileManager.defaultManager fileExistsAtPath:
+                            [bundled(@"i386-windows")
+                                stringByAppendingPathComponent:@"ntdll.dll"]]
+                            ? "present" : "missing",
                         [NSFileManager.defaultManager fileExistsAtPath:
                             [bundled(@"arm64ec-windows")
                                 stringByAppendingPathComponent:@"xtajit.dll"]]

@@ -90,11 +90,27 @@ Run scripts/build-fex64-toolchains.sh --stage llvm-mingw first."
 
 export PATH="${TOOLCHAIN}/bin:${PATH}"
 
-# The upstream link for this target is hand-rolled the same way the ARM64EC
-# one was, and that is where the macOS-host build breaks. The patch adds the
-# same FEX_IOS_HOST_BUILD fall-through the fork already carries next door.
+# Two things this target needs and the fork does not carry.
+#
+# The first is the link: upstream hand-rolls it here the same way it did for
+# ARM64EC, and that is where the macOS-host build breaks, so the patch adds
+# the same FEX_IOS_HOST_BUILD fall-through the fork already carries next door.
+#
+# The second is a translation unit of iOS-host symbols. FEX_IOS_HOST is not
+# optional -- the fork guards the declarations of several iOS diagnostics in
+# FEXCore while leaving some of their uses unguarded, so a build without the
+# define does not compile -- but with it, FEXCore references a set of hooks
+# that live in Source/Windows/ARM64EC, and CMake descends into exactly one of
+# ARM64EC and WOW64. Build 32444490215 found all eleven of them at once.
+# IosHostStubs.cpp supplies them: inert answers for the ARM64EC-only
+# optimisations, which describe things that cannot happen on a 32-bit path,
+# and real storage for DualMap::WriteOffset, which cannot be inert -- a zero
+# there sends every write to generated code at the r-x mapping iOS refuses to
+# make writable.
+#
 # Idempotent: already-applied is fine, because the two emulator builds share
-# one source tree and either may run first.
+# one source tree and either may run first. It touches no file any other
+# patch in patches/ touches, so their order does not matter either.
 LINK_PATCH="${BOXEDVN_ROOT}/patches/fex-wow64-ios-host-link.patch"
 require_file "${LINK_PATCH}"
 if git -C "${FEX_SOURCE}" apply --check "${LINK_PATCH}" 2>/dev/null; then

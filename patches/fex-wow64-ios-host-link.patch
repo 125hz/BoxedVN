@@ -1,8 +1,15 @@
 diff --git a/Source/Windows/WOW64/CMakeLists.txt b/Source/Windows/WOW64/CMakeLists.txt
-index 5bc5accff..38850affc 100644
+index 5bc5accff..07fd3ca63 100644
 --- a/Source/Windows/WOW64/CMakeLists.txt
 +++ b/Source/Windows/WOW64/CMakeLists.txt
-@@ -19,8 +19,19 @@ target_link_libraries(wow64fex PRIVATE
+@@ -1,5 +1,6 @@
+ add_library(wow64fex SHARED
+   Module.cpp
++  IosHostStubs.cpp
+   libwow64fex.def
+   $<TARGET_OBJECTS:FEXCore_object>)
+ 
+@@ -19,8 +20,19 @@ target_link_libraries(wow64fex PRIVATE
    wow64_ex
    ntdll_ex)
  
@@ -24,3 +31,168 @@ index 5bc5accff..38850affc 100644
  install(TARGETS wow64fex RUNTIME
    DESTINATION ${CMAKE_INSTALL_LIBDIR}
    COMPONENT Runtime)
+diff --git a/Source/Windows/WOW64/IosHostStubs.cpp b/Source/Windows/WOW64/IosHostStubs.cpp
+new file mode 100644
+index 000000000..9bbd87f43
+--- /dev/null
++++ b/Source/Windows/WOW64/IosHostStubs.cpp
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: MIT
++/*
++ * BoxedVN: the iOS-host symbols FEXCore references but only the ARM64EC
++ * frontend defines.
++ *
++ * FEX_IOS_HOST is not optional for this build. The fork guards the
++ * *declarations* of several iOS diagnostics inside `#ifdef FEX_IOS_HOST` in
++ * FEXCore's Core.cpp while leaving some of their *uses* unguarded, so a build
++ * without the define does not compile at all. With it, Core.cpp and
++ * InvalidationTracker.cpp reference a set of hooks that live in
++ * Source/Windows/ARM64EC -- a directory this target does not build, because
++ * CMake descends into exactly one of ARM64EC and WOW64.
++ *
++ * So the symbols have to exist here. Two kinds:
++ *
++ *   1. The ARM64EC-specific optimisations. The Mono backpatcher bridge and
++ *      the JIT-alias reverse translation both describe things that only
++ *      happen on the x86-64 path: pool-copied ARM64EC images, EC fast-forward
++ *      sequences, an emulator entered through xtajit64. None of it applies to
++ *      a 32-bit guest, and each one has a documented inert answer that its
++ *      own call site already handles -- "not armed", "nothing pending", "not
++ *      an alias", "resolve missed, take the faulting path". Those are the
++ *      answers given here. They are not placeholders for work not done; they
++ *      are what the feature being absent looks like.
++ *
++ *   2. DualMap::WriteOffset, which is NOT inert and must not be left at zero.
++ *      It is the distance from the JIT pool's executable mapping to its
++ *      writable alias, and FEXCore writes generated code through it. iOS will
++ *      not grant RWX, so a zero offset means every write to generated code
++ *      goes to the r-x address and faults. This PE has its own statically
++ *      linked FEXCore and therefore its own copy of the variable, exactly as
++ *      xtajit64.dll does, and it is set the same way: from the WINE_IOS_JIT_RW
++ *      and WINE_IOS_JIT_RX the app publishes for the unix side's pool.
++ */
++
++#include <FEXCore/Utils/DualMap.h>
++#include <FEXCore/Utils/LogManager.h>
++
++#include <cstdint>
++#include <cstdlib>
++
++namespace FEXCore::DualMap {
++int64_t WriteOffset = 0;
++} // namespace FEXCore::DualMap
++
++extern "C" {
++
++/* ml316 fast-forward-sequence counters, read for one diagnostic line in
++ * CompileBlock. Nothing on this path ever increments them. */
++uint64_t IosFfsBypassLog[4] {};
++
++/* Maps a pool-copy alias back to the PE virtual address it was copied from,
++ * and returns the input unchanged when the address is not an alias. A 32-bit
++ * guest's images are never pool-copied -- they are not ARM64EC and are never
++ * executed natively -- so "not an alias" is the true answer, not a fallback. */
++uint64_t IosJitReverseTranslate(uint64_t Addr) {
++  return Addr;
++}
++
++/* Resolves a guest address to its writable alias for the Mono backpatcher's
++ * direct-store shortcut. Zero means "missed", which its caller documents as
++ * falling through to the ordinary store: degraded, never wrong. */
++uint64_t IosMonoResolveRW(uint64_t GuestAddr, uint64_t Size) {
++  (void)GuestAddr;
++  (void)Size;
++  return 0;
++}
++
++void ios_fex_mono_arm(uint64_t Base, uint64_t End) {
++  (void)Base;
++  (void)End;
++}
++
++int ios_fex_mono_bridge_armed() {
++  return 0;
++}
++
++int ios_fex_mono_take_pending(uint64_t* BlockBegin, uint64_t* HostPC, uint64_t* FaultAddr) {
++  (void)BlockBegin;
++  (void)HostPC;
++  (void)FaultAddr;
++  return 0;
++}
++
++void ios_fex_mono_count_helper(int Miss) {
++  (void)Miss;
++}
++
++void ios_fex_mono_count_activated() {}
++
++uint64_t ios_fex_mono_captured_count() {
++  return 0;
++}
++
++/* The allocator revision this fork records was force-pushed out of its
++ * repository and the build uses upstream's pin instead, which carries none of
++ * the integration's private diagnostic hooks. Its only caller fills this for a
++ * single log line and skips the line when it returns zero. Same stub the
++ * ARM64EC build gets from patches/fex-arm64ec-rpmalloc-diagnostic-stub.patch. */
++struct rpm_cas_snapshot;
++int rpm_cas_snapshot_take(struct rpm_cas_snapshot* Out) {
++  (void)Out;
++  return 0;
++}
++
++/* Called from BTCpuProcessInit before InitCore, because the dispatcher reads
++ * WriteOffset while emitting. Loud on failure: a zero offset does not degrade,
++ * it corrupts, and it does so at the first write to generated code rather than
++ * anywhere near here. */
++void IosWow64InitJitWriteOffset() {
++  const char* RwEnv = getenv("WINE_IOS_JIT_RW");
++  const char* RxEnv = getenv("WINE_IOS_JIT_RX");
++  const uint64_t Rw = RwEnv ? strtoull(RwEnv, nullptr, 16) : 0;
++  const uint64_t Rx = RxEnv ? strtoull(RxEnv, nullptr, 16) : 0;
++
++  if (!Rw || !Rx) {
++    LogMan::Msg::EFmt("[FEX-iOS-wow64] FATAL: WINE_IOS_JIT_RW/RX missing (RW={} RX={}) "
++                      "-- writes to generated code will fault or corrupt",
++                      RwEnv ? RwEnv : "(unset)", RxEnv ? RxEnv : "(unset)");
++    return;
++  }
++
++  FEXCore::DualMap::WriteOffset = static_cast<int64_t>(Rw - Rx);
++  LogMan::Msg::EFmt("[FEX-iOS-wow64] fast-write ENABLED (WriteOffset={:#x} RW={:#x} RX={:#x})",
++                    FEXCore::DualMap::WriteOffset, Rw, Rx);
++}
++
++} // extern "C"
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index bff9ae2da..93e8304f4 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -29,6 +29,12 @@ $end_info$
+ #include <FEXCore/Utils/SignalScopeGuards.h>
+ 
+ #include "Windows/Common/Allocator.h"
++
++/* BoxedVN: defined in IosHostStubs.cpp, which also supplies the iOS-host
++ * symbols FEXCore references but only the ARM64EC frontend defines. Declared
++ * here at namespace scope because a linkage-specification may not appear
++ * inside a function body. */
++extern "C" void IosWow64InitJitWriteOffset();
+ #include "Windows/Common/EnvironmentVariablesHandling.h"
+ #include "Windows/Common/FEXUnixLib.h"
+ #include "Common/CallRetStack.h"
+@@ -537,6 +543,13 @@ void BTCpuProcessInit() {
+ 
+   CTX->SetSignalDelegator(SignalDelegator.get());
+   CTX->SetSyscallHandler(SyscallHandler.get());
++
++  /* BoxedVN: before InitCore, because the dispatcher's emit path reads
++   * DualMap::WriteOffset while it runs. See IosHostStubs.cpp -- on iOS the
++   * JIT pool's executable mapping is r-x and generated code has to be written
++   * through its writable alias. */
++  IosWow64InitJitWriteOffset();
++
+   CTX->InitCore();
+   Context::HandlerConfig.emplace(*CTX);
+   InvalidationTracker.emplace(*CTX, Threads);

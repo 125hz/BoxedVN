@@ -118,11 +118,32 @@ build_tree() {
     shift
     local build="${SOURCE}/build-${name}"
 
+    # What the tree was configured with, so a change of mind about the
+    # arguments is not silently ignored.
+    #
+    # "already configured" used to be decided by config.h alone. CI restores
+    # these trees from cache, so a tree configured by an older commit is the
+    # normal case rather than the exception -- and when --enable-archs gained
+    # i386, every run since reported "already configured", built no 32-bit PE
+    # side, and left the feature looking like a build failure with no error in
+    # it. The only signal was a warning three steps later saying zero i386
+    # DLLs were produced. Comparing the arguments makes the cache do what it
+    # is for and reconfigure when it no longer matches.
+    local stamp="${build}/.boxedvn-configure-args"
+    local signature="$*"
+
     if [[ "${FORCE}" -eq 1 ]]; then
         rm -rf "${build}"
     elif [[ -f "${build}/include/config.h" ]]; then
-        ok "wine/${name}: already configured"
-        return 0
+        if [[ -f "${stamp}" ]] && [[ "$(cat "${stamp}")" == "${signature}" ]]; then
+            ok "wine/${name}: already configured"
+            return 0
+        fi
+        # A reconfigure in place would leave object files built against the
+        # old config.h, so the tree goes. This costs a full rebuild, once,
+        # on the run that changes the arguments.
+        warn "wine/${name}: configure arguments changed since this tree was built; reconfiguring from scratch"
+        rm -rf "${build}"
     fi
 
     mkdir -p "${build}"
@@ -132,6 +153,7 @@ build_tree() {
         tail -40 "${build}/configure.log" >&2
         die "wine/${name}: configure failed. Full log: ${build}/configure.log"
     fi
+    printf '%s' "${signature}" > "${stamp}"
     ok "wine/${name}: configured"
 }
 

@@ -209,11 +209,25 @@ import it can enter their main function."
            "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit.dll"
         shasum -a 256 "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit.dll"
     fi
+    #
+    # The directory is created unconditionally, and left empty when there is
+    # no 32-bit side to put in it. The resource entry for it is declared
+    # optional in ios/project.yml, but that only stops XcodeGen refusing to
+    # generate -- the resource still lands in the build phase, and Xcode's
+    # CpResource then fails the whole build on a path it cannot lstat. That
+    # is how build 32444490215 died: the Wine tree produced no i386 DLLs, the
+    # guard here skipped the copy exactly as intended, and the IPA failed to
+    # package over a directory nothing needed. An empty directory copies
+    # fine, and the app decides whether a 32-bit side exists by looking for
+    # the one file inside it that a 32-bit process cannot start without.
+    mkdir -p "${WINE_RESOURCE_STAGING}/i386-windows"
     if [[ -d "${WINE_RUNTIME_DIR}/i386-windows" ]]; then
-        cp -R "${WINE_RUNTIME_DIR}/i386-windows" \
-              "${WINE_RESOURCE_STAGING}/i386-windows"
+        cp -R "${WINE_RUNTIME_DIR}/i386-windows/." \
+              "${WINE_RESOURCE_STAGING}/i386-windows/"
         i386_staged="$(find "${WINE_RESOURCE_STAGING}/i386-windows" -type f | wc -l | tr -d ' ')"
         log "Staged ${i386_staged} i386 PE files for the 32-bit guest side"
+    else
+        log "No i386 PE set to stage; this IPA runs x86-64 only"
     fi
     # The integration is a game launcher, so its ARM64EC runtime ships a full
     # DLL set and the display driver but none of Wine's own programs. A desktop
