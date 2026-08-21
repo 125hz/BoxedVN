@@ -350,7 +350,7 @@ jobs:
             build/x64-graphics/dxmt-x64/dxgi.dll \
             build/x64-graphics/dxmt-x64/d3d10core.dll \
             build/x64-graphics/dxmt-x64/winemetal.dll; do
-            file "${path}" | grep -Eqi 'PE32\\+.*x86-64' || {
+            file "${path}" | grep -Eqi 'PE32\+.*x86-64' || {
               echo "::error::${path} is not an x86-64 PE image."
               exit 1
             }
