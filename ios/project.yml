@@ -249,6 +249,9 @@ targets:
       - sdk: IOKit.framework
       - sdk: Metal.framework
       - sdk: QuartzCore.framework
+      # For SecTask: the shim reads this process's signed entitlements to
+      # report whether increased-memory-limit actually survived signing.
+      - sdk: Security.framework
       - sdk: UIKit.framework
       # DXMT's unix side reaches past Metal itself: CGColorSpace for swapchain
       # colour handling, IOSurface for shared texture backing, and MetalFX for

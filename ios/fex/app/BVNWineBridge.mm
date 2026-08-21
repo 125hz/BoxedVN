@@ -10,6 +10,7 @@
 #include "BVNFexBridge.h"
 #include "BVNExecMemory.h"
 #include "BVNJitArenaPlan.h"
+#include "BVNRuntime.h"
 #include "IOSDisplayShim.h"
 
 #include <atomic>
@@ -955,6 +956,34 @@ extern "C" bool BVNWineStart(void) {
     // have produced no picture says so before the graphics stack loads.
     reportf("display layer registered before start: %s",
             bvn_display_has_layer() ? "yes" : "no - swapchains will fail");
+
+    // The memory budget, in the session log rather than only in the app log.
+    //
+    // A run ends in one of two ways that look nothing alike in the code and
+    // identical in a log: a fault, which leaves a handler's forensics behind,
+    // or jetsam, which leaves the log stopping mid-line. One device run ended
+    // the second way with the footprint climbing past 1.6 GB while the guest
+    // spawned its sixteenth thread, and there was no way to tell from the log
+    // whether that was near the limit or nowhere near it -- because the limit
+    // was never written down.
+    //
+    // increasedMemoryLimit is read from this process's kernel-validated
+    // signature, not from the .entitlements file in the tree, so it answers
+    // the question that actually matters: whether the sideloader's signing
+    // kept the entitlement. Without it the ceiling is a fraction of what the
+    // arena sizing assumes.
+    {
+        const BVNMemoryReport memory = BVNMemoryProbe();
+        const char* entitlement =
+            memory.increasedMemoryLimit == BVNMemoryEntitlementEnabled  ? "signed in" :
+            memory.increasedMemoryLimit == BVNMemoryEntitlementDisabled ? "NOT signed in" :
+                                                                          "unknown";
+        reportf("memory: %llu MiB available now, %llu MiB physical, "
+                "increased-memory-limit %s",
+                (unsigned long long)(memory.availableBytes / (1024 * 1024)),
+                (unsigned long long)(memory.physicalMemoryBytes / (1024 * 1024)),
+                entitlement);
+    }
     if (!BVNWineAvailable()) {
         reportf("the linked build is missing one or more Wine resources");
         g_stage.store(BVNWineStageFailed, std::memory_order_release);

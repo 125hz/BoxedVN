@@ -330,6 +330,43 @@ process and never creates a child. Where a game ships its actual binaries
 beside the launcher, picking one of those is the difference between wedging on
 the first compiled block and not exercising this path at all.
 
+That route has now been run, and **a D3D11 title drew its first logo** —
+frontend, translation, graphics and presentation all working end to end for
+the first time on this branch. It then died about thirty seconds in, and the
+shape of that death is different again from everything above.
+
+### The next wall is memory, not correctness
+
+There is no fault in that log. No redelivery, no SEGV, no handler output: the
+log simply stops mid-line while the guest was creating its sixteenth thread.
+That is what being killed looks like, not what crashing looks like.
+
+The footprint says the same thing. It climbs steadily through thread creation
+— 1400, 1423, 1506, 1598, 1637, 1640 MB across the last six samples — and is
+still rising when the log ends. Sixteen guest threads had initialised, each
+one costing a FEX LookupCache arena and a code buffer carved from the JIT
+pool's tail. The bands line shows where it goes: `poolRX=256 poolRW=256`
+(one set of physical pages counted twice, and dirty end to end),
+`hostlow=765`, `guest=393`.
+
+What the log cannot say is whether 1.6 GB was near this process's ceiling or
+nowhere near it, because the ceiling was never written down. The arena's own
+memory probe reports to the app log, not the session log, and the fex64 shim's
+copy of it hardcoded the entitlement status to Unknown. Both are fixed: the
+session log now opens with available memory, physical memory, and whether
+`com.apple.developer.kernel.increased-memory-limit` is **signed into this
+process** — read from the kernel-validated signature via `SecTask`, not from
+the `.entitlements` file in the tree. Those are different facts, and a
+sideloader that strips the entitlement turns a 4 GB ceiling into a fraction of
+one while the repository still claims to have asked for it.
+
+Read that line before tuning anything. If the entitlement is not signed in,
+the fix is in the signing and no amount of arena tuning substitutes for it. If
+it is signed in and the run still dies at 1.6 GB, then the per-thread cost of
+sixteen threads is the thing to attack, and the JIT pool's tail — capped at
+half the pool, NOP-prefilled, and therefore dirty whether or not it is used —
+is where to start looking.
+
 ## 32-bit guests
 
 The stack is x86-64 by construction, and older visual novels are i386. There

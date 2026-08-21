@@ -15,6 +15,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 
 #include "BVNRuntime.h"
 
@@ -82,8 +83,41 @@ extern "C" BVNMemoryReport BVNMemoryProbe(void) {
     }
     report.physicalMemoryBytes = [NSProcessInfo processInfo].physicalMemory;
     report.availableBytes = os_proc_available_memory();
+    // Read from this process's kernel-validated signature rather than from
+    // the .entitlements file in the tree, because those are different facts.
+    // The tree asks for increased-memory-limit; whether the sideloader signed
+    // it in is what decides the jetsam ceiling, and the two disagree often
+    // enough that assuming is how a memory kill gets mistaken for a fault.
+    //
+    // Only the SecTask query, not BVNMemory.mm's csops blob fallback. That
+    // fallback exists for signatures SecTask cannot read at all, which is a
+    // rarer case than this shim needs to serve; here it reports Unknown and
+    // the available-memory figure beside it still bounds the answer.
     report.increasedMemoryLimit = BVNMemoryEntitlementUnknown;
-    report.detail = "fex64 shim";
+    report.detail = "fex64 shim: entitlement unreadable";
+    if (SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault)) {
+        CFErrorRef error = nullptr;
+        CFTypeRef value = SecTaskCopyValueForEntitlement(
+            task, CFSTR("com.apple.developer.kernel.increased-memory-limit"),
+            &error);
+        if (value != nullptr) {
+            const bool enabled = CFGetTypeID(value) == CFBooleanGetTypeID() &&
+                                 CFBooleanGetValue((CFBooleanRef)value);
+            report.increasedMemoryLimit = enabled ? BVNMemoryEntitlementEnabled
+                                                  : BVNMemoryEntitlementDisabled;
+            report.detail = enabled ? "fex64 shim: entitlement signed in"
+                                    : "fex64 shim: entitlement present but false";
+            CFRelease(value);
+        } else if (error == nullptr) {
+            // A clean query with no value means the key is simply absent.
+            report.increasedMemoryLimit = BVNMemoryEntitlementDisabled;
+            report.detail = "fex64 shim: entitlement not signed in";
+        }
+        if (error != nullptr) {
+            CFRelease(error);
+        }
+        CFRelease(task);
+    }
     return report;
 }
 
