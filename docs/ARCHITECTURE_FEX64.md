@@ -217,25 +217,32 @@ fails the whole package on a path it cannot `lstat`. The directory is now
 always staged, empty when there is nothing to put in it, and the app decides
 whether a 32-bit side exists by looking for the i386 `ntdll.dll` inside it.
 
-What is **not** settled is the address space. A 32-bit guest's pointers are 32
-bits, so its images, heaps and stacks must all live below 4 GiB — and a 64-bit
-Mach-O gets a `__PAGEZERO` of exactly that size unless it is linked with
-`-pagezero_size`. The app target now carries `-Wl,-pagezero_size,0x4000`, and
-whether iOS will load a binary that asks for that has never been tested here.
-It is the one change in this work that can stop the app launching at all.
+The address space is settled, and the answer is no — for now.
 
-So read the log before anything else. The FEX bridge reports both halves of
-the question at startup on a `low address space:` line: the real extent of the
-region at 0, and whether a fixed page at 256 MiB can be claimed. Three
-outcomes:
+A 32-bit guest's pointers are 32 bits, so its images, heaps and stacks must all
+live below 4 GiB, and a 64-bit Mach-O reserves exactly that range as
+`__PAGEZERO` unless linked with `-pagezero_size`. Build 32445525083 shipped an
+IPA linked with `-Wl,-pagezero_size,0x4000` — one 16 KiB page — and **the app
+did not launch on device at all**: no crash inside the app, no session log,
+nothing to read. iOS will not load this binary with a page-zero that small. The
+flag is gone from `ios/project.yml`; `scripts/validate-app.sh` now prints the
+reservation on every build so the state is never in doubt again.
 
-- **App launches, page granted.** The route is open; 32-bit failures from
-  here are ordinary WoW64 bugs.
-- **App launches, page refused.** `__PAGEZERO` was not the only thing in the
-  way. The line says what the region at 0 actually is.
-- **App does not launch.** iOS refused the shrunk `__PAGEZERO`. Remove the
-  `-Wl,-pagezero_size` line from `ios/project.yml` and everything else here
-  stays exactly as it is, running x86-64; 32-bit then needs the other route.
+Everything else here still builds and is still in the IPA. It reports itself
+unreachable at startup (`low address space:` in the session log) and refuses a
+32-bit executable with a message naming which half is missing.
+
+**Before trying a different page-zero, know which sizes are worth trying.**
+The obvious next move — keep a large `__PAGEZERO` and settle for the range
+above it — does not work, and the reason is the catalogue rather than the
+kernel. Old 32-bit Windows executables are based at `0x400000`, 4 MiB, and many
+of them have their relocations stripped, so they can be loaded at that address
+or not at all. A page-zero of 1 GiB would leave 3 GiB free — more than a 32-bit
+Windows process can address anyway — and still fail to load the exact
+executables this is for. The usable window is therefore a page-zero *below*
+4 MiB: `0x100000` is the next experiment, not `0x40000000`. Whether iOS objects
+to a small page-zero as such, or to one below some threshold, is what that
+would establish, and it is a coin flip worth one build.
 
 **The `ios` branch's Boxedwine backend.** It already runs 32-bit visual
 novels, today, with no address-space question at all, because the guest's

@@ -103,12 +103,12 @@ pagezero="$(otool -l "${EXECUTABLE}" 2>/dev/null     | awk '/__PAGEZERO/{found=1
 if [[ -z "${pagezero}" ]]; then
     warn "No __PAGEZERO segment found. Unusual, but not fatal on its own."
 elif [[ "${pagezero}" == "0x0000000100000000" ]]; then
-    warn "__PAGEZERO is the full 4 GiB (${pagezero}).
-32-bit guests cannot run in this build: the low range a WoW64 guest needs is
-reserved. If that is deliberate, ignore this. If not, -Wl,-pagezero_size is
-missing from the app target's OTHER_LDFLAGS, or the linker dropped it."
+    # The current, expected state: iOS refused to launch a build linked with a
+    # 16 KiB page-zero, so the flag is not passed. Stated rather than warned
+    # about, because it is what every build looks like today.
+    ok "__PAGEZERO ${pagezero} (stock 4 GiB; 32-bit guests unreachable)"
 else
-    ok "__PAGEZERO ${pagezero} (the low range is free for a 32-bit guest)"
+    ok "__PAGEZERO ${pagezero} (reduced; the low range is free for a 32-bit guest)"
 fi
 
 # --- root filesystem, when the build was told to bundle one -----------------
