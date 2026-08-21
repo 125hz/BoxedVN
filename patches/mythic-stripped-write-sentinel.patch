@@ -34,7 +34,7 @@
                                      host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
                      ++wr_seen;
                      if (wr_seen <= 12 || (wr_seen % 4096) == 0)
-@@ -10513,6 +10532,22 @@
+@@ -10513,6 +10532,21 @@
                              stripped ? "<== HOST STRIPPED WRITE" : "(not a strip)",
                              wr_seen, wr_healed);
  
@@ -47,8 +47,7 @@
 +                     * anyone writes code to raise the maximum. */
 +                    if (is_write && want < 0 && (wr_seen <= 12 || (wr_seen % 4096) == 0))
 +                        ERR("[wr-strip] #%lu no wine view for %p — not a strip and not "
-+                            "repairable from here; host prot=%d max=%d (%s) rev=bvn3
-+",
++                            "repairable from here; host prot=%d max=%d (%s) rev=bvn3\n",
 +                            wr_seen, siginfo->si_addr, host_prot, host_max,
 +                            (host_max >= 0 && !(host_max & VM_PROT_WRITE))
 +                                ? "maximum forbids write: unrepairable"
