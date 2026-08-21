@@ -265,11 +265,70 @@ one was not repaired because the faulting access was two indirections away
 from the register. It removes one disarmed diagnostic's reason to be the first
 thing that trips over it.
 
-Three crashes in a row have now been our own instrumentation: a page poll that
-read freed memory, an unchecked redelivery threshold, and a disarmed capture
-hook touching TLS. The pattern is worth naming — diagnostics here run on the
+Three crashes in a row were our own instrumentation: a page poll that read
+freed memory, an unchecked redelivery threshold, and a disarmed capture hook
+touching TLS. The pattern is worth naming — diagnostics here run on the
 hottest paths in the system, on threads with no TEB, in a second emulator
 instance nobody designed them for.
+
+### The blocker underneath: child processes have no alias routing
+
+With those three gone, the guest process wedges on the first block it tries to
+compile, and the cause is structural. The log reads, in order:
+
+```
+[iOS-xquery] MISS tracker=… addr=0x138e39660
+NoExec instruction in entry block: 138E39660
+[ir-topo] ml599b ARMED …
+[mach_exc] UNHANDLED #1 pc=…PassManager::Run+0xb8 addr=0x0
+[deliver-hold] tid=002c HOLDS FEX shared lock — this delivery leaks the read hold
+```
+
+That guest RIP is a **JIT-pool address**, not a PE one: Wine's own ledger
+resolves it (`[rip-leak] … IS POOL addr = PE 0x717fd51660`, ntdll+0x81660) and
+FEX's does not. FEX has a fix for exactly this — `IosJitReverseTranslate` maps
+a pool alias back to its PE address and `[pool-rip-fix]` re-enters the
+dispatcher — but it returned the address unchanged, because its table has no
+entry for that copy. So FEX decoded at an address it considers non-executable,
+emitted a degenerate block, and `PassManager::Run` dereferenced NULL on it.
+
+The reason the table has no entry is written down in `virtual_ios.c`:
+
+> Drain current table to the callback. **Child-owned copies are skipped**:
+> they share pe_base with the parent entry and pushing both would
+> double-register the alias range in FEX (x86-64 children under FEX will need
+> per-process alias routing — deferred to S3).
+
+A child process gets its own private pool copy of ntdll (`[child-ntdll]
+copied …`), registered in Wine's `ios_jit_mappings[]` with an `owner_peb` —
+and never pushed to the emulator. Pushing it would be worse than not:
+`BTCpu64IosAddAliasMapping` **retires every entry whose PE range overlaps the
+incoming one**, on the reasoning that two images cannot share a VA. Parent and
+child ntdll share `pe_base` exactly, so registering the child would retire the
+parent's entry and break the process that currently works.
+
+So this is the deferred work, arrived at from the other direction. What it
+would take:
+
+- an owner field in `IosAliasEntry` — the struct has a spare `_Padding` slot,
+  so the 32-byte stride `Module.S` depends on can stay;
+- overlap-retire scoped to one owner instead of the whole table;
+- `IosJitReverseTranslate` selecting by current PEB;
+- the Wine side pushing child mappings with their `owner_peb`, and the drain
+  no longer skipping them;
+- and the forward translation inside `Module.S`'s `ExitFunctionEC`, which
+  reads this table from hand-written assembly, made owner-aware too.
+
+That last item is why this is a project rather than a patch: it is assembly on
+the hot path of every EC call, and getting it wrong breaks the x86-64 path
+that works today.
+
+**There is a way around it that costs nothing.** The blocker only applies to a
+*second* guest process. A title whose selected executable is a launcher hits it
+immediately; the same title's real executable, selected directly, runs as one
+process and never creates a child. Where a game ships its actual binaries
+beside the launcher, picking one of those is the difference between wedging on
+the first compiled block and not exercising this path at all.
 
 ## 32-bit guests
 
