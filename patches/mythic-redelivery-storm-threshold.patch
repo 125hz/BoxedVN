@@ -1,0 +1,50 @@
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -7215,6 +7215,28 @@
+      * thread's pointer registers (the ml460 corruption lived at [x10+x9*8]
+      * and register dumps were capped away long before the storm settled),
+      * then terminate honestly. */
++    /* BoxedVN: the terminal threshold, lowered from 2000.
++     *
++     * 2000 was chosen against storms that burned CPU and log space -- 65k,
++     * 70k, 326,500 redeliveries -- where the cost of waiting was time. It is
++     * the wrong shape for a storm that burns the GUEST STACK, because every
++     * redelivery pushes an exception frame onto it and the stack runs out
++     * first. Two device runs, with different root causes and different stack
++     * sizes, ended identically: the "256 identical redeliveries ... storm
++     * forming" line appears, the terminal line never does, and the run dies
++     * of STATUS_STACK_OVERFLOW naming a guard page instead of the fault that
++     * caused it. One had a 1 MiB stack, the other 8 MiB; neither reached
++     * 2000. A threshold the stack cannot survive is not a guard.
++     *
++     * 512 is above anything legitimate and below anything fatal. The code
++     * already treats 256 as abnormal enough to warn about, and handled
++     * retries -- redirects, USD, unaligned -- never reach this point at all,
++     * so there is no pattern between 512 and 2000 that this now cuts short.
++     * What it buys is the forensic dump below running while there is still
++     * stack to run it on, which is the difference between a log that names
++     * the faulting pc and one that does not. */
++#define IOS_REDELIV_TERMINAL 512
++
+     {
+         static struct { uint64_t key; uint32_t n; } redeliv[16];
+         static volatile int ios_redeliv_terminating;
+@@ -7224,7 +7246,7 @@
+         else if (++redeliv[rslot].n == 256)
+             dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",
+                      (unsigned long long)pc, (unsigned long long)fault_addr );
+-        else if (redeliv[rslot].n >= 2000 && !ios_redeliv_terminating)
++        else if (redeliv[rslot].n >= IOS_REDELIV_TERMINAL && !ios_redeliv_terminating)
+         {
+             /* ml463: was `== 2000` + exit(76) — one shot, and exit() on iOS is
+              * the wine_ios_exit shim which LONGJMPS instead of terminating (the
+@@ -7241,7 +7263,8 @@
+             ios_redeliv_terminating = 1;
+             static const int fregs[] = { 0, 8, 9, 10, 16, 19, 20 };
+             unsigned fi;
+-            dprintf( 2, "[redeliv] 2000 identical redeliveries pc=0x%llx addr=0x%llx — unrecoverable host fault misdelivered to guest rev=ml461\n",
++            dprintf( 2, "[redeliv] %u identical redeliveries pc=0x%llx addr=0x%llx — unrecoverable host fault misdelivered to guest rev=ml461\n",
++                     (unsigned)IOS_REDELIV_TERMINAL,
+                      (unsigned long long)pc, (unsigned long long)fault_addr );
+             for (fi = 0; fi < sizeof(fregs) / sizeof(fregs[0]); fi++)
+             {

@@ -190,16 +190,36 @@ again at the same PC, 1400 times, until the thread's 8 MiB stack is gone and
 the run ends on `STATUS_STACK_OVERFLOW`. The stack overflow is the symptom;
 the unchecked NULL is the bug; the failed allocation is the cause.
 
-The allocation fails for want of *placement*, not memory. Footprint at the
-time is 882 MB against a 4 GB ceiling, and the address-space report says
-14.8 GB free with a 10 GB hole — but iOS refuses whole windows outright, and
-the log records `dead floor learned: 0x7c00000000 at size 0x1000`: a 4 KiB
-request refused at an address the map walk calls free. Two dozen
-`out of memory for allocation` lines precede the crash. This is the same
-failure the rpmalloc notes in `scripts/build-fex64-arm64ec.sh` describe, in
-their own words — "the allocation fails and the NULL is stored through" — so
-the span-size override addressed one source of address-space pressure and not
-this one. A third would fail exactly as the second used to, and the fix that
+And the allocation failed because of **our own diagnostic**. The host-side
+backtrace names it: `ios_rpm_header_poll+0x78`, reached from
+`NtAllocateVirtualMemory+0x44`, faulting on a `ldr w9,[x11]` with
+`x11 = 0x70114b0000` — an address no longer mapped. That poll was added by
+`patches/mythic-jit-pool-authority.patch` to bracket an allocator-corruption
+question: it records every 64 KiB guest page committed in
+`[0x7000000000, 0x7100000000)` and re-reads the first eight bytes of each one
+at four ntdll entry points. It never untracks a page. The moment the guest
+released one, the next allocation read freed memory and took a SIGSEGV inside
+the allocator, which the handler could not attribute to any guest stack
+("no TEB owns sp — BEST-EFFORT delivery on guest stack") and delivered as a
+guest exception anyway. The allocation never returned; rpmalloc got the NULL.
+
+So the chain is: a debugging aid reads a freed page → the allocator faults →
+the fault is misdelivered → rpmalloc stores through NULL → the dispatcher
+storms → the stack dies. The poll is removed. It answered its question long
+ago, and a diagnostic that costs a linear scan of 64 pages on every
+allocation and crashes when one is freed has no place in a shipping build.
+
+The storm is capped separately, because it will happen again for some other
+reason. `signal_arm64_ios.c` already terminates on identical-fault
+redelivery, but at 2000 — a number chosen against storms that burned CPU and
+log space, not stack. Both device crashes printed its "256 ... storm forming"
+warning and neither reached 2000, because every redelivery pushes an
+exception frame and the guest stack ran out first: 1 MiB in one run, 8 MiB in
+the other. `patches/mythic-redelivery-storm-threshold.patch` lowers it to
+512, which is above anything legitimate — handled retries never reach that
+code at all — and low enough that the forensic dump runs while there is still
+stack to run it on. It does not make the process survive; in one Mach task
+nothing does. It makes the log name the faulting pc instead of a guard page. A third would fail exactly as the second used to, and the fix that
 scales past counting is **dedup of the duplicate emulator copies**: the pool
 allocator's own comments record that `.text` is already byte-identical across
 copies of a module, which is the precondition for sharing them. Upstream's
