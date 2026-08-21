@@ -177,7 +177,29 @@ Two things then follow, and both have cost a build:
 
 `kBVNJitArenaSegmentBytes` is the number, because a lease is first fit inside
 one segment and never spans two. It is sized for two concurrent guest
-processes. A third would fail exactly as the second used to, and the fix that
+processes, and a device log has now confirmed that: at 256 MiB the second
+process's emulator copy lands, 47 images occupy 145 MiB of the pool, and no
+`EXHAUSTED` line appears anywhere in the run.
+
+What that uncovered underneath is a different defect with the same shape.
+The guest now dies in `get_thread_heap_allocate+0xf0` — rpmalloc, inside the
+emulator DLL, asking for a 4 KiB thread heap, getting NULL from
+`NtAllocateVirtualMemory`, and storing through it without checking. The
+resulting access violation faults the exception dispatcher, which faults
+again at the same PC, 1400 times, until the thread's 8 MiB stack is gone and
+the run ends on `STATUS_STACK_OVERFLOW`. The stack overflow is the symptom;
+the unchecked NULL is the bug; the failed allocation is the cause.
+
+The allocation fails for want of *placement*, not memory. Footprint at the
+time is 882 MB against a 4 GB ceiling, and the address-space report says
+14.8 GB free with a 10 GB hole — but iOS refuses whole windows outright, and
+the log records `dead floor learned: 0x7c00000000 at size 0x1000`: a 4 KiB
+request refused at an address the map walk calls free. Two dozen
+`out of memory for allocation` lines precede the crash. This is the same
+failure the rpmalloc notes in `scripts/build-fex64-arm64ec.sh` describe, in
+their own words — "the allocation fails and the NULL is stored through" — so
+the span-size override addressed one source of address-space pressure and not
+this one. A third would fail exactly as the second used to, and the fix that
 scales past counting is **dedup of the duplicate emulator copies**: the pool
 allocator's own comments record that `.text` is already byte-identical across
 copies of a module, which is the precondition for sharing them. Upstream's
@@ -228,9 +250,19 @@ nothing to read. iOS will not load this binary with a page-zero that small. The
 flag is gone from `ios/project.yml`; `scripts/validate-app.sh` now prints the
 reservation on every build so the state is never in doubt again.
 
-Everything else here still builds and is still in the IPA. It reports itself
-unreachable at startup (`low address space:` in the session log) and refuses a
-32-bit executable with a message naming which half is missing.
+Everything else here still builds and is still in the IPA, and a device log
+shows how far it gets. Selecting a 32-bit executable starts it: both halves
+are found, 606 i386 modules link into `syswow64`, the main image maps and
+relocates — and then `build_wow64_parameters` asserts, because the allocation
+window it asks for comes out as `0x100010000..0x80000000`. Lower bound above
+upper bound: WoW64 wants memory below 2 GiB and the allocator's floor sits
+above 4 GiB. The window is empty and can never be satisfied.
+
+That is the page-zero problem stated exactly, at the precise call that needs
+it. Since an assertion abort leaves no session log at all, the 32-bit refusal
+is now gated on the measured address space as well as on the files being
+present — `BVNFexLowAddressSpaceUsable()`, which probes rather than assumes —
+so the case ends in a message naming the obstacle instead of an abort.
 
 **Before trying a different page-zero, know which sizes are worth trying.**
 The obvious next move — keep a large `__PAGEZERO` and settle for the range

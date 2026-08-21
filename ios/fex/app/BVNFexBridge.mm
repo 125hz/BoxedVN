@@ -350,6 +350,8 @@ fextl::unique_ptr<FEXCore::Context::Context> g_context;
 // says whether the space beyond is usable or merely unclaimed. Both are
 // read-only in effect: vm_allocate with VM_FLAGS_FIXED fails rather than
 // relocating the request, and anything it does get is handed straight back.
+std::atomic<bool> g_lowAddressUsable {false};
+
 void reportLowAddressSpace() {
     vm_address_t address = 0;
     vm_size_t size = 0;
@@ -380,6 +382,7 @@ void reportLowAddressSpace() {
     if (claimed == KERN_SUCCESS) {
         vm_deallocate(mach_task_self(), candidate, page);
     }
+    g_lowAddressUsable.store(claimed == KERN_SUCCESS, std::memory_order_release);
 
     reportf("low address space: first region 0x%llx+0x%llx prot=%d/%d, "
             "fixed page at 0x10000000 %s -- 32-bit guests are %s",
@@ -400,10 +403,9 @@ bool prepareArena() {
         return true;
     }
 
-    // Costs one region read and one page; the answer decides whether any of
-    // the 32-bit work is worth starting, and it can only be measured here.
-    static std::once_flag lowAddressOnce;
-    std::call_once(lowAddressOnce, reportLowAddressSpace);
+    // Through the accessor so the probe runs exactly once however it is
+    // reached: the Wine side asks the same question before this point.
+    (void)BVNFexLowAddressSpaceUsable();
 
     if (!BVNExecMemArenaPrepared()) {
         // The header is explicit that this can be stopped indefinitely when a
@@ -506,6 +508,16 @@ bool prepareArena() {
 }
 
 } // namespace
+
+extern "C" bool BVNFexLowAddressSpaceUsable(void) {
+    // Runs the probe if nothing has yet. It costs one region read and one
+    // page, and the alternative is answering from a flag that is only set
+    // once the arena has been prepared -- which is after the point where the
+    // answer is needed.
+    static std::once_flag once;
+    std::call_once(once, reportLowAddressSpace);
+    return g_lowAddressUsable.load(std::memory_order_acquire);
+}
 
 extern "C" BVNFexStage BVNFexStageReached(void) {
     return g_stage.load(std::memory_order_acquire);

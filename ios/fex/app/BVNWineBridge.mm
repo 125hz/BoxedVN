@@ -807,8 +807,23 @@ extern "C" bool BVNWineThirtyTwoBitAvailable(void) {
         stringByAppendingPathComponent:@"xtajit.dll"];
     NSString* guestNtdll = [bundled(@"i386-windows")
         stringByAppendingPathComponent:@"ntdll.dll"];
-    return [files fileExistsAtPath:guestNtdll] &&
-           [files fileExistsAtPath:backend];
+    if (![files fileExistsAtPath:guestNtdll] ||
+        ![files fileExistsAtPath:backend]) {
+        return false;
+    }
+
+    // Having both halves is not enough, and a device log says why. With the
+    // files in place a 32-bit start gets as far as build_wow64_parameters and
+    // dies on an assertion, because WoW64 asks for memory below 2 GiB and the
+    // allocator's floor is above 4 GiB -- the request window comes out with
+    // its lower bound above its upper bound and can never be satisfied. That
+    // is an abort with no session log, which is a worse answer than a refusal
+    // even though the refusal says the same thing.
+    //
+    // So the last condition is the address space itself, measured rather than
+    // assumed. Everything above is about what this build carries; this is
+    // about whether the device will let it run.
+    return BVNFexLowAddressSpaceUsable();
 #else
     return false;
 #endif
@@ -952,16 +967,18 @@ extern "C" bool BVNWineStart(void) {
         if (selectedInstalledUnixPath(unixPath)) {
             const uint16_t machine = peMachine(unixPath);
             if (machine == 0x014c && !BVNWineThirtyTwoBitAvailable()) {
-                // Still checked, and still fatal, but now for a reason that
-                // can change: a build carries the 32-bit side or it does not.
-                // Name which half is missing, because they fail
-                // independently -- Wine's i386 arch can build while the
-                // emulator DLL does not, and the reverse.
+                // Three independent conditions, named separately because
+                // they fail independently: Wine's i386 arch can build while
+                // the emulator DLL does not, and both can be present while
+                // the device still refuses the address space they need. The
+                // last is the one that holds today.
                 reportf("the selected executable is 32-bit x86 (PE machine 0x014c) "
-                        "and this build has no 32-bit guest side: i386-windows %s, "
-                        "xtajit.dll %s. Select an x86-64 executable, or build with "
-                        "scripts/build-fex64-wow64.sh and a Wine tree configured "
-                        "for i386.",
+                        "and cannot start here: i386-windows %s, xtajit.dll %s, "
+                        "memory below 4 GiB %s. When only the last is missing the "
+                        "build is complete and the device is the obstacle -- iOS "
+                        "reserves the whole 32-bit address space as __PAGEZERO and "
+                        "refuses to load this app without it. Select an x86-64 "
+                        "executable.",
                         [NSFileManager.defaultManager fileExistsAtPath:
                             [bundled(@"i386-windows")
                                 stringByAppendingPathComponent:@"ntdll.dll"]]
@@ -969,7 +986,9 @@ extern "C" bool BVNWineStart(void) {
                         [NSFileManager.defaultManager fileExistsAtPath:
                             [bundled(@"arm64ec-windows")
                                 stringByAppendingPathComponent:@"xtajit.dll"]]
-                            ? "present" : "missing");
+                            ? "present" : "missing",
+                        BVNFexLowAddressSpaceUsable() ? "reachable"
+                                                      : "unreachable");
                 g_stage.store(BVNWineStageFailed, std::memory_order_release);
                 g_starting.store(false);
                 return false;

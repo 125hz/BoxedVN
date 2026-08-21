@@ -48,6 +48,13 @@ BVNFexStage BVNFexProbe(void);
 /// The furthest stage reached so far, without running anything.
 BVNFexStage BVNFexStageReached(void);
 
+/// Whether this process can address memory below 4 GiB, which is the whole of
+/// a 32-bit Windows guest's address space. Answered by a probe that runs once,
+/// on first call: reads the extent of the region at 0 and tries one fixed page
+/// above it. False on every build so far - iOS refuses to load this binary
+/// with a reduced __PAGEZERO, so the range stays reserved.
+bool BVNFexLowAddressSpaceUsable(void);
+
 /// A human-readable account of every step, accumulated across calls. Never
 /// NULL, and safe to read at any time.
 const char* BVNFexReport(void);
