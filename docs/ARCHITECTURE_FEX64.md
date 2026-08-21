@@ -149,6 +149,78 @@ The recipes, in dependency order. This is what the CI has to reproduce.
 9. **FEX** for iphoneos, reached through `xtajit64`.
 10. **The app**, then an unsigned IPA.
 
+## The executable pool is the scarce resource
+
+Everything that runs here is a copy. iOS will not make an existing mapping
+executable, so Wine's iOS side copies each PE image into a pool leased from
+the StikDebug-prepared arena and executes the copy; FEX carves its translated
+code buffers from the far end of that same pool. The pool is leased once,
+before the debugger detaches, and can never grow.
+
+Two things then follow, and both have cost a build:
+
+- **Every guest process pays for its own copies.** A Windows "process" is a
+  thread here, but it still gets its own PE views, so a guest whose launcher
+  starts a second binary duplicates the whole set — including the ARM64EC
+  emulator DLL, which is a little over 39 MiB by itself. Two device logs of a
+  D3D11 title ended this way: 46 images copied, the pool full, the second
+  process's emulator copy refused. Nothing recovers. The image stays
+  non-executable, every entry faults `c0000005` at the same guest PC, and the
+  redelivery storm walks the thread's 1 MiB stack off its bottom — so the
+  session dies about ten seconds in reporting a stack fault that names none
+  of the above. `[jit-pool] EXHAUSTED` is the line that does name it.
+- **The head and the tail compete.** Image copies grow from the bottom, FEX's
+  code buffers are reserved from the top, and the tail is capped at half the
+  pool. A refused tail carve is survivable — FEX halves its request and the
+  thread gets a smaller code buffer — but it is paid in recompilation, and
+  `[jit-pool] tail CAP` in a log means frames are being spent on it.
+
+`kBVNJitArenaSegmentBytes` is the number, because a lease is first fit inside
+one segment and never spans two. It is sized for two concurrent guest
+processes. A third would fail exactly as the second used to, and the fix that
+scales past counting is **dedup of the duplicate emulator copies**: the pool
+allocator's own comments record that `.text` is already byte-identical across
+copies of a module, which is the precondition for sharing them. Upstream's
+tuning constants were measured against a 896 MiB head and a 256 MiB tail, so
+there is a long way to grow before this stack is generously fed.
+
+The `[phys-map] bands` line in a session log is what says whether arena
+growth is paid in address space or in resident memory; read it before
+raising the segment again.
+
+## 32-bit guests
+
+The stack is x86-64 by construction, and older visual novels are i386. There
+are two routes and they are not close to equivalent.
+
+**Wine WoW64 with `libwow64fex.dll`.** Wine's WoW64 runs an i386 PE side
+against a 64-bit unix side, and FEX already builds the emulator for it —
+`Source/Windows/WOW64` produces `libwow64fex.dll`, the same BTCpu interface
+`libarm64ecfex.dll` implements, for an aarch64 host and an x86 guest. The
+build work is bounded: add `i386` to Wine's `--enable-archs`, configure FEX a
+second time for `ARCHITECTURE_arm64` to get the DLL, ship the syswow64 side
+in the prefix template, and register the CPU backend where Wine looks for it
+at process init.
+
+None of that is worth starting until one question is answered. A 32-bit
+guest's pointers are 32 bits, so its images, heaps and stacks must all live
+below 4 GiB — and a 64-bit Mach-O gets a `__PAGEZERO` of exactly that size
+unless it is linked with `-pagezero_size`. Whether iOS will load an app that
+asks for a smaller one is not something this project has ever tested. The FEX
+bridge now measures and reports both halves of it at startup (`low address
+space:` in the session log): the real extent of the region at 0, and whether
+a fixed page at 256 MiB can be claimed. If that line says the low range is
+unreachable, the next experiment is a build carrying
+`-Wl,-pagezero_size,0x4000` on the app target — which either launches, and
+opens the route, or does not, and closes it.
+
+**The `ios` branch's Boxedwine backend.** It already runs 32-bit visual
+novels, today, with no address-space question at all, because the guest's
+memory is emulated rather than mapped. Making one app serve both would mean
+carrying two runtimes and selecting between them on the executable's machine
+type. That is integration work rather than research, and it is the route that
+cannot fail for a reason outside this project's control.
+
 ## Staged plan
 
 There are two ladders, and they diverge early. **Testing JIT does not require
@@ -190,7 +262,9 @@ Wine build exists.
 ## What this branch is not
 
 - It does **not** replace the `ios` branch. 32-bit visual novels stay there;
-  this stack is x86-64 and would regress them to nothing.
+  this stack is x86-64 and would regress them to nothing. See "32-bit guests"
+  above for what changing that would take, and for the one measurement that
+  decides whether the cheaper of the two routes is available at all.
 - It has **no working runtime yet**. At this commit it is pinned forks, a
   toolchain build and CI. Nothing past A0 has run.
 - Its performance on BoxedVN is **unmeasured**. The 142 FPS figure is Mythic's,

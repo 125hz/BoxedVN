@@ -124,12 +124,29 @@ bool prepareWineJitPool() {
 
     // The arena is prepared in independent segments. FEX owns the first one;
     // Wine leases the next so its PE-image copier and FEX's allocator can
-    // never advance into each other's executable pages. This has to match the
-    // arena segment size exactly: a lease is first fit within one segment and
-    // never spans two, so asking for more than a segment fails no matter how
-    // much of the arena is free.
-    constexpr size_t poolBytes = kBVNJitArenaSegmentBytes;
-    void* executable = BVNExecMemAlloc(poolBytes);
+    // never advance into each other's executable pages. A lease is first fit
+    // within one segment and never spans two, so a full segment is the most
+    // this can ever be given, however much of the arena is free.
+    //
+    // Ask for the segment, but do not stake the whole session on getting it
+    // to the byte: a request for exactly a segment is the one an allocator's
+    // own bookkeeping is most likely to refuse, and a pool that is a page
+    // short still runs everything a smaller pool would have. Step down in
+    // 16 MiB increments rather than halving, because halving turns "a page
+    // short of 256" into 128 -- which is the size that could not carry a
+    // second guest process in the first place.
+    constexpr size_t kStep = 16u * 1024u * 1024u;
+    constexpr size_t kFloor = 128u * 1024u * 1024u;
+    size_t poolBytes = 0;
+    void* executable = nullptr;
+    for (size_t candidate = kBVNJitArenaSegmentBytes; candidate >= kFloor;
+         candidate -= kStep) {
+        executable = BVNExecMemAlloc(candidate);
+        if (executable != nullptr) {
+            poolBytes = candidate;
+            break;
+        }
+    }
     if (executable == nullptr) {
         size_t capacity = 0;
         size_t available = 0;
@@ -138,6 +155,14 @@ bool prepareWineJitPool() {
         reportf("could not lease Wine's executable pool (%zu MiB free of %zu MiB across %zu segments)",
                 available / (1024 * 1024), capacity / (1024 * 1024), segments);
         return false;
+    }
+    if (poolBytes != kBVNJitArenaSegmentBytes) {
+        // Worth its own line: a short pool is the difference between a guest
+        // that starts a second process and one that dies ten seconds in, and
+        // the size is otherwise only visible in the banner below.
+        reportf("Wine's pool is short: leased %zu MiB of the %zu MiB segment",
+                poolBytes / (1024 * 1024),
+                kBVNJitArenaSegmentBytes / (1024 * 1024));
     }
     void* writable = BVNExecMemWritableAddress(executable, poolBytes);
     if (writable == nullptr) {

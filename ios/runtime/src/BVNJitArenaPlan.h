@@ -33,14 +33,27 @@ struct BVNJitArenaPlan {
 
 // The smallest arena BoxedVN will attempt. Build 23 proved 128 MiB carries a
 // Direct3D 9 visual novel plus a fully attached WineDbg, and it is what every
-// device result up to build 89 was measured against, so it stays the floor
-// even when the memory probe reports nothing usable.
-inline constexpr std::size_t kBVNJitArenaMinimumBytes = 256u * 1024u * 1024u;
+// device result up to build 89 was measured against, so it stayed the floor
+// for as long as one segment was 128 MiB.
+//
+// The floor is expressed in segments, not in megabytes: it has to leave the
+// fex64 Wine side a whole empty segment after the emulator has taken part of
+// the first one, or Wine's lease fails and nothing starts. Two segments is
+// that promise, so the floor moves with the segment size below.
+inline constexpr std::size_t kBVNJitArenaMinimumBytes = 512u * 1024u * 1024u;
 
 // The largest arena BoxedVN will attempt. Preparation writes through
 // debugserver page by page, so this is paid in startup time and in resident
 // memory that the guest can then never use.
-inline constexpr std::size_t kBVNJitArenaMaximumBytes = 512u * 1024u * 1024u;
+//
+// How much of it is really resident is worth checking before raising this
+// again. The [phys-map] bands line reports the leased Wine pool dirty end to
+// end while the FEX band beside it reads 0/0, which is what it would look
+// like if preparation only reserved and Wine had genuinely filled all
+// 128 MiB -- the reading that says the old pool was starved. It is not what
+// it would look like if preparation dirtied every page. A device log at the
+// larger size settles it either way.
+inline constexpr std::size_t kBVNJitArenaMaximumBytes = 768u * 1024u * 1024u;
 
 // One segment, and also the largest single lease: allocation is first fit
 // within a segment and never spans two, so a caller that needs more than this
@@ -54,7 +67,43 @@ inline constexpr std::size_t kBVNJitArenaMaximumBytes = 512u * 1024u * 1024u;
 // one image and broken on the next, so size the segment for the whole stack
 // instead. The floor rises with it, because a single-segment arena leaves the
 // Wine side nothing once the emulator has taken the first one.
-inline constexpr std::size_t kBVNJitArenaSegmentBytes = 128u * 1024u * 1024u;
+//
+// 128 MiB then stopped being enough as soon as a guest started a SECOND guest
+// process. Every Windows "process" here is a thread in the one Mach task, but
+// each still gets its own PE views and therefore its own pool copies, and the
+// ARM64EC emulator DLL alone is 0x2713000 -- a little over 39 MiB -- of that
+// copy. Two device logs of a D3D11 title whose launcher execs a second binary
+// end identically: 46 images copied, the pool at 0x5ef0000 of 0x8000000 with
+// 0x1004000 held back for the dispatcher tail, and the second process's copy
+// of the emulator refused for want of about 22 MiB. Nothing recovers from
+// that. The image stays non-executable, every entry into it faults
+// c0000005 at the same guest PC, the redelivery storm walks the thread's
+// 1 MiB stack off its bottom, and the session dies about ten seconds in with
+// a stack fault that names none of this.
+//
+// So the segment has to hold the whole stack TWICE over: roughly 104 MiB of
+// first-process images, then the second process's emulator copy and its own
+// kernel32/kernelbase/ucrtbase/graphics set. That measured out at about
+// 224 MiB including the tail reserve. 256 MiB carries it with room to spare;
+// a third concurrent guest process would not fit, and would fail the same
+// way. Dedup of the duplicate emulator copies is the fix that scales past
+// two -- see docs/ARCHITECTURE_FEX64.md -- and this is the sizing that makes
+// two work now.
+//
+// This segment is not only the image copier's. FEX's translated code buffers
+// carve from the SAME pool, from the far end: the log's DUAL_MAP_SANITY lines
+// put its cursor inside the leased range, and the head allocator holds back
+// whatever the tail has reserved. The tail is capped at half the pool and a
+// refusal there is survivable -- FEX halves its request down and keeps going,
+// so a thread gets a smaller code buffer rather than none -- but it is paid
+// in recompilation. 256 MiB leaves about 50 MiB for that after two guest
+// processes' images, which is thin: the upstream tuning constants in
+// virtual_ios.c were measured against a 896 MiB head and a 256 MiB tail. If a
+// device log shows code buffers rotating (the "[jit-pool] tail CAP" and
+// "Failed to mprotect last page of code buffer" lines), this is the number to
+// raise, and the [phys-map] bands line is what says whether the arena is
+// actually resident or merely reserved.
+inline constexpr std::size_t kBVNJitArenaSegmentBytes = 256u * 1024u * 1024u;
 
 // Fraction of the process memory budget the arena may claim. The guest still
 // needs the rest: BVNGuestReportedTotalMemory advertises up to 3 GB to a

@@ -28,8 +28,10 @@
 #include <FEXCore/fextl/memory.h>
 
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <csetjmp>
@@ -331,10 +333,77 @@ GuestSignals g_signals;
 // would be worse than leaking it.
 fextl::unique_ptr<FEXCore::Context::Context> g_context;
 
+// Whether a 32-bit Windows guest could ever run here.
+//
+// Wine's WoW64 runs an i386 PE side whose pointers are 32 bits, so every
+// image, heap and stack it owns has to live below 4 GiB. FEX already ships
+// the other half of that route -- libwow64fex.dll, the same BTCpu interface
+// the ARM64EC emulator implements, built for an aarch64 host and an x86
+// guest -- so the build work is real and bounded. What is not known is
+// whether this process can address the low 4 GiB at all: a 64-bit Mach-O
+// gets a __PAGEZERO of exactly that size unless it is linked with
+// -pagezero_size, and nothing in this app has ever asked for an address
+// under it.
+//
+// Report the answer rather than guessing at it. Reading the region at 0
+// gives __PAGEZERO's real extent, and one fixed allocation attempt above it
+// says whether the space beyond is usable or merely unclaimed. Both are
+// read-only in effect: vm_allocate with VM_FLAGS_FIXED fails rather than
+// relocating the request, and anything it does get is handed straight back.
+void reportLowAddressSpace() {
+    vm_address_t address = 0;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+
+    const kern_return_t region = vm_region_64(
+        mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+        reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+    if (region != KERN_SUCCESS) {
+        reportf("low address space: the region at 0 could not be read (%d)",
+                region);
+        return;
+    }
+
+    // A 4 GiB reserved region starting at 0 is __PAGEZERO at its default
+    // size, which is the whole of a 32-bit guest's address space.
+    const bool pagezeroCoversFourGiB =
+        address == 0 && size >= 0x100000000ull;
+
+    // Try for a page in the middle of the low range. 256 MiB is above
+    // anything a shrunk __PAGEZERO would keep and below the 4 GiB line.
+    vm_address_t candidate = 0x10000000ull;
+    const vm_size_t page = static_cast<vm_size_t>(getpagesize());
+    const kern_return_t claimed =
+        vm_allocate(mach_task_self(), &candidate, page, VM_FLAGS_FIXED);
+    if (claimed == KERN_SUCCESS) {
+        vm_deallocate(mach_task_self(), candidate, page);
+    }
+
+    reportf("low address space: first region 0x%llx+0x%llx prot=%d/%d, "
+            "fixed page at 0x10000000 %s -- 32-bit guests are %s",
+            (unsigned long long)address, (unsigned long long)size,
+            info.protection, info.max_protection,
+            claimed == KERN_SUCCESS ? "granted" : "refused",
+            claimed == KERN_SUCCESS
+                ? "addressable; the WoW64 route is open"
+                : (pagezeroCoversFourGiB
+                       ? "unreachable: __PAGEZERO is the full 4 GiB, so the "
+                         "app has to be linked with -pagezero_size before "
+                         "WoW64 is worth building"
+                       : "unreachable for a reason other than __PAGEZERO"));
+}
+
 bool prepareArena() {
     if (g_poolExecutable != nullptr) {
         return true;
     }
+
+    // Costs one region read and one page; the answer decides whether any of
+    // the 32-bit work is worth starting, and it can only be measured here.
+    static std::once_flag lowAddressOnce;
+    std::call_once(lowAddressOnce, reportLowAddressSpace);
 
     if (!BVNExecMemArenaPrepared()) {
         // The header is explicit that this can be stopped indefinitely when a

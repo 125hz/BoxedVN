@@ -56,6 +56,22 @@ BOXEDVN_TEST(jit_arena_plan_respects_the_smaller_of_the_two_budgets) {
     CHECK(constrained.totalBytes() >= kBVNJitArenaMinimumBytes);
 }
 
+BOXEDVN_TEST(jit_arena_segment_holds_two_guest_processes_of_pe_copies) {
+    // The fex64 Wine side copies every PE image it runs into one leased
+    // segment, and each guest process gets its own copies -- including its own
+    // 39 MiB copy of the ARM64EC emulator DLL. The device logs that ended in a
+    // ten-second stack fault had 46 images and about 224 MiB of demand across
+    // two guest processes. A segment smaller than that reproduces the fault
+    // exactly, and the failure names a stack overflow rather than the pool, so
+    // guard the number here where it is legible.
+    constexpr std::size_t kTwoProcessDemandBytes = 224u * kMiB;
+    CHECK(kBVNJitArenaSegmentBytes >= kTwoProcessDemandBytes);
+
+    // And the floor has to leave a whole segment free after the emulator has
+    // taken part of the first one, or Wine's lease fails outright.
+    CHECK(kBVNJitArenaMinimumBytes >= 2 * kBVNJitArenaSegmentBytes);
+}
+
 BOXEDVN_TEST(jit_arena_plan_segments_are_page_aligned_and_cover_the_total) {
     const BVNJitArenaPlan plan = BVNPlanJitArena(4 * kGiB, 8 * kGiB,
                                                 kPageSize);
