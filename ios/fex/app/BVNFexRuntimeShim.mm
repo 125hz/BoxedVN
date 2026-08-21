@@ -17,6 +17,16 @@
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 
+// SecTask is exported by Security.framework on iOS but omitted from the public
+// umbrella header, so it has to be declared here -- the same declaration
+// ios/runtime/src/BVNMemory.mm carries, for the same reason. Including
+// <Security/Security.h> is not enough and the compiler's suggestion
+// ("did you mean SecTrustRef?") is how that reads when it is missing.
+typedef struct __SecTask* SecTaskRef;
+extern "C" SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef allocator);
+extern "C" CFTypeRef SecTaskCopyValueForEntitlement(
+    SecTaskRef task, CFStringRef entitlement, CFErrorRef* error);
+
 #include "BVNRuntime.h"
 
 #include <mach/mach.h>
