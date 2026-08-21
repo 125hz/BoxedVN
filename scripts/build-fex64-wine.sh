@@ -98,6 +98,17 @@ require_mingw() {
 Run scripts/build-fex64-toolchains.sh --stage llvm-mingw first. Wine builds
 its DLLs as PE binaries whatever the host, so no configuration here avoids
 needing it."
+
+    # i386 is a separate target in the same llvm-mingw release, and configure
+    # drops an arch whose compiler it cannot find rather than failing on it. A
+    # tree that quietly built no 32-bit PE side would look like a success here
+    # and like a missing ntdll on device, so check for it by name.
+    [[ -x "${MINGW}/bin/i686-w64-mingw32-clang" ]] || die \
+"llvm-mingw at '${MINGW}' has no i686 target.
+The 32-bit guest side needs it: --enable-archs below includes i386, which is
+the PE half of WoW64. If this llvm-mingw release genuinely ships without an
+i686 target, the pin in scripts/dependencies.fex64.lock.sh has to be raised
+deliberately."
 }
 
 # Wine refuses to configure in its source directory, and both trees have to
@@ -165,9 +176,17 @@ for tree in ${TREES}; do
             # emulated and native without a thunk layer in between. aarch64 is
             # built alongside it because Wine's own builtins need a pure ARM64
             # form as well.
+            #
+            # i386 is the 32-bit guest side. It is not a third way of building
+            # the same Wine: it is the PE half of WoW64, thunked down onto the
+            # same 64-bit unix side, and it is what lets an i386 program run
+            # here at all. Its instructions are executed by libwow64fex.dll
+            # (scripts/build-fex64-wow64.sh) exactly as x86-64 ones are by
+            # libarm64ecfex.dll. It costs configure a third arch and make a
+            # set of small PE DLLs; nothing else in the tree changes.
             PATH="${MINGW}/bin:${PATH}" \
                 build_tree arm64ec \
-                    --enable-archs=arm64ec,aarch64 \
+                    --enable-archs=arm64ec,aarch64,i386 \
                     --with-mingw \
                     "${COMMON_CONFIGURE[@]}"
             ;;
@@ -226,6 +245,19 @@ ${count} other PE DLLs were, so this is that library specifically rather than a
 broken tree. Its failure is in ${build}/build.log."
         done
         ok "wine/arm64ec: ${count} PE DLLs, including the three that must exist"
+
+        # The 32-bit side is reported separately, and its absence is NOT
+        # fatal. A tree whose i386 arch failed still carries a complete
+        # x86-64 stack, and refusing to ship that because 32-bit did not
+        # build would trade a working app for an unbuilt feature. What must
+        # not happen is a zero going unnoticed, so say it either way.
+        i386_count="$(find "${build}/dlls" -path '*i386-windows*' -name '*.dll' 2>/dev/null | wc -l | tr -d ' ')"
+        if [[ "${i386_count}" -gt 0 ]]; then
+            ok "wine/arm64ec: ${i386_count} i386 PE DLLs for the 32-bit guest side"
+        else
+            warn "wine/arm64ec: no i386 PE DLLs were produced, so 32-bit guests will
+not start. The x86-64 side is unaffected. The failure is in ${build}/build.log."
+        fi
     else
         ok "wine/${tree}: built, config.h present"
     fi

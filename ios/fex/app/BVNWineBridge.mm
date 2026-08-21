@@ -328,6 +328,44 @@ bool preparePrefix() {
         }
     }
 
+    // The 32-bit guest side, when this build carries one.
+    //
+    // WoW64 keeps the two worlds in separate directories: a 64-bit process
+    // resolves system DLLs from system32, a 32-bit one from syswow64, and the
+    // names inside them collide by design -- there is an i386 ntdll.dll and an
+    // ARM64EC ntdll.dll and they are not interchangeable. Linking the i386 set
+    // into system32 would therefore not "also enable 32-bit"; it would break
+    // 64-bit. So it gets its own directory or nothing.
+    //
+    // Absent i386-windows the loop simply does not run, which is the state
+    // every build before this one shipped in.
+    NSString* guest32 = bundled(@"i386-windows");
+    if (isDirectory(guest32)) {
+        NSString* syswow64 = [prefix stringByAppendingPathComponent:
+                               @"drive_c/windows/syswow64"];
+        if ([files createDirectoryAtPath:syswow64
+              withIntermediateDirectories:YES attributes:nil error:&error]) {
+            NSArray<NSString*>* names32 =
+                [files contentsOfDirectoryAtPath:guest32 error:nil];
+            NSUInteger linked32 = 0;
+            for (NSString* name in names32) {
+                NSString* source = [guest32 stringByAppendingPathComponent:name];
+                NSString* destination =
+                    [syswow64 stringByAppendingPathComponent:name];
+                [files removeItemAtPath:destination error:nil];
+                if ([files createSymbolicLinkAtPath:destination
+                                withDestinationPath:source error:nil]) {
+                    linked32++;
+                }
+            }
+            reportf("prefix ready with %lu i386-windows runtime links",
+                    (unsigned long)linked32);
+        } else {
+            reportf("could not create syswow64: %s",
+                    error.localizedDescription.UTF8String);
+        }
+    }
+
     NSString* dosdevices = [prefix stringByAppendingPathComponent:@"dosdevices"];
     [files createDirectoryAtPath:dosdevices
       withIntermediateDirectories:YES attributes:nil error:nil];
@@ -741,6 +779,27 @@ extern "C" bool BVNWineAvailable(void) {
 #endif
 }
 
+extern "C" bool BVNWineThirtyTwoBitAvailable(void) {
+#if BVN_WINE_BOOT_ENABLED
+    // Both halves or neither. The i386 PE side is what a 32-bit program's
+    // imports resolve against; xtajit.dll is what executes its instructions.
+    // Either one alone starts a process that fails later and further from the
+    // cause, so treat a half-built bundle as no 32-bit support at all.
+    //
+    // xtajit.dll is FEX's libwow64fex.dll under the name the loader asks for,
+    // the same substitution that already puts libarm64ecfex.dll in place as
+    // xtajit64.dll. It lives beside that one, in the ARM64EC directory that
+    // becomes system32: the CPU backend is loaded by the 64-bit loader, not
+    // by the 32-bit world it serves.
+    NSString* backend = [bundled(@"arm64ec-windows")
+        stringByAppendingPathComponent:@"xtajit.dll"];
+    return isDirectory(bundled(@"i386-windows")) &&
+           [NSFileManager.defaultManager fileExistsAtPath:backend];
+#else
+    return false;
+#endif
+}
+
 extern "C" bool BVNWineSetTarget(BVNWineTarget target) {
     if (target < BVNWineTargetNative || target > BVNWineTargetInstalled) return false;
 #if BVN_WINE_BOOT_ENABLED
@@ -878,13 +937,29 @@ extern "C" bool BVNWineStart(void) {
         std::string unixPath;
         if (selectedInstalledUnixPath(unixPath)) {
             const uint16_t machine = peMachine(unixPath);
-            if (machine == 0x014c) {
-                reportf("the selected executable is 32-bit x86 (PE machine 0x014c); "
-                        "this build contains only the x86-64 translator. Select an "
-                        "x86-64 executable.");
+            if (machine == 0x014c && !BVNWineThirtyTwoBitAvailable()) {
+                // Still checked, and still fatal, but now for a reason that
+                // can change: a build carries the 32-bit side or it does not.
+                // Name which half is missing, because they fail
+                // independently -- Wine's i386 arch can build while the
+                // emulator DLL does not, and the reverse.
+                reportf("the selected executable is 32-bit x86 (PE machine 0x014c) "
+                        "and this build has no 32-bit guest side: i386-windows %s, "
+                        "xtajit.dll %s. Select an x86-64 executable, or build with "
+                        "scripts/build-fex64-wow64.sh and a Wine tree configured "
+                        "for i386.",
+                        isDirectory(bundled(@"i386-windows")) ? "present" : "missing",
+                        [NSFileManager.defaultManager fileExistsAtPath:
+                            [bundled(@"arm64ec-windows")
+                                stringByAppendingPathComponent:@"xtajit.dll"]]
+                            ? "present" : "missing");
                 g_stage.store(BVNWineStageFailed, std::memory_order_release);
                 g_starting.store(false);
                 return false;
+            }
+            if (machine == 0x014c) {
+                reportf("the selected executable is 32-bit x86; starting it "
+                        "through WoW64 with the i386 Wine side and xtajit.dll");
             }
         }
     }

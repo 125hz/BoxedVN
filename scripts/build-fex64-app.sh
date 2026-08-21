@@ -185,13 +185,43 @@ import it can enter their main function."
             "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit64.dll" \
             || die "Patching the ARM64EC emulator DLL failed."
     fi
+
+    # The 32-bit guest side, in two halves that are staged independently and
+    # checked together by the app at start.
+    #
+    # Both are optional here on purpose. A build that carries neither is every
+    # build before this one and runs x86-64 exactly as it did; a build that
+    # carries one and not the other is a mistake worth naming, but not one
+    # worth refusing an otherwise working IPA over, so the app reports which
+    # half is missing rather than the packaging step failing here.
+    #
+    # xtajit.dll is FEX's libwow64fex.dll under the name the loader asks for,
+    # the same substitution that stages libarm64ecfex.dll as xtajit64.dll. It
+    # goes into the ARM64EC set because that is what becomes system32, and the
+    # CPU backend is loaded by the 64-bit loader rather than by the 32-bit
+    # world it serves. The i386 DLLs go into their own directory, which the
+    # app links into syswow64: their names collide with the 64-bit set by
+    # design, and mixing the two would break both.
+    if [[ -n "${BOXEDVN_WOW64_DLL:-}" ]]; then
+        require_file "${BOXEDVN_WOW64_DLL}"
+        log "Staging the WoW64 emulator DLL as xtajit.dll"
+        cp "${BOXEDVN_WOW64_DLL}" \
+           "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit.dll"
+        shasum -a 256 "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit.dll"
+    fi
+    if [[ -d "${WINE_RUNTIME_DIR}/i386-windows" ]]; then
+        cp -R "${WINE_RUNTIME_DIR}/i386-windows" \
+              "${WINE_RESOURCE_STAGING}/i386-windows"
+        i386_staged="$(find "${WINE_RESOURCE_STAGING}/i386-windows" -type f | wc -l | tr -d ' ')"
+        log "Staged ${i386_staged} i386 PE files for the 32-bit guest side"
+    fi
     # The integration is a game launcher, so its ARM64EC runtime ships a full
     # DLL set and the display driver but none of Wine's own programs. A desktop
     # needs explorer, and it has to be ARM64EC: the display driver is built
     # only for that architecture, so an ARM64 explorer can never load it while
     # an ARM64EC one runs beside the same wineios.drv the x64 path already
-    # uses. Wine is configured here with --enable-archs=arm64ec,aarch64, so
-    # that build already produced one; copy it in alongside rather than
+    # uses. Wine is configured here with --enable-archs=arm64ec,aarch64,i386,
+    # so that build already produced one; copy it in alongside rather than
     # replacing anything.
     # No display driver is staged, because none exists for iOS. wineios.drv is
     # the CoreAudio/CoreMIDI driver, not a display one; the fork carries only
@@ -208,6 +238,49 @@ import it can enter their main function."
     mkdir -p "${WINE_RESOURCE_STAGING}/prefix-template"
     tar -xzf "${MYTHIC_DIR}/app/Mythic/prefix-template.tar.gz" \
         -C "${WINE_RESOURCE_STAGING}/prefix-template" --strip-components=1
+
+    # Point the x86 CPU backend at the emulator that can actually run here.
+    #
+    # Wine asks Software\Microsoft\Wow64\x86 which DLL executes a 32-bit
+    # guest's instructions, and the pinned template answers "wow64cpu.dll" --
+    # correct for an x86-64 host, where 32-bit code runs on the hardware and
+    # the backend only has to switch modes. On ARM64 there is nothing to
+    # switch to, so the answer has to name an emulator: xtajit.dll, which is
+    # where libwow64fex.dll was staged above. The template already lists both
+    # xtajit and xtajit64 in KnownDLLs, so the name is the one Wine expects;
+    # only this value was left at the x86-64 default.
+    #
+    # Rewritten only when the backend is actually present. A prefix naming a
+    # DLL that was never staged fails further from the cause than one still
+    # naming the x86-64 default, and the app checks for the file itself
+    # before it lets a 32-bit program start.
+    if [[ -f "${WINE_RESOURCE_STAGING}/arm64ec-windows/xtajit.dll" ]]; then
+        registry="${WINE_RESOURCE_STAGING}/prefix-template/system.reg"
+        require_file "${registry}"
+        # Scoped to the one key: "wow64cpu.dll" also appears in KnownDLLs,
+        # where it is a name-to-file mapping rather than a choice of backend
+        # and has to stay as it is.
+        #
+        # The key is matched with . rather than by spelling its separators.
+        # Registry paths in system.reg are written with doubled backslashes,
+        # and how many a backslash has to become to survive both awk's regex
+        # lexer and the shell quoting around it is exactly the kind of detail
+        # that silently matches nothing -- which here would mean shipping a
+        # prefix that still names the x86-64 backend. The anchors and the
+        # trailing "] " keep it precise without depending on that count.
+        awk '
+            /^\[Software.*Microsoft.*Wow64.*x86\] / { inkey = 1 }
+            inkey && /^@="wow64cpu\.dll"$/ { print "@=\"xtajit.dll\""; inkey = 0; next }
+            /^\[/ && !/^\[Software.*Microsoft.*Wow64.*x86\] / { inkey = 0 }
+            { print }
+        ' "${registry}" > "${registry}.wow64" || die "Rewriting the WoW64 CPU backend failed."
+        grep -q '^@="xtajit\.dll"$' "${registry}.wow64" || die \
+"The prefix template's Software\Microsoft\Wow64\x86 key did not carry the
+expected wow64cpu.dll default, so the CPU backend was not redirected. The
+pinned template has changed shape; re-read it before assuming 32-bit works."
+        mv "${registry}.wow64" "${registry}"
+        log "Prefix template: x86 CPU backend set to xtajit.dll"
+    fi
     trap 'rm -rf "${WINE_RESOURCE_STAGING}"' EXIT
     WINE_ENABLED=1
     log "Staged the native and ARM64EC Wine runtime resources"

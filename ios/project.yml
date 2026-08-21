@@ -163,6 +163,10 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      - path: fex/runtime/i386-windows
+        optional: true
+        type: folder
+        buildPhase: resources
       - path: fex/runtime/nls
         optional: true
         type: folder
@@ -195,6 +199,20 @@ targets:
         CLANG_CXX_LIBRARY: "libc++"
         OTHER_LDFLAGS:
           - $(inherited)
+          # A 32-bit Windows guest's pointers are 32 bits, so every image,
+          # heap and stack WoW64 gives it has to sit below 4 GiB - and a
+          # 64-bit Mach-O reserves exactly that range as __PAGEZERO unless it
+          # is told otherwise. Shrink it to one page so the range is free.
+          #
+          # This is the one change here that can stop the app launching at
+          # all, because whether iOS will load a binary with a non-default
+          # __PAGEZERO is not documented and has not been tested on this
+          # project before. If the app does not start after this, remove
+          # these two lines and the x86-64 stack is exactly as it was; the
+          # 32-bit side then needs a different answer. The FEX bridge reports
+          # what it actually got ("low address space:" in the session log),
+          # so a launch that succeeds also says whether this worked.
+          - -Wl,-pagezero_size,0x4000
           # Order matters for static archives: FEXCore first, then what it
           # draws on.
           - -lFEXCore

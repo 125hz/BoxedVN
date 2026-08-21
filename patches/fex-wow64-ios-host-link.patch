@@ -1,0 +1,26 @@
+diff --git a/Source/Windows/WOW64/CMakeLists.txt b/Source/Windows/WOW64/CMakeLists.txt
+index 5bc5accff..38850affc 100644
+--- a/Source/Windows/WOW64/CMakeLists.txt
++++ b/Source/Windows/WOW64/CMakeLists.txt
+@@ -19,8 +19,19 @@ target_link_libraries(wow64fex PRIVATE
+   wow64_ex
+   ntdll_ex)
+ 
+-target_link_options(wow64fex PRIVATE -static -nostdlib -nostartfiles -nodefaultlibs -lc++ -lc++abi -lunwind)
+-target_link_libraries(wow64fex PRIVATE ${LIBGCC_PATH})
++# Same reasoning as Source/Windows/ARM64EC/CMakeLists.txt: upstream's
++# `-nostdlib -nostartfiles -nodefaultlibs` link, with libc++/libc++abi/libunwind
++# re-added by hand, is tuned for a Linux host. On a macOS-host llvm-mingw the
++# hand-rolled link is where these builds break, and the fix there was to fall
++# through to the default mingw link rules, which supply the right startup files
++# and CRT and produce a clean PE. Do the same here rather than discovering the
++# same failure a second time.
++if (FEX_IOS_HOST_BUILD)
++  target_link_options(wow64fex PRIVATE -static)
++else()
++  target_link_options(wow64fex PRIVATE -static -nostdlib -nostartfiles -nodefaultlibs -lc++ -lc++abi -lunwind)
++  target_link_libraries(wow64fex PRIVATE ${LIBGCC_PATH})
++endif()
+ install(TARGETS wow64fex RUNTIME
+   DESTINATION ${CMAKE_INSTALL_LIBDIR}
+   COMPONENT Runtime)

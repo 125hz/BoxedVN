@@ -36,6 +36,12 @@ typedef enum {
 /// runtime inputs.
 bool BVNWineAvailable(void);
 
+/// True when this build can also run 32-bit x86 programs: the i386 Wine PE
+/// side is bundled and the WoW64 CPU backend is staged beside the 64-bit one.
+/// Independent of BVNWineAvailable - a build can have a complete x86-64 stack
+/// and no 32-bit side, which is what every build before this one was.
+bool BVNWineThirtyTwoBitAvailable(void);
+
 /// Selects the bundled acceptance executable for the next bootstrap. The
 /// selection is locked once Wine starts.
 bool BVNWineSetTarget(BVNWineTarget target);

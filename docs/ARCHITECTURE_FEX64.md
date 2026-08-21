@@ -193,26 +193,43 @@ raising the segment again.
 The stack is x86-64 by construction, and older visual novels are i386. There
 are two routes and they are not close to equivalent.
 
-**Wine WoW64 with `libwow64fex.dll`.** Wine's WoW64 runs an i386 PE side
-against a 64-bit unix side, and FEX already builds the emulator for it —
-`Source/Windows/WOW64` produces `libwow64fex.dll`, the same BTCpu interface
+**Wine WoW64 with `libwow64fex.dll`** — built. Wine's WoW64 runs an i386 PE
+side against a 64-bit unix side, and FEX already carries the emulator for it:
+`Source/Windows/WOW64` builds `libwow64fex.dll`, the same BTCpu interface
 `libarm64ecfex.dll` implements, for an aarch64 host and an x86 guest. The
-build work is bounded: add `i386` to Wine's `--enable-archs`, configure FEX a
-second time for `ARCHITECTURE_arm64` to get the DLL, ship the syswow64 side
-in the prefix template, and register the CPU backend where Wine looks for it
-at process init.
+pieces, and where each lives:
 
-None of that is worth starting until one question is answered. A 32-bit
-guest's pointers are 32 bits, so its images, heaps and stacks must all live
-below 4 GiB — and a 64-bit Mach-O gets a `__PAGEZERO` of exactly that size
-unless it is linked with `-pagezero_size`. Whether iOS will load an app that
-asks for a smaller one is not something this project has ever tested. The FEX
-bridge now measures and reports both halves of it at startup (`low address
-space:` in the session log): the real extent of the region at 0, and whether
-a fixed page at 256 MiB can be claimed. If that line says the low range is
-unreachable, the next experiment is a build carrying
-`-Wl,-pagezero_size,0x4000` on the app target — which either launches, and
-opens the route, or does not, and closes it.
+| Piece | Where |
+|---|---|
+| The emulator DLL | `scripts/build-fex64-wow64.sh` — same FEX tree and toolchain as the ARM64EC one, configured for plain `aarch64` so its CMake descends into `WOW64` instead of `ARM64EC` |
+| The i386 Wine PE side | `--enable-archs=arm64ec,aarch64,i386` in `scripts/build-fex64-wine.sh`; gathered out of Wine's per-DLL layout by `scripts/collect-fex64-i386.sh` |
+| Staging | `scripts/build-fex64-app.sh` puts the emulator in the ARM64EC set as `xtajit.dll` and the i386 set in its own directory |
+| The prefix | the same script rewrites `Software\Microsoft\Wow64\x86` from `wow64cpu.dll` to `xtajit.dll`. The pinned template value is correct for an x86-64 host, where 32-bit code runs on the hardware; on ARM64 it has to name an emulator |
+| The prefix at runtime | `BVNWineBridge` links the i386 set into `syswow64`, not `system32` — an i386 `ntdll.dll` and an ARM64EC `ntdll.dll` share a name and are not interchangeable |
+
+Every one of those is additive: a build where the i386 arch or the emulator
+DLL fails still ships, still runs x86-64 exactly as before, and reports which
+half is missing when a 32-bit program is selected.
+
+What is **not** settled is the address space. A 32-bit guest's pointers are 32
+bits, so its images, heaps and stacks must all live below 4 GiB — and a 64-bit
+Mach-O gets a `__PAGEZERO` of exactly that size unless it is linked with
+`-pagezero_size`. The app target now carries `-Wl,-pagezero_size,0x4000`, and
+whether iOS will load a binary that asks for that has never been tested here.
+It is the one change in this work that can stop the app launching at all.
+
+So read the log before anything else. The FEX bridge reports both halves of
+the question at startup on a `low address space:` line: the real extent of the
+region at 0, and whether a fixed page at 256 MiB can be claimed. Three
+outcomes:
+
+- **App launches, page granted.** The route is open; 32-bit failures from
+  here are ordinary WoW64 bugs.
+- **App launches, page refused.** `__PAGEZERO` was not the only thing in the
+  way. The line says what the region at 0 actually is.
+- **App does not launch.** iOS refused the shrunk `__PAGEZERO`. Remove the
+  `-Wl,-pagezero_size` line from `ios/project.yml` and everything else here
+  stays exactly as it is, running x86-64; 32-bit then needs the other route.
 
 **The `ios` branch's Boxedwine backend.** It already runs 32-bit visual
 novels, today, with no address-space question at all, because the guest's
