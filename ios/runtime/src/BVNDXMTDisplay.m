@@ -21,6 +21,19 @@
 #include "BVNDXMTDisplay.h"
 #include "BVNRuntime.h"
 
+#if defined(BOXEDWINE_DXMT_NATIVE)
+// The pinned iOS DXMT cadence logger samples counters owned by its native-Wine
+// exception and server transports. BoxedWine supplies neither transport, so
+// expose weak zero counters for that diagnostic-only ABI. A future transport
+// can provide strong definitions without changing the DXMT archive.
+volatile int ios_exc_msg_count __attribute__((weak)) = 0;
+volatile int ios_srv_wait_count __attribute__((weak)) = 0;
+volatile int ios_srv_wait_timeouts __attribute__((weak)) = 0;
+volatile int ios_srv_req_count __attribute__((weak)) = 0;
+volatile long long ios_srv_wait_us __attribute__((weak)) = 0;
+volatile long long ios_srv_wait_req_us __attribute__((weak)) = 0;
+#endif
+
 extern UIWindow* BVNGuestUIWindow(void);
 
 @interface BVNDXMTMetalView : UIView
