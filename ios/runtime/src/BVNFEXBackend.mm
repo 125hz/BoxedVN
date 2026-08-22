@@ -63,6 +63,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 
 #include <libkern/OSCacheControl.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 
@@ -477,6 +478,16 @@ bool gFEXGlobalsReady = false;
 bool initializeFEXGlobals() {
     if (!preparePool()) return false;
     std::call_once(gFEXGlobalsOnce, [] {
+        // The pinned iOS FEX fork carries an environment-gated escape hatch
+        // for a known non-converging DeadFlagCalculationEliminination pass.
+        // BoxedWine's ELF loader reaches that complex control-flow path before
+        // Wine can issue its second syscall, so keep the rest of the optimiser
+        // enabled while omitting only the unstable pass.
+        if (setenv("MYTHIC_NO_DFE", "1", 1) != 0) {
+            reportf("could not disable the unstable FEX dead-flag pass");
+            return;
+        }
+        reportf("FEX dead-flag optimisation disabled for deterministic guest startup");
         FEXCore::Allocator::mmap = fexMmap;
         FEXCore::Allocator::munmap = fexMunmap;
         LogMan::Msg::InstallHandler(fexLog);

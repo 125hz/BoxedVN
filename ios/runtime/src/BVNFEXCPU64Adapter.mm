@@ -69,6 +69,7 @@ struct BVNFEXCPU64Adapter {
 };
 
 static thread_local BVNFEXCPU64Adapter* gCurrentAdapter = nullptr;
+static std::atomic<uint32_t> gLiveSyscallTraceOrdinal {0};
 
 // FEX stores x87 state in a stack-relative view (the MM array is indexed by
 // physical stack slot, while AbridgedFTW bits are indexed by ST(i)). CPU64's
@@ -471,6 +472,9 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     }
     CPU64* cpu = adapter->cpu;
     const uint64_t syscallNumber = arguments[0];
+    const uint32_t syscallOrdinal = gLiveSyscallTraceOrdinal.fetch_add(
+        1, std::memory_order_relaxed);
+    const bool traceSyscall = syscallOrdinal < 64;
     if (!adapter->process->fexLiveSyscallReported.exchange(
             true, std::memory_order_acq_rel)) {
         klog_fmt("BOXEDWINE_FEX64_LIVE_SYSCALL pid=%d tid=%d nr=%llu rip=0x%llx",
@@ -497,7 +501,25 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     cpu->rip = postSyscallRip;
     cpu->yield = false;
     cpu->reExecuteSyscall = false;
+    if (traceSyscall) {
+        klog_fmt("BOXEDWINE_FEX64_SYSCALL_ENTER ordinal=%u pid=%d tid=%d "
+                 "nr=%llu a1=0x%llx a2=0x%llx rip=0x%llx",
+                 syscallOrdinal, adapter->process->id, adapter->thread->id,
+                 static_cast<unsigned long long>(syscallNumber),
+                 static_cast<unsigned long long>(arguments[1]),
+                 static_cast<unsigned long long>(arguments[2]),
+                 static_cast<unsigned long long>(cpu->syscallRip));
+    }
     ksyscall64(cpu);
+    if (traceSyscall) {
+        klog_fmt("BOXEDWINE_FEX64_SYSCALL_RETURN ordinal=%u pid=%d tid=%d "
+                 "nr=%llu result=0x%llx rip=0x%llx yield=%d restart=%d",
+                 syscallOrdinal, adapter->process->id, adapter->thread->id,
+                 static_cast<unsigned long long>(syscallNumber),
+                 static_cast<unsigned long long>(cpu->reg[X64_RAX].u64),
+                 static_cast<unsigned long long>(cpu->rip),
+                 cpu->yield ? 1 : 0, cpu->reExecuteSyscall ? 1 : 0);
+    }
 
     if (cpu->yield) {
         if (cpu->reExecuteSyscall) {
