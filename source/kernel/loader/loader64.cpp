@@ -12,6 +12,7 @@
 #include "loader64.h"
 #include "elfloaderpolicy64.h"
 #include "kelf64.h"
+#include "krandom.h"
 #include <algorithm>
 #include <array>
 #ifdef BOXEDWINE_GUEST_X64
@@ -1261,11 +1262,27 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         argvPtrs.insert(argvPtrs.begin(), sp);
     }
 
-    // 16-byte random pool for AT_RANDOM (glibc TLS canary). Zero-filled is
-    // fine for early bringup — deterministic and harmless.
+    static constexpr char platformName[] = "x86_64";
+    sp -= sizeof(platformName);
+    const U64 platformAddr = sp;
+    mem->memcpyToGuest(platformAddr, platformName, sizeof(platformName));
+
+    // Linux supplies 16 bytes of process entropy through AT_RANDOM. glibc uses
+    // them for stack and pointer guards before main(), so advertising a
+    // zero-filled region violates the ELF process-start contract.
     sp -= 16;
-    U64 randomAddr = sp;
-    mem->memsetGuest(randomAddr, 0, 16);
+    const U64 randomAddr = sp;
+    std::array<U8, 16> startupRandom{};
+    const KRandom::Source randomSource =
+        KRandom::fill(startupRandom.data(), startupRandom.size());
+    if (randomSource == KRandom::Source::Invalid) {
+        klog("loadProgram64: could not construct AT_RANDOM data");
+        return false;
+    }
+    mem->memcpyToGuest(randomAddr, startupRandom.data(), startupRandom.size());
+    klog_fmt("loadProgram64: startup auxv random=%s platform=%s",
+             randomSource == KRandom::Source::System ? "system" : "fallback",
+             platformName);
 
     // Align sp down to 16B. The vector below pushes pairs of qwords, so
     // we need (sp - totalSize) to land on a 16-byte boundary.
@@ -1299,6 +1316,7 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         { AT_EUID,    process->effectiveUserId },
         { AT_GID,     process->groupId },
         { AT_EGID,    process->effectiveGroupId },
+        { AT_PLATFORM, platformAddr },
         { AT_RANDOM,  randomAddr },
         { AT_HWCAP,   0 },
         { AT_CLKTCK,  100 },

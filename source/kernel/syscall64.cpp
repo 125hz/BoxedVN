@@ -14,6 +14,7 @@
 #include "syscall64.h"
 #include "cpu64.h"
 #include "kmemory64.h"
+#include "krandom.h"
 #include "boxedwine_x64_hostcall.h"
 #include "kevent.h"
 #include "ksocket.h"
@@ -871,16 +872,19 @@ static U64 sys_uname64(CPU64* cpu, U64 bufAddr) {
     return 0;
 }
 
-// getrandom — fill buffer with pseudo-random bytes. Good enough for ld.so's
-// stack canary; not cryptographically strong, but glibc only needs entropy.
+// getrandom — use the same host entropy path as the ELF AT_RANDOM vector.
 static U64 sys_getrandom64(CPU64* cpu, U64 bufAddr, U64 buflen, U64 /*flags*/) {
-    if (!bufAddr || buflen == 0) return 0;
+    if (buflen == 0) return 0;
+    if (!bufAddr) return (U64)-K_EFAULT;
     if (buflen > 256) buflen = 256;
     U8 tmp[256];
-    static U64 seed = 0x9E3779B97F4A7C15ULL;
-    for (U64 i = 0; i < buflen; i++) {
-        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
-        tmp[i] = (U8)(seed >> 33);
+    const KRandom::Source source = KRandom::fill(tmp, (size_t)buflen);
+    if (source == KRandom::Source::Invalid) return (U64)-K_EFAULT;
+    if (source == KRandom::Source::Fallback) {
+        static std::atomic<bool> reportedFallback{false};
+        if (!reportedFallback.exchange(true, std::memory_order_relaxed)) {
+            klog("sys_getrandom64: host entropy unavailable; using emergency fallback");
+        }
     }
     cpu->memory->memcpyToGuest(bufAddr, tmp, buflen);
     return buflen;
