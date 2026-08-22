@@ -358,14 +358,6 @@ if [[ -n "${DXMT_NATIVE_ARCHIVE}" ]]; then
     DXMT_FORCE_LINK="-Wl,-u,_dxmt_winemetal_unix_call_funcs"
 fi
 
-FEX32_PAGEZERO=""
-if [[ ${ENABLE_FEX64} -eq 1 ]]; then
-    # ld defaults to a 4 GiB __PAGEZERO for arm64 executables. Keep the null
-    # guard, but release the rest of the low address space so a future FEX32
-    # native-identity KMemory backend can map x86 pointers directly.
-    FEX32_PAGEZERO="-Wl,-pagezero_size,0x10000"
-fi
-
 log "Building BoxedVN.app for generic iOS device"
 set +e
 xcodebuild \
@@ -378,7 +370,6 @@ xcodebuild \
     BVN_INCLUDE_DIR="${BOXEDVN_ROOT}/ios/runtime/include" \
     BVN_BUILD_REVISION="${BUILD_REVISION}" \
     BVN_DXMT_FORCE_LINK="${DXMT_FORCE_LINK}" \
-    BVN_FEX32_PAGEZERO="${FEX32_PAGEZERO}" \
     "${signing_args[@]}" \
     build \
     >"${BUILD_LOG}" 2>&1

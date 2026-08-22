@@ -62,25 +62,6 @@ minimum="$(otool -l "${EXECUTABLE}" \
     | awk '/LC_BUILD_VERSION/{found=1} found && /minos/{print $2; exit}')"
 ok "minimum iOS version: ${minimum:-unknown}"
 
-# FEX-generated 32-bit memory accesses use the x86 virtual address directly.
-# The arm64 linker default reserves every address below 4 GiB as __PAGEZERO,
-# making that impossible even when vm_allocate itself permits fixed mappings.
-# FEX-enabled builds must retain a useful null guard while releasing the rest.
-pagezero_size="$(otool -l "${EXECUTABLE}" | awk '
-    $1 == "segname" && $2 == "__PAGEZERO" { pagezero = 1; next }
-    pagezero && $1 == "vmsize" { print $2; exit }
-')"
-if [[ "${BOXEDVN_REQUIRE_FEX_PROBE:-0}" == "1" ]]; then
-    if [[ "${pagezero_size}" != "0x0000000000010000" && \
-          "${pagezero_size}" != "0x10000" ]]; then
-        die "The FEX-enabled app reserves __PAGEZERO size '${pagezero_size}'.
-Expected 0x10000 so 32-bit native-identity guest mappings remain possible."
-    fi
-    ok "FEX32-compatible __PAGEZERO: ${pagezero_size}"
-else
-    ok "__PAGEZERO: ${pagezero_size:-unknown}"
-fi
-
 # DXMT locates the host display table with dlsym(RTLD_DEFAULT, ...). A source
 # declaration is not evidence that Release linking kept it in the export trie,
 # so reject an IPA that could execute D3D11 but has nowhere to present it.
