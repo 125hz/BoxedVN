@@ -127,6 +127,12 @@ targets:
           # the object out of libboxedvn.a even before an x64 launch requests
           # the presentation surface, then verify the export after linking.
           - -Wl,-u,_macdrv_functions
+          # A 64-bit Mach-O normally reserves the complete low 4 GiB as
+          # __PAGEZERO. FEX32 needs x86 guest addresses to be usable as direct
+          # host pointers, so FEX-enabled device builds reduce that guard to
+          # one 64 KiB allocation unit. Non-FEX builds leave this expansion
+          # empty and retain Apple's default layout.
+          - $(BVN_FEX32_PAGEZERO)
           # Set only by build-ios.sh when the native DXMT archive is present.
           # The unix-call table otherwise has no root at the final app link and
           # Release dead stripping removes the archive member that defines it.
