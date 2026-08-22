@@ -42,6 +42,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Core/SignalDelegator.h>
+#include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/Allocator.h>
@@ -65,6 +66,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <libkern/OSCacheControl.h>
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/thread_act.h>
 #include <pthread.h>
 #include <signal.h>
@@ -384,8 +386,25 @@ struct ExecutionTraceSnapshot {
     integer_t runState = 0;
     integer_t cpuUsage = 0;
     uint64_t hostPC = 0;
+    uint64_t hostLR = 0;
+    uint64_t hostSP = 0;
+    uint64_t hostCodeAddress = 0;
+    std::array<uint32_t, 8> hostCode {};
+    bool hostCodeValid = false;
     uint64_t guestRIP = 0;
     uint64_t frameRIP = 0;
+    uint64_t fsBase = 0;
+    uint64_t gsBase = 0;
+    uint64_t inSyscallInfo = 0;
+    std::array<uint64_t, 16> guestGPRs {};
+    uint32_t liveGPRMask = 0;
+    uint32_t memoryValueMask = 0;
+    uint64_t chunkSizeWord = 0;
+    uint64_t chunkUserWord = 0;
+    uint64_t chunkKeyWord = 0;
+    uint64_t arenaLockWord = 0;
+    uint64_t arenaSystemMem = 0;
+    uint64_t tlsOperandWord = 0;
     uint64_t hostFaults = 0;
     uint64_t handledFaults = 0;
     uint64_t newFaults = 0;
@@ -398,6 +417,32 @@ struct ExecutionTraceSnapshot {
     size_t historyCount = 0;
     std::array<uint64_t, 8> guestHistory {};
 };
+
+enum ExecutionTraceMemoryValue : uint32_t {
+    TraceChunkSizeWord = 1u << 0,
+    TraceChunkUserWord = 1u << 1,
+    TraceChunkKeyWord = 1u << 2,
+    TraceArenaLockWord = 1u << 3,
+    TraceArenaSystemMem = 1u << 4,
+    TraceTlsOperandWord = 1u << 5,
+};
+
+bool readNativeGuestQword(KMemory64* memory, uint64_t address,
+                          uint64_t& value) {
+    if (!memory || address > std::numeric_limits<uint64_t>::max() - 7) {
+        return false;
+    }
+    if (!memory->nativeIdentityMode() ||
+        !memory->nativeGuestRangeAllowed(address, sizeof(value))) {
+        return false;
+    }
+    mach_vm_size_t bytesRead = 0;
+    return mach_vm_read_overwrite(
+        mach_task_self(), address, sizeof(value),
+        reinterpret_cast<mach_vm_address_t>(&value), &bytesRead) ==
+            KERN_SUCCESS &&
+        bytesRead == sizeof(value);
+}
 
 const char* machRunStateName(integer_t state) {
     switch (state) {
@@ -1038,15 +1083,92 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                 snapshot.frameRIP =
                     threadState->fexThread->CurrentFrame->State.rip;
                 snapshot.guestRIP = snapshot.frameRIP;
+                auto& fexFrame = *threadState->fexThread->CurrentFrame;
+                snapshot.fsBase = fexFrame.State.fs_cached;
+                snapshot.gsBase = fexFrame.State.gs_cached;
+                snapshot.inSyscallInfo = fexFrame.InSyscallInfo;
+                std::copy_n(fexFrame.State.gregs,
+                            snapshot.guestGPRs.size(),
+                            snapshot.guestGPRs.begin());
                 if (stateResult == KERN_SUCCESS) {
                     snapshot.hostPC = arm_thread_state64_get_pc(registers);
+                    snapshot.hostLR = arm_thread_state64_get_lr(registers);
+                    snapshot.hostSP = arm_thread_state64_get_sp(registers);
+                    snapshot.hostCodeAddress = snapshot.hostPC & ~uint64_t {3};
+                    mach_vm_size_t hostCodeBytes = 0;
+                    snapshot.hostCodeValid = mach_vm_read_overwrite(
+                        mach_task_self(), snapshot.hostCodeAddress,
+                        sizeof(snapshot.hostCode),
+                        reinterpret_cast<mach_vm_address_t>(
+                            snapshot.hostCode.data()),
+                        &hostCodeBytes) == KERN_SUCCESS &&
+                        hostCodeBytes == sizeof(snapshot.hostCode);
                     if (processState->context->IsAddressInCodeBuffer(
                             threadState->fexThread, snapshot.hostPC)) {
                         const uint64_t restored =
                             processState->context->RestoreRIPFromHostPC(
                                 threadState->fexThread, snapshot.hostPC);
                         if (restored != 0) snapshot.guestRIP = restored;
+
+                        // Static-register allocation keeps live guest GPRs in
+                        // ARM64 registers while translated code is running.
+                        // The frame copy above is therefore stale for those
+                        // registers. Reconstruct the same view used by FEX's
+                        // signal bridge while the host thread is suspended.
+                        const auto& signalConfig = gSignals.GetConfig();
+                        const uint32_t ignoreMask =
+                            static_cast<uint32_t>(snapshot.inSyscallInfo & 0xffffu);
+                        const size_t gprCount = std::min<size_t>(
+                            signalConfig.SRAGPRCount,
+                            snapshot.guestGPRs.size());
+                        for (size_t gpr = 0; gpr < gprCount; ++gpr) {
+                            const uint8_t hostRegister =
+                                signalConfig.SRAGPRMapping[gpr];
+                            if (hostRegister >= 29 ||
+                                (ignoreMask & (1u << hostRegister))) {
+                                continue;
+                            }
+                            snapshot.guestGPRs[gpr] =
+                                registers.__x[hostRegister];
+                            snapshot.liveGPRMask |= 1u << gpr;
+                        }
                     }
+                }
+
+                // These are the operands used by glibc's allocator/free path
+                // in the pinned x64 rootfs. Reads are diagnostic only, are
+                // bounded to already mapped readable guest pages, and happen
+                // while the sole translated thread is suspended.
+                KMemory64* memory = process->memory64;
+                const uint64_t rsi = snapshot.guestGPRs[
+                    FEXCore::X86State::REG_RSI];
+                const uint64_t rdi = snapshot.guestGPRs[
+                    FEXCore::X86State::REG_RDI];
+                const uint64_t rbx = snapshot.guestGPRs[
+                    FEXCore::X86State::REG_RBX];
+                if (readNativeGuestQword(memory, rsi + 8,
+                                         snapshot.chunkSizeWord)) {
+                    snapshot.memoryValueMask |= TraceChunkSizeWord;
+                }
+                if (readNativeGuestQword(memory, rsi + 0x10,
+                                         snapshot.chunkUserWord)) {
+                    snapshot.memoryValueMask |= TraceChunkUserWord;
+                }
+                if (readNativeGuestQword(memory, rsi + 0x18,
+                                         snapshot.chunkKeyWord)) {
+                    snapshot.memoryValueMask |= TraceChunkKeyWord;
+                }
+                if (readNativeGuestQword(memory, rbx + 8,
+                                         snapshot.arenaLockWord)) {
+                    snapshot.memoryValueMask |= TraceArenaLockWord;
+                }
+                if (readNativeGuestQword(memory, rbx + 0x888,
+                                         snapshot.arenaSystemMem)) {
+                    snapshot.memoryValueMask |= TraceArenaSystemMem;
+                }
+                if (readNativeGuestQword(memory, snapshot.fsBase + rdi,
+                                         snapshot.tlsOperandWord)) {
+                    snapshot.memoryValueMask |= TraceTlsOperandWord;
                 }
 
                 const kern_return_t resumeResult = thread_resume(
@@ -1143,11 +1265,13 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
         if (snapshot.emitSample) {
             const double cpuPercent = snapshot.cpuUsage * 100.0 /
                 static_cast<double>(TH_USAGE_SCALE);
-            reportf("BOXEDWINE_FEX64_SAMPLE poll=%llu pid=%u tid=%u state=%s cpu=%.1f%% host_pc=0x%llx guest_rip=0x%llx frame_rip=0x%llx faults=%llu handled=%llu new_faults=%llu last_signal=%llu last_address=0x%llx last_fault_pc=0x%llx history=[%s]",
+            reportf("BOXEDWINE_FEX64_SAMPLE poll=%llu pid=%u tid=%u state=%s cpu=%.1f%% host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx frame_rip=0x%llx faults=%llu handled=%llu new_faults=%llu last_signal=%llu last_address=0x%llx last_fault_pc=0x%llx history=[%s]",
                     static_cast<unsigned long long>(snapshot.poll),
                     snapshot.processId, snapshot.threadId,
                     machRunStateName(snapshot.runState), cpuPercent,
                     static_cast<unsigned long long>(snapshot.hostPC),
+                    static_cast<unsigned long long>(snapshot.hostLR),
+                    static_cast<unsigned long long>(snapshot.hostSP),
                     static_cast<unsigned long long>(snapshot.guestRIP),
                     static_cast<unsigned long long>(snapshot.frameRIP),
                     static_cast<unsigned long long>(snapshot.hostFaults),
@@ -1159,17 +1283,64 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     history);
         }
         if (snapshot.emitWarning) {
-            reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx guest_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",
+            reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",
                     snapshot.processId, snapshot.threadId,
                     snapshot.stablePolls,
                     machRunStateName(snapshot.runState),
                     static_cast<unsigned long long>(snapshot.hostPC),
+                    static_cast<unsigned long long>(snapshot.hostLR),
+                    static_cast<unsigned long long>(snapshot.hostSP),
                     static_cast<unsigned long long>(snapshot.guestRIP),
                     static_cast<unsigned long long>(snapshot.hostFaults),
                     static_cast<unsigned long long>(snapshot.handledFaults),
                     static_cast<unsigned long long>(snapshot.lastSignal),
                     static_cast<unsigned long long>(snapshot.lastFaultAddress),
                     history);
+            const auto& gpr = snapshot.guestGPRs;
+            reportf("BOXEDWINE_FEX64_STALL_GPRS_A pid=%u tid=%u live_mask=0x%x syscall_info=0x%llx rax=0x%llx rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx",
+                    snapshot.processId, snapshot.threadId,
+                    snapshot.liveGPRMask,
+                    static_cast<unsigned long long>(snapshot.inSyscallInfo),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RAX]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RCX]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RDX]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RBX]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RSP]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RBP]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RSI]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_RDI]));
+            reportf("BOXEDWINE_FEX64_STALL_GPRS_B pid=%u tid=%u r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx fs=0x%llx gs=0x%llx",
+                    snapshot.processId, snapshot.threadId,
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R8]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R9]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R10]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R11]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R12]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R13]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R14]),
+                    static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R15]),
+                    static_cast<unsigned long long>(snapshot.fsBase),
+                    static_cast<unsigned long long>(snapshot.gsBase));
+            reportf("BOXEDWINE_FEX64_STALL_MEMORY pid=%u tid=%u valid_mask=0x%x chunk_size=0x%llx chunk_user=0x%llx chunk_key=0x%llx arena_lock=0x%llx arena_system=0x%llx tls_address=0x%llx tls_value=0x%llx",
+                    snapshot.processId, snapshot.threadId,
+                    snapshot.memoryValueMask,
+                    static_cast<unsigned long long>(snapshot.chunkSizeWord),
+                    static_cast<unsigned long long>(snapshot.chunkUserWord),
+                    static_cast<unsigned long long>(snapshot.chunkKeyWord),
+                    static_cast<unsigned long long>(snapshot.arenaLockWord),
+                    static_cast<unsigned long long>(snapshot.arenaSystemMem),
+                    static_cast<unsigned long long>(snapshot.fsBase +
+                        gpr[FEXCore::X86State::REG_RDI]),
+                    static_cast<unsigned long long>(snapshot.tlsOperandWord));
+            if (snapshot.hostCodeValid) {
+                reportf("BOXEDWINE_FEX64_STALL_HOST_CODE pid=%u tid=%u address=0x%llx words=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                        snapshot.processId, snapshot.threadId,
+                        static_cast<unsigned long long>(snapshot.hostCodeAddress),
+                        snapshot.hostCode[0], snapshot.hostCode[1],
+                        snapshot.hostCode[2], snapshot.hostCode[3],
+                        snapshot.hostCode[4], snapshot.hostCode[5],
+                        snapshot.hostCode[6], snapshot.hostCode[7]);
+            }
         }
     }
 }
