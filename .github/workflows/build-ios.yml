@@ -387,16 +387,23 @@ jobs:
             echo "::error::The CI app contains signing metadata; refusing to package it as unsigned."
             exit 1
           fi
-          if [[ ! -f "${app}/boxedwine64-runtime/glibc-rootfs64.zip" || \
-                  ! -f "${app}/boxedwine64-runtime/wine64.zip" || \
-                  ! -f "${app}/boxedwine64-runtime/wine64-runtime.manifest" || \
-                  ! -f "${app}/boxedwine64-runtime/boxedvn-d3d11-cube-x64.exe" || \
-                  ! -f "${app}/boxedwine64-runtime/x64-graphics.manifest" || \
-                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/d3d11.dll" || \
-                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/dxgi.dll" || \
-                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/d3d10core.dll" || \
-                  ! -f "${app}/boxedwine64-runtime/dxmt-x64/winemetal.dll" ]]; then
-            echo "::error::The validated x86-64 runtime and DXMT resources were not copied into the app bundle."
+          missing=0
+          for relative in \
+            boxedwine64-runtime/glibc-rootfs64.zip \
+            boxedwine64-runtime/wine64.zip \
+            boxedwine64-runtime/wine64-runtime.manifest \
+            boxedwine64-runtime/boxedvn-d3d11-cube-x64.exe \
+            boxedwine64-runtime/x64-graphics.manifest \
+            boxedwine64-runtime/dxmt-x64/d3d11.dll \
+            boxedwine64-runtime/dxmt-x64/dxgi.dll \
+            boxedwine64-runtime/dxmt-x64/d3d10core.dll \
+            boxedwine64-runtime/dxmt-x64/winemetal.dll; do
+            if [[ ! -f "${app}/${relative}" ]]; then
+              echo "::error::Missing app resource: ${relative}"
+              missing=1
+            fi
+          done
+          if [[ ${missing} -ne 0 ]]; then
             exit 1
           fi
           echo "Wine64 and x86-64 DXMT resources present in app bundle."

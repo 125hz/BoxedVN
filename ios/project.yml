@@ -61,13 +61,16 @@ targets:
         optional: true
         buildPhase: resources
       # Populated by scripts/fetch-rootfs.sh when BOXEDVN_BUNDLE_ROOTFS is on.
-      # Optional so a clean clone builds without the multi-hundred-megabyte
-      # root filesystem archive.
-      # The iOS build stages validated Wine64/FEX/DXMT resources here when the
-      # x86-64 acceptance target is enabled. The directory remains optional so
-      # the ordinary 32-bit build can still be produced from a clean clone.
-      - path: app/Bundled
+      # Keep the legacy archive at the bundle root where the runtime expects it.
+      - path: app/Bundled/boxedwine.zip
         optional: true
+        buildPhase: resources
+      # The validated Wine64/FEX/DXMT resources must retain this directory and
+      # its nested dxmt-x64 directory. A normal resource group flattens both,
+      # so use a folder reference. It remains optional for ordinary IA-32 builds.
+      - path: app/Bundled/boxedwine64-runtime
+        optional: true
+        type: folder
         buildPhase: resources
       # Patched DXVK, kept as a folder reference so the DLLs stay inside a
       # Dxvk/ subdirectory in the bundle rather than being flattened into the
