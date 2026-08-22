@@ -516,7 +516,9 @@ std::vector<std::string> BVNBuildLaunchArguments(
     }
 
     if (launch.runThroughWine) {
-        argv.push_back(launch.useFEX64 ? "/usr/bin/wine64" : "/bin/wine");
+        // Use the packaged ELF directly for the x64 path. This keeps the first
+        // device bootstrap independent of merged-ZIP symlink resolution.
+        argv.push_back(launch.useFEX64 ? "/usr/lib/wine/wine64" : "/bin/wine");
     }
     argv.push_back(launch.executablePath);
     for (const std::string& argument : launch.arguments) {

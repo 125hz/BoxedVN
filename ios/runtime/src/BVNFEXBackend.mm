@@ -869,8 +869,10 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 }
 
 extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
+    reportf("BOXEDWINE_FEX64_RUN attach process=%p thread=%p", process, thread);
     BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterAttach(process, thread);
     if (!adapter) {
+        reportf("BOXEDWINE_FEX64_RUN adapter attach failed");
         return false;
     }
     LiveProcessState* processState = nullptr;
@@ -892,6 +894,7 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
     };
 
     if (!initializeFEXGlobals()) {
+        reportf("BOXEDWINE_FEX64_RUN global initialization failed");
         finish(false, false);
         return false;
     }

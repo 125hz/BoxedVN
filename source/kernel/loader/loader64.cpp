@@ -865,6 +865,7 @@ U64 ElfLoader64::setupStaticTls(KMemory64* mem,
 }
 
 bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
+    klog("loadProgram64: begin");
     Elf64ParseResult r = parse(openNode);
     if (!r.ok) {
         return false;

@@ -1077,16 +1077,36 @@ void KProcess::initStdio() {
 }
 
 KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BString>& argValues, const std::vector<BString>& envValues, int userId, int groupId, int effectiveUserId, int effectiveGroupId) {
+    bool traceFEX64 = false;
     if (argValues.size() == 0) {
         kwarn("No command specified");
         return nullptr;
 	}
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+    for (const BString& value : envValues) {
+        if (value == "BOXEDWINE_CPU64=fex") {
+            this->useFEX64 = true;
+            traceFEX64 = true;
+            break;
+        }
+    }
+    if (traceFEX64) {
+        klog_fmt("BOXEDWINE_FEX64_START resolve executable=%s cwd=%s",
+                 argValues[0].c_str(), currentDirectory.c_str());
+    }
+#endif
     std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(currentDirectory, argValues[0], true);
 
     if (!node) {
         kwarn_fmt("Could not find %s", argValues[0].c_str());
         return nullptr;
     }
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+    if (traceFEX64) {
+        klog_fmt("BOXEDWINE_FEX64_START resolved node=%s",
+                 node->path.c_str());
+    }
+#endif
 
     BString interpreter;
     BString loader;
@@ -1117,8 +1137,19 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
     this->initStdio();
     FsOpenNode* openNode=ElfLoader::inspectNode(currentDirectory, node, loader, interpreter, interpreterArgs);
     if (!openNode) {
+        if (traceFEX64) {
+            klog_fmt("BOXEDWINE_FEX64_START inspect failed executable=%s",
+                     argValues[0].c_str());
+        }
         return nullptr;
     }
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+    if (traceFEX64) {
+        klog_fmt("BOXEDWINE_FEX64_START inspected node=%s loader=%s interpreter=%s",
+                 node->path.c_str(), loader.length() ? loader.c_str() : "(self)",
+                 interpreter.length() ? interpreter.c_str() : "(none)");
+    }
+#endif
 #ifdef BOXEDWINE_GUEST_X64
     // ElfLoader64 constructs the complete SysV initial stack while it maps the
     // program, so make the final program argv and environment available before
@@ -1130,15 +1161,10 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
         this->startupArgs64.push_back(argValues[i]);
     }
     this->startupEnv64 = envValues;
-#ifdef BOXEDWINE_FEX64_BACKEND
-    for (const BString& value : envValues) {
-        if (value == "BOXEDWINE_CPU64=fex") {
-            this->useFEX64 = true;
-            break;
-        }
+#endif
+    if (traceFEX64) {
+        klog("BOXEDWINE_FEX64_START entering ELF loader");
     }
-#endif
-#endif
     if (ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {        
         if (loader.length())
             args.push_back(loader);
@@ -1163,8 +1189,22 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
             openNode->close();
             delete openNode;
         }
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+        if (traceFEX64) {
+            klog_fmt("BOXEDWINE_FEX64_START loaded is64=%d native=%d rip=0x%llx",
+                     this->is64Bit ? 1 : 0,
+                     this->memory64 && this->memory64->nativeIdentityMode() ? 1 : 0,
+                     (unsigned long long)(thread->cpu64 ? thread->cpu64->rip : 0));
+        }
+#endif
         scheduleThread(thread);
+        if (traceFEX64) {
+            klog("BOXEDWINE_FEX64_START scheduled");
+        }
     } else {
+        if (traceFEX64) {
+            klog("BOXEDWINE_FEX64_START ELF loader failed");
+        }
         if (openNode) {
             openNode->close();
             delete openNode;

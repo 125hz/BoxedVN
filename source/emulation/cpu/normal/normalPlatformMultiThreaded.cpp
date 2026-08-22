@@ -85,6 +85,9 @@ static void platformThread(CPU* cpu) {
             try {
 #ifdef BOXEDWINE_FEX64_BACKEND
                 if (process->useFEX64) {
+                    klog_fmt("BOXEDWINE_FEX64_SCHED enter process=%d thread=%d rip=0x%llx",
+                             process->id, cpu->thread->id,
+                             (unsigned long long)cpu64->rip);
                     if (!BVNFEXCPU64Run(process.get(), cpu->thread)) {
                         klog_fmt("FEX CPU64 dispatch failed for process %d; "
                                  "terminating the explicitly translated launch",
@@ -98,6 +101,10 @@ static void platformThread(CPU* cpu) {
                     cpu64->run();
                 }
             } catch (...) {
+                if (process->useFEX64) {
+                    klog_fmt("BOXEDWINE_FEX64_SCHED exception process=%d thread=%d",
+                             process->id, cpu->thread->id);
+                }
                 if (cpu->thread->terminating) {
                     break;
                 }

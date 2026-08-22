@@ -31,7 +31,8 @@ public:
     static U32 getPELoadAddress(FsOpenNode* FsopenNode, U32* section, U32* numberOfSections, U32* sizeOfSection);
 
 private:
-    static BString getInterpreter(FsOpenNode* openNode, bool* isElf);
+    static BString getInterpreter(FsOpenNode* openNode, bool* isElf,
+                                  bool* isElf64 = nullptr);
 };
 
 #endif

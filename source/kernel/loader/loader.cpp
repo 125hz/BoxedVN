@@ -58,18 +58,26 @@ bool isValidElf(struct k_Elf32_Ehdr* hdr) {
     return isElf32Ident(hdr->e_ident);
 }
 
-BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf) {
+BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf,
+                                  bool* isElf64) {
     U8 buffer[sizeof(struct k_Elf32_Ehdr)] = { 0 };
     struct k_Elf32_Ehdr* hdr = (struct k_Elf32_Ehdr*)buffer;
     U32 len = openNode->readNative(buffer, sizeof(buffer));
     char interp[MAX_FILEPATH_LEN] = { 0 };
 
     *isElf=true;
+    if (isElf64) {
+        *isElf64 = false;
+    }
     if (len!=sizeof(buffer)) {
         *isElf=true;
     }
     if (*isElf) {
-        *isElf = isElf32Ident(buffer) || isElf64Ident(buffer);
+        const bool elf64 = isElf64Ident(buffer);
+        *isElf = isElf32Ident(buffer) || elf64;
+        if (isElf64) {
+            *isElf64 = elf64;
+        }
     }
     if (!*isElf) {
         if (buffer[0]=='#') {
@@ -122,6 +130,7 @@ BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf) {
 
 FsOpenNode* ElfLoader::inspectNode(BString currentDirectory, const std::shared_ptr<FsNode>& node, BString& loader, BString& interpreter, std::vector<BString>& interpreterArgs) {
     bool isElf = 0;
+    bool isElf64 = false;
     FsOpenNode* openNode = nullptr;
     std::shared_ptr<FsNode> interpreterNode;
     std::shared_ptr<FsNode> loaderNode;
@@ -130,10 +139,22 @@ FsOpenNode* ElfLoader::inspectNode(BString currentDirectory, const std::shared_p
         openNode = node->open(K_O_RDONLY);
     }
     if (openNode) {        
-        interpreter = getInterpreter(openNode, &isElf);
+        interpreter = getInterpreter(openNode, &isElf, &isElf64);
         if (isElf) {
-            loader = interpreter;
-            interpreter = B("");
+#ifdef BOXEDWINE_GUEST_X64
+            // ElfLoader64 maps the original executable and its PT_INTERP as
+            // one image, then builds the matching SysV aux vector. Replacing
+            // an ELF64 executable with ld-linux here loses the executable and
+            // gives the 64-bit loader the wrong AT_ENTRY/AT_PHDR image.
+            if (isElf64) {
+                loader = B("");
+                interpreter = B("");
+            } else
+#endif
+            {
+                loader = interpreter;
+                interpreter = B("");
+            }
         } else if (interpreter.length()) {
             interpreter.split(' ', interpreterArgs);
             interpreter = interpreterArgs[0];

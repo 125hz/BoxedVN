@@ -105,7 +105,7 @@ BOXEDVN_TEST(fex64_launch_mounts_runtime_layers_and_enters_wine64) {
         "-zip", "/runtime/glibc-rootfs64.zip",
         "-zip", "/runtime/wine64.zip",
         "-nozip", "-env", "BOXEDWINE_CPU64=fex",
-        "/usr/bin/wine64", "d:\\probe.exe",
+        "/usr/lib/wine/wine64", "d:\\probe.exe",
     };
     CHECK(actual == expected);
 }
