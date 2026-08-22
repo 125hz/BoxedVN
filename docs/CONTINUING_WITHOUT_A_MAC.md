@@ -322,7 +322,7 @@ mingw toolchain. To rebuild them (Linux or Windows/WSL both work):
 
 ```bash
 git clone --branch v2.5.2 --recurse-submodules https://github.com/doitsujin/dxvk
-cd dxvk && git apply /path/to/dxvk-2.5.2-moltenvk.patch
+cd dxvk && git apply --unidiff-zero /path/to/dxvk-2.5.2-moltenvk.patch
 meson setup --cross-file build-win32.txt --buildtype release \
       -Denable_d3d9=false -Denable_d3d8=false build.w32
 ninja -C build.w32
