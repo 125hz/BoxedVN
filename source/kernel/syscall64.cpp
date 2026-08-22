@@ -536,6 +536,24 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
 }
 
 static U64 sys_arch_prctl64(CPU64* cpu, U64 code, U64 addr) {
+    static std::atomic<U32> logCount{0};
+    const U32 ordinal = logCount.fetch_add(1, std::memory_order_relaxed);
+    const bool logCall = ordinal < 16;
+    const U32 processId = cpu && cpu->thread && cpu->thread->process
+        ? cpu->thread->process->id : 0;
+    const bool validOperation = code == X64_ARCH_SET_FS ||
+        code == X64_ARCH_SET_GS || code == X64_ARCH_GET_FS ||
+        code == X64_ARCH_GET_GS;
+    const char* operation = code == X64_ARCH_SET_FS ? "set-fs"
+        : code == X64_ARCH_SET_GS ? "set-gs"
+        : code == X64_ARCH_GET_FS ? "get-fs"
+        : code == X64_ARCH_GET_GS ? "get-gs" : "invalid";
+    if (logCall || !validOperation) {
+        klog_fmt("BOXEDWINE_X64_ARCH_PRCTL ordinal=%u pid=%u op=%s addr=0x%llx fs=0x%llx gs=0x%llx",
+                 ordinal, processId, operation, (unsigned long long)addr,
+                 (unsigned long long)cpu->fsbase,
+                 (unsigned long long)cpu->gsbase);
+    }
     switch (code) {
         case X64_ARCH_SET_FS:
             cpu->fsbase = addr;
@@ -1341,6 +1359,11 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     if (!kfile || !kfile->openFile) {
         return (U64)-K_ENOSYS;
     }
+    static std::atomic<U32> fileMapLogCount{0};
+    const U32 logOrdinal =
+        fileMapLogCount.fetch_add(1, std::memory_order_relaxed);
+    const bool boundedLog = logOrdinal < 32;
+    const U64 requestedAddress = addr;
     bool reserved = false;
     const bool fixed = (flags & K_MAP_FIXED) != 0;
     const U32 loadProt = (U32)prot | 0x3u;
@@ -1382,11 +1405,13 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     U64 aligned = addr & ~0xFFFULL;
     U64 mapLen = (length + (addr - aligned) + 0xFFF) & ~0xFFFULL;
     bool dump = getenv("BW64_FMMAP") != nullptr;
-    if (dump) {
-        klog_fmt("FMMAP [pid=%d] addr=0x%llx aligned=0x%llx len=0x%llx mapLen=0x%llx "
-                 "prot=0x%x flags=0x%x off=0x%llx fixed=%d file='%s'",
-                 (int)(cpu->thread ? cpu->thread->process->id : -1),
-                 (unsigned long long)addr, (unsigned long long)aligned,
+    if (dump || boundedLog) {
+        klog_fmt("BOXEDWINE_X64_FILEMAP ordinal=%u pid=%d requested=0x%llx addr=0x%llx aligned=0x%llx len=0x%llx mapLen=0x%llx "
+                  "prot=0x%x flags=0x%x off=0x%llx fixed=%d file='%s'",
+                  logOrdinal,
+                  (int)(cpu->thread ? cpu->thread->process->id : -1),
+                  (unsigned long long)requestedAddress,
+                  (unsigned long long)addr, (unsigned long long)aligned,
                  (unsigned long long)length, (unsigned long long)mapLen,
                  (unsigned)prot, (unsigned)flags, (unsigned long long)offset,
                  (int)((flags & K_MAP_FIXED) != 0),
@@ -1435,6 +1460,10 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
                                             kfile->openFile->node->path.c_str(),
                                             fileBase, seedBuf.data(), (U64)seedBuf.size());
         if ((S64)r < 0) return r;
+        if (dump || boundedLog) {
+            klog_fmt("BOXEDWINE_X64_FILEMAP_RETURN ordinal=%u result=0x%llx shared=1",
+                     logOrdinal, (unsigned long long)addr);
+        }
         return addr;
     }
     // The page that contains `addr` may already hold valid bytes from a PRIOR
@@ -1533,6 +1562,10 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     U64 protectedAddress = cpu->memory->mprotect(aligned, mapLen, (U32)prot);
     if (protectedAddress != aligned) {
         return protectedAddress;
+    }
+    if (dump || boundedLog) {
+        klog_fmt("BOXEDWINE_X64_FILEMAP_RETURN ordinal=%u result=0x%llx bytes=%u shared=0",
+                 logOrdinal, (unsigned long long)addr, got);
     }
     (void)flags;
     return addr;
@@ -2773,16 +2806,29 @@ static const char* x64SyscallName(U64 nr) {
  * the syscall reserved but return ENOSYS, preserving the optional-backend
  * property of the core.
  */
+static const char* dxmtUnixCallName64(U64 callIndex) {
+    switch (callIndex) {
+        case 47: return "present";
+        case 48: return "present-after-delay";
+        case 67: return "next-drawable";
+        case 70: return "set-layer-properties";
+        case 71: return "get-layer-properties";
+        case 72: return "create-view";
+        default: return nullptr;
+    }
+}
+
 static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     static std::atomic<U32> callLogCount{0};
     const U32 logOrdinal = callLogCount.fetch_add(1, std::memory_order_relaxed);
-    const bool logCall = logOrdinal < 32 || callIndex == 47 || callIndex == 72;
+    const char* callName = dxmtUnixCallName64(callIndex);
+    const bool logCall = logOrdinal < 32 || callName != nullptr;
     const U32 processId = cpu && cpu->thread && cpu->thread->process
         ? cpu->thread->process->id : 0;
     if (logCall) {
-        klog_fmt("BOXEDWINE_DXMT_CALL ordinal=%u pid=%u index=%llu args=0x%llx",
+        klog_fmt("BOXEDWINE_DXMT_CALL ordinal=%u pid=%u index=%llu name=%s args=0x%llx",
                  logOrdinal, processId, (unsigned long long)callIndex,
-                 (unsigned long long)args);
+                 callName ? callName : "other", (unsigned long long)args);
     }
     if (!cpu || !cpu->memory || !cpu->memory->nativeIdentityMode()) {
         if (logCall) {
@@ -2816,6 +2862,11 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     using DxmtUnixEntry = S32 (*)(void*);
     const void* raw = dxmt_winemetal_unix_call_funcs[callIndex];
     if (!raw) {
+        if (logCall) {
+            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=entry",
+                     logOrdinal,
+                     (S32)BOXEDWINE_X64_HOSTCALL_STATUS_NOT_IMPLEMENTED);
+        }
         return (U64)(S64)(S32)BOXEDWINE_X64_HOSTCALL_STATUS_NOT_IMPLEMENTED;
     }
     const auto entry = reinterpret_cast<DxmtUnixEntry>(const_cast<void*>(raw));
@@ -2831,6 +2882,10 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
 #else
     (void)callIndex;
     (void)args;
+    if (logCall) {
+        klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=archive",
+                 logOrdinal, -K_ENOSYS);
+    }
     return (U64)(S64)-K_ENOSYS;
 #endif
 }
