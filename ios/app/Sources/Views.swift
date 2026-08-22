@@ -888,6 +888,8 @@ struct SettingsView: View {
     private var preferredOrientation = 1
     @AppStorage(Preferences.soundEnabledKey)
     private var soundEnabled = true
+    @AppStorage("BoxedVN.presentation.fillCropPercent")
+    private var fillCropPercent = 5.0
     @State private var showingRootFilesystemImporter = false
 
     var body: some View {
@@ -901,12 +903,27 @@ struct SettingsView: View {
                 .onChange(of: preferredOrientation) { _ in
                     BVNApplyPreferredOrientation()
                 }
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Fill crop per edge")
+                        Spacer()
+                        Text("\(Int(fillCropPercent.rounded()))%")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(value: $fillCropPercent, in: 0...25, step: 1)
+                        .onChange(of: fillCropPercent) { value in
+                            BVNGuestSetFillCropPercent(Int32(value.rounded()))
+                        }
+                }
             } header: {
                 Text("Display")
             } footer: {
                 Text("BoxedVN stays in this orientation in the library and "
-                     + "while Wine is running. Change it here before "
-                     + "launching a game.")
+                      + "while Wine is running. Change it here before "
+                      + "launching a game. Fill crop controls the maximum "
+                      + "zoom used by Fill aspect: increase it to reduce "
+                      + "black bars, or use 0% for an uncropped fit.")
             }
 
             Section {

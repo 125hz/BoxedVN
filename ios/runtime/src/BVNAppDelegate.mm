@@ -1335,6 +1335,8 @@ static uint32_t gGuestPresentationGuestWidth = 0;
 static uint32_t gGuestPresentationGuestHeight = 0;
 // 0 = fit (letterbox), 1 = fill while preserving aspect (crop), 2 = stretch.
 static int gGuestPresentationMode = 0;
+static NSString* const kBVNFillCropPercentKey =
+    @"BoxedVN.presentation.fillCropPercent";
 
 // The natural drawable size of the presenting layer (bounds x contentsScale)
 // as of the last fit. Cached rather than read live because swapchains are
@@ -1351,6 +1353,15 @@ extern "C" int BVNGuestPreferredPresentationMode(void) {
     }
     // Preserve the old two-state preference when upgrading.
     return [defaults boolForKey:@"BoxedVN.presentation.stretch"] ? 2 : 0;
+}
+
+extern "C" int BVNGuestFillCropPercent(void) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults objectForKey:kBVNFillCropPercentKey] == nil) {
+        return 5;
+    }
+    return MAX(0, MIN(25,
+        (int)[defaults integerForKey:kBVNFillCropPercentKey]));
 }
 
 // The geometry the current fit was computed for, measured on the Metal view's
@@ -1511,10 +1522,13 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
         const CGFloat fitScale = MIN(scaleX, scaleY);
         const CGFloat coverScale = MAX(scaleX, scaleY);
         // A strict cover can remove a large part of a 4:3 guest surface on a
-        // wide phone. Keep at least 90% of each guest dimension visible. Near
-        // matching aspect ratios still cover completely; larger mismatches
-        // retain slim bars instead of cutting important edge controls away.
-        const CGFloat cropSafeScale = fitScale / 0.90;
+        // wide phone. Limit how much is removed from each opposing edge using
+        // the player's persisted percentage. The default 5% keeps the prior
+        // 90%-visible behaviour; increasing it trades the slim bars for zoom.
+        const CGFloat cropPerEdge =
+            (CGFloat)BVNGuestFillCropPercent() / 100.0;
+        const CGFloat visibleFraction = 1.0 - cropPerEdge * 2.0;
+        const CGFloat cropSafeScale = fitScale / visibleFraction;
         scaleX = scaleY = MIN(coverScale, cropSafeScale);
     }
     const CGRect target = CGRectMake(
@@ -1697,6 +1711,26 @@ extern "C" void BVNGuestSetPresentationMode(int mode) {
                                         mode);
         BVNGuestPresentationGeometryChanged();
     }
+}
+
+extern "C" void BVNGuestSetFillCropPercent(int percent) {
+    if (!NSThread.isMainThread) {
+        return;
+    }
+    percent = MAX(0, MIN(25, percent));
+    [[NSUserDefaults standardUserDefaults]
+        setInteger:percent forKey:kBVNFillCropPercentKey];
+    if (gGuestPresentationSurface != nullptr &&
+        gGuestPresentationMode == 1) {
+        BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
+                                        gGuestPresentationGuestWidth,
+                                        gGuestPresentationGuestHeight,
+                                        gGuestPresentationMode);
+        BVNGuestPresentationGeometryChanged();
+    }
+    NSString* message = [NSString stringWithFormat:
+        @"Fill-aspect crop limit set to %d%% per edge.", percent];
+    BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
 }
 
 // Forgets the recorded rectangle, so a stale letterbox from a surface that no

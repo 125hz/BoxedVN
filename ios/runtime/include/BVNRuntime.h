@@ -213,6 +213,13 @@ uint64_t BVNGuestReportedFreeMemory(void);
 // changes it. Values are 0 portrait, 1 landscape, 2 landscape flipped.
 void BVNApplyPreferredOrientation(void);
 
+// Maximum percentage of the guest image that fill-aspect may crop from each
+// opposing edge. Zero behaves like aspect fit; 25 allows up to half of one
+// guest dimension to be outside the display. The preference is persisted and
+// applied to the active guest when possible.
+int BVNGuestFillCropPercent(void);
+void BVNGuestSetFillCropPercent(int percent);
+
 // ---------------------------------------------------------------------------
 // Storage layout
 //
