@@ -71,12 +71,23 @@ if [[ "${exports}" != *"macdrv_functions"* ]]; then
 name at runtime; check BVNDXMTDisplay.m and the force-link setting."
 fi
 ok "DXMT host display table exported"
+
+# The host-call dispatcher references this table directly; it does not resolve
+# it with dlsym. Verify retention in the unstripped Mach-O symbol table rather
+# than requiring an unnecessary dynamic export.
+has_dxmt_unix_table=0
+if xcrun nm "${EXECUTABLE}" 2>/dev/null | awk '
+    $NF == "_dxmt_winemetal_unix_call_funcs" { found = 1 }
+    END { exit(found ? 0 : 1) }
+'; then
+    has_dxmt_unix_table=1
+fi
 if [[ "${BOXEDVN_REQUIRE_DXMT_NATIVE:-0}" == "1" && \
-      "${exports}" != *"dxmt_winemetal_unix_call_funcs" ]]; then
+      ${has_dxmt_unix_table} -ne 1 ]]; then
     die "The x86-64 build does not retain dxmt_winemetal_unix_call_funcs.
 Check the native DXMT archive and its force-link setting."
 fi
-if [[ "${exports}" == *"dxmt_winemetal_unix_call_funcs" ]]; then
+if [[ ${has_dxmt_unix_table} -eq 1 ]]; then
     ok "DXMT native unix-call table retained"
 elif [[ "${BOXEDVN_REQUIRE_DXMT_NATIVE:-0}" != "1" ]]; then
     warn "No native DXMT unix-call table in this non-x86-64 build"
