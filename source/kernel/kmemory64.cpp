@@ -1143,23 +1143,48 @@ U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
     U64 cursor = mmapNext >> K64_PAGE_SHIFT;
     if (cursor < mmapBasePage) cursor = mmapBasePage;
 
+    // Darwin maps memory at the host page granularity (16 KiB on current iOS
+    // devices), while the x86-64 guest uses 4 KiB pages.  An automatic mmap
+    // placed immediately after a 4 KiB-aligned ELF image can therefore share
+    // a host page with that image.  nativeMapAnonymous must reject extending
+    // such a partially tracked host page because MAP_FIXED would overwrite
+    // the executable bytes already living there.  Automatic Linux mappings
+    // are free to choose any page-aligned address, so keep their starts on a
+    // host-page boundary in native-identity mode and leave the unusable tail
+    // of the preceding host page as padding.
+    U64 allocationAlignmentPages = 1;
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    if (nativeIdentityMode()) {
+        allocationAlignmentPages = k64NativeHostPageSize() >> K64_PAGE_SHIFT;
+        if (allocationAlignmentPages == 0) allocationAlignmentPages = 1;
+    }
+#endif
+    auto alignCandidate = [allocationAlignmentPages](U64 value) {
+        if (allocationAlignmentPages <= 1) return value;
+        const U64 mask = allocationAlignmentPages - 1;
+        if (value > UINT64_MAX - mask) return UINT64_MAX;
+        return (value + mask) & ~mask;
+    };
+
     // Gap search over the ordered reservation map: O(log n + ranges scanned),
     // not O(pages). Walk ranges from `cursor`; the first hole of `pageCount`
     // pages between consecutive reservations (or after the last one) wins.
-    U64 candidate = cursor;
+    U64 candidate = alignCandidate(cursor);
     auto it = ranges.lower_bound(candidate);
     // A range starting before `candidate` may still cover it — back up one and
     // push `candidate` past its end if so.
     if (it != ranges.begin()) {
         auto prev = std::prev(it);
         U64 prevEnd = prev->second.startPage + prev->second.pageCount;
-        if (prevEnd > candidate) candidate = prevEnd;
+        if (prevEnd > candidate) candidate = alignCandidate(prevEnd);
     }
     for (; it != ranges.end(); ++it) {
         U64 gapEnd = it->second.startPage; // exclusive
         if (gapEnd >= candidate + pageCount) break; // fits before this range
         U64 rangeEnd = it->second.startPage + it->second.pageCount;
-        if (rangeEnd > candidate) candidate = rangeEnd; // jump past it
+        if (rangeEnd > candidate) {
+            candidate = alignCandidate(rangeEnd); // jump past it
+        }
     }
     // `candidate` now points at a hole large enough (either before `it` or past
     // the last range — address space above is effectively unbounded for us).
@@ -1174,7 +1199,7 @@ U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
     // in `ranges` itself, so the gap is claimed before we drop the lock.
     U64 mapped = mmapAnonymousFixed(addr, pageCount << K64_PAGE_SHIFT, prot);
     if (mapped != addr) return mapped;
-    mmapNext = (candidate + pageCount) << K64_PAGE_SHIFT;
+    mmapNext = alignCandidate(candidate + pageCount) << K64_PAGE_SHIFT;
     return addr;
 }
 

@@ -245,6 +245,9 @@ jobs:
       - name: Run tests
         run: ctest --preset tests-only
 
+      - name: Test DXMT ABI validator
+        run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
+
   ipa:
     name: Unsigned IPA (${{ inputs.configuration || 'Release' }})
     needs:
@@ -344,17 +347,8 @@ jobs:
           bash scripts/validate-wine64-runtime.sh \
             --input build/wine64-runtime \
             --manifest build/wine64-runtime/wine64-runtime.manifest
-          for path in \
-            build/x64-graphics/boxedvn-d3d11-cube-x64.exe \
-            build/x64-graphics/dxmt-x64/d3d11.dll \
-            build/x64-graphics/dxmt-x64/dxgi.dll \
-            build/x64-graphics/dxmt-x64/d3d10core.dll \
-            build/x64-graphics/dxmt-x64/winemetal.dll; do
-            file "${path}" | grep -Eqi 'PE32\+.*x86-64' || {
-              echo "::error::${path} is not an x86-64 PE image."
-              exit 1
-            }
-          done
+          python3 scripts/validate-dxmt-guest-abi.py \
+            --graphics-dir build/x64-graphics
 
       - name: Build unsigned app
         shell: bash

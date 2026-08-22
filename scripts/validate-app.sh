@@ -99,6 +99,16 @@ if [[ "${BOXEDVN_REQUIRE_FEX_PROBE:-0}" == "1" ]]; then
     ok "FEX translated correctness probe bundled"
 fi
 
+X64_GRAPHICS_DIR="${APP_PATH}/boxedwine64-runtime"
+if [[ -f "${X64_GRAPHICS_DIR}/x64-graphics.manifest" ]]; then
+    require_command python3
+    python3 "${BOXEDVN_SCRIPT_DIR}/validate-dxmt-guest-abi.py" \
+        --packaged-graphics-dir "${X64_GRAPHICS_DIR}"
+    ok "packaged x86-64 DXMT guest assets match their manifest"
+elif [[ "${BOXEDVN_REQUIRE_DXMT_NATIVE:-0}" == "1" ]]; then
+    die "The x86-64 build has no packaged graphics manifest."
+fi
+
 # --- Info.plist -------------------------------------------------------------
 require_file "${INFO_PLIST}" "The app bundle has no Info.plist."
 

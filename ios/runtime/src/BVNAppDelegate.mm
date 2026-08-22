@@ -38,8 +38,11 @@
 #import <objc/runtime.h>
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <dispatch/dispatch.h>
+#include <mutex>
+#include <thread>
 
 #include "BVNDXMTDisplay.h"
 #include "BVNRuntime.h"
@@ -544,9 +547,9 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 // Session display-rate preference
 //
 // Keep a live display-link preference while a guest session is active. Build
-// 74's present-path timing disproved adaptive-refresh starvation as Grisaia's
-// failure: the guest initiated only two presents in five seconds and both
-// returned immediately. The title-specific workaround therefore lives in the
+// Device present-path timing disproved adaptive-refresh starvation for a
+// low-frame-rate GDI workload: the guest initiated only two presents in five
+// seconds and both returned immediately. Its workaround therefore lives in the
 // X11 input path; this link remains only as the session's smooth-display hint.
 // Its callback deliberately does no work.
 @interface BVNRefreshRateHold : NSObject
@@ -560,6 +563,88 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 @end
 
 static BVNRefreshRateHold* gRefreshRateHold = nil;
+static NSString* const kBVNFrameRateModeKey =
+    @"BoxedVN.presentation.frameRateMode";
+static std::atomic<int> gGuestFrameRateLimitHz{0};
+static std::mutex gGuestFramePacerMutex;
+static std::chrono::steady_clock::time_point gGuestNextFrameDeadline;
+
+extern "C" int BVNGuestFrameRateMode(void) {
+    return MAX(0, MIN(2, (int)[[NSUserDefaults standardUserDefaults]
+        integerForKey:kBVNFrameRateModeKey]));
+}
+
+static void BVNResetGuestFramePacer(int mode) {
+    gGuestFrameRateLimitHz.store(mode == 1 ? 60 : mode == 2 ? 120 : 0,
+                                 std::memory_order_release);
+    std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
+    gGuestNextFrameDeadline = {};
+}
+
+extern "C" void BVNGuestFrameLimiterWait(void) {
+    const int limit = gGuestFrameRateLimitHz.load(std::memory_order_acquire);
+    if (limit <= 0) {
+        return;
+    }
+    const auto interval = std::chrono::nanoseconds(1000000000ll / limit);
+    std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (gGuestNextFrameDeadline.time_since_epoch().count() == 0 ||
+        now > gGuestNextFrameDeadline + interval * 2) {
+        gGuestNextFrameDeadline = now;
+        return;
+    }
+    gGuestNextFrameDeadline += interval;
+    if (gGuestNextFrameDeadline > now) {
+        std::this_thread::sleep_until(gGuestNextFrameDeadline);
+    }
+}
+
+static void BVNApplyGuestFrameRateMode(void) {
+    if (gRefreshRateHold.link == nil) {
+        return;
+    }
+    UIWindow* guestWindow = BVNGuestUIWindow();
+    UIScreen* screen = guestWindow.screen ?: gAppDelegate.libraryWindow.screen;
+    const NSInteger deviceMaximum = MAX(
+        60, screen.maximumFramesPerSecond);
+    const int mode = BVNGuestFrameRateMode();
+    const NSInteger requested = mode == 1 ? 60
+                                : mode == 2 ? 120
+                                            : deviceMaximum;
+    const NSInteger ceiling = MIN(requested, deviceMaximum);
+    if (@available(iOS 15.0, *)) {
+        if (mode == 0) {
+            // Let ProMotion vary freely up to the panel limit while preferring
+            // its fastest cadence. The OS may still lower this for power or
+            // thermal reasons.
+            gRefreshRateHold.link.preferredFrameRateRange =
+                CAFrameRateRangeMake(30.0f, (float)deviceMaximum,
+                                     (float)deviceMaximum);
+        } else {
+            gRefreshRateHold.link.preferredFrameRateRange =
+                CAFrameRateRangeMake((float)ceiling, (float)ceiling,
+                                     (float)ceiling);
+        }
+    } else {
+        gRefreshRateHold.link.preferredFramesPerSecond =
+            mode == 0 ? 0 : (NSInteger)ceiling;
+    }
+}
+
+extern "C" void BVNGuestSetFrameRateMode(int mode) {
+    NSCAssert(NSThread.isMainThread,
+              @"Guest frame-rate mode must change on the main thread");
+    mode = MAX(0, MIN(2, mode));
+    [[NSUserDefaults standardUserDefaults]
+        setInteger:mode forKey:kBVNFrameRateModeKey];
+    BVNResetGuestFramePacer(mode);
+    BVNApplyGuestFrameRateMode();
+    NSString* message = [NSString stringWithFormat:
+        @"Guest display cadence set to %@.",
+        mode == 1 ? @"60 FPS" : mode == 2 ? @"120 FPS" : @"uncapped"];
+    BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
+}
 
 static void BVNStartRefreshRateHold(void) {
     if (gRefreshRateHold != nil) {
@@ -569,18 +654,20 @@ static void BVNStartRefreshRateHold(void) {
     CADisplayLink* link =
         [CADisplayLink displayLinkWithTarget:gRefreshRateHold
                                     selector:@selector(tick:)];
-    if (@available(iOS 15.0, *)) {
-        link.preferredFrameRateRange = CAFrameRateRangeMake(60.0f, 120.0f,
-                                                            120.0f);
-    }
     // Common modes, so it keeps firing while UIKit is tracking a touch. The
     // guest owns the main thread, but SDL's UIKit_PumpEvents cycles the main
     // run loop on every SDL_PollEvent, which is often enough to keep this
     // scheduled.
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     gRefreshRateHold.link = link;
+    BVNResetGuestFramePacer(BVNGuestFrameRateMode());
+    BVNApplyGuestFrameRateMode();
+    const int mode = BVNGuestFrameRateMode();
     BVNLogWrite(BVNLogLevelInfo, "frontend",
-                "Requesting a 60-120 Hz display range for the guest session.");
+                mode == 1 ? "Requesting a locked 60 Hz guest display cadence."
+                : mode == 2
+                    ? "Requesting a locked 120 Hz guest display cadence."
+                    : "Requesting the fastest adaptive guest display cadence.");
 }
 
 static void BVNStopRefreshRateHold(void) {
@@ -588,6 +675,7 @@ static void BVNStopRefreshRateHold(void) {
         return;
     }
     [gRefreshRateHold.link invalidate];
+    BVNResetGuestFramePacer(0);
     gRefreshRateHold.link = nil;
     gRefreshRateHold = nil;
 }
@@ -954,7 +1042,7 @@ static CGRect gGuestPresentationContentRect = CGRectZero;
     // Keep one shared Metal texture for the lifetime of the guest surface.
     // Core Animation's UIView backing-store path retained a small amount of
     // state for every forced partial draw/flush while SDL owned the main run
-    // loop. At Grisaia's 20-45 GDI patches/sec that grew resident memory by
+    // loop. At 20-45 GDI patches/sec that grew resident memory by
     // roughly 220 MB in three minutes, then presentation stopped near the
     // device limit. Uploading into this fixed allocation gives CA only its
     // normal bounded drawable pool, independent of the number of patches.
@@ -1420,7 +1508,14 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
         // widescreen picture inside it: aspect-fit preserves both sets of
         // bars, while stretch distorts the picture. Fill crops only the outer
         // surface and keeps circles, fonts and cursor geometry undistorted.
-        scaleX = scaleY = MAX(scaleX, scaleY);
+        const CGFloat fitScale = MIN(scaleX, scaleY);
+        const CGFloat coverScale = MAX(scaleX, scaleY);
+        // A strict cover can remove a large part of a 4:3 guest surface on a
+        // wide phone. Keep at least 90% of each guest dimension visible. Near
+        // matching aspect ratios still cover completely; larger mismatches
+        // retain slim bars instead of cutting important edge controls away.
+        const CGFloat cropSafeScale = fitScale / 0.90;
+        scaleX = scaleY = MIN(coverScale, cropSafeScale);
     }
     const CGRect target = CGRectMake(
         available.origin.x +
@@ -1464,8 +1559,8 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
         // flight before a present has to wait for the compositor. MoltenVK
         // derives this from the swapchain's image count, which wined3d asks
         // for as two; with only two drawables a single late compositor frame
-        // stalls the guest, and the guest stalling is the whole Grisaia
-        // symptom. See BVNStartRefreshRateHold above.
+        // stalls the guest, matching the observed low-frame-rate GDI symptom.
+        // See BVNStartRefreshRateHold above.
         metalLayer.maximumDrawableCount = 3;
     }
 

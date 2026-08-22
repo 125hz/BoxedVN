@@ -26,6 +26,7 @@
 #include "../opengl/gl64bridge_abi.h"
 #endif
 #if defined(BOXEDWINE_DXMT_NATIVE)
+#include "BVNFrameRate.h"
 extern "C" const void *dxmt_winemetal_unix_call_funcs[];
 #endif
 
@@ -1373,6 +1374,9 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         // disjoint, uncorrupted pages. Atomically reserve+map (closes the
         // MT TOCTOU race two sibling threads hit via the old scan-then-map).
         addr = cpu->memory->mmapReserveAndMap(length, loadProt);
+        if ((S64)addr < 0) {
+            return addr;
+        }
         reserved = true; // pages already mapped under the lock; don't re-map/zero
     }
     U64 aligned = addr & ~0xFFFULL;
@@ -2815,6 +2819,9 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         return (U64)(S64)(S32)BOXEDWINE_X64_HOSTCALL_STATUS_NOT_IMPLEMENTED;
     }
     const auto entry = reinterpret_cast<DxmtUnixEntry>(const_cast<void*>(raw));
+    if (callIndex == 47 || callIndex == 48) {
+        BVNGuestFrameLimiterWait();
+    }
     const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
     if (logCall) {
         klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d",

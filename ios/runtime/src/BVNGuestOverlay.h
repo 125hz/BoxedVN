@@ -32,6 +32,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "BVNFrameRate.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -230,6 +230,7 @@ static NSString* const kBVNPerformanceBatteryKey =
 @property (nonatomic, strong) UIButton* pointerItem;
 @property (nonatomic, strong) UIButton* pointerSettingsItem;
 @property (nonatomic, strong) UIButton* displayItem;
+@property (nonatomic, strong) UIButton* frameRateItem;
 @property (nonatomic, strong) UIButton* performanceItem;
 @property (nonatomic, strong) UIButton* performanceSettingsItem;
 @property (nonatomic, strong) UIButton* quitItem;
@@ -468,12 +469,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         const NSInteger pointerMode = MAX(
             0, MIN(3, [defaults integerForKey:kBVNPointerModeKey]));
         self.trackpadMode = pointerMode != 0;
-        self.guestCursorMode = pointerMode >= 2;
-        self.wineCursorOnlyMode = pointerMode == 3;
+        self.guestCursorMode = self.trackpadMode;
+        self.wineCursorOnlyMode = NO;
     } else {
         // Preserve the old direct/trackpad choice when upgrading.
         self.trackpadMode = [defaults boolForKey:kBVNTrackpadModeKey];
-        self.guestCursorMode = NO;
+        self.guestCursorMode = self.trackpadMode;
         self.wineCursorOnlyMode = NO;
     }
     [self buildMenu];
@@ -1261,6 +1262,9 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.displayItem = [self makePanelItemWithTitle:@"Display: fit"
                                              action:@selector(toggleDisplayMode)
                                         destructive:NO];
+    self.frameRateItem = [self makePanelItemWithTitle:@"Frame rate: uncapped"
+                                                action:@selector(toggleFrameRateMode)
+                                           destructive:NO];
     self.performanceItem = [self makePanelItemWithTitle:@"Performance overlay: off"
                                                   action:@selector(togglePerformanceOverlay)
                                              destructive:NO];
@@ -1274,6 +1278,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     [panel addSubview:self.pointerItem];
     [panel addSubview:self.pointerSettingsItem];
     [panel addSubview:self.displayItem];
+    [panel addSubview:self.frameRateItem];
     [panel addSubview:self.performanceItem];
     [panel addSubview:self.performanceSettingsItem];
     [panel addSubview:self.quitItem];
@@ -2031,10 +2036,10 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (void)setPointerMode:(NSInteger)mode {
-    mode = MAX(0, MIN(3, mode));
+    mode = MAX(0, MIN(1, mode));
     const BOOL enabled = mode != 0;
-    const BOOL guestCursor = mode >= 2;
-    const BOOL wineCursorOnly = mode == 3;
+    const BOOL guestCursor = enabled;
+    const BOOL wineCursorOnly = NO;
     if (self.trackpadMode == enabled &&
         self.guestCursorMode == guestCursor &&
         self.wineCursorOnlyMode == wineCursorOnly) {
@@ -2064,13 +2069,9 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                                forKey:kBVNPointerModeKey];
     [self positionCursor];
     BVNLogWrite(BVNLogLevelInfo, "input",
-                mode == 3
-                    ? "Pointer mode: trackpad with Wine bitmap only."
-                    : mode == 2
+                enabled
                     ? "Pointer mode: trackpad with Wine cursor and fallback."
-                    : enabled
-                        ? "Pointer mode: trackpad with BoxedVN cursor."
-                        : "Pointer mode: direct tap.");
+                    : "Pointer mode: direct tap.");
 }
 
 // ---------------------------------------------------------------------------
@@ -2151,6 +2152,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     } else {
         for (UIButton* item in @[self.keyboardItem, self.pointerItem,
                                  self.pointerSettingsItem, self.displayItem,
+                                 self.frameRateItem,
                                  self.performanceItem,
                                  self.performanceSettingsItem,
                                  self.quitItem]) {
@@ -2476,6 +2478,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.pointerItem.hidden = confirming;
     self.pointerSettingsItem.hidden = confirming;
     self.displayItem.hidden = confirming;
+    self.frameRateItem.hidden = confirming;
     self.performanceItem.hidden = confirming;
     self.performanceSettingsItem.hidden = confirming;
     self.quitItem.hidden = confirming;
@@ -2488,11 +2491,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                        forState:UIControlStateNormal];
     NSString* pointerTitle = @"Pointer: direct tap";
     if (self.trackpadMode) {
-        pointerTitle = self.wineCursorOnlyMode
-            ? @"Pointer: Wine cursor only"
-            : self.guestCursorMode
-            ? @"Pointer: Wine cursor + fallback"
-            : @"Pointer: trackpad + BoxedVN cursor";
+        pointerTitle = @"Pointer: Wine cursor + fallback";
     }
     [self.pointerItem setTitle:pointerTitle
                       forState:UIControlStateNormal];
@@ -2503,6 +2502,13 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                     ? @"Display: fill aspect"
                                     : @"Display: fit aspect")
                       forState:UIControlStateNormal];
+    const int frameRateMode = BVNGuestFrameRateMode();
+    [self.frameRateItem setTitle:(frameRateMode == 1
+                                      ? @"Frame rate: 60 FPS"
+                                      : frameRateMode == 2
+                                      ? @"Frame rate: 120 FPS"
+                                      : @"Frame rate: uncapped")
+                         forState:UIControlStateNormal];
     const BOOL performanceEnabled = [[NSUserDefaults standardUserDefaults]
         boolForKey:kBVNPerformanceEnabledKey];
     [self.performanceItem setTitle:(performanceEnabled
@@ -2532,9 +2538,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (void)togglePointerMode {
-    const NSInteger current = !self.trackpadMode
-        ? 0 : self.wineCursorOnlyMode ? 3 : self.guestCursorMode ? 2 : 1;
-    [self setPointerMode:(current + 1) % 4];
+    [self setPointerMode:self.trackpadMode ? 0 : 1];
+    [self applyMenuState];
+}
+
+- (void)toggleFrameRateMode {
+    BVNGuestSetFrameRateMode((BVNGuestFrameRateMode() + 1) % 3);
     [self applyMenuState];
 }
 

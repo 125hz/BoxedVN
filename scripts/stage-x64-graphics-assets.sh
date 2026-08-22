@@ -53,10 +53,6 @@ if [[ -n "${NATIVE_ARCHIVE}" ]]; then
     cp "${NATIVE_ARCHIVE}" "${OUTPUT_DIR}/libdxmt_combined.a"
 fi
 
-python3 "${BOXEDVN_SCRIPT_DIR}/validate-dxmt-guest-abi.py" \
-    --pe-dir "${OUTPUT_DIR}/dxmt-x64" \
-    --probe "${OUTPUT_DIR}/boxedvn-d3d11-cube-x64.exe"
-
 sha256_file() {
     if command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$1" | awk '{print $1}'
@@ -79,4 +75,6 @@ sha256_file() {
             "$(sha256_file "${OUTPUT_DIR}/libdxmt_combined.a")"
     fi
 } > "${OUTPUT_DIR}/x64-graphics.manifest"
+python3 "${BOXEDVN_SCRIPT_DIR}/validate-dxmt-guest-abi.py" \
+    --graphics-dir "${OUTPUT_DIR}"
 ok "Staged x86-64 graphics resources: ${OUTPUT_DIR}"

@@ -102,6 +102,9 @@ if [[ -n "${X64_GRAPHICS_RUNTIME_INPUT}" ]]; then
     for dxmt_dll in d3d11 dxgi d3d10core winemetal; do
         require_file "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x64/${dxmt_dll}.dll"
     done
+    require_command python3
+    python3 "${BOXEDVN_SCRIPT_DIR}/validate-dxmt-guest-abi.py" \
+        --graphics-dir "${X64_GRAPHICS_RUNTIME_INPUT}"
     if [[ -z "${DXMT_NATIVE_ARCHIVE}" ]]; then
         DXMT_NATIVE_ARCHIVE="${X64_GRAPHICS_RUNTIME_INPUT}/libdxmt_combined.a"
     fi

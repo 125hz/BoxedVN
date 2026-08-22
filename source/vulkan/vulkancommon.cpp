@@ -25,6 +25,7 @@
 #include "kvulkan.h"
 #include <SDL_vulkan.h>
 #ifdef BOXEDWINE_IOS
+#include "BVNFrameRate.h"
 #include "bvnhostpresent.h"
 #include <chrono>
 
@@ -732,6 +733,9 @@ void callVulkan(CPU* cpu, U32 index) {
             const auto started = timed
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point();
+            if (index == QueuePresentKHR) {
+                BVNGuestFrameLimiterWait();
+            }
 #endif
             int9ACallback[index](cpu);
 #ifdef BOXEDWINE_IOS

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import re
 import struct
@@ -315,6 +316,98 @@ PROBE_REQUIREMENTS: dict[str, object] = {
     "import_symbols": {"d3d11.dll": {"D3D11CreateDevice"}},
 }
 
+GRAPHICS_MANIFEST_FORMAT = "boxedvn-x64-graphics-v1"
+GRAPHICS_GUEST_FILES = {
+    "probe_sha256": "boxedvn-d3d11-cube-x64.exe",
+    "d3d11_sha256": "dxmt-x64/d3d11.dll",
+    "dxgi_sha256": "dxmt-x64/dxgi.dll",
+    "d3d10core_sha256": "dxmt-x64/d3d10core.dll",
+    "winemetal_sha256": "dxmt-x64/winemetal.dll",
+}
+GRAPHICS_MANIFEST_KEYS = {
+    "format",
+    "probe",
+    *GRAPHICS_GUEST_FILES.keys(),
+    "native_archive",
+    "native_archive_sha256",
+}
+
+
+def parse_key_value_manifest(path: pathlib.Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            fail(f"{path}:{line_number}: expected key=value")
+        key, value = line.split("=", 1)
+        if not key or not value:
+            fail(f"{path}:{line_number}: manifest key and value must be non-empty")
+        if key in values:
+            fail(f"{path}:{line_number}: duplicate manifest key {key}")
+        values[key] = value
+    missing = GRAPHICS_MANIFEST_KEYS - set(values)
+    unknown = set(values) - GRAPHICS_MANIFEST_KEYS
+    if missing:
+        fail(f"{path}: missing manifest keys: {', '.join(sorted(missing))}")
+    if unknown:
+        fail(f"{path}: unknown manifest keys: {', '.join(sorted(unknown))}")
+    return values
+
+
+def validate_manifest_file(root: pathlib.Path, relative: str,
+                           expected_hash: str, label: str) -> pathlib.Path:
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+        fail(f"{label}: malformed SHA-256 {expected_hash!r}")
+    path = root / relative
+    if path.is_symlink() or not path.is_file():
+        fail(f"{label}: missing regular file {path}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual.lower() != expected_hash.lower():
+        fail(f"{label}: SHA-256 mismatch for {path.name}: "
+             f"expected {expected_hash.lower()}, got {actual}")
+    return path
+
+
+def validate_graphics_bundle(root: pathlib.Path,
+                             require_native_archive: bool) -> None:
+    if not root.is_dir():
+        fail(f"x64 graphics directory is missing: {root}")
+    manifest_path = root / "x64-graphics.manifest"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        fail(f"x64 graphics manifest is missing: {manifest_path}")
+    values = parse_key_value_manifest(manifest_path)
+    if values["format"] != GRAPHICS_MANIFEST_FORMAT:
+        fail(f"{manifest_path}: unsupported format {values['format']!r}")
+    if values["probe"] != GRAPHICS_GUEST_FILES["probe_sha256"]:
+        fail(f"{manifest_path}: unexpected probe name {values['probe']!r}")
+    if values["native_archive"] != "libdxmt_combined.a":
+        fail(f"{manifest_path}: unexpected native archive name "
+             f"{values['native_archive']!r}")
+
+    paths = {
+        key: validate_manifest_file(root, relative, values[key], key)
+        for key, relative in GRAPHICS_GUEST_FILES.items()
+    }
+    if require_native_archive:
+        archive = validate_manifest_file(
+            root, values["native_archive"], values["native_archive_sha256"],
+            "native_archive_sha256")
+        if archive.read_bytes()[:8] != b"!<arch>\n":
+            fail(f"{archive}: native DXMT library is not a static archive")
+    elif not re.fullmatch(r"[0-9a-fA-F]{64}",
+                          values["native_archive_sha256"]):
+        fail(f"{manifest_path}: malformed native archive SHA-256")
+
+    pe_dir = root / "dxmt-x64"
+    for filename, requirements in PE_REQUIREMENTS.items():
+        validate_pe(pe_dir / filename, requirements)
+    validate_dxmt_resolution(pe_dir)
+    validate_pe(paths["probe_sha256"], PROBE_REQUIREMENTS)
+    mode = "build artifact" if require_native_archive else "packaged guest assets"
+    print(f"x64 graphics manifest ok: {mode}, all checksums and ABIs match")
+
 
 def validate_pe(path: pathlib.Path, requirements: dict[str, object] | None = None) -> None:
     image = PEImage(path)
@@ -435,8 +528,11 @@ def main() -> int:
     parser.add_argument("--unixlib", type=pathlib.Path)
     parser.add_argument("--pe-dir", type=pathlib.Path)
     parser.add_argument("--probe", type=pathlib.Path)
+    parser.add_argument("--graphics-dir", type=pathlib.Path)
+    parser.add_argument("--packaged-graphics-dir", type=pathlib.Path)
     args = parser.parse_args()
-    if args.unixlib is None and args.pe_dir is None and args.probe is None:
+    if (args.unixlib is None and args.pe_dir is None and args.probe is None and
+            args.graphics_dir is None and args.packaged_graphics_dir is None):
         parser.error("at least one validation target is required")
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     if args.unixlib is not None:
@@ -450,6 +546,10 @@ def main() -> int:
         validate_dxmt_resolution(args.pe_dir)
     if args.probe is not None:
         validate_pe(args.probe, PROBE_REQUIREMENTS)
+    if args.graphics_dir is not None:
+        validate_graphics_bundle(args.graphics_dir, True)
+    if args.packaged_graphics_dir is not None:
+        validate_graphics_bundle(args.packaged_graphics_dir, False)
     return 0
 
 
