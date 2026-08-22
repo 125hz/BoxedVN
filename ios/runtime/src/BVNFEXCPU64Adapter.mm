@@ -53,6 +53,9 @@ extern "C" BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(const BVNFEXCPU
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <signal.h>
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE
+#endif
 #include <ucontext.h>
 #endif
 
