@@ -33,6 +33,7 @@ require_command cmake
 require_command file
 require_command meson "Install Meson with 'python3 -m pip install meson'."
 require_command ninja
+require_command python3
 require_command xcrun
 require_command xxd
 [[ -n "${JOBS}" ]] || JOBS="$(sysctl -n hw.ncpu)"
@@ -166,4 +167,6 @@ for dll in d3d11 dxgi d3d10core winemetal; do
     file "${candidate}" | grep -Eqi 'PE32\+.*x86-64' \
         || die "${candidate} is not an x86-64 PE image."
 done
+python3 "${BOXEDVN_ROOT}/scripts/validate-dxmt-guest-abi.py" \
+    --pe-dir "${OUTPUT_DIR}/x86_64-windows"
 ok "DXMT x86-64 PE DLLs: ${OUTPUT_DIR}/x86_64-windows"

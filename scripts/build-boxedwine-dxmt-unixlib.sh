@@ -15,6 +15,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 [[ -f "${SOURCE}" ]] || die "missing ${SOURCE}"
 command -v "${CC}" >/dev/null 2>&1 || die "${CC} is not installed"
+command -v python3 >/dev/null 2>&1 || die "python3 is not installed"
 
 mkdir -p "$(dirname "${OUTPUT}")"
 
@@ -24,5 +25,8 @@ mkdir -p "$(dirname "${OUTPUT}")"
     -Wl,--no-undefined -Wl,-soname,winemetal.so \
     -I"${REPO_ROOT}/include" \
     "${SOURCE}" -o "${OUTPUT}"
+
+python3 "${REPO_ROOT}/scripts/validate-dxmt-guest-abi.py" \
+    --unixlib "${OUTPUT}"
 
 printf 'built %s\n' "${OUTPUT}"

@@ -22,6 +22,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var memory: MemoryReport = .probe()
     @Published private(set) var fexBackend: FEXBackendReport = .status()
     @Published private(set) var isProbingFEX = false
+    @Published private(set) var lowAddressProbe: LowAddressProbeReport = .notRun
+    @Published private(set) var isProbingLowAddresses = false
     @Published private(set) var runtimeState: RuntimeState = .idle
     @Published private(set) var isImporting = false
     @Published var importProgressMessage = ""
@@ -860,6 +862,18 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 self.fexBackend = result
                 self.isProbingFEX = false
+            }
+        }
+    }
+
+    func runLowAddressProbe() {
+        guard !isProbingLowAddresses else { return }
+        isProbingLowAddresses = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = LowAddressProbeReport.execute()
+            DispatchQueue.main.async {
+                self.lowAddressProbe = result
+                self.isProbingLowAddresses = false
             }
         }
     }

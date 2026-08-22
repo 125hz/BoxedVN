@@ -93,6 +93,36 @@ struct FEXBackendReport {
     }
 }
 
+struct LowAddressProbeReport {
+    var status: BVNLowAddressProbeStatus
+    var statusText: String
+    var detail: String
+
+    static let notRun = LowAddressProbeReport(
+        status: BVNLowAddressProbeNotRun,
+        statusText: "Not tested",
+        detail: "Run the device test to determine whether iOS permits the low-address identity mappings required by FEX32."
+    )
+
+    static func execute() -> LowAddressProbeReport {
+        let report = BVNLow4GiBIdentityProbe()
+        let statusText: String
+        switch report.status {
+        case BVNLowAddressProbeBlocked: statusText = "Blocked by host address space"
+        case BVNLowAddressProbePartial: statusText = "Partial holes only"
+        case BVNLowAddressProbeCandidate: statusText = "Candidate mapping available"
+        case BVNLowAddressProbeQueryError: statusText = "VM query failed"
+        case BVNLowAddressProbeReservationError: statusText = "Reservation failed"
+        default: statusText = "Not tested"
+        }
+        return LowAddressProbeReport(
+            status: report.status,
+            statusText: statusText,
+            detail: report.detail.map(String.init(cString:)) ?? ""
+        )
+    }
+}
+
 // MARK: - Memory entitlement
 
 /// Settings that apply to every session rather than to one game.

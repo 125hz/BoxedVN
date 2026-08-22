@@ -861,6 +861,19 @@ struct StatusView: View {
                         .disabled(model.isProbingFEX || model.fexBackend.completed)
                     }
                 }
+                VStack(alignment: .leading, spacing: 4) {
+                    LabeledContent("FEX32 low-address identity map",
+                                   value: model.lowAddressProbe.statusText)
+                    Text(model.lowAddressProbe.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Button(model.isProbingLowAddresses
+                           ? "Testing…" : "Run low-4 GiB address test") {
+                        model.runLowAddressProbe()
+                    }
+                    .disabled(model.isProbingLowAddresses)
+                }
             }
         }
         .navigationTitle("Runtime status")

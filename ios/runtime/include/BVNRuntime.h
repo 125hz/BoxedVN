@@ -172,6 +172,37 @@ typedef struct {
 // Safe and side-effect free. Suitable for the library screen and its timer.
 BVNMemoryReport BVNMemoryProbe(void);
 
+// ---------------------------------------------------------------------------
+// Optional FEX32 low-address identity-map feasibility
+// ---------------------------------------------------------------------------
+
+typedef enum {
+    BVNLowAddressProbeNotRun = 0,
+    BVNLowAddressProbeBlocked = 1,
+    BVNLowAddressProbePartial = 2,
+    BVNLowAddressProbeCandidate = 3,
+    BVNLowAddressProbeQueryError = 4,
+    BVNLowAddressProbeReservationError = 5,
+} BVNLowAddressProbeStatus;
+
+typedef struct {
+    BVNLowAddressProbeStatus status;
+    uint64_t hostPageSize;
+    uint64_t blockingRegionStart;
+    uint64_t blockingRegionSize;
+    uint32_t regionCount;
+    uint32_t candidateCount;
+    uint32_t claimedCandidateCount;
+    int32_t machResult;
+    const char* detail;
+} BVNLowAddressProbeReport;
+
+// Explicit, temporary, non-overwriting device probe. It only reserves holes
+// that vm_region_64 first reports free, verifies read/write identity, and
+// immediately releases them. It never requests executable permission and is
+// never called by startup or the memory polling path.
+BVNLowAddressProbeReport BVNLow4GiBIdentityProbe(void);
+
 // Memory advertised to the 32-bit Linux/Wine guest. Boxedwine historically
 // hard-coded 1 GB in both sysinfo() and /proc/meminfo; iOS can safely expose a
 // larger but still 32-bit-addressable budget when the signed process has it.

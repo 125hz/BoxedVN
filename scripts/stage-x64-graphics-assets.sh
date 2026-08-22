@@ -29,6 +29,7 @@ if [[ -n "${NATIVE_ARCHIVE}" ]]; then
     [[ -f "${NATIVE_ARCHIVE}" ]] || die "Native DXMT archive '${NATIVE_ARCHIVE}' is missing."
 fi
 require_command file
+require_command python3
 mkdir -p "${OUTPUT_DIR}/dxmt-x64"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 
@@ -51,6 +52,10 @@ done
 if [[ -n "${NATIVE_ARCHIVE}" ]]; then
     cp "${NATIVE_ARCHIVE}" "${OUTPUT_DIR}/libdxmt_combined.a"
 fi
+
+python3 "${BOXEDVN_SCRIPT_DIR}/validate-dxmt-guest-abi.py" \
+    --pe-dir "${OUTPUT_DIR}/dxmt-x64" \
+    --probe "${OUTPUT_DIR}/boxedvn-d3d11-cube-x64.exe"
 
 sha256_file() {
     if command -v shasum >/dev/null 2>&1; then
