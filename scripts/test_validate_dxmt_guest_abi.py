@@ -9,6 +9,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).with_name("validate-dxmt-guest-abi.py")
@@ -59,6 +60,68 @@ class GraphicsManifestTests(unittest.TestCase):
             wrong = hashlib.sha256(b"different payload").hexdigest()
             with self.assertRaisesRegex(MODULE.ValidationError, "SHA-256 mismatch"):
                 MODULE.validate_manifest_file(root, payload.name, wrong, "payload")
+
+
+class PeSurfaceTests(unittest.TestCase):
+    class FakeImage:
+        def __init__(self, machine: int = 0x8664,
+                     exports: dict[str, int] | None = None,
+                     imports: dict[str, set[str | int]] | None = None):
+            self.machine = machine
+            self._exports = exports or {}
+            self._imports = imports or {}
+
+        def exports(self) -> dict[str, int]:
+            return self._exports
+
+        def import_symbols(self) -> dict[str, set[str | int]]:
+            return self._imports
+
+    def test_d3d11_surface_accepts_required_exports_and_imports(self) -> None:
+        requirements = MODULE.PE_REQUIREMENTS["d3d11.dll"]
+        image = self.FakeImage(
+            exports=dict(requirements["exports"]),
+            imports={
+                "dxgi.dll": {"CreateDXGIFactory1"},
+                "winemetal.dll": set(),
+            },
+        )
+        with mock.patch.object(MODULE, "PEImage", return_value=image):
+            MODULE.validate_pe(pathlib.Path("d3d11.dll"), requirements)
+
+    def test_surface_rejects_non_amd64_machine(self) -> None:
+        requirements = MODULE.PE_REQUIREMENTS["d3d11.dll"]
+        image = self.FakeImage(
+            machine=0xAA64,
+            exports=dict(requirements["exports"]),
+            imports={"dxgi.dll": {"CreateDXGIFactory1"},
+                     "winemetal.dll": set()},
+        )
+        with mock.patch.object(MODULE, "PEImage", return_value=image):
+            with self.assertRaisesRegex(MODULE.ValidationError, "AMD64"):
+                MODULE.validate_pe(pathlib.Path("d3d11.dll"), requirements)
+
+    def test_surface_rejects_wrong_export_ordinal(self) -> None:
+        requirements = MODULE.PE_REQUIREMENTS["dxgi.dll"]
+        exports = dict(requirements["exports"])
+        exports["CreateDXGIFactory1"] = 99
+        image = self.FakeImage(exports=exports,
+                               imports={"winemetal.dll": set()})
+        with mock.patch.object(MODULE, "PEImage", return_value=image):
+            with self.assertRaisesRegex(MODULE.ValidationError,
+                                         "expected 10"):
+                MODULE.validate_pe(pathlib.Path("dxgi.dll"), requirements)
+
+    def test_surface_rejects_missing_key_import_symbol(self) -> None:
+        requirements = MODULE.PE_REQUIREMENTS["d3d11.dll"]
+        image = self.FakeImage(
+            exports=dict(requirements["exports"]),
+            imports={"dxgi.dll": set(), "winemetal.dll": set()},
+        )
+        with mock.patch.object(MODULE, "PEImage", return_value=image):
+            with self.assertRaisesRegex(MODULE.ValidationError,
+                                         "CreateDXGIFactory1"):
+                MODULE.validate_pe(pathlib.Path("d3d11.dll"), requirements)
 
 
 if __name__ == "__main__":

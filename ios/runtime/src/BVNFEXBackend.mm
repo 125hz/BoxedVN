@@ -389,6 +389,7 @@ struct ExecutionTraceSnapshot {
     uint64_t hostLR = 0;
     uint64_t hostSP = 0;
     std::array<uint64_t, 8> hostArguments {};
+    std::array<uint64_t, 10> hostCallRegisters {};
     uint64_t hostCodeAddress = 0;
     std::array<uint32_t, 8> hostCode {};
     bool hostCodeValid = false;
@@ -396,6 +397,12 @@ struct ExecutionTraceSnapshot {
     uint64_t hostCallCodeAddress = 0;
     std::array<uint32_t, 8> hostCallCode {};
     bool hostCallCodeValid = false;
+    uint64_t hostReturnCodeAddress = 0;
+    std::array<uint32_t, 16> hostReturnCode {};
+    bool hostReturnCodeValid = false;
+    bool hostReturnInPool = false;
+    uint64_t hostReturnPoolOffset = 0;
+    uint64_t hostReturnWritableAlias = 0;
     uint64_t guestRIP = 0;
     uint64_t frameRIP = 0;
     uint64_t fsBase = 0;
@@ -1101,6 +1108,9 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     snapshot.hostSP = arm_thread_state64_get_sp(registers);
                     std::copy_n(registers.__x, snapshot.hostArguments.size(),
                                 snapshot.hostArguments.begin());
+                    std::copy_n(registers.__x + 8,
+                                snapshot.hostCallRegisters.size(),
+                                snapshot.hostCallRegisters.begin());
                     snapshot.hostCodeAddress = snapshot.hostPC & ~uint64_t {3};
                     vm_size_t hostCodeBytes = 0;
                     snapshot.hostCodeValid = vm_read_overwrite(
@@ -1110,6 +1120,35 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                             snapshot.hostCode.data()),
                         &hostCodeBytes) == KERN_SUCCESS &&
                         hostCodeBytes == sizeof(snapshot.hostCode);
+                    if (snapshot.hostLR >= 32) {
+                        snapshot.hostReturnCodeAddress =
+                            (snapshot.hostLR - 32) & ~uint64_t {3};
+                        vm_size_t hostReturnCodeBytes = 0;
+                        snapshot.hostReturnCodeValid = vm_read_overwrite(
+                            mach_task_self(), snapshot.hostReturnCodeAddress,
+                            sizeof(snapshot.hostReturnCode),
+                            reinterpret_cast<vm_address_t>(
+                                snapshot.hostReturnCode.data()),
+                            &hostReturnCodeBytes) == KERN_SUCCESS &&
+                            hostReturnCodeBytes ==
+                                sizeof(snapshot.hostReturnCode);
+
+                        const uintptr_t poolBase =
+                            reinterpret_cast<uintptr_t>(gPoolRX);
+                        const uintptr_t returnAddress =
+                            static_cast<uintptr_t>(snapshot.hostLR - 4);
+                        snapshot.hostReturnInPool =
+                            poolOwns(reinterpret_cast<const void*>(returnAddress));
+                        if (snapshot.hostReturnInPool) {
+                            snapshot.hostReturnPoolOffset =
+                                returnAddress - poolBase;
+                            if (gPoolRW != nullptr) {
+                                snapshot.hostReturnWritableAlias =
+                                    reinterpret_cast<uintptr_t>(gPoolRW) +
+                                    snapshot.hostReturnPoolOffset;
+                            }
+                        }
+                    }
                     if (processState->context->IsAddressInCodeBuffer(
                             threadState->fexThread, snapshot.hostPC)) {
                         const uint64_t restored =
@@ -1356,6 +1395,18 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     static_cast<unsigned long long>(snapshot.hostArguments[6]),
                     static_cast<unsigned long long>(snapshot.hostArguments[7]),
                     static_cast<unsigned long long>(snapshot.hostCallGuestRIP));
+            reportf("BOXEDWINE_FEX64_STALL_HOST_CALL_REGS pid=%u tid=%u x8=0x%llx x9=0x%llx x10=0x%llx x11=0x%llx x12=0x%llx x13=0x%llx x14=0x%llx x15=0x%llx x16=0x%llx x17=0x%llx",
+                    snapshot.processId, snapshot.threadId,
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[0]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[1]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[2]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[3]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[4]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[5]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[6]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[7]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[8]),
+                    static_cast<unsigned long long>(snapshot.hostCallRegisters[9]));
             reportf("BOXEDWINE_FEX64_STALL_MEMORY pid=%u tid=%u valid_mask=0x%x chunk_size=0x%llx chunk_user=0x%llx chunk_key=0x%llx arena_lock=0x%llx arena_system=0x%llx tls_address=0x%llx tls_value=0x%llx",
                     snapshot.processId, snapshot.threadId,
                     snapshot.memoryValueMask,
@@ -1387,6 +1438,26 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                         snapshot.hostCallCode[4], snapshot.hostCallCode[5],
                         snapshot.hostCallCode[6], snapshot.hostCallCode[7]);
             }
+            if (snapshot.hostReturnCodeValid) {
+                reportf("BOXEDWINE_FEX64_STALL_RETURN_CODE pid=%u tid=%u address=0x%llx lr=0x%llx in_pool=%u pool_offset=0x%llx writable_alias=0x%llx words=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                        snapshot.processId, snapshot.threadId,
+                        static_cast<unsigned long long>(
+                            snapshot.hostReturnCodeAddress),
+                        static_cast<unsigned long long>(snapshot.hostLR),
+                        snapshot.hostReturnInPool ? 1u : 0u,
+                        static_cast<unsigned long long>(
+                            snapshot.hostReturnPoolOffset),
+                        static_cast<unsigned long long>(
+                            snapshot.hostReturnWritableAlias),
+                        snapshot.hostReturnCode[0], snapshot.hostReturnCode[1],
+                        snapshot.hostReturnCode[2], snapshot.hostReturnCode[3],
+                        snapshot.hostReturnCode[4], snapshot.hostReturnCode[5],
+                        snapshot.hostReturnCode[6], snapshot.hostReturnCode[7],
+                        snapshot.hostReturnCode[8], snapshot.hostReturnCode[9],
+                        snapshot.hostReturnCode[10], snapshot.hostReturnCode[11],
+                        snapshot.hostReturnCode[12], snapshot.hostReturnCode[13],
+                        snapshot.hostReturnCode[14], snapshot.hostReturnCode[15]);
+            }
             Dl_info hostImage {};
             if (snapshot.hostPC != 0 &&
                 dladdr(reinterpret_cast<const void*>(snapshot.hostPC),
@@ -1404,6 +1475,37 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                         static_cast<unsigned long long>(symbolBase),
                         static_cast<unsigned long long>(symbolBase != 0
                             ? snapshot.hostPC - symbolBase : 0));
+
+                // iOS may redact dli_sname even for an exported system
+                // routine. Resolve a small set of plausible synchronization
+                // and memory helpers directly so the next device log can
+                // identify the callee without relying on dyld local symbols.
+                static constexpr const char* hostCandidates[] = {
+                    "memset",
+                    "_platform_memset",
+                    "__ulock_wait",
+                    "__ulock_wait2",
+                    "os_sync_wait_on_address",
+                    "os_sync_wait_on_address_with_deadline",
+                    "os_unfair_lock_lock",
+                    "os_unfair_lock_lock_with_options",
+                };
+                for (const char* candidate : hostCandidates) {
+                    void* address = dlsym(RTLD_DEFAULT, candidate);
+                    if (address == nullptr) continue;
+                    const uint64_t candidateAddress =
+                        reinterpret_cast<uint64_t>(address);
+                    if (snapshot.hostPC >= candidateAddress &&
+                        snapshot.hostPC - candidateAddress < 0x1000) {
+                        reportf("BOXEDWINE_FEX64_STALL_HOST_CANDIDATE pid=%u tid=%u name=%s address=0x%llx offset=0x%llx",
+                                snapshot.processId, snapshot.threadId,
+                                candidate,
+                                static_cast<unsigned long long>(
+                                    candidateAddress),
+                                static_cast<unsigned long long>(
+                                    snapshot.hostPC - candidateAddress));
+                    }
+                }
             }
         }
     }

@@ -15,6 +15,7 @@ add_executable(boxedvn_tests
     test_elf_inspector.cpp
     test_elf_loader_policy.cpp
     test_fex64_kernel.cpp
+    test_fex32_backend_admission.cpp
     test_fex32_backend_descriptor.cpp
     test_guest_address_contract32.cpp
     test_guest_address_space.cpp

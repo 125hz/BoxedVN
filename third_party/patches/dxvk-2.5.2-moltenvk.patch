@@ -38,3 +38,26 @@ index 1285c4e..acddbc5 100644
 +      ", cull=", enabledFeatures.core.features.shaderCullDistance,
 +      ", robust2=", enabledFeatures.extRobustness2.robustBufferAccess2,
 +      ", null=", enabledFeatures.extRobustness2.nullDescriptor, ")"));
+
+diff --git a/src/d3d9/d3d9_include.h b/src/d3d9/d3d9_include.h
+index 8a2ec14..32c5ba6 100644
+--- a/src/d3d9/d3d9_include.h
++++ b/src/d3d9/d3d9_include.h
+@@ -52,0 +53 @@
++namespace dxvk {
+@@ -56,0 +58 @@
++}
+
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index a55f0a0..33694a0 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -4484 +4484 @@ namespace dxvk {
+-    enabled.core.features.geometryShader = VK_TRUE;
++    enabled.core.features.geometryShader = VK_FALSE;
+@@ -4511 +4511 @@ namespace dxvk {
+-    enabled.core.features.shaderCullDistance = VK_TRUE;
++    enabled.core.features.shaderCullDistance = VK_FALSE;
+@@ -4514 +4514 @@ namespace dxvk {
+-    enabled.core.features.textureCompressionBC = VK_TRUE;
++    enabled.core.features.textureCompressionBC = supported.core.features.textureCompressionBC;

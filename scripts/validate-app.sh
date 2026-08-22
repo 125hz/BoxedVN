@@ -99,6 +99,22 @@ if [[ "${BOXEDVN_REQUIRE_FEX_PROBE:-0}" == "1" ]]; then
     ok "FEX translated correctness probe bundled"
 fi
 
+DXVK_DIR="${APP_PATH}/Dxvk"
+if [[ -d "${DXVK_DIR}" ]]; then
+    for module in d3d9.dll d3d10core.dll d3d11.dll dxgi.dll; do
+        require_file "${DXVK_DIR}/${module}" \
+            "The bundled MoltenVK-compatible DXVK set is incomplete."
+        if ! file "${DXVK_DIR}/${module}" | grep -q 'PE32 executable'; then
+            die "${module} is not a 32-bit Windows DLL."
+        fi
+    done
+    if ! grep -a -q 'compatibility feature mask active' \
+            "${DXVK_DIR}/d3d9.dll"; then
+        die "The bundled D3D9 module lacks the MoltenVK compatibility mask."
+    fi
+    ok "32-bit MoltenVK-compatible DXVK modules bundled"
+fi
+
 X64_GRAPHICS_DIR="${APP_PATH}/boxedwine64-runtime"
 if [[ -f "${X64_GRAPHICS_DIR}/x64-graphics.manifest" ]]; then
     require_command python3

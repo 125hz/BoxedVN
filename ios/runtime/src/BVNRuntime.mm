@@ -781,14 +781,15 @@ void runSession(const BVNLaunchConfiguration& launch) {
         // Shadow the rootfs's stock DXVK with the MoltenVK-compatible build.
         // Upstream DXVK requires geometryShader and VK_EXT_transform_feedback
         // and therefore refuses to create a device on Metal at all; the
-        // bundled modules treat those as optional. Only d3d11/dxgi/d3d10core
-        // are replaced, so d3d8/d3d9 continue to come from the archive.
+        // bundled modules treat those as optional. D3D9, D3D10 and D3D11 are
+        // replaced; D3D8 continues to use Wine's builtin implementation.
         if (launch.enableWineD3DVulkan) {
             const char* bundledDxvk = BVNPathBundledDxvkDirectory();
             if (bundledDxvk == nullptr) {
                 BVNLogWrite(BVNLogLevelError, "prefix",
-                            "This build ships no patched DXVK, so Direct3D 11 "
-                            "titles cannot render. Rebuild with ios/app/Dxvk "
+                            "This build ships no patched DXVK, so modern "
+                            "Direct3D titles cannot render. Rebuild with "
+                            "ios/app/Dxvk "
                             "populated.");
             } else {
                 bool installed = false;

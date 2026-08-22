@@ -66,6 +66,13 @@ direct descriptor must provide aligned code and data access across the complete
 4 GiB window. A structurally valid descriptor remains explicitly unavailable
 until an approved translator implements that contract.
 
+`selectFex32Backend` is the admission boundary for that future translator. It
+requires an explicit request and returns separate not-requested, invalid,
+unavailable and selected states. The current descriptor therefore cannot be
+promoted into a runnable CPU merely because a build flag or UI value exists;
+selection becomes possible only after the complete address and ABI contract is
+both valid and reported available.
+
 ## BoxedWine memory contract
 
 After the translator exposes that base, BoxedWine needs a flat 32-bit memory
@@ -108,3 +115,10 @@ address space.
 Until stage 1 exists, claiming FEX32 support would be cosmetic. The shipping
 32-bit path remains BoxedWine's ARMv8 JIT/interpreter while the 64-bit FEX path
 continues to provide the integration and device-debugging foundation.
+
+The x86-64 bring-up has a separate pre-device conformance fixture at
+`scripts/guest-probes/fex64-loader-stall.asm`. It runs the sampled libc SIMD
+memory path through FEX's ARM64 VIXL simulator in single-block and multiblock
+modes. Passing that fixture proves translator instruction/control-flow
+semantics only; it does not prove iOS executable memory, host callbacks, Wine,
+DXMT or Metal presentation.

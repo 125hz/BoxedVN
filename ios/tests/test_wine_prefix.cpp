@@ -234,6 +234,7 @@ BOXEDVN_TEST(bundled_dxvk_overwrites_a_same_size_stale_module) {
     fs::create_directories(destination, ec);
 
     std::ofstream(source / "d3d11.dll", std::ios::binary) << "NEWNEWNEW";
+    std::ofstream(source / "d3d9.dll", std::ios::binary) << "NINENINE";
     std::ofstream(destination / "d3d11.dll", std::ios::binary) << "OLDOLDOLD";
     // Non-DLL files are ignored.
     std::ofstream(source / "README.txt") << "notes";
@@ -243,6 +244,7 @@ BOXEDVN_TEST(bundled_dxvk_overwrites_a_same_size_stale_module) {
     CHECK(installBundledDxvk(source.string(), root.string(), changed, error));
     CHECK(changed);
     CHECK_EQ(readTestFile(destination / "d3d11.dll"), std::string("NEWNEWNEW"));
+    CHECK_EQ(readTestFile(destination / "d3d9.dll"), std::string("NINENINE"));
     CHECK(!fs::exists(destination / "README.txt", ec));
 
     fs::remove_all(temporary, ec);

@@ -327,15 +327,15 @@ mingw toolchain. To rebuild them (Linux or Windows/WSL both work):
 git clone --branch v2.5.2 --recurse-submodules https://github.com/doitsujin/dxvk
 cd dxvk && git apply --unidiff-zero /path/to/dxvk-2.5.2-moltenvk.patch
 meson setup --cross-file build-win32.txt --buildtype release \
-      -Denable_d3d9=false -Denable_d3d8=false build.w32
+      -Denable_d3d9=true -Denable_d3d8=false build.w32
 ninja -C build.w32
-i686-w64-mingw32-strip build.w32/src/{d3d11/d3d11.dll,dxgi/dxgi.dll,d3d10/d3d10core.dll}
+i686-w64-mingw32-strip build.w32/src/{d3d9/d3d9.dll,d3d11/d3d11.dll,dxgi/dxgi.dll,d3d10/d3d10core.dll}
 ```
-D3D9/D3D8 are disabled because current mingw headers already define
-`_D3DDEVINFO_RESOURCEMANAGER`, colliding with DXVK's own copy. The engine
-imports only `d3d11.dll`, so this costs nothing here.
+D3D8 remains disabled. For D3D9, the patch applies upstream's namespace fix
+for `_D3DDEVINFO_RESOURCEMANAGER`, avoiding the duplicate global definition
+in current mingw headers.
 
-Copy the three stripped DLLs over `ios/app/Dxvk/` and commit.
+Copy the four stripped DLLs over `ios/app/Dxvk/` and commit.
 
 ### Do not rebuild DXVK while the JIT defect is being narrowed
 
@@ -346,6 +346,7 @@ frozen and express positions as module + RVA, which is ASLR-independent.
 
 Frozen module hashes (SHA-256):
 ```
+d3d9.dll        8b1ad13c435dc8a990bd075bebdf1795351eab19ed96686797a2b729d947e2ae
 d3d10core.dll  19d682f82b59f33e8fe581b2bb2d283cce7c262b62e5ff4cf891c4b01dce9f86
 d3d11.dll      fd46bf3c2860b2baa039c82f88b37925ae5c6870d962ce058be2a215eafe7a96
 dxgi.dll       37edf9541f50c217e175c2d55a18408a0203efaccc8e0e88f4f568696eccf4ef

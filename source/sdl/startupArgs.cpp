@@ -562,7 +562,17 @@ bool StartUpArgs::apply() {
             klog("-dxvk was enabled but not found in the file system");
         } else {
             for (const char* pName : { "d3d8.dll", "d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll" }) {
-               Fs::addFileNode(parent->path + "/" + pName, dxvkParent->path + "/" + pName, dxvkParent->nativePath + "/" + pName, false, parent);
+                const BString sourcePath = dxvkParent->path + "/" + pName;
+                const BString nativeSourcePath =
+                    dxvkParent->nativePath.stringByApppendingPath(pName);
+                if (!Fs::doesNativePathExist(nativeSourcePath)) {
+                    klog_fmt("DXVK override not bundled: %s", pName);
+                    continue;
+                }
+                Fs::addFileNode(parent->path + "/" + pName, sourcePath,
+                                nativeSourcePath, false, parent);
+                klog_fmt("DXVK override mounted: %s -> %s", pName,
+                         sourcePath.c_str());
             }
         }
     }

@@ -132,6 +132,8 @@ class PEImage:
                 fail(f"{self.path}: export ordinal index is out of range")
             name = c_string(self.data, self.rva_to_offset(name_rva),
                             f"{self.path} export")
+            if name in result:
+                fail(f"{self.path}: duplicate export name {name}")
             result[name] = ordinal_base + ordinal_index
         return result
 
@@ -400,11 +402,7 @@ def validate_graphics_bundle(root: pathlib.Path,
                           values["native_archive_sha256"]):
         fail(f"{manifest_path}: malformed native archive SHA-256")
 
-    pe_dir = root / "dxmt-x64"
-    for filename, requirements in PE_REQUIREMENTS.items():
-        validate_pe(pe_dir / filename, requirements)
-    validate_dxmt_resolution(pe_dir)
-    validate_pe(paths["probe_sha256"], PROBE_REQUIREMENTS)
+    validate_pe_surface(root / "dxmt-x64", paths["probe_sha256"])
     mode = "build artifact" if require_native_archive else "packaged guest assets"
     print(f"x64 graphics manifest ok: {mode}, all checksums and ABIs match")
 
@@ -440,6 +438,27 @@ def validate_pe(path: pathlib.Path, requirements: dict[str, object] | None = Non
         f"PE ABI ok: {path.name} machine=AMD64 exports={len(exports)} "
         f"imports={','.join(sorted(imports)) or '(none)'}"
     )
+
+
+def validate_pe_surface(pe_dir: pathlib.Path,
+                        probe: pathlib.Path | None = None) -> None:
+    """Validate the complete staged DXMT PE surface and its probe.
+
+    Keeping this as one entry point makes direct PE validation and manifest
+    validation enforce the same machine/export/import contract. The manifest
+    remains responsible for hashes and layout; this function is the
+    host/CI-facing ABI gate.
+    """
+    if not pe_dir.is_dir():
+        fail(f"DXMT PE directory is missing: {pe_dir}")
+    for filename, requirements in PE_REQUIREMENTS.items():
+        path = pe_dir / filename
+        if path.is_symlink() or not path.is_file():
+            fail(f"missing required PE module {path}")
+        validate_pe(path, requirements)
+    validate_dxmt_resolution(pe_dir)
+    if probe is not None:
+        validate_pe(probe, PROBE_REQUIREMENTS)
 
 
 def expected_unix_count(repo_root: pathlib.Path) -> int:
@@ -538,12 +557,7 @@ def main() -> int:
     if args.unixlib is not None:
         validate_unixlib(args.unixlib, repo_root)
     if args.pe_dir is not None:
-        for filename, requirements in PE_REQUIREMENTS.items():
-            path = args.pe_dir / filename
-            if not path.is_file():
-                fail(f"missing required PE module {path}")
-            validate_pe(path, requirements)
-        validate_dxmt_resolution(args.pe_dir)
+        validate_pe_surface(args.pe_dir)
     if args.probe is not None:
         validate_pe(args.probe, PROBE_REQUIREMENTS)
     if args.graphics_dir is not None:

@@ -8,6 +8,7 @@ add_library(boxedvn_support STATIC
     src/engine_profile.cpp
     src/elf_inspector.cpp
     src/fex64_kernel.cpp
+    src/fex32_backend_admission.cpp
     src/fex32_backend_descriptor.cpp
     src/guest_address_contract32.cpp
     src/guest_address_space.cpp

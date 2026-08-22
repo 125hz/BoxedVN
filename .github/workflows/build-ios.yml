@@ -248,10 +248,44 @@ jobs:
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
 
+  fex-translator-probe:
+    name: FEX loader-path translator probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out BoxedVN
+        uses: actions/checkout@v6
+
+      - name: Install translator-probe tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang cmake ninja-build nasm python3
+
+      - name: Restore translator-probe cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/fex64/fex
+            build/fex-vixl-probe
+          key: boxedvn-fex-vixl-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/run-fex64-vixl-probe.sh', 'scripts/guest-probes/fex64-loader-stall.asm') }}
+
+      - name: Fetch pinned translator source
+        shell: bash
+        run: bash scripts/fetch-fex64-dependencies.sh --component fex
+
+      - name: Run loader-path fixture through ARM64 simulator
+        shell: bash
+        env:
+          CC: clang
+          CXX: clang++
+        run: bash scripts/run-fex64-vixl-probe.sh
+
   ipa:
     name: Unsigned IPA (${{ inputs.configuration || 'Release' }})
     needs:
       - guest-probe
+      - fex-translator-probe
       - tests
       - wine64-runtime
       - x64-graphics-assets
@@ -384,6 +418,10 @@ jobs:
           missing=0
           for relative in \
             boxedvn-fex64-kernel-probe \
+            Dxvk/d3d9.dll \
+            Dxvk/d3d10core.dll \
+            Dxvk/d3d11.dll \
+            Dxvk/dxgi.dll \
             boxedwine64-runtime/glibc-rootfs64.zip \
             boxedwine64-runtime/wine64.zip \
             boxedwine64-runtime/wine64-runtime.manifest \
