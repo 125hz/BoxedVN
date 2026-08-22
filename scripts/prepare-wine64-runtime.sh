@@ -47,4 +47,4 @@ done
 args=(--input "${INPUT}" --output-dir "${OUTPUT_DIR}")
 [[ -n "${MANIFEST}" ]] && args+=(--manifest "${MANIFEST}")
 [[ ${ALLOW_UNPINNED} -eq 1 ]] && args+=(--allow-unpinned)
-exec "${SCRIPT_DIR}/validate-wine64-runtime.sh" "${args[@]}"
+exec bash "${SCRIPT_DIR}/validate-wine64-runtime.sh" "${args[@]}"

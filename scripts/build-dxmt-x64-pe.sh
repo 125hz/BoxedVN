@@ -64,7 +64,12 @@ build_llvm() {
     if [[ ${FORCE} -eq 0 && -f "${prefix}/lib/libLLVMCore.a" ]]; then
         ok "LLVM ${kind}: cached"; return 0
     fi
-    rm -rf "${build}" "${prefix}"; mkdir -p "${build}"
+    if [[ ${FORCE} -eq 1 ]]; then
+        rm -rf "${build}" "${prefix}"
+    else
+        rm -rf "${prefix}"
+    fi
+    mkdir -p "${build}"
     local args=(
         -S "${LLVM_SOURCE}/llvm" -B "${build}" -G Ninja
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${prefix}"
@@ -81,7 +86,11 @@ build_llvm() {
             -DCMAKE_SYSROOT="${MINGW_ROOT}"
             -DCMAKE_C_COMPILER="${MINGW_BIN}/x86_64-w64-mingw32-gcc"
             -DCMAKE_CXX_COMPILER="${MINGW_BIN}/x86_64-w64-mingw32-g++" )
-    cmake "${args[@]}"; cmake --build "${build}" --parallel "${JOBS}"
+    if [[ -f "${build}/CMakeCache.txt" ]]; then
+        ok "LLVM ${kind}: reconfiguring cached build tree"
+    fi
+    cmake "${args[@]}"
+    cmake --build "${build}" --parallel "${JOBS}"
     cmake --install "${build}"
     [[ -f "${prefix}/lib/libLLVMCore.a" ]] || die "LLVM ${kind} produced no libLLVMCore.a."
     ok "LLVM ${kind}: ${prefix}"
