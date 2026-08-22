@@ -43,6 +43,14 @@ for instruction in movlpd movhpd pcmpeqb psubb pmovmskb bsf; do
         exit 1
     }
 done
+grep -Eq '[[:space:]]rep[[:space:]]+stos' <<<"${disassembly}" || {
+    echo "error: the kernel probe is missing its REP STOS fill path" >&2
+    exit 1
+}
+grep -Eq '[[:space:]]add[[:space:]].*0x40.*%rdx' <<<"${disassembly}" || {
+    echo "error: the kernel probe is missing its normalized loader pointer update" >&2
+    exit 1
+}
 grep -Eq '[[:space:]]sub[[:space:]].*0xffff' <<<"${disassembly}" || {
     echo "error: the kernel probe is missing its scalar mask subtraction" >&2
     exit 1
@@ -59,8 +67,8 @@ grep -Eq '[[:space:]]ret[[:space:]]*$' <<<"${disassembly}" || {
     echo "error: the kernel probe is missing its guest return path" >&2
     exit 1
 }
-strings "${output}" | grep -Fq 'BoxedWine FEX64 SSE2 strcmp/call-ret PASS' || {
-    echo "error: the kernel probe is missing its SSE2 success marker" >&2
+strings "${output}" | grep -Fq 'BoxedWine FEX64 SSE2/REP STOS/call-ret PASS' || {
+    echo "error: the kernel probe is missing its translated-memory success marker" >&2
     exit 1
 }
 
@@ -69,11 +77,11 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
     native_output="$("${output}" 2>&1)"
     native_status=$?
     set -e
-    [[ ${native_status} -eq 45 ]] || {
-        echo "error: native kernel probe returned ${native_status}, expected 45" >&2
+    [[ ${native_status} -eq 47 ]] || {
+        echo "error: native kernel probe returned ${native_status}, expected 47" >&2
         exit 1
     }
-    [[ "${native_output}" == 'BoxedWine FEX64 SSE2 strcmp/call-ret PASS' ]] || {
+    [[ "${native_output}" == 'BoxedWine FEX64 SSE2/REP STOS/call-ret PASS' ]] || {
         echo "error: native kernel probe produced unexpected output" >&2
         printf '%s\n' "${native_output}" >&2
         exit 1

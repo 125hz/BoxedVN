@@ -105,7 +105,7 @@ constexpr size_t kPoolBytes = 64u * 1024u * 1024u;
 constexpr size_t kMinimumPoolBytes = 4u * 1024u * 1024u;
 constexpr size_t kGuestCodeBytes = kPageBytes;
 constexpr size_t kGuestStackBytes = 256u * 1024u;
-constexpr uint64_t kExpectedExitCode = 45;
+constexpr uint64_t kExpectedExitCode = 47;
 
 std::mutex gProbeMutex;
 std::mutex gReportMutex;
@@ -736,7 +736,7 @@ bool mapRawGuestProbe() {
 }
 
 bool mapGuestProbe() {
-    reportf("preparing the bundled SSE2/call-ret process against BoxedWine's CPU64 kernel state");
+    reportf("preparing the bundled SSE2/REP-STOS/call-ret process against BoxedWine's CPU64 kernel state");
     return mapBundledELFProbe();
 }
 
@@ -1385,11 +1385,11 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     gStage.store(BVNFEXBackendStageKernelEntered, std::memory_order_release);
     if (!gProbeExited.load(std::memory_order_acquire) ||
         gProbeExitCode.load(std::memory_order_acquire) != kExpectedExitCode) {
-        reportf("BoxedWine kernel exit mismatch: expected 45, observed %d",
+        reportf("BoxedWine kernel exit mismatch: expected 47, observed %d",
                 static_cast<int>(gProbeExitCode.load(std::memory_order_acquire)));
         return gStage.load();
     }
-    reportf("x86-64 SSE2 strcmp/call-ret probe passed through FEX and "
+    reportf("x86-64 SSE2/REP-STOS/call-ret probe passed through FEX and "
             "returned through BoxedWine's CPU64 syscall dispatcher "
             "(translated pool used %zu KiB)",
             gPoolUsed.load() / 1024);

@@ -19,6 +19,31 @@ _start:
     cmp $-12, %eax
     jne unequal_failed
 
+    /* The pinned dynamic loader clears its final data segment with an SSE2
+     * loop. Device traces showed that loop repeatedly returning to its
+     * pointer-update edge after mmap had already succeeded. Prove both a
+     * bulk fill and the normalized positive-add form of that loop before
+     * launching a real guest. */
+    lea rep_stos_buffer(%rip), %rdi
+    mov $0x5a, %esi
+    mov $0x6000, %edx
+    call rep_stos_probe
+    lea rep_stos_buffer(%rip), %rcx
+    cmp %rcx, %rax
+    jne rep_stos_failed
+    cmpb $0x5a, (%rcx)
+    jne rep_stos_failed
+    cmpb $0x5a, 0x5fff(%rcx)
+    jne rep_stos_failed
+    lea rep_stos_buffer(%rip), %rdx
+    lea rep_stos_buffer+0x6000(%rip), %rdi
+    call normalized_pointer_probe
+    lea rep_stos_buffer(%rip), %rcx
+    cmpb $0, (%rcx)
+    jne rep_stos_failed
+    cmpb $0, 0x5fff(%rcx)
+    jne rep_stos_failed
+
     mov $1, %rax
     mov $1, %rdi
     lea success_message(%rip), %rsi
@@ -28,7 +53,7 @@ _start:
     mov $60, %rax
     // Versioned success code: the older scalar-only probe returned 42. A
     // stale packaged binary must not satisfy this stronger acceptance gate.
-    mov $45, %rdi
+    mov $47, %rdi
     syscall
     ud2
 
@@ -51,6 +76,17 @@ unequal_failed:
     syscall
     mov $60, %rax
     mov $44, %rdi
+    syscall
+    ud2
+
+rep_stos_failed:
+    mov $1, %rax
+    mov $1, %rdi
+    lea rep_stos_failure(%rip), %rsi
+    mov $(rep_stos_failure_end-rep_stos_failure), %rdx
+    syscall
+    mov $60, %rax
+    mov $46, %rdi
     syscall
     ud2
 
@@ -85,6 +121,31 @@ strcmp_vector_found:
     movzbl (%rsi,%rcx), %edx
     sub %edx, %eax
     ret
+
+/* Semantically equivalent replacement for the loader's vector memset path.
+ * R9 is caller-saved in the x86-64 System V ABI, so it can retain the return
+ * value while REP STOSB consumes RDI/RCX/AL. */
+rep_stos_probe:
+    mov %rdi, %r9
+    mov %rdx, %rcx
+    mov %sil, %al
+    rep stosb
+    mov %r9, %rax
+    ret
+
+/* Mirrors the loader loop after its guarded `sub rdx, -64` to `add rdx, 64`
+ * normalization. The compare immediately after the update owns the flags. */
+normalized_pointer_probe:
+    pxor %xmm0, %xmm0
+normalized_pointer_loop:
+    movaps %xmm0, (%rdx)
+    movaps %xmm0, 0x10(%rdx)
+    movaps %xmm0, 0x20(%rdx)
+    movaps %xmm0, 0x30(%rdx)
+    add $0x40, %rdx
+    cmp %rdi, %rdx
+    jb normalized_pointer_loop
+    ret
     .size _start, .-_start
 
     .section .rodata
@@ -104,7 +165,7 @@ unequal_left:
     .byte 0
     .fill 15, 1, 0
 success_message:
-    .ascii "BoxedWine FEX64 SSE2 strcmp/call-ret PASS\n"
+    .ascii "BoxedWine FEX64 SSE2/REP STOS/call-ret PASS\n"
 success_message_end:
 equal_failure:
     .ascii "BoxedWine FEX64 SSE2 equal comparison FAIL\n"
@@ -112,3 +173,11 @@ equal_failure_end:
 unequal_failure:
     .ascii "BoxedWine FEX64 SSE2 unequal comparison FAIL\n"
 unequal_failure_end:
+rep_stos_failure:
+    .ascii "BoxedWine FEX64 REP STOS fill FAIL\n"
+rep_stos_failure_end:
+
+    .section .bss
+    .balign 64
+rep_stos_buffer:
+    .skip 0x6000

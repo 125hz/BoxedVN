@@ -582,7 +582,7 @@ BVNFEXBackendStage probeFexWithTimeout() {
                       kJitProbeTimeoutSeconds * NSEC_PER_SEC));
     if (timedOut != 0) {
         BVNLogWrite(BVNLogLevelError, "fex64",
-                    "The translated SSE2/call-ret correctness probe did not "
+                    "The translated SSE2/REP-STOS/call-ret correctness probe did not "
                     "return within six seconds. The x86-64 guest will not be "
                     "started on top of a stuck translator worker; force-quit "
                     "BoxedVN before retrying.");

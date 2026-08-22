@@ -12,6 +12,8 @@
 #include "loader64.h"
 #include "elfloaderpolicy64.h"
 #include "kelf64.h"
+#include <algorithm>
+#include <array>
 #ifdef BOXEDWINE_GUEST_X64
 #include "kmemory64.h"
 #include "cpu64.h"
@@ -233,6 +235,100 @@ static U32 phdrFlagsToProt(U32 pFlags) {
     if (pFlags & 0x2) prot |= K_PROT_WRITE;
     if (pFlags & 0x1) prot |= K_PROT_EXEC;
     return prot;
+}
+
+enum class FEX64InterpreterNormalization {
+    NotNeeded,
+    Applied,
+    Failed,
+};
+
+// The pinned glibc loader contains an SSE2 memset loop whose forward pointer
+// update is encoded as `sub rdx, -64`.  Device traces show the translated
+// process repeatedly returning to that update after its final data mapping
+// succeeds, while the equivalent `add rdx, 64` form is used successfully
+// throughout the same startup path.  Normalize only this complete instruction
+// context, before any guest code is dispatched.  The following compare owns
+// the flags, so the two encodings are semantically identical here.
+static FEX64InterpreterNormalization normalizeFEX64InterpreterMemset(
+        KMemory64* mem, const Elf64ParseResult& image, U64 base) {
+    if (!mem || !mem->nativeIdentityMode()) {
+        return FEX64InterpreterNormalization::NotNeeded;
+    }
+
+    static constexpr std::array<U8, 24> kPattern = {
+        0x0f, 0x29, 0x02,             // movaps [rdx], xmm0
+        0x0f, 0x29, 0x42, 0x10,       // movaps [rdx+0x10], xmm0
+        0x0f, 0x29, 0x42, 0x20,       // movaps [rdx+0x20], xmm0
+        0x0f, 0x29, 0x42, 0x30,       // movaps [rdx+0x30], xmm0
+        0x48, 0x83, 0xea, 0xc0,       // sub rdx, -64
+        0x48, 0x39, 0xfa,             // cmp rdx, rdi
+        0x72, 0xe8,                   // jb loop
+    };
+    static constexpr std::array<U8, 4> kReplacement = {
+        0x48, 0x83, 0xc2, 0x40,       // add rdx, 64
+    };
+    constexpr U64 kUpdateOffset = 15;
+
+    U64 matchAddress = 0;
+    U32 matchProtection = 0;
+    U32 matchCount = 0;
+    for (const Elf64LoadSegment& segment : image.segments) {
+        if (!(segment.flags & PF_X) || segment.filesz < kPattern.size() ||
+            segment.filesz > SIZE_MAX) {
+            continue;
+        }
+        std::vector<U8> bytes((size_t)segment.filesz);
+        mem->memcpyFromGuest(bytes.data(), segment.vaddr + base,
+                             segment.filesz);
+        auto cursor = bytes.cbegin();
+        while (cursor != bytes.cend()) {
+            auto found = std::search(cursor, bytes.cend(),
+                                     kPattern.cbegin(), kPattern.cend());
+            if (found == bytes.cend()) break;
+            const U64 offset = (U64)std::distance(bytes.cbegin(), found);
+            matchAddress = segment.vaddr + base + offset;
+            matchProtection = phdrFlagsToProt(segment.flags);
+            matchCount++;
+            cursor = found + 1;
+        }
+    }
+
+    if (matchCount == 0) {
+        klog("loadProgram64: translated-loader pointer normalization not required");
+        return FEX64InterpreterNormalization::NotNeeded;
+    }
+    if (matchCount != 1) {
+        klog_fmt("loadProgram64: refusing ambiguous translated-loader pointer normalization (matches=%u)",
+                 matchCount);
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    const U64 pageAddress = matchAddress & ~K64_PAGE_MASK;
+    if (mem->mprotect(pageAddress, K64_PAGE_SIZE,
+                      K_PROT_READ | K_PROT_WRITE) != pageAddress) {
+        klog_fmt("loadProgram64: translated-loader pointer normalization could not make 0x%llx writable",
+                 (unsigned long long)matchAddress);
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    mem->memcpyToGuest(matchAddress + kUpdateOffset, kReplacement.data(),
+                       kReplacement.size());
+    std::array<U8, kReplacement.size()> verify = {};
+    mem->memcpyFromGuest(verify.data(), matchAddress + kUpdateOffset,
+                         verify.size());
+    const bool restored = mem->mprotect(pageAddress, K64_PAGE_SIZE,
+                                        matchProtection) == pageAddress;
+    if (!restored || verify != kReplacement) {
+        klog_fmt("loadProgram64: translated-loader pointer normalization failed at 0x%llx (write=%d restore=%d)",
+                 (unsigned long long)(matchAddress + kUpdateOffset),
+                 verify == kReplacement ? 1 : 0, restored ? 1 : 0);
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    klog_fmt("loadProgram64: normalized translated-loader memset pointer update at 0x%llx",
+             (unsigned long long)(matchAddress + kUpdateOffset));
+    return FEX64InterpreterNormalization::Applied;
 }
 
 template <typename CopySegment>
@@ -1068,6 +1164,12 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         // this, _dl_start crashes on the first indirect call through its
         // own GOT.)
         applyRelativeRelocations(mem, interpR.dynamic, interpBase, "interp");
+        if (normalizeFEX64InterpreterMemset(mem, interpR, interpBase) ==
+            FEX64InterpreterNormalization::Failed) {
+            interpNode->close();
+            delete interpNode;
+            return false;
+        }
         // Control transfers to the interpreter, not the exe.
         *rip = interpR.entry + interpBase;
         klog_fmt("loadProgram64: interp '%s' mapped at base 0x%llx, RIP=0x%llx",
