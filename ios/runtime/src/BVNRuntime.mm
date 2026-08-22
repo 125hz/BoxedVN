@@ -79,6 +79,10 @@ bool gShutdownRequested = false;
 // never cleared if that call never returns.  See probeJitWithTimeout() below
 // for why a hang, not just a crash, has to be planned for.
 std::atomic<bool> gJitProbeInFlight{false};
+// The FEX correctness probe executes translated guest code and can fail by
+// hanging rather than returning an error.  Track an abandoned worker exactly
+// as the executable-memory probe does so a later launch cannot race it.
+std::atomic<bool> gFexProbeInFlight{false};
 
 void setState(BVNRuntimeState state) {
     pthread_mutex_lock(&gMutex);
@@ -550,6 +554,43 @@ BVNJITReport probeJitWithTimeout() {
     return probeResult;
 }
 
+BVNFEXBackendStage probeFexWithTimeout() {
+    const BVNFEXBackendStage current = BVNFEXBackendStageReached();
+    if (current == BVNFEXBackendStageExecuted) {
+        return current;
+    }
+    if (gFexProbeInFlight.exchange(true)) {
+        BVNLogWrite(BVNLogLevelError, "fex64",
+                    "A previous translated correctness probe is still "
+                    "running. Refusing to start another FEX session until "
+                    "the app is restarted.");
+        return BVNFEXBackendStageReached();
+    }
+
+    __block BVNFEXBackendStage result = current;
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+    dispatch_async(
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            result = BVNFEXBackendProbe();
+            gFexProbeInFlight.store(false);
+            dispatch_semaphore_signal(finished);
+        });
+
+    const long timedOut = dispatch_semaphore_wait(
+        finished,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      kJitProbeTimeoutSeconds * NSEC_PER_SEC));
+    if (timedOut != 0) {
+        BVNLogWrite(BVNLogLevelError, "fex64",
+                    "The translated SSE2/call-ret correctness probe did not "
+                    "return within six seconds. The x86-64 guest will not be "
+                    "started on top of a stuck translator worker; force-quit "
+                    "BoxedVN before retrying.");
+        return BVNFEXBackendStageReached();
+    }
+    return result;
+}
+
 bool configureMoltenVKForWineD3D(std::string& error) {
     // WineD3D's D3D11 compatibility path does not need the very large bindless
     // descriptor capacity supplied by Metal argument buffers. On this device,
@@ -796,6 +837,23 @@ void runSession(const BVNLaunchConfiguration& launch) {
             jit.detail);
         setState(BVNRuntimeStateFailed);
         return;
+    }
+
+    if (launch.useFEX64) {
+        const BVNFEXBackendStage fexStage = probeFexWithTimeout();
+        const char* fexReport = BVNFEXBackendReport();
+        BVNLogWrite(fexStage == BVNFEXBackendStageExecuted
+                        ? BVNLogLevelInfo : BVNLogLevelError,
+                    "fex64", fexReport ? fexReport : "FEX produced no report.");
+        if (fexStage != BVNFEXBackendStageExecuted) {
+            setLastError(
+                std::string("The FEX x86-64 correctness probe stopped at '") +
+                BVNFEXBackendStageName(fexStage) +
+                "', so the Wine64 guest was not started. See the FEX log "
+                "for its SSE2/call-ret result.");
+            setState(BVNRuntimeStateFailed);
+            return;
+        }
     }
 
     const std::vector<std::string> argumentStrings =

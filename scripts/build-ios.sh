@@ -172,6 +172,13 @@ cmake_options=(
 if [[ ${ENABLE_FEX64} -eq 1 ]]; then
     require_file "${FEX64_PREFIX}/lib/libFEXCore.a" \
         "Run scripts/build-fex64-fex.sh before enabling the optional FEX backend."
+    require_file "${BOXEDVN_ROOT}/build/guest-probes/boxedvn-fex64-kernel-probe" \
+        "Run scripts/build-guest-fex64-probe.sh before enabling the optional FEX backend."
+    strings "${BOXEDVN_ROOT}/build/guest-probes/boxedvn-fex64-kernel-probe" | \
+        grep -Fq 'BoxedWine FEX64 SSE2 strcmp/call-ret PASS' || {
+        echo "error: the bundled FEX correctness probe is stale; rebuild it" >&2
+        exit 1
+    }
     cmake_options+=(
         -DBOXEDVN_ENABLE_FEX64=ON
         -DBOXEDVN_ENABLE_GUEST_X64=ON
@@ -386,7 +393,16 @@ ok "Built ${APP_PATH}"
 if [[ -n "${DXMT_NATIVE_ARCHIVE}" ]]; then
     export BOXEDVN_REQUIRE_DXMT_NATIVE=1
 fi
+if [[ ${ENABLE_FEX64} -eq 1 ]]; then
+    export BOXEDVN_REQUIRE_FEX_PROBE=1
+fi
 "${BOXEDVN_SCRIPT_DIR}/validate-app.sh" "${APP_PATH}"
+if [[ ${ENABLE_FEX64} -eq 1 ]]; then
+    cmp "${BOXEDVN_ROOT}/build/guest-probes/boxedvn-fex64-kernel-probe" \
+        "${APP_PATH}/boxedvn-fex64-kernel-probe" \
+        || die "The bundled FEX correctness probe differs from the validated CI input."
+    ok "bundled FEX correctness probe matches the validated input"
+fi
 
 printf '\n'
 log "Build complete"

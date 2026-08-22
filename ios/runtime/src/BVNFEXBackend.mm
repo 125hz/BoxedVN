@@ -100,7 +100,7 @@ constexpr size_t kPoolBytes = 64u * 1024u * 1024u;
 constexpr size_t kMinimumPoolBytes = 4u * 1024u * 1024u;
 constexpr size_t kGuestCodeBytes = kPageBytes;
 constexpr size_t kGuestStackBytes = 256u * 1024u;
-constexpr uint64_t kExpectedExitCode = 42;
+constexpr uint64_t kExpectedExitCode = 45;
 
 std::mutex gProbeMutex;
 std::mutex gReportMutex;
@@ -510,6 +510,7 @@ bool mapBundledELFProbe() {
     NSString* path = [[NSBundle mainBundle]
         pathForResource:@"boxedvn-fex64-kernel-probe" ofType:nil];
     if (path == nil) {
+        reportf("the bundled ELF64 correctness probe is missing");
         return false;
     }
     NSData* data = [NSData dataWithContentsOfFile:path];
@@ -542,8 +543,10 @@ bool mapBundledELFProbe() {
     const size_t mappingSize = static_cast<size_t>(last - first);
     void* mapping = mmap(nullptr, mappingSize, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mapping == MAP_FAILED) {
-        reportf("the bundled ELF64 load span could not be mapped");
+    gGuestStack = mmap(nullptr, kGuestStackBytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mapping == MAP_FAILED || gGuestStack == MAP_FAILED) {
+        reportf("the bundled ELF64 load span or stack could not be mapped");
         return false;
     }
     std::memset(mapping, 0, mappingSize);
@@ -563,17 +566,47 @@ bool mapBundledELFProbe() {
         reportf("the bundled ELF64 entry lies outside its load span");
         return false;
     }
-    if (!gAddressSpace.add({reinterpret_cast<uint64_t>(mapping), mappingSize,
-                            reinterpret_cast<uintptr_t>(mapping),
-                            boxedvn::GuestMemoryRead |
-                            boxedvn::GuestMemoryWrite |
-                            boxedvn::GuestMemoryExecute})) {
-        reportf("the bundled ELF64 mapping could not be registered");
+    const auto addIdentity = [](void* pointer, size_t size, uint8_t access) {
+        return gAddressSpace.add({reinterpret_cast<uint64_t>(pointer), size,
+                                  reinterpret_cast<uintptr_t>(pointer), access});
+    };
+    if (!addIdentity(mapping, mappingSize,
+                     boxedvn::GuestMemoryRead |
+                     boxedvn::GuestMemoryWrite |
+                     boxedvn::GuestMemoryExecute) ||
+        !addIdentity(gGuestStack, kGuestStackBytes,
+                     boxedvn::GuestMemoryRead | boxedvn::GuestMemoryWrite)) {
+        reportf("the bundled ELF64 mapping or stack could not be registered");
         return false;
     }
+
+    // FEX fetches and accesses the identity-mapped host image directly.  The
+    // BoxedWine CPU64 mirror is still required because write/exit return
+    // through the real syscall dispatcher, which reads guest buffers through
+    // KMemory64 rather than through FEX's host pointer.
+    gProbeMemory = std::make_unique<KMemory64>(nullptr);
+    gProbeCPU = std::make_unique<CPU64>(gProbeMemory.get());
+    const uint64_t mappingAddress = reinterpret_cast<uint64_t>(mapping);
+    const uint64_t stackAddress = reinterpret_cast<uint64_t>(gGuestStack);
+    const uint64_t mirroredImage = gProbeMemory->mmapAnonymousFixed(
+        mappingAddress, mappingSize, 0x7);
+    const uint64_t mirroredStack = gProbeMemory->mmapAnonymousFixed(
+        stackAddress, kGuestStackBytes, 0x3);
+    if (mirroredImage != mappingAddress || mirroredStack != stackAddress) {
+        reportf("the CPU64 correctness mirror failed: image=0x%llx stack=0x%llx",
+                static_cast<unsigned long long>(mirroredImage),
+                static_cast<unsigned long long>(mirroredStack));
+        return false;
+    }
+    gProbeMemory->memcpyToGuest(
+        mappingAddress, mapping, mappingSize);
+
     gGuestCode = mapping;
     gGuestEntry = reinterpret_cast<uint64_t>(mapping) + entryOffset;
-    reportf("loaded bundled PIE ELF64 process: %zu segments, entry=%p",
+    gProbeCPU->rip = gGuestEntry;
+    gProbeCPU->reg[X64_RSP].setU64(
+        reinterpret_cast<uint64_t>(gGuestStack) + kGuestStackBytes - 0x100);
+    reportf("loaded bundled PIE ELF64 correctness process: %zu segments, entry=%p",
             image.loadSegments.size(), reinterpret_cast<void*>(gGuestEntry));
     return true;
 }
@@ -641,8 +674,8 @@ bool mapRawGuestProbe() {
 }
 
 bool mapGuestProbe() {
-    reportf("preparing a translated process against BoxedWine's CPU64 kernel state");
-    return mapRawGuestProbe();
+    reportf("preparing the bundled SSE2/call-ret process against BoxedWine's CPU64 kernel state");
+    return mapBundledELFProbe();
 }
 
 FEXCore::HLE::ExecutableRangeInfo queryLiveExecutableRange(uint64_t address) {
@@ -1085,12 +1118,13 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     gStage.store(BVNFEXBackendStageKernelEntered, std::memory_order_release);
     if (!gProbeExited.load(std::memory_order_acquire) ||
         gProbeExitCode.load(std::memory_order_acquire) != kExpectedExitCode) {
-        reportf("BoxedWine kernel exit mismatch: expected 42, observed %d",
+        reportf("BoxedWine kernel exit mismatch: expected 45, observed %d",
                 static_cast<int>(gProbeExitCode.load(std::memory_order_acquire)));
         return gStage.load();
     }
-    reportf("x86-64 executed through FEX and returned through BoxedWine's "
-            "CPU64 syscall dispatcher (translated pool used %zu KiB)",
+    reportf("x86-64 SSE2 strcmp/call-ret probe passed through FEX and "
+            "returned through BoxedWine's CPU64 syscall dispatcher "
+            "(translated pool used %zu KiB)",
             gPoolUsed.load() / 1024);
     gStage.store(BVNFEXBackendStageExecuted, std::memory_order_release);
     return BVNFEXBackendStageExecuted;

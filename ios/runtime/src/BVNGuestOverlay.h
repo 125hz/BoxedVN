@@ -50,7 +50,10 @@ void BVNGuestOverlayRemove(void);
 // The Wine startup notice: proper UIKit text over SDL's backdrop, replacing the
 // bitmap font that could not be read at a useful size.
 void BVNGuestStartupNoticeSetVisible(bool visible);
-void BVNGuestStartupNoticeSetProgress(size_t jitBlocks);
+// Records executable-memory allocator progress. This is not a translated-code
+// count; the startup notice derives real translation activity from the live
+// session log instead.
+void BVNGuestStartupNoticeSetProgress(size_t allocationCount);
 
 // Applies state requested off the main thread and keeps the overlay above
 // SDL's views.  Cheap; called from the emulator's own event loop.

@@ -389,6 +389,7 @@ jobs:
           fi
           missing=0
           for relative in \
+            boxedvn-fex64-kernel-probe \
             boxedwine64-runtime/glibc-rootfs64.zip \
             boxedwine64-runtime/wine64.zip \
             boxedwine64-runtime/wine64-runtime.manifest \
@@ -406,6 +407,8 @@ jobs:
           if [[ ${missing} -ne 0 ]]; then
             exit 1
           fi
+          cmp build/guest-probes/boxedvn-fex64-kernel-probe \
+              "${app}/boxedvn-fex64-kernel-probe"
           echo "Wine64 and x86-64 DXMT resources present in app bundle."
 
       - name: Package increased-memory entitlement template

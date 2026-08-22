@@ -11,6 +11,8 @@ output="${output_dir}/boxedvn-fex64-kernel-probe"
 
 command -v cc >/dev/null || { echo "error: a native x86-64 C compiler is required" >&2; exit 1; }
 command -v readelf >/dev/null || { echo "error: readelf is required" >&2; exit 1; }
+command -v objdump >/dev/null || { echo "error: objdump is required" >&2; exit 1; }
+command -v strings >/dev/null || { echo "error: strings is required" >&2; exit 1; }
 mkdir -p "${output_dir}"
 
 cc -nostdlib -fPIE -pie \
@@ -27,6 +29,55 @@ grep -q 'Type:[[:space:]]*DYN' <<<"${header}"
 if readelf -l "${output}" | grep -q 'INTERP'; then
     echo "error: the kernel probe unexpectedly needs a host dynamic linker" >&2
     exit 1
+fi
+if readelf -rW "${output}" | grep -q 'R_X86_64_'; then
+    echo "error: the kernel probe has relocations the custom guest mapper cannot apply" >&2
+    readelf -rW "${output}" >&2
+    exit 1
+fi
+
+disassembly="$(objdump -d "${output}")"
+for instruction in movlpd movhpd pcmpeqb psubb pmovmskb bsf; do
+    grep -Eq "[[:space:]]${instruction}[[:space:]]" <<<"${disassembly}" || {
+        echo "error: the kernel probe is missing ${instruction}" >&2
+        exit 1
+    }
+done
+grep -Eq '[[:space:]]sub[[:space:]].*0xffff' <<<"${disassembly}" || {
+    echo "error: the kernel probe is missing its scalar mask subtraction" >&2
+    exit 1
+}
+grep -Eq '[[:space:]]jne[[:space:]].*<strcmp_vector_found>' <<<"${disassembly}" || {
+    echo "error: the kernel probe is missing its mask branch" >&2
+    exit 1
+}
+grep -Eq '[[:space:]]call[[:space:]].*<strcmp_vector_probe>' <<<"${disassembly}" || {
+    echo "error: the kernel probe is missing its guest call path" >&2
+    exit 1
+}
+grep -Eq '[[:space:]]ret[[:space:]]*$' <<<"${disassembly}" || {
+    echo "error: the kernel probe is missing its guest return path" >&2
+    exit 1
+}
+strings "${output}" | grep -Fq 'BoxedWine FEX64 SSE2 strcmp/call-ret PASS' || {
+    echo "error: the kernel probe is missing its SSE2 success marker" >&2
+    exit 1
+}
+
+if [[ "$(uname -m)" == "x86_64" ]]; then
+    set +e
+    native_output="$("${output}" 2>&1)"
+    native_status=$?
+    set -e
+    [[ ${native_status} -eq 45 ]] || {
+        echo "error: native kernel probe returned ${native_status}, expected 45" >&2
+        exit 1
+    }
+    [[ "${native_output}" == 'BoxedWine FEX64 SSE2 strcmp/call-ret PASS' ]] || {
+        echo "error: native kernel probe produced unexpected output" >&2
+        printf '%s\n' "${native_output}" >&2
+        exit 1
+    }
 fi
 
 shasum -a 256 "${output}" > "${output}.sha256"

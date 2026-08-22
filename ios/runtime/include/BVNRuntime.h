@@ -414,7 +414,8 @@ int BVNGuestMain(int argc, char* argv[]);
 // session.
 void BVNRuntimeNotifyFrontendReady(void);
 
-// Thread-safe progress signal consumed by SDL's native loading screen.
+// Thread-safe executable-memory allocation signal. It must not be presented
+// as a translated-code count: one allocation can contain many translations.
 void BVNGuestLoadingUpdateJITProgress(size_t allocationCount);
 
 #ifdef __cplusplus

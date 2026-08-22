@@ -35,7 +35,7 @@ extern "C" void BVNAttachGuestWindowToScene(void);
 extern "C" bool BVNGuestPresentationContentRect(int* x, int* y, int* w, int* h);
 // The startup notice is UIKit text over SDL's backdrop; see BVNGuestOverlay.mm.
 extern "C" void BVNGuestStartupNoticeSetVisible(bool visible);
-extern "C" void BVNGuestStartupNoticeSetProgress(size_t jitBlocks);
+extern "C" void BVNGuestStartupNoticeSetProgress(size_t allocationCount);
 extern "C" void BVNGuestCursorDefine(U32 id, const U8* bgraPixels,
                                       int width, int height,
                                       int hotX, int hotY);
@@ -50,6 +50,8 @@ KNativeScreenSDL* gIOSActiveScreen = nullptr;
 
 extern "C" void BVNGuestLoadingUpdateJITProgress(size_t allocationCount) {
     gIOSJITAllocationCount.store(allocationCount, std::memory_order_relaxed);
+    // One allocation can hold thousands of translations. The UIKit startup
+    // notice gets the real translation addresses from the session log.
     BVNGuestStartupNoticeSetProgress(allocationCount);
 }
 

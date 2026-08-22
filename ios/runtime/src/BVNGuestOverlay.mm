@@ -321,7 +321,15 @@ static NSString* const kBVNPerformanceBatteryKey =
 
 // The startup notice shown while Wine boots.
 @property (nonatomic, strong) UIView* startupNotice;
+@property (nonatomic, strong) UILabel* startupStateBadge;
 @property (nonatomic, strong) UILabel* startupProgress;
+@property (nonatomic, strong) UILabel* startupMetrics;
+@property (nonatomic, strong) UILabel* startupLog;
+@property (nonatomic, assign) uint64_t appliedStartupLogGeneration;
+@property (nonatomic, assign) NSTimeInterval startupLastActivityTime;
+@property (nonatomic, copy) NSString* startupActivitySignature;
+@property (nonatomic, assign) NSUInteger startupTranslationCount;
+@property (nonatomic, copy) NSString* startupLastRIP;
 
 // A latched Ctrl that outlives the keyboard would leave the guest convinced a
 // key is held down with no way to release it.
@@ -355,6 +363,38 @@ std::mutex gGuestCursorMutex;
 std::unordered_map<uint32_t, BVNGuestCursorBitmap> gGuestCursorBitmaps;
 
 }  // namespace
+
+static NSString* BVNStartupTokenAfter(NSString* line, NSString* marker) {
+    const NSRange markerRange = [line rangeOfString:marker];
+    if (markerRange.location == NSNotFound) {
+        return nil;
+    }
+    const NSUInteger start = NSMaxRange(markerRange);
+    NSRange end = [line rangeOfCharacterFromSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet
+                                             options:0
+                                               range:NSMakeRange(
+                                                   start,
+                                                   line.length - start)];
+    const NSUInteger length = end.location == NSNotFound
+        ? line.length - start
+        : end.location - start;
+    return [line substringWithRange:NSMakeRange(start, length)];
+}
+
+static NSString* BVNStartupMessageAfter(NSString* line, NSString* marker) {
+    const NSRange markerRange = [line rangeOfString:marker];
+    if (markerRange.location == NSNotFound) {
+        return nil;
+    }
+    NSString* message = [line substringFromIndex:NSMaxRange(markerRange)];
+    message = [message stringByTrimmingCharactersInSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (message.length > 110) {
+        message = [[message substringToIndex:109] stringByAppendingString:@"…"];
+    }
+    return message;
+}
 
 extern "C" void BVNGuestPointerPositionChanged(int x, int y) {
     gGuestPointerX.store(x, std::memory_order_relaxed);
@@ -821,64 +861,270 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 
 - (void)buildStartupNotice {
     UIView* notice = [[UIView alloc] initWithFrame:self.bounds];
-    notice.backgroundColor = [UIColor colorWithRed:10.0 / 255.0
-                                             green:12.0 / 255.0
-                                              blue:20.0 / 255.0
-                                             alpha:1.0];
+    notice.backgroundColor = UIColor.systemBackgroundColor;
     notice.userInteractionEnabled = NO;
     notice.hidden = YES;
 
     UILabel* title = [[UILabel alloc] initWithFrame:CGRectZero];
     title.text = @"Starting Wine";
-    title.textColor = UIColor.whiteColor;
-    title.font = [UIFont systemFontOfSize:28.0 weight:UIFontWeightSemibold];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
+    title.textColor = UIColor.labelColor;
+    title.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleLargeTitle]
+        scaledFontForFont:[UIFont systemFontOfSize:32.0
+                                             weight:UIFontWeightBold]];
+    title.adjustsFontForContentSizeCategory = YES;
+    title.textAlignment = NSTextAlignmentLeft;
 
     UILabel* body = [[UILabel alloc] initWithFrame:CGRectZero];
-    body.text = @"This can take up to 3 minutes.\n\n"
-                 "Keep BoxedVN open while it works — don't minimise the app "
-                 "or lock the screen, or Wine will have to start over.";
-    body.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
-    body.font = [UIFont systemFontOfSize:16.0];
-    body.textAlignment = NSTextAlignmentCenter;
+    body.text = @"Keep BoxedVN open. Translation and guest startup activity "
+                 "will appear here as it happens.";
+    body.textColor = UIColor.secondaryLabelColor;
+    body.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    body.adjustsFontForContentSizeCategory = YES;
+    body.textAlignment = NSTextAlignmentLeft;
     body.numberOfLines = 0;
-    body.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // Deliberately not a spinner. An indeterminate spinner says "something is
-    // happening" and nothing more; a rising count of translated code blocks
-    // says the same thing and also lets a player tell progress from a hang.
+    UILabel* badge = [[UILabel alloc] initWithFrame:CGRectZero];
+    badge.text = @"PREPARING RUNTIME";
+    badge.textColor = UIColor.systemBlueColor;
+    badge.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+    badge.adjustsFontForContentSizeCategory = YES;
+
     UILabel* progress = [[UILabel alloc] initWithFrame:CGRectZero];
-    progress.text = @"Preparing…";
-    progress.textColor = [UIColor colorWithRed:0.35 green:0.78 blue:0.55
-                                         alpha:1.0];
-    progress.font = [UIFont monospacedDigitSystemFontOfSize:14.0
-                                                     weight:UIFontWeightRegular];
-    progress.textAlignment = NSTextAlignmentCenter;
-    progress.translatesAutoresizingMaskIntoConstraints = NO;
+    progress.text = @"Preparing executable memory";
+    progress.textColor = UIColor.labelColor;
+    progress.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    progress.adjustsFontForContentSizeCategory = YES;
+    progress.numberOfLines = 2;
 
-    [notice addSubview:title];
-    [notice addSubview:body];
-    [notice addSubview:progress];
+    UILabel* metrics = [[UILabel alloc] initWithFrame:CGRectZero];
+    metrics.text = @"Waiting for guest translation";
+    metrics.textColor = UIColor.secondaryLabelColor;
+    metrics.font = [UIFont monospacedDigitSystemFontOfSize:12.0
+                                                    weight:UIFontWeightRegular];
+    metrics.adjustsFontForContentSizeCategory = YES;
+    metrics.numberOfLines = 2;
+
+    UIView* activityCard = [[UIView alloc] initWithFrame:CGRectZero];
+    activityCard.backgroundColor = UIColor.secondarySystemBackgroundColor;
+    activityCard.layer.cornerRadius = 14.0;
+    activityCard.layer.cornerCurve = kCACornerCurveContinuous;
+
+    UILabel* activityTitle = [[UILabel alloc] initWithFrame:CGRectZero];
+    activityTitle.text = @"LIVE STARTUP ACTIVITY";
+    activityTitle.textColor = UIColor.secondaryLabelColor;
+    activityTitle.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+    activityTitle.adjustsFontForContentSizeCategory = YES;
+    activityTitle.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel* activityLog = [[UILabel alloc] initWithFrame:CGRectZero];
+    activityLog.text = @"Waiting for the guest runtime…";
+    activityLog.textColor = UIColor.labelColor;
+    activityLog.font = [UIFont monospacedSystemFontOfSize:11.5
+                                                   weight:UIFontWeightRegular];
+    activityLog.adjustsFontForContentSizeCategory = YES;
+    activityLog.numberOfLines = 7;
+    activityLog.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    activityLog.translatesAutoresizingMaskIntoConstraints = NO;
+
+    [activityCard addSubview:activityTitle];
+    [activityCard addSubview:activityLog];
     [NSLayoutConstraint activateConstraints:@[
-        [title.centerXAnchor constraintEqualToAnchor:notice.centerXAnchor],
-        [title.centerYAnchor constraintEqualToAnchor:notice.centerYAnchor
-                                            constant:-70.0],
-        [body.topAnchor constraintEqualToAnchor:title.bottomAnchor
-                                       constant:18.0],
-        [body.centerXAnchor constraintEqualToAnchor:notice.centerXAnchor],
-        [body.widthAnchor constraintLessThanOrEqualToConstant:420.0],
-        [body.leadingAnchor
-            constraintGreaterThanOrEqualToAnchor:notice.leadingAnchor
-                                        constant:24.0],
-        [progress.topAnchor constraintEqualToAnchor:body.bottomAnchor
-                                           constant:24.0],
-        [progress.centerXAnchor constraintEqualToAnchor:notice.centerXAnchor],
+        [activityTitle.topAnchor constraintEqualToAnchor:activityCard.topAnchor
+                                                 constant:14.0],
+        [activityTitle.leadingAnchor constraintEqualToAnchor:activityCard.leadingAnchor
+                                                     constant:16.0],
+        [activityTitle.trailingAnchor constraintEqualToAnchor:activityCard.trailingAnchor
+                                                      constant:-16.0],
+        [activityLog.topAnchor constraintEqualToAnchor:activityTitle.bottomAnchor
+                                               constant:10.0],
+        [activityLog.leadingAnchor constraintEqualToAnchor:activityCard.leadingAnchor
+                                                   constant:16.0],
+        [activityLog.trailingAnchor constraintEqualToAnchor:activityCard.trailingAnchor
+                                                    constant:-16.0],
+        [activityLog.bottomAnchor constraintEqualToAnchor:activityCard.bottomAnchor
+                                                  constant:-14.0],
+    ]];
+
+    UILabel* footer = [[UILabel alloc] initWithFrame:CGRectZero];
+    footer.text = @"If activity stops, the idle timer makes the pause visible. "
+                  "The complete session log is still saved for export.";
+    footer.textColor = UIColor.tertiaryLabelColor;
+    footer.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    footer.adjustsFontForContentSizeCategory = YES;
+    footer.numberOfLines = 0;
+
+    UIStackView* content = [[UIStackView alloc] initWithArrangedSubviews:@[
+        title, body, badge, progress, metrics, activityCard, footer
+    ]];
+    content.axis = UILayoutConstraintAxisVertical;
+    content.alignment = UIStackViewAlignmentFill;
+    content.spacing = 10.0;
+    [content setCustomSpacing:22.0 afterView:body];
+    [content setCustomSpacing:4.0 afterView:badge];
+    [content setCustomSpacing:16.0 afterView:metrics];
+    [content setCustomSpacing:14.0 afterView:activityCard];
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+
+    [notice addSubview:content];
+    UILayoutGuide* readable = notice.readableContentGuide;
+    NSLayoutConstraint* centered =
+        [content.centerYAnchor constraintEqualToAnchor:notice.safeAreaLayoutGuide.centerYAnchor];
+    centered.priority = UILayoutPriorityDefaultHigh;
+    NSLayoutConstraint* readableWidth =
+        [content.widthAnchor constraintEqualToAnchor:readable.widthAnchor];
+    readableWidth.priority = UILayoutPriorityDefaultHigh;
+    [NSLayoutConstraint activateConstraints:@[
+        [content.centerXAnchor constraintEqualToAnchor:readable.centerXAnchor],
+        [content.leadingAnchor constraintGreaterThanOrEqualToAnchor:readable.leadingAnchor],
+        [content.trailingAnchor constraintLessThanOrEqualToAnchor:readable.trailingAnchor],
+        [content.widthAnchor constraintLessThanOrEqualToConstant:560.0],
+        [content.topAnchor constraintGreaterThanOrEqualToAnchor:notice.safeAreaLayoutGuide.topAnchor
+                                                        constant:18.0],
+        [content.bottomAnchor constraintLessThanOrEqualToAnchor:notice.safeAreaLayoutGuide.bottomAnchor
+                                                         constant:-18.0],
+        readableWidth,
+        centered,
     ]];
 
     [self addSubview:notice];
     self.startupNotice = notice;
+    self.startupStateBadge = badge;
     self.startupProgress = progress;
+    self.startupMetrics = metrics;
+    self.startupLog = activityLog;
+}
+
+- (void)refreshStartupActivity {
+    const NSTimeInterval now = CACurrentMediaTime();
+    const uint64_t generation = BVNLogGeneration();
+    if (generation != self.appliedStartupLogGeneration) {
+        self.appliedStartupLogGeneration = generation;
+
+        constexpr size_t kStartupLogTailBytes = 96 * 1024;
+        std::vector<char> buffer(kStartupLogTailBytes);
+        const size_t copied = BVNLogCopyRecent(buffer.data(), buffer.size());
+        NSString* tail = [[NSString alloc]
+            initWithBytes:buffer.data()
+                   length:copied
+                 encoding:NSUTF8StringEncoding];
+        if (tail == nil) {
+            tail = @"";
+        }
+
+        NSMutableArray<NSString*>* activity = [NSMutableArray array];
+        NSString* stage = @"Preparing the 64-bit guest runtime";
+        NSUInteger translationCount = 0;
+        NSString* lastRIP = nil;
+
+        for (NSString* line in [tail componentsSeparatedByCharactersInSet:
+                                    NSCharacterSet.newlineCharacterSet]) {
+            NSString* entry = nil;
+            if ([line containsString:@"[boxedwine-block] enter ordinal="]) {
+                NSString* ordinal = BVNStartupTokenAfter(line, @"ordinal=");
+                NSString* rip = BVNStartupTokenAfter(line, @"rip=");
+                if (ordinal.length > 0) {
+                    translationCount = MAX(translationCount,
+                        static_cast<NSUInteger>(ordinal.longLongValue) + 1);
+                }
+                if (rip.length > 0) {
+                    lastRIP = rip;
+                }
+                stage = @"Translating 64-bit guest code";
+                entry = [NSString stringWithFormat:@"translate #%@  %@",
+                                                    ordinal ?: @"?",
+                                                    rip ?: @"unknown RIP"];
+            } else if ([line containsString:@"BOXEDWINE_FEX64_SYSCALL_ENTER"]) {
+                NSString* number = BVNStartupTokenAfter(line, @"nr=");
+                NSString* rip = BVNStartupTokenAfter(line, @"rip=");
+                stage = @"Running the 64-bit guest loader";
+                entry = [NSString stringWithFormat:@"guest syscall %@  %@",
+                                                    number ?: @"?",
+                                                    rip ?: @""];
+            } else if ([line containsString:@"BOXEDWINE_FEX64_START loaded"]) {
+                NSString* rip = BVNStartupTokenAfter(line, @"rip=");
+                stage = @"Loading the 64-bit guest runtime";
+                entry = [NSString stringWithFormat:@"loader mapped  %@",
+                                                    rip ?: @""];
+            } else if ([line containsString:@"BOXEDWINE_FEX64_START scheduled"]) {
+                entry = @"translator scheduled";
+            } else if ([line containsString:@"BOXEDWINE_FEX64_SCHED enter"]) {
+                entry = @"guest thread entered translator";
+            } else if ([line containsString:@"BOXEDWINE_FEX64_LIVE_ENTER"]) {
+                NSString* rip = BVNStartupTokenAfter(line, @"rip=");
+                entry = [NSString stringWithFormat:@"guest execution began  %@",
+                                                    rip ?: @""];
+            } else if ([line containsString:@"] dxmt: "]) {
+                stage = @"Preparing the graphics translation layer";
+                entry = BVNStartupMessageAfter(line, @"] dxmt: ");
+            } else if ([line containsString:@"] jit: "]) {
+                entry = BVNStartupMessageAfter(line, @"] jit: ");
+            } else if ([line hasPrefix:@"Launching \""]) {
+                stage = @"Launching Wine";
+                entry = @"Wine process launch requested";
+            } else if ([line hasPrefix:@"wine:"] ||
+                       [line containsString:@":err:"] ||
+                       [line containsString:@":warn:"]) {
+                stage = @"Wine is starting";
+                entry = line;
+                if (entry.length > 110) {
+                    entry = [[entry substringToIndex:109]
+                        stringByAppendingString:@"…"];
+                }
+            }
+
+            if (entry.length == 0 || [entry isEqualToString:activity.lastObject]) {
+                continue;
+            }
+            [activity addObject:entry];
+            if (activity.count > 7) {
+                [activity removeObjectAtIndex:0];
+            }
+        }
+
+        NSString* visibleLog = activity.count > 0
+            ? [activity componentsJoinedByString:@"\n"]
+            : @"Waiting for the guest runtime…";
+        NSString* signature = [NSString stringWithFormat:@"%@|%lu|%@",
+            visibleLog, (unsigned long)translationCount, lastRIP ?: @""];
+        if (![signature isEqualToString:self.startupActivitySignature]) {
+            self.startupActivitySignature = signature;
+            self.startupLastActivityTime = now;
+        }
+        self.startupTranslationCount = translationCount;
+        self.startupLastRIP = lastRIP;
+        self.startupProgress.text = stage;
+        self.startupLog.text = visibleLog;
+    }
+
+    const NSTimeInterval idle = self.startupLastActivityTime > 0.0
+        ? MAX(0.0, now - self.startupLastActivityTime)
+        : 0.0;
+    if (idle >= 3.0) {
+        self.startupStateBadge.text = @"NO NEW GUEST ACTIVITY";
+        self.startupStateBadge.textColor = UIColor.systemOrangeColor;
+    } else if (self.startupTranslationCount > 0) {
+        self.startupStateBadge.text = @"TRANSLATOR ACTIVE";
+        self.startupStateBadge.textColor = UIColor.systemGreenColor;
+    } else {
+        self.startupStateBadge.text = @"PREPARING RUNTIME";
+        self.startupStateBadge.textColor = UIColor.systemBlueColor;
+    }
+
+    NSMutableArray<NSString*>* metrics = [NSMutableArray array];
+    if (self.startupTranslationCount > 0) {
+        [metrics addObject:[NSString stringWithFormat:@"%lu translations",
+            (unsigned long)self.startupTranslationCount]];
+    }
+    if (self.startupLastRIP.length > 0) {
+        [metrics addObject:[NSString stringWithFormat:@"last RIP %@",
+                                                     self.startupLastRIP]];
+    }
+    if (idle >= 1.0) {
+        [metrics addObject:[NSString stringWithFormat:@"idle %.0fs", idle]];
+    }
+    self.startupMetrics.text = metrics.count > 0
+        ? [metrics componentsJoinedByString:@"  ·  "]
+        : @"Waiting for guest translation";
 }
 
 // A key SDL does not recognise would otherwise be a button that silently does
@@ -2498,8 +2744,9 @@ extern "C" void BVNGuestOverlayInstall(void) {
 // was never hidden: the call that hides it lives in
 // KNativeScreenSDL::putBitsOnWnd, which runs on the X server's thread.
 static std::atomic<int> gStartupNoticeWanted{0};   // -1 hide, 0 unset, 1 show
-// Written by the JIT allocator's thread; rendered on the main one.
-static std::atomic<size_t> gStartupNoticeBlocks{0};
+// Written by the JIT allocator's thread. This is intentionally kept separate
+// from translated units: an allocation can hold thousands of translations.
+static std::atomic<size_t> gStartupNoticeAllocations{0};
 extern "C" void BVNGuestOverlayApplyPendingState(void);
 
 extern "C" void BVNGuestStartupNoticeSetVisible(bool visible) {
@@ -2529,7 +2776,12 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
         const BOOL visible = wanted > 0;
         gOverlay.startupNotice.hidden = !visible;
         if (visible) {
-            gOverlay.startupProgress.text = @"Preparing…";
+            gOverlay.appliedStartupLogGeneration = UINT64_MAX;
+            gOverlay.startupLastActivityTime = CACurrentMediaTime();
+            gOverlay.startupActivitySignature = nil;
+            gOverlay.startupTranslationCount = 0;
+            gOverlay.startupLastRIP = nil;
+            [gOverlay refreshStartupActivity];
             [gOverlay bringSubviewToFront:gOverlay.startupNotice];
         }
     }
@@ -2555,12 +2807,7 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
         [gOverlay positionCursor];
     }
     if (!gOverlay.startupNotice.hidden) {
-        const size_t blocks =
-            gStartupNoticeBlocks.load(std::memory_order_relaxed);
-        gOverlay.startupProgress.text = blocks > 0
-            ? [NSString stringWithFormat:@"Translating x86 code — %lu blocks",
-                                         (unsigned long)blocks]
-            : @"Preparing…";
+        [gOverlay refreshStartupActivity];
     }
     UIView* parent = gOverlay.superview;
     if (parent != nil && parent.subviews.lastObject != gOverlay) {
@@ -2600,7 +2847,6 @@ extern "C" void BVNGuestOverlayGeometryDidChange(void) {
     const CGPoint menuFraction = oldOverlay.menuButtonFraction;
     const CGPoint performanceFraction = oldOverlay.performanceFraction;
     const BOOL startupVisible = !oldOverlay.startupNotice.hidden;
-    NSString* startupText = oldOverlay.startupProgress.text;
     [oldOverlay.performanceTimer invalidate];
     oldOverlay.performanceTimer = nil;
     [oldOverlay releaseHeldKeys];
@@ -2611,7 +2857,11 @@ extern "C" void BVNGuestOverlayGeometryDidChange(void) {
         gOverlay.menuButtonFraction = menuFraction;
         gOverlay.performanceFraction = performanceFraction;
         gOverlay.startupNotice.hidden = !startupVisible;
-        gOverlay.startupProgress.text = startupText;
+        if (startupVisible) {
+            gOverlay.appliedStartupLogGeneration = UINT64_MAX;
+            gOverlay.startupLastActivityTime = CACurrentMediaTime();
+            [gOverlay refreshStartupActivity];
+        }
         [gOverlay setNeedsLayout];
     }
     BVNLogWrite(BVNLogLevelInfo, "input",
@@ -2621,8 +2871,9 @@ extern "C" void BVNGuestOverlayGeometryDidChange(void) {
 
 // Called from the JIT's allocator, which is not the main thread. Recorded here
 // and rendered by BVNGuestOverlayApplyPendingState.
-extern "C" void BVNGuestStartupNoticeSetProgress(size_t jitBlocks) {
-    gStartupNoticeBlocks.store(jitBlocks, std::memory_order_relaxed);
+extern "C" void BVNGuestStartupNoticeSetProgress(size_t allocationCount) {
+    gStartupNoticeAllocations.store(allocationCount,
+                                    std::memory_order_relaxed);
 }
 
 extern "C" void BVNGuestOverlayRemove(void) {

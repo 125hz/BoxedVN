@@ -93,6 +93,12 @@ elif [[ "${BOXEDVN_REQUIRE_DXMT_NATIVE:-0}" != "1" ]]; then
     warn "No native DXMT unix-call table in this non-x86-64 build"
 fi
 
+if [[ "${BOXEDVN_REQUIRE_FEX_PROBE:-0}" == "1" ]]; then
+    require_file "${APP_PATH}/boxedvn-fex64-kernel-probe" \
+        "The FEX-enabled app has no mandatory translated correctness probe."
+    ok "FEX translated correctness probe bundled"
+fi
+
 # --- Info.plist -------------------------------------------------------------
 require_file "${INFO_PLIST}" "The app bundle has no Info.plist."
 
