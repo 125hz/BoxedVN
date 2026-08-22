@@ -64,15 +64,17 @@ start:
     xor     esi, esi
     mov     edx, 0x518
     call    glibc_memset_probe
-    cmp     rax, DATA + 0x2038
+    mov     r8, DATA
+    lea     r9, [r8 + 0x2038]
+    cmp     rax, r9
     jnz     fail
-    cmp     byte [DATA + 0x2037], 0x5a
+    cmp     byte [r8 + 0x2037], 0x5a
     jnz     fail
-    cmp     qword [DATA + 0x2038], 0
+    cmp     qword [r8 + 0x2038], 0
     jnz     fail
-    cmp     qword [DATA + 0x2548], 0
+    cmp     qword [r8 + 0x2548], 0
     jnz     fail
-    cmp     byte [DATA + 0x2550], 0x5a
+    cmp     byte [r8 + 0x2550], 0x5a
     jnz     fail
 
     ; Exercise REP STOS and preserve the original destination as the return.
@@ -80,11 +82,12 @@ start:
     mov     esi, 0x5a
     mov     edx, 0x1000
     call    rep_stos_probe
-    cmp     rax, DATA + 0x8000
+    lea     r9, [r8 + 0x8000]
+    cmp     rax, r9
     jnz     fail
-    cmp     byte [DATA + 0x8000], 0x5a
+    cmp     byte [r8 + 0x8000], 0x5a
     jnz     fail
-    cmp     byte [DATA + 0x8fff], 0x5a
+    cmp     byte [r8 + 0x8fff], 0x5a
     jnz     fail
 
     mov     rax, PASS
