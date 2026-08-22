@@ -9,6 +9,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fex_source="${FEX_SOURCE:-${root}/third_party/fex64/fex}"
 fex_build="${FEX_BUILD:-${root}/build/fex-vixl-probe}"
 fixture="${root}/scripts/guest-probes/fex64-loader-stall.asm"
+host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 cc="${CC:-clang}"
 cxx="${CXX:-clang++}"
 allocator_declaration_header="${fex_source}/FEXCore/Source/Utils/Allocator.h"
@@ -33,6 +34,7 @@ command -v "${cc}" >/dev/null || die "the Clang C compiler is required"
 command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
 [[ -d "${fex_source}/FEXCore" ]] || die "FEX source not found: ${fex_source}"
 [[ -f "${fixture}" ]] || die "fixture not found: ${fixture}"
+[[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
 [[ -f "${allocator_declaration_header}" ]] || \
     die "allocator declaration header not found: ${allocator_declaration_header}"
 for runtime_patch in "${runtime_patches[@]}"; do
@@ -67,10 +69,14 @@ build_runner() (
     # InitializeAllocator declaration without including the private header.
     # Preinclude that declaration for this host-only conformance build; keep
     # the pinned third-party checkout untouched.
+    mkdir -p "${fex_build}"
+    host_stubs_object="${fex_build}/boxedvn-probe-host-stubs.o"
+    "${cxx}" -std=c++20 -c "${host_stubs_source}" -o "${host_stubs_object}"
     cmake -S "${fex_source}" -B "${fex_build}" -G Ninja \
         -DCMAKE_C_COMPILER="${cc}" \
         -DCMAKE_CXX_COMPILER="${cxx}" \
         -DCMAKE_CXX_FLAGS="-include${allocator_declaration_header}" \
+        -DCMAKE_EXE_LINKER_FLAGS="${host_stubs_object}" \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DENABLE_LTO=OFF \
         -DENABLE_ASSERTIONS=ON \
