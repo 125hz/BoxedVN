@@ -61,9 +61,13 @@ targets:
         optional: true
         buildPhase: resources
       # Populated by scripts/fetch-rootfs.sh when BOXEDVN_BUNDLE_ROOTFS is on.
-      # Keep the legacy archive at the bundle root where the runtime expects it.
-      - path: app/Bundled/boxedwine.zip
+      # Enumerating the optional directory omits an absent legacy archive while
+      # still copying it to the bundle root when present. The x64 folder is a
+      # separate folder reference below and must not also be flattened here.
+      - path: app/Bundled
         optional: true
+        excludes:
+          - boxedwine64-runtime
         buildPhase: resources
       # The validated Wine64/FEX/DXMT resources must retain this directory and
       # its nested dxmt-x64 directory. A normal resource group flattens both,
