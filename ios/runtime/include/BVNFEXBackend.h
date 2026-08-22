@@ -45,6 +45,12 @@ BVNFEXBackendStage BVNFEXBackendStageReached(void);
 const char* BVNFEXBackendStageName(BVNFEXBackendStage stage);
 const char* BVNFEXBackendReport(void);
 
+// Samples the active FEX host thread without relying on UIKit's main run loop.
+// Safe from BoxedVN's detached diagnostics watcher; a non-FEX build is a
+// no-op. Output is throttled and repeated stable samples produce one bounded
+// stall line rather than flooding the session log.
+void BVNFEXBackendPollExecutionTrace(void);
+
 // The adapter borrows a live KProcess/KThread and their CPU64 state. The
 // caller must keep both objects alive and must leave the adapter before the
 // thread exits. execve is handled by the syscall path while the adapter is

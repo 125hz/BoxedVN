@@ -23,6 +23,7 @@ extern "C" BVNFEXBackendStage BVNFEXBackendStageReached(void) {
 extern "C" const char* BVNFEXBackendReport(void) {
     return "FEX was not linked into this build.";
 }
+extern "C" void BVNFEXBackendPollExecutionTrace(void) {}
 extern "C" bool BVNFEXCPU64Run(void*, void*) { return false; }
 extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
     return stage == BVNFEXBackendStageUnavailable ? "not linked" : "unknown";
@@ -62,6 +63,10 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "syscall64.h"
 
 #include <libkern/OSCacheControl.h>
+#include <mach/arm/thread_status.h>
+#include <mach/mach.h>
+#include <mach/thread_act.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -145,6 +150,16 @@ struct LiveThreadState {
     // FEX execution at a time, even if a scheduler bug attempts to dispatch
     // the same opaque thread concurrently.
     bool active = false;
+    mach_port_t hostMachThread = MACH_PORT_NULL;
+    uint64_t sampleLastHostPC = 0;
+    uint64_t sampleLastGuestRIP = 0;
+    uint64_t sampleLastReportPoll = 0;
+    uint64_t sampleLastWarningPoll = 0;
+    uint64_t sampleLastFaultCount = 0;
+    uint32_t sampleStablePolls = 0;
+    size_t sampleCursor = 0;
+    size_t sampleCount = 0;
+    std::array<uint64_t, 8> sampleGuestRIPs {};
 };
 
 struct LiveProcessState {
@@ -356,6 +371,44 @@ std::once_flag gFEXSignalInstallOnce;
 std::atomic<bool> gFEXSignalHandlersInstalled {false};
 std::atomic<uint64_t> gFEXHostFaultCount {0};
 std::atomic<uint64_t> gFEXKuserFaultCount {0};
+std::atomic<uint64_t> gFEXHandledHostFaultCount {0};
+std::atomic<uint64_t> gFEXLastHostSignal {0};
+std::atomic<uint64_t> gFEXLastHostFaultAddress {0};
+std::atomic<uint64_t> gFEXLastHostFaultPC {0};
+std::atomic<uint64_t> gExecutionTracePoll {0};
+
+struct ExecutionTraceSnapshot {
+    uint64_t poll = 0;
+    U32 processId = 0;
+    U32 threadId = 0;
+    integer_t runState = 0;
+    integer_t cpuUsage = 0;
+    uint64_t hostPC = 0;
+    uint64_t guestRIP = 0;
+    uint64_t frameRIP = 0;
+    uint64_t hostFaults = 0;
+    uint64_t handledFaults = 0;
+    uint64_t newFaults = 0;
+    uint64_t lastSignal = 0;
+    uint64_t lastFaultAddress = 0;
+    uint64_t lastFaultPC = 0;
+    uint32_t stablePolls = 0;
+    bool emitSample = false;
+    bool emitWarning = false;
+    size_t historyCount = 0;
+    std::array<uint64_t, 8> guestHistory {};
+};
+
+const char* machRunStateName(integer_t state) {
+    switch (state) {
+        case TH_STATE_RUNNING: return "running";
+        case TH_STATE_STOPPED: return "stopped";
+        case TH_STATE_WAITING: return "waiting";
+        case TH_STATE_UNINTERRUPTIBLE: return "uninterruptible";
+        case TH_STATE_HALTED: return "halted";
+        default: return "unknown";
+    }
+}
 
 size_t fexSignalIndex(int signal) {
     for (size_t index = 0; index < kFEXHostSignals.size(); ++index) {
@@ -387,16 +440,25 @@ void chainFEXHostSignal(int signal, siginfo_t* info, void* ucontext) {
 
 void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
     gFEXHostFaultCount.fetch_add(1, std::memory_order_relaxed);
+    gFEXLastHostSignal.store(static_cast<uint64_t>(signal),
+                             std::memory_order_relaxed);
     if (info && info->si_addr) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(info->si_addr);
+        gFEXLastHostFaultAddress.store(address, std::memory_order_relaxed);
         if (address >= K64_KUSER_SHARED_BASE &&
             address < K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE) {
             gFEXKuserFaultCount.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    auto* context = static_cast<ucontext_t*>(ucontext);
+    if (context && context->uc_mcontext) {
+        gFEXLastHostFaultPC.store(context->uc_mcontext->__ss.__pc,
+                                  std::memory_order_relaxed);
+    }
     BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent();
     if (adapter && BVNFEXCPU64AdapterHandleHostFault(
             adapter, &gSignals.GetConfig(), signal, info, ucontext)) {
+        gFEXHandledHostFaultCount.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     chainFEXHostSignal(signal, info, ucontext);
@@ -740,6 +802,7 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
     if (it != processState->threads.end()) {
         if (it->second->active) return nullptr;
         it->second->active = true;
+        it->second->hostMachThread = pthread_mach_thread_np(pthread_self());
         return it->second.get();
     }
 
@@ -779,6 +842,7 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
     state->fexThread->CurrentFrame->State.cs_idx = 0;
     gLiveThreadContexts.emplace(state->fexThread, processState->context.get());
     state->active = true;
+    state->hostMachThread = pthread_mach_thread_np(pthread_self());
     LiveThreadState* result = state.get();
     processState->threads.emplace(thread, std::move(state));
     return result;
@@ -796,6 +860,7 @@ void releaseLiveThreadRun(LiveProcessState* processState,
             if (it->second.get() != threadState) continue;
             if (!retire) {
                 it->second->active = false;
+                it->second->hostMachThread = MACH_PORT_NULL;
                 return;
             }
             if (it->second->fexThread) {
@@ -897,14 +962,216 @@ extern "C" const char* BVNFEXBackendReport(void) {
     const uint64_t hostFaults = gFEXHostFaultCount.load(std::memory_order_relaxed);
     const uint64_t kuserFaults = gFEXKuserFaultCount.load(std::memory_order_relaxed);
     if (hostFaults != 0 || kuserFaults != 0) {
-        char diagnostics[160];
+        char diagnostics[320];
         snprintf(diagnostics, sizeof(diagnostics),
-                 "host_faults=%llu kuser_faults=%llu\n",
+                 "host_faults=%llu handled_faults=%llu kuser_faults=%llu "
+                 "last_signal=%llu last_address=0x%llx last_pc=0x%llx\n",
                  static_cast<unsigned long long>(hostFaults),
-                 static_cast<unsigned long long>(kuserFaults));
+                 static_cast<unsigned long long>(
+                     gFEXHandledHostFaultCount.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(kuserFaults),
+                 static_cast<unsigned long long>(
+                     gFEXLastHostSignal.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     gFEXLastHostFaultAddress.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     gFEXLastHostFaultPC.load(std::memory_order_relaxed)));
         snapshot.append(diagnostics);
     }
     return snapshot.c_str();
+}
+
+extern "C" void BVNFEXBackendPollExecutionTrace(void) {
+    constexpr size_t kMaximumSnapshots = 8;
+    constexpr uint64_t kSampleReportInterval = 5;
+    constexpr uint64_t kStallWarningInterval = 30;
+    constexpr uint32_t kStableSamplesBeforeWarning = 3;
+    std::array<ExecutionTraceSnapshot, kMaximumSnapshots> snapshots {};
+    size_t snapshotCount = 0;
+    const uint64_t poll = gExecutionTracePoll.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    const mach_port_t pollingThread = pthread_mach_thread_np(pthread_self());
+
+    {
+        std::lock_guard<std::mutex> guard(gLiveMutex);
+        for (const auto& processEntry : gLiveProcesses) {
+            if (snapshotCount == snapshots.size()) break;
+            auto* process = static_cast<KProcess*>(processEntry.first);
+            LiveProcessState* processState = processEntry.second.get();
+            if (!process || !processState) continue;
+            for (const auto& threadEntry : processState->threads) {
+                if (snapshotCount == snapshots.size()) break;
+                auto* thread = static_cast<KThread*>(threadEntry.first);
+                LiveThreadState* threadState = threadEntry.second.get();
+                if (!thread || !threadState || !threadState->active ||
+                    threadState->hostMachThread == MACH_PORT_NULL ||
+                    threadState->hostMachThread == pollingThread ||
+                    !threadState->fexThread ||
+                    !threadState->fexThread->CurrentFrame) {
+                    continue;
+                }
+
+                thread_basic_info_data_t basic {};
+                mach_msg_type_number_t basicCount = THREAD_BASIC_INFO_COUNT;
+                const kern_return_t infoResult = thread_info(
+                    threadState->hostMachThread, THREAD_BASIC_INFO,
+                    reinterpret_cast<thread_info_t>(&basic), &basicCount);
+                const kern_return_t suspendResult = thread_suspend(
+                    threadState->hostMachThread);
+                if (suspendResult != KERN_SUCCESS) continue;
+
+                arm_thread_state64_t registers {};
+                mach_msg_type_number_t registerCount = ARM_THREAD_STATE64_COUNT;
+                const kern_return_t stateResult = thread_get_state(
+                    threadState->hostMachThread, ARM_THREAD_STATE64,
+                    reinterpret_cast<thread_state_t>(&registers),
+                    &registerCount);
+
+                ExecutionTraceSnapshot snapshot {};
+                snapshot.poll = poll;
+                snapshot.processId = process->id;
+                snapshot.threadId = thread->id;
+                if (infoResult == KERN_SUCCESS) {
+                    snapshot.runState = basic.run_state;
+                    snapshot.cpuUsage = basic.cpu_usage;
+                }
+                snapshot.frameRIP =
+                    threadState->fexThread->CurrentFrame->State.rip;
+                snapshot.guestRIP = snapshot.frameRIP;
+                if (stateResult == KERN_SUCCESS) {
+                    snapshot.hostPC = arm_thread_state64_get_pc(registers);
+                    if (processState->context->IsAddressInCodeBuffer(
+                            threadState->fexThread, snapshot.hostPC)) {
+                        const uint64_t restored =
+                            processState->context->RestoreRIPFromHostPC(
+                                threadState->fexThread, snapshot.hostPC);
+                        if (restored != 0) snapshot.guestRIP = restored;
+                    }
+                }
+
+                const kern_return_t resumeResult = thread_resume(
+                    threadState->hostMachThread);
+                if (resumeResult != KERN_SUCCESS) {
+                    // This line is intentionally direct: leaving a translated
+                    // thread suspended is terminal and must not be hidden by
+                    // the normal heartbeat throttle.
+                    reportf("BOXEDWINE_FEX64_SAMPLE thread_resume failed pid=%u tid=%u status=%d",
+                            process->id, thread->id, resumeResult);
+                }
+
+                snapshot.hostFaults = gFEXHostFaultCount.load(
+                    std::memory_order_relaxed);
+                snapshot.handledFaults = gFEXHandledHostFaultCount.load(
+                    std::memory_order_relaxed);
+                snapshot.lastSignal = gFEXLastHostSignal.load(
+                    std::memory_order_relaxed);
+                snapshot.lastFaultAddress = gFEXLastHostFaultAddress.load(
+                    std::memory_order_relaxed);
+                snapshot.lastFaultPC = gFEXLastHostFaultPC.load(
+                    std::memory_order_relaxed);
+                snapshot.newFaults = snapshot.hostFaults >=
+                    threadState->sampleLastFaultCount
+                    ? snapshot.hostFaults - threadState->sampleLastFaultCount
+                    : snapshot.hostFaults;
+                threadState->sampleLastFaultCount = snapshot.hostFaults;
+
+                if (snapshot.hostPC != 0 &&
+                    snapshot.hostPC == threadState->sampleLastHostPC &&
+                    snapshot.guestRIP == threadState->sampleLastGuestRIP) {
+                    ++threadState->sampleStablePolls;
+                } else {
+                    threadState->sampleStablePolls = 1;
+                }
+                threadState->sampleLastHostPC = snapshot.hostPC;
+                threadState->sampleLastGuestRIP = snapshot.guestRIP;
+                snapshot.stablePolls = threadState->sampleStablePolls;
+
+                threadState->sampleGuestRIPs[threadState->sampleCursor] =
+                    snapshot.guestRIP;
+                threadState->sampleCursor = (threadState->sampleCursor + 1) %
+                    threadState->sampleGuestRIPs.size();
+                threadState->sampleCount = std::min(
+                    threadState->sampleCount + 1,
+                    threadState->sampleGuestRIPs.size());
+                snapshot.historyCount = threadState->sampleCount;
+                const size_t first = threadState->sampleCount ==
+                    threadState->sampleGuestRIPs.size()
+                    ? threadState->sampleCursor : 0;
+                for (size_t index = 0; index < snapshot.historyCount; ++index) {
+                    snapshot.guestHistory[index] =
+                        threadState->sampleGuestRIPs[
+                            (first + index) %
+                            threadState->sampleGuestRIPs.size()];
+                }
+
+                snapshot.emitSample = threadState->sampleLastReportPoll == 0 ||
+                    poll - threadState->sampleLastReportPoll >=
+                        kSampleReportInterval;
+                if (snapshot.emitSample) {
+                    threadState->sampleLastReportPoll = poll;
+                }
+                snapshot.emitWarning =
+                    threadState->sampleStablePolls >=
+                        kStableSamplesBeforeWarning &&
+                    (threadState->sampleLastWarningPoll == 0 ||
+                     poll - threadState->sampleLastWarningPoll >=
+                         kStallWarningInterval);
+                if (snapshot.emitWarning) {
+                    threadState->sampleLastWarningPoll = poll;
+                }
+                snapshots[snapshotCount++] = snapshot;
+            }
+        }
+    }
+
+    for (size_t index = 0; index < snapshotCount; ++index) {
+        const ExecutionTraceSnapshot& snapshot = snapshots[index];
+        char history[256] {};
+        size_t used = 0;
+        for (size_t item = 0; item < snapshot.historyCount &&
+                              used < sizeof(history); ++item) {
+            const int written = snprintf(
+                history + used, sizeof(history) - used,
+                "%s0x%llx", item == 0 ? "" : ",",
+                static_cast<unsigned long long>(snapshot.guestHistory[item]));
+            if (written < 0 ||
+                static_cast<size_t>(written) >= sizeof(history) - used) {
+                break;
+            }
+            used += static_cast<size_t>(written);
+        }
+        if (snapshot.emitSample) {
+            const double cpuPercent = snapshot.cpuUsage * 100.0 /
+                static_cast<double>(TH_USAGE_SCALE);
+            reportf("BOXEDWINE_FEX64_SAMPLE poll=%llu pid=%u tid=%u state=%s cpu=%.1f%% host_pc=0x%llx guest_rip=0x%llx frame_rip=0x%llx faults=%llu handled=%llu new_faults=%llu last_signal=%llu last_address=0x%llx last_fault_pc=0x%llx history=[%s]",
+                    static_cast<unsigned long long>(snapshot.poll),
+                    snapshot.processId, snapshot.threadId,
+                    machRunStateName(snapshot.runState), cpuPercent,
+                    static_cast<unsigned long long>(snapshot.hostPC),
+                    static_cast<unsigned long long>(snapshot.guestRIP),
+                    static_cast<unsigned long long>(snapshot.frameRIP),
+                    static_cast<unsigned long long>(snapshot.hostFaults),
+                    static_cast<unsigned long long>(snapshot.handledFaults),
+                    static_cast<unsigned long long>(snapshot.newFaults),
+                    static_cast<unsigned long long>(snapshot.lastSignal),
+                    static_cast<unsigned long long>(snapshot.lastFaultAddress),
+                    static_cast<unsigned long long>(snapshot.lastFaultPC),
+                    history);
+        }
+        if (snapshot.emitWarning) {
+            reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx guest_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",
+                    snapshot.processId, snapshot.threadId,
+                    snapshot.stablePolls,
+                    machRunStateName(snapshot.runState),
+                    static_cast<unsigned long long>(snapshot.hostPC),
+                    static_cast<unsigned long long>(snapshot.guestRIP),
+                    static_cast<unsigned long long>(snapshot.hostFaults),
+                    static_cast<unsigned long long>(snapshot.handledFaults),
+                    static_cast<unsigned long long>(snapshot.lastSignal),
+                    static_cast<unsigned long long>(snapshot.lastFaultAddress),
+                    history);
+        }
+    }
 }
 
 extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {

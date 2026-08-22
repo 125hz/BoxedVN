@@ -46,6 +46,7 @@
 #include <thread>
 
 #include "BVNRuntime.h"
+#include "BVNFEXBackend.h"
 
 // Implemented in the SDL/core translation unit, which already includes
 // boxedwine.h in the order its internal headers require. Pulling ksystem.h
@@ -103,6 +104,10 @@ void startBootHeartbeatWatch() {
     std::thread([] {
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Unlike Swift/UIKit timers, this watcher remains alive while
+            // boxedmain owns the main thread. Sample translated execution even
+            // when FEX is reusing linked blocks and emits no compile messages.
+            BVNFEXBackendPollExecutionTrace();
             const uint64_t sequence =
                 gBootHeartbeatSequence.load(std::memory_order_acquire);
             if (sequence == 0 || sequence ==

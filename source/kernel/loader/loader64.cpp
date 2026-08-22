@@ -10,6 +10,7 @@
 #include "boxedwine.h"
 
 #include "loader64.h"
+#include "elfloaderpolicy64.h"
 #include "kelf64.h"
 #ifdef BOXEDWINE_GUEST_X64
 #include "kmemory64.h"
@@ -984,15 +985,26 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // Milestone A3 wires up cross-library symbol resolution.
     applyRelativeRelocations(mem, r.dynamic, reloc, "exe");
 
-    // PT_GNU_RELRO: now that relocations have written through .got/.got.plt,
-    // mark the region read-only (matches what ld.so does at runtime). The
-    // region is page-rounded outward — RELRO p_vaddr is page-aligned per the
-    // spec but p_memsz is not always page-aligned, so we round up.
-    if (r.relro.present && r.relro.memsz) {
+    // PT_INTERP owns the main image's complete relocation lifecycle. Our
+    // narrow pass above intentionally leaves symbol-bound relocations and the
+    // dynamic linker's own pointer rebasing unfinished, so applying RELRO here
+    // would make ld-linux fault on its first write to DT_PLTGOT. A guest
+    // dynamic linker enforces RELRO with mprotect after it has finished.
+    //
+    // Keep the existing kernel-side finalization only for images without an
+    // interpreter, where this loader owns the relocation-to-entry boundary.
+    if (r.relro.present && r.relro.memsz &&
+        kernelOwnsElf64Relro(r.interpreter.length() != 0)) {
         U64 relroAddr = (r.relro.vaddr + reloc) & ~K64_PAGE_MASK;
         U64 relroEnd  = (r.relro.vaddr + reloc + r.relro.memsz + K64_PAGE_MASK) & ~K64_PAGE_MASK;
         mem->mprotect(relroAddr, relroEnd - relroAddr, 0x1 /* PROT_READ */);
         klog_fmt("loadProgram64: PT_GNU_RELRO 0x%llx..0x%llx -> RO",
+                 (unsigned long long)relroAddr,
+                 (unsigned long long)relroEnd);
+    } else if (r.relro.present && r.relro.memsz) {
+        U64 relroAddr = (r.relro.vaddr + reloc) & ~K64_PAGE_MASK;
+        U64 relroEnd  = (r.relro.vaddr + reloc + r.relro.memsz + K64_PAGE_MASK) & ~K64_PAGE_MASK;
+        klog_fmt("loadProgram64: deferring PT_GNU_RELRO 0x%llx..0x%llx to PT_INTERP dynamic linker",
                  (unsigned long long)relroAddr,
                  (unsigned long long)relroEnd);
     }
