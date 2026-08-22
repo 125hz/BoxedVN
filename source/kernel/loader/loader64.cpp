@@ -243,13 +243,14 @@ enum class FEX64InterpreterNormalization {
     Failed,
 };
 
-// The pinned glibc loader contains an SSE2 memset loop whose forward pointer
-// update is encoded as `sub rdx, -64`.  Device traces show the translated
-// process repeatedly returning to that update after its final data mapping
-// succeeds, while the equivalent `add rdx, 64` form is used successfully
-// throughout the same startup path.  Normalize only this complete instruction
-// context, before any guest code is dispatched.  The following compare owns
-// the flags, so the two encodings are semantically identical here.
+// The pinned glibc loader contains an SSE2 memset implementation that does not
+// retire under the iOS FEX path after the final libc mapping succeeds. Device
+// samples remain inside this routine even after normalising its pointer update,
+// while the bundled correctness process proves that the same translator and
+// memory path complete REP STOSB correctly. Replace only the exact pinned
+// routine entry, before any guest code is dispatched, with the ABI-equivalent
+// scalar string operation. R9 is caller-saved and preserves memset's required
+// return value while RDI and RCX are consumed.
 static FEX64InterpreterNormalization normalizeFEX64InterpreterMemset(
         KMemory64* mem, const Elf64ParseResult& image, U64 base) {
     if (!mem || !mem->nativeIdentityMode()) {
@@ -257,18 +258,22 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterMemset(
     }
 
     static constexpr std::array<U8, 24> kPattern = {
-        0x0f, 0x29, 0x02,             // movaps [rdx], xmm0
-        0x0f, 0x29, 0x42, 0x10,       // movaps [rdx+0x10], xmm0
-        0x0f, 0x29, 0x42, 0x20,       // movaps [rdx+0x20], xmm0
-        0x0f, 0x29, 0x42, 0x30,       // movaps [rdx+0x30], xmm0
-        0x48, 0x83, 0xea, 0xc0,       // sub rdx, -64
-        0x48, 0x39, 0xfa,             // cmp rdx, rdi
-        0x72, 0xe8,                   // jb loop
+        0xf3, 0x0f, 0x1e, 0xfa,       // endbr64
+        0x66, 0x0f, 0x6e, 0xc6,       // movd xmm0, esi
+        0x48, 0x89, 0xf8,             // mov rax, rdi
+        0x66, 0x0f, 0x60, 0xc0,       // punpcklbw xmm0, xmm0
+        0x66, 0x0f, 0x61, 0xc0,       // punpcklwd xmm0, xmm0
+        0x66, 0x0f, 0x70, 0xc0, 0x00, // pshufd xmm0, xmm0, 0
     };
-    static constexpr std::array<U8, 4> kReplacement = {
-        0x48, 0x83, 0xc2, 0x40,       // add rdx, 64
+    static constexpr std::array<U8, 19> kReplacement = {
+        0xf3, 0x0f, 0x1e, 0xfa,       // endbr64
+        0x49, 0x89, 0xf9,             // mov r9, rdi
+        0x48, 0x89, 0xd1,             // mov rcx, rdx
+        0x40, 0x88, 0xf0,             // mov al, sil
+        0xf3, 0xaa,                   // rep stosb
+        0x4c, 0x89, 0xc8,             // mov rax, r9
+        0xc3,                         // ret
     };
-    constexpr U64 kUpdateOffset = 15;
 
     U64 matchAddress = 0;
     U32 matchProtection = 0;
@@ -295,11 +300,11 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterMemset(
     }
 
     if (matchCount == 0) {
-        klog("loadProgram64: translated-loader pointer normalization not required");
+        klog("loadProgram64: translated-loader memset replacement not required");
         return FEX64InterpreterNormalization::NotNeeded;
     }
     if (matchCount != 1) {
-        klog_fmt("loadProgram64: refusing ambiguous translated-loader pointer normalization (matches=%u)",
+        klog_fmt("loadProgram64: refusing ambiguous translated-loader memset replacement (matches=%u)",
                  matchCount);
         return FEX64InterpreterNormalization::Failed;
     }
@@ -307,27 +312,27 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterMemset(
     const U64 pageAddress = matchAddress & ~K64_PAGE_MASK;
     if (mem->mprotect(pageAddress, K64_PAGE_SIZE,
                       K_PROT_READ | K_PROT_WRITE) != pageAddress) {
-        klog_fmt("loadProgram64: translated-loader pointer normalization could not make 0x%llx writable",
+        klog_fmt("loadProgram64: translated-loader memset replacement could not make 0x%llx writable",
                  (unsigned long long)matchAddress);
         return FEX64InterpreterNormalization::Failed;
     }
 
-    mem->memcpyToGuest(matchAddress + kUpdateOffset, kReplacement.data(),
+    mem->memcpyToGuest(matchAddress, kReplacement.data(),
                        kReplacement.size());
     std::array<U8, kReplacement.size()> verify = {};
-    mem->memcpyFromGuest(verify.data(), matchAddress + kUpdateOffset,
+    mem->memcpyFromGuest(verify.data(), matchAddress,
                          verify.size());
     const bool restored = mem->mprotect(pageAddress, K64_PAGE_SIZE,
                                         matchProtection) == pageAddress;
     if (!restored || verify != kReplacement) {
-        klog_fmt("loadProgram64: translated-loader pointer normalization failed at 0x%llx (write=%d restore=%d)",
-                 (unsigned long long)(matchAddress + kUpdateOffset),
+        klog_fmt("loadProgram64: translated-loader memset replacement failed at 0x%llx (write=%d restore=%d)",
+                 (unsigned long long)matchAddress,
                  verify == kReplacement ? 1 : 0, restored ? 1 : 0);
         return FEX64InterpreterNormalization::Failed;
     }
 
-    klog_fmt("loadProgram64: normalized translated-loader memset pointer update at 0x%llx",
-             (unsigned long long)(matchAddress + kUpdateOffset));
+    klog_fmt("loadProgram64: installed translated-loader REP STOS memset at 0x%llx",
+             (unsigned long long)matchAddress);
     return FEX64InterpreterNormalization::Applied;
 }
 
