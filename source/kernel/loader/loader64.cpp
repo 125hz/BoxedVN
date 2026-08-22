@@ -234,6 +234,90 @@ static U32 phdrFlagsToProt(U32 pFlags) {
     return prot;
 }
 
+template <typename CopySegment>
+static bool mapLoadSpan(KMemory64* mem, const Elf64ParseResult& r,
+                        U64 reloc, const char* tag,
+                        CopySegment copySegment) {
+    U64 spanStart = UINT64_MAX;
+    U64 spanEnd = 0;
+    for (const Elf64LoadSegment& seg : r.segments) {
+        if (seg.vaddr > UINT64_MAX - reloc) {
+            klog_fmt("loadProgram64[%s]: relocated segment address overflow", tag);
+            return false;
+        }
+        const U64 vaddr = seg.vaddr + reloc;
+        if (seg.memsz > UINT64_MAX - vaddr ||
+            vaddr + seg.memsz > UINT64_MAX - K64_PAGE_MASK) {
+            klog_fmt("loadProgram64[%s]: relocated segment length overflow", tag);
+            return false;
+        }
+        const U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
+        const U64 alignedEnd = (vaddr + seg.memsz + K64_PAGE_MASK) & ~K64_PAGE_MASK;
+        if (alignedAddr < spanStart) spanStart = alignedAddr;
+        if (alignedEnd > spanEnd) spanEnd = alignedEnd;
+    }
+    if (spanStart == UINT64_MAX || spanEnd <= spanStart) {
+        klog_fmt("loadProgram64[%s]: empty PT_LOAD span", tag);
+        return false;
+    }
+
+    // Darwin's host pages are larger than the 4 KiB x86 guest pages. Mapping
+    // each PT_LOAD independently makes two adjacent guest segments request
+    // partially-overlapping host pages, which the guarded identity mapper must
+    // reject. Reserve the complete image once, while writable, then populate
+    // every segment and apply final page permissions after all copies.
+    const U64 mapped = mem->mmapAnonymousFixed(
+        spanStart, spanEnd - spanStart, K_PROT_READ | K_PROT_WRITE);
+    if (mapped != spanStart) {
+        klog_fmt("loadProgram64[%s]: mmap failed for span [0x%llx,0x%llx) (got 0x%llx)",
+                 tag, (unsigned long long)spanStart,
+                 (unsigned long long)spanEnd, (unsigned long long)mapped);
+        return false;
+    }
+
+    for (const Elf64LoadSegment& seg : r.segments) {
+        const U64 vaddr = seg.vaddr + reloc;
+        if (!copySegment(seg, vaddr)) {
+            return false;
+        }
+    }
+    for (const Elf64LoadSegment& seg : r.segments) {
+        if (seg.memsz > seg.filesz) {
+            mem->memsetGuest(seg.vaddr + reloc + seg.filesz, 0,
+                             seg.memsz - seg.filesz);
+        }
+    }
+
+    for (U64 page = spanStart; page < spanEnd; page += K64_PAGE_SIZE) {
+        U32 pageProt = 0;
+        for (const Elf64LoadSegment& seg : r.segments) {
+            const U64 segStart = (seg.vaddr + reloc) & ~K64_PAGE_MASK;
+            const U64 segEnd = (seg.vaddr + reloc + seg.memsz + K64_PAGE_MASK) &
+                               ~K64_PAGE_MASK;
+            if (page >= segStart && page < segEnd) {
+                pageProt |= phdrFlagsToProt(seg.flags);
+            }
+        }
+        if (mem->mprotect(page, K64_PAGE_SIZE, pageProt) != page) {
+            klog_fmt("loadProgram64[%s]: final mprotect failed at 0x%llx",
+                     tag, (unsigned long long)page);
+            return false;
+        }
+    }
+
+    for (const Elf64LoadSegment& seg : r.segments) {
+        const U64 vaddr = seg.vaddr + reloc;
+        const U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
+        const U64 mapLen = ((vaddr - alignedAddr) + seg.memsz +
+                            K64_PAGE_MASK) & ~K64_PAGE_MASK;
+        klog_fmt("loadProgram64[%s]:   mapped seg vaddr=0x%llx len=0x%llx prot=0x%x filesz=0x%llx",
+                 tag, (unsigned long long)alignedAddr,
+                 (unsigned long long)mapLen, phdrFlagsToProt(seg.flags),
+                 (unsigned long long)seg.filesz);
+    }
+    return true;
+}
+
 // Public companion to the file-backed mapSegments — same shape, buffer
 // source. Self-test entry point.
 bool ElfLoader64::mapSegmentsFromBuffer(KMemory64* mem,
@@ -242,37 +326,20 @@ bool ElfLoader64::mapSegmentsFromBuffer(KMemory64* mem,
                                         U64 bufferLength,
                                         U64 reloc,
                                         const char* tag) {
-    for (const Elf64LoadSegment& seg : r.segments) {
-        U64 vaddr = seg.vaddr + reloc;
-        U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
-        U64 trailing = vaddr - alignedAddr;
-        U64 mapLen = (seg.memsz + trailing + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
-        U32 prot = phdrFlagsToProt(seg.flags);
-        const U32 loadProt = prot | K_PROT_READ | K_PROT_WRITE;
-        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, loadProt);
-        if (mapped != alignedAddr) {
-            klog_fmt("mapSegmentsFromBuffer[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
-                     tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
-            return false;
-        }
-        if (seg.filesz > 0) {
-            if (seg.offset + seg.filesz > bufferLength) {
+    return mapLoadSpan(mem, r, reloc, tag,
+        [&](const Elf64LoadSegment& seg, U64 vaddr) {
+            if (seg.filesz == 0) return true;
+            if (seg.offset > bufferLength ||
+                seg.filesz > bufferLength - seg.offset) {
                 klog_fmt("mapSegmentsFromBuffer[%s]: segment extends past buffer (offset=%llu filesz=%llu bufLen=%llu)",
-                         tag,
-                         (unsigned long long)seg.offset,
+                         tag, (unsigned long long)seg.offset,
                          (unsigned long long)seg.filesz,
                          (unsigned long long)bufferLength);
                 return false;
             }
             mem->memcpyToGuest(vaddr, buffer + seg.offset, seg.filesz);
-        }
-        if (mem->mprotect(alignedAddr, mapLen, prot) != alignedAddr) {
-            klog_fmt("mapSegmentsFromBuffer[%s]: final mprotect failed at 0x%llx",
-                     tag, (unsigned long long)alignedAddr);
-            return false;
-        }
-    }
-    return true;
+            return true;
+        });
 }
 
 // Map every PT_LOAD segment of one parsed ELF into guest memory at the
@@ -281,20 +348,15 @@ bool ElfLoader64::mapSegmentsFromBuffer(KMemory64* mem,
 static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
                         const Elf64ParseResult& r, U64 reloc,
                         const char* tag, int pid, const char* modPath) {
-    for (const Elf64LoadSegment& seg : r.segments) {
-        U64 vaddr = seg.vaddr + reloc;
-        U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
-        U64 trailing = vaddr - alignedAddr;
-        U64 mapLen = (seg.memsz + trailing + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
-        U32 prot = phdrFlagsToProt(seg.flags);
-        const U32 loadProt = prot | K_PROT_READ | K_PROT_WRITE;
-        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, loadProt);
-        if (mapped != alignedAddr) {
-            klog_fmt("loadProgram64[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
-                     tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
-            return false;
-        }
-        if (seg.filesz > 0) {
+    (void)pid;
+    (void)modPath;
+    return mapLoadSpan(mem, r, reloc, tag,
+        [&](const Elf64LoadSegment& seg, U64 vaddr) {
+            if (seg.filesz == 0) return true;
+            if (seg.filesz > UINT32_MAX) {
+                klog_fmt("loadProgram64[%s]: segment is too large to read", tag);
+                return false;
+            }
             std::vector<U8> buf((size_t)seg.filesz);
             openNode->seek((U64)seg.offset);
             U32 read = openNode->readNative(buf.data(), (U32)seg.filesz);
@@ -304,20 +366,8 @@ static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
                 return false;
             }
             mem->memcpyToGuest(vaddr, buf.data(), seg.filesz);
-        }
-        if (mem->mprotect(alignedAddr, mapLen, prot) != alignedAddr) {
-            klog_fmt("loadProgram64[%s]: final mprotect failed at 0x%llx",
-                     tag, (unsigned long long)alignedAddr);
-            return false;
-        }
-        klog_fmt("loadProgram64[%s]:   mapped seg vaddr=0x%llx len=0x%llx prot=0x%x filesz=0x%llx",
-                 tag,
-                 (unsigned long long)alignedAddr,
-                 (unsigned long long)mapLen,
-                 prot,
-                 (unsigned long long)seg.filesz);
-    }
-    return true;
+            return true;
+        });
 }
 
 // Open a guest-rootfs path. The interpreter path in PT_INTERP is an absolute

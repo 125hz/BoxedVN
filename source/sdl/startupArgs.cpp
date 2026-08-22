@@ -732,6 +732,17 @@ bool StartUpArgs::apply() {
         bool result = false;
         {
             KProcessPtr process = KProcess::create();// keep in this small scope so we don't hold onto it for the life of the program
+            bool requestedFEX64 = false;
+            for (const BString& value : this->envValues) {
+                if (value == "BOXEDWINE_CPU64=fex") {
+                    requestedFEX64 = true;
+                    break;
+                }
+            }
+            if (requestedFEX64) {
+                klog_fmt("BOXEDWINE_X64_LAUNCH request=fex executable=%s env_count=%u",
+                         this->args[0].c_str(), (U32)this->envValues.size());
+            }
             KThread* thread = process->startProcess(this->workingDir, this->args, this->envValues, this->userId, this->groupId, this->effectiveUserId, this->effectiveGroupId);
             result = thread != nullptr;
         }

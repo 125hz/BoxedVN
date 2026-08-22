@@ -15,6 +15,7 @@
 #include "cpu64.h"
 #include "kmemory64.h"
 #include "boxedwine_x64_hostcall.h"
+#include "kevent.h"
 #include "ksocket.h"
 #include <thread>   // std::this_thread::yield() for sched_yield
 #include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
@@ -938,14 +939,12 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     return (U64)got;
 }
 
-// openat(dirfd, path, flags, mode). For dirfd we honour AT_FDCWD (-100) and
-// any "absolute" path. Relative paths against a real dirfd aren't supported
-// yet — ld-linux always passes AT_FDCWD or absolute, so this covers the
-// startup path.
+// openat(dirfd, path, flags, mode). Reuse KProcess::openat so relative paths
+// resolve against a real directory descriptor as well as AT_FDCWD (-100).
 #ifndef K_AT_FDCWD
 #define K_AT_FDCWD (-100)
 #endif
-static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mode*/) {
+static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     if (!pathAddr) return (U64)-K_EFAULT;
     char path[1024] = {0};
@@ -971,15 +970,8 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
         klog_fmt("DLLPATH pid=%d openat('%s') flags=0x%llx", (int)process->id, path,
                  (unsigned long long)flags);
     }
-    bool isAbs = (path[0] == '/');
-    if (!isAbs && (S32)dirfd != K_AT_FDCWD) {
-        klog_fmt("sys_openat64: relative path '%s' with dirfd=%d not yet supported",
-                 path, (int)(S32)dirfd);
-        return (U64)-2;
-    }
-    KFileDescriptorPtr result;
-    U32 rc = process->openFile(process->currentDirectory, BString::copy(path),
-                               (U32)flags, result);
+    U32 rc = process->openat((FD)(S32)dirfd, BString::copy(path),
+                             (U32)flags, (U32)mode);
     if ((S32)rc < 0) {
         if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
                                         strstr(path, "x86_64-windows") || strstr(path, "kernel32"))) {
@@ -995,6 +987,8 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
         }
         return (U64)(S64)(S32)rc;
     }
+    KFileDescriptorPtr result = process->getFileDescriptor((FD)rc);
+    if (!result) return (U64)-K_EBADF;
     if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
                                     strstr(path, "x86_64-windows") || strstr(path, "x86_64-unix"))) {
         klog_fmt("DLLTRACE pid=%d OPEN  '%s' -> fd %d", (int)process->id, path, (int)result->handle);
@@ -2776,10 +2770,28 @@ static const char* x64SyscallName(U64 nr) {
  * property of the core.
  */
 static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
+    static std::atomic<U32> callLogCount{0};
+    const U32 logOrdinal = callLogCount.fetch_add(1, std::memory_order_relaxed);
+    const bool logCall = logOrdinal < 32 || callIndex == 47 || callIndex == 72;
+    const U32 processId = cpu && cpu->thread && cpu->thread->process
+        ? cpu->thread->process->id : 0;
+    if (logCall) {
+        klog_fmt("BOXEDWINE_DXMT_CALL ordinal=%u pid=%u index=%llu args=0x%llx",
+                 logOrdinal, processId, (unsigned long long)callIndex,
+                 (unsigned long long)args);
+    }
     if (!cpu || !cpu->memory || !cpu->memory->nativeIdentityMode()) {
+        if (logCall) {
+            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=native-memory",
+                     logOrdinal, -K_ENOSYS);
+        }
         return (U64)(S64)-K_ENOSYS;
     }
     if (callIndex >= BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT) {
+        if (logCall) {
+            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=index",
+                     logOrdinal, -K_EINVAL);
+        }
         return (U64)(S64)-K_EINVAL;
     }
     // The native table dereferences the unix-call parameter block directly.
@@ -2789,6 +2801,10 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         args >= K64_NATIVE_GUEST_WINDOW_END ||
         !(cpu->memory->getPageFlags(args >> K64_PAGE_SHIFT) &
           K64_PAGE_MAPPED)) {
+        if (logCall) {
+            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=args",
+                     logOrdinal, -K_EFAULT);
+        }
         return (U64)(S64)-K_EFAULT;
     }
 
@@ -2800,6 +2816,10 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     }
     const auto entry = reinterpret_cast<DxmtUnixEntry>(const_cast<void*>(raw));
     const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
+    if (logCall) {
+        klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d",
+                 logOrdinal, status);
+    }
     return (U64)(S64)status;
 #else
     (void)callIndex;
@@ -3848,8 +3868,9 @@ void ksyscall64(CPU64* cpu) {
             ret = (U64)(S64)rc;
             break;
         }
+        case X64_SYS_select:
         case X64_SYS_pselect6: {
-            // pselect6(nfds, readfds*, writefds*, exceptfds*, timespec*, sigmask).
+            // select/pselect6(nfds, readfds*, writefds*, exceptfds*, timeout*, ...).
             // We have no native select, but kpoll() is the real readiness/blocking
             // engine. Translate the fd_set bitmaps into a pollfd array, run kpoll,
             // then translate the revents back into the fd_sets. Without this, wine
@@ -3859,17 +3880,30 @@ void ksyscall64(CPU64* cpu) {
             }
             U32 nfds = (U32)a1;          // highest fd + 1
             U64 rfdsAddr = a2, wfdsAddr = a3, efdsAddr = a4, tsAddr = a5;
-            if (nfds > 1024) { ret = (U64)-K_EINVAL; break; }
+            // The shared 32-bit poll scratch is one page and each pollfd is
+            // eight bytes. Do not overflow it while translating fd_sets.
+            constexpr U32 maxPollFds = K_PAGE_SIZE / 8;
+            if (nfds > maxPollFds) { ret = (U64)-K_EINVAL; break; }
 
-            // Timeout: a5 is a timespec* (NULL == infinite). Match kpoll's
-            // convention (0 == non-blocking, >0xF0000000 == infinite).
+            // pselect6 uses timespec {sec,nsec}; select uses timeval {sec,usec}.
+            // A NULL timeout means infinite wait for either syscall.
             U32 timeoutMs;
             if (tsAddr == 0) {
                 timeoutMs = 0xFFFFFFFFu;
             } else {
-                U64 sec  = cpu->memory->readq(tsAddr);
-                U64 nsec = cpu->memory->readq(tsAddr + 8);
-                timeoutMs = (U32)(sec * 1000 + nsec / 1000000);
+                const S64 sec = (S64)cpu->memory->readq(tsAddr);
+                const S64 subsec = (S64)cpu->memory->readq(tsAddr + 8);
+                const S64 subsecLimit = nr == X64_SYS_select
+                    ? 1000000LL : 1000000000LL;
+                if (sec < 0 || subsec < 0 || subsec >= subsecLimit) {
+                    ret = (U64)-K_EINVAL;
+                    break;
+                }
+                const U64 divisor = nr == X64_SYS_select ? 1000ULL : 1000000ULL;
+                const U64 millis = (U64)sec * 1000ULL +
+                                   ((U64)subsec + divisor - 1) / divisor;
+                timeoutMs = millis >= 0xF0000000ULL
+                    ? 0xEFFFFFFFU : (U32)millis;
             }
 
             // Read the three fd_set bitmaps (each (nfds+7)/8 bytes, capped to the
@@ -3887,9 +3921,9 @@ void ksyscall64(CPU64* cpu) {
             // — one entry per fd that appears in any set. POLLIN=1, POLLOUT=4,
             // POLLPRI=2 (the select events) per Linux poll.h.
             struct PFD { S32 fd; U16 ev; U16 rev; };
-            PFD pfds[1024];
+            PFD pfds[maxPollFds];
             U32 npoll = 0;
-            for (U32 fd = 0; fd < nfds && npoll < 1024; fd++) {
+            for (U32 fd = 0; fd < nfds && npoll < maxPollFds; fd++) {
                 U16 ev = 0;
                 if (rfdsAddr && isSet(rset, fd)) ev |= 0x0001; // POLLIN
                 if (wfdsAddr && isSet(wset, fd)) ev |= 0x0004; // POLLOUT
@@ -4059,9 +4093,12 @@ void ksyscall64(CPU64* cpu) {
             }
             break;
         case X64_SYS_eventfd2:
-            // Used by glibc for thread-pool wakeups, by GLib mainloop, etc.
-            // Real impl needs an FD allocator that can wire poll/read.
-            ret = (U64)-K_ENOSYS;
+            if (!cpu->thread || !cpu->thread->process) {
+                ret = (U64)-K_ENOSYS;
+            } else {
+                ret = (U64)(S64)(S32)syscall_eventfd2(
+                    cpu->thread, (U32)a1, (U32)a2);
+            }
             break;
         case X64_SYS_epoll_create:
         case X64_SYS_epoll_create1:
@@ -4167,11 +4204,6 @@ void ksyscall64(CPU64* cpu) {
             if (a2 == 0) { ret = (U64)-K_EFAULT; break; }
             ret = sys_readv64(cpu, a1, a2, a3);
             break;
-        case X64_SYS_select:
-            // select(nfds, readfds, writefds, exceptfds, timeout). Without
-            // real fd polling we cannot honor it; ENOSYS surfaces cleanly.
-            ret = (U64)-K_ENOSYS;
-            break;
         case X64_SYS_chmod:
         case X64_SYS_fchmod:
             // No-op success: rootfs is effectively read-only for our purpose
@@ -4225,12 +4257,37 @@ void ksyscall64(CPU64* cpu) {
             }
             ret = 0;
             break;
-        case X64_SYS_nanosleep:
-        case X64_SYS_clock_nanosleep:
-            // No-op sleep. Real Wine workloads will need pacing here, but
-            // for ld.so startup it's fine to return immediately.
-            ret = 0;
+        case X64_SYS_nanosleep: {
+            if (!cpu->thread || !a1) { ret = (U64)-K_EFAULT; break; }
+            const S64 sec = (S64)cpu->memory->readq(a1);
+            const S64 nsec = (S64)cpu->memory->readq(a1 + 8);
+            if (sec < 0 || nsec < 0 || nsec >= 1000000000LL ||
+                (U64)sec > (UINT64_MAX - (U64)nsec) / 1000000000ULL) {
+                ret = (U64)-K_EINVAL;
+                break;
+            }
+            ret = (U64)(S64)(S32)cpu->thread->nanoSleep(
+                (U64)sec * 1000000000ULL + (U64)nsec);
             break;
+        }
+        case X64_SYS_clock_nanosleep: {
+            if (!cpu->thread || !a3) { ret = (U64)-K_EFAULT; break; }
+            // Linux uses TIMER_ABSTIME=1. The shared KThread implementation
+            // currently supports relative sleeps only, so reject other flags
+            // instead of silently returning without sleeping.
+            if (a2 != 0) { ret = (U64)-K_ENOTSUP; break; }
+            const S64 sec = (S64)cpu->memory->readq(a3);
+            const S64 nsec = (S64)cpu->memory->readq(a3 + 8);
+            if (sec < 0 || nsec < 0 || nsec >= 1000000000LL ||
+                (U64)sec > (UINT64_MAX - (U64)nsec) / 1000000000ULL) {
+                ret = (U64)-K_EINVAL;
+                break;
+            }
+            ret = (U64)(S64)(S32)cpu->thread->clockNanoSleep(
+                (U32)a1, 0, (U64)sec * 1000000000ULL + (U64)nsec,
+                (U32)a4);
+            break;
+        }
         case X64_SYS_rseq:
             // restartable-sequences registration. glibc 2.35+ calls this on
             // every thread start. Pretend it's not supported so glibc falls

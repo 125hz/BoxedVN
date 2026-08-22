@@ -66,7 +66,7 @@ bool KEvent::isReadReady() {
 }
 
 bool KEvent::isWriteReady() {
-    return counter != 0xffffffffffffffffl;
+    return counter < UINT64_MAX - 1;
 }
 
 U32 KEvent::writeNative(U8* buffer, U32 len) {
@@ -74,16 +74,18 @@ U32 KEvent::writeNative(U8* buffer, U32 len) {
         return -K_EINVAL;
     }
     U64 value = *(U64*)buffer;
+    if (value == UINT64_MAX) {
+        return -K_EINVAL;
+    }
     BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(lockCond);
     while (true) {
-        U64 result = counter + value;
-        if (result < counter || result < value) {
+        if (value > (UINT64_MAX - 1) - counter) {
             if (!blocking) {
                 return -K_EAGAIN;
             }
             BOXEDWINE_CONDITION_WAIT(lockCond);
         } else {
-            counter = result;
+            counter += value;
             BOXEDWINE_CONDITION_SIGNAL(lockCond);
             break;
         }
@@ -98,8 +100,12 @@ U32 KEvent::readNative(U8* buffer, U32 len) {
     BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(lockCond);
     while (true) {
         if (counter) {
-            *((U64*)buffer) = counter;
-            counter = 0;
+            *((U64*)buffer) = semaphore ? 1 : counter;
+            if (semaphore) {
+                --counter;
+            } else {
+                counter = 0;
+            }
             BOXEDWINE_CONDITION_SIGNAL(lockCond);
             return 8;
         }
@@ -149,10 +155,15 @@ S64 KEvent::length() {
 }
 
 U32 syscall_eventfd2(KThread* thread, U32 initialValue, U32 flags) {
+    const U32 allowedFlags = K_O_NONBLOCK | K_O_CLOEXEC | 1U; // EFD_SEMAPHORE
+    if (flags & ~allowedFlags) {
+        return -K_EINVAL;
+    }
     KFileDescriptorPtr fd;
 
     std::shared_ptr<KEvent> o = std::make_shared<KEvent>();
     o->counter = initialValue;
+    o->semaphore = (flags & 1) != 0; // EFD_SEMAPHORE
     fd = thread->process->allocFileDescriptor(o, K_O_RDWR, 0, -1, 0);
 
     if (flags & K_O_CLOEXEC) {
@@ -160,12 +171,6 @@ U32 syscall_eventfd2(KThread* thread, U32 initialValue, U32 flags) {
     }
     if (flags & K_O_NONBLOCK) {
         fd->accessFlags |= K_O_NONBLOCK;
-    }
-    U32 unusedFlags = flags;
-    unusedFlags &= ~K_O_NONBLOCK;
-    unusedFlags &= ~K_O_CLOEXEC;
-    if (unusedFlags) {
-        kwarn_fmt("syscall_eventfd2 unhandled flags=%X", unusedFlags);
     }
     o->blocking = (fd->accessFlags & K_O_NONBLOCK) == 0;
     return fd->handle;

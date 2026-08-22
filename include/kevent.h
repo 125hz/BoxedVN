@@ -51,6 +51,7 @@ public:
     BString selfFd() override;
 
     bool blocking = false;
+    bool semaphore = false;
     BOXEDWINE_CONDITION lockCond;
     U64 counter = 0;
 };

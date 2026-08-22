@@ -1082,13 +1082,29 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
         kwarn("No command specified");
         return nullptr;
 	}
-#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
     for (const BString& value : envValues) {
         if (value == "BOXEDWINE_CPU64=fex") {
-            this->useFEX64 = true;
             traceFEX64 = true;
             break;
         }
+    }
+#if defined(BOXEDWINE_GUEST_X64)
+    constexpr U32 compiledGuestX64 = 1;
+#else
+    constexpr U32 compiledGuestX64 = 0;
+#endif
+#if defined(BOXEDWINE_FEX64_BACKEND)
+    constexpr U32 compiledFEX64 = 1;
+#else
+    constexpr U32 compiledFEX64 = 0;
+#endif
+    if (traceFEX64) {
+        klog_fmt("BOXEDWINE_X64_START entered executable=%s guest64=%u fex_backend=%u",
+                 argValues[0].c_str(), compiledGuestX64, compiledFEX64);
+    }
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+    if (traceFEX64) {
+        this->useFEX64 = true;
     }
     if (traceFEX64) {
         klog_fmt("BOXEDWINE_FEX64_START resolve executable=%s cwd=%s",
@@ -1615,6 +1631,13 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     if (!openNode) {
         return -K_ENOEXEC;
     }
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+    if (this->is64Bit) {
+        klog_fmt("BOXEDWINE_X64_EXEC pid=%u path=%s fex=%u native=%u",
+                 this->id, path.c_str(), this->useFEX64 ? 1U : 0U,
+                 this->memory64 && this->memory64->nativeIdentityMode() ? 1U : 0U);
+    }
+#endif
 #ifdef BOXEDWINE_MULTI_THREADED
     if (KSystem::cpuAffinityCountForApp) {
         Platform::setCpuAffinityForThread(thread, this->isSystemProcess()?0:KSystem::cpuAffinityCountForApp);
@@ -1715,6 +1738,11 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         }
         this->startupArgs64 = args;
         this->startupEnv64 = envs;
+#if defined(BOXEDWINE_FEX64_BACKEND)
+        klog_fmt("BOXEDWINE_X64_EXEC_REMAP pid=%u fex=%u native=%u",
+                 this->id, this->useFEX64 ? 1U : 0U,
+                 preserveNativeIdentity ? 1U : 0U);
+#endif
     }
 #endif
 
@@ -2831,6 +2859,11 @@ U32 KProcess::forkProcess64(KThread* thread, U64 flags, U64 childTid,
             childThread->clear_child_tid64 = childTid;
         }
         childProcess->publish();
+#if defined(BOXEDWINE_FEX64_BACKEND)
+        klog_fmt("BOXEDWINE_X64_FORK parent=%u child=%u parent_fex=%u child_fex=0 native=0 flags=0x%llx",
+                 this->id, childProcess->id, this->useFEX64 ? 1U : 0U,
+                 (unsigned long long)flags);
+#endif
     } catch (const std::bad_alloc&) {
         childProcess.reset();
         return -K_ENOMEM;

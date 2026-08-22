@@ -199,6 +199,11 @@ bool BVNDXMTDisplayHasLayer(void) {
 }
 
 static struct macdrv_win_data* BVNDXMTGetWinData(HWND hwnd) {
+    static unsigned callCount = 0;
+    if (__atomic_fetch_add(&callCount, 1, __ATOMIC_RELAXED) < 8) {
+        BVNLogWrite(BVNLogLevelInfo, "dxmt",
+                    "DXMT requested BoxedWine window data.");
+    }
     struct macdrv_win_data* data = calloc(1, sizeof(*data));
     if (data != NULL) {
         data->hwnd = hwnd;
@@ -213,6 +218,8 @@ static void BVNDXMTReleaseWinData(struct macdrv_win_data* data) {
 }
 
 static macdrv_metal_device BVNDXMTCreateMetalDevice(void) {
+    BVNLogWrite(BVNLogLevelInfo, "dxmt",
+                "DXMT requested the BoxedWine Metal device token.");
     // DXMT creates the actual MTLDevice. A non-null token keeps its Wine-facing
     // macdrv contract intact without claiming ownership of that object here.
     return (macdrv_metal_device)(uintptr_t)1;
@@ -232,10 +239,17 @@ static macdrv_metal_view BVNDXMTCreateMetalView(macdrv_view view,
                     "DXMT requested a swapchain before its layer was prepared.");
         return NULL;
     }
+    BVNLogWrite(BVNLogLevelInfo, "dxmt",
+                "DXMT acquired the BoxedWine Metal presentation view.");
     return (macdrv_metal_view)CFBridgingRetain(layer);
 }
 
 static macdrv_metal_layer BVNDXMTGetMetalLayer(macdrv_metal_view view) {
+    static unsigned callCount = 0;
+    if (__atomic_fetch_add(&callCount, 1, __ATOMIC_RELAXED) < 8) {
+        BVNLogWrite(BVNLogLevelInfo, "dxmt",
+                    "DXMT acquired the BoxedWine CAMetalLayer.");
+    }
     return (macdrv_metal_layer)view;
 }
 
