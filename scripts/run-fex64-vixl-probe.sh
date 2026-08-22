@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Execute the loader SIMD/control-flow fixture through FEX's ARM64 JIT using
 # the VIXL simulator. This is intentionally separate from the iOS build and
-# never modifies third_party/fex64/fex.
+# leaves third_party/fex64/fex unchanged when it exits.
 
 set -euo pipefail
 
@@ -12,6 +12,11 @@ fixture="${root}/scripts/guest-probes/fex64-loader-stall.asm"
 cc="${CC:-clang}"
 cxx="${CXX:-clang++}"
 allocator_declaration_header="${fex_source}/FEXCore/Source/Utils/Allocator.h"
+runtime_patches=(
+    "${root}/scripts/fex64-patches/fex-ios-host-diagnostics-guard.patch"
+    "${root}/scripts/fex64-patches/fex-ios-caspal-diagnostic-host.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-block-diagnostics.patch"
+)
 
 die() {
     echo "error: $*" >&2
@@ -30,8 +35,34 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
 [[ -f "${fixture}" ]] || die "fixture not found: ${fixture}"
 [[ -f "${allocator_declaration_header}" ]] || \
     die "allocator declaration header not found: ${allocator_declaration_header}"
+for runtime_patch in "${runtime_patches[@]}"; do
+    [[ -f "${runtime_patch}" ]] || die "runtime patch not found: ${runtime_patch}"
+done
 
-if [[ ! -x "${fex_build}/Bin/TestHarnessRunner" ]]; then
+build_runner() (
+    applied_patches=()
+    restore_source() {
+        local index
+        for ((index=${#applied_patches[@]} - 1; index >= 0; index--)); do
+            git -C "${fex_source}" apply --reverse \
+                "${applied_patches[index]}" || true
+        done
+    }
+    trap restore_source EXIT
+
+    # Exercise the same maintained translator patches as the iOS build. Apply
+    # them only for this build and restore the fetched checkout on every exit.
+    for runtime_patch in "${runtime_patches[@]}"; do
+        if git -C "${fex_source}" apply --reverse --check \
+                "${runtime_patch}" 2>/dev/null; then
+            continue
+        fi
+        git -C "${fex_source}" apply --check "${runtime_patch}" || \
+            die "runtime patch no longer applies: ${runtime_patch}"
+        git -C "${fex_source}" apply "${runtime_patch}"
+        applied_patches+=("${runtime_patch}")
+    done
+
     # The pinned iOS fork's Linux Allocator.cpp calls its private
     # InitializeAllocator declaration without including the private header.
     # Preinclude that declaration for this host-only conformance build; keep
@@ -52,6 +83,10 @@ if [[ ! -x "${fex_build}/Bin/TestHarnessRunner" ]]; then
         -DENABLE_GDB_SYMBOLS=OFF \
         -DENABLE_ZYDIS=OFF
     cmake --build "${fex_build}" --target TestHarnessRunner
+)
+
+if [[ ! -x "${fex_build}/Bin/TestHarnessRunner" ]]; then
+    build_runner
 fi
 
 runner="${fex_build}/Bin/TestHarnessRunner"
