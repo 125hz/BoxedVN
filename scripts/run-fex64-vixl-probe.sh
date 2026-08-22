@@ -11,6 +11,7 @@ fex_build="${FEX_BUILD:-${root}/build/fex-vixl-probe}"
 fixture="${root}/scripts/guest-probes/fex64-loader-stall.asm"
 cc="${CC:-clang}"
 cxx="${CXX:-clang++}"
+allocator_declaration_header="${fex_source}/FEXCore/Source/Utils/Allocator.h"
 
 die() {
     echo "error: $*" >&2
@@ -27,11 +28,18 @@ command -v "${cc}" >/dev/null || die "the Clang C compiler is required"
 command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
 [[ -d "${fex_source}/FEXCore" ]] || die "FEX source not found: ${fex_source}"
 [[ -f "${fixture}" ]] || die "fixture not found: ${fixture}"
+[[ -f "${allocator_declaration_header}" ]] || \
+    die "allocator declaration header not found: ${allocator_declaration_header}"
 
 if [[ ! -x "${fex_build}/Bin/TestHarnessRunner" ]]; then
+    # The pinned iOS fork's Linux Allocator.cpp calls its private
+    # InitializeAllocator declaration without including the private header.
+    # Preinclude that declaration for this host-only conformance build; keep
+    # the pinned third-party checkout untouched.
     cmake -S "${fex_source}" -B "${fex_build}" -G Ninja \
         -DCMAKE_C_COMPILER="${cc}" \
         -DCMAKE_CXX_COMPILER="${cxx}" \
+        -DCMAKE_CXX_FLAGS="-include${allocator_declaration_header}" \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DENABLE_LTO=OFF \
         -DENABLE_ASSERTIONS=ON \
