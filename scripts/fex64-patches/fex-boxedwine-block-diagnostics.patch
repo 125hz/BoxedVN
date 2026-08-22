@@ -2,7 +2,7 @@ diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/C
 index 92305f460..50c8cf656 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
-@@ -1360,4 +1360,24 @@
+@@ -1360,4 +1360,31 @@
  uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
 +  /* BoxedWine: keep a bounded enter/leave trace around the whole compiler.
 +   * An unmatched enter identifies a translator-side stall, while a matched
@@ -15,13 +15,20 @@ index 92305f460..50c8cf656 100644
 +    uint32_t Ordinal;
 +    uint64_t RIP;
 +    ~BoxedWineCompileTrace() {
-+      if (Ordinal < 128) {
++      if (Ordinal < 512) {
 +        LogMan::Msg::IFmt("[boxedwine-block] leave ordinal={} rip={:#x}", Ordinal, RIP);
 +      }
 +    }
 +  } BoxedWineTrace {BoxedWineOrdinal, GuestRIP};
-+  if (BoxedWineOrdinal < 128) {
-+    LogMan::Msg::IFmt("[boxedwine-block] enter ordinal={} rip={:#x} max_inst={}", BoxedWineOrdinal, GuestRIP, MaxInst);
++  if (BoxedWineOrdinal < 512) {
++    LogMan::Msg::IFmt(
++      "[boxedwine-block] enter ordinal={} rip={:#x} max_inst={} frame_rip={:#x} rsp={:#x} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x}",
++      BoxedWineOrdinal, GuestRIP, MaxInst, Frame ? Frame->State.rip : 0,
++      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSP] : 0,
++      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RAX] : 0,
++      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RDI] : 0,
++      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSI] : 0,
++      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RDX] : 0);
 +  }
 +
    if constexpr (BLOCK_DEBUGGING) {

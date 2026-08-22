@@ -494,6 +494,13 @@ bool initializeFEXGlobals() {
         LogMan::Throw::InstallHandler(fexThrow);
         FEXCore::Config::Initialize();
         FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE, "1");
+        // The bundled ELF loader exercises dense, cyclic control flow before
+        // Wine reaches its first process boundary.  Keep each compiled unit to
+        // one basic block while the BoxedWine backend is being brought up.  It
+        // avoids optimizer/linker ambiguity without disabling the JIT, and is
+        // still an optional FEX-only policy.
+        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "0");
+        reportf("FEX multiblock compilation disabled for deterministic guest control flow");
         gFEXGlobalsReady = true;
     });
     return gFEXGlobalsReady;
