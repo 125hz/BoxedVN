@@ -66,7 +66,6 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <libkern/OSCacheControl.h>
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach/thread_act.h>
 #include <pthread.h>
 #include <signal.h>
@@ -436,10 +435,10 @@ bool readNativeGuestQword(KMemory64* memory, uint64_t address,
         !memory->nativeGuestRangeAllowed(address, sizeof(value))) {
         return false;
     }
-    mach_vm_size_t bytesRead = 0;
-    return mach_vm_read_overwrite(
+    vm_size_t bytesRead = 0;
+    return vm_read_overwrite(
         mach_task_self(), address, sizeof(value),
-        reinterpret_cast<mach_vm_address_t>(&value), &bytesRead) ==
+        reinterpret_cast<vm_address_t>(&value), &bytesRead) ==
             KERN_SUCCESS &&
         bytesRead == sizeof(value);
 }
@@ -1095,11 +1094,11 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     snapshot.hostLR = arm_thread_state64_get_lr(registers);
                     snapshot.hostSP = arm_thread_state64_get_sp(registers);
                     snapshot.hostCodeAddress = snapshot.hostPC & ~uint64_t {3};
-                    mach_vm_size_t hostCodeBytes = 0;
-                    snapshot.hostCodeValid = mach_vm_read_overwrite(
+                    vm_size_t hostCodeBytes = 0;
+                    snapshot.hostCodeValid = vm_read_overwrite(
                         mach_task_self(), snapshot.hostCodeAddress,
                         sizeof(snapshot.hostCode),
-                        reinterpret_cast<mach_vm_address_t>(
+                        reinterpret_cast<vm_address_t>(
                             snapshot.hostCode.data()),
                         &hostCodeBytes) == KERN_SUCCESS &&
                         hostCodeBytes == sizeof(snapshot.hostCode);
