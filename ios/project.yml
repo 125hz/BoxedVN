@@ -120,6 +120,10 @@ targets:
           # the object out of libboxedvn.a even before an x64 launch requests
           # the presentation surface, then verify the export after linking.
           - -Wl,-u,_macdrv_functions
+          # Set only by build-ios.sh when the native DXMT archive is present.
+          # The unix-call table otherwise has no root at the final app link and
+          # Release dead stripping removes the archive member that defines it.
+          - $(BVN_DXMT_FORCE_LINK)
         CLANG_ENABLE_MODULES: YES
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         # Sideloading tools re-sign the IPA, so CI produces it unsigned.

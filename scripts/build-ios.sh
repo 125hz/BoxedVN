@@ -343,6 +343,11 @@ if [[ ${SIGN} -eq 1 ]]; then
     signing_args=()
 fi
 
+DXMT_FORCE_LINK=""
+if [[ -n "${DXMT_NATIVE_ARCHIVE}" ]]; then
+    DXMT_FORCE_LINK="-Wl,-u,_dxmt_winemetal_unix_call_funcs"
+fi
+
 log "Building BoxedVN.app for generic iOS device"
 set +e
 xcodebuild \
@@ -354,6 +359,7 @@ xcodebuild \
     BVN_LIBRARY_DIR="${CMAKE_BUILD_DIR}" \
     BVN_INCLUDE_DIR="${BOXEDVN_ROOT}/ios/runtime/include" \
     BVN_BUILD_REVISION="${BUILD_REVISION}" \
+    BVN_DXMT_FORCE_LINK="${DXMT_FORCE_LINK}" \
     "${signing_args[@]}" \
     build \
     >"${BUILD_LOG}" 2>&1
