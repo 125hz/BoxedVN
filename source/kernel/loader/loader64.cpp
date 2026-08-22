@@ -1125,7 +1125,16 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     process->phdr64 = r.phdrVaddr + reloc;
     process->phnum64 = r.phnum;
     process->phentsize64 = r.phentsize;
-    process->brkEnd64 = (r.baseAddrHigh + reloc + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
+    const U64 brkAlignment = mem->nativeIdentityMode()
+        ? K64_NATIVE_GUEST_LAYOUT_ALIGN
+        : K64_PAGE_SIZE;
+    process->brkEnd64 = (r.baseAddrHigh + reloc + brkAlignment - 1) &
+                        ~(brkAlignment - 1);
+    klog_fmt("loadProgram64: initial brk=0x%llx mmap base=0x%llx",
+             (unsigned long long)process->brkEnd64,
+             (unsigned long long)(mem->nativeIdentityMode()
+                 ? K64_NATIVE_GUEST_MMAP_BASE
+                 : 0));
     process->is64Bit = true;
 
     // ---- PT_INTERP: recursively load the dynamic linker. ----

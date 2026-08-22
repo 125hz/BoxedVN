@@ -599,8 +599,24 @@ static U64 sys_brk64(CPU64* cpu, U64 newBrk) {
     U64 alignedOld = (oldBrk + 0xFFF) & ~0xFFFULL;
     U64 alignedNew = (newBrk + 0xFFF) & ~0xFFFULL;
     if (alignedNew > alignedOld) {
+        const U64 firstPage = alignedOld >> K64_PAGE_SHIFT;
+        const U64 pageCount = (alignedNew - alignedOld) >> K64_PAGE_SHIFT;
+        for (U64 i = 0; i < pageCount; ++i) {
+            if (cpu->memory->getPageFlags(firstPage + i) & K64_PAGE_MAPPED) {
+                klog_fmt("sys_brk64: refusing occupied growth range "
+                         "[0x%llx,0x%llx) at page 0x%llx",
+                         (unsigned long long)alignedOld,
+                         (unsigned long long)alignedNew,
+                         (unsigned long long)((firstPage + i) << K64_PAGE_SHIFT));
+                return oldBrk;
+            }
+        }
         U64 ret = cpu->memory->mmapAnonymousFixed(alignedOld, alignedNew - alignedOld, 0x3); // PROT_READ|WRITE
         if ((S64)ret < 0) {
+            klog_fmt("sys_brk64: failed to map growth range [0x%llx,0x%llx), error=%lld",
+                     (unsigned long long)alignedOld,
+                     (unsigned long long)alignedNew,
+                     (long long)(S64)ret);
             return oldBrk;
         }
     }

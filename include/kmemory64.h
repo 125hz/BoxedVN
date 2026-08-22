@@ -69,8 +69,18 @@ class KThread;
 // their normal Linux-style addresses and do not use these limits.
 #define K64_NATIVE_GUEST_WINDOW_START 0x7048000000ULL
 #define K64_NATIVE_GUEST_WINDOW_END   0x7fffff0000ULL
-#define K64_NATIVE_GUEST_MMAP_BASE    K64_NATIVE_GUEST_WINDOW_START
 #define K64_NATIVE_GUEST_IMAGE_BASE  (K64_NATIVE_GUEST_WINDOW_START)
+// Keep automatic mappings out of the executable's program-break growth lane.
+// Starting mmap(NULL, ...) at IMAGE_BASE let ld-linux place libc immediately
+// above a small PIE, so glibc's first brk expansion collided with libc. Four
+// GiB is ample initial brk space; larger allocations naturally use mmap.
+#define K64_NATIVE_GUEST_HEAP_LIMIT   (K64_NATIVE_GUEST_IMAGE_BASE + 0x100000000ULL)
+#define K64_NATIVE_GUEST_MMAP_BASE    K64_NATIVE_GUEST_HEAP_LIMIT
+// Darwin/iOS native mappings use 16 KiB host pages while the x86-64 guest uses
+// 4 KiB pages. The initial break must not share the executable's final host
+// page, because extending that partially tracked mapping cannot be done with a
+// destructive MAP_FIXED operation.
+#define K64_NATIVE_GUEST_LAYOUT_ALIGN 0x4000ULL
 #define K64_NATIVE_GUEST_INTERP_BASE (K64_NATIVE_GUEST_WINDOW_END - 0x200000000ULL)
 #define K64_NATIVE_GUEST_STACK_TOP   (K64_NATIVE_GUEST_WINDOW_END - 0x100000ULL)
 #define K64_NATIVE_GUEST_TLS_BASE    (K64_NATIVE_GUEST_STACK_TOP - 0x900000ULL)
@@ -85,6 +95,14 @@ static_assert((K64_NATIVE_GUEST_WINDOW_START & 0x3FFFULL) == 0 &&
               "native guest window must be 16 KiB host-page aligned");
 static_assert(K64_NATIVE_GUEST_WINDOW_START < K64_NATIVE_GUEST_WINDOW_END,
               "native guest window must have positive size");
+static_assert((K64_NATIVE_GUEST_LAYOUT_ALIGN & (K64_NATIVE_GUEST_LAYOUT_ALIGN - 1)) == 0,
+              "native guest layout alignment must be a power of two");
+static_assert((K64_NATIVE_GUEST_MMAP_BASE & (K64_NATIVE_GUEST_LAYOUT_ALIGN - 1)) == 0,
+              "native mmap base must satisfy the iOS host-page layout contract");
+static_assert(K64_NATIVE_GUEST_IMAGE_BASE < K64_NATIVE_GUEST_HEAP_LIMIT,
+              "native guest heap lane must have positive size");
+static_assert(K64_NATIVE_GUEST_HEAP_LIMIT == K64_NATIVE_GUEST_MMAP_BASE,
+              "native automatic mappings must begin after the heap lane");
 static_assert(K64_NATIVE_GUEST_INTERP_BASE > K64_NATIVE_GUEST_MMAP_BASE,
               "native interpreter base must follow the mmap region");
 #endif
