@@ -67,6 +67,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
 #include <mach/thread_act.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -387,9 +388,14 @@ struct ExecutionTraceSnapshot {
     uint64_t hostPC = 0;
     uint64_t hostLR = 0;
     uint64_t hostSP = 0;
+    std::array<uint64_t, 8> hostArguments {};
     uint64_t hostCodeAddress = 0;
     std::array<uint32_t, 8> hostCode {};
     bool hostCodeValid = false;
+    uint64_t hostCallGuestRIP = 0;
+    uint64_t hostCallCodeAddress = 0;
+    std::array<uint32_t, 8> hostCallCode {};
+    bool hostCallCodeValid = false;
     uint64_t guestRIP = 0;
     uint64_t frameRIP = 0;
     uint64_t fsBase = 0;
@@ -1093,6 +1099,8 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     snapshot.hostPC = arm_thread_state64_get_pc(registers);
                     snapshot.hostLR = arm_thread_state64_get_lr(registers);
                     snapshot.hostSP = arm_thread_state64_get_sp(registers);
+                    std::copy_n(registers.__x, snapshot.hostArguments.size(),
+                                snapshot.hostArguments.begin());
                     snapshot.hostCodeAddress = snapshot.hostPC & ~uint64_t {3};
                     vm_size_t hostCodeBytes = 0;
                     snapshot.hostCodeValid = vm_read_overwrite(
@@ -1131,6 +1139,23 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                                 registers.__x[hostRegister];
                             snapshot.liveGPRMask |= 1u << gpr;
                         }
+                    }
+                    if (snapshot.hostLR >= 4 &&
+                        processState->context->IsAddressInCodeBuffer(
+                            threadState->fexThread, snapshot.hostLR - 4)) {
+                        snapshot.hostCallGuestRIP =
+                            processState->context->RestoreRIPFromHostPC(
+                                threadState->fexThread, snapshot.hostLR - 4);
+                        snapshot.hostCallCodeAddress =
+                            (snapshot.hostLR - 16) & ~uint64_t {3};
+                        vm_size_t hostCallCodeBytes = 0;
+                        snapshot.hostCallCodeValid = vm_read_overwrite(
+                            mach_task_self(), snapshot.hostCallCodeAddress,
+                            sizeof(snapshot.hostCallCode),
+                            reinterpret_cast<vm_address_t>(
+                                snapshot.hostCallCode.data()),
+                            &hostCallCodeBytes) == KERN_SUCCESS &&
+                            hostCallCodeBytes == sizeof(snapshot.hostCallCode);
                     }
                 }
 
@@ -1320,6 +1345,17 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     static_cast<unsigned long long>(gpr[FEXCore::X86State::REG_R15]),
                     static_cast<unsigned long long>(snapshot.fsBase),
                     static_cast<unsigned long long>(snapshot.gsBase));
+            reportf("BOXEDWINE_FEX64_STALL_HOST_ARGS pid=%u tid=%u x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x4=0x%llx x5=0x%llx x6=0x%llx x7=0x%llx call_guest_rip=0x%llx",
+                    snapshot.processId, snapshot.threadId,
+                    static_cast<unsigned long long>(snapshot.hostArguments[0]),
+                    static_cast<unsigned long long>(snapshot.hostArguments[1]),
+                    static_cast<unsigned long long>(snapshot.hostArguments[2]),
+                    static_cast<unsigned long long>(snapshot.hostArguments[3]),
+                    static_cast<unsigned long long>(snapshot.hostArguments[4]),
+                    static_cast<unsigned long long>(snapshot.hostArguments[5]),
+                    static_cast<unsigned long long>(snapshot.hostArguments[6]),
+                    static_cast<unsigned long long>(snapshot.hostArguments[7]),
+                    static_cast<unsigned long long>(snapshot.hostCallGuestRIP));
             reportf("BOXEDWINE_FEX64_STALL_MEMORY pid=%u tid=%u valid_mask=0x%x chunk_size=0x%llx chunk_user=0x%llx chunk_key=0x%llx arena_lock=0x%llx arena_system=0x%llx tls_address=0x%llx tls_value=0x%llx",
                     snapshot.processId, snapshot.threadId,
                     snapshot.memoryValueMask,
@@ -1339,6 +1375,35 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                         snapshot.hostCode[2], snapshot.hostCode[3],
                         snapshot.hostCode[4], snapshot.hostCode[5],
                         snapshot.hostCode[6], snapshot.hostCode[7]);
+            }
+            if (snapshot.hostCallCodeValid) {
+                reportf("BOXEDWINE_FEX64_STALL_CALL_CODE pid=%u tid=%u address=0x%llx lr=0x%llx words=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                        snapshot.processId, snapshot.threadId,
+                        static_cast<unsigned long long>(
+                            snapshot.hostCallCodeAddress),
+                        static_cast<unsigned long long>(snapshot.hostLR),
+                        snapshot.hostCallCode[0], snapshot.hostCallCode[1],
+                        snapshot.hostCallCode[2], snapshot.hostCallCode[3],
+                        snapshot.hostCallCode[4], snapshot.hostCallCode[5],
+                        snapshot.hostCallCode[6], snapshot.hostCallCode[7]);
+            }
+            Dl_info hostImage {};
+            if (snapshot.hostPC != 0 &&
+                dladdr(reinterpret_cast<const void*>(snapshot.hostPC),
+                       &hostImage) != 0) {
+                const uint64_t imageBase = reinterpret_cast<uint64_t>(
+                    hostImage.dli_fbase);
+                const uint64_t symbolBase = reinterpret_cast<uint64_t>(
+                    hostImage.dli_saddr);
+                reportf("BOXEDWINE_FEX64_STALL_HOST_IMAGE pid=%u tid=%u image=%s image_base=0x%llx image_offset=0x%llx symbol=%s symbol_base=0x%llx symbol_offset=0x%llx",
+                        snapshot.processId, snapshot.threadId,
+                        hostImage.dli_fname ? hostImage.dli_fname : "(unknown)",
+                        static_cast<unsigned long long>(imageBase),
+                        static_cast<unsigned long long>(snapshot.hostPC - imageBase),
+                        hostImage.dli_sname ? hostImage.dli_sname : "(unknown)",
+                        static_cast<unsigned long long>(symbolBase),
+                        static_cast<unsigned long long>(symbolBase != 0
+                            ? snapshot.hostPC - symbolBase : 0));
             }
         }
     }

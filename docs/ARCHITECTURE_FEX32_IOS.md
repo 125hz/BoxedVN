@@ -20,13 +20,17 @@ XNU raises the process VM map's minimum address to the end of that segment;
 fixed or overwrite allocation cannot lower it again. The launch-safe app can
 therefore neither reserve nor populate an IA-32 identity-mapped address space.
 
-The pinned FEXCore assumes identity mapping in three independent places:
+The pinned FEXCore assumes identity mapping in several independent places:
 
 1. `FEXCore/Source/Interface/Core/Core.cpp` passes `GuestRIP` to the decoder as
    `reinterpret_cast<const uint8_t*>(GuestRIP)`.
 2. The ARM64 JIT's memory operations load and store through the guest effective
    address without an integration-supplied base.
 3. The 32-bit entry path rejects entrypoints with nonzero upper 32 bits.
+4. The x32 syscall wrappers reinterpret 32-bit guest pointer arguments as host
+   pointers, including nested structures, clone/TLS state, and `argv`/`envp`.
+5. Fault-safe memory access and signal-frame delivery dereference the supplied
+   guest address directly.
 
 Setting data-segment bases cannot repair this contract. It would not relocate
 instruction fetch, and flat IA-32 applications expect ordinary DS/ES/SS bases
@@ -55,6 +59,12 @@ host base `B` and preserve IA-32 architectural addresses as 32-bit values:
 The base must be an explicit context property. Inferring it from a code mapping,
 overloading segment state or adding it only in the decoder would leave other
 memory and control-flow paths inconsistent.
+
+`GuestAddressContract32` and `Fex32BackendDescriptor` encode this boundary in
+host-only tests. A paged descriptor cannot claim direct access, and a biased
+direct descriptor must provide aligned code and data access across the complete
+4 GiB window. A structurally valid descriptor remains explicitly unavailable
+until an approved translator implements that contract.
 
 ## BoxedWine memory contract
 

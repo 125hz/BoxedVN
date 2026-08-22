@@ -4,10 +4,10 @@ index b2cbba4..462b5e5 100644
 +++ b/src/d3d11/d3d11_device.cpp
 @@ -1946 +1946 @@ namespace dxvk {
 -    enabled.core.features.geometryShader                          = VK_TRUE;
-+    enabled.core.features.geometryShader                          = supported.core.features.geometryShader;
++    enabled.core.features.geometryShader                          = VK_FALSE;
 @@ -1955 +1955 @@ namespace dxvk {
 -    enabled.core.features.shaderCullDistance                      = VK_TRUE;
-+    enabled.core.features.shaderCullDistance                      = supported.core.features.shaderCullDistance;
++    enabled.core.features.shaderCullDistance                      = VK_FALSE;
 @@ -1957 +1957 @@ namespace dxvk {
 -    enabled.core.features.textureCompressionBC                    = VK_TRUE;
 +    enabled.core.features.textureCompressionBC                    = supported.core.features.textureCompressionBC;
@@ -20,14 +20,21 @@ diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
 index 1285c4e..acddbc5 100644
 --- a/src/dxvk/dxvk_adapter.cpp
 +++ b/src/dxvk/dxvk_adapter.cpp
-@@ -402,4 +402,3 @@ namespace dxvk {
+@@ -402,6 +402,12 @@ namespace dxvk {
 -    // Require robustBufferAccess2 since we use the robustness alignment
 -    // info in a number of places, and require null descriptor support
 -    // since we no longer have a fallback for those in the backend
 -    enabledFeatures.extRobustness2.robustBufferAccess2 = VK_TRUE;
-+    // MoltenVK may expose robustness2 without buffer robustness or null
-+    // descriptors. Keep those optional so D3D devices can still be created.
-+    enabledFeatures.extRobustness2.robustBufferAccess2 = m_deviceFeatures.extRobustness2.robustBufferAccess2;
-@@ -407 +406 @@ namespace dxvk {
++    // Never request the two robustness2 features that MoltenVK cannot
++    // provide, even if an earlier feature query reported them.
++    enabledFeatures.extRobustness2.robustBufferAccess2 = VK_FALSE;
+     enabledFeatures.extRobustness2.robustImageAccess2 = m_deviceFeatures.extRobustness2.robustImageAccess2;
 -    enabledFeatures.extRobustness2.nullDescriptor = VK_TRUE;
-+    enabledFeatures.extRobustness2.nullDescriptor = m_deviceFeatures.extRobustness2.nullDescriptor;
++    enabledFeatures.extRobustness2.nullDescriptor = VK_FALSE;
++
++    Logger::warn(str::format(
++      "DxvkAdapter: compatibility feature mask active (geometry=",
++      enabledFeatures.core.features.geometryShader,
++      ", cull=", enabledFeatures.core.features.shaderCullDistance,
++      ", robust2=", enabledFeatures.extRobustness2.robustBufferAccess2,
++      ", null=", enabledFeatures.extRobustness2.nullDescriptor, ")"));

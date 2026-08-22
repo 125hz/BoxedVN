@@ -310,10 +310,13 @@ guest window being wider than it is tall. UIKit intersects the two.
 
 `third_party/patches/dxvk-2.5.2-moltenvk.patch` applies to upstream DXVK at tag
 `v2.5.2` (commit `b4faf0b`). It relaxes device features MoltenVK cannot provide
-- `geometryShader`, `shaderCullDistance`, `textureCompressionBC`,
-`VK_EXT_transform_feedback`, and robustness2's `robustBufferAccess2` /
-`nullDescriptor` - from required to optional. Upstream fails device creation
-without them; nothing in `GetMaxFeatureLevel()` consults them and its floor is
+- `geometryShader`, `shaderCullDistance`, and robustness2's
+`robustBufferAccess2` / `nullDescriptor` are disabled, while
+`textureCompressionBC` and `VK_EXT_transform_feedback` are requested only when
+reported. The explicit false mask is intentional because the device log showed
+the earlier query values could not safely be reused for MoltenVK device
+creation. Upstream fails device creation without this mask; nothing in
+`GetMaxFeatureLevel()` consults these fields and its floor is
 `D3D_FEATURE_LEVEL_10_1`, so the resulting device is still shader-model-4
 capable.
 
@@ -343,12 +346,12 @@ frozen and express positions as module + RVA, which is ASLR-independent.
 
 Frozen module hashes (SHA-256):
 ```
-d3d10core.dll  ad924849f3f9ca7c3405b6946565c22b7af5196e0943c8604b4e815693a2ccec
-d3d11.dll      03ec08cb2131ec40a36f8b149dca474895835b9d69994f7f3ca9f75ba61d9a35
-dxgi.dll       cb589a90b807499f995cf0a39d5a6d9fdc6c2ede8e2d211b87551ede4d379484
+d3d10core.dll  19d682f82b59f33e8fe581b2bb2d283cce7c262b62e5ff4cf891c4b01dce9f86
+d3d11.dll      fd46bf3c2860b2baa039c82f88b37925ae5c6870d962ce058be2a215eafe7a96
+dxgi.dll       37edf9541f50c217e175c2d55a18408a0203efaccc8e0e88f4f568696eccf4ef
 ```
-In this build, `D3D11CommonContext<D3D11ImmediateContext>::BindFramebuffer` is
-at RVA `0x2109A0`. The guest load base observed on device is `0x7BB70000`.
+Any prior module RVA must be rediscovered against these exact files. Do not
+reuse an address recorded for an older module hash.
 
 ### What the disassembly already rules out
 
