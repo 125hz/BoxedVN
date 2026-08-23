@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Execute the loader SIMD/control-flow fixture through FEX's ARM64 JIT using
+# Execute the x64 loader and IA-32 core fixtures through FEX's ARM64 JIT using
 # the VIXL simulator. This is intentionally separate from the iOS build and
 # leaves third_party/fex64/fex unchanged when it exits.
 
@@ -8,7 +8,8 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fex_source="${FEX_SOURCE:-${root}/third_party/fex64/fex}"
 fex_build="${FEX_BUILD:-${root}/build/fex-vixl-probe}"
-fixture="${root}/scripts/guest-probes/fex64-loader-stall.asm"
+fixture64="${root}/scripts/guest-probes/fex64-loader-stall.asm"
+fixture32="${root}/scripts/guest-probes/fex32-core-contract.asm"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 cc="${CC:-clang}"
 cxx="${CXX:-clang++}"
@@ -33,7 +34,8 @@ command -v python3 >/dev/null || die "python3 is required"
 command -v "${cc}" >/dev/null || die "the Clang C compiler is required"
 command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
 [[ -d "${fex_source}/FEXCore" ]] || die "FEX source not found: ${fex_source}"
-[[ -f "${fixture}" ]] || die "fixture not found: ${fixture}"
+[[ -f "${fixture64}" ]] || die "fixture not found: ${fixture64}"
+[[ -f "${fixture32}" ]] || die "fixture not found: ${fixture32}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
 [[ -f "${allocator_declaration_header}" ]] || \
     die "allocator declaration header not found: ${allocator_declaration_header}"
@@ -101,20 +103,13 @@ runner="${fex_build}/Bin/TestHarnessRunner"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/boxedvn-fex-vixl.XXXXXX")"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
-probe_bin="${tmp_dir}/fex64-loader-stall.bin"
-probe_config="${tmp_dir}/fex64-loader-stall.config.bin"
-nasm -f bin "${fixture}" -o "${probe_bin}"
-PYTHONDONTWRITEBYTECODE=1 python3 \
-    "${fex_source}/Scripts/json_asm_config_parse.py" \
-    "${fixture}" "${probe_config}"
-
-[[ -s "${probe_bin}" ]] || die "NASM produced an empty fixture"
-[[ -s "${probe_config}" ]] || die "FEX configuration was not generated"
-
 run_one() {
-    local maxinst="$1"
-    local multiblock="$2"
-    echo "[fex-vixl] maxinst=${maxinst} multiblock=${multiblock}"
+    local label="$1"
+    local probe_bin="$2"
+    local probe_config="$3"
+    local maxinst="$4"
+    local multiblock="$5"
+    echo "[fex-vixl] fixture=${label} maxinst=${maxinst} multiblock=${multiblock}"
     FEX_SILENTLOG=0 \
     FEX_MAXINST="${maxinst}" \
     FEX_MULTIBLOCK="${multiblock}" \
@@ -142,9 +137,39 @@ raise SystemExit(result.returncode)
 PY
 }
 
+prepare_fixture() {
+    local fixture="$1"
+    local stem="$2"
+    local probe_bin="${tmp_dir}/${stem}.bin"
+    local probe_config="${tmp_dir}/${stem}.config.bin"
+    nasm -f bin "${fixture}" -o "${probe_bin}"
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${fex_source}/Scripts/json_asm_config_parse.py" \
+        "${fixture}" "${probe_config}"
+    [[ -s "${probe_bin}" ]] || die "NASM produced an empty ${stem} fixture"
+    [[ -s "${probe_config}" ]] || \
+        die "FEX configuration was not generated for ${stem}"
+}
+
+prepare_fixture "${fixture64}" fex64-loader-stall
+prepare_fixture "${fixture32}" fex32-core-contract
+
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
-run_one 1 0
-run_one 500 0
-run_one 500 1
-echo "[fex-vixl] PASS: SIMD/string/control-flow fixture completed in all modes"
+run_one x64-loader "${tmp_dir}/fex64-loader-stall.bin" \
+    "${tmp_dir}/fex64-loader-stall.config.bin" 1 0
+run_one x64-loader "${tmp_dir}/fex64-loader-stall.bin" \
+    "${tmp_dir}/fex64-loader-stall.config.bin" 500 0
+run_one x64-loader "${tmp_dir}/fex64-loader-stall.bin" \
+    "${tmp_dir}/fex64-loader-stall.config.bin" 500 1
+
+# The IA-32 fixture is a separate contract: it catches accidental 64-bit
+# address arithmetic, 64-bit call/return state and SSE/REP regressions before
+# a future biased memory window is allowed to select FEX32 in BoxedWine.
+run_one ia32-core "${tmp_dir}/fex32-core-contract.bin" \
+    "${tmp_dir}/fex32-core-contract.config.bin" 1 0
+run_one ia32-core "${tmp_dir}/fex32-core-contract.bin" \
+    "${tmp_dir}/fex32-core-contract.config.bin" 500 0
+run_one ia32-core "${tmp_dir}/fex32-core-contract.bin" \
+    "${tmp_dir}/fex32-core-contract.config.bin" 500 1
+echo "[fex-vixl] PASS: x64 loader and IA-32 core fixtures completed in all modes"
