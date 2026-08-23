@@ -61,6 +61,8 @@ extern "C" BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(const BVNFEXCPU
 #include <cstdio>
 #endif
 
+extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address);
+
 struct BVNFEXCPU64Adapter {
     KProcess* process = nullptr;
     KThread* thread = nullptr;
@@ -401,6 +403,73 @@ static uint32_t hostSignalGuestNumber(int signal) {
         default: return static_cast<uint32_t>(signal);
     }
 }
+
+static bool containUnclassifiedFEXFault(
+    BVNFEXCPU64Adapter* adapter, const FEXCore::SignalDelegatorConfig* config,
+    ucontext_t* context, int signal, uint64_t faultAddress,
+    bool inCodeBuffer) {
+    auto* frame = adapter->fexThread->CurrentFrame;
+    auto* machine = context->uc_mcontext;
+    const uint64_t hostPC = machine->__ss.__pc;
+    const uint64_t returningStack = frame->ReturningStackLocation;
+    if (returningStack == 0 || config->ThreadStopHandlerAddress == 0) {
+        return false;
+    }
+
+    uint8_t hostCode[16] = {};
+    vm_size_t hostCodeBytes = 0;
+    bool hostCodeValid = false;
+    if (hostPC != 0) {
+        hostCodeValid = vm_read_overwrite(
+            mach_task_self(), hostPC, sizeof(hostCode),
+            reinterpret_cast<vm_address_t>(hostCode),
+            &hostCodeBytes) == KERN_SUCCESS &&
+            hostCodeBytes == sizeof(hostCode);
+    }
+    char encoded[64] = {};
+    size_t used = 0;
+    if (hostCodeValid) {
+        for (size_t i = 0; i < sizeof(hostCode) && used + 4 < sizeof(encoded);
+             ++i) {
+            const int written = snprintf(encoded + used, sizeof(encoded) - used,
+                                         "%s%02x", i == 0 ? "" : " ",
+                                         hostCode[i]);
+            if (written <= 0) break;
+            used += static_cast<size_t>(written);
+        }
+    }
+
+    const auto faultData = frame->SynchronousFaultData;
+    klog_fmt("BOXEDWINE_FEX64_HOST_FAULT_CONTAINED pid=%d tid=%d signal=%d "
+             "host_pc=0x%llx address=0x%llx in_buffer=%d guest_rip=0x%llx "
+             "generated=%u guest_signal=%u trapno=%u err=%u host_bytes=[%s]",
+             adapter->process ? adapter->process->id : -1,
+             adapter->thread ? adapter->thread->id : -1, signal,
+             (unsigned long long)hostPC,
+             (unsigned long long)faultAddress, inCodeBuffer ? 1 : 0,
+             (unsigned long long)frame->State.rip,
+             (unsigned)faultData.FaultToTopAndGeneratedException,
+             (unsigned)faultData.Signal, (unsigned)faultData.TrapNo,
+             (unsigned)faultData.err_code,
+             encoded[0] ? encoded : "unreadable");
+
+    // This is an active FEX thread and the fault is either in BoxedVN's
+    // executable pool or the result of a translated branch to address zero.
+    // Do not let Darwin terminate the whole app. Stop only this guest through
+    // the dispatcher's normal ExecuteThread unwind; the detailed marker above
+    // retains the evidence needed to fix the translator path itself.
+    const uint32_t guestSignal = hostSignalGuestNumber(signal);
+    if (adapter->process) {
+        adapter->process->signalProcess(guestSignal);
+    }
+    adapter->cpu->yield = true;
+    adapter->lastAction = BVNFEXCPU64AdapterActionProcessExit;
+    frame->InSyscallInfo = 0;
+    machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
+    machine->__ss.__sp = returningStack;
+    machine->__ss.__pc = config->ThreadStopHandlerAddress;
+    return true;
+}
 #endif
 
 extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
@@ -427,7 +496,9 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         return false;
     }
     auto* machine = context->uc_mcontext;
+    auto* siginfo = static_cast<siginfo_t*>(infoPointer);
     const uint64_t hostPC = machine->__ss.__pc;
+    const uint64_t faultAddress = reinterpret_cast<uint64_t>(siginfo->si_addr);
     const bool inCodeBuffer =
         adapter->context->IsAddressInCodeBuffer(adapter->fexThread, hostPC);
     // FEX reports a synchronous guest fault (an invalid or unimplemented x86
@@ -451,11 +522,18 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     // thread's translated code or to a fault FEX generated on purpose; every
     // other fault chains to the prior action.
     if (!inCodeBuffer && !generatedException) {
+        const bool inExecutablePool =
+            BVNFEXBackendOwnsHostCodeAddress(hostPC);
+        const bool translatedNullBranch =
+            signal == SIGSEGV && hostPC == 0 && faultAddress == 0;
+        if ((inExecutablePool || translatedNullBranch) &&
+            containUnclassifiedFEXFault(adapter, config, context, signal,
+                                        faultAddress, inCodeBuffer)) {
+            return true;
+        }
         return false;
     }
 
-    auto* siginfo = static_cast<siginfo_t*>(infoPointer);
-    const uint64_t faultAddress = reinterpret_cast<uint64_t>(siginfo->si_addr);
     // iOS __PAGEZERO prevents the Windows KUSER_SHARED_DATA VA from being
     // mapped. Match the proven Darwin Wine workaround: rewrite only ARM64
     // base registers that carry a canonical 0x7ffe* pointer and leave PC
