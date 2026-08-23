@@ -518,6 +518,28 @@ void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
         gFEXHandledHostFaultCount.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    // Declining means this fault leaves FEX's world. Say so once per handful,
+    // with the host PC and where it sits relative to the dispatcher, because a
+    // declined fault taken inside FEX's own code is a translator defect and is
+    // otherwise indistinguishable from an unrelated host crash.
+    if (adapter != nullptr) {
+        static std::atomic<uint32_t> declined {0};
+        if (declined.fetch_add(1, std::memory_order_relaxed) < 8) {
+            const auto& config = gSignals.GetConfig();
+            const uint64_t pc = context && context->uc_mcontext
+                ? context->uc_mcontext->__ss.__pc : 0;
+            const bool inDispatcher = config.DispatcherEnd > config.DispatcherBegin &&
+                pc >= config.DispatcherBegin && pc < config.DispatcherEnd;
+            reportf("BOXEDWINE_FEX64_FAULT_DECLINED signal=%d host_pc=0x%llx "
+                    "address=0x%llx dispatcher=%d dispatcher_range=[0x%llx,0x%llx)",
+                    signal, static_cast<unsigned long long>(pc),
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(info ? info->si_addr : nullptr)),
+                    inDispatcher ? 1 : 0,
+                    static_cast<unsigned long long>(config.DispatcherBegin),
+                    static_cast<unsigned long long>(config.DispatcherEnd));
+        }
+    }
     chainFEXHostSignal(signal, info, ucontext);
 }
 

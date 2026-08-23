@@ -23,6 +23,7 @@
 #include <signal.h>
 
 void platformHandler(int sig, siginfo_t* info, void* vcontext);
+void platformChainHostSignal(int sig, siginfo_t* info, void* vcontext);
 
 #ifdef __MACH__
 #include <mach/task.h>
@@ -30,20 +31,71 @@ void platformHandler(int sig, siginfo_t* info, void* vcontext);
 #include <mach/mach_port.h>
 #endif
 
+// Boxedwine is not the only fault handler in this address space. A second
+// translator (FEX, for the 64-bit guest) installs its own handlers for the same
+// four signals and relies on them being reached, and Darwin's default action is
+// what must run for a fault that belongs to neither. Remember whatever was
+// installed before us so platformHandler can pass on a fault it cannot
+// attribute to a Boxedwine CPU. Returning from a synchronous fault handler
+// without changing the context re-runs the faulting instruction, so a silent
+// return is not "ignore", it is an unbreakable fault loop.
+static const int platformHandledSignals[] = { SIGBUS, SIGSEGV, SIGILL, SIGFPE };
+static const unsigned platformHandledSignalCount =
+    sizeof(platformHandledSignals) / sizeof(platformHandledSignals[0]);
+static struct sigaction platformPreviousActions[4];
+
+static int platformSignalIndex(int sig) {
+    for (unsigned i = 0; i < platformHandledSignalCount; i++) {
+        if (platformHandledSignals[i] == sig) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void platformChainHostSignal(int sig, siginfo_t* info, void* vcontext) {
+    const int index = platformSignalIndex(sig);
+    if (index < 0) {
+        return;
+    }
+    const struct sigaction previous = platformPreviousActions[index];
+    if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction) {
+        previous.sa_sigaction(sig, info, vcontext);
+        return;
+    }
+    if (previous.sa_handler == SIG_IGN) {
+        return;
+    }
+    if (previous.sa_handler != SIG_DFL && previous.sa_handler != nullptr) {
+        previous.sa_handler(sig);
+        return;
+    }
+    // Nobody else claimed this fault. Restore the default action and re-raise
+    // so the process dies with the real signal instead of spinning forever on
+    // the faulting instruction.
+    sigaction(sig, &previous, nullptr);
+    raise(sig);
+}
+
 void platformInitExceptionHandling() {
     static bool initializedHandler = false;
     if (!initializedHandler) {
-        struct sigaction sa;
+        struct sigaction sa {};
+        sigemptyset(&sa.sa_mask);
         sa.sa_sigaction = platformHandler;
         sa.sa_flags = SA_SIGINFO;
-        struct sigaction oldsa;
-        sigaction(SIGBUS, &sa, &oldsa);
-        sigaction(SIGSEGV, &sa, &oldsa);
-        sigaction(SIGILL, &sa, &oldsa);
-        sigaction(SIGFPE, &sa, &oldsa);
-        //for (int i = 0x91; i <= 0x96; i++) {
-        //    sigaction(i, &sa, &oldsa);
-        //}
+        for (unsigned i = 0; i < platformHandledSignalCount; i++) {
+            struct sigaction oldsa {};
+            if (sigaction(platformHandledSignals[i], &sa, &oldsa) != 0) {
+                continue;
+            }
+            // Guard against chaining to ourselves if this ever runs twice.
+            if ((oldsa.sa_flags & SA_SIGINFO) != 0 &&
+                oldsa.sa_sigaction == platformHandler) {
+                continue;
+            }
+            platformPreviousActions[i] = oldsa;
+        }
         //sigaction(SIGTRAP, &sa, &oldsa);
         initializedHandler = true;
 #ifdef __MACH__

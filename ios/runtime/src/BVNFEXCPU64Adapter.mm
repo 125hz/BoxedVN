@@ -57,6 +57,8 @@ extern "C" BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(const BVNFEXCPU
 #define _XOPEN_SOURCE
 #endif
 #include <ucontext.h>
+#include <mach/mach.h>
+#include <cstdio>
 #endif
 
 struct BVNFEXCPU64Adapter {
@@ -347,6 +349,47 @@ static uint32_t hostSignalTrapNumber(int signal) {
     }
 }
 
+// A fault FEX generated on purpose names an exact guest instruction, which is
+// the single most useful thing a device log can carry about an untranslatable
+// opcode. Report a bounded number of them with the guest RIP and the bytes the
+// decoder choked on so the offending instruction can be identified offline.
+static void reportGeneratedGuestFault(
+    BVNFEXCPU64Adapter* adapter, FEXCore::Core::CpuStateFrame* frame,
+    const FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& faultData) {
+    static std::atomic<uint32_t> reported {0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+    const uint64_t rip = frame->State.rip;
+    char bytes[64];
+    bytes[0] = 0;
+    size_t used = 0;
+    KMemory64* memory = adapter->process ? adapter->process->memory64 : nullptr;
+    if (memory && memory->nativeIdentityMode() &&
+        memory->nativeGuestRangeAllowed(rip, 16)) {
+        uint8_t instruction[16] = {};
+        vm_size_t read = 0;
+        if (vm_read_overwrite(mach_task_self(), rip, sizeof(instruction),
+                              reinterpret_cast<vm_address_t>(instruction),
+                              &read) == KERN_SUCCESS &&
+            read == sizeof(instruction)) {
+            for (size_t i = 0; i < sizeof(instruction) && used + 4 < sizeof(bytes);
+                 ++i) {
+                const int written = snprintf(bytes + used, sizeof(bytes) - used,
+                                             "%s%02x", i == 0 ? "" : " ",
+                                             instruction[i]);
+                if (written <= 0) break;
+                used += static_cast<size_t>(written);
+            }
+        }
+    }
+    klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT pid=%d tid=%d signal=%u trapno=%u "
+             "si_code=%u err=%u rip=0x%llx bytes=[%s]",
+             adapter->process ? adapter->process->id : -1,
+             adapter->thread ? adapter->thread->id : -1,
+             (unsigned)faultData.Signal, (unsigned)faultData.TrapNo,
+             (unsigned)faultData.si_code, (unsigned)faultData.err_code,
+             (unsigned long long)rip, bytes[0] ? bytes : "unreadable");
+}
+
 static uint32_t hostSignalGuestNumber(int signal) {
     // CPU64 builds a Linux guest siginfo frame, so do not pass Darwin's
     // host-numbered SIGBUS (10) through as the Linux guest's SIGBUS (7).
@@ -385,10 +428,29 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     }
     auto* machine = context->uc_mcontext;
     const uint64_t hostPC = machine->__ss.__pc;
+    const bool inCodeBuffer =
+        adapter->context->IsAddressInCodeBuffer(adapter->fexThread, hostPC);
+    // FEX reports a synchronous guest fault (an invalid or unimplemented x86
+    // instruction, a guest #GP, an int3) by writing SynchronousFaultData into
+    // the frame and branching to one of the dispatcher's GuestSignal_* stubs.
+    // Those stubs spill the static registers and then deliberately execute an
+    // instruction that traps -- `hlt` for SIGILL, `brk` for SIGTRAP, a null
+    // load for SIGSEGV -- so the fault arrives here with a PC inside the
+    // dispatcher rather than inside a translated block. Without this branch the
+    // trap is declined, nothing else in the process knows what it means, and
+    // returning from the handler simply re-executes it: the guest thread then
+    // spins in host signal delivery forever, which is what a stalled x64 guest
+    // pinned at a constant host PC actually is.
+    const auto& faultData = adapter->fexThread->CurrentFrame->SynchronousFaultData;
+    const bool inDispatcher = !inCodeBuffer && config->DispatcherEnd > config->DispatcherBegin &&
+        hostPC >= config->DispatcherBegin && hostPC < config->DispatcherEnd;
+    const bool generatedException =
+        inDispatcher && faultData.FaultToTopAndGeneratedException != 0;
     // A BoxedWine process may have ordinary host threads and native code in the
     // same address space. Only consume a fault whose PC belongs to this FEX
-    // thread's translated code; every other fault chains to the prior action.
-    if (!adapter->context->IsAddressInCodeBuffer(adapter->fexThread, hostPC)) {
+    // thread's translated code or to a fault FEX generated on purpose; every
+    // other fault chains to the prior action.
+    if (!inCodeBuffer && !generatedException) {
         return false;
     }
 
@@ -398,7 +460,7 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     // mapped. Match the proven Darwin Wine workaround: rewrite only ARM64
     // base registers that carry a canonical 0x7ffe* pointer and leave PC
     // unchanged so the translated load/store retries in place.
-    if (isKuserAddress(faultAddress)) {
+    if (!generatedException && isKuserAddress(faultAddress)) {
         bool fixed = false;
         for (unsigned reg = 0; reg <= 28; ++reg) {
             const uint64_t guestAddress = machine->__ss.__x[reg];
@@ -417,39 +479,90 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     }
 
     auto* frame = adapter->fexThread->CurrentFrame;
-    const uint32_t ignoreMask = frame->InSyscallInfo & 0xffffu;
-    frame->State.rip = adapter->context->RestoreRIPFromHostPC(
-        adapter->fexThread, hostPC);
-    const size_t gprCount = std::min<size_t>(config->SRAGPRCount, 16);
-    for (size_t i = 0; i < gprCount; ++i) {
-        const uint8_t hostRegister = config->SRAGPRMapping[i];
-        if (hostRegister >= 29 || (ignoreMask & (1u << hostRegister))) continue;
-        frame->State.gregs[i] = machine->__ss.__x[hostRegister];
+    uint32_t guestSignal = hostSignalGuestNumber(signal);
+    uint32_t guestTrapNumber = hostSignalTrapNumber(signal);
+    uint32_t guestSignalCode = static_cast<uint32_t>(siginfo->si_code);
+    uint64_t guestFaultAddress = faultAddress;
+
+    if (generatedException) {
+        // The GuestSignal_* stub already ran SpillStaticRegs, so the frame is
+        // the authoritative guest state and the host registers are not. The
+        // host siginfo describes the trapping stub instruction, not the guest
+        // access, so take the architectural fault description from FEX.
+        guestSignal = hostSignalGuestNumber(faultData.Signal);
+        guestTrapNumber = faultData.TrapNo;
+        guestSignalCode = faultData.si_code;
+        guestFaultAddress = frame->State.rip;
+        reportGeneratedGuestFault(adapter, frame, faultData);
+        frame->SynchronousFaultData.FaultToTopAndGeneratedException = 0;
+    } else {
+        const uint32_t ignoreMask = frame->InSyscallInfo & 0xffffu;
+        frame->State.rip = adapter->context->RestoreRIPFromHostPC(
+            adapter->fexThread, hostPC);
+        const size_t gprCount = std::min<size_t>(config->SRAGPRCount, 16);
+        for (size_t i = 0; i < gprCount; ++i) {
+            const uint8_t hostRegister = config->SRAGPRMapping[i];
+            if (hostRegister >= 29 || (ignoreMask & (1u << hostRegister))) continue;
+            frame->State.gregs[i] = machine->__ss.__x[hostRegister];
+        }
+        const size_t fprCount = std::min<size_t>(config->SRAFPRCount, 16);
+        for (size_t i = 0; i < fprCount; ++i) {
+            const uint8_t hostRegister = config->SRAFPRMapping[i];
+            if (hostRegister >= 32) continue;
+            std::memcpy(frame->State.xmm.sse.data[i],
+                        &machine->__ns.__v[hostRegister],
+                        sizeof(frame->State.xmm.sse.data[i]));
+        }
+        const uint32_t compactedFlags = adapter->context->ReconstructCompactedEFLAGS(
+            adapter->fexThread, true, machine->__ss.__x, machine->__ss.__cpsr);
+        adapter->context->SetFlagsFromCompactedEFLAGS(
+            adapter->fexThread, compactedFlags);
     }
-    const size_t fprCount = std::min<size_t>(config->SRAFPRCount, 16);
-    for (size_t i = 0; i < fprCount; ++i) {
-        const uint8_t hostRegister = config->SRAFPRMapping[i];
-        if (hostRegister >= 32) continue;
-        std::memcpy(frame->State.xmm.sse.data[i],
-                    &machine->__ns.__v[hostRegister],
-                    sizeof(frame->State.xmm.sse.data[i]));
-    }
-    const uint32_t compactedFlags = adapter->context->ReconstructCompactedEFLAGS(
-        adapter->fexThread, true, machine->__ss.__x, machine->__ss.__cpsr);
-    adapter->context->SetFlagsFromCompactedEFLAGS(
-        adapter->fexThread, compactedFlags);
 
     // CPU64::raiseSyncFault constructs the guest signal frame and updates the
     // guest registers. It is intentionally called from this narrow signal
     // seam; the surrounding BoxedWine ARMv8 exception path uses the same
-    // architectural operation. If no guest handler exists, return false so
-    // Darwin's previous action/default termination remains authoritative.
-    if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, frame) ||
-        !adapter->cpu->raiseSyncFault(
-            hostSignalGuestNumber(signal), hostSignalTrapNumber(signal),
-            siginfo->si_code, faultAddress) ||
-        !BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
+    // architectural operation. If no guest handler exists, an ordinary host
+    // fault returns false so Darwin's previous action/default termination
+    // remains authoritative, while a fault FEX generated on purpose is turned
+    // into a clean guest-process termination (see below): the trapping stub
+    // would otherwise be re-executed forever.
+    if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, frame)) {
         return false;
+    }
+    if (!adapter->cpu->raiseSyncFault(
+            guestSignal, guestTrapNumber,
+            static_cast<int>(guestSignalCode), guestFaultAddress) ||
+        !BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
+        if (!generatedException) {
+            return false;
+        }
+        // FEX generated this fault deliberately and the guest has no handler
+        // for it, so the architectural outcome is that the guest process dies.
+        // Chaining to the host's default action would kill the whole app and
+        // returning would re-execute the trapping stub forever, so unwind FEX
+        // the way its own dispatcher does: restore the stack pointer saved on
+        // dispatcher entry and jump to the stop handler, which pops the
+        // callee-saved registers and returns out of ExecuteThread.
+        const uint64_t returningStack = frame->ReturningStackLocation;
+        if (returningStack == 0 || config->ThreadStopHandlerAddress == 0) {
+            return false;
+        }
+        klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT unhandled signal=%u at rip=0x%llx "
+                 "(no guest handler) — terminating guest process %d",
+                 (unsigned)guestSignal,
+                 (unsigned long long)frame->State.rip,
+                 adapter->process ? adapter->process->id : -1);
+        if (adapter->process) {
+            adapter->process->signalProcess(guestSignal);
+        }
+        adapter->cpu->yield = true;
+        adapter->lastAction = BVNFEXCPU64AdapterActionProcessExit;
+        frame->InSyscallInfo = 0;
+        machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
+        machine->__ss.__sp = returningStack;
+        machine->__ss.__pc = config->ThreadStopHandlerAddress;
+        return true;
     }
 
     frame->InSyscallInfo = 0;

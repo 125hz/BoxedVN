@@ -205,6 +205,8 @@ U32 exceptionCount;
 #include <signal.h>
 #include <pthread.h>
 
+void platformChainHostSignal(int sig, siginfo_t* info, void* vcontext);
+
 // this will quickly store the info then exit to signalHandler() to perform the logic there
 void platformHandler(int sig, siginfo_t* info, void* vcontext) {
     exceptionCount++;
@@ -217,11 +219,16 @@ void platformHandler(int sig, siginfo_t* info, void* vcontext) {
     }
     KThread* currentThread = KThread::currentThread();
 
+    // See the ARMv8 handler: a fault we cannot attribute to a Boxedwine CPU has
+    // to be forwarded, never swallowed. Returning here restarts the faulting
+    // instruction and loops forever.
     if (!currentThread) {
+        platformChainHostSignal(sig, info, vcontext);
         return;
-    }    
+    }
     CPU* cpu = (CPU*)currentThread->cpu;
     if (cpu != (CPU*)context->CONTEXT_R13) {
+        platformChainHostSignal(sig, info, vcontext);
         return;
     }
 

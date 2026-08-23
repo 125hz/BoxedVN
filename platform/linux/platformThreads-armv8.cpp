@@ -135,17 +135,26 @@ static bool Aarch64GetESR(ucontext_t *ucontext, bool* isWrite) {
 }
 #endif
 
+void platformChainHostSignal(int sig, siginfo_t* info, void* vcontext);
+
 // this will quickly store the info then exit to signalHandler() to perform the logic there
 void platformHandler(int sig, siginfo_t* info, void* vcontext) {
     exceptionCount++;
     KThread* currentThread = KThread::currentThread();
+    // A fault that does not belong to a Boxedwine translated thread must be
+    // handed to whoever was handling it before us (the FEX backend installs its
+    // own handler for these signals, and Darwin's default action has to remain
+    // reachable). Simply returning restarts the faulting instruction, which for
+    // a synchronous fault is an unbreakable host signal loop.
     if (!currentThread) {
+        platformChainHostSignal(sig, info, vcontext);
         return;
     }
     ucontext_t* context = (ucontext_t*)vcontext;
 
     CPU* cpu = (CPU*)currentThread->cpu;
     if (cpu != (CPU*)context->CONTEXT_REG(19)) {
+        platformChainHostSignal(sig, info, vcontext);
         return;
     }
 
