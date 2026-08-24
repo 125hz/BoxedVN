@@ -413,6 +413,18 @@ static bool containUnclassifiedFEXFault(
     const uint64_t hostPC = machine->__ss.__pc;
     const uint64_t returningStack = frame->ReturningStackLocation;
     if (returningStack == 0 || config->ThreadStopHandlerAddress == 0) {
+        klog_fmt("BOXEDWINE_FEX64_HOST_FAULT_UNWIND_UNAVAILABLE pid=%d tid=%d "
+                 "signal=%d host_pc=0x%llx address=0x%llx returning_stack=0x%llx "
+                 "stop_handler=0x%llx spill_handler=0x%llx frame_thread=%p expected_thread=%p",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1, signal,
+                 (unsigned long long)hostPC,
+                 (unsigned long long)faultAddress,
+                 (unsigned long long)returningStack,
+                 (unsigned long long)config->ThreadStopHandlerAddress,
+                 (unsigned long long)config->ThreadStopHandlerAddressSpillSRA,
+                 static_cast<void*>(frame->Thread),
+                 static_cast<void*>(adapter->fexThread));
         return false;
     }
 
@@ -485,6 +497,11 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
 #else
     if (!validAdapter(adapter) || !signalConfigPointer || !infoPointer ||
         !ucontextPointer) {
+        if (adapter) {
+            klog_fmt("BOXEDWINE_FEX64_HOST_FAULT_ADAPTER_REJECTED signal=%d "
+                     "config=%p info=%p ucontext=%p",
+                     signal, signalConfigPointer, infoPointer, ucontextPointer);
+        }
         return false;
     }
 

@@ -642,13 +642,11 @@ bool initializeFEXGlobals() {
         // still an optional FEX-only policy.
         FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "0");
         reportf("FEX multiblock compilation disabled for deterministic guest control flow");
-        // The device loader currently reaches native faults after a long
-        // translated block even though the same instruction families pass the
-        // isolated core probes. Keep the bring-up path at one guest instruction
-        // per compiled block until the first complete Wine process proves that
-        // longer linked blocks are safe on the iOS executable-memory backend.
-        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MAXINST, "1");
-        reportf("FEX instruction blocks limited to one instruction for deterministic guest startup");
+        // Do not use CONFIG_MAXINST as a live-guest diagnostic. Forcing every
+        // instruction through a separate exit/link sequence amplified the iOS
+        // linker-lock defect and changed a later stall into an immediate host
+        // fault. The ordinary decoder limit preserves the last known-good
+        // execution boundary while that linker path is diagnosed directly.
         gFEXGlobalsReady = true;
     });
     return gFEXGlobalsReady;
