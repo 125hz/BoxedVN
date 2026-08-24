@@ -93,7 +93,8 @@ def main() -> None:
     require_ordered(
         backend,
         [
-            "state->fexThread = processState->context->CreateThread(0, 0);",
+            "state->fexThread = processState->fex->initialThread;",
+            "state->fexThread = createFEXThread(*processState->fex, 0, 0);",
             "disableLiveBlockLinking(state->fexThread);",
         ],
         "BoxedVN callback installation",
