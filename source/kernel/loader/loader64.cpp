@@ -11,6 +11,7 @@
 
 #include "loader64.h"
 #include "elfloaderpolicy64.h"
+#include "fex64loaderhandoff.h"
 #include "kelf64.h"
 #include "krandom.h"
 #include <algorithm>
@@ -243,6 +244,147 @@ enum class FEX64InterpreterNormalization {
     Applied,
     Failed,
 };
+
+// The pinned loader's `_start` saves the return from `_dl_start` in R12 and
+// eventually transfers to it with `jmp r12`. The native-identity FEX path has
+// been observed returning AT_BASE there, which asks the decoder to execute the
+// loader's ELF header. BoxedWine has already validated AT_ENTRY while mapping
+// the main image, so replace only the exact pinned handoff tail with a
+// register-preserving RIP-relative indirect jump through that validated entry.
+// The slot is placed in zero padding at the end of the loader's executable
+// host page; no ELF segment contents or guest stack words are repurposed.
+static FEX64InterpreterNormalization normalizeFEX64InterpreterHandoff(
+        KMemory64* mem, const Elf64ParseResult& image, U64 base,
+        U64 programEntry) {
+    if (!mem || !mem->nativeIdentityMode()) {
+        return FEX64InterpreterNormalization::NotNeeded;
+    }
+
+    static constexpr std::array<U8, 56> kHandoffTail = {
+        0x4c, 0x89, 0xe0, 0x4c, 0x89, 0xec, 0x48, 0x8b,
+        0x14, 0x24, 0x48, 0x89, 0xd6, 0x48, 0x83, 0xe4,
+        0xf0, 0x48, 0x8b, 0x3d, 0x70, 0x8a, 0x01, 0x00,
+        0x49, 0x8d, 0x4c, 0xd5, 0x10, 0x49, 0x8d, 0x55,
+        0x08, 0x31, 0xed, 0xe8, 0xe0, 0x61, 0xfe, 0xff,
+        0x48, 0x8d, 0x15, 0xd9, 0x5d, 0xfe, 0xff, 0x4c,
+        0x89, 0xec, 0x41, 0xff, 0xe4, 0x0f, 0x1f, 0x00,
+    };
+    static constexpr U64 kJumpBytes = 6;
+
+    U64 matchAddress = 0;
+    U64 slotAddress = 0;
+    U32 matchProtection = 0;
+    U32 matchCount = 0;
+    for (const Elf64LoadSegment& segment : image.segments) {
+        if (!(segment.flags & PF_X) || segment.filesz < kHandoffTail.size() ||
+            segment.filesz > SIZE_MAX ||
+            segment.vaddr > UINT64_MAX - segment.memsz) {
+            continue;
+        }
+        std::vector<U8> bytes((size_t)segment.filesz);
+        mem->memcpyFromGuest(bytes.data(), segment.vaddr + base,
+                             segment.filesz);
+        auto cursor = bytes.cbegin();
+        while (cursor != bytes.cend()) {
+            const auto found = std::search(cursor, bytes.cend(),
+                                           kHandoffTail.cbegin(),
+                                           kHandoffTail.cend());
+            if (found == bytes.cend()) break;
+            const U64 offset = (U64)std::distance(bytes.cbegin(), found);
+            matchAddress = segment.vaddr + base + offset;
+            matchProtection = phdrFlagsToProt(segment.flags);
+            matchCount++;
+
+            const U64 segmentEnd = segment.vaddr + segment.memsz;
+            if (segmentEnd <= UINT64_MAX - K64_PAGE_MASK) {
+                const U64 mappedEnd =
+                    (segmentEnd + K64_PAGE_MASK) & ~K64_PAGE_MASK;
+                const U64 alignedSlot = (segmentEnd + 7) & ~U64{7};
+                if (alignedSlot <= mappedEnd &&
+                    mappedEnd - alignedSlot >= sizeof(U64)) {
+                    slotAddress = base + alignedSlot;
+                }
+            }
+            cursor = found + 1;
+        }
+    }
+
+    if (matchCount == 0) {
+        klog("loadProgram64: translated-loader entry handoff replacement not required");
+        return FEX64InterpreterNormalization::NotNeeded;
+    }
+    if (matchCount != 1 || slotAddress == 0 || programEntry == 0) {
+        klog_fmt("loadProgram64: refusing ambiguous translated-loader entry handoff replacement (matches=%u slot=0x%llx entry=0x%llx)",
+                 matchCount, (unsigned long long)slotAddress,
+                 (unsigned long long)programEntry);
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    const U64 jumpAddress = matchAddress + kHandoffTail.size() - kJumpBytes;
+    const auto patch = boxedvn::planFex64LoaderHandoffPatch(
+        jumpAddress, slotAddress, programEntry);
+    if (!patch.has_value()) {
+        klog("loadProgram64: translated-loader entry handoff slot is unreachable");
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    std::array<U8, sizeof(U64)> priorSlot = {};
+    mem->memcpyFromGuest(priorSlot.data(), slotAddress, priorSlot.size());
+    if (std::any_of(priorSlot.cbegin(), priorSlot.cend(),
+                    [](U8 byte) { return byte != 0; })) {
+        klog_fmt("loadProgram64: translated-loader entry handoff slot 0x%llx is not padding",
+                 (unsigned long long)slotAddress);
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    const U64 jumpPage = jumpAddress & ~K64_PAGE_MASK;
+    const U64 slotPage = slotAddress & ~K64_PAGE_MASK;
+    const bool jumpWritable = mem->mprotect(
+        jumpPage, K64_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE) == jumpPage;
+    const bool slotWritable = jumpWritable &&
+        (slotPage == jumpPage ||
+         mem->mprotect(slotPage, K64_PAGE_SIZE,
+                       K_PROT_READ | K_PROT_WRITE) == slotPage);
+    if (!slotWritable) {
+        if (jumpWritable) {
+            mem->mprotect(jumpPage, K64_PAGE_SIZE, matchProtection);
+        }
+        klog("loadProgram64: translated-loader entry handoff pages could not be made writable");
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    mem->memcpyToGuest(slotAddress, patch->entrySlot.data(),
+                       patch->entrySlot.size());
+    mem->memcpyToGuest(jumpAddress, patch->indirectJump.data(),
+                       patch->indirectJump.size());
+
+    std::array<U8, 6> verifyJump = {};
+    std::array<U8, 8> verifySlot = {};
+    mem->memcpyFromGuest(verifyJump.data(), jumpAddress, verifyJump.size());
+    mem->memcpyFromGuest(verifySlot.data(), slotAddress, verifySlot.size());
+    bool restored = true;
+    if (slotPage != jumpPage) {
+        restored = mem->mprotect(slotPage, K64_PAGE_SIZE,
+                                 matchProtection) == slotPage;
+    }
+    restored = (mem->mprotect(jumpPage, K64_PAGE_SIZE,
+                              matchProtection) == jumpPage) && restored;
+    if (!restored || verifyJump != patch->indirectJump ||
+        verifySlot != patch->entrySlot) {
+        klog_fmt("loadProgram64: translated-loader entry handoff replacement failed at 0x%llx (write=%d restore=%d)",
+                 (unsigned long long)jumpAddress,
+                 verifyJump == patch->indirectJump &&
+                         verifySlot == patch->entrySlot ? 1 : 0,
+                 restored ? 1 : 0);
+        return FEX64InterpreterNormalization::Failed;
+    }
+
+    klog_fmt("loadProgram64: installed translated-loader entry handoff 0x%llx -> 0x%llx via slot 0x%llx",
+             (unsigned long long)jumpAddress,
+             (unsigned long long)programEntry,
+             (unsigned long long)slotAddress);
+    return FEX64InterpreterNormalization::Applied;
+}
 
 // The pinned glibc loader contains an SSE2 memset implementation that does not
 // retire under the iOS FEX path after the final libc mapping succeeds. Device
@@ -1180,6 +1322,13 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         // own GOT.)
         applyRelativeRelocations(mem, interpR.dynamic, interpBase, "interp");
         if (normalizeFEX64InterpreterMemset(mem, interpR, interpBase) ==
+            FEX64InterpreterNormalization::Failed) {
+            interpNode->close();
+            delete interpNode;
+            return false;
+        }
+        if (normalizeFEX64InterpreterHandoff(
+                mem, interpR, interpBase, process->entry64) ==
             FEX64InterpreterNormalization::Failed) {
             interpNode->close();
             delete interpNode;
