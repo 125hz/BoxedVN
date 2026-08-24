@@ -34,6 +34,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "boxedvn/fex64_kernel.h"
 #include "boxedvn/fex_code_buffer_layout.h"
 #include "boxedvn/fex_exit_dispatch_contract.h"
+#include "boxedvn/fex_guest_mode_policy.h"
 #include "boxedvn/guest_address_space.h"
 #include "boxedvn/elf_inspector.h"
 
@@ -115,6 +116,10 @@ constexpr size_t kGuestStackBytes = 256u * 1024u;
 constexpr uint64_t kExpectedExitCode = 47;
 
 std::mutex gProbeMutex;
+// FEX's guest-bitness option is process-global. Context creation, including
+// the first thread, must therefore be serialized even when BoxedWine has
+// multiple guest processes entering the optional backend concurrently.
+std::mutex gFEXContextConstructionMutex;
 std::mutex gReportMutex;
 std::mutex gPoolMutex;
 std::atomic<BVNFEXBackendStage> gStage {BVNFEXBackendStageIdle};
@@ -148,6 +153,25 @@ thread_local FEXCore::SignalDelegator* gActiveSignals = nullptr;
 std::atomic<bool> gProbeExited {false};
 std::atomic<uint64_t> gProbeExitCode {0};
 
+struct FEXContextBundle {
+    boxedvn::FexGuestMode mode = boxedvn::FexGuestMode::X86_64;
+    std::unique_ptr<FEXCore::SignalDelegator> signals;
+    std::unique_ptr<FEXCore::HLE::SyscallHandler> syscalls;
+    fextl::unique_ptr<FEXCore::Context::Context> context;
+    // The factory may create the first thread while the mode lock is held.
+    // Ownership stays here until the caller transfers it to its thread table.
+    FEXCore::Core::InternalThreadState* initialThread = nullptr;
+
+    ~FEXContextBundle() {
+        if (initialThread != nullptr && context != nullptr) {
+            context->DestroyThread(initialThread);
+            initialThread = nullptr;
+        }
+    }
+};
+
+std::unique_ptr<FEXContextBundle> gProbeContext;
+
 struct LiveThreadState {
     FEXCore::Core::InternalThreadState* fexThread = nullptr;
     void* callRetMapping = nullptr;
@@ -171,9 +195,7 @@ struct LiveThreadState {
 };
 
 struct LiveProcessState {
-    std::unique_ptr<FEXCore::SignalDelegator> signals;
-    std::unique_ptr<FEXCore::HLE::SyscallHandler> syscalls;
-    fextl::unique_ptr<FEXCore::Context::Context> context;
+    std::unique_ptr<FEXContextBundle> fex;
     std::unordered_map<void*, std::unique_ptr<LiveThreadState>> threads;
     std::atomic<size_t> activeRuns {0};
     std::atomic<bool> retiring {false};
@@ -304,12 +326,23 @@ FEXCore::HostFeatures appleHostFeatures() {
 
 class BoxedWineSyscalls final : public FEXCore::HLE::SyscallHandler {
 public:
-    BoxedWineSyscalls() {
-        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
+    explicit BoxedWineSyscalls(boxedvn::FexGuestMode mode)
+        : mode_(mode) {
+        OSABI = mode == boxedvn::FexGuestMode::X86_32
+            ? FEXCore::HLE::SyscallOSABI::OS_LINUX32
+            : FEXCore::HLE::SyscallOSABI::OS_LINUX64;
     }
 
     uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame,
                            FEXCore::HLE::SyscallArguments* arguments) override {
+        // The IA-32 register/syscall adapter is intentionally not admitted by
+        // createFEXContext yet. Keep this guard as a second line of defence
+        // so a future caller cannot accidentally route 32-bit state through
+        // the CPU64 bridge below.
+        if (mode_ != boxedvn::FexGuestMode::X86_64) {
+            reportf("FEX x86-32 syscall dispatch rejected: Linux32 adapter is not implemented");
+            return static_cast<uint64_t>(-38); // ENOSYS
+        }
         if (BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent()) {
             const uint64_t result = BVNFEXCPU64AdapterHandleSyscall(
                 adapter, frame, arguments->Argument);
@@ -393,13 +426,25 @@ public:
         FEXCore::Core::InternalThreadState*, uint64_t) override {
         return std::nullopt;
     }
+
+private:
+    boxedvn::FexGuestMode mode_;
 };
 
-class BoxedWineSignals final : public FEXCore::SignalDelegator {};
+class BoxedWineSignals final : public FEXCore::SignalDelegator {
+public:
+    explicit BoxedWineSignals(boxedvn::FexGuestMode mode) : mode_(mode) {}
 
-BoxedWineSyscalls gSyscalls;
-BoxedWineSignals gSignals;
-fextl::unique_ptr<FEXCore::Context::Context> gContext;
+private:
+    boxedvn::FexGuestMode mode_;
+};
+
+std::unique_ptr<FEXContextBundle> createFEXContext(
+    boxedvn::FexGuestMode mode,
+    bool (*createInitialThread)(FEXContextBundle&));
+
+FEXCore::Core::InternalThreadState* createFEXThread(
+    FEXContextBundle& bundle, uint64_t rip, uint64_t stack);
 
 constexpr std::array<int, 4> kFEXHostSignals {
     SIGSEGV, SIGBUS, SIGILL, SIGFPE,
@@ -550,8 +595,14 @@ void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
                                   std::memory_order_relaxed);
     }
     BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent();
-    FEXCore::SignalDelegator* signals = gActiveSignals != nullptr
-        ? gActiveSignals : &gSignals;
+    FEXCore::SignalDelegator* signals = gActiveSignals;
+    if (signals == nullptr && gProbeContext != nullptr) {
+        signals = gProbeContext->signals.get();
+    }
+    if (signals == nullptr) {
+        chainFEXHostSignal(signal, info, ucontext);
+        return;
+    }
     if (adapter && BVNFEXCPU64AdapterHandleHostFault(
             adapter, &signals->GetConfig(), signal, info, ucontext)) {
         gFEXHandledHostFaultCount.fetch_add(1, std::memory_order_relaxed);
@@ -689,6 +740,101 @@ bool initializeFEXGlobals() {
         gFEXGlobalsReady = true;
     });
     return gFEXGlobalsReady;
+}
+
+class FEXGuestModeConfigScope final {
+public:
+    explicit FEXGuestModeConfigScope(boxedvn::FexGuestMode mode) {
+        if (auto current = FEXCore::Config::Get(
+                FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE);
+            current.has_value() && *current != nullptr) {
+            previous_ = std::string(**current);
+        }
+        FEXCore::Config::Set(
+            FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE,
+            mode == boxedvn::FexGuestMode::X86_64 ? "1" : "0");
+    }
+
+    ~FEXGuestModeConfigScope() {
+        if (previous_.has_value()) {
+            FEXCore::Config::Set(
+                FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE,
+                *previous_);
+        } else {
+            FEXCore::Config::Erase(
+                FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE);
+        }
+    }
+
+    FEXGuestModeConfigScope(const FEXGuestModeConfigScope&) = delete;
+    FEXGuestModeConfigScope& operator=(const FEXGuestModeConfigScope&) = delete;
+
+private:
+    std::optional<std::string> previous_;
+};
+
+std::unique_ptr<FEXContextBundle> createFEXContext(
+    boxedvn::FexGuestMode mode,
+    bool (*createInitialThread)(FEXContextBundle&)) {
+    if (!boxedvn::fexGuestModeAdmitted(mode)) {
+        reportf("FEX context rejected mode=%s: Linux32 syscall adapter is not implemented",
+                boxedvn::fexGuestModeName(mode));
+        return nullptr;
+    }
+    if (!initializeFEXGlobals()) {
+        reportf("FEX context rejected mode=%s: global initialization failed",
+                boxedvn::fexGuestModeName(mode));
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(gFEXContextConstructionMutex);
+    // This scope covers handler construction, InitCore, and the optional
+    // initial CreateThread callback. FEX consults the process-global bitness
+    // option during these operations, so restoring it only after InitCore is
+    // insufficient for a concurrent 32/64-bit context factory.
+    FEXGuestModeConfigScope modeScope(mode);
+    auto bundle = std::make_unique<FEXContextBundle>();
+    bundle->mode = mode;
+    bundle->signals = std::make_unique<BoxedWineSignals>(mode);
+    bundle->syscalls = std::make_unique<BoxedWineSyscalls>(mode);
+    bundle->context = FEXCore::Context::Context::CreateNewContext(
+        appleHostFeatures());
+    if (!bundle->context) {
+        reportf("FEX refused to create a %s translator context",
+                boxedvn::fexGuestModeName(mode));
+        return nullptr;
+    }
+    bundle->context->SetSignalDelegator(bundle->signals.get());
+    bundle->context->SetSyscallHandler(bundle->syscalls.get());
+    bundle->context->SetHardwareTSOSupport(true);
+    if (!bundle->context->InitCore()) {
+        reportf("FEX failed to initialise its %s dispatcher",
+                boxedvn::fexGuestModeName(mode));
+        return nullptr;
+    }
+    if (createInitialThread != nullptr && !createInitialThread(*bundle)) {
+        reportf("FEX failed to create the initial %s guest thread",
+                boxedvn::fexGuestModeName(mode));
+        return nullptr;
+    }
+    reportf("FEX context constructed mode=%s initial_thread=%p",
+            boxedvn::fexGuestModeName(mode),
+            static_cast<void*>(bundle->initialThread));
+    return bundle;
+}
+
+FEXCore::Core::InternalThreadState* createFEXThread(
+    FEXContextBundle& bundle, uint64_t rip, uint64_t stack) {
+    if (!boxedvn::fexGuestModeAdmitted(bundle.mode) ||
+        bundle.context == nullptr) {
+        reportf("FEX thread rejected mode=%s context=%p",
+                boxedvn::fexGuestModeName(bundle.mode),
+                static_cast<void*>(bundle.context.get()));
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(gFEXContextConstructionMutex);
+    FEXGuestModeConfigScope modeScope(bundle.mode);
+    return bundle.context->CreateThread(rip, stack);
 }
 
 bool mapBundledELFProbe() {
@@ -883,13 +1029,26 @@ void invalidateLiveExecutableRange(FEXCore::Core::InternalThreadState* thread,
         it->second->InvalidateThreadCachedCodeRange(thread, start, length);
         return;
     }
-    // The probe uses the original global context rather than the live process
-    // table. Preserve FEX's SMC invalidation semantics there as well; silently
-    // dropping this callback leaves stale translated blocks after self-modifying
-    // guest code.
-    if (gContext != nullptr) {
-        gContext->InvalidateThreadCachedCodeRange(thread, start, length);
+    // The probe uses its own mode-explicit context rather than the live
+    // process table. Preserve FEX's SMC invalidation semantics there as well;
+    // silently dropping this callback leaves stale translated blocks after
+    // self-modifying guest code.
+    if (gProbeContext != nullptr && gProbeContext->context != nullptr) {
+        gProbeContext->context->InvalidateThreadCachedCodeRange(
+            thread, start, length);
     }
+}
+
+bool createLiveInitialThread(FEXContextBundle& bundle) {
+    bundle.initialThread = bundle.context->CreateThread(0, 0);
+    return bundle.initialThread != nullptr;
+}
+
+bool createProbeInitialThread(FEXContextBundle& bundle) {
+    const uint64_t stack = reinterpret_cast<uint64_t>(gGuestStack) +
+                           kGuestStackBytes - 0x100;
+    bundle.initialThread = bundle.context->CreateThread(gGuestEntry, stack);
+    return bundle.initialThread != nullptr;
 }
 
 LiveProcessState* getLiveProcessState(void* process) {
@@ -902,14 +1061,9 @@ LiveProcessState* getLiveProcessState(void* process) {
     }
 
     auto state = std::make_unique<LiveProcessState>();
-    state->signals = std::make_unique<BoxedWineSignals>();
-    state->syscalls = std::make_unique<BoxedWineSyscalls>();
-    state->context = FEXCore::Context::Context::CreateNewContext(appleHostFeatures());
-    if (!state->context) return nullptr;
-    state->context->SetSignalDelegator(state->signals.get());
-    state->context->SetSyscallHandler(state->syscalls.get());
-    state->context->SetHardwareTSOSupport(true);
-    if (!state->context->InitCore()) return nullptr;
+    state->fex = createFEXContext(boxedvn::FexGuestMode::X86_64,
+                                  &createLiveInitialThread);
+    if (!state->fex) return nullptr;
     if (!installFEXHostSignalHandlers()) {
         reportf("FEX host fault handlers could not be installed");
         return nullptr;
@@ -932,7 +1086,12 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
     }
 
     auto state = std::make_unique<LiveThreadState>();
-    state->fexThread = processState->context->CreateThread(0, 0);
+    if (processState->fex->initialThread != nullptr) {
+        state->fexThread = processState->fex->initialThread;
+        processState->fex->initialThread = nullptr;
+    } else {
+        state->fexThread = createFEXThread(*processState->fex, 0, 0);
+    }
     if (!state->fexThread) return nullptr;
     // The iOS host currently wedges when FEX's first-time direct block linker
     // recursively waits on its lookup-cache writer lock. Bounce link misses
@@ -947,7 +1106,7 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
     state->callRetMapping = mmap(nullptr, state->callRetMappingSize, PROT_NONE,
                                  MAP_PRIVATE | MAP_ANON, -1, 0);
     if (state->callRetMapping == MAP_FAILED) {
-        processState->context->DestroyThread(state->fexThread);
+        processState->fex->context->DestroyThread(state->fexThread);
         state->callRetMapping = nullptr;
         state->fexThread = nullptr;
         return nullptr;
@@ -955,7 +1114,7 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
     void* shadow = static_cast<uint8_t*>(state->callRetMapping) + kPageBytes;
     if (mprotect(shadow, shadowBytes, PROT_READ | PROT_WRITE) != 0) {
         munmap(state->callRetMapping, state->callRetMappingSize);
-        processState->context->DestroyThread(state->fexThread);
+        processState->fex->context->DestroyThread(state->fexThread);
         state->callRetMapping = nullptr;
         state->fexThread = nullptr;
         return nullptr;
@@ -971,7 +1130,7 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
     state->gdt[0].Type = 0b1011;
     state->fexThread->CurrentFrame->State.segment_arrays[0] = state->gdt;
     state->fexThread->CurrentFrame->State.cs_idx = 0;
-    gLiveThreadContexts.emplace(state->fexThread, processState->context.get());
+    gLiveThreadContexts.emplace(state->fexThread, processState->fex->context.get());
     state->active = true;
     state->hostMachThread = pthread_mach_thread_np(pthread_self());
     LiveThreadState* result = state.get();
@@ -1004,7 +1163,7 @@ void releaseLiveThreadRun(LiveProcessState* processState,
     }
     if (!retiredState) return;
     if (retiredState->fexThread) {
-        processState->context->DestroyThread(retiredState->fexThread);
+        processState->fex->context->DestroyThread(retiredState->fexThread);
         retiredState->fexThread = nullptr;
     }
     if (retiredState->callRetMapping) {
@@ -1046,7 +1205,7 @@ void releaseLiveProcessRun(void* process, LiveProcessState* expected,
     for (auto& entry : state->threads) {
         LiveThreadState* thread = entry.second.get();
         if (thread->fexThread) {
-            state->context->DestroyThread(thread->fexThread);
+            state->fex->context->DestroyThread(thread->fexThread);
             thread->fexThread = nullptr;
         }
         if (thread->callRetMapping) {
@@ -1060,7 +1219,15 @@ void releaseLiveProcessRun(void* process, LiveProcessState* expected,
 void resetLiveThreadAfterExec(LiveProcessState* processState,
                               LiveThreadState* threadState) {
     if (!processState || !threadState || !threadState->fexThread) return;
-    processState->context->ClearCodeCache(threadState->fexThread, true);
+    // The recovered ELF-loader boundary needs the lookup caches and call/ret
+    // predictor reset, but it must keep the thread's existing JIT buffer. A
+    // `NewCodeBuffer=true` reset asks FEX for another full code buffer. On iOS
+    // the translator owns a bounded dual-mapped arena, so that request can
+    // return MAP_FAILED after loader translation; Arm64JITCore then applies
+    // DualMap::WriteOffset to -1 and faults while emitting its detection
+    // string. The ordinary clear path invalidates the lookup mappings and calls
+    // ResetCallRetStack without allocating another executable buffer.
+    processState->fex->context->ClearCodeCache(threadState->fexThread, false);
     if (threadState->callRetMapping && threadState->callRetMappingSize > 0) {
         void* shadow = static_cast<uint8_t*>(threadState->callRetMapping) +
                        kPageBytes;
@@ -1229,10 +1396,10 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                             }
                         }
                     }
-                    if (processState->context->IsAddressInCodeBuffer(
+                    if (processState->fex->context->IsAddressInCodeBuffer(
                             threadState->fexThread, snapshot.hostPC)) {
                         const uint64_t restored =
-                            processState->context->RestoreRIPFromHostPC(
+                            processState->fex->context->RestoreRIPFromHostPC(
                                 threadState->fexThread, snapshot.hostPC);
                         if (restored != 0) snapshot.guestRIP = restored;
 
@@ -1241,7 +1408,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                         // The frame copy above is therefore stale for those
                         // registers. Reconstruct the same view used by FEX's
                         // signal bridge while the host thread is suspended.
-                        const auto& signalConfig = processState->signals->GetConfig();
+                        const auto& signalConfig = processState->fex->signals->GetConfig();
                         const uint32_t ignoreMask =
                             static_cast<uint32_t>(snapshot.inSyscallInfo & 0xffffu);
                         const size_t gprCount = std::min<size_t>(
@@ -1260,10 +1427,10 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                         }
                     }
                     if (snapshot.hostLR >= 4 &&
-                        processState->context->IsAddressInCodeBuffer(
+                        processState->fex->context->IsAddressInCodeBuffer(
                             threadState->fexThread, snapshot.hostLR - 4)) {
                         snapshot.hostCallGuestRIP =
-                            processState->context->RestoreRIPFromHostPC(
+                            processState->fex->context->RestoreRIPFromHostPC(
                                 threadState->fexThread, snapshot.hostLR - 4);
                         snapshot.hostCallCodeAddress =
                             (snapshot.hostLR - 16) & ~uint64_t {3};
@@ -1644,11 +1811,11 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
         threadState = processState
             ? getLiveThreadState(processState, thread)
             : nullptr;
-        if (threadState && processState->signals) {
-            gActiveSignals = processState->signals.get();
+        if (threadState && processState->fex->signals) {
+            gActiveSignals = processState->fex->signals.get();
         }
         if (!threadState || !BVNFEXCPU64AdapterBindFEX(
-                adapter, processState->context.get(), threadState->fexThread) ||
+                adapter, processState->fex->context.get(), threadState->fexThread) ||
             !BVNFEXCPU64AdapterEnter(adapter)) {
             reportf("FEX could not attach a live BoxedWine CPU64 thread");
             finish(true, true);
@@ -1675,7 +1842,7 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
             bool returnedByGuard = false;
             const int jumpResult = setjmp(gExitJump);
             if (jumpResult == 0) {
-                processState->context->ExecuteThread(threadState->fexThread);
+                processState->fex->context->ExecuteThread(threadState->fexThread);
             } else {
                 returnedByGuard = true;
             }
@@ -1699,7 +1866,8 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
                 break;
             }
             if (action == BVNFEXCPU64AdapterActionExec) {
-                reportf("BOXEDWINE_FEX64_CONTEXT_RESET rip=0x%llx reason=exec-boundary",
+                reportf("BOXEDWINE_FEX64_CONTEXT_RESET rip=0x%llx "
+                        "reason=exec-boundary codebuffer=reused",
                         static_cast<unsigned long long>(
                             threadState->fexThread->CurrentFrame->State.rip));
                 resetLiveThreadAfterExec(processState, threadState);
@@ -1739,16 +1907,12 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     }
     gStage.store(BVNFEXBackendStageArenaReady, std::memory_order_release);
 
-    gContext = FEXCore::Context::Context::CreateNewContext(appleHostFeatures());
-    if (!gContext) {
-        reportf("FEX refused to create a translator context");
+    if (!mapGuestProbe()) {
         return gStage.load();
     }
-    gContext->SetSignalDelegator(&gSignals);
-    gContext->SetSyscallHandler(&gSyscalls);
-    gContext->SetHardwareTSOSupport(true);
-    if (!gContext->InitCore()) {
-        reportf("FEX failed to initialise its dispatcher");
+    gProbeContext = createFEXContext(boxedvn::FexGuestMode::X86_64,
+                                     &createProbeInitialThread);
+    if (!gProbeContext) {
         return gStage.load();
     }
     if (!installFEXHostSignalHandlers()) {
@@ -1756,17 +1920,8 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
         return gStage.load();
     }
     gStage.store(BVNFEXBackendStageContextReady, std::memory_order_release);
-
-    if (!mapGuestProbe()) {
-        return gStage.load();
-    }
-    const uint64_t stack = reinterpret_cast<uint64_t>(gGuestStack) +
-                           kGuestStackBytes - 0x100;
-    auto* thread = gContext->CreateThread(gGuestEntry, stack);
-    if (thread == nullptr) {
-        reportf("FEX failed to create the x86-64 guest thread");
-        return gStage.load();
-    }
+    auto* thread = gProbeContext->initialThread;
+    if (thread == nullptr) return gStage.load();
 
     constexpr size_t shadowBytes =
         FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
@@ -1799,14 +1954,17 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     gProbeExited.store(false, std::memory_order_release);
     gProbeExitCode.store(0, std::memory_order_release);
     gActiveCPU = gProbeCPU.get();
+    gActiveSignals = gProbeContext->signals.get();
     if (setjmp(gExitJump) == 0) {
-        gContext->ExecuteThread(thread);
+        gProbeContext->context->ExecuteThread(thread);
         gActiveCPU = nullptr;
+        gActiveSignals = nullptr;
         gCanJump = false;
         reportf("FEX returned without the guest issuing exit");
         return gStage.load();
     }
     gActiveCPU = nullptr;
+    gActiveSignals = nullptr;
     gCanJump = false;
     gStage.store(BVNFEXBackendStageKernelEntered, std::memory_order_release);
     if (!gProbeExited.load(std::memory_order_acquire) ||

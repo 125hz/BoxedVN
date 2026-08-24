@@ -17,6 +17,7 @@ add_executable(boxedvn_tests
     test_fex_code_buffer_layout.cpp
     test_fex64_kernel.cpp
     test_fex64_loader_handoff.cpp
+    test_fex_guest_mode_policy.cpp
     test_fex_exit_dispatch_contract.cpp
     test_fex32_guest_window.cpp
     test_fex32_kmemory_window_binding.cpp
