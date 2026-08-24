@@ -416,6 +416,7 @@ struct ExecutionTraceSnapshot {
     uint64_t poll = 0;
     U32 processId = 0;
     U32 threadId = 0;
+    uint64_t processEntryRIP = 0;
     integer_t runState = 0;
     integer_t cpuUsage = 0;
     uint64_t hostPC = 0;
@@ -1159,6 +1160,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                 snapshot.poll = poll;
                 snapshot.processId = process->id;
                 snapshot.threadId = thread->id;
+                snapshot.processEntryRIP = process->entry64;
                 if (infoResult == KERN_SUCCESS) {
                     snapshot.runState = basic.run_state;
                     snapshot.cpuUsage = basic.cpu_usage;
@@ -1399,7 +1401,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
         if (snapshot.emitSample) {
             const double cpuPercent = snapshot.cpuUsage * 100.0 /
                 static_cast<double>(TH_USAGE_SCALE);
-            reportf("BOXEDWINE_FEX64_SAMPLE poll=%llu pid=%u tid=%u state=%s cpu=%.1f%% host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx frame_rip=0x%llx faults=%llu handled=%llu new_faults=%llu last_signal=%llu last_address=0x%llx last_fault_pc=0x%llx history=[%s]",
+            reportf("BOXEDWINE_FEX64_SAMPLE poll=%llu pid=%u tid=%u state=%s cpu=%.1f%% host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx entry_rip=0x%llx frame_rip=0x%llx faults=%llu handled=%llu new_faults=%llu last_signal=%llu last_address=0x%llx last_fault_pc=0x%llx history=[%s]",
                     static_cast<unsigned long long>(snapshot.poll),
                     snapshot.processId, snapshot.threadId,
                     machRunStateName(snapshot.runState), cpuPercent,
@@ -1407,6 +1409,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     static_cast<unsigned long long>(snapshot.hostLR),
                     static_cast<unsigned long long>(snapshot.hostSP),
                     static_cast<unsigned long long>(snapshot.guestRIP),
+                    static_cast<unsigned long long>(snapshot.processEntryRIP),
                     static_cast<unsigned long long>(snapshot.frameRIP),
                     static_cast<unsigned long long>(snapshot.hostFaults),
                     static_cast<unsigned long long>(snapshot.handledFaults),
@@ -1417,7 +1420,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     history);
         }
         if (snapshot.emitWarning) {
-            reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",
+            reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx entry_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",
                     snapshot.processId, snapshot.threadId,
                     snapshot.stablePolls,
                     machRunStateName(snapshot.runState),
@@ -1425,6 +1428,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     static_cast<unsigned long long>(snapshot.hostLR),
                     static_cast<unsigned long long>(snapshot.hostSP),
                     static_cast<unsigned long long>(snapshot.guestRIP),
+                    static_cast<unsigned long long>(snapshot.processEntryRIP),
                     static_cast<unsigned long long>(snapshot.hostFaults),
                     static_cast<unsigned long long>(snapshot.handledFaults),
                     static_cast<unsigned long long>(snapshot.lastSignal),

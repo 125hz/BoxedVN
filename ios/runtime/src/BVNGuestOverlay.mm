@@ -1054,6 +1054,39 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                 NSString* rip = BVNStartupTokenAfter(line, @"rip=");
                 entry = [NSString stringWithFormat:@"guest execution began  %@",
                                                     rip ?: @""];
+            } else if ([line containsString:@"BOXEDWINE_FEX64_SAMPLE poll="]) {
+                NSString* rip = BVNStartupTokenAfter(line, @"guest_rip=");
+                NSString* target = BVNStartupTokenAfter(line, @"entry_rip=");
+                if (rip.length > 0) {
+                    lastRIP = rip;
+                }
+                stage = @"Running translated 64-bit code";
+                entry = [NSString stringWithFormat:@"execution sample  %@  entry %@",
+                                                    rip ?: @"unknown RIP",
+                                                    target ?: @"unknown"];
+            } else if ([line containsString:@"BOXEDWINE_X64_EXEC_REMAP"]) {
+                stage = @"Replacing the 64-bit guest process";
+                entry = @"exec address space rebuilt";
+            } else if ([line containsString:@"BOXEDWINE_X64_EXEC pid="]) {
+                stage = @"Starting the 64-bit guest process";
+                entry = @"guest process entered exec";
+            } else if ([line containsString:@"BOXEDWINE_X64_FORK"]) {
+                NSString* child = BVNStartupTokenAfter(line, @"child=");
+                stage = @"Creating a 64-bit guest process";
+                entry = [NSString stringWithFormat:@"guest process forked  child %@",
+                                                    child ?: @"?"];
+            } else if ([line containsString:@"BOXEDWINE_DXMT_CALL"]) {
+                NSString* name = BVNStartupTokenAfter(line, @"name=");
+                NSString* index = BVNStartupTokenAfter(line, @"index=");
+                stage = @"Calling the graphics translation layer";
+                entry = [NSString stringWithFormat:@"graphics call %@  index %@",
+                                                    name ?: @"other",
+                                                    index ?: @"?"];
+            } else if ([line containsString:@"BOXEDWINE_DXMT_RETURN"]) {
+                NSString* status = BVNStartupTokenAfter(line, @"status=");
+                stage = @"Running the graphics translation layer";
+                entry = [NSString stringWithFormat:@"graphics call returned %@",
+                                                    status ?: @"?"];
             } else if ([line containsString:@"] dxmt: "]) {
                 stage = @"Preparing the graphics translation layer";
                 entry = BVNStartupMessageAfter(line, @"] dxmt: ");
