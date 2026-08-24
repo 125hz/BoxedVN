@@ -22,6 +22,19 @@ struct Fex64LoaderHandoffPatch final {
     std::array<std::uint8_t, kTrampolineSize> trampoline;
 };
 
+constexpr std::optional<std::uint64_t>
+validatedFex64LoaderFallbackEntry(
+        std::uint64_t faultRIP, std::uint64_t interpreterBase,
+        std::uint64_t programEntry,
+        const std::array<std::uint8_t, 4>& faultBytes) noexcept {
+    constexpr std::array<std::uint8_t, 4> elfMagic {0x7f, 'E', 'L', 'F'};
+    if (faultRIP != interpreterBase || programEntry == 0 ||
+        programEntry == faultRIP || faultBytes != elfMagic) {
+        return std::nullopt;
+    }
+    return programEntry;
+}
+
 // Replaces a six-byte loader handoff site with `jmp rel32` plus padding. The
 // nearby trampoline loads the validated program entry into caller-saved R11
 // and jumps through it. This avoids the RIP-relative memory-indirect branch

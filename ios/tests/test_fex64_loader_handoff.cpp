@@ -57,3 +57,21 @@ BOXEDVN_TEST(fex64_loader_handoff_rejects_invalid_or_unreachable_slots) {
                0x900000000ULL, 0x87ffffff4ULL, 0x3000)
                .has_value());
 }
+
+BOXEDVN_TEST(fex64_loader_handoff_recovers_only_the_interpreter_elf_base) {
+    constexpr std::array<std::uint8_t, 4> elfMagic {0x7f, 'E', 'L', 'F'};
+    constexpr std::array<std::uint8_t, 4> nonElf {0x90, 0x90, 0x90, 0x90};
+    const auto recovered = validatedFex64LoaderFallbackEntry(
+        0x7dffff0000ULL, 0x7dffff0000ULL, 0x70480014a0ULL, elfMagic);
+    CHECK(recovered.has_value());
+    CHECK_EQ(*recovered, std::uint64_t{0x70480014a0ULL});
+
+    CHECK(!validatedFex64LoaderFallbackEntry(
+               0x7dffff1000ULL, 0x7dffff0000ULL,
+               0x70480014a0ULL, elfMagic).has_value());
+    CHECK(!validatedFex64LoaderFallbackEntry(
+               0x7dffff0000ULL, 0x7dffff0000ULL,
+               0x70480014a0ULL, nonElf).has_value());
+    CHECK(!validatedFex64LoaderFallbackEntry(
+               0x7dffff0000ULL, 0x7dffff0000ULL, 0, elfMagic).has_value());
+}

@@ -40,6 +40,7 @@ extern "C" BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(const BVNFEXCPU
 #endif
 #include "boxedwine.h"
 #include "cpu64.h"
+#include "fex64loaderhandoff.h"
 #include "kmemory64.h"
 #include "kprocess.h"
 #include "kthread.h"
@@ -404,6 +405,48 @@ static uint32_t hostSignalGuestNumber(int signal) {
     }
 }
 
+static bool recoverTranslatedLoaderHandoff(
+    BVNFEXCPU64Adapter* adapter, FEXCore::Core::CpuStateFrame* frame,
+    const FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& faultData,
+    ucontext_t* context, const FEXCore::SignalDelegatorConfig* config) {
+    if (!adapter || !adapter->process || !adapter->process->memory64 || !frame ||
+        !context || !context->uc_mcontext || !config ||
+        !faultData.FaultToTopAndGeneratedException ||
+        hostSignalGuestNumber(faultData.Signal) != 11 ||
+        !adapter->process->memory64->nativeIdentityMode()) {
+        return false;
+    }
+
+    std::array<uint8_t, 4> faultBytes {};
+    vm_size_t bytesRead = 0;
+    if (vm_read_overwrite(
+            mach_task_self(), frame->State.rip, faultBytes.size(),
+            reinterpret_cast<vm_address_t>(faultBytes.data()),
+            &bytesRead) != KERN_SUCCESS || bytesRead != faultBytes.size()) {
+        return false;
+    }
+    const auto entry = boxedvn::validatedFex64LoaderFallbackEntry(
+        frame->State.rip, K64_NATIVE_GUEST_INTERP_BASE,
+        adapter->process->entry64, faultBytes);
+    if (!entry.has_value()) return false;
+
+    const uint64_t previousRIP = frame->State.rip;
+    frame->State.rip = *entry;
+    frame->SynchronousFaultData.FaultToTopAndGeneratedException = 0;
+    frame->InSyscallInfo = 0;
+    auto* machine = context->uc_mcontext;
+    machine->__ss.__x[1] = 0;
+    machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
+    machine->__ss.__pc = frame->Pointers.DispatcherLoopTopFillSRA;
+    klog_fmt("BOXEDWINE_FEX64_LOADER_HANDOFF_RECOVERED pid=%d tid=%d "
+             "fault_rip=0x%llx entry=0x%llx",
+             adapter->process->id,
+             adapter->thread ? adapter->thread->id : -1,
+             (unsigned long long)previousRIP,
+             (unsigned long long)*entry);
+    return machine->__ss.__pc != 0;
+}
+
 static bool containUnclassifiedFEXFault(
     BVNFEXCPU64Adapter* adapter, const FEXCore::SignalDelegatorConfig* config,
     ucontext_t* context, int signal, uint64_t faultAddress,
@@ -589,6 +632,10 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         guestSignalCode = faultData.si_code;
         guestFaultAddress = frame->State.rip;
         reportGeneratedGuestFault(adapter, frame, faultData);
+        if (recoverTranslatedLoaderHandoff(
+                adapter, frame, faultData, context, config)) {
+            return true;
+        }
         frame->SynchronousFaultData.FaultToTopAndGeneratedException = 0;
     } else {
         const uint32_t ignoreMask = frame->InSyscallInfo & 0xffffu;
