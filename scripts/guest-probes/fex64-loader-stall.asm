@@ -15,6 +15,7 @@
 %endif
 
 BITS 64
+ORG 0x10000
 
 %define DATA  0x100000000
 %define STACK 0xe0001000
