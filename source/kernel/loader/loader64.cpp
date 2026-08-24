@@ -299,7 +299,8 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterHandoff(
             if (segmentEnd <= UINT64_MAX - K64_PAGE_MASK) {
                 const U64 mappedEnd =
                     (segmentEnd + K64_PAGE_MASK) & ~K64_PAGE_MASK;
-                const U64 alignedSlot = (segmentEnd + 7) & ~U64{7};
+                const U64 alignedSlot =
+                    (segmentEnd + 7) & ~static_cast<U64>(7);
                 if (alignedSlot <= mappedEnd &&
                     mappedEnd - alignedSlot >= sizeof(U64)) {
                     slotAddress = base + alignedSlot;
