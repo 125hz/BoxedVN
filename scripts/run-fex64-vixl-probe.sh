@@ -18,6 +18,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-ios-host-diagnostics-guard.patch"
     "${root}/scripts/fex64-patches/fex-ios-caspal-diagnostic-host.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-block-diagnostics.patch"
+    "${root}/scripts/fex64-patches/fex-apple-dual-map-cache-publish.patch"
 )
 
 die() {

@@ -24,6 +24,9 @@ extern "C" const char* BVNFEXBackendReport(void) {
     return "FEX was not linked into this build.";
 }
 extern "C" void BVNFEXBackendPollExecutionTrace(void) {}
+extern "C" uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t) {
+    return 0;
+}
 extern "C" bool BVNFEXCPU64Run(void*, void*) { return false; }
 extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
     return stage == BVNFEXBackendStageUnavailable ? "not linked" : "unknown";
@@ -93,8 +96,10 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 
 extern "C" {
 void __clear_cache(void* start, void* end) {
-    sys_icache_invalidate(start,
-        static_cast<size_t>(static_cast<char*>(end) - static_cast<char*>(start)));
+    const size_t length =
+        static_cast<size_t>(static_cast<char*>(end) - static_cast<char*>(start));
+    sys_dcache_flush(start, length);
+    sys_icache_invalidate(start, length);
 }
 
 int rpm_cas_snapshot_take(void* snapshot) {
@@ -1268,6 +1273,16 @@ void resetLiveThreadAfterExec(LiveProcessState* processState,
 extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address) {
     return poolOwns(reinterpret_cast<const void*>(
         static_cast<uintptr_t>(address)));
+}
+
+extern "C" uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t address) {
+    if (!poolOwns(reinterpret_cast<const void*>(
+            static_cast<uintptr_t>(address))) || gPoolRW == nullptr) {
+        return 0;
+    }
+    const uintptr_t offset = static_cast<uintptr_t>(address) -
+        reinterpret_cast<uintptr_t>(gPoolRX);
+    return reinterpret_cast<uintptr_t>(gPoolRW) + offset;
 }
 
 extern "C" bool BVNFEXBackendBuilt(void) { return true; }

@@ -51,6 +51,10 @@ const char* BVNFEXBackendReport(void);
 // stall line rather than flooding the session log.
 void BVNFEXBackendPollExecutionTrace(void);
 
+// Translate an executable-pool address to its writable alias for bounded
+// first-fault diagnostics. Returns zero when the address is not pool-owned.
+uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t address);
+
 // The adapter borrows a live KProcess/KThread and their CPU64 state. The
 // caller must keep both objects alive and must leave the adapter before the
 // thread exits. execve is handled by the syscall path while the adapter is

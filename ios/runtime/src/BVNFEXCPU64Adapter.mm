@@ -506,10 +506,38 @@ static bool containUnclassifiedFEXFault(
         }
     }
 
+    uint8_t writableCode[16] = {};
+    vm_size_t writableCodeBytes = 0;
+    bool writableCodeValid = false;
+    const uint64_t writablePC =
+        BVNFEXBackendWritableHostCodeAddress(hostPC);
+    if (writablePC != 0) {
+        writableCodeValid = vm_read_overwrite(
+            mach_task_self(), writablePC, sizeof(writableCode),
+            reinterpret_cast<vm_address_t>(writableCode),
+            &writableCodeBytes) == KERN_SUCCESS &&
+            writableCodeBytes == sizeof(writableCode);
+    }
+    char writableEncoded[64] = {};
+    used = 0;
+    if (writableCodeValid) {
+        for (size_t i = 0; i < sizeof(writableCode) &&
+             used + 4 < sizeof(writableEncoded); ++i) {
+            const int written = snprintf(
+                writableEncoded + used, sizeof(writableEncoded) - used,
+                "%s%02x", i == 0 ? "" : " ", writableCode[i]);
+            if (written <= 0) break;
+            used += static_cast<size_t>(written);
+        }
+    }
+    const bool aliasesMatch = hostCodeValid && writableCodeValid &&
+        memcmp(hostCode, writableCode, sizeof(hostCode)) == 0;
+
     const auto faultData = frame->SynchronousFaultData;
     klog_fmt("BOXEDWINE_FEX64_HOST_FAULT_CONTAINED pid=%d tid=%d signal=%d "
              "host_pc=0x%llx address=0x%llx in_buffer=%d guest_rip=0x%llx "
-             "generated=%u guest_signal=%u trapno=%u err=%u host_bytes=[%s]",
+             "generated=%u guest_signal=%u trapno=%u err=%u host_bytes=[%s] "
+             "rw_pc=0x%llx rw_bytes=[%s] aliases_match=%d",
              adapter->process ? adapter->process->id : -1,
              adapter->thread ? adapter->thread->id : -1, signal,
              (unsigned long long)hostPC,
@@ -518,7 +546,10 @@ static bool containUnclassifiedFEXFault(
              (unsigned)faultData.FaultToTopAndGeneratedException,
              (unsigned)faultData.Signal, (unsigned)faultData.TrapNo,
              (unsigned)faultData.err_code,
-             encoded[0] ? encoded : "unreadable");
+             encoded[0] ? encoded : "unreadable",
+             (unsigned long long)writablePC,
+             writableEncoded[0] ? writableEncoded : "unreadable",
+             aliasesMatch ? 1 : 0);
 
     // This is an active FEX thread and the fault is either in BoxedVN's
     // executable pool or the result of a translated branch to address zero.

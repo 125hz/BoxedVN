@@ -108,6 +108,7 @@ The pin moved or upstream fixed this. Re-cut the patch deliberately."
 apply_patch fex-ios-host-diagnostics-guard.patch
 apply_patch fex-ios-caspal-diagnostic-host.patch
 apply_patch fex-boxedwine-block-diagnostics.patch
+apply_patch fex-apple-dual-map-cache-publish.patch
 
 # CMAKE_SYSTEM_PROCESSOR has to be stated. CMake leaves it empty when cross-
 # compiling unless a toolchain file sets it, and FEX selects its entire
