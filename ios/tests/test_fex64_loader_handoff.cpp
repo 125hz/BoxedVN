@@ -85,6 +85,7 @@ BOXEDVN_TEST(fex64_loader_handoff_returns_through_the_runner_boundary) {
     CHECK_EQ(resume->guestEntry, std::uint64_t{0x70480014a0ULL});
     CHECK_EQ(resume->hostStack, std::uint64_t{0x16b5f25f0ULL});
     CHECK_EQ(resume->hostPC, std::uint64_t{0x119426000ULL});
+    CHECK(resume->resetContext);
 
     CHECK(!validatedFex64LoaderRunnerResume(
                0x7dffff0000ULL, 0x7dffff0000ULL, 0x70480014a0ULL,

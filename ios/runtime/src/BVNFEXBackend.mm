@@ -1699,6 +1699,9 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
                 break;
             }
             if (action == BVNFEXCPU64AdapterActionExec) {
+                reportf("BOXEDWINE_FEX64_CONTEXT_RESET rip=0x%llx reason=exec-boundary",
+                        static_cast<unsigned long long>(
+                            threadState->fexThread->CurrentFrame->State.rip));
                 resetLiveThreadAfterExec(processState, threadState);
                 BVNFEXCPU64AdapterResetAction(adapter);
                 continue;

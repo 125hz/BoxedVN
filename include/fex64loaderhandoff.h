@@ -39,6 +39,7 @@ struct Fex64LoaderRunnerResume {
     std::uint64_t guestEntry;
     std::uint64_t hostStack;
     std::uint64_t hostPC;
+    bool resetContext;
 };
 
 // A generated guest fault is handled on the Darwin signal stack. Re-entering
@@ -57,7 +58,8 @@ validatedFex64LoaderRunnerResume(
     if (!entry.has_value() || returningStack == 0 || stopHandler == 0) {
         return std::nullopt;
     }
-    return Fex64LoaderRunnerResume{*entry, returningStack, stopHandler};
+    return Fex64LoaderRunnerResume{
+        *entry, returningStack, stopHandler, true};
 }
 
 // Replaces a six-byte loader handoff site with `jmp rel32` plus padding. The

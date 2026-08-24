@@ -435,14 +435,20 @@ static bool recoverTranslatedLoaderHandoff(
     frame->State.rip = resume->guestEntry;
     frame->SynchronousFaultData.FaultToTopAndGeneratedException = 0;
     frame->InSyscallInfo = 0;
-    adapter->lastAction = BVNFEXCPU64AdapterActionContinue;
+    // The runner boundary restores the authoritative guest RIP, but the FEX
+    // thread still owns dispatcher and call/return state from the faulted
+    // loader epoch. Route through the existing exec reset before translating
+    // the recovered program entry; reusing that epoch dispatches target zero.
+    adapter->lastAction = resume->resetContext
+                              ? BVNFEXCPU64AdapterActionExec
+                              : BVNFEXCPU64AdapterActionContinue;
     auto* machine = context->uc_mcontext;
     machine->__ss.__x[1] = 0;
     machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
     machine->__ss.__sp = resume->hostStack;
     machine->__ss.__pc = resume->hostPC;
     klog_fmt("BOXEDWINE_FEX64_LOADER_HANDOFF_RECOVERED pid=%d tid=%d "
-             "fault_rip=0x%llx entry=0x%llx resume=runner "
+             "fault_rip=0x%llx entry=0x%llx resume=runner reset=context "
              "host_sp=0x%llx host_pc=0x%llx",
              adapter->process->id,
              adapter->thread ? adapter->thread->id : -1,
