@@ -172,6 +172,31 @@ struct LiveProcessState {
     std::atomic<bool> entryReported {false};
 };
 
+// FEX's generated exit thunk passes this three-word record to the function in
+// CpuStateFrame::Pointers.ExitFunctionLink. The type is internal to FEXCore,
+// so keep the narrow ABI layout here instead of importing private headers into
+// BoxedVN's public-header-only integration.
+struct BoxedWineExitFunctionLinkData {
+    uint64_t hostCode;
+    uint64_t guestRIP;
+    int64_t callerOffset;
+};
+static_assert(sizeof(BoxedWineExitFunctionLinkData) == 24);
+
+uint64_t dispatchExitWithoutBlockLinking(
+    FEXCore::Core::CpuStateFrame* frame, void* recordPointer) noexcept {
+    auto* record = static_cast<BoxedWineExitFunctionLinkData*>(recordPointer);
+    if (!frame || !record) return 0;
+    frame->State.rip = record->guestRIP;
+    return frame->Pointers.DispatcherLoopTop;
+}
+
+void disableLiveBlockLinking(FEXCore::Core::InternalThreadState* thread) {
+    if (!thread || !thread->CurrentFrame) return;
+    thread->CurrentFrame->Pointers.ExitFunctionLink =
+        reinterpret_cast<uint64_t>(&dispatchExitWithoutBlockLinking);
+}
+
 std::mutex gLiveMutex;
 std::unordered_map<void*, std::unique_ptr<LiveProcessState>> gLiveProcesses;
 std::unordered_map<FEXCore::Core::InternalThreadState*,
@@ -893,6 +918,12 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
     auto state = std::make_unique<LiveThreadState>();
     state->fexThread = processState->context->CreateThread(0, 0);
     if (!state->fexThread) return nullptr;
+    // The iOS host currently wedges when FEX's first-time direct block linker
+    // recursively waits on its lookup-cache writer lock. Bounce link misses
+    // back through the ordinary dispatcher instead. Translation and L1/L2
+    // cache lookup remain active; only direct call-site patching is disabled.
+    disableLiveBlockLinking(state->fexThread);
+    reportf("FEX live direct block linking disabled; exits use the dispatcher cache");
 
     constexpr size_t shadowBytes =
         FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
