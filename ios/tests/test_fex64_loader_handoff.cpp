@@ -75,3 +75,21 @@ BOXEDVN_TEST(fex64_loader_handoff_recovers_only_the_interpreter_elf_base) {
     CHECK(!validatedFex64LoaderFallbackEntry(
                0x7dffff0000ULL, 0x7dffff0000ULL, 0, elfMagic).has_value());
 }
+
+BOXEDVN_TEST(fex64_loader_handoff_returns_through_the_runner_boundary) {
+    constexpr std::array<std::uint8_t, 4> elfMagic {0x7f, 'E', 'L', 'F'};
+    const auto resume = validatedFex64LoaderRunnerResume(
+        0x7dffff0000ULL, 0x7dffff0000ULL, 0x70480014a0ULL,
+        elfMagic, 0x16b5f25f0ULL, 0x119426000ULL);
+    CHECK(resume.has_value());
+    CHECK_EQ(resume->guestEntry, std::uint64_t{0x70480014a0ULL});
+    CHECK_EQ(resume->hostStack, std::uint64_t{0x16b5f25f0ULL});
+    CHECK_EQ(resume->hostPC, std::uint64_t{0x119426000ULL});
+
+    CHECK(!validatedFex64LoaderRunnerResume(
+               0x7dffff0000ULL, 0x7dffff0000ULL, 0x70480014a0ULL,
+               elfMagic, 0, 0x119426000ULL).has_value());
+    CHECK(!validatedFex64LoaderRunnerResume(
+               0x7dffff0000ULL, 0x7dffff0000ULL, 0x70480014a0ULL,
+               elfMagic, 0x16b5f25f0ULL, 0).has_value());
+}

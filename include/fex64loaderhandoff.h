@@ -35,6 +35,31 @@ validatedFex64LoaderFallbackEntry(
     return programEntry;
 }
 
+struct Fex64LoaderRunnerResume {
+    std::uint64_t guestEntry;
+    std::uint64_t hostStack;
+    std::uint64_t hostPC;
+};
+
+// A generated guest fault is handled on the Darwin signal stack. Re-entering
+// the dispatcher directly from that ucontext bypasses ExecuteThread's normal
+// return boundary and can lose the replacement RIP. Return through FEX's stop
+// handler first; BoxedWine then schedules guestEntry as authoritative CPU64
+// state on the same thread.
+constexpr std::optional<Fex64LoaderRunnerResume>
+validatedFex64LoaderRunnerResume(
+        std::uint64_t faultRIP, std::uint64_t interpreterBase,
+        std::uint64_t programEntry,
+        const std::array<std::uint8_t, 4>& faultBytes,
+        std::uint64_t returningStack, std::uint64_t stopHandler) noexcept {
+    const auto entry = validatedFex64LoaderFallbackEntry(
+        faultRIP, interpreterBase, programEntry, faultBytes);
+    if (!entry.has_value() || returningStack == 0 || stopHandler == 0) {
+        return std::nullopt;
+    }
+    return Fex64LoaderRunnerResume{*entry, returningStack, stopHandler};
+}
+
 // Replaces a six-byte loader handoff site with `jmp rel32` plus padding. The
 // nearby trampoline loads the validated program entry into caller-saved R11
 // and jumps through it. This avoids the RIP-relative memory-indirect branch

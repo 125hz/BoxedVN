@@ -425,25 +425,31 @@ static bool recoverTranslatedLoaderHandoff(
             &bytesRead) != KERN_SUCCESS || bytesRead != faultBytes.size()) {
         return false;
     }
-    const auto entry = boxedvn::validatedFex64LoaderFallbackEntry(
+    const auto resume = boxedvn::validatedFex64LoaderRunnerResume(
         frame->State.rip, K64_NATIVE_GUEST_INTERP_BASE,
-        adapter->process->entry64, faultBytes);
-    if (!entry.has_value()) return false;
+        adapter->process->entry64, faultBytes,
+        frame->ReturningStackLocation, config->ThreadStopHandlerAddress);
+    if (!resume.has_value()) return false;
 
     const uint64_t previousRIP = frame->State.rip;
-    frame->State.rip = *entry;
+    frame->State.rip = resume->guestEntry;
     frame->SynchronousFaultData.FaultToTopAndGeneratedException = 0;
     frame->InSyscallInfo = 0;
+    adapter->lastAction = BVNFEXCPU64AdapterActionContinue;
     auto* machine = context->uc_mcontext;
     machine->__ss.__x[1] = 0;
     machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
-    machine->__ss.__pc = frame->Pointers.DispatcherLoopTopFillSRA;
+    machine->__ss.__sp = resume->hostStack;
+    machine->__ss.__pc = resume->hostPC;
     klog_fmt("BOXEDWINE_FEX64_LOADER_HANDOFF_RECOVERED pid=%d tid=%d "
-             "fault_rip=0x%llx entry=0x%llx",
+             "fault_rip=0x%llx entry=0x%llx resume=runner "
+             "host_sp=0x%llx host_pc=0x%llx",
              adapter->process->id,
              adapter->thread ? adapter->thread->id : -1,
              (unsigned long long)previousRIP,
-             (unsigned long long)*entry);
+             (unsigned long long)resume->guestEntry,
+             (unsigned long long)resume->hostStack,
+             (unsigned long long)resume->hostPC);
     return machine->__ss.__pc != 0;
 }
 
