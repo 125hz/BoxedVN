@@ -144,6 +144,7 @@ thread_local bool gCanJump = false;
 std::unique_ptr<KMemory64> gProbeMemory;
 std::unique_ptr<CPU64> gProbeCPU;
 thread_local CPU64* gActiveCPU = nullptr;
+thread_local FEXCore::SignalDelegator* gActiveSignals = nullptr;
 std::atomic<bool> gProbeExited {false};
 std::atomic<uint64_t> gProbeExitCode {0};
 
@@ -170,6 +171,8 @@ struct LiveThreadState {
 };
 
 struct LiveProcessState {
+    std::unique_ptr<FEXCore::SignalDelegator> signals;
+    std::unique_ptr<FEXCore::HLE::SyscallHandler> syscalls;
     fextl::unique_ptr<FEXCore::Context::Context> context;
     std::unordered_map<void*, std::unique_ptr<LiveThreadState>> threads;
     std::atomic<size_t> activeRuns {0};
@@ -547,8 +550,10 @@ void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
                                   std::memory_order_relaxed);
     }
     BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent();
+    FEXCore::SignalDelegator* signals = gActiveSignals != nullptr
+        ? gActiveSignals : &gSignals;
     if (adapter && BVNFEXCPU64AdapterHandleHostFault(
-            adapter, &gSignals.GetConfig(), signal, info, ucontext)) {
+            adapter, &signals->GetConfig(), signal, info, ucontext)) {
         gFEXHandledHostFaultCount.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -559,7 +564,7 @@ void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
     if (adapter != nullptr) {
         static std::atomic<uint32_t> declined {0};
         if (declined.fetch_add(1, std::memory_order_relaxed) < 8) {
-            const auto& config = gSignals.GetConfig();
+            const auto& config = signals->GetConfig();
             const uint64_t pc = context && context->uc_mcontext
                 ? context->uc_mcontext->__ss.__pc : 0;
             const bool inDispatcher = config.DispatcherEnd > config.DispatcherBegin &&
@@ -897,10 +902,12 @@ LiveProcessState* getLiveProcessState(void* process) {
     }
 
     auto state = std::make_unique<LiveProcessState>();
+    state->signals = std::make_unique<BoxedWineSignals>();
+    state->syscalls = std::make_unique<BoxedWineSyscalls>();
     state->context = FEXCore::Context::Context::CreateNewContext(appleHostFeatures());
     if (!state->context) return nullptr;
-    state->context->SetSignalDelegator(&gSignals);
-    state->context->SetSyscallHandler(&gSyscalls);
+    state->context->SetSignalDelegator(state->signals.get());
+    state->context->SetSyscallHandler(state->syscalls.get());
     state->context->SetHardwareTSOSupport(true);
     if (!state->context->InitCore()) return nullptr;
     if (!installFEXHostSignalHandlers()) {
@@ -1234,7 +1241,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                         // The frame copy above is therefore stale for those
                         // registers. Reconstruct the same view used by FEX's
                         // signal bridge while the host thread is suspended.
-                        const auto& signalConfig = gSignals.GetConfig();
+                        const auto& signalConfig = processState->signals->GetConfig();
                         const uint32_t ignoreMask =
                             static_cast<uint32_t>(snapshot.inSyscallInfo & 0xffffu);
                         const size_t gprCount = std::min<size_t>(
@@ -1615,6 +1622,7 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
             BVNFEXCPU64AdapterLeave(adapter);
             adapterEntered = false;
         }
+        gActiveSignals = nullptr;
         BVNFEXCPU64AdapterDetach(adapter);
         adapter = nullptr;
         if (processState) {
@@ -1636,6 +1644,9 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
         threadState = processState
             ? getLiveThreadState(processState, thread)
             : nullptr;
+        if (threadState && processState->signals) {
+            gActiveSignals = processState->signals.get();
+        }
         if (!threadState || !BVNFEXCPU64AdapterBindFEX(
                 adapter, processState->context.get(), threadState->fexThread) ||
             !BVNFEXCPU64AdapterEnter(adapter)) {
