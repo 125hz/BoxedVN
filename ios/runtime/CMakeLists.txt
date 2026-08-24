@@ -25,6 +25,7 @@ add_library(boxedvn_runtime STATIC
     src/BVNDXMTDisplay.m
     src/BVNFEXBackend.mm
     src/BVNFEXCPU64Adapter.mm
+    src/BVNFEX32VirtualMemory.mm
 )
 
 # Read BOXEDWINE_VERSION_STR straight out of the upstream header so the value

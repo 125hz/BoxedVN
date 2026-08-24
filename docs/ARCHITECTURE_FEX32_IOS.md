@@ -106,6 +106,17 @@ Until then this is an always-tested support contract, not an enabled emulator
 memory mode, and it cannot make the current identity-only translator usable by
 itself.
 
+`BVNFEX32DarwinVirtualMemory` is the first iOS implementation of that injected
+platform seam. It over-reserves an explicitly 64-bit Mach VM span, trims it to
+a high 4 GiB-aligned window, keeps the reservation inaccessible by default,
+and applies the guest window's grouped host-page protections without granting
+host execute permission to guest x86 pages. Recommit explicitly zeroes the
+host-page group, so advisory discard behaviour cannot leak stale anonymous
+bytes back to the guest. The provider is compiled into the iOS runtime but has
+no CPU-factory, launch-environment or scheduler caller. Its header and layout
+arithmetic are host-tested; successful reservation and protection on a signed
+iOS process remain a device acceptance gate.
+
 ## Delivery stages
 
 1. **Biased translator probe.** With an approved translator build, reserve a

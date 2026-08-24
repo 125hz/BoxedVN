@@ -19,6 +19,7 @@ add_executable(boxedvn_tests
     test_fex64_loader_handoff.cpp
     test_fex_exit_dispatch_contract.cpp
     test_fex32_guest_window.cpp
+    test_fex32_darwin_vm_header.cpp
     test_fex32_backend_admission.cpp
     test_fex32_backend_descriptor.cpp
     test_guest_address_contract32.cpp
