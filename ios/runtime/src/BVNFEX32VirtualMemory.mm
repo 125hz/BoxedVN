@@ -6,7 +6,6 @@
 #include "BVNFEX32VirtualMemory.h"
 
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -73,9 +72,10 @@ bool discardPages(void* address, std::uint64_t size) noexcept {
 BVNFEX32DarwinVirtualMemory::~BVNFEX32DarwinVirtualMemory() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (reservedSize_ != 0) {
-        ::mach_vm_deallocate(mach_task_self(), reservedBase_.value,
-                             reservedSize_);
-        reservedBase_ = {};
+        ::vm_deallocate(mach_task_self(),
+                        static_cast<vm_address_t>(reservedBase_.value),
+                        static_cast<vm_size_t>(reservedSize_));
+        reservedBase_ = boxedvn::HostAddress64{};
         reservedSize_ = 0;
     }
 }
@@ -104,9 +104,9 @@ BVNFEX32DarwinVirtualMemory::reserve(std::uint64_t size,
     // page aligned too. Requesting size+alignment (rather than size+alignment
     // minus one) keeps Mach's rounded allocation size equal to our arithmetic.
     const std::uint64_t requestedSpan = size + alignment;
-    mach_vm_address_t raw = 0;
-    const kern_return_t allocation = mach_vm_allocate(
-        mach_task_self(), &raw, static_cast<mach_vm_size_t>(requestedSpan),
+    vm_address_t raw = 0;
+    const kern_return_t allocation = vm_allocate(
+        mach_task_self(), &raw, static_cast<vm_size_t>(requestedSpan),
         VM_FLAGS_ANYWHERE);
     if (allocation != KERN_SUCCESS) {
         return std::nullopt;
@@ -116,36 +116,39 @@ BVNFEX32DarwinVirtualMemory::reserve(std::uint64_t size,
     const auto layout = bvn_fex32::computeReservationLayout(
         rawValue, size, alignment);
     if (!layout.has_value()) {
-        ::mach_vm_deallocate(mach_task_self(), raw, requestedSpan);
+        ::vm_deallocate(mach_task_self(), raw,
+                        static_cast<vm_size_t>(requestedSpan));
         return std::nullopt;
     }
 
     const std::uint64_t alignedValue = layout->aligned;
-    if (layout->prefix != 0 && mach_vm_deallocate(
+    if (layout->prefix != 0 && vm_deallocate(
             mach_task_self(), raw,
-            static_cast<mach_vm_size_t>(layout->prefix)) !=
+            static_cast<vm_size_t>(layout->prefix)) !=
             KERN_SUCCESS) {
-        ::mach_vm_deallocate(mach_task_self(), raw, requestedSpan);
+        ::vm_deallocate(mach_task_self(), raw,
+                        static_cast<vm_size_t>(requestedSpan));
         return std::nullopt;
     }
-    if (layout->suffix != 0 && mach_vm_deallocate(
+    if (layout->suffix != 0 && vm_deallocate(
             mach_task_self(),
-            static_cast<mach_vm_address_t>(alignedValue + size),
-            static_cast<mach_vm_size_t>(layout->suffix)) != KERN_SUCCESS) {
-        ::mach_vm_deallocate(
-            mach_task_self(), static_cast<mach_vm_address_t>(alignedValue),
-            static_cast<mach_vm_size_t>(requestedSpan - layout->prefix));
+            static_cast<vm_address_t>(alignedValue + size),
+            static_cast<vm_size_t>(layout->suffix)) != KERN_SUCCESS) {
+        ::vm_deallocate(
+            mach_task_self(), static_cast<vm_address_t>(alignedValue),
+            static_cast<vm_size_t>(requestedSpan - layout->prefix));
         return std::nullopt;
     }
 
-    // mach_vm_allocate starts as zero-filled read/write memory. Keep the
+    // vm_allocate starts as zero-filled read/write memory. Keep the
     // reservation inaccessible until the window commits host-page groups.
-    if (mach_vm_protect(mach_task_self(),
-                        static_cast<mach_vm_address_t>(alignedValue),
-                        static_cast<mach_vm_size_t>(size), FALSE,
-                        VM_PROT_NONE) !=
+    if (vm_protect(mach_task_self(),
+                   static_cast<vm_address_t>(alignedValue),
+                   static_cast<vm_size_t>(size), FALSE, VM_PROT_NONE) !=
         KERN_SUCCESS) {
-        ::mach_vm_deallocate(mach_task_self(), alignedValue, size);
+        ::vm_deallocate(mach_task_self(),
+                        static_cast<vm_address_t>(alignedValue),
+                        static_cast<vm_size_t>(size));
         return std::nullopt;
     }
 
@@ -175,24 +178,23 @@ bool BVNFEX32DarwinVirtualMemory::commit(
     if (!validAccess(access) || access == boxedvn::Fex32WindowNone) {
         return false;
     }
-    const mach_vm_address_t hostAddress = address.value;
-    const mach_vm_size_t hostSize = size;
+    const vm_address_t hostAddress = static_cast<vm_address_t>(address.value);
+    const vm_size_t hostSize = static_cast<vm_size_t>(size);
     // A commit establishes fresh anonymous storage. This explicit zeroing is
     // required even on systems where MADV_FREE is only an eviction hint.
-    if (mach_vm_protect(mach_task_self(), hostAddress, hostSize, FALSE,
-                        VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+    if (vm_protect(mach_task_self(), hostAddress, hostSize, FALSE,
+                   VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
         return false;
     }
     std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(address.value)),
                 0, static_cast<size_t>(size));
-    if (mach_vm_protect(
+    if (vm_protect(
             mach_task_self(), hostAddress, hostSize, FALSE,
             static_cast<vm_prot_t>(hostProtection(access))) ==
         KERN_SUCCESS) {
         return true;
     }
-    mach_vm_protect(mach_task_self(), hostAddress, hostSize, FALSE,
-                    VM_PROT_NONE);
+    vm_protect(mach_task_self(), hostAddress, hostSize, FALSE, VM_PROT_NONE);
     return false;
 }
 
@@ -206,8 +208,9 @@ bool BVNFEX32DarwinVirtualMemory::protect(
     if (!validAccess(access)) {
         return false;
     }
-    return mach_vm_protect(
-               mach_task_self(), address.value, size, FALSE,
+    return vm_protect(
+               mach_task_self(), static_cast<vm_address_t>(address.value),
+               static_cast<vm_size_t>(size), FALSE,
                static_cast<vm_prot_t>(hostProtection(access))) ==
            KERN_SUCCESS;
 }
@@ -221,8 +224,10 @@ bool BVNFEX32DarwinVirtualMemory::decommit(
     // Removing access is the authoritative decommit transition. Discard is a
     // best-effort physical-memory hint: commit always zeroes the complete host
     // page group, so MADV support cannot affect guest-visible bytes.
-    if (mach_vm_protect(mach_task_self(), address.value, size, FALSE,
-                        VM_PROT_NONE) != KERN_SUCCESS) {
+    if (vm_protect(mach_task_self(),
+                   static_cast<vm_address_t>(address.value),
+                   static_cast<vm_size_t>(size), FALSE, VM_PROT_NONE) !=
+        KERN_SUCCESS) {
         return false;
     }
     (void)discardPages(reinterpret_cast<void*>(
@@ -237,9 +242,11 @@ void BVNFEX32DarwinVirtualMemory::release(
         size != reservedSize_) {
         return;
     }
-    if (::mach_vm_deallocate(mach_task_self(), address.value, size) ==
+    if (::vm_deallocate(mach_task_self(),
+                        static_cast<vm_address_t>(address.value),
+                        static_cast<vm_size_t>(size)) ==
         KERN_SUCCESS) {
-        reservedBase_ = {};
+        reservedBase_ = boxedvn::HostAddress64{};
         reservedSize_ = 0;
     }
 }
