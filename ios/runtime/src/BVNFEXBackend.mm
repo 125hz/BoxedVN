@@ -32,6 +32,8 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #else
 
 #include "boxedvn/fex64_kernel.h"
+#include "boxedvn/fex_code_buffer_layout.h"
+#include "boxedvn/fex_exit_dispatch_contract.h"
 #include "boxedvn/guest_address_space.h"
 #include "boxedvn/elf_inspector.h"
 
@@ -103,6 +105,9 @@ int rpm_cas_snapshot_take(void* snapshot) {
 namespace {
 
 constexpr size_t kPageBytes = 0x4000;
+constexpr size_t kFEXPageBytes = 0x1000;
+static_assert(FEXCore::Utils::FEX_PAGE_SIZE == kFEXPageBytes,
+              "executable layout must match FEX's guard-page size");
 constexpr size_t kPoolBytes = 64u * 1024u * 1024u;
 constexpr size_t kMinimumPoolBytes = 4u * 1024u * 1024u;
 constexpr size_t kGuestCodeBytes = kPageBytes;
@@ -172,23 +177,19 @@ struct LiveProcessState {
     std::atomic<bool> entryReported {false};
 };
 
-// FEX's generated exit thunk passes this three-word record to the function in
-// CpuStateFrame::Pointers.ExitFunctionLink. The type is internal to FEXCore,
-// so keep the narrow ABI layout here instead of importing private headers into
-// BoxedVN's public-header-only integration.
-struct BoxedWineExitFunctionLinkData {
-    uint64_t hostCode;
-    uint64_t guestRIP;
-    int64_t callerOffset;
-};
-static_assert(sizeof(BoxedWineExitFunctionLinkData) == 24);
-
 uint64_t dispatchExitWithoutBlockLinking(
     FEXCore::Core::CpuStateFrame* frame, void* recordPointer) noexcept {
-    auto* record = static_cast<BoxedWineExitFunctionLinkData*>(recordPointer);
-    if (!frame || !record) return 0;
-    frame->State.rip = record->guestRIP;
-    return frame->Pointers.DispatcherLoopTop;
+    if (!frame || !recordPointer) {
+        BVNLogWrite(BVNLogLevelError, "fex64",
+                    "FEX exit callback received invalid ABI inputs");
+        abort();
+    }
+    const auto* record =
+        static_cast<const boxedvn::FexExitFunctionLinkData*>(recordPointer);
+    const auto transition = boxedvn::dispatchWithoutBlockLinking(
+        *record, frame->Pointers.DispatcherLoopTop);
+    frame->State.rip = transition.guestRIP;
+    return transition.hostTarget;
 }
 
 void disableLiveBlockLinking(FEXCore::Core::InternalThreadState* thread) {
@@ -232,13 +233,20 @@ bool poolOwns(const void* pointer) {
 }
 
 void* allocateTranslatedCode(size_t length) {
-    const size_t aligned = alignUp(length, kPageBytes);
-    size_t offset = gPoolUsed.load(std::memory_order_relaxed);
-    while (offset <= gPoolSize && aligned <= gPoolSize - offset) {
-        if (gPoolUsed.compare_exchange_weak(offset, offset + aligned,
-                                            std::memory_order_relaxed)) {
-            return static_cast<uint8_t*>(gPoolRX) + offset;
+    std::lock_guard<std::mutex> guard(gPoolMutex);
+    const auto layout = boxedvn::planFexCodeBufferLayout(
+        gPoolUsed.load(std::memory_order_relaxed), length, gPoolSize,
+        kPageBytes, kFEXPageBytes);
+    if (layout.has_value()) {
+        gPoolUsed.store(layout->nextOffset, std::memory_order_relaxed);
+        static std::atomic<uint32_t> reported {0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+            reportf("FEX executable carve request=0x%zx rx_offset=0x%zx "
+                    "guard_offset=0x%zx next_offset=0x%zx host_page=0x%zx",
+                    length, layout->allocationOffset, layout->guardOffset,
+                    layout->nextOffset, kPageBytes);
         }
+        return static_cast<uint8_t*>(gPoolRX) + layout->allocationOffset;
     }
     reportf("translator executable pool exhausted by a %zu-byte request", length);
     return MAP_FAILED;

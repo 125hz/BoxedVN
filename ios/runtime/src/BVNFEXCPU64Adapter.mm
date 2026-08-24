@@ -617,11 +617,10 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     // CPU64::raiseSyncFault constructs the guest signal frame and updates the
     // guest registers. It is intentionally called from this narrow signal
     // seam; the surrounding BoxedWine ARMv8 exception path uses the same
-    // architectural operation. If no guest handler exists, an ordinary host
-    // fault returns false so Darwin's previous action/default termination
-    // remains authoritative, while a fault FEX generated on purpose is turned
-    // into a clean guest-process termination (see below): the trapping stub
-    // would otherwise be re-executed forever.
+    // architectural operation. If the translated guest has no handler, stop
+    // only that guest through ExecuteThread's normal unwind. Chaining a fault
+    // whose PC is proven to be in this thread's code buffer would otherwise
+    // terminate the entire iOS app and discard the generated-code evidence.
     if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, frame)) {
         return false;
     }
@@ -629,35 +628,9 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             guestSignal, guestTrapNumber,
             static_cast<int>(guestSignalCode), guestFaultAddress) ||
         !BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
-        if (!generatedException) {
-            return false;
-        }
-        // FEX generated this fault deliberately and the guest has no handler
-        // for it, so the architectural outcome is that the guest process dies.
-        // Chaining to the host's default action would kill the whole app and
-        // returning would re-execute the trapping stub forever, so unwind FEX
-        // the way its own dispatcher does: restore the stack pointer saved on
-        // dispatcher entry and jump to the stop handler, which pops the
-        // callee-saved registers and returns out of ExecuteThread.
-        const uint64_t returningStack = frame->ReturningStackLocation;
-        if (returningStack == 0 || config->ThreadStopHandlerAddress == 0) {
-            return false;
-        }
-        klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT unhandled signal=%u at rip=0x%llx "
-                 "(no guest handler) — terminating guest process %d",
-                 (unsigned)guestSignal,
-                 (unsigned long long)frame->State.rip,
-                 adapter->process ? adapter->process->id : -1);
-        if (adapter->process) {
-            adapter->process->signalProcess(guestSignal);
-        }
-        adapter->cpu->yield = true;
-        adapter->lastAction = BVNFEXCPU64AdapterActionProcessExit;
-        frame->InSyscallInfo = 0;
-        machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
-        machine->__ss.__sp = returningStack;
-        machine->__ss.__pc = config->ThreadStopHandlerAddress;
-        return true;
+        return containUnclassifiedFEXFault(
+            adapter, config, context, signal, guestFaultAddress,
+            inCodeBuffer);
     }
 
     frame->InSyscallInfo = 0;

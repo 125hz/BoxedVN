@@ -93,6 +93,19 @@ This is a new `KMemory` mode, not `mapNativeMemory()`: that helper allocates an
 unrelated guest address for a bounded host buffer and cannot represent a whole
 address space.
 
+`Fex32GuestWindow` now defines the first host-tested ownership boundary for
+that mode. It requires a complete, high, 4 GiB-aligned reservation; translates
+only checked 32-bit ranges; and mirrors commitment and permissions for every
+4 KiB guest page under a lock. Platform VM operations are injected, so the
+required reserve, commit, protect, decommit and release transitions are
+deterministic in the host suite without consuming a real 4 GiB test mapping.
+Operations are grouped at the platform page size (16 KiB on current iOS
+devices) without treating adjacent guest pages as logically mapped. The MMU
+must remain authoritative when the native VM and `KMemory` adapters are added.
+Until then this is an always-tested support contract, not an enabled emulator
+memory mode, and it cannot make the current identity-only translator usable by
+itself.
+
 ## Delivery stages
 
 1. **Biased translator probe.** With an approved translator build, reserve a
