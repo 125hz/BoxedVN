@@ -46,6 +46,9 @@ class CPU;
 class Page;
 class KMemoryData;
 class KProcess;
+namespace boxedvn {
+class Fex32KMemoryBinding;
+}
 
 #ifdef BOXEDWINE_MULTI_THREADED   
 struct LockData8 {
@@ -73,9 +76,11 @@ public:
 
 class KMemory {
 private:
-    KMemory(KProcess* process);
+    KMemory(KProcess* process, boxedvn::Fex32KMemoryBinding* fex32Binding);
 public:
-    static KMemory* create(KProcess* process);
+    static KMemory* create(
+        KProcess* process,
+        boxedvn::Fex32KMemoryBinding* fex32Binding = nullptr);
     static void shutdown();
     
     ~KMemory();
@@ -202,12 +207,20 @@ private:
     void commitPreparedCodeInvalidation();
     void discardPreparedCodeInvalidation();
     void retryPendingCodeMemoryFrees();
+    bool attachFex32NativePages(KThread* thread, U32 firstPage,
+        U32 pageCount, U32 permissions);
+    void detachFex32NativePages(KThread* thread, U32 firstPage,
+        U32 pageCount, U32 permissions);
+    bool bindFex32CallbackPage();
 
     U32 unmapLocked(U32 address, U32 len,
         std::vector<std::shared_ptr<MappedFile>>& retirements);
 
     KMemoryData* data;    
     KProcess* process;
+    // Borrowed from the optional platform runtime. Null preserves the
+    // interpreter/WASM soft-MMU path exactly.
+    boxedvn::Fex32KMemoryBinding* fex32Binding;
     std::vector<PreparedCodeInvalidationBlock> preparedCodeBlocks;
     std::vector<std::pair<U32, U32>> preparedCodeRemovalRanges;
 #ifdef BOXEDWINE_JIT

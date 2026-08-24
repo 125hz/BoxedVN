@@ -9,6 +9,7 @@ add_library(boxedvn_support STATIC
     src/elf_inspector.cpp
     src/fex64_kernel.cpp
     src/fex32_guest_window.cpp
+    src/fex32_kmemory_window_binding.cpp
     src/fex32_backend_admission.cpp
     src/fex32_backend_descriptor.cpp
     src/guest_address_contract32.cpp
@@ -24,6 +25,7 @@ add_library(boxedvn_support STATIC
 
 target_include_directories(boxedvn_support PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../include"
 )
 
 target_link_libraries(boxedvn_support PRIVATE boxedwine_zlib)

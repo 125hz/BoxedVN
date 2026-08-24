@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "fex32kmemorybinding.h"
 #include "../emulation/softmmu/kmemory_soft.h"
 #include "../emulation/softmmu/soft_ram.h"
 #include "../emulation/softmmu/soft_page.h"
@@ -27,6 +28,18 @@
 #ifdef BOXEDWINE_JIT
 #include "../emulation/cpu/jit/jitCodeLifecycle.h"
 #endif
+
+namespace {
+
+std::uint8_t fex32AccessFromPermissions(U32 permissions) {
+    std::uint8_t access = boxedvn::Fex32KMemoryNone;
+    if (permissions & PAGE_READ) access |= boxedvn::Fex32KMemoryRead;
+    if (permissions & PAGE_WRITE) access |= boxedvn::Fex32KMemoryWrite;
+    if (permissions & PAGE_EXEC) access |= boxedvn::Fex32KMemoryExecute;
+    return access;
+}
+
+}  // namespace
 
 MappedFileCache::MappedFileCache(BString name, const std::shared_ptr<KFile>& file, U64 length)
     : name(name), file(file), length(length) {
@@ -505,12 +518,20 @@ void KMemory::shutdown() {
     KMemoryData::shutdown();
 }
 
-KMemory::KMemory(KProcess* process) : process(process) {
-    data = new KMemoryData(this);    
+KMemory::KMemory(KProcess* process,
+                 boxedvn::Fex32KMemoryBinding* fex32Binding)
+    : process(process), fex32Binding(fex32Binding) {
+    data = new KMemoryData(this);
+    if (fex32Binding && !bindFex32CallbackPage()) {
+        kpanic("FEX32 guest window could not bind the callback page");
+    }
 }
 
 KMemory::~KMemory() {
     if (data) {
+        if (fex32Binding && !fex32Binding->clear()) {
+            kwarn("FEX32 guest window could not be cleared during memory teardown");
+        }
 #if defined(BOXEDWINE_WASM_JIT) && defined(BOXEDWINE_MULTI_THREADED)
         std::vector<void*> jitOps;
         data->opCache.collectAllJitBlocks(jitOps);
@@ -528,6 +549,9 @@ KMemory::~KMemory() {
 void KMemory::cleanup() {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
     if (data) {
+        if (fex32Binding && !fex32Binding->clear()) {
+            kwarn("FEX32 guest window could not be cleared during memory cleanup");
+        }
 #if defined(BOXEDWINE_WASM_JIT) && defined(BOXEDWINE_MULTI_THREADED)
         std::vector<void*> jitOps;
         data->opCache.collectAllJitBlocks(jitOps);
@@ -541,8 +565,68 @@ void KMemory::cleanup() {
     // don't delete dynamic memory yet, we might return to it to finish
 }
 
-KMemory* KMemory::create(KProcess* process) {
-    return new KMemory(process);
+KMemory* KMemory::create(
+    KProcess* process, boxedvn::Fex32KMemoryBinding* fex32Binding) {
+    return new KMemory(process, fex32Binding);
+}
+
+bool KMemory::attachFex32NativePages(KThread* thread, U32 firstPage,
+                                     U32 pageCount, U32 permissions) {
+    if (!fex32Binding) return false;
+
+    for (U32 page = firstPage; page < firstPage + pageCount; ++page) {
+        if (!fex32Binding->hostPageAddress(page).has_value()) return false;
+    }
+    for (U32 page = firstPage; page < firstPage + pageCount; ++page) {
+        const std::uintptr_t host = *fex32Binding->hostPageAddress(page);
+        MMU& mmu = data->mmu[page];
+        const RamPage current = mmu.getRamPageIndex();
+        const RamPage expected {
+            static_cast<RAM_TYPE>(host >> K_PAGE_SHIFT)};
+        if (current.value != expected.value || !ramPageIsNative(current)) {
+            RamPage native = ramPageAllocNative(
+                reinterpret_cast<U8*>(host));
+            mmu.setPage(this, page, PageType::Ram, native);
+            ramPageRelease(native);  // setPage retains its own reference.
+        }
+        mmu.setFlags(mmu.flags | PAGE_MAPPED);
+        data->protectPage(thread, page, permissions);
+    }
+    return true;
+}
+
+void KMemory::detachFex32NativePages(KThread* thread, U32 firstPage,
+                                     U32 pageCount, U32 permissions) {
+    for (U32 page = firstPage; page < firstPage + pageCount; ++page) {
+        MMU& mmu = data->mmu[page];
+        data->protectPage(thread, page, permissions);
+        mmu.setPage(this, page, PageType::Ram, RamPage{});
+        data->onPageChanged(page);
+    }
+}
+
+bool KMemory::bindFex32CallbackPage() {
+    const U32 page = CALL_BACK_ADDRESS >> K_PAGE_SHIFT;
+    constexpr U32 permissions = PAGE_READ | PAGE_EXEC;
+    constexpr std::uint8_t writableAccess =
+        boxedvn::Fex32KMemoryRead | boxedvn::Fex32KMemoryWrite;
+    constexpr std::uint8_t executableAccess =
+        boxedvn::Fex32KMemoryRead | boxedvn::Fex32KMemoryExecute;
+    if (!fex32Binding->mapAnonymous(page, 1, writableAccess)) return false;
+
+    const auto host = fex32Binding->hostPageAddress(page);
+    const RamPage callback = data->mmu[page].getRamPageIndex();
+    if (!host.has_value() || !callback.value) {
+        fex32Binding->unmapAnonymous(page, 1);
+        return false;
+    }
+    ::memcpy(reinterpret_cast<void*>(*host), ramPageGet(callback), K_PAGE_SIZE);
+    if (!fex32Binding->protectAnonymous(page, 1, executableAccess) ||
+        !attachFex32NativePages(nullptr, page, 1, permissions)) {
+        fex32Binding->unmapAnonymous(page, 1);
+        return false;
+    }
+    return true;
 }
 
 U32 KMemory::mlock(U32 addr, U32 len) {
@@ -613,6 +697,14 @@ U32 KMemory::mmap(KThread* thread, U32 addr, U32 len, S32 prot, S32 flags, FD fi
     }
     if ((shared && priv) || (!shared && !priv)) {
         return -K_EINVAL;
+    }
+    if (fex32Binding &&
+        (!(flags & K_MAP_ANONYMOUS) || !priv || shared ||
+         fixedReplacement || remap)) {
+        // The direct translator window is deliberately anonymous/private
+        // only until file leases, COW, replacement mappings, and clone
+        // ownership have matching transactional implementations.
+        return -K_EOPNOTSUPP;
     }
 
     if (!(flags & K_MAP_ANONYMOUS) && fildes >= 0) {
@@ -788,6 +880,33 @@ U32 KMemory::mmap(KThread* thread, U32 addr, U32 len, S32 prot, S32 flags, FD fi
                 this->process->mappedFiles.set(mappedFile->key, mappedFile);
             }
             this->data->allocPages(thread, pageStart, pageCount, permissions, fildes, off, mappedFile);
+        } else if (fex32Binding) {
+            if (fixedReplacement) {
+                kpanic("FEX32 fixed replacement escaped mmap admission");
+            }
+            const std::uint8_t access =
+                fex32AccessFromPermissions(permissions);
+            if (!fex32Binding->mapAnonymous(pageStart, pageCount, access)) {
+                if (reservedAddress) {
+                    data->setPagesInvalid(pageStart, pageCount);
+                }
+                return -K_ENOMEM;
+            }
+            bool attached = true;
+            if (access != boxedvn::Fex32KMemoryNone) {
+                attached = attachFex32NativePages(
+                    thread, pageStart, pageCount, permissions);
+            } else {
+                this->data->allocPages(thread, pageStart, pageCount,
+                    permissions, 0, 0, nullptr);
+            }
+            if (!attached) {
+                if (!fex32Binding->unmapAnonymous(pageStart, pageCount)) {
+                    kpanic("FEX32 mmap rollback could not release the guest window");
+                }
+                data->setPagesInvalid(pageStart, pageCount);
+                return -K_ENOMEM;
+            }
         } else {
             if (fixedReplacement) {
                 U32 result = this->unmapLocked(addr, len, replacementRetirements);
@@ -865,6 +984,21 @@ U32 KMemory::mprotect(KThread* thread, U32 address, U32 len, U32 prot) {
             }
         }
     }
+    if (fex32Binding) {
+        const std::uint8_t access =
+            fex32AccessFromPermissions(permissions);
+        if (!fex32Binding->protectAnonymous(pageStart, pageCount, access)) {
+            return -K_EIO;
+        }
+        if (access == boxedvn::Fex32KMemoryNone) {
+            detachFex32NativePages(
+                thread, pageStart, pageCount, permissions);
+        } else if (!attachFex32NativePages(
+                       thread, pageStart, pageCount, permissions)) {
+            kpanic("FEX32 protection committed pages without host addresses");
+        }
+        return 0;
+    }
     for (U32 i = pageStart; i < pageStart + pageCount; i++) {
         this->data->protectPage(thread, i, permissions);
     }
@@ -872,6 +1006,9 @@ U32 KMemory::mprotect(KThread* thread, U32 address, U32 len, U32 prot) {
 }
 
 U32 KMemory::mremap(KThread* thread, U32 oldaddress, U32 oldsize, U32 newsize, U32 flags) {
+    if (fex32Binding) {
+        return -K_EOPNOTSUPP;
+    }
     if (flags > 1) {
         kpanic_fmt("mremap not implemented: flags=%X", flags);
     }
@@ -1042,6 +1179,14 @@ U32 KMemory::unmapLocked(U32 address, U32 len, std::vector<MappedFilePtr>& retir
         return -K_ENOMEM;
     }
 
+    if (fex32Binding &&
+        !fex32Binding->unmapAnonymous(pageStart, pageCount)) {
+        discardPreparedCodeInvalidation();
+        for (const PreparedSplit& split : splits) {
+            process->mappedFiles.remove(split.right->key);
+        }
+        return -K_EIO;
+    }
     this->data->setPagesInvalid(pageStart, pageCount, preparedCodeInvalidation);
     for (const MappedFilePtr& mapping : mappings) {
         U64 mappingStart = mapping->address;
@@ -1118,6 +1263,9 @@ U32 KMemory::unmap(U32 address, U32 len) {
 }
 
 U32 KMemory::mapPages(KThread* thread, U32 startPage, const std::vector<RamPage>& pages, U32 permissions) {
+    if (fex32Binding) {
+        return 0;
+    }
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
     if (startPage == 0 && !data->reserveAddress(ADDRESS_PROCESS_MMAP_START, (U32)pages.size(), &startPage, false, false, PAGE_MAPPED)) {
         return 0;        
@@ -1186,8 +1334,19 @@ void KMemory::execvReset(bool cloneVM) {
 #elif defined(BOXEDWINE_JIT)
     jitMemoryInvalidated(this, {});
 #endif
+    if (fex32Binding) {
+        if (cloneVM) {
+            kpanic("FEX32 direct memory does not support CLONE_VM exec ownership");
+        }
+        if (!fex32Binding->clear()) {
+            kpanic("FEX32 guest window could not be cleared for exec");
+        }
+    }
     if (!cloneVM) {
         data->execvReset();
+        if (fex32Binding && !bindFex32CallbackPage()) {
+            kpanic("FEX32 guest window could not rebind the callback page for exec");
+        }
     } else {
         // data no longer shared with parent
         data = new KMemoryData(this);
@@ -1894,6 +2053,9 @@ void KMemory::unmapNativeMemory(U32 address, U32 size) {
 }
 
 U32 KMemory::mapNativeMemory(void* hostAddress, U32 size) {
+    if (fex32Binding) {
+        return 0;
+    }
     U32 result = 0;
     U32 offset = (U32)(((RAM_TYPE)hostAddress) & 0xFFF);
     // ramPageAllocNative expect host address to be aligned to a page
@@ -1923,6 +2085,9 @@ U32 KMemory::mapNativeMemory(void* hostAddress, U32 size) {
 }
 
 U32 KMemory::ensureContinuousNative_unsafe(U32 page, U32 pageCount) {
+    if (fex32Binding) {
+        return 0;
+    }
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
     U8* ram = getRamPtr(page << K_PAGE_SHIFT, K_PAGE_SIZE, false);
     bool isContinuous = true;
@@ -2098,6 +2263,9 @@ U8* KMemory::getRamPtr(U32 address, U32 len, bool write, bool futex) {
 }
 
 void KMemory::clone(KMemory* from, bool vfork) {
+    if (fex32Binding || from->fex32Binding) {
+        kpanic("FEX32 direct memory does not support fork or vfork cloning");
+    }
     // don't allow changes to the from pages while we are cloning
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(from->mutex);
     cloneLocked(from, vfork);
