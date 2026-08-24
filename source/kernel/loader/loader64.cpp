@@ -250,9 +250,9 @@ enum class FEX64InterpreterNormalization {
 // been observed returning AT_BASE there, which asks the decoder to execute the
 // loader's ELF header. BoxedWine has already validated AT_ENTRY while mapping
 // the main image, so replace only the exact pinned handoff tail with a
-// register-preserving RIP-relative indirect jump through that validated entry.
-// The slot is placed in zero padding at the end of the loader's executable
-// host page; no ELF segment contents or guest stack words are repurposed.
+// relative branch to a nearby immediate-entry trampoline. The trampoline is
+// placed in zero padding at the end of the loader's executable host page; no
+// ELF segment contents or guest stack words are repurposed.
 static FEX64InterpreterNormalization normalizeFEX64InterpreterHandoff(
         KMemory64* mem, const Elf64ParseResult& image, U64 base,
         U64 programEntry) {
@@ -272,7 +272,7 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterHandoff(
     static constexpr U64 kJumpBytes = 6;
 
     U64 matchAddress = 0;
-    U64 slotAddress = 0;
+    U64 trampolineAddress = 0;
     U32 matchProtection = 0;
     U32 matchCount = 0;
     for (const Elf64LoadSegment& segment : image.segments) {
@@ -299,11 +299,12 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterHandoff(
             if (segmentEnd <= UINT64_MAX - K64_PAGE_MASK) {
                 const U64 mappedEnd =
                     (segmentEnd + K64_PAGE_MASK) & ~K64_PAGE_MASK;
-                const U64 alignedSlot =
-                    (segmentEnd + 7) & ~static_cast<U64>(7);
-                if (alignedSlot <= mappedEnd &&
-                    mappedEnd - alignedSlot >= sizeof(U64)) {
-                    slotAddress = base + alignedSlot;
+                const U64 alignedTrampoline =
+                    (segmentEnd + 15) & ~static_cast<U64>(15);
+                if (alignedTrampoline <= mappedEnd &&
+                    mappedEnd - alignedTrampoline >=
+                        boxedvn::Fex64LoaderHandoffPatch::kTrampolineSize) {
+                    trampolineAddress = base + alignedTrampoline;
                 }
             }
             cursor = found + 1;
@@ -314,39 +315,41 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterHandoff(
         klog("loadProgram64: translated-loader entry handoff replacement not required");
         return FEX64InterpreterNormalization::NotNeeded;
     }
-    if (matchCount != 1 || slotAddress == 0 || programEntry == 0) {
-        klog_fmt("loadProgram64: refusing ambiguous translated-loader entry handoff replacement (matches=%u slot=0x%llx entry=0x%llx)",
-                 matchCount, (unsigned long long)slotAddress,
+    if (matchCount != 1 || trampolineAddress == 0 || programEntry == 0) {
+        klog_fmt("loadProgram64: refusing ambiguous translated-loader entry handoff replacement (matches=%u trampoline=0x%llx entry=0x%llx)",
+                 matchCount, (unsigned long long)trampolineAddress,
                  (unsigned long long)programEntry);
         return FEX64InterpreterNormalization::Failed;
     }
 
     const U64 jumpAddress = matchAddress + kHandoffTail.size() - kJumpBytes;
     const auto patch = boxedvn::planFex64LoaderHandoffPatch(
-        jumpAddress, slotAddress, programEntry);
+        jumpAddress, trampolineAddress, programEntry);
     if (!patch.has_value()) {
-        klog("loadProgram64: translated-loader entry handoff slot is unreachable");
+        klog("loadProgram64: translated-loader entry handoff trampoline is unreachable");
         return FEX64InterpreterNormalization::Failed;
     }
 
-    std::array<U8, sizeof(U64)> priorSlot = {};
-    mem->memcpyFromGuest(priorSlot.data(), slotAddress, priorSlot.size());
-    if (std::any_of(priorSlot.cbegin(), priorSlot.cend(),
+    std::array<U8, boxedvn::Fex64LoaderHandoffPatch::kTrampolineSize>
+        priorTrampoline = {};
+    mem->memcpyFromGuest(priorTrampoline.data(), trampolineAddress,
+                         priorTrampoline.size());
+    if (std::any_of(priorTrampoline.cbegin(), priorTrampoline.cend(),
                     [](U8 byte) { return byte != 0; })) {
-        klog_fmt("loadProgram64: translated-loader entry handoff slot 0x%llx is not padding",
-                 (unsigned long long)slotAddress);
+        klog_fmt("loadProgram64: translated-loader entry handoff trampoline 0x%llx is not padding",
+                 (unsigned long long)trampolineAddress);
         return FEX64InterpreterNormalization::Failed;
     }
 
     const U64 jumpPage = jumpAddress & ~K64_PAGE_MASK;
-    const U64 slotPage = slotAddress & ~K64_PAGE_MASK;
+    const U64 trampolinePage = trampolineAddress & ~K64_PAGE_MASK;
     const bool jumpWritable = mem->mprotect(
         jumpPage, K64_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE) == jumpPage;
-    const bool slotWritable = jumpWritable &&
-        (slotPage == jumpPage ||
-         mem->mprotect(slotPage, K64_PAGE_SIZE,
-                       K_PROT_READ | K_PROT_WRITE) == slotPage);
-    if (!slotWritable) {
+    const bool trampolineWritable = jumpWritable &&
+        (trampolinePage == jumpPage ||
+         mem->mprotect(trampolinePage, K64_PAGE_SIZE,
+                       K_PROT_READ | K_PROT_WRITE) == trampolinePage);
+    if (!trampolineWritable) {
         if (jumpWritable) {
             mem->mprotect(jumpPage, K64_PAGE_SIZE, matchProtection);
         }
@@ -354,36 +357,38 @@ static FEX64InterpreterNormalization normalizeFEX64InterpreterHandoff(
         return FEX64InterpreterNormalization::Failed;
     }
 
-    mem->memcpyToGuest(slotAddress, patch->entrySlot.data(),
-                       patch->entrySlot.size());
-    mem->memcpyToGuest(jumpAddress, patch->indirectJump.data(),
-                       patch->indirectJump.size());
+    mem->memcpyToGuest(trampolineAddress, patch->trampoline.data(),
+                       patch->trampoline.size());
+    mem->memcpyToGuest(jumpAddress, patch->branchToTrampoline.data(),
+                       patch->branchToTrampoline.size());
 
     std::array<U8, 6> verifyJump = {};
-    std::array<U8, 8> verifySlot = {};
+    std::array<U8, boxedvn::Fex64LoaderHandoffPatch::kTrampolineSize>
+        verifyTrampoline = {};
     mem->memcpyFromGuest(verifyJump.data(), jumpAddress, verifyJump.size());
-    mem->memcpyFromGuest(verifySlot.data(), slotAddress, verifySlot.size());
+    mem->memcpyFromGuest(verifyTrampoline.data(), trampolineAddress,
+                         verifyTrampoline.size());
     bool restored = true;
-    if (slotPage != jumpPage) {
-        restored = mem->mprotect(slotPage, K64_PAGE_SIZE,
-                                 matchProtection) == slotPage;
+    if (trampolinePage != jumpPage) {
+        restored = mem->mprotect(trampolinePage, K64_PAGE_SIZE,
+                                 matchProtection) == trampolinePage;
     }
     restored = (mem->mprotect(jumpPage, K64_PAGE_SIZE,
                               matchProtection) == jumpPage) && restored;
-    if (!restored || verifyJump != patch->indirectJump ||
-        verifySlot != patch->entrySlot) {
+    if (!restored || verifyJump != patch->branchToTrampoline ||
+        verifyTrampoline != patch->trampoline) {
         klog_fmt("loadProgram64: translated-loader entry handoff replacement failed at 0x%llx (write=%d restore=%d)",
                  (unsigned long long)jumpAddress,
-                 verifyJump == patch->indirectJump &&
-                         verifySlot == patch->entrySlot ? 1 : 0,
+                 verifyJump == patch->branchToTrampoline &&
+                         verifyTrampoline == patch->trampoline ? 1 : 0,
                  restored ? 1 : 0);
         return FEX64InterpreterNormalization::Failed;
     }
 
-    klog_fmt("loadProgram64: installed translated-loader entry handoff 0x%llx -> 0x%llx via slot 0x%llx",
+    klog_fmt("loadProgram64: installed translated-loader entry handoff 0x%llx -> 0x%llx via trampoline 0x%llx",
              (unsigned long long)jumpAddress,
              (unsigned long long)programEntry,
-             (unsigned long long)slotAddress);
+             (unsigned long long)trampolineAddress);
     return FEX64InterpreterNormalization::Applied;
 }
 

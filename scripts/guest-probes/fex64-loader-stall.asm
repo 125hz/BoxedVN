@@ -26,6 +26,16 @@ start:
     ; region for address-mode tests, so use it for guest call/return traffic.
     mov     rsp, STACK
 
+    ; Mirror the loader handoff repair: materialise an absolute target in R11
+    ; and jump through it. Keep the encoding explicitly 64-bit even though the
+    ; flat fixture's target happens to be nearby.
+    db      0x49, 0xbb
+    dq      handoff_target
+    db      0x41, 0xff, 0xe3
+    jmp     fail
+
+handoff_target:
+
     ; Two equal strings with a terminating NUL in the first 16-byte vector.
     mov     rdi, DATA
     mov     rax, 0x6867666564636261 ; "abcdefgh"

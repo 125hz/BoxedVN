@@ -15,33 +15,38 @@
 namespace boxedvn {
 
 struct Fex64LoaderHandoffPatch final {
-    std::array<std::uint8_t, 6> indirectJump;
-    std::array<std::uint8_t, 8> entrySlot;
+    static constexpr std::size_t kBranchSize = 6;
+    static constexpr std::size_t kTrampolineSize = 13;
+
+    std::array<std::uint8_t, kBranchSize> branchToTrampoline;
+    std::array<std::uint8_t, kTrampolineSize> trampoline;
 };
 
-// Replaces a six-byte loader handoff site with `jmp qword ptr [rip+disp32]`.
-// The target slot lives in read-only padding of the loader's executable page,
-// so the patch neither consumes a guest register nor changes the guest stack.
+// Replaces a six-byte loader handoff site with `jmp rel32` plus padding. The
+// nearby trampoline loads the validated program entry into caller-saved R11
+// and jumps through it. This avoids the RIP-relative memory-indirect branch
+// that did not retire correctly in the live iOS translator while preserving
+// the guest stack and every register with defined ELF process-entry meaning.
 constexpr std::optional<Fex64LoaderHandoffPatch>
 planFex64LoaderHandoffPatch(std::uint64_t jumpAddress,
-                            std::uint64_t entrySlotAddress,
+                            std::uint64_t trampolineAddress,
                             std::uint64_t programEntry) noexcept {
     if (programEntry == 0 ||
-        jumpAddress > std::numeric_limits<std::uint64_t>::max() - 6) {
+        jumpAddress > std::numeric_limits<std::uint64_t>::max() - 5) {
         return std::nullopt;
     }
 
-    const std::uint64_t nextInstruction = jumpAddress + 6;
+    const std::uint64_t nextInstruction = jumpAddress + 5;
     std::int64_t displacement = 0;
-    if (entrySlotAddress >= nextInstruction) {
-        const std::uint64_t delta = entrySlotAddress - nextInstruction;
+    if (trampolineAddress >= nextInstruction) {
+        const std::uint64_t delta = trampolineAddress - nextInstruction;
         if (delta > static_cast<std::uint64_t>(
                         std::numeric_limits<std::int32_t>::max())) {
             return std::nullopt;
         }
         displacement = static_cast<std::int64_t>(delta);
     } else {
-        const std::uint64_t delta = nextInstruction - entrySlotAddress;
+        const std::uint64_t delta = nextInstruction - trampolineAddress;
         constexpr std::uint64_t minimumMagnitude =
             std::uint64_t{1} << 31;
         if (delta > minimumMagnitude) {
@@ -53,15 +58,15 @@ planFex64LoaderHandoffPatch(std::uint64_t jumpAddress,
     const std::uint32_t encodedDisplacement = static_cast<std::uint32_t>(
         static_cast<std::int32_t>(displacement));
     Fex64LoaderHandoffPatch patch {
-        {0xff, 0x25, 0, 0, 0, 0},
-        {0, 0, 0, 0, 0, 0, 0, 0},
+        {0xe9, 0, 0, 0, 0, 0x90},
+        {0x49, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0xff, 0xe3},
     };
     for (std::size_t byte = 0; byte < 4; ++byte) {
-        patch.indirectJump[2 + byte] = static_cast<std::uint8_t>(
+        patch.branchToTrampoline[1 + byte] = static_cast<std::uint8_t>(
             encodedDisplacement >> (byte * 8));
     }
     for (std::size_t byte = 0; byte < 8; ++byte) {
-        patch.entrySlot[byte] = static_cast<std::uint8_t>(
+        patch.trampoline[2 + byte] = static_cast<std::uint8_t>(
             programEntry >> (byte * 8));
     }
     return patch;
