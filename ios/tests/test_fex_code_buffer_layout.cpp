@@ -41,3 +41,29 @@ BOXEDVN_TEST(fex_code_buffer_layout_rejects_invalid_or_exhausted_requests) {
     CHECK(!planFexCodeBufferLayout(0, 0x10000, 0x10000, 0x4000, 0x1000)
                .has_value());
 }
+
+BOXEDVN_TEST(fex_code_buffer_pool_reuses_only_matching_retired_layouts) {
+    FexCodeBufferPool pool;
+    const auto small = pool.allocate(0x4000, 0x4000000, 0x4000, 0x1000);
+    const auto large = pool.allocate(0x1000000, 0x4000000, 0x4000, 0x1000);
+    CHECK(small.has_value());
+    CHECK(large.has_value());
+    CHECK(!small->reused);
+    CHECK(!large->reused);
+    const auto cursor = pool.cursor();
+
+    CHECK(pool.release(large->layout.allocationOffset, 0x1000000));
+    CHECK(!pool.release(large->layout.allocationOffset, 0x1000000));
+    const auto different = pool.allocate(0x800000, 0x4000000, 0x4000, 0x1000);
+    CHECK(different.has_value());
+    CHECK(!different->reused);
+    CHECK(pool.cursor() > cursor);
+
+    const auto beforeReuse = pool.cursor();
+    const auto reused = pool.allocate(0x1000000, 0x4000000, 0x4000, 0x1000);
+    CHECK(reused.has_value());
+    CHECK(reused->reused);
+    CHECK_EQ(reused->layout.allocationOffset,
+             large->layout.allocationOffset);
+    CHECK_EQ(pool.cursor(), beforeReuse);
+}

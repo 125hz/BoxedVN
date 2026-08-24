@@ -129,6 +129,7 @@ void* gPoolRX = nullptr;
 void* gPoolRW = nullptr;
 size_t gPoolSize = 0;
 std::atomic<size_t> gPoolUsed {0};
+boxedvn::FexCodeBufferPool gCodeBufferPool;
 
 void* gGuestCode = nullptr;
 void* gGuestStack = nullptr;
@@ -259,19 +260,20 @@ bool poolOwns(const void* pointer) {
 
 void* allocateTranslatedCode(size_t length) {
     std::lock_guard<std::mutex> guard(gPoolMutex);
-    const auto layout = boxedvn::planFexCodeBufferLayout(
-        gPoolUsed.load(std::memory_order_relaxed), length, gPoolSize,
-        kPageBytes, kFEXPageBytes);
-    if (layout.has_value()) {
-        gPoolUsed.store(layout->nextOffset, std::memory_order_relaxed);
+    const auto allocation = gCodeBufferPool.allocate(
+        length, gPoolSize, kPageBytes, kFEXPageBytes);
+    if (allocation.has_value()) {
+        const auto& layout = allocation->layout;
+        gPoolUsed.store(gCodeBufferPool.cursor(), std::memory_order_relaxed);
         static std::atomic<uint32_t> reported {0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-            reportf("FEX executable carve request=0x%zx rx_offset=0x%zx "
+            reportf("FEX executable %s request=0x%zx rx_offset=0x%zx "
                     "guard_offset=0x%zx next_offset=0x%zx host_page=0x%zx",
-                    length, layout->allocationOffset, layout->guardOffset,
-                    layout->nextOffset, kPageBytes);
+                    allocation->reused ? "reuse" : "carve", length,
+                    layout.allocationOffset, layout.guardOffset,
+                    layout.nextOffset, kPageBytes);
         }
-        return static_cast<uint8_t*>(gPoolRX) + layout->allocationOffset;
+        return static_cast<uint8_t*>(gPoolRX) + layout.allocationOffset;
     }
     reportf("translator executable pool exhausted by a %zu-byte request", length);
     return MAP_FAILED;
@@ -286,7 +288,17 @@ void* fexMmap(void* address, size_t length, int protection, int flags,
 }
 
 int fexMunmap(void* address, size_t length) {
-    return poolOwns(address) ? 0 : munmap(address, length);
+    if (!poolOwns(address)) {
+        return munmap(address, length);
+    }
+    std::lock_guard<std::mutex> guard(gPoolMutex);
+    const size_t offset = static_cast<uint8_t*>(address) -
+                          static_cast<uint8_t*>(gPoolRX);
+    if (!gCodeBufferPool.release(offset, length)) {
+        reportf("FEX executable release did not match a live carve "
+                "request=0x%zx rx_offset=0x%zx", length, offset);
+    }
+    return 0;
 }
 
 void fexLog(LogMan::DebugLevels level, const char* message) {
@@ -1217,7 +1229,8 @@ void releaseLiveProcessRun(void* process, LiveProcessState* expected,
 }
 
 void resetLiveThreadAfterExec(LiveProcessState* processState,
-                              LiveThreadState* threadState) {
+                              LiveThreadState* threadState,
+                              uint64_t resumeRIP) {
     if (!processState || !threadState || !threadState->fexThread) return;
     // The recovered ELF-loader boundary needs the lookup caches and call/ret
     // predictor reset, but it must keep the thread's existing JIT buffer. A
@@ -1228,6 +1241,11 @@ void resetLiveThreadAfterExec(LiveProcessState* processState,
     // string. The ordinary clear path invalidates the lookup mappings and calls
     // ResetCallRetStack without allocating another executable buffer.
     processState->fex->context->ClearCodeCache(threadState->fexThread, false);
+    // The loader recovery changes epochs without executing a Linux execve.
+    // Preserve its validated entry explicitly across FEX's cache reset. This
+    // also makes the intended authority unambiguous if a pinned FEX revision
+    // touches CpuState while clearing its lookup structures.
+    threadState->fexThread->CurrentFrame->State.rip = resumeRIP;
     if (threadState->callRetMapping && threadState->callRetMappingSize > 0) {
         void* shadow = static_cast<uint8_t*>(threadState->callRetMapping) +
                        kPageBytes;
@@ -1866,11 +1884,22 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
                 break;
             }
             if (action == BVNFEXCPU64AdapterActionExec) {
+                const uint64_t resumeRIP =
+                    threadState->fexThread->CurrentFrame->State.rip;
                 reportf("BOXEDWINE_FEX64_CONTEXT_RESET rip=0x%llx "
                         "reason=exec-boundary codebuffer=reused",
                         static_cast<unsigned long long>(
                             threadState->fexThread->CurrentFrame->State.rip));
-                resetLiveThreadAfterExec(processState, threadState);
+                resetLiveThreadAfterExec(processState, threadState, resumeRIP);
+                if (!BVNFEXCPU64AdapterSyncFromFEX(
+                        adapter, threadState->fexThread->CurrentFrame)) {
+                    cleanReturn = false;
+                    reportf("FEX could not restore the recovered loader entry");
+                    break;
+                }
+                reportf("BOXEDWINE_FEX64_CONTEXT_RESET_DONE frame_rip=0x%llx",
+                        static_cast<unsigned long long>(
+                            threadState->fexThread->CurrentFrame->State.rip));
                 BVNFEXCPU64AdapterResetAction(adapter);
                 continue;
             }

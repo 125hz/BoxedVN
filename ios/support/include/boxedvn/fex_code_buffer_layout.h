@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <vector>
 
 namespace boxedvn {
 
@@ -82,6 +83,63 @@ constexpr std::optional<FexCodeBufferLayout> planFexCodeBufferLayout(
     }
     return FexCodeBufferLayout {allocation, guard, next};
 }
+
+// FEX releases a code buffer with the same pointer and length that it received
+// from its executable allocator. Keep retired layouts available for an exact-
+// size reuse before advancing the finite iOS executable-pool cursor. Exact
+// reuse is important: it preserves the already-aligned host guard page at the
+// end of the allocation without having to change protections on a neighbouring
+// live buffer.
+class FexCodeBufferPool final {
+public:
+    struct Allocation final {
+        FexCodeBufferLayout layout;
+        bool reused;
+    };
+
+    std::optional<Allocation> allocate(
+        std::size_t length, std::size_t capacity,
+        std::size_t hostPageSize, std::size_t translatorPageSize) {
+        for (Reservation& reservation : reservations_) {
+            if (!reservation.live && reservation.length == length) {
+                reservation.live = true;
+                return Allocation {reservation.layout, true};
+            }
+        }
+
+        const auto layout = planFexCodeBufferLayout(
+            cursor_, length, capacity, hostPageSize, translatorPageSize);
+        if (!layout.has_value()) {
+            return std::nullopt;
+        }
+        reservations_.push_back(Reservation {*layout, length, true});
+        cursor_ = layout->nextOffset;
+        return Allocation {*layout, false};
+    }
+
+    bool release(std::size_t allocationOffset, std::size_t length) {
+        for (Reservation& reservation : reservations_) {
+            if (reservation.live && reservation.length == length &&
+                reservation.layout.allocationOffset == allocationOffset) {
+                reservation.live = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::size_t cursor() const noexcept { return cursor_; }
+
+private:
+    struct Reservation final {
+        FexCodeBufferLayout layout;
+        std::size_t length;
+        bool live;
+    };
+
+    std::size_t cursor_ = 0;
+    std::vector<Reservation> reservations_;
+};
 
 }  // namespace boxedvn
 
