@@ -1233,39 +1233,58 @@ void releaseLiveProcessRun(void* process, LiveProcessState* expected,
     state->threads.clear();
 }
 
-void resetLiveThreadAfterExec(LiveProcessState* processState,
-                              LiveThreadState* threadState,
-                              uint64_t resumeRIP) {
-    if (!processState || !threadState || !threadState->fexThread) return;
-    // The recovered ELF-loader boundary needs the lookup caches and call/ret
-    // predictor reset, but it must keep the thread's existing JIT buffer. A
-    // `NewCodeBuffer=true` reset asks FEX for another full code buffer. On iOS
-    // the translator owns a bounded dual-mapped arena, so that request can
-    // return MAP_FAILED after loader translation; Arm64JITCore then applies
-    // DualMap::WriteOffset to -1 and faults while emitting its detection
-    // string. The ordinary clear path invalidates the lookup mappings and calls
-    // ResetCallRetStack without allocating another executable buffer.
-    processState->fex->context->ClearCodeCache(threadState->fexThread, false);
-    // The loader recovery changes epochs without executing a Linux execve.
-    // Preserve its validated entry explicitly across FEX's cache reset. This
-    // also makes the intended authority unambiguous if a pinned FEX revision
-    // touches CpuState while clearing its lookup structures.
-    threadState->fexThread->CurrentFrame->State.rip = resumeRIP;
+bool recreateLiveThreadAfterExec(LiveProcessState* processState,
+                                 LiveThreadState* threadState,
+                                 uint64_t resumeRIP) {
+    if (!processState || !processState->fex || !threadState ||
+        !threadState->fexThread || !threadState->fexThread->CurrentFrame) {
+        return false;
+    }
+
+    // ClearCodeCache() is not a complete execution-epoch reset. The recovered
+    // ELF-loader handoff proved that the visible frame RIP survived the clear,
+    // while the dispatcher immediately requested guest RIP zero. Build a fresh
+    // FEX thread from the authoritative guest CPU state so its dispatcher,
+    // lookup cache, JIT backend, and call/return predictor agree on one epoch.
+    FEXCore::Core::CPUState savedState {};
+    std::memcpy(&savedState,
+                &threadState->fexThread->CurrentFrame->State,
+                sizeof(savedState));
+    savedState.rip = resumeRIP;
+    savedState.InlineJITBlockHeader = 0;
+    savedState.callret_sp = 0;
+    savedState.callret_sp_base = 0;
+
+    auto* replacement = processState->fex->context->CreateThread(
+        resumeRIP, savedState.gregs[FEXCore::X86State::REG_RSP], &savedState);
+    if (!replacement || !replacement->CurrentFrame) return false;
+
+    disableLiveBlockLinking(replacement);
     if (threadState->callRetMapping && threadState->callRetMappingSize > 0) {
         void* shadow = static_cast<uint8_t*>(threadState->callRetMapping) +
                        kPageBytes;
         const size_t shadowBytes =
             FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-        // ClearCodeCache() already invokes FEX's ResetCallRetStack(), which
-        // decommits the full reservation and lets the VM supply zero-fill-on-
-        // demand pages. Do not memset the reservation here: that would make
-        // every exec transition resident again and defeat FEX's reclaim path.
-        threadState->fexThread->CallRetStackBase = shadow;
-        threadState->fexThread->CurrentFrame->State.callret_sp =
+        (void)madvise(shadow, shadowBytes, MADV_DONTNEED);
+        replacement->CallRetStackBase = shadow;
+        replacement->CurrentFrame->State.callret_sp =
             reinterpret_cast<uint64_t>(shadow) + shadowBytes / 4;
-        threadState->fexThread->CurrentFrame->State.callret_sp_base =
+        replacement->CurrentFrame->State.callret_sp_base =
             reinterpret_cast<uint64_t>(shadow);
     }
+    replacement->CurrentFrame->State.segment_arrays[0] = threadState->gdt;
+    replacement->CurrentFrame->State.cs_idx = 0;
+
+    auto* retired = threadState->fexThread;
+    {
+        std::lock_guard<std::mutex> guard(gLiveMutex);
+        gLiveThreadContexts.erase(retired);
+        gLiveThreadContexts.emplace(replacement,
+                                    processState->fex->context.get());
+        threadState->fexThread = replacement;
+    }
+    processState->fex->context->DestroyThread(retired);
+    return true;
 }
 
 } // namespace
@@ -1902,10 +1921,18 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
                 const uint64_t resumeRIP =
                     threadState->fexThread->CurrentFrame->State.rip;
                 reportf("BOXEDWINE_FEX64_CONTEXT_RESET rip=0x%llx "
-                        "reason=exec-boundary codebuffer=reused",
+                        "reason=exec-boundary thread=recreated",
                         static_cast<unsigned long long>(
                             threadState->fexThread->CurrentFrame->State.rip));
-                resetLiveThreadAfterExec(processState, threadState, resumeRIP);
+                if (!recreateLiveThreadAfterExec(
+                        processState, threadState, resumeRIP) ||
+                    !BVNFEXCPU64AdapterBindFEX(
+                        adapter, processState->fex->context.get(),
+                        threadState->fexThread)) {
+                    cleanReturn = false;
+                    reportf("FEX could not recreate the loader execution epoch");
+                    break;
+                }
                 if (!BVNFEXCPU64AdapterSyncFromFEX(
                         adapter, threadState->fexThread->CurrentFrame)) {
                     cleanReturn = false;

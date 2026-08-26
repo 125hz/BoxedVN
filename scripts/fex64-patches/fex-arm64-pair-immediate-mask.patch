@@ -1,0 +1,16 @@
+diff --git a/CodeEmitter/CodeEmitter/LoadstoreOps.inl b/CodeEmitter/CodeEmitter/LoadstoreOps.inl
+index 31419b9d4..4fb24126e 100644
+--- a/CodeEmitter/CodeEmitter/LoadstoreOps.inl
++++ b/CodeEmitter/CodeEmitter/LoadstoreOps.inl
+@@ -4361,7 +4361,10 @@ public:
+   template<typename T>
+   void LoadStorePair(uint32_t Op, T rt, T rt2, ARMEmitter::Register rn, uint32_t Imm) {
+     uint32_t Instr = Op;
+-    Instr |= Imm << 15;
++    // Pair load/store immediates are signed seven-bit fields. Keep the final
++    // encoding boundary defensive even when a caller passes a sign-extended
++    // negative value; otherwise the sign bits replace the opcode with 0xffff.
++    Instr |= (Imm & 0b111'1111) << 15;
+     Instr |= Encode_rt2(rt2);
+     Instr |= Encode_rn(rn);
+     Instr |= Encode_rt(rt);

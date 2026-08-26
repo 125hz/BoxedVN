@@ -44,6 +44,13 @@ def main() -> None:
         / "ios/support/include/boxedvn/fex_exit_dispatch_contract.h"
     )
     backend = read(repository / "ios/runtime/src/BVNFEXBackend.mm")
+    pair_mask_patch = read(
+        repository
+        / "scripts/fex64-patches/fex-arm64-pair-immediate-mask.patch"
+    )
+    loader_fixture = read(
+        repository / "scripts/guest-probes/fex64-loader-stall.asm"
+    )
 
     require_ordered(
         context,
@@ -109,7 +116,37 @@ def main() -> None:
         "BoxedVN callback behavior",
     )
 
-    print("FEX exit-dispatch contract verified")
+    require_ordered(
+        backend,
+        [
+            "bool recreateLiveThreadAfterExec(",
+            "savedState.InlineJITBlockHeader = 0;",
+            "context->CreateThread(",
+            "disableLiveBlockLinking(replacement);",
+            "threadState->fexThread = replacement;",
+            "context->DestroyThread(retired);",
+        ],
+        "BoxedVN loader execution-epoch replacement",
+    )
+    require_ordered(
+        pair_mask_patch,
+        [
+            "void LoadStorePair(",
+            "Instr |= (Imm & 0b111'1111) << 15;",
+        ],
+        "FEX ARM64 pair-immediate encoding",
+    )
+    require_ordered(
+        loader_fixture,
+        [
+            "std",
+            "rep movsb",
+            "cld",
+        ],
+        "FEX backward REP MOVS regression fixture",
+    )
+
+    print("FEX exit-dispatch and loader-boundary contracts verified")
 
 
 if __name__ == "__main__":

@@ -101,6 +101,33 @@ handoff_target:
     cmp     byte [r8 + 0x8fff], 0x5a
     jnz     fail
 
+    ; Execute the negative post-index pair-load/store path used by backward
+    ; REP MOVS. A sign-extended pair immediate must remain confined to imm7;
+    ; leaking those sign bits into the opcode produces an illegal 0xffff....
+    ; ARM64 word on device.
+    mov     rdi, DATA + 0xa000
+    mov     esi, 0x6b
+    mov     edx, 0x100
+    call    rep_stos_probe
+    mov     rsi, DATA + 0xa0ff
+    mov     rdi, DATA + 0xb0ff
+    mov     rcx, 0x100
+    std
+    rep movsb
+    cld
+    cmp     rsi, DATA + 0x9fff
+    jnz     fail
+    cmp     rdi, DATA + 0xafff
+    jnz     fail
+    cmp     byte [r8 + 0xb000], 0x6b
+    jnz     fail
+    cmp     byte [r8 + 0xb0ff], 0x6b
+    jnz     fail
+    cmp     byte [r8 + 0xafff], 0
+    jnz     fail
+    cmp     byte [r8 + 0xb100], 0
+    jnz     fail
+
     mov     rax, PASS
     hlt
 
