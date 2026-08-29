@@ -826,6 +826,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testSseCompareImmediate_0x3c2, "Test SSE Compare Immediate 3c2"},
     {testSseInsertExtractShuffle_0x1c4_0x3c4_0x1c5_0x3c5_0x3c6, "Test SSE Insert/Extract/Shuffle"},
     {testCmpXchg8b_0x3c7, "Test CmpXchg8b 3c7"},
+    {testLockedCmpXchg8bAtomicIncrementProgress, "Test locked cmpxchg8b atomic increment progress"},
     {testBswap_0x3c8_0x3cf, "Test Bswap 3c8-3cf"},
     {testMmxPmovmskb_0x3d7, "Test MMX Pmovmskb 3d7"},
     {testMmxPminub_0x3da, "Test MMX Pminub 3da"},

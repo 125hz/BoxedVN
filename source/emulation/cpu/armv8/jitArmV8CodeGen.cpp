@@ -5668,65 +5668,20 @@ void JitArmV8CodeGen::dynamic_rdtsc(DecodedOp* op) {
 }
 
 void JitArmV8CodeGen::dynamic_cmpxchg8b_lock(DecodedOp* op) {
-    JitCodeGen::write(JitWidth::b64, calculateEaa(op), nullptr, [op, this](MemPtr address) {
-        U32 neededFlags = currentOp->needsToSetFlags(cpu) & ZF;
-        if (neededFlags && currentOp->getNeededFlagsAfter(PF | SF | AF | CF | OF)) { // The ZF flag is set if the destination operand and EDX:EAX are equal; otherwise it is cleared. The CF, PF, AF, SF, and OF flags are unaffected.
-            fillFlags();
-        }
-        RegPtr addressReg = calculateAddress(address);
-        RegPtr offsetReg = getTmpReg();
-        compiler.and_(R64(offsetReg), R64(addressReg), 7);
-        If(JitWidth::b32, offsetReg); {
-            emulateSingleOp();
-        } EndIf();
-        if (rt.cpu_features().has(asmjit::CpuFeatures::ARM::kLRCPC)) {
-            if (neededFlags) {
-                // we need to make a copy of eax/edx so that we can compare the original values to what was in memory
-                RegPtr tmp = getTmpReg();
-
-                // must be sequential and the first one must be even
-                if (regUsed[tmps[6]] || regUsed[tmps[7]] || (tmps[6] & 1)) {
-                    kpanic("");
-                }
-                compiler.mov(wTmp7, wEAX);
-                compiler.mov(wTmp8, wEDX);
-                compiler.caspal(wTmp7, wTmp8, wEBX, wECX, Mem(R64(addressReg)));
-                compiler.cmp(wEAX, wTmp7);
-                compiler.ccmp(wEDX, wTmp8, 0, asmjit::a64::CondCode::kEQ); // if EAX matched, compare EDX; otherwise force Z clear
-                compiler.cset(R32(tmp), asmjit::a64::CondCode::kEQ); // eq means z flag is set
-                compiler.bfi(xFLAGS, R32(tmp), 6, 1);
-                compiler.mov(wEAX, wTmp7);
-                compiler.mov(wEDX, wTmp8);
-            } else {
-                compiler.caspal(wEAX, wEDX, wEBX, wECX, Mem(R64(addressReg)));
-            }
-        } else {
-            Label label = compiler.new_label();
-            RegPtr tmp1 = getTmpReg();
-            RegPtr tmp2 = getTmpReg();
-            RegPtr tmp3 = getTmpReg();
-
-            if (neededFlags) {
-                compiler.bfc(xFLAGS, 6, 1); // clear ZF
-            }
-            compiler.bind(label);
-            compiler.ldaxp(R32(tmp1), R32(tmp2), Mem(R64(addressReg)));
-            compiler.cmp(wEAX, R32(tmp1));
-            compiler.ccmp(wEDX, R32(tmp2), 0, asmjit::a64::CondCode::kEQ); // if EAX matched, compare EDX; otherwise force Z clear
-
-            IfEqual(); {
-                compiler.stlxp(R32(tmp3), wEBX, wECX, Mem(R64(addressReg)));
-                compiler.cbnz(R32(tmp3), label);
-                if (neededFlags) {
-                    compiler.orr(xFLAGS, xFLAGS, ZF);
-                }
-            } StartElse(); {
-                compiler.clrex(15);
-                compiler.mov(wEAX, R32(tmp1));
-                compiler.mov(wEDX, R32(tmp2));
-            } EndIf();
-        }
-    });
+    // Keep the 64-bit compare, register write-back, and ZF update in the
+    // shared locked helper. The inline ARM pair-CAS path can leave ZF stale
+    // when a following Jcc consumes the result directly, turning the common
+    // atomic-add sequence below into an infinite retry loop:
+    //
+    //   mov edx:eax, [counter]
+    //   lock cmpxchg8b [counter]
+    //   jne retry
+    //
+    // CMPXCHG8B is uncommon enough that the helper boundary is preferable to
+    // a non-progressing renderer queue, and it also preserves the established
+    // unaligned and cross-page behaviour in one implementation.
+    (void)op;
+    emulateSingleOp();
 }
 
 void JitArmV8CodeGen::dynamic_cmpxchg_lock(JitWidth width, DecodedOp* op) {

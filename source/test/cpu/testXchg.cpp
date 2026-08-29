@@ -44,6 +44,8 @@ constexpr U32 CMPXCHG_BRANCH_ITERATIONS = 512;
 constexpr U32 CMPXCHG_SYNC_TARGET = 0x5200;
 constexpr U32 CMPXCHG_SYNC_EAX = 0x5204;
 constexpr U32 CMPXCHG_SYNC_ZF = 0x5208;
+constexpr U32 CMPXCHG8B_PROGRESS_TARGET = 0x5210;
+constexpr U32 CMPXCHG8B_PROGRESS_ERROR = 0x5218;
 constexpr U32 INITIAL_FLAGS = CF | PF | AF | ZF | SF | OF | DF;
 constexpr U32 FLAG_MASK = CF | PF | AF | ZF | SF | OF | DF;
 constexpr U32 CMPXCHG_FLAG_MASK = CF | PF | AF | ZF | SF | OF | DF;
@@ -761,6 +763,56 @@ void runCmpXchg8bCases(const char* name) {
                 runCmpXchg8bCase(CMPXCHG8B_CASES[i], lockPrefix != 0, false, true, flagMode, name);
             }
         }
+    }
+}
+
+void runLockedCmpXchg8bAtomicIncrementProgressCase(const char* name) {
+    constexpr U64 initial = 0x00000001fffffff0ULL;
+    constexpr U32 maxAttempts = 32;
+
+    newInstruction(0);
+
+    asmjit::CodeHolder code;
+    initCode(code);
+    asmjit::x86::Assembler a(&code);
+    asmjit::Label retry = a.new_label();
+    asmjit::Label succeeded = a.new_label();
+    asmjit::Label done = a.new_label();
+    auto expectOk = [](asmjit::Error err, const char* message) {
+        if (err != asmjit::Error::kOk) {
+            failed("%s", message);
+        }
+    };
+
+    expectOk(a.mov(asmjit::x86::esi, maxAttempts), "asmjit cmpxchg8b progress attempt count");
+    expectOk(a.bind(retry), "asmjit cmpxchg8b progress retry bind");
+    expectOk(a.mov(asmjit::x86::eax, asmjit::x86::dword_ptr(CMPXCHG8B_PROGRESS_TARGET)), "asmjit cmpxchg8b progress load low");
+    expectOk(a.mov(asmjit::x86::edx, asmjit::x86::dword_ptr(CMPXCHG8B_PROGRESS_TARGET + 4)), "asmjit cmpxchg8b progress load high");
+    expectOk(a.mov(asmjit::x86::ebx, asmjit::x86::eax), "asmjit cmpxchg8b progress desired low");
+    expectOk(a.mov(asmjit::x86::ecx, asmjit::x86::edx), "asmjit cmpxchg8b progress desired high");
+    expectOk(a.add(asmjit::x86::ebx, 1), "asmjit cmpxchg8b progress increment low");
+    expectOk(a.adc(asmjit::x86::ecx, 0), "asmjit cmpxchg8b progress increment high");
+    a.lock();
+    expectOk(a.cmpxchg8b(asmjit::x86::qword_ptr(CMPXCHG8B_PROGRESS_TARGET)), "asmjit cmpxchg8b progress compare exchange");
+    expectOk(a.je(succeeded), "asmjit cmpxchg8b progress success branch");
+    expectOk(a.dec(asmjit::x86::esi), "asmjit cmpxchg8b progress decrement attempts");
+    expectOk(a.jnz(retry), "asmjit cmpxchg8b progress retry branch");
+    expectOk(a.mov(asmjit::x86::dword_ptr(CMPXCHG8B_PROGRESS_ERROR), 1), "asmjit cmpxchg8b progress failure marker");
+    expectOk(a.jmp(done), "asmjit cmpxchg8b progress failure exit");
+    expectOk(a.bind(succeeded), "asmjit cmpxchg8b progress success bind");
+    expectOk(a.mov(asmjit::x86::dword_ptr(CMPXCHG8B_PROGRESS_ERROR), 0), "asmjit cmpxchg8b progress success marker");
+    expectOk(a.bind(done), "asmjit cmpxchg8b progress done bind");
+
+    pushGeneratedCode(code);
+    memory->writeq(cpu->seg[DS].address + CMPXCHG8B_PROGRESS_TARGET, initial);
+    memory->writed(cpu->seg[DS].address + CMPXCHG8B_PROGRESS_ERROR, 0xffffffffu);
+    runTestCPU();
+
+    if (memory->readd(cpu->seg[DS].address + CMPXCHG8B_PROGRESS_ERROR) != 0) {
+        failed("%s exhausted its retry budget", name);
+    }
+    if (memory->readq(cpu->seg[DS].address + CMPXCHG8B_PROGRESS_TARGET) != initial + 1) {
+        failed("%s counter did not advance exactly once", name);
     }
 }
 
@@ -1848,6 +1900,10 @@ void testCmpXchgE8R8_0x3b0() { runCmpXchgCases(8, true, CMPXCHG8_CASES, caseCoun
 void testCmpXchgE16R16_0x1b1() { runCmpXchgCases(16, false, CMPXCHG16_CASES, caseCount(CMPXCHG16_CASES), "cmpxchg e16,r16 1b1"); }
 void testCmpXchgE32R32_0x3b1() { runCmpXchgCases(32, true, CMPXCHG32_CASES, caseCount(CMPXCHG32_CASES), "cmpxchg e32,r32 3b1"); }
 void testCmpXchg8b_0x3c7() { runCmpXchg8bCases("cmpxchg8b 3c7"); }
+void testLockedCmpXchg8bAtomicIncrementProgress() {
+    runLockedCmpXchg8bAtomicIncrementProgressCase(
+        "locked cmpxchg8b atomic increment progress");
+}
 
 void testJitCmpXchgBranchAfterEmulatedOp() {
     runJitCmpXchgBranchAfterEmulatedOpCase("jit cmpxchg branch after emulated op");

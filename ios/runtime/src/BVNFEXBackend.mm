@@ -841,7 +841,8 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
 }
 
 FEXCore::Core::InternalThreadState* createFEXThread(
-    FEXContextBundle& bundle, uint64_t rip, uint64_t stack) {
+    FEXContextBundle& bundle, uint64_t rip, uint64_t stack,
+    const FEXCore::Core::CPUState* state = nullptr) {
     if (!boxedvn::fexGuestModeAdmitted(bundle.mode) ||
         bundle.context == nullptr) {
         reportf("FEX thread rejected mode=%s context=%p",
@@ -851,7 +852,7 @@ FEXCore::Core::InternalThreadState* createFEXThread(
     }
     std::lock_guard<std::mutex> lock(gFEXContextConstructionMutex);
     FEXGuestModeConfigScope modeScope(bundle.mode);
-    return bundle.context->CreateThread(rip, stack);
+    return bundle.context->CreateThread(rip, stack, state);
 }
 
 bool mapBundledELFProbe() {
@@ -1233,19 +1234,22 @@ void releaseLiveProcessRun(void* process, LiveProcessState* expected,
     state->threads.clear();
 }
 
-bool recreateLiveThreadAfterExec(LiveProcessState* processState,
-                                 LiveThreadState* threadState,
-                                 uint64_t resumeRIP) {
+bool recreateLiveContextAfterExec(LiveProcessState* processState,
+                                  LiveThreadState* threadState,
+                                  BVNFEXCPU64Adapter* adapter,
+                                  uint64_t resumeRIP) {
     if (!processState || !processState->fex || !threadState ||
-        !threadState->fexThread || !threadState->fexThread->CurrentFrame) {
+        !threadState->fexThread || !threadState->fexThread->CurrentFrame ||
+        !adapter) {
         return false;
     }
 
-    // ClearCodeCache() is not a complete execution-epoch reset. The recovered
-    // ELF-loader handoff proved that the visible frame RIP survived the clear,
-    // while the dispatcher immediately requested guest RIP zero. Build a fresh
-    // FEX thread from the authoritative guest CPU state so its dispatcher,
-    // lookup cache, JIT backend, and call/return predictor agree on one epoch.
+    // ClearCodeCache() and replacing only InternalThreadState are both too
+    // narrow for an exec boundary. The former retained a lookup path to guest
+    // RIP zero, while the latter entered a dispatcher whose continuation target
+    // was null. Replace the process context as one unit so the dispatcher,
+    // lookup cache, JIT backend, signal delegator, and thread all begin in the
+    // same execution epoch.
     FEXCore::Core::CPUState savedState {};
     std::memcpy(&savedState,
                 &threadState->fexThread->CurrentFrame->State,
@@ -1255,9 +1259,17 @@ bool recreateLiveThreadAfterExec(LiveProcessState* processState,
     savedState.callret_sp = 0;
     savedState.callret_sp_base = 0;
 
-    auto* replacement = processState->fex->context->CreateThread(
-        resumeRIP, savedState.gregs[FEXCore::X86State::REG_RSP], &savedState);
-    if (!replacement || !replacement->CurrentFrame) return false;
+    auto replacementBundle = createFEXContext(
+        processState->fex->mode, nullptr);
+    if (!replacementBundle) return false;
+    auto* replacement = createFEXThread(
+        *replacementBundle, resumeRIP,
+        savedState.gregs[FEXCore::X86State::REG_RSP], &savedState);
+    if (!replacement) return false;
+    // Until ownership is transferred to the live thread table, let the bundle
+    // clean this thread up on every early-return path.
+    replacementBundle->initialThread = replacement;
+    if (!replacement->CurrentFrame) return false;
 
     disableLiveBlockLinking(replacement);
     if (threadState->callRetMapping && threadState->callRetMappingSize > 0) {
@@ -1276,14 +1288,26 @@ bool recreateLiveThreadAfterExec(LiveProcessState* processState,
     replacement->CurrentFrame->State.cs_idx = 0;
 
     auto* retired = threadState->fexThread;
+    std::unique_ptr<FEXContextBundle> retiredBundle;
     {
         std::lock_guard<std::mutex> guard(gLiveMutex);
+        if (processState->threads.size() != 1 ||
+            processState->threads.begin()->second.get() != threadState ||
+            processState->fex == nullptr ||
+            !BVNFEXCPU64AdapterBindFEX(
+                adapter, replacementBundle->context.get(), replacement)) {
+            return false;
+        }
+        gActiveSignals = replacementBundle->signals.get();
         gLiveThreadContexts.erase(retired);
         gLiveThreadContexts.emplace(replacement,
-                                    processState->fex->context.get());
+                                    replacementBundle->context.get());
         threadState->fexThread = replacement;
+        replacementBundle->initialThread = nullptr;
+        retiredBundle = std::move(processState->fex);
+        processState->fex = std::move(replacementBundle);
     }
-    processState->fex->context->DestroyThread(retired);
+    retiredBundle->context->DestroyThread(retired);
     return true;
 }
 
@@ -1921,14 +1945,11 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
                 const uint64_t resumeRIP =
                     threadState->fexThread->CurrentFrame->State.rip;
                 reportf("BOXEDWINE_FEX64_CONTEXT_RESET rip=0x%llx "
-                        "reason=exec-boundary thread=recreated",
+                        "reason=exec-boundary context=recreated",
                         static_cast<unsigned long long>(
                             threadState->fexThread->CurrentFrame->State.rip));
-                if (!recreateLiveThreadAfterExec(
-                        processState, threadState, resumeRIP) ||
-                    !BVNFEXCPU64AdapterBindFEX(
-                        adapter, processState->fex->context.get(),
-                        threadState->fexThread)) {
+                if (!recreateLiveContextAfterExec(
+                        processState, threadState, adapter, resumeRIP)) {
                     cleanReturn = false;
                     reportf("FEX could not recreate the loader execution epoch");
                     break;

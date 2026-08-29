@@ -39,6 +39,7 @@ void testCmpXchgE8R8_0x3b0();
 void testCmpXchgE16R16_0x1b1();
 void testCmpXchgE32R32_0x3b1();
 void testCmpXchg8b_0x3c7();
+void testLockedCmpXchg8bAtomicIncrementProgress();
 void testJitCmpXchgBranchAfterEmulatedOp();
 void testJitCmpXchgEmulateSync();
 void testJitCmpXchgPrefixSkippedEntry();

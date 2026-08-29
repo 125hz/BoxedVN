@@ -119,12 +119,25 @@ def main() -> None:
     require_ordered(
         backend,
         [
-            "bool recreateLiveThreadAfterExec(",
+            "FEXCore::Core::InternalThreadState* createFEXThread(",
+            "FEXGuestModeConfigScope modeScope(bundle.mode);",
+            "return bundle.context->CreateThread(rip, stack, state);",
+        ],
+        "BoxedVN mode-scoped FEX thread construction",
+    )
+    require_ordered(
+        backend,
+        [
+            "bool recreateLiveContextAfterExec(",
             "savedState.InlineJITBlockHeader = 0;",
-            "context->CreateThread(",
+            "auto replacementBundle = createFEXContext(",
+            "auto* replacement = createFEXThread(",
             "disableLiveBlockLinking(replacement);",
+            "BVNFEXCPU64AdapterBindFEX(",
             "threadState->fexThread = replacement;",
-            "context->DestroyThread(retired);",
+            "retiredBundle = std::move(processState->fex);",
+            "processState->fex = std::move(replacementBundle);",
+            "retiredBundle->context->DestroyThread(retired);",
         ],
         "BoxedVN loader execution-epoch replacement",
     )
