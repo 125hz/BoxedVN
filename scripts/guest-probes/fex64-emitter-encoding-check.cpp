@@ -22,14 +22,14 @@
 // The emitter only reaches them through fextl::vector.
 namespace FEXCore::Allocator {
 void* aligned_alloc(size_t alignment, size_t size) {
-    void* result = nullptr;
-    if (posix_memalign(&result, alignment < sizeof(void*) ? sizeof(void*) : alignment, size) != 0) {
-        return nullptr;
-    }
-    return result;
+    // Unqualified names here would find this namespace's own declarations, so
+    // reach for the standard allocator explicitly.
+    const size_t effective = alignment < alignof(void*) ? alignof(void*) : alignment;
+    const size_t rounded = (size + effective - 1) & ~(effective - 1);
+    return std::aligned_alloc(effective, rounded);
 }
 void aligned_free(void* pointer) {
-    ::free(pointer);
+    std::free(pointer);
 }
 } // namespace FEXCore::Allocator
 
