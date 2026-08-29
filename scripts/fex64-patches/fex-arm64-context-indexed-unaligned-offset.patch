@@ -1,0 +1,32 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index 2cf05d1..9d7c9c2 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -266,8 +266,12 @@ DEF_OP(LoadContextIndexed) {
+         if (Op->BaseOffset % 16 == 0) {
+           ldr(Dst.Q(), TMP1, Op->BaseOffset);
+         } else {
++          // The base offset is already materialized into TMP1 above. Passing
++          // it to LDUR as well applied the displacement twice and, for a
++          // negative offset, drove a sign-extended immediate into the
++          // unscaled imm9 field. The unscaled immediate must be zero here.
+           add(ARMEmitter::Size::i64Bit, TMP1, TMP1, Op->BaseOffset);
+-          ldur(Dst.Q(), TMP1, Op->BaseOffset);
++          ldur(Dst.Q(), TMP1);
+         }
+         break;
+       case IR::OpSize::i256Bit:
+@@ -332,8 +336,12 @@ DEF_OP(StoreContextIndexed) {
+         if (Op->BaseOffset % 16 == 0) {
+           str(Value.Q(), TMP1, Op->BaseOffset);
+         } else {
++          // The base offset is already materialized into TMP1 above. Passing
++          // it to STUR as well applied the displacement twice and, for a
++          // negative offset, drove a sign-extended immediate into the
++          // unscaled imm9 field. The unscaled immediate must be zero here.
+           add(ARMEmitter::Size::i64Bit, TMP1, TMP1, Op->BaseOffset);
+-          stur(Value.Q(), TMP1, Op->BaseOffset);
++          stur(Value.Q(), TMP1);
+         }
+         break;
+       case IR::OpSize::i256Bit:

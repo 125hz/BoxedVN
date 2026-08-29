@@ -137,10 +137,14 @@ def main() -> None:
             "disableLiveBlockLinking(replacement);",
             "primeFEXThread(*replacementBundle, replacement, resumeRIP)",
             "BVNFEXCPU64AdapterBindFEX(",
+            "gLiveThreadContexts.erase(retired);",
+            "gLiveThreadContexts.emplace(replacement,",
             "threadState->fexThread = replacement;",
-            "retiredBundle = std::move(processState->fex);",
+            "retiredEpoch->thread = retired;",
+            "retiredEpoch->bundle = std::move(processState->fex);",
+            "processState->retiredEpochs.push_back(std::move(retiredEpoch));",
             "processState->fex = std::move(replacementBundle);",
-            "retiredBundle->context->DestroyThread(retired);",
+            "BOXEDWINE_FEX64_CONTEXT_RESET_RETAINED",
             "BOXEDWINE_FEX64_CONTEXT_RESET_DONE",
             "BVNFEXCPU64AdapterResetAction(adapter);",
             "BOXEDWINE_FEX64_CONTEXT_RESET_DEFERRED",
@@ -178,6 +182,155 @@ def main() -> None:
             "cld",
         ],
         "FEX backward REP MOVS regression fixture",
+    )
+
+    # The retired exec epoch owns the host frames the still-running
+    # BVNFEXCPU64Run returns through. Ownership must be declared once, held by
+    # the process, and released only at process teardown.
+    require_ordered(
+        backend,
+        [
+            "struct RetiredFEXEpoch {",
+            "std::unique_ptr<FEXContextBundle> bundle;",
+            "FEXCore::Core::InternalThreadState* thread = nullptr;",
+            "~RetiredFEXEpoch() {",
+            "bundle->context->DestroyThread(thread);",
+            "struct LiveProcessState {",
+            "std::vector<std::unique_ptr<RetiredFEXEpoch>> retiredEpochs;",
+        ],
+        "BoxedVN retired execution-epoch ownership",
+    )
+    require_ordered(
+        backend,
+        [
+            "void releaseLiveProcessRun(",
+            "state->fex->context->DestroyThread(thread->fexThread);",
+            "state->threads.clear();",
+            "state->retiredEpochs.clear();",
+        ],
+        "BoxedVN retired-epoch teardown ordering",
+    )
+
+    # Device build 137 reached CONTEXT_RESET_DEFERRED and then faulted at
+    # host_pc=0 because the retired epoch was torn down inside the same
+    # BVNFEXCPU64Run. Nothing in the recreate path may destroy it.
+    recreate_start = backend.index("bool recreateLiveContextAfterExec(")
+    terminator = chr(10) + "}" + chr(10)
+    recreate_end = backend.index(terminator, recreate_start)
+    recreate_body = backend[recreate_start:recreate_end]
+    for forbidden in ("DestroyThread", "retiredBundle"):
+        if forbidden in recreate_body:
+            raise SystemExit(
+                "recreateLiveContextAfterExec must not destroy the retired "
+                f"execution epoch; found {forbidden!r}"
+            )
+
+    # The indexed-context 128-bit path materialized the base offset into TMP1
+    # and then passed it to LDUR/STUR again, double-applying the displacement
+    # and driving a signed immediate into the unscaled field.
+    memory_ops = read(
+        fex / "FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp"
+    )
+    context_offset_patch = read(
+        repository
+        / "scripts/fex64-patches"
+        / "fex-arm64-context-indexed-unaligned-offset.patch"
+    )
+    # The probe applies and then reverses the maintained patches, so accept
+    # either state -- but only those two, and never a mixture.
+    unpatched = (
+        "ldur(Dst.Q(), TMP1, Op->BaseOffset);" in memory_ops
+        and "stur(Value.Q(), TMP1, Op->BaseOffset);" in memory_ops
+    )
+    patched = (
+        "ldur(Dst.Q(), TMP1);" in memory_ops
+        and "stur(Value.Q(), TMP1);" in memory_ops
+    )
+    if unpatched == patched:
+        raise SystemExit(
+            "FEX indexed context 128-bit path is in an unexpected state: the "
+            "pinned source must either double-apply Op->BaseOffset or carry "
+            "the downstream fix, not both and not neither"
+        )
+    if unpatched:
+        require_ordered(
+            memory_ops,
+            [
+                "DEF_OP(LoadContextIndexed) {",
+                "add(ARMEmitter::Size::i64Bit, TMP1, TMP1, Op->BaseOffset);",
+                "ldur(Dst.Q(), TMP1, Op->BaseOffset);",
+                "DEF_OP(StoreContextIndexed) {",
+                "add(ARMEmitter::Size::i64Bit, TMP1, TMP1, Op->BaseOffset);",
+                "stur(Value.Q(), TMP1, Op->BaseOffset);",
+            ],
+            "pinned FEX double-applied indexed context offset",
+        )
+    require_ordered(
+        context_offset_patch,
+        [
+            "a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
+            "-          ldur(Dst.Q(), TMP1, Op->BaseOffset);",
+            "+          ldur(Dst.Q(), TMP1);",
+            "-          stur(Value.Q(), TMP1, Op->BaseOffset);",
+            "+          stur(Value.Q(), TMP1);",
+        ],
+        "BoxedVN indexed context offset patch",
+    )
+
+    # Both the iOS translator build and the simulator probe must carry every
+    # maintained encoding patch, or the probe validates code the device never
+    # runs.
+    fex_build_script = read(repository / "scripts/build-fex64-fex.sh")
+    vixl_probe = read(repository / "scripts/run-fex64-vixl-probe.sh")
+    for label, text, fragment in (
+        ("iOS translator build", fex_build_script,
+         "apply_patch fex-arm64-context-indexed-unaligned-offset.patch"),
+        ("VIXL probe", vixl_probe,
+         "fex-arm64-context-indexed-unaligned-offset.patch"),
+    ):
+        if fragment not in text:
+            raise SystemExit(
+                f"{label} does not apply the indexed context offset patch"
+            )
+
+    # A restored TestHarnessRunner is not proof that the patches in this tree
+    # were compiled. The probe must rebuild, and must build the emitter
+    # encoding regression from source every run.
+    if 'if [[ ! -x "${fex_build}/Bin/TestHarnessRunner" ]]; then' in vixl_probe:
+        raise SystemExit(
+            "the VIXL probe still accepts a cached TestHarnessRunner as proof "
+            "that the maintained patches were compiled"
+        )
+    require_ordered(
+        vixl_probe,
+        [
+            "cmake --build \"${fex_build}\" --target TestHarnessRunner",
+            "${encoding_check_source}\" -o \"${encoding_check}\"",
+            "\"${encoding_check}\"",
+            "build_runner" + chr(10),
+            'runner="${fex_build}/Bin/TestHarnessRunner"',
+        ],
+        "VIXL probe rebuild ordering",
+    )
+
+    # The encoding regression drives the real ARM64 emitter, not arithmetic.
+    encoding_check = read(
+        repository / "scripts/guest-probes/fex64-emitter-encoding-check.cpp"
+    )
+    require_ordered(
+        encoding_check,
+        [
+            "#include <CodeEmitter/Emitter.h>",
+            "ARMEmitter::Emitter emitter(buffer, sizeof(buffer));",
+            "emitter.stur(ARMEmitter::QRegister(23), "
+            "ARMEmitter::Register(11), -16);",
+            "if (word != 0x3c9f0177u) {",
+            "emitter.stur(ARMEmitter::QRegister(23), "
+            "ARMEmitter::Register(11));",
+            "for (int32_t immediate = -256; immediate <= 255; ++immediate) {",
+            "kDeviceFaultWord",
+        ],
+        "BoxedVN ARM64 emitter encoding regression",
     )
 
     print("FEX exit-dispatch and loader-boundary contracts verified")

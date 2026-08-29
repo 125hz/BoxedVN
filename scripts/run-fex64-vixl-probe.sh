@@ -11,6 +11,7 @@ fex_build="${FEX_BUILD:-${root}/build/fex-vixl-probe}"
 fixture64="${root}/scripts/guest-probes/fex64-loader-stall.asm"
 fixture32="${root}/scripts/guest-probes/fex32-core-contract.asm"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
+encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
 cc="${CC:-clang}"
 cxx="${CXX:-clang++}"
 allocator_declaration_header="${fex_source}/FEXCore/Source/Utils/Allocator.h"
@@ -20,6 +21,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-boxedwine-block-diagnostics.patch"
     "${root}/scripts/fex64-patches/fex-apple-dual-map-cache-publish.patch"
     "${root}/scripts/fex64-patches/fex-arm64-pair-immediate-mask.patch"
+    "${root}/scripts/fex64-patches/fex-arm64-context-indexed-unaligned-offset.patch"
 )
 
 die() {
@@ -39,6 +41,8 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
 [[ -f "${fixture64}" ]] || die "fixture not found: ${fixture64}"
 [[ -f "${fixture32}" ]] || die "fixture not found: ${fixture32}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
+[[ -f "${encoding_check_source}" ]] || \
+    die "encoding check not found: ${encoding_check_source}"
 [[ -f "${allocator_declaration_header}" ]] || \
     die "allocator declaration header not found: ${allocator_declaration_header}"
 for runtime_patch in "${runtime_patches[@]}"; do
@@ -93,11 +97,35 @@ build_runner() (
         -DENABLE_GDB_SYMBOLS=OFF \
         -DENABLE_ZYDIS=OFF
     cmake --build "${fex_build}" --target TestHarnessRunner
+
+    # The device SIGILL was an ARM64 encoding defect, so validate the emitter
+    # itself here, with the maintained patches applied, before any fixture
+    # runs. Building this from source is also what proves the patches in this
+    # tree were compiled rather than inherited from a cached runner.
+    encoding_check="${fex_build}/boxedvn-emitter-encoding-check"
+    fmt_include=""
+    for candidate in "${fex_source}/External/fmt/include" \
+                     "${fex_source}/External/fmt"; do
+        if [[ -f "${candidate}/fmt/format.h" ]]; then
+            fmt_include="${candidate}"
+            break
+        fi
+    done
+    [[ -n "${fmt_include}" ]] || \
+        die "vendored fmt headers not found under ${fex_source}/External/fmt"
+    "${cxx}" -std=c++20 -O1 -DFMT_HEADER_ONLY \
+        -I"${fex_source}/CodeEmitter" \
+        -I"${fex_source}/FEXCore/include" \
+        -I"${fex_source}/FEXHeaderUtils" \
+        -I"${fmt_include}" \
+        "${encoding_check_source}" -o "${encoding_check}"
+    "${encoding_check}"
 )
 
-if [[ ! -x "${fex_build}/Bin/TestHarnessRunner" ]]; then
-    build_runner
-fi
+# Always apply the maintained patches and rebuild. A restored cache can carry a
+# TestHarnessRunner that predates the patches in this tree, and accepting that
+# executable as proof reported a green fixture for code that was never built.
+build_runner
 
 runner="${fex_build}/Bin/TestHarnessRunner"
 [[ -x "${runner}" ]] || die "TestHarnessRunner was not built: ${runner}"

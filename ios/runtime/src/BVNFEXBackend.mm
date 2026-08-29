@@ -93,6 +93,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 extern "C" {
 void __clear_cache(void* start, void* end) {
@@ -176,6 +177,25 @@ struct FEXContextBundle {
     }
 };
 
+// An exec boundary replaces the entire FEX execution epoch while BoxedWine is
+// still inside BVNFEXCPU64Run. The retired context therefore still owns the
+// host frames that call must return through, so its thread and context are
+// retained together here instead of being destroyed at the swap point.
+struct RetiredFEXEpoch {
+    std::unique_ptr<FEXContextBundle> bundle;
+    FEXCore::Core::InternalThreadState* thread = nullptr;
+
+    ~RetiredFEXEpoch() {
+        // Members are destroyed after this body runs, so the bundle -- and
+        // with it the context that owns `thread` -- is still alive here.
+        if (thread != nullptr && bundle != nullptr &&
+            bundle->context != nullptr && bundle->initialThread != thread) {
+            bundle->context->DestroyThread(thread);
+        }
+        thread = nullptr;
+    }
+};
+
 std::unique_ptr<FEXContextBundle> gProbeContext;
 
 struct LiveThreadState {
@@ -203,6 +223,9 @@ struct LiveThreadState {
 struct LiveProcessState {
     std::unique_ptr<FEXContextBundle> fex;
     std::unordered_map<void*, std::unique_ptr<LiveThreadState>> threads;
+    // Execution epochs retired by exec. Owned until process teardown; never
+    // destroyed from inside a BVNFEXCPU64Run that is still running on them.
+    std::vector<std::unique_ptr<RetiredFEXEpoch>> retiredEpochs;
     std::atomic<size_t> activeRuns {0};
     std::atomic<bool> retiring {false};
     std::atomic<bool> entryReported {false};
@@ -1243,6 +1266,10 @@ void releaseLiveProcessRun(void* process, LiveProcessState* expected,
         }
     }
     state->threads.clear();
+    // Exec-retired epochs are released last. They are unreachable once the
+    // process left gLiveProcesses, and each one destroys its own retired
+    // thread before its context, so nothing outlives the epoch that owns it.
+    state->retiredEpochs.clear();
 }
 
 bool recreateLiveContextAfterExec(LiveProcessState* processState,
@@ -1310,7 +1337,7 @@ bool recreateLiveContextAfterExec(LiveProcessState* processState,
             static_cast<unsigned long long>(resumeRIP));
 
     auto* retired = threadState->fexThread;
-    std::unique_ptr<FEXContextBundle> retiredBundle;
+    size_t retainedEpochs = 0;
     {
         std::lock_guard<std::mutex> guard(gLiveMutex);
         if (processState->threads.size() != 1 ||
@@ -1321,15 +1348,26 @@ bool recreateLiveContextAfterExec(LiveProcessState* processState,
             return false;
         }
         gActiveSignals = replacementBundle->signals.get();
+        // Stop routing the retired thread before the replacement becomes
+        // reachable: both epochs describe the same opaque BoxedWine thread.
         gLiveThreadContexts.erase(retired);
         gLiveThreadContexts.emplace(replacement,
                                     replacementBundle->context.get());
         threadState->fexThread = replacement;
         replacementBundle->initialThread = nullptr;
-        retiredBundle = std::move(processState->fex);
+        // Destroying the retired thread or its context here tore down the
+        // dispatcher and code buffers that this still-running BVNFEXCPU64Run
+        // returns through, which faulted at host_pc=0. Retain the whole epoch
+        // -- thread and context as one unit -- until the process is retired.
+        auto retiredEpoch = std::make_unique<RetiredFEXEpoch>();
+        retiredEpoch->thread = retired;
+        retiredEpoch->bundle = std::move(processState->fex);
+        processState->retiredEpochs.push_back(std::move(retiredEpoch));
+        retainedEpochs = processState->retiredEpochs.size();
         processState->fex = std::move(replacementBundle);
     }
-    retiredBundle->context->DestroyThread(retired);
+    reportf("BOXEDWINE_FEX64_CONTEXT_RESET_RETAINED epochs=%zu thread=%p",
+            retainedEpochs, static_cast<void*>(retired));
     return true;
 }
 
