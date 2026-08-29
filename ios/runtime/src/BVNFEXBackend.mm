@@ -1986,7 +1986,16 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
                         static_cast<unsigned long long>(
                             threadState->fexThread->CurrentFrame->State.rip));
                 BVNFEXCPU64AdapterResetAction(adapter);
-                continue;
+                // The old dispatcher's stop handler returned through this
+                // ExecuteThread invocation. Let that runner and its signal
+                // epoch unwind completely before entering the replacement
+                // context. BoxedWine's CPU64 scheduler immediately dispatches
+                // the still-live thread again; re-entering here occasionally
+                // branched through a stale null continuation on the first run.
+                reportf("BOXEDWINE_FEX64_CONTEXT_RESET_DEFERRED rip=0x%llx",
+                        static_cast<unsigned long long>(
+                            threadState->fexThread->CurrentFrame->State.rip));
+                break;
             }
             if (returnedByGuard || action == BVNFEXCPU64AdapterActionYield) {
                 break;

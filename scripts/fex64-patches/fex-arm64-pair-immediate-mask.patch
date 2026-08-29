@@ -1,5 +1,5 @@
 diff --git a/CodeEmitter/CodeEmitter/LoadstoreOps.inl b/CodeEmitter/CodeEmitter/LoadstoreOps.inl
-index 31419b9d4..8a5f7a2e1 100644
+index 31419b9d4..cfcc0bb42 100644
 --- a/CodeEmitter/CodeEmitter/LoadstoreOps.inl
 +++ b/CodeEmitter/CodeEmitter/LoadstoreOps.inl
 @@ -4354,4 +4354,7 @@ void LoadStoreNoAllocate(uint32_t Op, T rt, T rt2, ARMEmitter::Register rn, uint32_t Imm)
@@ -18,5 +18,14 @@ index 31419b9d4..8a5f7a2e1 100644
 +    // negative value; otherwise the sign bits replace the opcode with 0xffff.
 +    Instr |= (Imm & 0b111'1111) << 15;
      Instr |= Encode_rt2(rt2);
+     Instr |= Encode_rn(rn);
+     Instr |= Encode_rt(rt);
+@@ -4379,4 +4385,7 @@ void LoadStoreImm(uint32_t Op, uint32_t o2, T rt, ARMEmitter::Register rn, uint32_t Imm)
+-    Instr |= Imm << 12;
++    // The unscaled immediate is a signed nine-bit field. Mask again at the
++    // final encoder boundary: the ARM64EC device build otherwise allowed a
++    // negative STUR displacement to replace the opcode with 0xffff.
++    Instr |= (Imm & 0b1'1111'1111) << 12;
+     Instr |= o2 << 10;
      Instr |= Encode_rn(rn);
      Instr |= Encode_rt(rt);

@@ -44,7 +44,7 @@ def main() -> None:
         / "ios/support/include/boxedvn/fex_exit_dispatch_contract.h"
     )
     backend = read(repository / "ios/runtime/src/BVNFEXBackend.mm")
-    pair_mask_patch = read(
+    loadstore_mask_patch = read(
         repository
         / "scripts/fex64-patches/fex-arm64-pair-immediate-mask.patch"
     )
@@ -141,19 +141,35 @@ def main() -> None:
             "retiredBundle = std::move(processState->fex);",
             "processState->fex = std::move(replacementBundle);",
             "retiredBundle->context->DestroyThread(retired);",
+            "BOXEDWINE_FEX64_CONTEXT_RESET_DONE",
+            "BVNFEXCPU64AdapterResetAction(adapter);",
+            "BOXEDWINE_FEX64_CONTEXT_RESET_DEFERRED",
+            "break;",
         ],
         "BoxedVN loader execution-epoch replacement",
     )
     require_ordered(
-        pair_mask_patch,
+        loadstore_mask_patch,
         [
             "void LoadStoreNoAllocate(",
             "Instr |= (Imm & 0b111'1111) << 15;",
             "void LoadStorePair(",
             "Instr |= (Imm & 0b111'1111) << 15;",
+            "void LoadStoreImm(",
+            "Instr |= (Imm & 0b1'1111'1111) << 12;",
         ],
-        "FEX ARM64 pair-immediate encoding",
+        "FEX ARM64 signed load/store immediate encoding",
     )
+
+    # Device build 137 faulted on this exact lowering of libc's
+    # `movups [rax + 0x30], xmm0`: STUR Q23, [X11, #-16]. Without an imm9
+    # mask, the sign-extended displacement turns the opcode into 0xffff0177.
+    stur_q23_x11 = 0x3C800000 | ((-16 & 0x1FF) << 12) | (11 << 5) | 23
+    if stur_q23_x11 != 0x3C9F0177:
+        raise SystemExit(
+            "FEX ARM64 signed load/store immediate regression: "
+            f"expected 0x3c9f0177, got 0x{stur_q23_x11:08x}"
+        )
     require_ordered(
         loader_fixture,
         [
