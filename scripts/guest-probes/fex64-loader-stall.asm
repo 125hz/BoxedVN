@@ -115,9 +115,14 @@ handoff_target:
     std
     rep movsb
     cld
-    cmp     rsi, DATA + 0x9fff
+    ; CMP r64 has no imm64 form.  Comparing these >4 GiB addresses directly
+    ; truncates the expected value to a sign-extended imm32 and makes the
+    ; fixture report FEX_FAIL even when REP MOVSB produced the right pointers.
+    lea     r9, [r8 + 0x9fff]
+    cmp     rsi, r9
     jnz     fail
-    cmp     rdi, DATA + 0xafff
+    lea     r9, [r8 + 0xafff]
+    cmp     rdi, r9
     jnz     fail
     cmp     byte [r8 + 0xb000], 0x6b
     jnz     fail
