@@ -856,6 +856,16 @@ FEXCore::Core::InternalThreadState* createFEXThread(
     return bundle.context->CreateThread(rip, stack, state);
 }
 
+bool primeFEXThread(FEXContextBundle& bundle,
+                    FEXCore::Core::InternalThreadState* thread,
+                    uint64_t rip) {
+    if (!thread || !bundle.context || rip == 0) return false;
+    std::lock_guard<std::mutex> lock(gFEXContextConstructionMutex);
+    FEXGuestModeConfigScope modeScope(bundle.mode);
+    bundle.context->CompileRIP(thread, rip);
+    return true;
+}
+
 bool mapBundledELFProbe() {
     NSString* path = [[NSBundle mainBundle]
         pathForResource:@"boxedvn-fex64-kernel-probe" ofType:nil];
@@ -1287,6 +1297,17 @@ bool recreateLiveContextAfterExec(LiveProcessState* processState,
     }
     replacement->CurrentFrame->State.segment_arrays[0] = threadState->gdt;
     replacement->CurrentFrame->State.cs_idx = 0;
+
+    // A newly-created dispatcher normally compiles its first block on a cache
+    // miss. At the exec recovery boundary the iOS dispatcher instead observed
+    // the empty L1 entry as a host target and branched to zero. Seed only the
+    // validated program entry before publishing this execution epoch; later
+    // blocks continue to use FEX's ordinary compile-on-demand path.
+    if (!primeFEXThread(*replacementBundle, replacement, resumeRIP)) {
+        return false;
+    }
+    reportf("BOXEDWINE_FEX64_CONTEXT_RESET_PRIMED rip=0x%llx",
+            static_cast<unsigned long long>(resumeRIP));
 
     auto* retired = threadState->fexThread;
     std::unique_ptr<FEXContextBundle> retiredBundle;

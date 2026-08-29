@@ -122,6 +122,8 @@ def main() -> None:
             "FEXCore::Core::InternalThreadState* createFEXThread(",
             "FEXGuestModeConfigScope modeScope(bundle.mode);",
             "return bundle.context->CreateThread(rip, stack, state);",
+            "bool primeFEXThread(",
+            "bundle.context->CompileRIP(thread, rip);",
         ],
         "BoxedVN mode-scoped FEX thread construction",
     )
@@ -133,6 +135,7 @@ def main() -> None:
             "auto replacementBundle = createFEXContext(",
             "auto* replacement = createFEXThread(",
             "disableLiveBlockLinking(replacement);",
+            "primeFEXThread(*replacementBundle, replacement, resumeRIP)",
             "BVNFEXCPU64AdapterBindFEX(",
             "threadState->fexThread = replacement;",
             "retiredBundle = std::move(processState->fex);",
@@ -144,6 +147,8 @@ def main() -> None:
     require_ordered(
         pair_mask_patch,
         [
+            "void LoadStoreNoAllocate(",
+            "Instr |= (Imm & 0b111'1111) << 15;",
             "void LoadStorePair(",
             "Instr |= (Imm & 0b111'1111) << 15;",
         ],

@@ -271,6 +271,17 @@ BVNEngineProfileResult BVNApplyEngineCompatibilityProfile(
 }
 
 bool BVNApplyKnownCompatibilityProfile(BVNLaunchConfiguration& launch) {
+    // This UE3 build reaches a working WineD3D Vulkan swapchain and then its
+    // audio worker enters vorbis.dll with a null codec object (EDX=0x1e0,
+    // faulting at [EDX+0x10]). Wine treats that as an unhandled page fault and
+    // replaces the game with its debugger before the first frame. Removing the
+    // audio device prevents that invalid codec path while leaving the proven
+    // graphics path unchanged.
+    if (launchesAnyOf(launch, {"mirrorsedge.exe"})) {
+        launch.soundEnabled = false;
+        return true;
+    }
+
     // The Fruit of Grisaia: run it WITHOUT DXVK.
     //
     // Its build-65 device log shows DXVK failing to create a Vulkan device six

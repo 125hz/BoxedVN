@@ -368,6 +368,25 @@ BOXEDVN_TEST(grisaia_profile_keeps_dxvk_out_of_a_direct3d9_engine) {
     CHECK(forced.enableWineD3DVulkan);
 }
 
+BOXEDVN_TEST(mirrors_edge_profile_avoids_the_faulting_guest_audio_codec) {
+    BVNLaunchConfiguration launch;
+    launch.executablePath = "/bin/wine";
+    launch.arguments = {
+        "D:\\Mirrors-Edge\\Mirror's Edge\\Binaries\\MirrorsEdge.exe"};
+    launch.soundEnabled = true;
+
+    CHECK(BVNApplyKnownCompatibilityProfile(launch));
+    CHECK(!launch.soundEnabled);
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::find(actual.begin(), actual.end(), "-nosound") != actual.end());
+
+    BVNLaunchConfiguration unrelated;
+    unrelated.executablePath = "D:\\Games\\OtherGame.exe";
+    CHECK(!BVNApplyKnownCompatibilityProfile(unrelated));
+    CHECK(unrelated.soundEnabled);
+}
+
 BOXEDVN_TEST(command_does_not_let_boxedwine_truncate_frontend_log) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs.zip";
