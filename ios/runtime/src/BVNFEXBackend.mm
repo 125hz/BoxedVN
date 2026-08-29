@@ -461,7 +461,8 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     bool (*createInitialThread)(FEXContextBundle&));
 
 FEXCore::Core::InternalThreadState* createFEXThread(
-    FEXContextBundle& bundle, uint64_t rip, uint64_t stack);
+    FEXContextBundle& bundle, uint64_t rip, uint64_t stack,
+    const FEXCore::Core::CPUState* state = nullptr);
 
 constexpr std::array<int, 4> kFEXHostSignals {
     SIGSEGV, SIGBUS, SIGILL, SIGFPE,
@@ -842,7 +843,7 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
 
 FEXCore::Core::InternalThreadState* createFEXThread(
     FEXContextBundle& bundle, uint64_t rip, uint64_t stack,
-    const FEXCore::Core::CPUState* state = nullptr) {
+    const FEXCore::Core::CPUState* state) {
     if (!boxedvn::fexGuestModeAdmitted(bundle.mode) ||
         bundle.context == nullptr) {
         reportf("FEX thread rejected mode=%s context=%p",
