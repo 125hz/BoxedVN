@@ -244,7 +244,7 @@ index 3e01eeb7..9499c988 100644
    ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                      IR::MemOffsetType OffsetType, uint8_t OffsetScale);
 diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
-index 2cf05d14..224be447 100644
+index 2cf05d14..1c4955b6 100644
 --- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 @@ -584,19 +584,79 @@ DEF_OP(ContextClear) {
@@ -441,35 +441,48 @@ index 2cf05d14..224be447 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
-@@ -1882,6 +1961,12 @@ DEF_OP(MemSet) {
+@@ -1882,6 +1961,18 @@ DEF_OP(MemSet) {
      const auto Prefix = GetReg(Op->Prefix);
      add(TMP2, Prefix.X(), MemReg.X());
    }
 +  // TMP2 is this op's internal working pointer. The result address is
 +  // recomputed from the canonical MemReg and Length further down, so the
 +  // translation never reaches guest-visible state.
++  //
++  // The relocation is as load-bearing as the OR. A guest pointer into the
++  // top arena already carries the alias base's bits, so the OR alone is a
++  // no-op there and the emitted loop dereferences the canonical address the
++  // host cannot map. That is what faulted on device at 0x7fffffa10188.
 +  if (const uint64_t AliasBase = CTX->GetGuestLowAliasBase()) {
 +    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, AliasBase);
++    ApplyGuestTopRelocation(TMP2);
 +  }
 
    if (!DirectionIsInline) {
      // Backward or forwards implementation depends on flag
-@@ -2116,6 +2201,14 @@ DEF_OP(MemCpy) {
+@@ -2116,6 +2207,21 @@ DEF_OP(MemCpy) {
    mov(TMP1, Length.X());
    mov(TMP2, MemRegDest.X());
    mov(TMP3, MemRegSrc.X());
 +  // TMP2/TMP3 are internal working pointers; the out-addresses are recomputed
 +  // from the canonical MemRegDest/MemRegSrc registers below. TMP4 is this
 +  // op's value temporary, so the translation is emitted inline rather than
-+  // through the shared helper.
++  // through the shared helper -- but it must still be the WHOLE translation.
++  //
++  // Both pointers need the relocation as well as the OR. The device faulted
++  // in exactly this loop: the vectorised ldp/stp pair dereferenced source
++  // 0x7fffffa10188, a canonical top-arena address the OR leaves unchanged,
++  // instead of its host alias.
 +  if (const uint64_t AliasBase = CTX->GetGuestLowAliasBase()) {
 +    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, AliasBase);
 +    orr(ARMEmitter::Size::i64Bit, TMP3, TMP3, AliasBase);
++    ApplyGuestTopRelocation(TMP2);
++    ApplyGuestTopRelocation(TMP3);
 +  }
 
    // TMP1 = Length
    // TMP2 = Dest
-@@ -2396,7 +2489,7 @@ DEF_OP(CacheLineClear) {
+@@ -2396,7 +2502,7 @@ DEF_OP(CacheLineClear) {
 
    auto Op = IROp->C<IR::IROp_CacheLineClear>();
 
@@ -478,7 +491,7 @@ index 2cf05d14..224be447 100644
 
    // Clear dcache only
    // icache doesn't matter here since the guest application shouldn't be calling clflush on JIT code.
-@@ -2426,7 +2519,7 @@ DEF_OP(CacheLineClean) {
+@@ -2426,7 +2532,7 @@ DEF_OP(CacheLineClean) {
 
    auto Op = IROp->C<IR::IROp_CacheLineClean>();
 
@@ -487,7 +500,7 @@ index 2cf05d14..224be447 100644
 
    // Clean dcache only
    // check host cacheline size again x86_64 size to ensure at least 64 bytes are cleaned
-@@ -2445,7 +2538,7 @@ DEF_OP(CacheLineClean) {
+@@ -2445,7 +2551,7 @@ DEF_OP(CacheLineClean) {
  DEF_OP(CacheLineZero) {
    auto Op = IROp->C<IR::IROp_CacheLineZero>();
 
@@ -496,7 +509,7 @@ index 2cf05d14..224be447 100644
 
    if (CTX->HostFeatures.SupportsCLZERO) {
      // We can use this instruction directly
-@@ -2465,7 +2558,7 @@ DEF_OP(CacheLineZero) {
+@@ -2465,7 +2571,7 @@ DEF_OP(CacheLineZero) {
 
  DEF_OP(Prefetch) {
    auto Op = IROp->C<IR::IROp_Prefetch>();
@@ -505,7 +518,7 @@ index 2cf05d14..224be447 100644
 
    // Access size is only ever handled as 8-byte. Even though it is accesssed as a cacheline.
    const auto MemSrc = GenerateMemOperand(IR::OpSize::i64Bit, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
-@@ -2510,7 +2603,7 @@ DEF_OP(VStoreNonTemporal) {
+@@ -2510,7 +2616,7 @@ DEF_OP(VStoreNonTemporal) {
    const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
    const auto Value = GetVReg(Op->Value);
@@ -514,7 +527,7 @@ index 2cf05d14..224be447 100644
    const auto Offset = Op->Offset;
 
    if (Is256Bit) {
-@@ -2537,7 +2630,7 @@ DEF_OP(VStoreNonTemporalPair) {
+@@ -2537,7 +2643,7 @@ DEF_OP(VStoreNonTemporalPair) {
    const auto ValueLow = GetVReg(Op->ValueLow);
    const auto ValueHigh = GetVReg(Op->ValueHigh);
 
@@ -523,7 +536,7 @@ index 2cf05d14..224be447 100644
    const auto Offset = Op->Offset;
 
    stnp(ValueLow.Q(), ValueHigh.Q(), MemReg, Offset);
-@@ -2552,7 +2645,7 @@ DEF_OP(VLoadNonTemporal) {
+@@ -2552,7 +2658,7 @@ DEF_OP(VLoadNonTemporal) {
    const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
    const auto Dst = GetVReg(Node);

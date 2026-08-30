@@ -114,6 +114,10 @@ apply_patch fex-arm64-context-indexed-unaligned-offset.patch
 apply_patch fex-arm64-addsub-immediate-range.patch
 apply_patch fex-boxedwine-ir-capture-arm.patch
 apply_patch fex-boxedwine-low-address-alias.patch
+# Test-only: an env-gated alias configuration for TestHarnessRunner. It
+# changes no library code, and is applied here too so every checkout of
+# the pin carries the same maintained set.
+apply_patch fex-boxedwine-harness-alias.patch
 
 # CMAKE_SYSTEM_PROCESSOR has to be stated. CMake leaves it empty when cross-
 # compiling unless a toolchain file sets it, and FEX selects its entire

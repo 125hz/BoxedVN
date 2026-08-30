@@ -2317,14 +2317,36 @@ def main() -> None:
         ],
         "BoxedVN FEX top-arena translation contract",
     )
-    # Every path that ORs the alias base itself must relocate too, or that
-    # path alone would keep pointing at the unmappable canonical arena.
-    aliasOrs = alias_patch.count("orr(ARMEmitter::Size::i64Bit, TMP4,")
-    relocations = alias_patch.count("ApplyGuestTopRelocation(TMP4);")
-    if relocations != aliasOrs:
+    # Every path that ORs the alias base itself must relocate the same
+    # register too, or that path alone keeps pointing at the unmappable
+    # canonical arena. This is checked per register rather than by counting
+    # one temporary: MemSet and MemCpy use TMP2/TMP3, and a TMP4-only count
+    # is exactly why their missing relocation reached a device, where the
+    # vectorised copy loop faulted dereferencing 0x7fffffa10188.
+    patch_lines = alias_patch.split(newline)
+    aliased = 0
+    for index, line in enumerate(patch_lines):
+        if not line.startswith("+"):
+            continue
+        if "orr(ARMEmitter::Size::i64Bit, TMP" not in line:
+            continue
+        if "AliasBase)" not in line:
+            continue
+        register = line.split("TMP", 1)[1].split(",")[0]
+        register = "TMP" + register.strip()
+        aliased += 1
+        # The relocation may follow another OR for a second pointer, so look
+        # a few lines ahead rather than only at the next one.
+        window = newline.join(patch_lines[index + 1:index + 6])
+        if "ApplyGuestTopRelocation(" + register + ")" not in window:
+            raise SystemExit(
+                "an alias OR on " + register + " is not followed by the top "
+                "relocation, so that path would dereference the canonical "
+                "arena: " + line.strip())
+    if aliased < 5:
         raise SystemExit(
-            "every alias OR must be followed by the top relocation: {} OR(s), "
-            "{} relocation(s)".format(aliasOrs, relocations))
+            "expected every aliasing memory path to be covered; found only " +
+            str(aliased))
     # A compare inside operand generation would corrupt guest flags, which FEX
     # keeps in the host NZCV register.
     reloc_start = alias_patch.index(
@@ -2359,16 +2381,82 @@ def main() -> None:
                 "the emitter check's constant is not the runtime's: " +
                 constant)
 
+    # A fixture that runs with the translation disabled cannot catch a
+    # missing translation. The alias-enabled harness path exists for exactly
+    # that, and the values it publishes must be the runtime's own.
+    harness_patch = read(
+        repository / "scripts/fex64-patches/fex-boxedwine-harness-alias.patch")
+    require_ordered(
+        harness_patch,
+        [
+            '+  const char* const BoxedWineAliasEnv = std::getenv("FEX_BOXEDWINE_ALIAS");',
+            "+  constexpr uint64_t BoxedWineLowAliasBase = 0x7800000000ULL;",
+            "+  constexpr uint64_t BoxedWineLowGuestLimit = 0x200000000ULL;",
+            "+  constexpr uint64_t BoxedWineTopClearMask = 0x7f8000000000ULL;",
+            "+    CTX->SetGuestLowAlias(BoxedWineLowAliasBase, BoxedWineLowGuestLimit);",
+            "+    CTX->SetGuestTopClearMask(BoxedWineTopClearMask);",
+            "   if (!CTX->InitCore()) {",
+            "+    auto MapForFixture = [&](uint64_t Address, size_t Size) -> void* {",
+            "+          DoMmap(Host, Size);",
+            "+    if (!Loader.MapMemory(MapForFixture)) {",
+        ],
+        "BoxedVN alias-enabled harness contract",
+    )
+    # Off by default, so every other harness run is unchanged.
+    if "BoxedWineAliasEnv[0] != 0" not in harness_patch:
+        raise SystemExit(
+            "an empty FEX_BOXEDWINE_ALIAS must leave the harness unchanged")
+    # The harness's copies of the constants have to be the runtime's.
+    for constant in ("0x7800000000ULL", "0x200000000ULL", "0x7f8000000000ULL"):
+        if constant.lower() not in alias_header.lower():
+            raise SystemExit(
+                "the harness's alias constant is not the runtime's: " +
+                constant)
+    builder = read(repository / "scripts/build-fex64-fex.sh")
+    if "apply_patch fex-boxedwine-harness-alias.patch" not in builder:
+        raise SystemExit(
+            "every maintained patch must be applied by the FEX builder")
+
     probe = read(repository / "scripts/run-fex64-vixl-probe.sh")
     require_ordered(
         probe,
         [
             'fixture_top_alias="${root}/scripts/guest-probes/fex64-top-alias-contract.asm"',
+            'fixture_top_alias_repmov="${root}/scripts/guest-probes/fex64-top-alias-repmov.asm"',
             'prepare_fixture "${fixture_top_alias}" fex64-top-alias',
+            'prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov',
             'run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin"',
+            'run_one x64-top-alias-repmov "${tmp_dir}/fex64-top-alias-repmov.bin"',
         ],
         "BoxedVN top-arena VIXL probe contract",
     )
+    # The alias is turned on for that fixture and nothing else.
+    if 'FEX_BOXEDWINE_ALIAS="${boxedwine_alias}"' not in probe:
+        raise SystemExit(
+            "the probe must pass the alias mode explicitly rather than rely "
+            "on a temporary assignment in front of a shell function")
+    for line in probe.split(newline):
+        if "run_one " not in line or "repmov" in line:
+            continue
+        if line.rstrip().endswith(" 1") and line.count('"') == 2:
+            raise SystemExit(
+                "only the alias-enabled fixture may request the alias: " +
+                line.strip())
+    repmov = read(
+        repository / "scripts/guest-probes/fex64-top-alias-repmov.asm")
+    for required in ("rep movsq", "rep movsb", "rep stosq", "rep stosb",
+                     "std", "cld",
+                     "%define ARENA_SRC 0x7ffffe000000",
+                     "%define ARENA_DST 0x7ffffe010000",
+                     "%define LOW_BUF   0x100000"):
+        if required not in repmov:
+            raise SystemExit(
+                "the alias-enabled fixture must exercise the string ops that "
+                "faulted: " + required)
+    workflow_key = read(repository / ".github/workflows/build-ios.yml")
+    if "scripts/guest-probes/fex64-top-alias-repmov.asm" not in workflow_key:
+        raise SystemExit(
+            "the alias-enabled fixture must participate in the VIXL cache key")
     fixture = read(
         repository / "scripts/guest-probes/fex64-top-alias-contract.asm")
     for required in ("mov r10, ARENA", "lock xadd", "lock cmpxchg",

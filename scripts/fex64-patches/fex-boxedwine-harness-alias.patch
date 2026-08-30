@@ -1,0 +1,85 @@
+diff --git a/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp b/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp
+index 4a0f8511..a50e71ba 100644
+--- a/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp
++++ b/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp
+@@ -38,6 +38,8 @@ $end_info$
+
+ #include <csetjmp>
+ #include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <errno.h>
+ #include <signal.h>
+ #include <stdio.h>
+@@ -329,6 +331,35 @@ int main(int argc, char** argv, char** const envp) {
+   CTX->SetSignalDelegator(SignalDelegation.get());
+   CTX->SetSyscallHandler(SyscallHandler.get());
+
++  // BoxedWine's guest address translation, for fixtures that exist to exercise
++  // it. Off unless FEX_BOXEDWINE_ALIAS is set, so every other harness run is
++  // bit-for-bit what it was.
++  //
++  // This exists because a fixture running with the translation disabled cannot
++  // catch a missing translation. The device faulted in the vectorised copy
++  // loop on a canonical top-arena pointer that MemCpy had OR'd but never
++  // relocated, and no harness fixture could have seen it.
++  //
++  // The values match include/guest_low_alias.h. They are literals here because
++  // this tool is built from the FEX tree and has no path to BoxedVN's headers;
++  // the contract test pins the two together.
++  // Empty counts as off: the probe passes the variable on every run and
++  // only sets a value for the fixture that wants it.
++  const char* const BoxedWineAliasEnv = std::getenv("FEX_BOXEDWINE_ALIAS");
++  const bool BoxedWineAlias = BoxedWineAliasEnv != nullptr && BoxedWineAliasEnv[0] != 0 && BoxedWineAliasEnv[0] != '0';
++  constexpr uint64_t BoxedWineLowAliasBase = 0x7800000000ULL;
++  constexpr uint64_t BoxedWineLowGuestLimit = 0x200000000ULL;
++  constexpr uint64_t BoxedWineTopClearMask = 0x7f8000000000ULL;
++  auto BoxedWineGuestToHost = [](uint64_t Address) -> uint64_t {
++    return (Address | BoxedWineLowAliasBase) & ~BoxedWineTopClearMask;
++  };
++  if (BoxedWineAlias) {
++    CTX->SetGuestLowAlias(BoxedWineLowAliasBase, BoxedWineLowGuestLimit);
++    CTX->SetGuestTopClearMask(BoxedWineTopClearMask);
++    LogMan::Msg::IFmt("BOXEDWINE_HARNESS_ALIAS low_base={:#x} limit={:#x} clear_mask={:#x}", BoxedWineLowAliasBase,
++                      BoxedWineLowGuestLimit, BoxedWineTopClearMask);
++  }
++
+   if (!CTX->InitCore()) {
+     return 1;
+   }
+@@ -336,13 +367,34 @@ int main(int argc, char** argv, char** const envp) {
+   if (!IsHostRunner) {
+     LongJumpHandler::RegisterLongJumpHandler(SignalDelegation.get());
+
++    // With the translation on, the guest keeps its canonical addresses and the
++    // bytes live at the translated host address -- including the code the
++    // decoder fetches. Map both, and copy each region across afterwards so the
++    // fixture image is present where execution will actually read it.
++    fextl::vector<std::pair<uint64_t, size_t>> BoxedWineAliased;
++    auto MapForFixture = [&](uint64_t Address, size_t Size) -> void* {
++      void* Result = DoMmap(Address, Size);
++      if (BoxedWineAlias) {
++        const uint64_t Host = BoxedWineGuestToHost(Address);
++        if (Host != Address) {
++          DoMmap(Host, Size);
++          BoxedWineAliased.emplace_back(Address, Size);
++        }
++      }
++      return Result;
++    };
++
+     // Run through FEX
+-    if (!Loader.MapMemory(DoMmap)) {
++    if (!Loader.MapMemory(MapForFixture)) {
+       // failed to map
+       LogMan::Msg::EFmt("Failed to map {}-bit elf file.", Loader.Is64BitMode() ? 64 : 32);
+       return -ENOEXEC;
+     }
+
++    for (const auto& [Address, Size] : BoxedWineAliased) {
++      std::memcpy(reinterpret_cast<void*>(BoxedWineGuestToHost(Address)), reinterpret_cast<const void*>(Address), Size);
++    }
++
+     auto ParentThread = SyscallHandler->TM.CreateThread(Loader.DefaultRIP(), 0);
+     SyscallHandler->TM.TrackThread(ParentThread);
+     SignalDelegation->RegisterTLSState(ParentThread);

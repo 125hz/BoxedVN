@@ -14,6 +14,7 @@ fixture_vector="${root}/scripts/guest-probes/fex64-vector-store-contract.asm"
 fixture_negative_add="${root}/scripts/guest-probes/fex64-negative-add-contract.asm"
 fixture_indexed_alias="${root}/scripts/guest-probes/fex64-indexed-alias-contract.asm"
 fixture_top_alias="${root}/scripts/guest-probes/fex64-top-alias-contract.asm"
+fixture_top_alias_repmov="${root}/scripts/guest-probes/fex64-top-alias-repmov.asm"
 host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
@@ -30,6 +31,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-arm64-addsub-immediate-range.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-harness-alias.patch"
 )
 
 die() {
@@ -56,6 +58,8 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
     die "fixture not found: ${fixture_indexed_alias}"
 [[ -f "${fixture_top_alias}" ]] || \
     die "fixture not found: ${fixture_top_alias}"
+[[ -f "${fixture_top_alias_repmov}" ]] || \
+    die "fixture not found: ${fixture_top_alias_repmov}"
 [[ -f "${host_word_check}" ]] || \
     die "host-word checker not found: ${host_word_check}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
@@ -158,8 +162,10 @@ run_one() {
     local maxinst="$4"
     local multiblock="$5"
     local ircap_target="${6:-}"
-    echo "[fex-vixl] fixture=${label} maxinst=${maxinst} multiblock=${multiblock}"
+    local boxedwine_alias="${7:-}"
+    echo "[fex-vixl] fixture=${label} maxinst=${maxinst} multiblock=${multiblock} alias=${boxedwine_alias:-0}"
     FEX_BOXEDWINE_IRCAP_TARGET="${ircap_target}" \
+    FEX_BOXEDWINE_ALIAS="${boxedwine_alias}" \
     FEX_SILENTLOG=0 \
     FEX_MAXINST="${maxinst}" \
     FEX_MULTIBLOCK="${multiblock}" \
@@ -207,6 +213,7 @@ prepare_fixture "${fixture_vector}" fex64-vector-store
 prepare_fixture "${fixture_negative_add}" fex64-negative-add
 prepare_fixture "${fixture_indexed_alias}" fex64-indexed-alias
 prepare_fixture "${fixture_top_alias}" fex64-top-alias
+prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -301,4 +308,22 @@ run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin" \
 # fixture's claim is behavioural -- every access is read back and compared
 # -- and the encoding of the two translation instructions is proven
 # against the real emitter in fex64-emitter-encoding-check.cpp instead.
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias and top-alias fixtures completed in all modes"
+# The same arena, but with BoxedWine's address translation ENABLED, so a
+# memory operation that forgets to apply it dereferences an unmapped host
+# address and faults. That is the gap the device found: MemCpy ORed the
+# low alias base into its working pointers and never relocated the top
+# arena, and no fixture running with the translation off could see it.
+#
+# REP MOVSQ/MOVSB in both lane directions and both DF directions, and REP
+# STOSQ/STOSB, at a length that forces the vectorised ldp/stp loop and
+# leaves a scalar tail. Guest-visible RSI/RDI/RCX are checked to be
+# canonical afterwards.
+# The sixth argument is the IR-capture target, unused here; the seventh
+# turns the alias on for this fixture and only this fixture.
+run_one x64-top-alias-repmov "${tmp_dir}/fex64-top-alias-repmov.bin" \
+    "${tmp_dir}/fex64-top-alias-repmov.config.bin" 1 0 "" 1
+run_one x64-top-alias-repmov "${tmp_dir}/fex64-top-alias-repmov.bin" \
+    "${tmp_dir}/fex64-top-alias-repmov.config.bin" 500 0 "" 1
+run_one x64-top-alias-repmov "${tmp_dir}/fex64-top-alias-repmov.bin" \
+    "${tmp_dir}/fex64-top-alias-repmov.config.bin" 500 1 "" 1
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias and alias-enabled rep-movs fixtures completed in all modes"
