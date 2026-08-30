@@ -606,6 +606,57 @@ static bool containUnclassifiedFEXFault(
              writableEncoded[0] ? writableEncoded : "unreadable",
              aliasesMatch ? 1 : 0);
 
+    // The faulting effective address alone cannot say whether a guest base
+    // register was zero or the displacement was applied to the wrong base.
+    // Report the architectural state FEX reconstructed from the ucontext,
+    // plus the host registers the translated address arithmetic actually
+    // used, so the next log can distinguish a bad lowering from a guest
+    // pointer that was never populated.
+    if (gExactRIPReports.load(std::memory_order_relaxed) <=
+        kExactRIPReportLimit) {
+        const auto& guest = frame->State;
+        klog_fmt("BOXEDWINE_FEX64_FAULT_STATE pid=%d tid=%d rip=0x%llx "
+                 "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx "
+                 "rdi=0x%llx rsp=0x%llx rbp=0x%llx r12=0x%llx r13=0x%llx "
+                 "fs_cached=0x%llx gs_cached=0x%llx address=0x%llx",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1,
+                 (unsigned long long)guest.rip,
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RAX],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RBX],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RCX],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RDX],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RSI],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RDI],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RSP],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_RBP],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_R12],
+                 (unsigned long long)guest.gregs[FEXCore::X86State::REG_R13],
+                 (unsigned long long)guest.fs_cached,
+                 (unsigned long long)guest.gs_cached,
+                 (unsigned long long)faultAddress);
+        // The translated address arithmetic lives in host registers at the
+        // fault, and the static register allocation moves between blocks, so
+        // record the whole general file rather than guessing which pair the
+        // captured `add xN, xM, xK, lsl #2` used.
+        char hostRegisters[512] = {};
+        size_t hostUsed = 0;
+        for (int i = 0; i < 29 && hostUsed + 24 < sizeof(hostRegisters); ++i) {
+            const int written = snprintf(
+                hostRegisters + hostUsed, sizeof(hostRegisters) - hostUsed,
+                "%sx%d=0x%llx", i == 0 ? "" : " ", i,
+                (unsigned long long)machine->__ss.__x[i]);
+            if (written <= 0) break;
+            hostUsed += static_cast<size_t>(written);
+        }
+        klog_fmt("BOXEDWINE_FEX64_FAULT_HOSTREGS pid=%d tid=%d host_pc=0x%llx "
+                 "host_sp=0x%llx %s",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1,
+                 (unsigned long long)hostPC,
+                 (unsigned long long)machine->__ss.__sp, hostRegisters);
+    }
+
     // This is an active FEX thread and the fault is either in BoxedVN's
     // executable pool or the result of a translated branch to address zero.
     // Do not let Darwin terminate the whole app. Stop only this guest through

@@ -223,6 +223,25 @@ public:
     U64 mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path, U64 fileOffset,
                        const U8* fileBytes, U64 fileBytesLen);
 
+    // Map [addr, addr+len) at exactly that address, but only while every page
+    // in it is unmapped. This is MAP_FIXED_NOREPLACE: it never relocates and
+    // never replaces. The occupancy test and the mapping happen under the same
+    // allocator lock, so a sibling thread cannot claim the range in between --
+    // a check-then-MAP_FIXED sequence would be a TOCTOU race whose loser
+    // silently destroys the winner's mapping.
+    //
+    // Returns addr on success, (U64)-K_EEXIST when any page is already mapped
+    // or (in native identity mode) when the exact range lies outside the
+    // guest window, and (U64)-errno otherwise. On every failure path the
+    // existing contents are untouched and no allocator cursor advances.
+    U64 mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot);
+
+    // True when no page in [addr, addr+len) is mapped at all, reservations
+    // included. This is the occupancy question MAP_FIXED_NOREPLACE asks, and
+    // it is deliberately stricter than the "no accessible page" test an
+    // ordinary hint uses.
+    bool rangeCompletelyUnmapped(U64 addr, U64 len) const;
+
     // Atomically pick a free address range AND map it, so two guest threads of
     // the same process (sharing this KMemory64) can never be handed overlapping
     // mmap(NULL,...) placements. The old split — allocMmapRange() scans for a

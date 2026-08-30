@@ -1131,6 +1131,62 @@ void KMemory64::rangeRemoveLocked(U64 startPage, U64 pageCount) {
     }
 }
 
+bool KMemory64::rangeCompletelyUnmapped(U64 addr, U64 len) const {
+    if (len == 0) return true;
+    if (addr > (U64)-1 - len) return false;
+    const U64 pageStart = addr >> K64_PAGE_SHIFT;
+    const U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+    for (U64 i = 0; i < pageCount; i++) {
+        auto it = pages.find(pageStart + i);
+        if (it != pages.end() && (it->second->flags & K64_PAGE_MAPPED)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+U64 KMemory64::mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot) {
+    if (len == 0) return (U64)-K_EINVAL;
+    if (addr == 0 || (addr & K64_PAGE_MASK)) return (U64)-K_EINVAL;
+    if (len > (U64)-1 - K64_PAGE_MASK || addr > (U64)-1 - len) {
+        return (U64)-K_EINVAL;
+    }
+
+    const U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    const U64 mapLen = pageCount << K64_PAGE_SHIFT;
+
+    // Hold the allocator lock across the occupancy test AND the mapping. This
+    // is the whole point of the API: an unlocked "check the pages, then
+    // MAP_FIXED" sequence lets a sibling thread map the range in between, and
+    // the loser then destroys the winner's mapping -- exactly the failure
+    // mmapReserveAndMap already exists to avoid. mmapMutex is recursive, so
+    // mmapAnonymousFixed may re-enter it below, and this is the same
+    // mmapMutex-then-pagesMutex order mmapReserveAndMap already establishes.
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+
+    if (nativeIdentityMode() && !nativeGuestRangeAllowed(addr, mapLen)) {
+        // The exact range can never be provided at the address demanded, and
+        // MAP_FIXED_NOREPLACE forbids relocating. Report it the way Linux
+        // reports an unavailable exact range, without mapping anything and
+        // without advancing mmapNext.
+        return (U64)-K_EEXIST;
+    }
+
+    if (!rangeCompletelyUnmapped(addr, mapLen)) {
+        return (U64)-K_EEXIST;
+    }
+
+    const U64 mapped = mmapAnonymousFixed(addr, mapLen, prot);
+    if (mapped != addr) {
+        // Never fall through to a destructive placement. Surface the address
+        // space's own error when it produced one, otherwise report the range
+        // as taken.
+        return ((S64)mapped < 0) ? mapped : (U64)-K_EEXIST;
+    }
+    return addr;
+}
+
 U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
     if (length > (U64)-1 - K64_PAGE_MASK) return (U64)-K_EINVAL;
     U64 pageCount = (length + K64_PAGE_MASK) >> K64_PAGE_SHIFT;

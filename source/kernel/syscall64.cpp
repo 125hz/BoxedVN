@@ -14,12 +14,14 @@
 #include "syscall64.h"
 #include "cpu64.h"
 #include "kmemory64.h"
+#include "guest_mmap_placement.h"
 #include "krandom.h"
 #include "boxedwine_x64_hostcall.h"
 #include "kevent.h"
 #include "ksocket.h"
 #include <thread>   // std::this_thread::yield() for sched_yield
 #include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
+#include <atomic>   // bounded guest mmap placement counters
 #include "kunixsocket.h"
 #include "kpoll.h"
 #ifdef BOXEDWINE_OPENGL
@@ -626,6 +628,63 @@ static U64 sys_brk64(CPU64* cpu, U64 newBrk) {
     return newBrk;
 }
 
+// ---- Bounded guest mmap placement diagnostics -----------------------------
+// The relocation storm that drained the guest window was invisible except as
+// 161,259 identical log lines with no flags, no protection and no outcome. The
+// counters below are process-global and lock-free; the per-call lines stop
+// after a small prefix so the same build can prove the incoming contract
+// without producing a log nobody can read.
+namespace {
+
+struct GuestMmapCounters {
+    std::atomic<U64> calls {0};
+    std::atomic<U64> lowIneligibleHints {0};
+    std::atomic<U64> fixedNoReplaceRequests {0};
+    std::atomic<U64> highWindowRelocations {0};
+    std::atomic<U64> rejectedWithoutAllocating {0};
+    std::atomic<U64> highWindowFailures {0};
+};
+
+GuestMmapCounters gGuestMmapCounters;
+
+constexpr U64 kGuestMmapDetailLines = 32;
+constexpr U64 kGuestMmapSummaryEvery = 4096;
+
+const char* guestMmapPlacementName(boxedvn::GuestMmapPlacement placement) {
+    switch (placement) {
+        case boxedvn::GuestMmapPlacement::MapExact: return "map-exact";
+        case boxedvn::GuestMmapPlacement::MapExactNoReplace:
+            return "map-exact-noreplace";
+        case boxedvn::GuestMmapPlacement::RelocateHighWindow:
+            return "relocate-high-window";
+        case boxedvn::GuestMmapPlacement::FailExists: return "fail-eexist";
+        case boxedvn::GuestMmapPlacement::FailNoMemory: return "fail-enomem";
+    }
+    return "unknown";
+}
+
+void reportGuestMmapSummary(const char* reason) {
+    klog_fmt("BOXEDWINE_X64_MMAP_SUMMARY reason=%s calls=%llu "
+             "low_ineligible=%llu noreplace=%llu relocations=%llu "
+             "rejected=%llu window_failures=%llu",
+             reason,
+             (unsigned long long)gGuestMmapCounters.calls.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)gGuestMmapCounters.lowIneligibleHints.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)gGuestMmapCounters.fixedNoReplaceRequests.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)gGuestMmapCounters.highWindowRelocations.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)
+                 gGuestMmapCounters.rejectedWithoutAllocating.load(
+                     std::memory_order_relaxed),
+             (unsigned long long)gGuestMmapCounters.highWindowFailures.load(
+                 std::memory_order_relaxed));
+}
+
+} // namespace
+
 // Forward decl for the file-backed path; defined below.
 static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
                            U64 flags, U64 fd, U64 offset);
@@ -639,75 +698,130 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
                  (int)(cpu->thread ? cpu->thread->process->id : -1),
                  (unsigned long long)addr, (unsigned long long)length, (unsigned)prot);
     }
-    U64 ret;
-    bool fixed = (flags & K_MAP_FIXED) != 0;
-    if (addr != 0 && fixed) {
-        // MAP_FIXED: caller demands this exact address and expects any existing
-        // mapping there to be replaced. Native identity deliberately refuses a
-        // low PE preferred base here; Wine must retry without MAP_FIXED so the
-        // loader can relocate into the guarded host window.
-        const U64 fixedMapLen =
-            length <= UINT64_MAX - 0xFFFULL
-                ? ((length + 0xFFFULL) & ~0xFFFULL)
-                : 0;
-        if (cpu->memory->nativeIdentityMode() &&
-            !cpu->memory->nativeGuestRangeAllowed(addr & ~0xFFFULL,
-                                                  fixedMapLen)) {
-            klog_fmt("sys_mmap64: reject native fixed mapping at 0x%llx len=0x%llx; "
-                     "caller must relocate",
-                     (unsigned long long)addr, (unsigned long long)length);
-        }
-        ret = cpu->memory->mmapAnonymousFixed(addr & ~0xFFFULL, length, (U32)prot);
-    } else if (addr != 0) {
-        // addr is a HINT (no MAP_FIXED). Linux may place elsewhere if the hint
-        // is already occupied — and it MUST, because force-mapping over an
-        // existing region silently destroys whatever lived there. Wine's view
-        // manager then later MAP_FIXED-maps its own view at an address it still
-        // believes is free, finds our stray anonymous mapping, and aborts in
-        // create_view (`assert(view->protect & VPROT_SYSTEM)`, virtual.c:1578).
-        // So: take the hint only if the whole range is free; otherwise let the
-        // allocator pick a free range (kernel's prerogative for a hint).
-        //
-        // "Free" here means no ACCESSIBLE mapping — a page with any of R/W/X.
-        // Crucially it does NOT mean "no K64_PAGE_MAPPED": wine reserves huge
-        // PROT_NONE arenas (MAPPED but prot 0) and then mmaps committed pages at
-        // HINT addresses *inside* its own reservation. Treating those reserved
-        // pages as occupied would bounce the allocation to an unrelated address
-        // and desync wine's view tree (hang/abort). Only a real R/W/X mapping is
-        // a genuine conflict that forces relocation.
-        U64 alignedAddr = addr & ~0xFFFULL;
-        U64 pageStart = alignedAddr >> 12;
-        U64 pageCount = (length + 0xFFFULL) >> 12;
+    // Exhaustively assigned by the placement switch below; seeded so no
+    // compiler has to prove that for itself.
+    U64 ret = (U64)-K_EINVAL;
+    const bool fixed = (flags & K_MAP_FIXED) != 0;
+    const bool fixedNoReplace = (flags & K_MAP_FIXED_NOREPLACE) != 0;
+    const U64 alignedAddr = addr & ~0xFFFULL;
+    const U64 pageCount = (length + 0xFFFULL) >> 12;
+    const U64 mapLen = pageCount << 12;
+    const bool nativeIdentity = cpu->memory->nativeIdentityMode();
+
+    boxedvn::GuestMmapRequest request;
+    request.address = addr ? alignedAddr : 0;
+    request.length = mapLen;
+    request.protection = (U32)prot;
+    request.fixed = fixed;
+    request.fixedNoReplace = fixedNoReplace;
+    request.nativeIdentity = nativeIdentity;
+    if (addr != 0) {
+        request.exactRangeAllowed =
+            !nativeIdentity ||
+            cpu->memory->nativeGuestRangeAllowed(alignedAddr, mapLen);
+        // "Free" for an ordinary hint means no ACCESSIBLE mapping. It must NOT
+        // mean "nothing mapped": wine reserves huge PROT_NONE arenas and then
+        // mmaps committed pages at hint addresses inside its own reservation.
+        // Treating those reserved pages as occupied would bounce the mapping
+        // to an unrelated address and desync wine's view tree.
         const U32 accessible = K64_PAGE_READ | K64_PAGE_WRITE | K64_PAGE_EXEC;
+        const U64 pageStart = alignedAddr >> 12;
         bool rangeFree = true;
         for (U64 i = 0; i < pageCount; i++) {
-            if (cpu->memory->getPageFlags(pageStart + i) & accessible) { rangeFree = false; break; }
+            if (cpu->memory->getPageFlags(pageStart + i) & accessible) {
+                rangeFree = false;
+                break;
+            }
         }
-        // A non-fixed hint outside the native host window is not a reason to
-        // issue MAP_FIXED there: Linux treats it as a hint and may relocate.
-        // Let the bounded allocator choose a safe address instead.
-        const bool hintAllowed =
-            !cpu->memory->nativeIdentityMode() ||
-            cpu->memory->nativeGuestRangeAllowed(
-                alignedAddr, pageCount << 12);
-        if (rangeFree && hintAllowed) {
-            ret = cpu->memory->mmapAnonymousFixed(alignedAddr, length, (U32)prot);
-        } else {
-            if (!hintAllowed) {
-                klog_fmt("sys_mmap64: relocating native hint 0x%llx len=0x%llx "
-                         "into the guarded guest window",
-                         (unsigned long long)alignedAddr,
+        request.exactRangeFree = rangeFree;
+        // MAP_FIXED_NOREPLACE is defined against total occupancy, reservations
+        // included, so it needs the stricter question.
+        request.exactRangeUnmapped =
+            !fixedNoReplace ||
+            cpu->memory->rangeCompletelyUnmapped(alignedAddr, mapLen);
+    }
+
+    const boxedvn::GuestMmapPlacement placement =
+        boxedvn::chooseGuestMmapPlacement(request);
+
+    const U64 ordinal =
+        gGuestMmapCounters.calls.fetch_add(1, std::memory_order_relaxed);
+    if (fixedNoReplace) {
+        gGuestMmapCounters.fixedNoReplaceRequests.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    const bool lowIneligible =
+        addr != 0 && nativeIdentity && !request.exactRangeAllowed;
+    if (lowIneligible) {
+        gGuestMmapCounters.lowIneligibleHints.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+
+    switch (placement) {
+        case boxedvn::GuestMmapPlacement::MapExact:
+            if (fixed && nativeIdentity && !request.exactRangeAllowed) {
+                // MAP_FIXED outside the window stays a hard refusal in
+                // KMemory64; the caller must retry without MAP_FIXED so the
+                // loader can relocate into the guarded host window.
+                klog_fmt("sys_mmap64: reject native fixed mapping at 0x%llx "
+                         "len=0x%llx; caller must relocate",
+                         (unsigned long long)addr,
                          (unsigned long long)length);
             }
+            ret = cpu->memory->mmapAnonymousFixed(alignedAddr, length,
+                                                  (U32)prot);
+            break;
+        case boxedvn::GuestMmapPlacement::MapExactNoReplace:
+            ret = cpu->memory->mmapAnonymousNoReplace(alignedAddr, mapLen,
+                                                      (U32)prot);
+            if ((S64)ret < 0) {
+                gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            break;
+        case boxedvn::GuestMmapPlacement::RelocateHighWindow:
+            if (lowIneligible) {
+                gGuestMmapCounters.highWindowRelocations.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             ret = cpu->memory->mmapReserveAndMap(length, (U32)prot);
-        }
-    } else {
-        // addr == 0: atomically reserve+map a free range. mmapReserveAndMap holds
-        // the process mmap lock across the gap scan AND the map, so two sibling
-        // threads can't be handed the same address (the old allocMmapRange-then-
-        // map split was a TOCTOU race → guest-heap corruption in wineserver
-        // during the MT boot storm).
-        ret = cpu->memory->mmapReserveAndMap(length, (U32)prot);
+            if ((S64)ret < 0) {
+                gGuestMmapCounters.highWindowFailures.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            break;
+        case boxedvn::GuestMmapPlacement::FailExists:
+            gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
+                1, std::memory_order_relaxed);
+            ret = (U64)-K_EEXIST;
+            break;
+        case boxedvn::GuestMmapPlacement::FailNoMemory:
+            gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
+                1, std::memory_order_relaxed);
+            ret = (U64)-K_ENOMEM;
+            break;
+    }
+
+    if (ordinal < kGuestMmapDetailLines ||
+        (lowIneligible && ordinal < kGuestMmapDetailLines * 4)) {
+        klog_fmt("BOXEDWINE_X64_MMAP ordinal=%llu pid=%d tid=%d addr=0x%llx "
+                 "len=0x%llx prot=0x%x flags=0x%llx fd=%lld off=0x%llx "
+                 "fixed=%d noreplace=%d native=%d allowed=%d free=%d "
+                 "unmapped=%d placement=%s ret=0x%llx",
+                 (unsigned long long)ordinal,
+                 (int)(cpu->thread ? cpu->thread->process->id : -1),
+                 (int)(cpu->thread ? cpu->thread->id : -1),
+                 (unsigned long long)addr, (unsigned long long)length,
+                 (unsigned)prot, (unsigned long long)flags, (long long)(S64)fd,
+                 (unsigned long long)offset, fixed ? 1 : 0,
+                 fixedNoReplace ? 1 : 0, nativeIdentity ? 1 : 0,
+                 request.exactRangeAllowed ? 1 : 0,
+                 request.exactRangeFree ? 1 : 0,
+                 request.exactRangeUnmapped ? 1 : 0,
+                 guestMmapPlacementName(placement),
+                 (unsigned long long)ret);
+    } else if ((ordinal % kGuestMmapSummaryEvery) == 0) {
+        reportGuestMmapSummary("periodic");
     }
     if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
         klog_fmt("MMAP [pid=%d] BIG anon exit  -> 0x%llx",
@@ -1386,6 +1500,7 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     const U64 requestedAddress = addr;
     bool reserved = false;
     const bool fixed = (flags & K_MAP_FIXED) != 0;
+    const bool fixedNoReplace = (flags & K_MAP_FIXED_NOREPLACE) != 0;
     const U32 loadProt = (U32)prot | 0x3u;
     if (length == 0 || addr > UINT64_MAX - length) {
         return (U64)-K_EINVAL;
@@ -1394,17 +1509,41 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     // when MAP_FIXED is absent, but cannot be used as host identity addresses
     // on iOS. Relocate those hints through the same bounded allocator used by
     // anonymous mappings; an explicit MAP_FIXED remains a hard failure in
-    // KMemory64 rather than risking host VA destruction.
-    if (addr != 0 && !fixed && cpu->memory->nativeIdentityMode()) {
+    // KMemory64 rather than risking host VA destruction. MAP_FIXED_NOREPLACE
+    // is neither: it demands this exact address and forbids both relocating
+    // and replacing, so an unusable or occupied range is EEXIST.
+    if (addr != 0 && cpu->memory->nativeIdentityMode()) {
         const U64 hintAligned = addr & ~0xFFFULL;
         const U64 hintOffset = addr - hintAligned;
         if (length > UINT64_MAX - hintOffset - 0xFFFULL) {
             return (U64)-K_EINVAL;
         }
         const U64 hintMapLen = (length + hintOffset + 0xFFFULL) & ~0xFFFULL;
-        if (!cpu->memory->nativeGuestRangeAllowed(hintAligned, hintMapLen)) {
+        const bool hintAllowed =
+            cpu->memory->nativeGuestRangeAllowed(hintAligned, hintMapLen);
+        if (fixedNoReplace) {
+            if (!hintAllowed ||
+                !cpu->memory->rangeCompletelyUnmapped(hintAligned,
+                                                      hintMapLen)) {
+                gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
+                    1, std::memory_order_relaxed);
+                klog_fmt("sys_mmap64_file: refuse no-replace mapping at "
+                         "0x%llx len=0x%llx allowed=%d",
+                         (unsigned long long)hintAligned,
+                         (unsigned long long)hintMapLen, hintAllowed ? 1 : 0);
+                return (U64)-K_EEXIST;
+            }
+        } else if (!fixed && !hintAllowed) {
+            gGuestMmapCounters.lowIneligibleHints.fetch_add(
+                1, std::memory_order_relaxed);
+            gGuestMmapCounters.highWindowRelocations.fetch_add(
+                1, std::memory_order_relaxed);
             addr = cpu->memory->mmapReserveAndMap(length, loadProt);
-            if ((S64)addr < 0) return addr;
+            if ((S64)addr < 0) {
+                gGuestMmapCounters.highWindowFailures.fetch_add(
+                    1, std::memory_order_relaxed);
+                return addr;
+            }
             reserved = true;
             klog_fmt("sys_mmap64_file: relocated native hint to 0x%llx",
                      (unsigned long long)addr);

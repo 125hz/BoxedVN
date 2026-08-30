@@ -669,6 +669,136 @@ def main() -> None:
         "VIXL unencodable add/sub regression",
     )
 
+    # ------------------------------------------------------------------ #
+    # Guest mmap placement. Wine's low reservation walk produced 53,753    #
+    # high-window relocations per launch because only MAP_FIXED was        #
+    # recognised; the window a direct guest can execute from is bounded.   #
+    # ------------------------------------------------------------------ #
+    placement_header = read(repository / "include/guest_mmap_placement.h")
+    syscall64 = read(repository / "source/kernel/syscall64.cpp")
+    kmemory64_header = read(repository / "include/kmemory64.h")
+    kmemory64 = read(repository / "source/kernel/kmemory64.cpp")
+    process_header = read(repository / "include/kprocess.h")
+
+    if "#define K_MAP_FIXED_NOREPLACE 0x100000" not in process_header:
+        raise SystemExit(
+            "MAP_FIXED_NOREPLACE must keep the Linux flag value the guest sends"
+        )
+
+    require_ordered(
+        placement_header,
+        [
+            "enum class GuestMmapPlacement",
+            "MapExactNoReplace",
+            "RelocateHighWindow",
+            "FailExists",
+            "FailNoMemory",
+            "chooseGuestMmapPlacement(",
+            "if (request.fixedNoReplace) {",
+            "if (!request.exactRangeUnmapped) {",
+            "return GuestMmapPlacement::FailExists;",
+            "if (request.nativeIdentity && !request.exactRangeAllowed) {",
+            "return GuestMmapPlacement::FailExists;",
+            "return GuestMmapPlacement::MapExactNoReplace;",
+            "if (request.fixed) {",
+            "request.protection == 0",
+            "return GuestMmapPlacement::FailNoMemory;",
+        ],
+        "BoxedVN guest mmap placement policy",
+    )
+
+    # The address space owns the atomic no-replace operation; the syscall layer
+    # must not open-code a check-then-MAP_FIXED sequence.
+    require_ordered(
+        kmemory64_header,
+        [
+            "U64 mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot);",
+            "bool rangeCompletelyUnmapped(U64 addr, U64 len) const;",
+        ],
+        "BoxedVN no-replace address-space API",
+    )
+    require_ordered(
+        kmemory64,
+        [
+            "bool KMemory64::rangeCompletelyUnmapped(",
+            "flags & K64_PAGE_MAPPED",
+            "U64 KMemory64::mmapAnonymousNoReplace(",
+            "BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);",
+            "nativeIdentityMode() && !nativeGuestRangeAllowed(addr, mapLen)",
+            "return (U64)-K_EEXIST;",
+            "if (!rangeCompletelyUnmapped(addr, mapLen)) {",
+            "return (U64)-K_EEXIST;",
+            "mmapAnonymousFixed(addr, mapLen, prot);",
+        ],
+        "BoxedVN atomic no-replace mapping",
+    )
+    noreplace_start = kmemory64.index("U64 KMemory64::mmapAnonymousNoReplace(")
+    noreplace_end = kmemory64.index(chr(10) + "}" + chr(10), noreplace_start)
+    noreplace_body = kmemory64[noreplace_start:noreplace_end]
+    if "mmapReserveAndMap(" in noreplace_body:
+        raise SystemExit(
+            "a no-replace mapping must never fall through to the relocating "
+            "allocator"
+        )
+
+    # Both syscall paths route through the policy and account for what they do.
+    require_ordered(
+        syscall64,
+        [
+            '#include "guest_mmap_placement.h"',
+            "struct GuestMmapCounters {",
+            "lowIneligibleHints",
+            "fixedNoReplaceRequests",
+            "highWindowRelocations",
+            "rejectedWithoutAllocating",
+            "highWindowFailures",
+            "BOXEDWINE_X64_MMAP_SUMMARY",
+            "static U64 sys_mmap64(",
+            "const bool fixedNoReplace = (flags & K_MAP_FIXED_NOREPLACE) != 0;",
+            "boxedvn::chooseGuestMmapPlacement(request);",
+            "case boxedvn::GuestMmapPlacement::MapExactNoReplace:",
+            "cpu->memory->mmapAnonymousNoReplace(",
+            "case boxedvn::GuestMmapPlacement::FailExists:",
+            "ret = (U64)-K_EEXIST;",
+            "case boxedvn::GuestMmapPlacement::FailNoMemory:",
+            "ret = (U64)-K_ENOMEM;",
+            "BOXEDWINE_X64_MMAP ordinal=",
+        ],
+        "BoxedVN anonymous mmap placement routing",
+    )
+    require_ordered(
+        syscall64,
+        [
+            "static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, "
+            "U64 prot,",
+            "const bool fixedNoReplace = (flags & K_MAP_FIXED_NOREPLACE) != 0;",
+            "if (fixedNoReplace) {",
+            "cpu->memory->rangeCompletelyUnmapped(",
+            "return (U64)-K_EEXIST;",
+            "} else if (!fixed && !hintAllowed) {",
+            "mmapReserveAndMap(length, loadProt);",
+        ],
+        "BoxedVN file-backed mmap no-replace distinction",
+    )
+
+    # The enriched fault report must name the guest registers the effective
+    # address is built from, so a zero base is distinguishable from a bad
+    # lowering without another build.
+    require_ordered(
+        adapter,
+        [
+            "BOXEDWINE_FEX64_HOST_FAULT_CONTAINED",
+            "BOXEDWINE_FEX64_FAULT_STATE",
+            "REG_RAX",
+            "REG_RSP",
+            "REG_R12",
+            "fs_cached",
+            "gs_cached",
+            "BOXEDWINE_FEX64_FAULT_HOSTREGS",
+        ],
+        "BoxedVN contained-fault guest state report",
+    )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 
