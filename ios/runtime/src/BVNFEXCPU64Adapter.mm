@@ -47,6 +47,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
 #include "kprocess.h"
 #include "kthread.h"
 #include "syscall64.h"
+#include "wine_nt_syscall_memory.h"
 
 #include <algorithm>
 #include <array>
@@ -866,6 +867,60 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     cpu->reg[X64_R10].setU64(arguments[4]);
     cpu->reg[X64_R8].setU64(arguments[5]);
     cpu->reg[X64_R9].setU64(arguments[6]);
+
+    // Wine's PE ntdll reaches its Unix side through per-service thunks that
+    // fall into a raw SYSCALL while KUSER_SHARED_DATA's SystemCall flag is
+    // clear. RAX then holds a Windows NT ordinal, not a Linux syscall number,
+    // and handing it to ksyscall64 answers the wrong question: the device log
+    // shows NT 227 returning -ENOSYS to a caller that retried it 3,215,735
+    // times. The interpreter already recognised these thunks; the FEX path
+    // never did, and FEX is what actually executes x86-64 here.
+    //
+    // Recognition is the shared byte-and-control-flow matcher, so both
+    // backends agree on what a thunk is.
+    boxedvn::WineNtSyscallStub ntStub;
+    if (boxedvn::matchWineNtSyscallStubInGuest(
+            cpu->memory, cpu->rip, arguments[0], ntStub)) {
+        boxedvn::setWineNtSystemCallFlag(cpu->memory);
+        // FEX has already applied SYSCALL's architectural clobber: it stored
+        // the post-instruction RIP into RCX before calling this handler.
+        // Wine's indirect path is a call and performs no such clobber, and its
+        // dispatcher still expects the NT call's first argument in RCX -- the
+        // thunk's own `mov r10, rcx` is what preserved it, and arguments[4]
+        // is that R10.
+        cpu->reg[X64_RCX].setU64(arguments[4]);
+        cpu->reg[X64_R11].setU64(cpu->rflags);
+        // The dispatcher reads the NT ordinal from RAX.
+        cpu->reg[X64_RAX].setU64(ntStub.ntOrdinal);
+        cpu->syscallRip = ntStub.syscallAddress;
+        cpu->rip = ntStub.indirectPath;
+        cpu->yield = false;
+        cpu->reExecuteSyscall = false;
+        boxedvn::reportWineNtSyscallRedirect(
+            ntStub, (uint32_t)adapter->process->id,
+            (uint32_t)adapter->thread->id, "fex");
+        if (!BVNFEXCPU64AdapterSyncToFEX(adapter, framePointer)) {
+            adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
+            return static_cast<uint64_t>(-K_EFAULT);
+        }
+        // A changed frame RIP is NOT honoured by simply returning here. In the
+        // pinned FEX, DEFAULT_SYSCALL_FLAGS omits FLAGS_BLOCK_END off Windows
+        // (FEXCore/Source/Interface/Core/X86Tables/X86Tables.h), so SyscallOp
+        // never emits the `ExitFunction(_LoadContextGPR(rip))` that would pick
+        // the new RIP up -- the block just continues into the byte after the
+        // SYSCALL. Yield is the contract that does honour it: BoxedWineSyscalls
+        // ::HandleSyscall longjmps out of ExecuteThread on that action, and the
+        // run loop's next iteration re-enters FEX after syncing cpu->rip back
+        // into the frame. cpu->yield stays false, so the CPU64 scheduler
+        // re-dispatches this thread immediately rather than parking it.
+        //
+        // The cost is one FEX exit and re-entry, and it is paid roughly once
+        // per process: the SystemCall flag written above means every later
+        // thunk branches to its indirect path without trapping at all.
+        adapter->lastAction = BVNFEXCPU64AdapterActionYield;
+        return ntStub.ntOrdinal;
+    }
+
     // FEX invokes the handler with RIP at the SYSCALL instruction. Mirror the
     // architectural side effects that CPU64's interpreter performs before
     // entering ksyscall64: RCX receives the post-instruction RIP and R11 gets

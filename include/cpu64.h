@@ -12,6 +12,7 @@
 
 #ifdef BOXEDWINE_GUEST_X64
 
+#include "bounded_syscall_report.h"
 #include "reg64.h"
 #include <memory>
 #include "../source/emulation/cpu/common/fpu.h"
@@ -170,6 +171,14 @@ public:
     // RIP is advanced so reExecuteSyscall can rewind to it.
     U64  syscallRip = 0;
     U64  instructionCount = 0;
+
+    // Bounds the diagnostics an unsupported syscall may produce. One CPU64
+    // exists per guest thread, so this needs no locking, and its storage is a
+    // fixed-size table rather than a map keyed on guest-controlled values.
+    // A single retry loop on one unsupported syscall wrote 408 MB across
+    // 3,215,735 identical lines; the first sighting of a key is still
+    // reported in full, and everything after it is bounded.
+    boxedvn::BoundedSyscallReportLimiter unsupportedSyscallReports;
 
     void run();
     // Run up to maxInsn instructions or until yield / decode failure.

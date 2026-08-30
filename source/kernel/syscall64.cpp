@@ -4531,22 +4531,55 @@ void ksyscall64(CPU64* cpu) {
             // — appearing as a repeating "unimplemented syscall #74" near a hang.
             ret = 0;
             break;
-        default:
-            klog_fmt("ksyscall64: unimplemented syscall #%llu (%s) at RIP=0x%llx — RDI=0x%llx RSI=0x%llx RDX=0x%llx R10=0x%llx R8=0x%llx R9=0x%llx",
-                     (unsigned long long)nr,
-                     x64SyscallName(nr),
-                     (unsigned long long)cpu->rip,
-                     (unsigned long long)a1,
-                     (unsigned long long)a2,
-                     (unsigned long long)a3,
-                     (unsigned long long)a4,
-                     (unsigned long long)a5,
-                     (unsigned long long)a6);
-            // TEMP DIAGNOSTIC: dump the bytes around the syscall RIP and the
-            // full register set so we can tell a real Linux syscall from a
-            // wine __wine_unix_call / NT thunk landing here. syscallRip points
-            // at the 0F 05 instruction.
-            if (getenv("BW64_SCDUMP")) {
+        default: {
+            // A guest that retries an unsupported syscall does so at machine
+            // speed: one such loop wrote 408 MB across 3,215,735 identical
+            // lines and buried the evidence that would have explained it.
+            // Report the first sighting of each process/thread/number/RIP in
+            // full, a few early repeats and then powers of two, and go quiet
+            // after saying so. A different number or a different RIP is a
+            // different key and still gets its own first-fault report. The
+            // return value below is unchanged: this bounds the diagnostics,
+            // not the semantics.
+            const boxedvn::BoundedSyscallReportLimiter::Outcome unsupported =
+                cpu->unsupportedSyscallReports.record(
+                    cpu->thread && cpu->thread->process
+                        ? (U64)cpu->thread->process->id : 0,
+                    cpu->thread ? (U64)cpu->thread->id : 0,
+                    (U64)nr, (U64)cpu->syscallRip);
+            using UnsupportedDecision =
+                boxedvn::BoundedSyscallReportLimiter::Decision;
+            if (unsupported.decision == UnsupportedDecision::Detailed) {
+                klog_fmt("ksyscall64: unimplemented syscall #%llu (%s) at RIP=0x%llx — RDI=0x%llx RSI=0x%llx RDX=0x%llx R10=0x%llx R8=0x%llx R9=0x%llx",
+                         (unsigned long long)nr,
+                         x64SyscallName(nr),
+                         (unsigned long long)cpu->rip,
+                         (unsigned long long)a1,
+                         (unsigned long long)a2,
+                         (unsigned long long)a3,
+                         (unsigned long long)a4,
+                         (unsigned long long)a5,
+                         (unsigned long long)a6);
+            } else if (unsupported.decision == UnsupportedDecision::Repeat) {
+                klog_fmt("ksyscall64: unimplemented syscall #%llu (%s) at RIP=0x%llx — seen %llu times",
+                         (unsigned long long)nr,
+                         x64SyscallName(nr),
+                         (unsigned long long)cpu->rip,
+                         (unsigned long long)unsupported.occurrences);
+            } else if (unsupported.decision == UnsupportedDecision::Suppress) {
+                klog_fmt("ksyscall64: unimplemented syscall #%llu (%s) at RIP=0x%llx — seen %llu times; further reports for this syscall are suppressed",
+                         (unsigned long long)nr,
+                         x64SyscallName(nr),
+                         (unsigned long long)cpu->rip,
+                         (unsigned long long)unsupported.occurrences);
+            }
+            // Dump the bytes around the syscall RIP and the full register set
+            // so a real Linux syscall can be told apart from a wine NT thunk
+            // landing here. syscallRip points at the 0F 05 instruction. Bound
+            // it with the same decision: this is the most verbose part of the
+            // report and must not run millions of times either.
+            if (unsupported.decision == UnsupportedDecision::Detailed &&
+                getenv("BW64_SCDUMP")) {
                 U64 r = cpu->syscallRip;
                 U8 b[16];
                 for (int i = 0; i < 16; i++) b[i] = cpu->memory->readb(r - 6 + i);
@@ -4564,6 +4597,7 @@ void ksyscall64(CPU64* cpu) {
             }
             ret = (U64)-K_ENOSYS;
             break;
+        }
     }
 
     // execve (and any future blocking/restart paths) return -K_CONTINUE to mean

@@ -32,6 +32,8 @@ add_executable(boxedvn_tests
     test_exec_transition.cpp
     test_x64_runtime_dir.cpp
     test_guest_wine_prefix.cpp
+    test_wine_nt_syscall_stub.cpp
+    test_bounded_syscall_report.cpp
     test_boot_diagnostics.cpp
     test_pixmap_formats.cpp
     test_getrusage_fairness.cpp

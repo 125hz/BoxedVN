@@ -1749,6 +1749,200 @@ def main() -> None:
             "Windows path"
         )
 
+    # ------------------------------------------------------------------ #
+    # Wine's PE ntdll reaches its Unix side through per-service thunks that   #
+    # fall into a raw SYSCALL while KUSER_SHARED_DATA's SystemCall flag is    #
+    # clear. RAX then holds a Windows NT ordinal, not a Linux syscall         #
+    # number. The interpreter recognised these; FEX, which is what actually   #
+    # runs x86-64, did not, and NT 227 returned -ENOSYS to a caller that      #
+    # retried it 3,215,735 times.                                            #
+    # ------------------------------------------------------------------ #
+    nt_stub_header = read(repository / "include/wine_nt_syscall_stub.h")
+    require_ordered(
+        nt_stub_header,
+        [
+            "#define K_WINE_KUSER_SYSTEM_CALL_FLAG 0x7ffe0308ULL",
+            "#define K_WINE_KUSER_SYSCALL_DISPATCHER 0x7ffe1000ULL",
+            "inline bool matchWineNtSyscallStub(",
+            "if ((rax >> 32) != 0) {",
+            "at(-18) != 0x4C || at(-17) != 0x8B || at(-16) != 0xD1",
+            "at(-15) != 0xB8",
+            "ordinal != (uint32_t)rax",
+            "at(-10) != 0xF6 || at(-9) != 0x04 || at(-8) != 0x25",
+            "(uint64_t)dword(-7) != K_WINE_KUSER_SYSTEM_CALL_FLAG",
+            "at(-2) != 0x75",
+            "at(0) != 0x0F || at(1) != 0x05",
+            "at(3) != 0xFF || at(4) != 0x14 || at(5) != 0x25",
+            "(uint64_t)dword(6) != K_WINE_KUSER_SYSCALL_DISPATCHER",
+            "branchTarget != syscallAddress + 3",
+            "dispatcher == 0 || dispatcher == ~(uint64_t)0",
+        ],
+        "BoxedVN Wine NT stub recognition contract",
+    )
+    # Recognition must be by instruction shape. An address range is what broke
+    # last time: ntdll moved and the check silently stopped matching. Comments
+    # may still recount that history; code may not act on it.
+    def code_lines(text):
+        for line in text.split(newline):
+            stripped = line.strip()
+            if stripped.startswith("//") or stripped.startswith("*") or                     stripped.startswith("#"):
+                continue
+            yield stripped
+
+    for line in code_lines(nt_stub_header):
+        for banned in ("0x170000000", "0x170400000"):
+            if banned in line:
+                raise SystemExit(
+                    "the Wine NT stub matcher must not depend on where ntdll "
+                    "is mapped: " + line
+                )
+
+    nt_memory_header = read(repository / "include/wine_nt_syscall_memory.h")
+    require_ordered(
+        nt_memory_header,
+        [
+            '#include "wine_nt_syscall_stub.h"',
+            "inline bool readGuestBytesForNtStub(",
+            "if (!memory->isPageMapped(page)) {",
+            "inline bool matchWineNtSyscallStubInGuest(",
+            "inline void setWineNtSystemCallFlag(",
+            "inline void reportWineNtSyscallRedirect(",
+            "BOXEDWINE_X64_NT_REDIRECT pid=%u tid=%u nt=%u stub=0x%llx ",
+        ],
+        "BoxedVN Wine NT stub guest binding",
+    )
+
+    # Both CPU backends must reach the same recognition, or they will disagree
+    # about what a thunk is.
+    interpreter = read(repository / "source/emulation/cpu/cpu64.cpp")
+    adapter = read(repository / "ios/runtime/src/BVNFEXCPU64Adapter.mm")
+    for name, source in (("interpreter", interpreter), ("FEX adapter", adapter)):
+        for required in ('#include "wine_nt_syscall_memory.h"',
+                         "boxedvn::matchWineNtSyscallStubInGuest(",
+                         "boxedvn::setWineNtSystemCallFlag(",
+                         "boxedvn::reportWineNtSyscallRedirect("):
+            if required not in source:
+                raise SystemExit(
+                    "the " + name + " must use the shared Wine NT stub "
+                    "recognition: " + required
+                )
+    # The obsolete image-base gate is what stopped the interpreter matching
+    # this Wine at all.
+    for line in code_lines(interpreter):
+        for banned in ("0x170000000", "0x170400000"):
+            if banned in line:
+                raise SystemExit(
+                    "the interpreter must not gate the NT redirect on an "
+                    "ntdll address range: " + line
+                )
+
+    # The redirect has to happen before the Linux dispatcher sees the ordinal.
+    handler_start = adapter.index(
+        "extern " + chr(34) + "C" + chr(34) +
+        " uint64_t BVNFEXCPU64AdapterHandleSyscall(")
+    handler = adapter[handler_start:]
+    match_at = handler.index("boxedvn::matchWineNtSyscallStubInGuest(")
+    ksyscall_at = handler.index("ksyscall64(cpu);")
+    if match_at > ksyscall_at:
+        raise SystemExit(
+            "the FEX adapter must recognise a Wine NT thunk before calling "
+            "ksyscall64"
+        )
+    redirect = handler[match_at:ksyscall_at]
+    for required in (
+        # RAX carries the NT ordinal into Wine's dispatcher.
+        "cpu->reg[X64_RAX].setU64(ntStub.ntOrdinal);",
+        # The indirect path is a call, so RCX keeps the NT call's first
+        # argument, which the thunk's own `mov r10, rcx` preserved.
+        "cpu->reg[X64_RCX].setU64(arguments[4]);",
+        # Resume on the validated indirect path, not on a guessed offset.
+        "cpu->rip = ntStub.indirectPath;",
+        "BVNFEXCPU64AdapterSyncToFEX(adapter, framePointer)",
+        "adapter->lastAction = BVNFEXCPU64AdapterActionYield;",
+        "return ntStub.ntOrdinal;",
+    ):
+        if required not in redirect:
+            raise SystemExit(
+                "the FEX NT redirect is incomplete: " + required
+            )
+
+    # Why Yield rather than a bare RIP change: in the pinned FEX, SYSCALL is
+    # not a block-ending instruction off Windows, so SyscallOp never reloads
+    # RIP from the state and a changed frame RIP would simply be ignored. If a
+    # future pin changes that, this redirect should be revisited rather than
+    # silently keeping the more expensive exit.
+    fex_tables = read(fex / "FEXCore/Source/Interface/Core/X86Tables/X86Tables.h")
+    expected_flags = (
+        "#ifndef _WIN32" + newline +
+        "  constexpr uint32_t DEFAULT_SYSCALL_FLAGS = FLAGS_NO_OVERLAY;"
+    )
+    if expected_flags not in fex_tables:
+        raise SystemExit(
+            "the pinned FEX no longer omits FLAGS_BLOCK_END from SYSCALL off "
+            "Windows; the Wine NT redirect's use of a Yield re-entry must be "
+            "re-checked against the new block-exit behaviour"
+        )
+    fex_dispatcher = read(
+        fex / "FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp")
+    require_ordered(
+        fex_dispatcher,
+        [
+            "void OpDispatchBuilder::SyscallOp(",
+            "StoreGPRRegister(X86State::REG_RAX, SyscallOp);",
+            "if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END) {",
+        ],
+        "pinned FEX syscall block-exit contract",
+    )
+
+    # Unsupported-syscall diagnostics must be bounded independently of the
+    # semantic fix above.
+    limiter_header = read(repository / "include/bounded_syscall_report.h")
+    require_ordered(
+        limiter_header,
+        [
+            "class BoundedSyscallReportLimiter {",
+            "static constexpr unsigned kSlots =",
+            "static constexpr unsigned kReportsPerKey =",
+            "static constexpr unsigned kTotalReports =",
+            "Outcome record(",
+            "Slot slots_[kSlots]",
+        ],
+        "BoxedVN bounded syscall report contract",
+    )
+    # A fixed-size table, not a map keyed on guest-controlled values.
+    for banned in ("std::map", "std::unordered_map", "std::vector"):
+        if banned in limiter_header:
+            raise SystemExit(
+                "the unsupported-syscall limiter must use bounded storage, "
+                "not " + banned
+            )
+
+    syscall_dispatch = read(repository / "source/kernel/syscall64.cpp")
+    require_ordered(
+        syscall_dispatch,
+        [
+            "cpu->unsupportedSyscallReports.record(",
+            "UnsupportedDecision::Detailed",
+            "UnsupportedDecision::Repeat",
+            "UnsupportedDecision::Suppress",
+            "further reports for this syscall are suppressed",
+            "unsupported.decision == UnsupportedDecision::Detailed &&",
+            'getenv("BW64_SCDUMP")',
+            "ret = (U64)-K_ENOSYS;",
+        ],
+        "BoxedVN unsupported syscall reporting bound",
+    )
+    # The register dump is the most verbose part of the report and has to be
+    # inside the same bound, not merely behind the environment variable.
+    scdump_at = syscall_dispatch.index(
+        "unsupported.decision == UnsupportedDecision::Detailed &&" + newline)
+    scdump_tail = syscall_dispatch[scdump_at:scdump_at + 400]
+    if 'getenv("BW64_SCDUMP")' not in scdump_tail:
+        raise SystemExit(
+            "BW64_SCDUMP must be gated by the report limiter as well as by "
+            "its environment variable"
+        )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 
