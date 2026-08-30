@@ -267,6 +267,10 @@ verify_or_report "${WINE_ARCHIVE}" wine_sha256
 # by run_wine64.sh's -root/-zip launch sequence.
 check_zip_path "${GLIBC_ARCHIVE}" lib64/ld-linux-x86-64.so.2
 check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libc.so.6
+# Wine puts its server socket directory in the modelled user's XDG runtime
+# directory. The rootfs has to ship it; BoxedWine's permission policy is what
+# makes it writable, because ZIP entries carry no Unix mode.
+check_zip_path "${GLIBC_ARCHIVE}" run/user/1000
 check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wine64
 check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver64
 check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver

@@ -98,6 +98,8 @@ class WineserverArchiveValidation(unittest.TestCase):
         with zipfile.ZipFile(glibc, "w") as archive:
             archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
             archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
+            # Wine's server needs the modelled user's XDG runtime directory.
+            archive.writestr("run/user/1000/", b"")
         with zipfile.ZipFile(wine, "w") as archive:
             archive.writestr("usr/lib/wine/wine64", elf(body=b"wine64"))
             archive.writestr("usr/lib/wine/wineserver64", server)
@@ -174,6 +176,7 @@ class WineserverArchiveValidation(unittest.TestCase):
             with zipfile.ZipFile(glibc, "w") as archive:
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
+                archive.writestr("run/user/1000/", b"")
             with zipfile.ZipFile(wine, "w") as archive:
                 archive.writestr("usr/lib/wine/wine64", elf())
                 archive.writestr("usr/lib/wine/wineserver64", server)
@@ -186,6 +189,46 @@ class WineserverArchiveValidation(unittest.TestCase):
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0)
             self.assertIn("usr/lib/wine/wineserver", output)
+
+
+    def test_a_missing_guest_runtime_directory_is_rejected(self) -> None:
+        # Wine chooses /run/user/1000 for its server socket directory. If the
+        # rootfs does not ship it, wineserver cannot start.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc = directory / "glibc-rootfs64.zip"
+            wine = directory / "wine64.zip"
+            with zipfile.ZipFile(glibc, "w") as archive:
+                archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
+                archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
+            with zipfile.ZipFile(wine, "w") as archive:
+                archive.writestr("usr/lib/wine/wine64", elf())
+                archive.writestr("usr/lib/wine/wineserver64", server)
+                archive.writestr("usr/lib/wine/wineserver", server)
+                archive.writestr(
+                    "usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winemetal.so",
+                    elf())
+                archive.writestr(
+                    "usr/lib/x86_64-linux-gnu/wine/x86_64-windows/ntdll.dll",
+                    b"MZ")
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0)
+            self.assertIn("run/user/1000", output)
+
+
+class GuestRuntimeDirectoryStaging(unittest.TestCase):
+    """The builder has to stage the runtime directory into the rootfs layer."""
+
+    def test_builder_stages_the_guest_runtime_directory(self) -> None:
+        builder = BUILDER.read_text(encoding="utf-8")
+        self.assertIn('"${STAGE}/run/user/1000"', builder)
+        # It has to land in the rootfs archive, not the Wine archive.
+        rootfs_line = [line for line in builder.splitlines()
+                       if "glibc-rootfs64.zip" in line and "zip -qry9" in line]
+        self.assertTrue(rootfs_line, "rootfs archive command not found")
+        index = builder.index(rootfs_line[0])
+        self.assertIn(" run ", builder[index:index + 200])
 
 
 if __name__ == "__main__":

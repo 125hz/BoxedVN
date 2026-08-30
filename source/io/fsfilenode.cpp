@@ -17,6 +17,9 @@
  */
 
 #include "boxedwine.h"
+#include "x64_runtime_dir.h"
+
+#include <atomic>
 
 #include <stdio.h>
 #include <fcntl.h>
@@ -456,16 +459,40 @@ U32 FsFileNode::getMode() {
     }
     bool isAutomationFilesPath = this->path == "/files" ||
         this->path.startsWith("/files/");
+    // The 64-bit guest models exactly UID/GID 1000, and Wine's server puts
+    // its socket directory in that user's XDG runtime directory. The rootfs
+    // ships /run/user/1000, but FsZip builds plain file nodes and drops the
+    // archive entry's Unix mode, so the directory arrived read-only and
+    // wineserver died on `mkdir /run/user/1000/wine: Permission denied`.
+    // Present the private 0700 the runtime directory is defined to have.
+    // /run and /run/user stay read-only, and no other /run/user/<uid> is
+    // affected.
+    bool isUserRuntimePath = boxedvn::isX64UserRuntimePath(this->path.c_str());
     if (KThread::currentThread()->process->userId == 0 ||
         this->path.startsWith("/tmp") ||
         this->path.startsWith("/var") ||
         this->path.startsWith("/home") ||
         isAutomationFilesPath ||
+        isUserRuntimePath ||
         isMountedHostPath) {
         result |= K__S_IWRITE;
         // wine server needs to be private, but winetricks check "-w" in the script on /tmp which needs these 2
-        if (!this->path.startsWith("/tmp/.wine")) {
+        if (!this->path.startsWith("/tmp/.wine") && !isUserRuntimePath) {
             result |= K__S_IWGRP | K__S_IWOTH;
+        }
+    }
+    if (isUserRuntimePath && this->path == K_X64_USER_RUNTIME_DIR) {
+        // Bounded: one line the first time the runtime directory is
+        // consulted, so a device log shows it is present and private
+        // rather than leaving that to be inferred from the absence of a
+        // failure.
+        static std::atomic<bool> reported {false};
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+            klog_fmt("BOXEDWINE_X64_RUNTIME_DIR path=%s mode=0%o writable=%d "
+                     "uid=%u gid=%u",
+                     K_X64_USER_RUNTIME_DIR, result & 0777,
+                     (result & K__S_IWRITE) ? 1 : 0,
+                     (U32)K_X64_MODELLED_UID, (U32)K_X64_MODELLED_GID);
         }
     }
     return result;

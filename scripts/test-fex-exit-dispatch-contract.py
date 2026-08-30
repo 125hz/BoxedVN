@@ -1580,6 +1580,61 @@ def main() -> None:
         "BoxedVN wineserver archive validation",
     )
 
+    # ------------------------------------------------------------------ #
+    # Wine's server puts its socket directory in the modelled user's XDG      #
+    # runtime directory. ZIP entries carry no Unix mode, so the directory     #
+    # arrived read-only and wineserver died on mkdir. The write exception     #
+    # must stay exactly that one subtree.                                     #
+    # ------------------------------------------------------------------ #
+    runtime_dir_header = read(repository / "include/x64_runtime_dir.h")
+    fsfilenode = read(repository / "source/io/fsfilenode.cpp")
+    require_ordered(
+        runtime_dir_header,
+        [
+            '#define K_X64_MODELLED_UID 1000',
+            '#define K_X64_USER_RUNTIME_DIR "/run/user/1000"',
+            '#define K_X64_USER_RUNTIME_DIR_MODE 0700',
+            'inline bool isX64UserRuntimePath(',
+            "return path[index] == 0 || path[index] == '/';",
+        ],
+        "BoxedVN guest runtime directory contract",
+    )
+    require_ordered(
+        fsfilenode,
+        [
+            '#include "x64_runtime_dir.h"',
+            'U32 FsFileNode::getMode() {',
+            'bool isUserRuntimePath = boxedvn::isX64UserRuntimePath(this->path.c_str());',
+            'isUserRuntimePath ||',
+            'result |= K__S_IWRITE;',
+            'if (!this->path.startsWith("/tmp/.wine") && !isUserRuntimePath) {',
+            'result |= K__S_IWGRP | K__S_IWOTH;',
+            'BOXEDWINE_X64_RUNTIME_DIR path=%s mode=0%o writable=%d ',
+        ],
+        "BoxedVN guest runtime directory permission policy",
+    )
+    # The exception must never hand out group or other write.
+    mode_start = fsfilenode.index('U32 FsFileNode::getMode() {')
+    mode_end = fsfilenode.index(chr(10) + '}' + chr(10), mode_start)
+    mode_body = fsfilenode[mode_start:mode_end]
+    if mode_body.count('K__S_IWGRP') != 1 or mode_body.count('K__S_IWOTH') != 1:
+        raise SystemExit(
+            'the runtime directory exception must not add a second group or '
+            'other write path'
+        )
+    for widened in ('startsWith("/run")', 'startsWith("/run/")',
+                    'startsWith("/run/user")'):
+        if widened in fsfilenode:
+            raise SystemExit(
+                'the write exception must not widen beyond the modelled '
+                "user's runtime directory"
+            )
+    validator = read(repository / "scripts/validate-wine64-runtime.sh")
+    if 'check_zip_path "${GLIBC_ARCHIVE}" run/user/1000' not in validator:
+        raise SystemExit(
+            'the rootfs layer must ship the guest runtime directory'
+        )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

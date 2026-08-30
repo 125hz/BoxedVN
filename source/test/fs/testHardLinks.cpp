@@ -8,6 +8,7 @@
  */
 
 #include "boxedwine.h"
+#include "x64_runtime_dir.h"
 #include "kinotify.h"
 #include "kpoll.h"
 #include "ksignal.h"
@@ -5878,6 +5879,95 @@ void testLinuxPathResolutionSemantics() {
         if ((S32)deniedFd >= 0) {
             process->close(deniedFd);
         }
+    }
+
+    // The 64-bit guest models exactly UID/GID 1000, and Wine's server puts its
+    // socket directory in that user's XDG runtime directory. ZIP entries carry
+    // no Unix mode, so the directory arrived read-only and wineserver died on
+    // `mkdir /run/user/1000/wine: Permission denied`. The exception is exactly
+    // that one subtree: /run and /run/user stay read-only.
+    expectZero("stage guest runtime directory",
+        Fs::makeLocalDirs(B(K_X64_USER_RUNTIME_DIR)));
+    expectZero("stage unrelated runtime path",
+        Fs::makeLocalDirs(B("/run/systemd")));
+    expectZero("stage another user runtime directory",
+        Fs::makeLocalDirs(B("/run/user/1001")));
+    {
+        U32 savedUserId = process->userId;
+        U32 savedEffectiveUserId = process->effectiveUserId;
+        process->userId = K_X64_MODELLED_UID;
+        process->effectiveUserId = K_X64_MODELLED_UID;
+
+        std::shared_ptr<FsNode> runtimeDir =
+            Fs::getNodeFromLocalPath(B(""), B(K_X64_USER_RUNTIME_DIR), true);
+        if (!runtimeDir) {
+            testFail("guest runtime directory was not found");
+        } else {
+            expectU32("guest runtime directory is private 0700",
+                runtimeDir->getMode() & 0777, K_X64_USER_RUNTIME_DIR_MODE);
+            expectU32("guest runtime directory has no group write",
+                runtimeDir->getMode() & K__S_IWGRP, 0);
+            expectU32("guest runtime directory has no other write",
+                runtimeDir->getMode() & K__S_IWOTH, 0);
+            expectU32("guest runtime directory is writable",
+                runtimeDir->canWrite() ? 1U : 0U, 1U);
+        }
+
+        // The failure the device reported, exactly.
+        expectZero("wineserver can create its runtime subdirectory",
+            process->mkdir(B(K_X64_USER_RUNTIME_DIR "/wine"), 0700));
+        std::shared_ptr<FsNode> wineRuntime = Fs::getNodeFromLocalPath(
+            B(""), B(K_X64_USER_RUNTIME_DIR "/wine"), true);
+        if (!wineRuntime) {
+            testFail("wineserver runtime directory was not created");
+        } else {
+            expectU32("wineserver runtime directory keeps its private mode",
+                wineRuntime->getMode() & 0777, 0700);
+        }
+        // Sockets and lock files are created beneath it.
+        expectZero("create a directory beneath the runtime directory",
+            process->mkdir(B(K_X64_USER_RUNTIME_DIR "/wine/server"), 0700));
+        U32 runtimeFd = process->open(
+            B(K_X64_USER_RUNTIME_DIR "/wine/socket"), K_O_CREAT | K_O_RDWR, 0600);
+        expectU32("create a file beneath the runtime directory",
+            (S32)runtimeFd >= 0 ? 1U : 0U, 1U);
+        if ((S32)runtimeFd >= 0) {
+            process->close(runtimeFd);
+        }
+
+        // The exception must not widen. /run, /run/user and another user's
+        // runtime directory stay read-only to this guest.
+        expectU32("mkdir under /run is still denied",
+            process->mkdir(B("/run/boxedwine-probe"), 0755), (U32)-K_EACCES);
+        expectU32("mkdir under /run/user is still denied",
+            process->mkdir(B("/run/user/boxedwine-probe"), 0755), (U32)-K_EACCES);
+        expectU32("mkdir under another user runtime dir is still denied",
+            process->mkdir(B("/run/user/1001/wine"), 0700), (U32)-K_EACCES);
+        expectU32("mkdir under an unrelated /run path is still denied",
+            process->mkdir(B("/run/systemd/probe"), 0755), (U32)-K_EACCES);
+
+        std::shared_ptr<FsNode> runDir =
+            Fs::getNodeFromLocalPath(B(""), B("/run"), true);
+        if (runDir) {
+            expectU32("/run is not writable", runDir->getMode() & K__S_IWRITE, 0);
+            expectU32("/run is not world writable",
+                runDir->getMode() & K__S_IWOTH, 0);
+        }
+        std::shared_ptr<FsNode> runUserDir =
+            Fs::getNodeFromLocalPath(B(""), B("/run/user"), true);
+        if (runUserDir) {
+            expectU32("/run/user is not writable",
+                runUserDir->getMode() & K__S_IWRITE, 0);
+        }
+        std::shared_ptr<FsNode> otherUserDir =
+            Fs::getNodeFromLocalPath(B(""), B("/run/user/1001"), true);
+        if (otherUserDir) {
+            expectU32("another user's runtime directory is not writable",
+                otherUserDir->getMode() & K__S_IWRITE, 0);
+        }
+
+        process->userId = savedUserId;
+        process->effectiveUserId = savedEffectiveUserId;
     }
 
     expectZero("create automation output directory",

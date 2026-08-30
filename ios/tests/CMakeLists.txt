@@ -30,6 +30,7 @@ add_executable(boxedvn_tests
     test_guest_low_alias.cpp
     test_launch_preflight.cpp
     test_exec_transition.cpp
+    test_x64_runtime_dir.cpp
     test_boot_diagnostics.cpp
     test_pixmap_formats.cpp
     test_getrusage_fairness.cpp
