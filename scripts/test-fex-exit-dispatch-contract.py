@@ -1108,17 +1108,17 @@ def main() -> None:
             "probeFexWithTimeout();",
             'extern "C" bool BVNRuntimeRequestLaunch(',
             "preflight->begin(generation);",
-            "if (!preflight->claimCleanup()) return;",
             "BOXEDWINE_PREFLIGHT_BEGIN",
-            "dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{",
+            "dispatch_async(preflightQueue(), ^{",
             "runLaunchPreflight(launch.useFEX64, preflightError);",
             "dispatch_async(dispatch_get_main_queue(), ^{",
             "BOXEDWINE_PREFLIGHT_COMPLETE",
             "preflight->complete(",
             "boxedvn::LaunchPreflightAction::Ignore",
             "boxedvn::LaunchPreflightAction::Fail",
+            "if (!preflight->claimCleanup()) return;",
             "runSession(launch);",
-            "releasePresentation();",
+            "releaseGuestPresentation();",
         ],
         "BoxedVN asynchronous launch preflight",
     )
@@ -1142,6 +1142,142 @@ def main() -> None:
             "the event pump and presentation must be released through one "
             "claimed cleanup path, not on every early return"
         )
+
+    # ------------------------------------------------------------------ #
+    # Every guest-address dereference that bypasses the operand funnels.   #
+    # movlpd/movhpd lower to VLoadVectorElement, which reads through the    #
+    # raw address register; with a canonical low address that reached an    #
+    # unmapped host page and the correctness probe stalled inside the SSE2  #
+    # strcmp loop with no further block, fault or exit.                     #
+    # ------------------------------------------------------------------ #
+    memory_ops_text = read(
+        fex / "FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp"
+    )
+    bypassing_ops = (
+        "LoadMemTSO", "StoreMemTSO",
+        "VLoadVectorElement", "VStoreVectorElement",
+        "LoadMemX87SVEOptPredicate", "StoreMemX87SVEOptPredicate",
+        "CacheLineClear", "CacheLineClean", "CacheLineZero", "Prefetch",
+        "VLoadNonTemporal", "VStoreNonTemporal", "VStoreNonTemporalPair",
+    )
+    for name in bypassing_ops:
+        if ("DEF_OP(%s)" % name) not in memory_ops_text:
+            raise SystemExit(
+                "the pinned translator no longer defines %s; the alias "
+                "coverage list must be re-derived" % name
+            )
+        if ("+  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));"
+                not in alias_patch and
+                "+  auto MemReg = AliasGuestAddress(GetReg(Op->Addr));"
+                not in alias_patch):
+            raise SystemExit(
+                "the address these ops dereference directly must be translated"
+            )
+    aliased = alias_patch.count(
+        "MemReg = AliasGuestAddress(GetReg(Op->Addr));")
+    if aliased < len(bypassing_ops):
+        raise SystemExit(
+            "expected every op that dereferences the raw address register to "
+            "be translated; found %d of %d" % (aliased, len(bypassing_ops))
+        )
+
+    # The stack write-back forms stay untranslated on purpose: both the probe
+    # stack and the guest stack lane are high identity addresses, and rewriting
+    # a pre/post-indexed form would put a translated address into the guest's
+    # stack pointer.
+    for forbidden in ("AliasGuestAddress(AddrSrc)",
+                      "IndexType::PRE>(Src.W(), StoreAddr"):
+        if forbidden in alias_patch:
+            raise SystemExit(
+                "stack write-back translation is out of scope; it would make "
+                "the alias visible in guest architectural state"
+            )
+
+    # The probe retires one guest instruction per block so the bounded block
+    # trace names the exact last instruction that executed. Compilation
+    # "leave" is not execution proof.
+    require_ordered(
+        backend_text,
+        [
+            "if (!mapGuestProbe()) {",
+            "FEXCore::Config::ConfigOption::CONFIG_MAXINST",
+            "BOXEDWINE_FEX64_PROBE_TRACE maxinst=1 scope=probe",
+            "struct ProbeInstructionLimitScope final {",
+            "FEXCore::Config::Erase(",
+            "gProbeContext = createFEXContext(",
+        ],
+        "BoxedVN probe instruction-level retirement trace",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Nothing that belongs to a guest session may start before preflight   #
+    # succeeds. Rotating the scene, holding the refresh rate, enabling      #
+    # SDL's pump and preparing DXMT were all happening with no SDL guest    #
+    # window in existence, and the main queue then serviced a queued block  #
+    # seconds late.                                                        #
+    # ------------------------------------------------------------------ #
+    launch_start = runtime.index('extern "C" bool BVNRuntimeRequestLaunch(')
+    launch_body = runtime[launch_start:runtime.index(
+        'extern "C" bool BVNRuntimeRequestShutdown', launch_start)]
+    fail_branch = launch_body.index("boxedvn::LaunchPreflightAction::Fail")
+    for guest_facility in ("BVNPrepareGuestPresentation(",
+                           "SDL_iPhoneSetEventPump(SDL_TRUE)",
+                           "BVNDXMTDisplayPrepare("):
+        if guest_facility not in launch_body:
+            raise SystemExit(
+                "%s must still be reachable on the success path" % guest_facility
+            )
+        if launch_body.index(guest_facility) < fail_branch:
+            raise SystemExit(
+                "%s belongs to a guest session and must not run before "
+                "preflight succeeds" % guest_facility
+            )
+
+    require_ordered(
+        runtime,
+        [
+            "constexpr uint64_t kMainStallThresholdMilliseconds = 250;",
+            "dispatch_queue_t preflightQueue() {",
+            "QOS_CLASS_UTILITY",
+            "void reportMainThreadStall(",
+            "thread_get_state(thread, ARM_THREAD_STATE64,",
+            "dladdr(reinterpret_cast<const void*>(pc), &pcInfo)",
+            "BOXEDWINE_MAIN_STALL latency_ms=",
+            "BOXEDWINE_PREFLIGHT_MAIN_SENTINEL generation=",
+        ],
+        "BoxedVN main-thread availability instrumentation",
+    )
+    require_ordered(
+        launch_body,
+        [
+            "preflight->begin(generation);",
+            "const uint64_t sentinelStart = monotonicMilliseconds();",
+            "dispatch_async(dispatch_get_main_queue(), ^{",
+            "reportMainThreadStall(latency);",
+            "BOXEDWINE_PREFLIGHT_BEGIN",
+            "dispatch_async(preflightQueue(), ^{",
+            "BOXEDWINE_PREFLIGHT_WORKER_BEGIN",
+            "runLaunchPreflight(launch.useFEX64, preflightError);",
+            "BOXEDWINE_PREFLIGHT_WORKER_END",
+            "BOXEDWINE_PREFLIGHT_COMPLETE",
+            "boxedvn::LaunchPreflightAction::Fail",
+            "BVNPrepareGuestPresentation(^{",
+            "SDL_iPhoneSetEventPump(SDL_TRUE);",
+            "BVNDXMTDisplayPrepare(",
+            "runSession(launch);",
+        ],
+        "BoxedVN library-mode preflight ordering",
+    )
+    # The failure path acquired nothing, so it must release nothing.
+    fail_to_success = launch_body[fail_branch:launch_body.index(
+        "BVNPrepareGuestPresentation(")]
+    for forbidden in ("SDL_iPhoneSetEventPump(SDL_FALSE)",
+                      "BVNFinishGuestPresentation()"):
+        if forbidden in fail_to_success:
+            raise SystemExit(
+                "the preflight failure path must not release a guest facility "
+                "it never acquired"
+            )
 
     print("FEX exit-dispatch and loader-boundary contracts verified")
 

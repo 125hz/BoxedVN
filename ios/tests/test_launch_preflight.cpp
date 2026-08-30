@@ -1,6 +1,7 @@
 #include "boxedvn_test.h"
 #include "boxedvn/launch_preflight.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -21,14 +22,23 @@ public:
     std::string state = "idle";
     LaunchPreflight preflight;
 
-    // BVNRuntimeRequestLaunch: accept, install the presentation, schedule the
-    // probes off the main thread, and return. Nothing here may block.
+    // BVNRuntimeRequestLaunch: accept, schedule the probes off the main
+    // thread, and return. The app stays in library mode -- no scene rotation,
+    // no refresh-rate hold, no SDL event pump and no DXMT layer, because none
+    // of those belong to anything until a guest session actually starts.
+    // There is no guest overlay to show here either: it is installed only
+    // once SDL has created and attached the guest window.
     void requestLaunch() {
         state = "starting";
-        presentationInstalled = true;
         ++currentGeneration;
         preflight.begin(currentGeneration);
         events.push_back("launch-returned");
+    }
+
+    // The success path, and only the success path, enters guest presentation.
+    void enterGuestPresentation() {
+        presentationInstalled = true;
+        events.push_back("presentation");
     }
 
     void enqueueMain(const std::string& item) { mainQueue.push_back(item); }
@@ -50,14 +60,15 @@ public:
                 events.push_back("ignored");
                 return;
             case LaunchPreflightAction::StartSession:
+                enterGuestPresentation();
                 events.push_back("boxedmain");
                 state = "running";
                 releasePresentation();
                 return;
             case LaunchPreflightAction::Fail:
+                // Nothing guest-owned was acquired, so nothing is released.
                 state = "failed";
                 events.push_back("failed");
-                releasePresentation();
                 return;
         }
     }
@@ -97,12 +108,19 @@ BOXEDVN_TEST(launch_preflight_returns_before_a_probe_that_never_completes) {
     harness.drainMain();
     CHECK(harness.count("main:sentinel") == 1);
 
-    // Still waiting: the state stays visible and the presentation stays up.
+    // Still waiting: the state stays visible, the app is still in library
+    // mode, and no guest facility has been started.
     CHECK(harness.state == "starting");
-    CHECK(harness.presentationInstalled);
+    CHECK(!harness.presentationInstalled);
+    CHECK(harness.count("presentation") == 0);
     CHECK(harness.count("boxedmain") == 0);
     CHECK(harness.count("cleanup") == 0);
     CHECK(harness.preflight.outcome() == LaunchPreflightOutcome::Pending);
+
+    // Ordering: the launch returned, then the main queue ran, and only then
+    // could any completion be delivered.
+    CHECK(harness.events[0] == "launch-returned");
+    CHECK(harness.events[1] == "main:sentinel");
 }
 
 BOXEDVN_TEST(launch_preflight_timeout_fails_and_cleans_up_exactly_once) {
@@ -113,16 +131,18 @@ BOXEDVN_TEST(launch_preflight_timeout_fails_and_cleans_up_exactly_once) {
 
     harness.deliver(LaunchPreflightOutcome::TimedOut);
     CHECK(harness.state == "failed");
+    // The app never left library mode, so there is nothing to tear down.
     CHECK(!harness.presentationInstalled);
+    CHECK(harness.count("presentation") == 0);
     CHECK(harness.count("failed") == 1);
-    CHECK(harness.count("cleanup") == 1);
+    CHECK(harness.count("cleanup") == 0);
     CHECK(harness.count("boxedmain") == 0);
 
     // The abandoned probe reporting later must change nothing.
     harness.deliver(LaunchPreflightOutcome::Ready);
     CHECK(harness.count("boxedmain") == 0);
+    CHECK(harness.count("presentation") == 0);
     CHECK(harness.count("failed") == 1);
-    CHECK(harness.count("cleanup") == 1);
     CHECK(harness.count("double-cleanup") == 0);
     CHECK(harness.state == "failed");
 }
@@ -132,9 +152,17 @@ BOXEDVN_TEST(launch_preflight_success_starts_the_session_once) {
     harness.requestLaunch();
     harness.deliver(LaunchPreflightOutcome::Ready);
     CHECK(harness.state == "running");
+    // Guest presentation is entered only here, and strictly before the
+    // session starts.
+    CHECK(harness.count("presentation") == 1);
     CHECK(harness.count("boxedmain") == 1);
     CHECK(harness.count("cleanup") == 1);
     CHECK(!harness.presentationInstalled);
+    const auto presentationAt = std::find(harness.events.begin(),
+                                          harness.events.end(), "presentation");
+    const auto sessionAt = std::find(harness.events.begin(),
+                                     harness.events.end(), "boxedmain");
+    CHECK(presentationAt < sessionAt);
 
     // A duplicate completion cannot start a second session or release the
     // presentation again.
@@ -158,8 +186,9 @@ BOXEDVN_TEST(launch_preflight_rejects_a_superseded_completion) {
     harness.deliver(LaunchPreflightOutcome::Ready);
     CHECK(harness.count("ignored") == 1);
     CHECK(harness.count("boxedmain") == 0);
+    CHECK(harness.count("presentation") == 0);
     CHECK(harness.count("cleanup") == 0);
-    CHECK(harness.presentationInstalled);
+    CHECK(!harness.presentationInstalled);
     CHECK(!harness.preflight.sessionStarted());
 }
 

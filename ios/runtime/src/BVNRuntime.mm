@@ -30,6 +30,11 @@
 #import <UIKit/UIKit.h>
 
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/arm/thread_status.h>
+#include <mach/thread_act.h>
+#include <time.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +90,81 @@ std::atomic<bool> gJitProbeInFlight{false};
 // hanging rather than returning an error.  Track an abandoned worker exactly
 // as the executable-memory probe does so a later launch cannot race it.
 std::atomic<bool> gFexProbeInFlight{false};
+
+// A main-queue turnaround longer than this means UIKit is not being
+// serviced: the library cannot scroll or render at that point.
+constexpr uint64_t kMainStallThresholdMilliseconds = 250;
+
+uint64_t monotonicMilliseconds() {
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull;
+}
+
+// The FEX probe can wedge. Give it its own serial queue at a lower QoS so a
+// stuck probe cannot occupy a shared global worker, and so nothing this
+// launch does competes with the main thread for a high-priority slot.
+dispatch_queue_t preflightQueue() {
+    static dispatch_queue_t queue = [] {
+        dispatch_queue_attr_t attributes = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+        return dispatch_queue_create("com.boxedvn.launch-preflight", attributes);
+    }();
+    return queue;
+}
+
+// Capture where the main thread actually is when it fails to service a queued
+// block promptly. Bounded to the launch diagnostic window: a stall that is
+// never explained is the reason this exists.
+std::atomic<uint32_t> gMainStallReports {0};
+pthread_t gMainPthread {};
+
+void reportMainThreadStall(uint64_t latencyMilliseconds) {
+    if (gMainStallReports.fetch_add(1, std::memory_order_relaxed) >= 4) {
+        return;
+    }
+    const mach_port_t thread = pthread_mach_thread_np(gMainPthread);
+    if (thread == MACH_PORT_NULL) {
+        return;
+    }
+    arm_thread_state64_t state {};
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(thread, ARM_THREAD_STATE64,
+                         reinterpret_cast<thread_state_t>(&state),
+                         &count) != KERN_SUCCESS) {
+        return;
+    }
+    const uint64_t pc = arm_thread_state64_get_pc(state);
+    const uint64_t lr = arm_thread_state64_get_lr(state);
+    Dl_info pcInfo {};
+    Dl_info lrInfo {};
+    const bool pcNamed = dladdr(reinterpret_cast<const void*>(pc), &pcInfo) != 0;
+    const bool lrNamed = dladdr(reinterpret_cast<const void*>(lr), &lrInfo) != 0;
+    char line[512];
+    snprintf(line, sizeof(line),
+             "BOXEDWINE_MAIN_STALL latency_ms=%llu pc=0x%llx image=%s "
+             "offset=0x%llx symbol=%s lr=0x%llx lr_symbol=%s sp=0x%llx "
+             "fp=0x%llx",
+             (unsigned long long)latencyMilliseconds,
+             (unsigned long long)pc,
+             pcNamed && pcInfo.dli_fname ? pcInfo.dli_fname : "?",
+             pcNamed && pcInfo.dli_fbase
+                 ? (unsigned long long)(pc -
+                                        reinterpret_cast<uint64_t>(pcInfo.dli_fbase))
+                 : 0ull,
+             pcNamed && pcInfo.dli_sname ? pcInfo.dli_sname : "?",
+             (unsigned long long)lr,
+             lrNamed && lrInfo.dli_sname ? lrInfo.dli_sname : "?",
+             (unsigned long long)arm_thread_state64_get_sp(state),
+             (unsigned long long)arm_thread_state64_get_fp(state));
+    BVNLogWrite(BVNLogLevelWarning, "runtime", line);
+}
+
+std::string preflightSentinelMarker(uint64_t generation, uint64_t latency) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "BOXEDWINE_PREFLIGHT_MAIN_SENTINEL generation=%llu latency_ms=%llu",
+             (unsigned long long)generation, (unsigned long long)latency);
+    return std::string(line);
+}
 
 std::string preflightMarker(const char* name, uint64_t generation,
                             int result) {
@@ -984,6 +1064,9 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
     }
     copyString(errorBuffer, errorBufferSize, "");
     BVNLogWrite(BVNLogLevelInfo, "runtime", "launch request accepted");
+    if (pthread_main_np() != 0) {
+        gMainPthread = pthread_self();
+    }
 
     // The session runs on the main thread, as SDL's UIKit backend requires,
     // but it is started from a queued block rather than from BVNGuestMain's
@@ -1008,80 +1091,108 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
             return;
         }
 
-        // Rotate the UIKit scene *before* SDL creates its UIWindow/CAMetalLayer.
-        // Creating the guest while the portrait-to-landscape transition was
-        // still in flight produced a portrait first drawable, then replaced
-        // it underneath Boxedwine's blocking main-thread loop. The visible
-        // results were a stretched loading screen, frozen input after a
-        // rotation, and a missing software keyboard.
-        BVNPrepareGuestPresentation(^{
-            // SDL disables its UIKit event pump when the function it was given
-            // (BVNGuestMain) returns - see -[SDLUIKitDelegate postFinishLaunch],
-            // which brackets that call with SDL_iPhoneSetEventPump TRUE/FALSE.
-            // Since BVNGuestMain now returns immediately so the real UIKit run
-            // loop can service the library UI, the pump has to be turned back
-            // on here or SDL_PumpEvents would be a no-op for the whole session.
-            SDL_iPhoneSetEventPump(SDL_TRUE);
+        // Preflight runs FIRST, while the app is still in library mode.
+        //
+        // Nothing that belongs to a guest session may be started before it
+        // succeeds. Rotating the scene, holding the refresh rate, enabling
+        // SDL's event pump and preparing DXMT were all being done here with no
+        // SDL guest window in existence: the library UI stayed on screen but
+        // the main queue was no longer servicing it promptly, and a completion
+        // dispatched to main arrived seconds late. There is also no "Starting
+        // Wine" guest overlay at this point -- that is installed only once SDL
+        // has created and attached the guest window -- so the library owns the
+        // progress indication instead.
+        const uint64_t generation =
+            gLaunchGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+        auto preflight = std::make_shared<boxedvn::LaunchPreflight>();
+        preflight->begin(generation);
+        // The library already renders the Starting state, and it keeps
+        // rendering it because the main queue stays free below.
 
-            auto preflight = std::make_shared<boxedvn::LaunchPreflight>();
-            const uint64_t generation =
-                gLaunchGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
-            preflight->begin(generation);
-            // One release path for the pump and the presentation, whether the
-            // attempt fails here, fails in preflight, or the session returns.
-            const auto releasePresentation = [preflight]() {
-                if (!preflight->claimCleanup()) return;
-                SDL_iPhoneSetEventPump(SDL_FALSE);
-                BVNFinishGuestPresentation();
-            };
-
-            if (launch.useDXMT &&
-                !BVNDXMTDisplayPrepare(launch.width ? launch.width : 1280,
-                                       launch.height ? launch.height : 720)) {
-                setLastError("The DXMT Metal presentation layer could not be prepared.");
-                setState(BVNRuntimeStateFailed);
-                releasePresentation();
-                return;
-            }
-
-            // The presentation stays installed and the state stays Starting
-            // while the probes run. Returning to the run loop here is the
-            // point: UIKit can now render the starting presentation, scroll
-            // and deliver touches for the whole preflight.
+        // A sentinel queued now must run while the probes are still
+        // outstanding. Its latency is the direct measure of whether the main
+        // queue is actually available to UIKit.
+        const uint64_t sentinelStart = monotonicMilliseconds();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            const uint64_t latency = monotonicMilliseconds() - sentinelStart;
             BVNLogWrite(BVNLogLevelInfo, "runtime",
-                        preflightMarker("BOXEDWINE_PREFLIGHT_BEGIN",
+                        preflightSentinelMarker(generation, latency).c_str());
+            if (latency > kMainStallThresholdMilliseconds) {
+                reportMainThreadStall(latency);
+            }
+        });
+
+        BVNLogWrite(BVNLogLevelInfo, "runtime",
+                    preflightMarker("BOXEDWINE_PREFLIGHT_BEGIN", generation,
+                                    -1).c_str());
+
+        // The FEX probe can wedge, so it gets its own serial queue at a lower
+        // QoS and its timeout is an asynchronous race rather than a wait. No
+        // worker ever blocks waiting for another worker.
+        dispatch_async(preflightQueue(), ^{
+            BVNLogWrite(BVNLogLevelInfo, "runtime",
+                        preflightMarker("BOXEDWINE_PREFLIGHT_WORKER_BEGIN",
                                         generation, -1).c_str());
-            dispatch_async(
-                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    std::string preflightError;
-                    const boxedvn::LaunchPreflightOutcome outcome =
-                        runLaunchPreflight(launch.useFEX64, preflightError);
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        BVNLogWrite(
-                            BVNLogLevelInfo, "runtime",
-                            preflightMarker("BOXEDWINE_PREFLIGHT_COMPLETE",
-                                            generation,
-                                            static_cast<int>(outcome)).c_str());
-                        const boxedvn::LaunchPreflightAction action =
-                            preflight->complete(
-                                outcome,
-                                gLaunchGeneration.load(
-                                    std::memory_order_acquire));
-                        if (action == boxedvn::LaunchPreflightAction::Ignore) {
-                            return;
-                        }
-                        if (action == boxedvn::LaunchPreflightAction::Fail) {
-                            setLastError(preflightError);
-                            setState(BVNRuntimeStateFailed);
-                            releasePresentation();
-                            return;
-                        }
-                        // boxedmain owns the main thread, which SDL's UIKit
-                        // backend requires.
-                        runSession(launch);
-                        releasePresentation();
-                    });
+            std::string preflightError;
+            const boxedvn::LaunchPreflightOutcome outcome =
+                runLaunchPreflight(launch.useFEX64, preflightError);
+            BVNLogWrite(BVNLogLevelInfo, "runtime",
+                        preflightMarker("BOXEDWINE_PREFLIGHT_WORKER_END",
+                                        generation,
+                                        static_cast<int>(outcome)).c_str());
+            dispatch_async(dispatch_get_main_queue(), ^{
+                BVNLogWrite(
+                    BVNLogLevelInfo, "runtime",
+                    preflightMarker("BOXEDWINE_PREFLIGHT_COMPLETE", generation,
+                                    static_cast<int>(outcome)).c_str());
+                const boxedvn::LaunchPreflightAction action =
+                    preflight->complete(
+                        outcome,
+                        gLaunchGeneration.load(std::memory_order_acquire));
+                if (action == boxedvn::LaunchPreflightAction::Ignore) {
+                    return;
+                }
+                if (action == boxedvn::LaunchPreflightAction::Fail) {
+                    // Nothing guest-owned was acquired, so nothing guest-owned
+                    // is released: stay in the library and show the error.
+                    setLastError(preflightError);
+                    setState(BVNRuntimeStateFailed);
+                    return;
+                }
+
+                // Only now does this become a guest session. Rotate the scene
+                // before SDL creates its UIWindow/CAMetalLayer: starting the
+                // guest while a portrait-to-landscape transition was still in
+                // flight produced a portrait first drawable that was then
+                // replaced underneath Boxedwine's blocking main-thread loop.
+                BVNPrepareGuestPresentation(^{
+                    // SDL disables its UIKit event pump when the function it
+                    // was given (BVNGuestMain) returns - see
+                    // -[SDLUIKitDelegate postFinishLaunch]. BVNGuestMain now
+                    // returns immediately so the real run loop can service the
+                    // library, so the pump has to be turned back on here.
+                    SDL_iPhoneSetEventPump(SDL_TRUE);
+                    const auto releaseGuestPresentation = [preflight]() {
+                        if (!preflight->claimCleanup()) return;
+                        SDL_iPhoneSetEventPump(SDL_FALSE);
+                        BVNFinishGuestPresentation();
+                    };
+                    if (launch.useDXMT &&
+                        !BVNDXMTDisplayPrepare(
+                            launch.width ? launch.width : 1280,
+                            launch.height ? launch.height : 720)) {
+                        setLastError("The DXMT Metal presentation layer could "
+                                     "not be prepared.");
+                        setState(BVNRuntimeStateFailed);
+                        releaseGuestPresentation();
+                        return;
+                    }
+                    // boxedmain owns the main thread, which SDL's UIKit
+                    // backend requires.
+                    runSession(launch);
+                    releaseGuestPresentation();
                 });
+            });
         });
     });
     return true;

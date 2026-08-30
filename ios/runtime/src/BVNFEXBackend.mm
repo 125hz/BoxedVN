@@ -2256,6 +2256,23 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     if (!mapGuestProbe()) {
         return gStage.load();
     }
+    // Probe only: one guest instruction per translated block. Compilation
+    // "leave" proves the translator emitted something, not that the guest
+    // retired it. At one instruction per block the bounded block trace names
+    // the exact last instruction that actually executed, which is the
+    // difference between a faulting load, a bad vector mask, a lost flag and
+    // a mis-taken backedge. The live guest keeps the ordinary decoder limit;
+    // this is restored immediately after the probe thread stops.
+    FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MAXINST, "1");
+    reportf("BOXEDWINE_FEX64_PROBE_TRACE maxinst=1 scope=probe");
+    // Every early return below must put the decoder limit back before the
+    // live guest is created.
+    struct ProbeInstructionLimitScope final {
+        ~ProbeInstructionLimitScope() {
+            FEXCore::Config::Erase(
+                FEXCore::Config::ConfigOption::CONFIG_MAXINST);
+        }
+    } probeInstructionLimit;
     gProbeContext = createFEXContext(boxedvn::FexGuestMode::X86_64,
                                      &createProbeInitialThread);
     if (!gProbeContext) {

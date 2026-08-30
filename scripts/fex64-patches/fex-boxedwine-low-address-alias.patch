@@ -222,7 +222,7 @@ index 3e01eeb..c89c963 100644
    ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                      IR::MemOffsetType OffsetType, uint8_t OffsetScale);
 diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
-index 2cf05d1..e0b3422 100644
+index 2cf05d1..f01cb12 100644
 --- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 @@ -584,8 +584,22 @@ DEF_OP(ContextClear) {
@@ -267,6 +267,51 @@ index 2cf05d1..e0b3422 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      const auto Dst1 = GetReg(Op->OutValue1);
+@@ -768,7 +785,7 @@ DEF_OP(LoadMemTSO) {
+   const auto Op = IROp->C<IR::IROp_LoadMemTSO>();
+   const auto OpSize = IROp->Size;
+
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   if (Op->Class == IR::RegClass::GPR) {
+     LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
+@@ -1355,7 +1372,7 @@ DEF_OP(VLoadVectorElement) {
+
+   const auto Dst = GetVReg(Node);
+   const auto DstSrc = GetVReg(Op->DstSrc);
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
+                        ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
+@@ -1392,7 +1409,7 @@ DEF_OP(VStoreVectorElement) {
+   const auto ElementSize = IROp->ElementSize;
+
+   const auto Value = GetVReg(Op->Value);
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
+                        ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
+@@ -1694,7 +1711,7 @@ DEF_OP(StoreMemX87SVEOptPredicate) {
+   LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "StoreMemX87SVEOptPredicate needs SVE support");
+
+   const auto RegData = GetVReg(Op->Value);
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+   const auto MemDst = ARMEmitter::SVEMemOperand(MemReg.X(), 0);
+
+   switch (IROp->ElementSize) {
+@@ -1722,7 +1739,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
+   const auto Op = IROp->C<IR::IROp_LoadMemX87SVEOptPredicate>();
+   const auto Dst = GetVReg(Node);
+   const auto Predicate = PRED_X87_SVEOPT;
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "LoadMemX87SVEOptPredicate needs SVE support");
+
 @@ -1752,7 +1769,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
  DEF_OP(StoreMemPair) {
    const auto Op = IROp->C<IR::IROp_StoreMemPair>();
@@ -276,6 +321,15 @@ index 2cf05d1..e0b3422 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      const auto Src1 = GetZeroableReg(Op->Value1);
+@@ -1779,7 +1796,7 @@ DEF_OP(StoreMemTSO) {
+   const auto Op = IROp->C<IR::IROp_StoreMemTSO>();
+   const auto OpSize = IROp->Size;
+
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   if (Op->Class == IR::RegClass::GPR) {
+     LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
 @@ -1882,6 +1899,12 @@ DEF_OP(MemSet) {
      const auto Prefix = GetReg(Op->Prefix);
      add(TMP2, Prefix.X(), MemReg.X());
@@ -304,6 +358,69 @@ index 2cf05d1..e0b3422 100644
 
    // TMP1 = Length
    // TMP2 = Dest
+@@ -2396,7 +2427,7 @@ DEF_OP(CacheLineClear) {
+
+   auto Op = IROp->C<IR::IROp_CacheLineClear>();
+
+-  auto MemReg = GetReg(Op->Addr);
++  auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   // Clear dcache only
+   // icache doesn't matter here since the guest application shouldn't be calling clflush on JIT code.
+@@ -2426,7 +2457,7 @@ DEF_OP(CacheLineClean) {
+
+   auto Op = IROp->C<IR::IROp_CacheLineClean>();
+
+-  auto MemReg = GetReg(Op->Addr);
++  auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   // Clean dcache only
+   // check host cacheline size again x86_64 size to ensure at least 64 bytes are cleaned
+@@ -2445,7 +2476,7 @@ DEF_OP(CacheLineClean) {
+ DEF_OP(CacheLineZero) {
+   auto Op = IROp->C<IR::IROp_CacheLineZero>();
+
+-  auto MemReg = GetReg(Op->Addr);
++  auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   if (CTX->HostFeatures.SupportsCLZERO) {
+     // We can use this instruction directly
+@@ -2465,7 +2496,7 @@ DEF_OP(CacheLineZero) {
+
+ DEF_OP(Prefetch) {
+   auto Op = IROp->C<IR::IROp_Prefetch>();
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+
+   // Access size is only ever handled as 8-byte. Even though it is accesssed as a cacheline.
+   const auto MemSrc = GenerateMemOperand(IR::OpSize::i64Bit, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+@@ -2510,7 +2541,7 @@ DEF_OP(VStoreNonTemporal) {
+   const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
+
+   const auto Value = GetVReg(Op->Value);
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+   const auto Offset = Op->Offset;
+
+   if (Is256Bit) {
+@@ -2537,7 +2568,7 @@ DEF_OP(VStoreNonTemporalPair) {
+   const auto ValueLow = GetVReg(Op->ValueLow);
+   const auto ValueHigh = GetVReg(Op->ValueHigh);
+
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+   const auto Offset = Op->Offset;
+
+   stnp(ValueLow.Q(), ValueHigh.Q(), MemReg, Offset);
+@@ -2552,7 +2583,7 @@ DEF_OP(VLoadNonTemporal) {
+   const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
+
+   const auto Dst = GetVReg(Node);
+-  const auto MemReg = GetReg(Op->Addr);
++  const auto MemReg = AliasGuestAddress(GetReg(Op->Addr));
+   const auto Offset = Op->Offset;
+
+   if (Is256Bit) {
 diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
 index ec61b90..441e0ec 100644
 --- a/FEXCore/include/FEXCore/Core/Context.h
