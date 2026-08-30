@@ -111,6 +111,7 @@ apply_patch fex-boxedwine-block-diagnostics.patch
 apply_patch fex-apple-dual-map-cache-publish.patch
 apply_patch fex-arm64-pair-immediate-mask.patch
 apply_patch fex-arm64-context-indexed-unaligned-offset.patch
+apply_patch fex-arm64-addsub-immediate-range.patch
 apply_patch fex-boxedwine-ir-capture-arm.patch
 
 # CMAKE_SYSTEM_PROCESSOR has to be stated. CMake leaves it empty when cross-

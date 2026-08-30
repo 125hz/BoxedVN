@@ -1,0 +1,81 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index f9b470d..c48041e 100644
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -28,10 +28,41 @@ namespace FEXCore::CPU {
+     }                                                                                     \
+   }
+ 
+-DEF_BINOP_WITH_CONSTANT(Add, add, add)
+-DEF_BINOP_WITH_CONSTANT(Sub, sub, sub)
+-DEF_BINOP_WITH_CONSTANT(AddWithFlags, adds, adds)
+-DEF_BINOP_WITH_CONSTANT(SubWithFlags, subs, subs)
++/* The add/sub immediate form encodes an UNSIGNED twelve-bit value, optionally
++ * shifted left by twelve. An inline constant outside that range -- a negative
++ * displacement such as `lea rbx, [rdi - 0x40]`, which reaches the backend as
++ * 0xffffffffffffffc0 -- was still handed to the immediate emitter, whose
++ * parameter is uint32_t. With assertions compiled out the oversized value was
++ * shifted straight into the opcode field and produced an invalid instruction.
++ *
++ * Masking the immediate would be worse than the fault: it would turn -64 into
++ * a positive displacement and silently corrupt guest results. Materialize the
++ * constant instead and use the ordinary register form, which is exact for both
++ * the plain and the flag-setting operations. The inline-constant IR node never
++ * receives a register of its own -- register allocation skips it entirely --
++ * so a scratch register, not GetReg(Op->Src2), is what the register form has
++ * to consume here. */
++#define DEF_ADDSUB_WITH_CONSTANT(FEXOp, VarOp, ConstOp)                                    \
++  DEF_OP(FEXOp) {                                                                          \
++    auto Op = IROp->C<IR::IROp_##FEXOp>();                                                 \
++                                                                                           \
++    uint64_t Const;                                                                        \
++    if (IsInlineConstant(Op->Src2, &Const)) {                                              \
++      if (ARMEmitter::IsImmAddSub(Const)) {                                                \
++        ConstOp(ConvertSize(IROp), GetReg(Node), GetReg(Op->Src1), Const);                 \
++      } else {                                                                             \
++        LoadConstant(ConvertSize(IROp), TMP1, Const);                                      \
++        VarOp(ConvertSize(IROp), GetReg(Node), GetZeroableReg(Op->Src1), TMP1);            \
++      }                                                                                    \
++    } else {                                                                               \
++      VarOp(ConvertSize(IROp), GetReg(Node), GetZeroableReg(Op->Src1), GetReg(Op->Src2));  \
++    }                                                                                      \
++  }
++
++DEF_ADDSUB_WITH_CONSTANT(Add, add, add)
++DEF_ADDSUB_WITH_CONSTANT(Sub, sub, sub)
++DEF_ADDSUB_WITH_CONSTANT(AddWithFlags, adds, adds)
++DEF_ADDSUB_WITH_CONSTANT(SubWithFlags, subs, subs)
+ DEF_BINOP_WITH_CONSTANT(Or, orr, orr)
+ DEF_BINOP_WITH_CONSTANT(And, and_, and_)
+ DEF_BINOP_WITH_CONSTANT(Andn, bic, bic)
+@@ -105,7 +136,14 @@ DEF_OP(AddNZCV) {
+   uint64_t Const;
+   if (IsInlineConstant(Op->Src2, &Const)) {
+     LOGMAN_THROW_A_FMT(IROp->Size >= IR::OpSize::i32Bit, "Constant not allowed here");
+-    cmn(EmitSize, Src1, Const);
++    // cmn is the same add/sub immediate encoding; an unencodable constant has
++    // to be materialized rather than truncated into the opcode.
++    if (ARMEmitter::IsImmAddSub(Const)) {
++      cmn(EmitSize, Src1, Const);
++    } else {
++      LoadConstant(EmitSize, TMP1, Const);
++      cmn(EmitSize, Src1, TMP1);
++    }
+   } else if (IROp->Size < IR::OpSize::i32Bit) {
+     unsigned Shift = 32 - IR::OpSizeAsBits(IROp->Size);
+ 
+@@ -241,7 +279,13 @@ DEF_OP(SubNZCV) {
+   uint64_t Const;
+   if (IsInlineConstant(Op->Src2, &Const)) {
+     LOGMAN_THROW_A_FMT(OpSize >= IR::OpSize::i32Bit, "Constant not allowed here");
+-    cmp(EmitSize, GetReg(Op->Src1), Const);
++    // Same encoding family as add/sub immediate; see AddNZCV above.
++    if (ARMEmitter::IsImmAddSub(Const)) {
++      cmp(EmitSize, GetReg(Op->Src1), Const);
++    } else {
++      LoadConstant(EmitSize, TMP1, Const);
++      cmp(EmitSize, GetReg(Op->Src1), TMP1);
++    }
+   } else {
+     unsigned Shift = OpSize < IR::OpSize::i32Bit ? (32 - IR::OpSizeAsBits(OpSize)) : 0;
+     ARMEmitter::Register ShiftedSrc1 = GetZeroableReg(Op->Src1);

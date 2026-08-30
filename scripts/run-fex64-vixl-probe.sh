@@ -11,6 +11,8 @@ fex_build="${FEX_BUILD:-${root}/build/fex-vixl-probe}"
 fixture64="${root}/scripts/guest-probes/fex64-loader-stall.asm"
 fixture32="${root}/scripts/guest-probes/fex32-core-contract.asm"
 fixture_vector="${root}/scripts/guest-probes/fex64-vector-store-contract.asm"
+fixture_negative_add="${root}/scripts/guest-probes/fex64-negative-add-contract.asm"
+host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
 cc="${CC:-clang}"
@@ -23,6 +25,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-apple-dual-map-cache-publish.patch"
     "${root}/scripts/fex64-patches/fex-arm64-pair-immediate-mask.patch"
     "${root}/scripts/fex64-patches/fex-arm64-context-indexed-unaligned-offset.patch"
+    "${root}/scripts/fex64-patches/fex-arm64-addsub-immediate-range.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
 )
 
@@ -44,6 +47,10 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
 [[ -f "${fixture32}" ]] || die "fixture not found: ${fixture32}"
 [[ -f "${fixture_vector}" ]] || \
     die "fixture not found: ${fixture_vector}"
+[[ -f "${fixture_negative_add}" ]] || \
+    die "fixture not found: ${fixture_negative_add}"
+[[ -f "${host_word_check}" ]] || \
+    die "host-word checker not found: ${host_word_check}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
 [[ -f "${encoding_check_source}" ]] || \
     die "encoding check not found: ${encoding_check_source}"
@@ -190,6 +197,7 @@ prepare_fixture() {
 prepare_fixture "${fixture64}" fex64-loader-stall
 prepare_fixture "${fixture32}" fex32-core-contract
 prepare_fixture "${fixture_vector}" fex64-vector-store
+prepare_fixture "${fixture_negative_add}" fex64-negative-add
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -226,35 +234,26 @@ vector_capture="${tmp_dir}/fex64-vector-store.ircap.txt"
 run_one x64-vector-store-ircap "${tmp_dir}/fex64-vector-store.bin" \
     "${tmp_dir}/fex64-vector-store.config.bin" 500 0 0x10100 \
     | tee "${vector_capture}"
+python3 "${host_word_check}" "${vector_capture}" \
+    --label vector-store --forbid-word ffff0177
 
-python3 - "${vector_capture}" <<'CAPTURE'
-import re
-import sys
+# A negative guest displacement reaches the backend as a sign-extended
+# 64-bit inline constant, which the ARM64 add/sub immediate form cannot
+# encode. The device shifted it into the opcode field instead. This
+# fixture checks the arithmetic and the flags, so a truncated or
+# sign-flipped immediate fails on results rather than on an encoding scan.
+run_one x64-negative-add "${tmp_dir}/fex64-negative-add.bin" \
+    "${tmp_dir}/fex64-negative-add.config.bin" 1 0
+run_one x64-negative-add "${tmp_dir}/fex64-negative-add.bin" \
+    "${tmp_dir}/fex64-negative-add.config.bin" 500 0
+run_one x64-negative-add "${tmp_dir}/fex64-negative-add.bin" \
+    "${tmp_dir}/fex64-negative-add.config.bin" 500 1
 
-text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+negative_add_capture="${tmp_dir}/fex64-negative-add.ircap.txt"
+run_one x64-negative-add-ircap "${tmp_dir}/fex64-negative-add.bin" \
+    "${tmp_dir}/fex64-negative-add.config.bin" 500 0 0x10100 \
+    | tee "${negative_add_capture}"
+python3 "${host_word_check}" "${negative_add_capture}" \
+    --label negative-add --forbid-word ffff0177 --require-addsub-register
 
-if "[ircap]" not in text:
-    raise SystemExit(
-        "error: targeted IR capture produced no output; the downstream "
-        "arming patch is not compiled into this translator"
-    )
-
-if "ml623 HOST bytes" not in text:
-    raise SystemExit(
-        "error: IR capture never reached the host-word stage for the "
-        "pinned guest target"
-    )
-
-words = re.findall(r"ircap[]][ ]+[+]0x[0-9a-f]+[ ]+([0-9a-f]{8})", text)
-if not words:
-    raise SystemExit("error: IR capture printed no emitted host words")
-
-if "ffff0177" in words:
-    raise SystemExit(
-        "error: the emitter produced the invalid device word 0xffff0177 "
-        "for movups [rax + 0x30], xmm0"
-    )
-
-print("[fex-vixl] ircap host words: " + " ".join(words))
-CAPTURE
-echo "[fex-vixl] PASS: x64 loader, IA-32 core and vector-store fixtures completed in all modes"
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store and negative-add fixtures completed in all modes"

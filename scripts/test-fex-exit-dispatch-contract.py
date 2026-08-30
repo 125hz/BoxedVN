@@ -491,8 +491,7 @@ def main() -> None:
             "run_one x64-vector-store ",
             "run_one x64-vector-store-ircap ",
             "0x10100 ",
-            "ml623 HOST bytes",
-            "ffff0177",
+            '--label vector-store --forbid-word ffff0177',
         ],
         "VIXL vector-store regression and capture assertion",
     )
@@ -522,6 +521,153 @@ def main() -> None:
             "the exec-replacement path must advance the epoch identity the "
             "unwind trace reports"
         )
+
+    # ------------------------------------------------------------------ #
+    # Unencodable add/sub constants must reach a register, not an          #
+    # immediate field. The device executed 0xffff0177 where a valid add    #
+    # belonged, because a sign-extended -0x40 was shifted into the opcode. #
+    # ------------------------------------------------------------------ #
+    addsub_patch = read(
+        repository
+        / "scripts/fex64-patches/fex-arm64-addsub-immediate-range.patch"
+    )
+    negative_add_fixture = read(
+        repository / "scripts/guest-probes/fex64-negative-add-contract.asm"
+    )
+    host_word_check = read(
+        repository / "scripts/guest-probes/check-ircap-host-words.py"
+    )
+    alu_ops = read(fex / "FEXCore/Source/Interface/Core/JIT/ALUOps.cpp")
+    loadstore_emitter = read(
+        fex / "CodeEmitter/CodeEmitter/ALUOps.inl"
+    )
+
+    # The pinned defect: selection is unconditional on IsInlineConstant, and
+    # the emitter only rejects an oversized immediate through an assertion
+    # that the Release iOS build compiles out.
+    alu_unpatched = "DEF_BINOP_WITH_CONSTANT(Add, add, add)" in alu_ops
+    alu_patched = "DEF_ADDSUB_WITH_CONSTANT(Add, add, add)" in alu_ops
+    if alu_unpatched == alu_patched:
+        raise SystemExit(
+            "FEX ARM64 add/sub constant selection is in an unexpected state: "
+            "the pinned source must either route every inline constant to the "
+            "immediate form or carry the downstream fix, not both and neither"
+        )
+    if alu_unpatched:
+        require_ordered(
+            alu_ops,
+            [
+                "#define DEF_BINOP_WITH_CONSTANT(FEXOp, VarOp, ConstOp)",
+                "if (IsInlineConstant(Op->Src2, &Const)) {",
+                "ConstOp(ConvertSize(IROp), GetReg(Node), GetReg(Op->Src1), "
+                "Const);",
+                "DEF_BINOP_WITH_CONSTANT(Add, add, add)",
+            ],
+            "pinned FEX unconditional add/sub immediate selection",
+        )
+    require_ordered(
+        loadstore_emitter,
+        [
+            "DataProcessing_AddSub_Imm",
+            "LOGMAN_THROW_A_FMT",
+            "Instr |= Imm << 10;",
+        ],
+        "pinned FEX add/sub immediate encoder",
+    )
+
+    # The correction is in JIT selection, and only there.
+    require_ordered(
+        addsub_patch,
+        [
+            "a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp",
+            "#define DEF_ADDSUB_WITH_CONSTANT(FEXOp, VarOp, ConstOp)",
+            "if (IsInlineConstant(Op->Src2, &Const)) {",
+            "if (ARMEmitter::IsImmAddSub(Const)) {",
+            "LoadConstant(ConvertSize(IROp), TMP1, Const);",
+            "VarOp(ConvertSize(IROp), GetReg(Node), "
+            "GetZeroableReg(Op->Src1), TMP1);",
+            "+DEF_ADDSUB_WITH_CONSTANT(Add, add, add)",
+            "+DEF_ADDSUB_WITH_CONSTANT(Sub, sub, sub)",
+            "+DEF_ADDSUB_WITH_CONSTANT(AddWithFlags, adds, adds)",
+            "+DEF_ADDSUB_WITH_CONSTANT(SubWithFlags, subs, subs)",
+        ],
+        "BoxedVN add/sub immediate range patch",
+    )
+    for touched in ("CodeEmitter/CodeEmitter/ALUOps.inl",
+                    "CodeEmitter/CodeEmitter/Emitter.h"):
+        if touched in addsub_patch:
+            raise SystemExit(
+                "the add/sub fix must correct JIT selection, not the encoder: "
+                f"masking the immediate in {touched} would turn a negative "
+                "displacement into a positive one and corrupt guest results"
+            )
+    if "DEF_BINOP_WITH_CONSTANT(Or, orr, orr)" not in alu_ops:
+        raise SystemExit(
+            "the generic logical and shift lowering must remain on the "
+            "original macro"
+        )
+
+    # Every maintained clean-source route applies it.
+    for label, text, fragment in (
+        ("iOS translator build", fex_build_script,
+         "apply_patch fex-arm64-addsub-immediate-range.patch"),
+        ("VIXL probe", vixl_probe,
+         "fex-arm64-addsub-immediate-range.patch"),
+    ):
+        if fragment not in text:
+            raise SystemExit(
+                f"{label} does not apply the add/sub immediate range patch"
+            )
+
+    # The regression drives the proven operation and checks arithmetic and
+    # flags, not just an encoding scan.
+    require_ordered(
+        negative_add_fixture,
+        [
+            "ORG 0x10000",
+            "times 0x0fc - ($ - $$) db 0x90",
+            "negative_add_entry:",
+            "negative_add_target:",
+            "lea     rbx, [rdi - 0x40]",
+            "lea     edx, [esi - 0x40]",
+            "add     r8, -0x40",
+            "jnc     fail",
+            "sub     r12, 0x12345",
+            "add     rax, 0x40",
+            "add     rax, 0x1000",
+        ],
+        "BoxedVN unencodable add/sub guest fixture",
+    )
+    require_ordered(
+        host_word_check,
+        [
+            "ADDSUB_SHIFTED_REGISTER_MASK = 0x7F200000",
+            "0x0B000000",
+            "0x2B000000",
+            "0x4B000000",
+            "0x6B000000",
+            'if "[ircap]" not in text:',
+            'if "ml623 HOST bytes" not in text:',
+            "if (int(word, 16) >> 21) == 0x7FF:",
+            "require_addsub_register",
+        ],
+        "BoxedVN emitted host-word checker",
+    )
+    require_ordered(
+        vixl_probe,
+        [
+            'prepare_fixture "${fixture_negative_add}" fex64-negative-add',
+            "run_one x64-negative-add ",
+            '"${tmp_dir}/fex64-negative-add.config.bin" 1 0',
+            '"${tmp_dir}/fex64-negative-add.config.bin" 500 0',
+            '"${tmp_dir}/fex64-negative-add.config.bin" 500 1',
+            "run_one x64-negative-add-ircap ",
+            "0x10100 ",
+            '--label negative-add --forbid-word ffff0177 '
+            '--require-addsub-register',
+        ],
+        "VIXL unencodable add/sub regression",
+    )
 
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
