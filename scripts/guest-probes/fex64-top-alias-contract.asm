@@ -102,7 +102,11 @@ ORG 0x10000
     jne done
     mov rcx, qword [r10 + 0x4000]
     mov rdx, VALUE_A
-    add rdx, ADDEND
+    ; Through a register: x86-64 has no 64-bit ADD immediate, so `add rdx,
+    ; ADDEND` would silently assemble a sign-extended imm32 and compare
+    ; against the wrong sum.
+    mov rbx, ADDEND
+    add rdx, rbx
     cmp rcx, rdx                      ; memory holds the sum
     jne done
 
