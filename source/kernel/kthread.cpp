@@ -120,6 +120,19 @@ void KThread::reset() {
     this->getrusageFairness.reset();
     this->schedYieldFairness.reset();
 #endif
+#ifdef BOXEDWINE_GUEST_X64
+    // A 64-bit process never runs on the legacy stack: ElfLoader64 builds its
+    // own SysV stack and auxiliary vector in the 64-bit address space, and
+    // execve() deliberately skips setupThreadStack() for it. Building the
+    // legacy one anyway is not merely wasted work -- setupStack() mmaps a
+    // MAX_STACK_SIZE region in the legacy address space and then touches
+    // sixteen pages of it, and for a fork child that address space is a fresh
+    // clone of the parent's. Leave it alone and let the 64-bit loader own the
+    // stack it is going to build.
+    if (this->process && this->process->is64Bit) {
+        return;
+    }
+#endif
     this->setupStack();    
 }
 

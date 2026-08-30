@@ -262,7 +262,25 @@ KProcess::KProcess(U32 id) : id(id), exitOrExecCond(std::make_shared<BoxedWineCo
     this->hasSetSeg[FS] = true;    
 }
 
+// A fork child that execs has to unwind the whole inherited process before it
+// can load its replacement image. When that stalls there is nothing between
+// the remap marker and the loader's first line to say where, so each phase
+// announces itself. Bounded: exec is rare, and only the first few matter.
+void KProcess::logExecPhase(const char* phase) const noexcept {
+#if defined(BOXEDWINE_FEX64_BACKEND)
+    static std::atomic<U32> reports {0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 96) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_EXEC_PHASE pid=%u phase=%s", this->id, phase);
+#else
+    (void)phase;
+#endif
+}
+
 void KProcess::onExec(KThread* thread) {
+    logExecPhase("onexec-begin");
+    logExecPhase("cloexec-begin");
     BHashTable<U32, KFileDescriptorPtr> fdsToClose = this->fds; // make a copy since we can't remove from it while iterating
     for( const auto& n : fdsToClose ) {
         KFileDescriptorPtr fd = n.value;
@@ -270,12 +288,18 @@ void KProcess::onExec(KThread* thread) {
             clearFdHandle(fd->handle);
         }
     }
+    logExecPhase("cloexec-end");
+    logExecPhase("shm-begin");
     this->attachedShm.clear();
     this->privateShm.clear();
+    logExecPhase("shm-end");
     // execvReset invalidated every old page before onExec, so no direct mapped
     // store can race the final identity-ordered retirement.
+    logExecPhase("retire-mapped-begin");
     this->retireAllMappedFiles();
+    logExecPhase("retire-mapped-end");
 
+    logExecPhase("signals-begin");
     for (int i = 0; i < MAX_SIG_ACTIONS; i++) {
         this->sigActions[i].reset();
     }
@@ -283,7 +307,9 @@ void KProcess::onExec(KThread* thread) {
     if (this->timer.active) {
         removeTimer(&this->timer);
     }
+    logExecPhase("signals-end");
 
+    logExecPhase("siblings-begin");
     std::vector<KThread*> toDelete;
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
@@ -301,6 +327,7 @@ void KProcess::onExec(KThread* thread) {
         this->threads.clear();
         this->threads.set(thread->id, thread);
     }
+    logExecPhase("siblings-end");
     
     for (int i=0;i<LDT_ENTRIES;i++) {
         this->ldt[i].seg_not_present = 1;
@@ -343,6 +370,7 @@ void KProcess::onExec(KThread* thread) {
     vulkanFreePtrAddress = 0;
     vulkanPtrMap.clear();
 #endif
+    logExecPhase("onexec-end");
 }
 
 KProcess::~KProcess() {
@@ -1746,7 +1774,9 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     }
 #endif
 
+    logExecPhase("thread-reset-begin");
     thread->reset();
+    logExecPhase("thread-reset-end");
     this->onExec(thread);
 
     // not sure why x64 doesn't catch setting the CS segment this in time
@@ -1757,6 +1787,7 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         }
     }
 
+    logExecPhase("loader-begin");
     if (!ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {
         // :TODO: maybe alloc a new memory object and keep the old one until we know we are loaded
         kpanic("program failed to load, but memory was already reset");
@@ -1769,6 +1800,7 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     {
         setupThreadStack(thread, thread->cpu, this->name, args, envs);
     }
+    logExecPhase("loader-end");
     openNode->close();
     delete openNode;
 

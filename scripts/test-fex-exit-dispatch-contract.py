@@ -1424,6 +1424,106 @@ def main() -> None:
                 "%s must participate in the workflow cache keys" % cached
             )
 
+    # ------------------------------------------------------------------ #
+    # A fork child that execs unwinds the whole inherited process before it #
+    # can load its replacement image. When that stalls the child produces    #
+    # nothing at all and its parent waits in wait4 forever, which is the     #
+    # correct thing for the parent to do. Every phase announces itself.      #
+    # ------------------------------------------------------------------ #
+    kprocess = read(repository / "source/kernel/kprocess.cpp")
+    kthread = read(repository / "source/kernel/kthread.cpp")
+    exec_header = read(
+        repository / "ios/support/include/boxedvn/exec_transition.h"
+    )
+
+    require_ordered(
+        kprocess,
+        [
+            "void KProcess::logExecPhase(const char* phase) const noexcept {",
+            "BOXEDWINE_X64_EXEC_PHASE pid=%u phase=%s",
+            "void KProcess::onExec(KThread* thread) {",
+            'logExecPhase("onexec-begin");',
+            'logExecPhase("cloexec-begin");',
+            'logExecPhase("cloexec-end");',
+            'logExecPhase("shm-begin");',
+            'logExecPhase("shm-end");',
+            'logExecPhase("retire-mapped-begin");',
+            "this->retireAllMappedFiles();",
+            'logExecPhase("retire-mapped-end");',
+            'logExecPhase("signals-begin");',
+            'logExecPhase("signals-end");',
+            'logExecPhase("siblings-begin");',
+            "terminateOtherThread(shared_from_this(), otherThread->id);",
+            'logExecPhase("siblings-end");',
+            'logExecPhase("onexec-end");',
+        ],
+        "BoxedVN exec phase trace",
+    )
+    require_ordered(
+        kprocess,
+        [
+            "BOXEDWINE_X64_EXEC_REMAP",
+            'logExecPhase("thread-reset-begin");',
+            "thread->reset();",
+            'logExecPhase("thread-reset-end");',
+            "this->onExec(thread);",
+            'logExecPhase("loader-begin");',
+            "ElfLoader::loadProgram(thread, openNode",
+            'logExecPhase("loader-end");',
+        ],
+        "BoxedVN exec call-site phase order",
+    )
+
+    # A 64-bit process never runs on the legacy stack: the loader builds its
+    # own, and execve already skips setupThreadStack for it. Building one
+    # anyway mmaps and then touches sixteen pages of an address space that,
+    # for a fork child, is a fresh clone of the parent's.
+    require_ordered(
+        kthread,
+        [
+            "void KThread::reset() {",
+            "memory->threadCleanup(id);",
+            "this->clearFutexes();",
+            "if (this->process && this->process->is64Bit) {",
+            "return;",
+            "this->setupStack();",
+        ],
+        "BoxedVN 64-bit exec reset path",
+    )
+    reset_start = kthread.index("void KThread::reset() {")
+    reset_end = kthread.index(chr(10) + "}" + chr(10), reset_start)
+    reset_body = kthread[reset_start:reset_end]
+    if reset_body.index("is64Bit") > reset_body.index("this->setupStack();"):
+        raise SystemExit(
+            "the legacy stack must not be built for a 64-bit process; "
+            "ElfLoader64 owns that stack"
+        )
+    for retained in ("memory->threadCleanup(id);", "this->clearFutexes();",
+                     "this->cpu->reset();", "this->setupStack();"):
+        if retained not in reset_body:
+            raise SystemExit(
+                "the 32-bit reset path must keep %r" % retained
+            )
+
+    require_ordered(
+        exec_header,
+        [
+            "enum class ExecPhase",
+            "ThreadReset",
+            "CloseOnExec",
+            "RetireMappedFiles",
+            "SiblingThreads",
+            "Loader",
+            "enum class ExecTransitionResult",
+            "Stalled",
+            "struct ExecReplacementImage",
+            "bool crossLinked() const noexcept",
+            "bool belongsToImage(",
+            "ExecTransitionResult finish() noexcept",
+        ],
+        "BoxedVN exec transition contract",
+    )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 
