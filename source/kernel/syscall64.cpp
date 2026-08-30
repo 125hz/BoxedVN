@@ -643,12 +643,12 @@ struct GuestMmapCounters {
     std::atomic<U64> highWindowRelocations {0};
     std::atomic<U64> rejectedWithoutAllocating {0};
     std::atomic<U64> highWindowFailures {0};
+    std::atomic<U64> sparseReservations {0};
 };
 
 GuestMmapCounters gGuestMmapCounters;
 
 constexpr U64 kGuestMmapDetailLines = 32;
-constexpr U64 kGuestMmapSummaryEvery = 4096;
 
 const char* guestMmapPlacementName(boxedvn::GuestMmapPlacement placement) {
     switch (placement) {
@@ -659,6 +659,7 @@ const char* guestMmapPlacementName(boxedvn::GuestMmapPlacement placement) {
             return "relocate-high-window";
         case boxedvn::GuestMmapPlacement::FailExists: return "fail-eexist";
         case boxedvn::GuestMmapPlacement::FailNoMemory: return "fail-enomem";
+        case boxedvn::GuestMmapPlacement::ReserveSparse: return "reserve-sparse";
     }
     return "unknown";
 }
@@ -666,7 +667,7 @@ const char* guestMmapPlacementName(boxedvn::GuestMmapPlacement placement) {
 void reportGuestMmapSummary(const char* reason) {
     klog_fmt("BOXEDWINE_X64_MMAP_SUMMARY reason=%s calls=%llu "
              "low_ineligible=%llu noreplace=%llu relocations=%llu "
-             "rejected=%llu window_failures=%llu",
+             "rejected=%llu window_failures=%llu sparse=%llu",
              reason,
              (unsigned long long)gGuestMmapCounters.calls.load(
                  std::memory_order_relaxed),
@@ -680,7 +681,19 @@ void reportGuestMmapSummary(const char* reason) {
                  gGuestMmapCounters.rejectedWithoutAllocating.load(
                      std::memory_order_relaxed),
              (unsigned long long)gGuestMmapCounters.highWindowFailures.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)gGuestMmapCounters.sparseReservations.load(
                  std::memory_order_relaxed));
+}
+
+// After the detailed prefix, report only at powers of two. The old fixed
+// stride of one summary per 4096 calls still produced 2,177 lines against a
+// guest issuing nine million mmaps -- bounded in principle, unreadable in
+// practice. This is diagnostics only: nothing about which mappings are made,
+// attempted or refused changes, and the first requests are still printed in
+// full.
+bool guestMmapSummaryDue(U64 ordinal) {
+    return ordinal >= kGuestMmapDetailLines && (ordinal & (ordinal - 1)) == 0;
 }
 
 } // namespace
@@ -715,6 +728,7 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
     request.fixed = fixed;
     request.fixedNoReplace = fixedNoReplace;
     request.nativeIdentity = nativeIdentity;
+    request.anonymous = true;
     if (addr != 0) {
         request.exactRangeAllowed =
             !nativeIdentity ||
@@ -735,10 +749,13 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
         }
         request.exactRangeFree = rangeFree;
         // MAP_FIXED_NOREPLACE is defined against total occupancy, reservations
-        // included, so it needs the stricter question.
+        // included, so it needs the stricter question. A sparse reservation
+        // occupies its range as completely as a mapped page does, even though
+        // it owns no pages, so it has to be asked about separately.
         request.exactRangeUnmapped =
             !fixedNoReplace ||
-            cpu->memory->rangeCompletelyUnmapped(alignedAddr, mapLen);
+            (cpu->memory->rangeCompletelyUnmapped(alignedAddr, mapLen) &&
+             !cpu->memory->sparseReservationOverlaps(alignedAddr, mapLen));
     }
 
     const boxedvn::GuestMmapPlacement placement =
@@ -790,6 +807,18 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
                     1, std::memory_order_relaxed);
             }
             break;
+        case boxedvn::GuestMmapPlacement::ReserveSparse:
+            // Guest metadata only: no host mapping, no native backing, and no
+            // page object per 4 KiB. One interval, whatever the length.
+            ret = cpu->memory->reserveSparseNoReplace(alignedAddr, mapLen);
+            if ((S64)ret < 0) {
+                gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                gGuestMmapCounters.sparseReservations.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            break;
         case boxedvn::GuestMmapPlacement::FailExists:
             gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
                 1, std::memory_order_relaxed);
@@ -820,8 +849,8 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
                  request.exactRangeUnmapped ? 1 : 0,
                  guestMmapPlacementName(placement),
                  (unsigned long long)ret);
-    } else if ((ordinal % kGuestMmapSummaryEvery) == 0) {
-        reportGuestMmapSummary("periodic");
+    } else if (guestMmapSummaryDue(ordinal)) {
+        reportGuestMmapSummary("milestone");
     }
     if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
         klog_fmt("MMAP [pid=%d] BIG anon exit  -> 0x%llx",
@@ -1136,7 +1165,36 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode
                      path, (int)(S32)rc, process->currentDirectory.c_str(), full.c_str(),
                      (unsigned long long)flags);
         } else {
-            klog_fmt("sys_openat64: open('%s') -> %d", path, (int)(S32)rc);
+            // A guest that reopens one missing path in a loop wrote 468,768
+            // identical lines in a single device run. Report the first
+            // sighting of each path/errno in full, a few early repeats and
+            // then powers of two, and say once that it has gone quiet. A
+            // different path is a different key and is still reported. The
+            // return value below is untouched: this bounds the diagnostics,
+            // not the syscall.
+            U64 pathKey = 1469598103934665603ULL;
+            for (const char* cursor = path; *cursor; ++cursor) {
+                pathKey = (pathKey ^ (U64)(U8)*cursor) * 1099511628211ULL;
+            }
+            const boxedvn::BoundedSyscallReportLimiter::Outcome failedOpen =
+                cpu->failedOpenReports.record(
+                    (U64)process->id,
+                    cpu->thread ? (U64)cpu->thread->id : 0,
+                    pathKey, (U64)(S64)(S32)rc);
+            using FailedOpenDecision =
+                boxedvn::BoundedSyscallReportLimiter::Decision;
+            if (failedOpen.decision == FailedOpenDecision::Detailed) {
+                klog_fmt("sys_openat64: open('%s') -> %d", path, (int)(S32)rc);
+            } else if (failedOpen.decision == FailedOpenDecision::Repeat) {
+                klog_fmt("sys_openat64: open('%s') -> %d — seen %llu times",
+                         path, (int)(S32)rc,
+                         (unsigned long long)failedOpen.occurrences);
+            } else if (failedOpen.decision == FailedOpenDecision::Suppress) {
+                klog_fmt("sys_openat64: open('%s') -> %d — seen %llu times; "
+                         "further reports for this path are suppressed",
+                         path, (int)(S32)rc,
+                         (unsigned long long)failedOpen.occurrences);
+            }
         }
         return (U64)(S64)(S32)rc;
     }

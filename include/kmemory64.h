@@ -339,6 +339,37 @@ public:
     // ordinary hint uses.
     bool rangeCompletelyUnmapped(U64 addr, U64 len) const;
 
+    // ---- Sparse inaccessible reservations -------------------------------
+    //
+    // Wine reserves multi-gigabyte arenas it never touches, at high addresses
+    // the native identity window cannot host. Refusing them is what made Wine
+    // halve the request and retry without end: one device run issued
+    // 8,916,993 mmaps and rejected 8,916,842 of them at about 98% of a core.
+    //
+    // An inaccessible anonymous range has nothing to read, nothing to execute
+    // and no pointer FEX could ever be handed, so it needs no host mapping and
+    // no K64Page per 4 KiB. It is recorded as one interval, whatever its size.
+    // These live outside the native window by construction, so nothing here
+    // changes identity mappings, the low alias, or any accessible mapping.
+
+    // Record [addr, addr+len) as reserved. Returns `addr` on success, or
+    // -K_EEXIST when any part of the range is already mapped or reserved.
+    // Costs one interval regardless of length; no page objects are created.
+    U64 reserveSparseNoReplace(U64 addr, U64 len);
+
+    // True when any page of [addr, addr+len) falls inside a reservation.
+    bool sparseReservationOverlaps(U64 addr, U64 len) const;
+
+    // Remove [addr, addr+len) from the reservations, splitting an interval it
+    // falls inside and trimming the ones it partially covers, so the address
+    // space is genuinely reusable. Returns true when anything was removed.
+    bool releaseSparseReservation(U64 addr, U64 len);
+
+    // Live interval count and total reserved pages. For tests and diagnostics:
+    // the interval count is what proves the representation is sparse.
+    U64 sparseReservationCount() const;
+    U64 sparseReservationPages() const;
+
     // Atomically pick a free address range AND map it, so two guest threads of
     // the same process (sharing this KMemory64) can never be handed overlapping
     // mmap(NULL,...) placements. The old split — allocMmapRange() scans for a
@@ -504,6 +535,13 @@ private:
     enum MMapKind : U8 { MMAP_ANON = 0, MMAP_FILE = 1, MMAP_RESERVED = 2 };
     struct MMapRange { U64 startPage; U64 pageCount; U32 prot; U8 kind; };
     std::map<U64, MMapRange> ranges;
+
+    // Inaccessible guest reservations outside the native window, as
+    // non-overlapping intervals keyed by start PAGE number: startPage ->
+    // pageCount. Deliberately separate from `ranges`, which feeds the
+    // high-window gap scan; these addresses are never allocated from and must
+    // not perturb that search. Guarded by mmapMutex.
+    std::map<U64, U64> sparseReservations;
 
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
     struct NativeRange { U64 hostStart; U64 hostLength; U32 prot; };

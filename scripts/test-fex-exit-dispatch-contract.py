@@ -1700,7 +1700,7 @@ def main() -> None:
             "const BString winePrefix = guestWinePrefixFromEnv(this->envValues);",
             'const BString wineDosDevices = winePrefix + "/dosdevices";',
             "Fs::makeLocalDirs(wineDosDevices);",
-            "BOXEDWINE_X64_PREFIX path=%s arch=%s dosdevices=%s cwd=%s",
+            "BOXEDWINE_X64_PREFIX path=%s arch=%s dosdevices=%s ",
         ],
         "BoxedVN startup prefix resolution",
     )
@@ -1971,6 +1971,226 @@ def main() -> None:
             "BW64_SCDUMP must be gated by the report limiter as well as by "
             "its environment variable"
         )
+
+    # ------------------------------------------------------------------ #
+    # Wine reserves inaccessible arenas at high addresses the identity        #
+    # window cannot host. Refusing them made it retry without end: 8,916,993  #
+    # mmaps in one device run, 8,916,842 rejected, ~98% of a core.            #
+    # ------------------------------------------------------------------ #
+    placement = read(repository / "include/guest_mmap_placement.h")
+    require_ordered(
+        placement,
+        [
+            "ReserveSparse = 5,",
+            "bool anonymous = false;",
+            "if (request.nativeIdentity && !request.exactRangeAllowed) {",
+            "if (request.anonymous && request.protection == 0) {",
+            "return GuestMmapPlacement::ReserveSparse;",
+            "return GuestMmapPlacement::FailExists;",
+        ],
+        "BoxedVN sparse reservation placement contract",
+    )
+    # A reservation is a grant, not a failure: nothing may skip the address
+    # space for it.
+    failure_start = placement.index("inline bool guestMmapPlacementIsFailure(")
+    failure_body = placement[failure_start:placement.index("}", failure_start)]
+    if "ReserveSparse" in failure_body:
+        raise SystemExit(
+            "a granted sparse reservation must not be classified as a failure"
+        )
+
+    memory_header = read(repository / "include/kmemory64.h")
+    require_ordered(
+        memory_header,
+        [
+            "U64 reserveSparseNoReplace(U64 addr, U64 len);",
+            "bool sparseReservationOverlaps(U64 addr, U64 len) const;",
+            "bool releaseSparseReservation(U64 addr, U64 len);",
+            "U64 sparseReservationCount() const;",
+            "std::map<U64, U64> sparseReservations;",
+        ],
+        "BoxedVN sparse reservation address-space contract",
+    )
+
+    memory = read(repository / "source/kernel/kmemory64.cpp")
+    require_ordered(
+        memory,
+        [
+            "U64 KMemory64::reserveSparseNoReplace(",
+            "return (U64)-K_EEXIST;",
+            "bool KMemory64::sparseReservationOverlaps(",
+            "bool KMemory64::releaseSparseReservation(",
+        ],
+        "BoxedVN sparse reservation implementation contract",
+    )
+    # The whole point is that a reservation costs one interval. It must not
+    # walk pages, map anything, or touch the native layer.
+    reserve_start = memory.index("U64 KMemory64::reserveSparseNoReplace(")
+    reserve_body = memory[reserve_start:memory.index(
+        newline + "}" + newline, reserve_start)]
+    for line in code_lines(reserve_body):
+        for banned in ("getOrAllocPage", "commitPageLocked",
+                       "mmapAnonymousFixed", "nativeMapAnonymous",
+                       "mmapReserveAndMap", "new K64Page"):
+            if banned in line:
+                raise SystemExit(
+                    "a sparse reservation must allocate no backing store: " +
+                    line
+                )
+    # munmap has to release the interval before the native window guard, or the
+    # address could never be reused.
+    munmap_start = memory.index("U64 KMemory64::munmap(")
+    munmap_body = memory[munmap_start:munmap_start + 2000]
+    release_at = munmap_body.index("releaseSparseReservation(")
+    guard_at = munmap_body.index("reject native munmap outside guest window")
+    if release_at > guard_at:
+        raise SystemExit(
+            "munmap must release a sparse reservation before the native "
+            "window guard refuses its address"
+        )
+    if "sparseReservations = from->sparseReservations;" not in memory:
+        raise SystemExit(
+            "a cloned address space must inherit its sparse reservations"
+        )
+
+    syscall_mmap = read(repository / "source/kernel/syscall64.cpp")
+    require_ordered(
+        syscall_mmap,
+        [
+            "request.anonymous = true;",
+            "cpu->memory->sparseReservationOverlaps(alignedAddr, mapLen)",
+            "case boxedvn::GuestMmapPlacement::ReserveSparse:",
+            "cpu->memory->reserveSparseNoReplace(alignedAddr, mapLen);",
+        ],
+        "BoxedVN sparse reservation syscall contract",
+    )
+    # Summaries are bounded, not merely strided: one line per 4096 calls still
+    # produced 2,177 lines against nine million mmaps.
+    if "kGuestMmapSummaryEvery" in syscall_mmap:
+        raise SystemExit(
+            "mmap summaries must be bounded rather than emitted on a fixed "
+            "stride"
+        )
+    require_ordered(
+        syscall_mmap,
+        [
+            "bool guestMmapSummaryDue(U64 ordinal) {",
+            "(ordinal & (ordinal - 1)) == 0;",
+            'reportGuestMmapSummary("milestone");',
+        ],
+        "BoxedVN bounded mmap summary contract",
+    )
+
+    # ------------------------------------------------------------------ #
+    # CMPXCHG16B: Wine's ntdll reaches f0 49 0f c7 08 and the interpreter      #
+    # stopped there with "unimpl opcode".                                     #
+    # ------------------------------------------------------------------ #
+    cmpxchg = read(repository / "include/cmpxchg16b.h")
+    require_ordered(
+        cmpxchg,
+        [
+            "inline Cmpxchg16bResult evaluateCmpxchg16b(",
+            "if (memoryLow == rax && memoryHigh == rdx) {",
+            "result.writeLow = rbx;",
+            "result.writeHigh = rcx;",
+            "result.zeroFlag = true;",
+            "result.raxAfter = memoryLow;",
+            "result.rdxAfter = memoryHigh;",
+            "result.zeroFlag = false;",
+            "inline bool isCmpxchg16bEncoding(",
+            "return (regField & 7) == 1 && rexW && !registerForm;",
+        ],
+        "BoxedVN CMPXCHG16B semantics contract",
+    )
+    interpreter64 = read(repository / "source/emulation/cpu/cpu64.cpp")
+    require_ordered(
+        interpreter64,
+        [
+            '#include "cmpxchg16b.h"',
+            "if (op2 == 0xC7 && opSize == 8) {",
+            "boxedvn::isCmpxchg16bEncoding(m.regField, opSize == 8,",
+            "goto unhandled;",
+            "cpu64AtomicLockFor(m.effAddr)",
+            "boxedvn::evaluateCmpxchg16b(memLow, memHigh,",
+            "if (swap.succeeded) {",
+            "memory->writeq(m.effAddr, swap.writeLow);",
+            "memory->writeq(m.effAddr + 8, swap.writeHigh);",
+            "reg[X64_RAX].setU64(swap.raxAfter);",
+            "reg[X64_RDX].setU64(swap.rdxAfter);",
+            "if (swap.zeroFlag) rflags |= X64_ZF;",
+            "U32 used = opOff + 2 + m.length;",
+        ],
+        "BoxedVN CMPXCHG16B interpreter contract",
+    )
+    # ZF is the architectural result; the SDM leaves the rest undefined, and
+    # flagsSub would invent them.
+    cmpxchg_start = interpreter64.index("if (op2 == 0xC7 && opSize == 8) {")
+    cmpxchg_body = interpreter64[cmpxchg_start:cmpxchg_start + 2400]
+    if "flagsSub" in cmpxchg_body:
+        raise SystemExit(
+            "CMPXCHG16B must not synthesise the flags the SDM leaves undefined"
+        )
+
+    # ------------------------------------------------------------------ #
+    # The Wine C: drive link, and the diagnostics it used to drown.           #
+    # ------------------------------------------------------------------ #
+    prefix_header = read(repository / "include/guest_wine_prefix.h")
+    require_ordered(
+        prefix_header,
+        [
+            '#define K_GUEST_WINE_DRIVE_C "drive_c"',
+            '#define K_GUEST_WINE_DOSDEVICES "dosdevices"',
+            '#define K_GUEST_WINE_C_LINK "c:"',
+            '#define K_GUEST_WINE_C_LINK_TARGET "../drive_c"',
+            "inline GuestWinePrefixSetup planGuestWinePrefixSetup(",
+            "setup.createDriveCLink = !driveCLinkExists;",
+        ],
+        "BoxedVN Wine prefix completion contract",
+    )
+    startup = read(repository / "source/sdl/startupArgs.cpp")
+    require_ordered(
+        startup,
+        [
+            'const BString wineDriveC = winePrefix + "/" K_GUEST_WINE_DRIVE_C;',
+            "boxedvn::planGuestWinePrefixSetup(",
+            "if (prefixSetup.createDriveC) {",
+            "if (prefixSetup.createDosDevices) {",
+            "if (prefixSetup.createDriveCLink) {",
+            "Fs::addFileNode(wineDriveCLink, B(K_GUEST_WINE_C_LINK_TARGET),",
+            "BOXEDWINE_X64_PREFIX path=%s arch=%s dosdevices=%s ",
+            "drive_c=%s c_link=%s cwd=%s",
+        ],
+        "BoxedVN Wine prefix startup contract",
+    )
+    # The prefix is the resolved one, never a hardcoded .wine64.
+    for line in code_lines(startup):
+        if ".wine64" in line:
+            raise SystemExit(
+                "prefix setup must use the resolved WINEPREFIX, not a "
+                "hardcoded .wine64: " + line
+            )
+
+    require_ordered(
+        syscall_mmap,
+        [
+            "cpu->failedOpenReports.record(",
+            "FailedOpenDecision::Detailed",
+            "FailedOpenDecision::Repeat",
+            "FailedOpenDecision::Suppress",
+            "further reports for this path are suppressed",
+        ],
+        "BoxedVN bounded failed-open reporting contract",
+    )
+    # The bounded unsupported-syscall limiter stays exactly as it is: the
+    # device logs show it holding a run to about 270 KB.
+    require_ordered(
+        read(repository / "include/cpu64.h"),
+        [
+            "boxedvn::BoundedSyscallReportLimiter unsupportedSyscallReports;",
+            "boxedvn::BoundedSyscallReportLimiter failedOpenReports;",
+        ],
+        "BoxedVN diagnostic limiter contract",
+    )
 
     print("FEX exit-dispatch and loader-boundary contracts verified")
 

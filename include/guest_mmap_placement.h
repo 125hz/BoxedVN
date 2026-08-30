@@ -42,6 +42,11 @@ enum class GuestMmapPlacement : std::uint8_t {
     // A reservation probe that this address space can never host: -ENOMEM.
     // Nothing is mapped, and no allocator cursor advances.
     FailNoMemory = 4,
+    // Record an inaccessible range in guest metadata only, at exactly the
+    // requested address, without a host mapping and without one page object
+    // per 4 KiB. Wine reserves address space it never touches; the guest has
+    // to be told it owns those addresses, but nothing has to exist there.
+    ReserveSparse = 5,
 };
 
 struct GuestMmapRequest {
@@ -66,6 +71,9 @@ struct GuestMmapRequest {
     // No page in the range is mapped at all, reservations included. This is the
     // occupancy test MAP_FIXED_NOREPLACE is defined against.
     bool exactRangeUnmapped = false;
+    // MAP_ANONYMOUS. A sparse reservation has no backing store at all, so it
+    // can only stand in for a mapping that has nothing to read.
+    bool anonymous = false;
 };
 
 // Decide where one anonymous or file-backed guest mmap request belongs.
@@ -84,11 +92,23 @@ inline GuestMmapPlacement chooseGuestMmapPlacement(
             return GuestMmapPlacement::FailExists;
         }
         if (request.nativeIdentity && !request.exactRangeAllowed) {
-            // Direct execution needs identity-mappable guest addresses, so an
-            // address outside the proven window can never be provided AT the
-            // address the caller demanded. Relocating is forbidden by the flag,
-            // so model it the way Linux models an unavailable exact range:
-            // fail, map nothing, and leave the high-window cursor alone.
+            // An inaccessible anonymous range needs no host memory: there is
+            // nothing to read, nothing to execute, and nothing for FEX to be
+            // handed a pointer to. Record it in guest metadata at exactly the
+            // requested address.
+            //
+            // This is the difference between Wine starting and Wine spinning.
+            // Wine reserves its inaccessible arenas at high addresses the
+            // identity window cannot host, and refusing them made it halve the
+            // request and try again without end: one device run issued
+            // 8,916,993 mmaps, rejected 8,916,842 of them, and burned 98% of a
+            // core doing it. Granting the reservation costs one interval.
+            if (request.anonymous && request.protection == 0) {
+                return GuestMmapPlacement::ReserveSparse;
+            }
+            // Anything the guest could actually touch still has to be refused:
+            // direct execution needs identity-mappable addresses, and
+            // relocating is forbidden by the flag.
             return GuestMmapPlacement::FailExists;
         }
         return GuestMmapPlacement::MapExactNoReplace;

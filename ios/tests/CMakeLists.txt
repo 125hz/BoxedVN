@@ -34,6 +34,8 @@ add_executable(boxedvn_tests
     test_guest_wine_prefix.cpp
     test_wine_nt_syscall_stub.cpp
     test_bounded_syscall_report.cpp
+    test_sparse_reservation_policy.cpp
+    test_cmpxchg16b.cpp
     test_boot_diagnostics.cpp
     test_pixmap_formats.cpp
     test_getrusage_fairness.cpp

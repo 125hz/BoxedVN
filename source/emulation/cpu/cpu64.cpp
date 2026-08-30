@@ -13,6 +13,7 @@
 
 #include "cpu64.h"
 #include "wine_nt_syscall_memory.h"
+#include "cmpxchg16b.h"
 #include "kmemory64.h"
 #include "syscall64.h"
 #include "ksignal.h"   // K_SIGFPE
@@ -2154,6 +2155,63 @@ dsp_37:
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
+        }
+
+        // 0F C7 /1 with REX.W - CMPXCHG16B m128.
+        //
+        // Wine's ntdll reaches this five bytes into a hot path
+        // (f0 49 0f c7 08 = lock cmpxchg16b [r8]) and the device log stopped
+        // there with "unimpl opcode". The 128-bit memory value is compared
+        // against RDX:RAX; on equality RCX:RBX is stored and ZF is set, and on
+        // inequality memory is left alone and loaded into RDX:RAX with ZF
+        // clear. The caller here follows it with `sete r10b`, so ZF is the
+        // architectural result that matters; the other status flags are
+        // documented as undefined for this instruction, so no flagsSub.
+        //
+        // /1 requires a memory operand: the register form is invalid and must
+        // not be silently executed as something else. Without REX.W the same
+        // encoding is CMPXCHG8B, which nothing has needed yet.
+        if (op2 == 0xC7 && opSize == 8) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if ((m.regField & 7) == 1) {
+                if (!boxedvn::isCmpxchg16bEncoding(m.regField, opSize == 8,
+                                                   m.isReg)) {
+                    // /1 has no register form. Report it as unimplemented
+                    // rather than inventing a meaning; returning a zero length
+                    // here would spin the interpreter.
+                    goto unhandled;
+                }
+                // The whole compare-read-write is one operation as far as
+                // other threads are concerned. Take the lock for LOCK and
+                // without it alike: the guest is reading and writing 16 bytes
+                // through two 8-byte accesses either way, and a torn result is
+                // never the right answer.
+                std::unique_lock<std::recursive_mutex> atomicLock(
+                    cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+                atomicLock.lock();
+                const U64 memLow = memory->readq(m.effAddr);
+                const U64 memHigh = memory->readq(m.effAddr + 8);
+                const boxedvn::Cmpxchg16bResult swap =
+                    boxedvn::evaluateCmpxchg16b(memLow, memHigh,
+                                                reg[X64_RAX].u64,
+                                                reg[X64_RDX].u64,
+                                                reg[X64_RBX].u64,
+                                                reg[X64_RCX].u64);
+                if (swap.succeeded) {
+                    memory->writeq(m.effAddr, swap.writeLow);
+                    memory->writeq(m.effAddr + 8, swap.writeHigh);
+                }
+                // On failure memory is untouched and the caller is handed what
+                // it actually found, which is how a compare-and-swap loop
+                // makes progress.
+                reg[X64_RAX].setU64(swap.raxAfter);
+                reg[X64_RDX].setU64(swap.rdxAfter);
+                if (swap.zeroFlag) rflags |= X64_ZF;
+                else rflags &= ~X64_ZF;
+                U32 used = opOff + 2 + m.length;
+                rip += used;
+                return used;
+            }
         }
     }
 

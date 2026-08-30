@@ -31,6 +31,18 @@
 #define K_X64_GUEST_WINE_PREFIX "/home/username/.wine64"
 #define K_X64_GUEST_WINE_ARCH "win64"
 
+// The two directories every Wine prefix has, and the DOS drive link that makes
+// C: reachable. wineboot exits 0 without creating the link in a prefix it did
+// not initialise itself, and the guest then reopens the missing path forever:
+// one device run logged 468,768 failed opens of dosdevices/c:.
+#define K_GUEST_WINE_DRIVE_C "drive_c"
+#define K_GUEST_WINE_DOSDEVICES "dosdevices"
+#define K_GUEST_WINE_C_LINK "c:"
+// Relative on purpose: it is what Wine writes, and it keeps the prefix
+// relocatable. The guest filesystem resolves a relative link target against
+// the link's own directory.
+#define K_GUEST_WINE_C_LINK_TARGET "../drive_c"
+
 #if defined(__cplusplus)
 #include <cstddef>
 #include <string>
@@ -107,6 +119,45 @@ inline const char* guestWinePrefixAssignment(const char* entry) noexcept {
         ++index;
     }
     return entry + index;
+}
+
+// What a prefix is still missing. Kept as a decision so it can be tested
+// without a filesystem: the rule that matters is that nothing valid is ever
+// replaced, and a prefix Wine64 has yet to initialise is completed rather
+// than rebuilt.
+struct GuestWinePrefixSetup {
+    bool createDriveC = false;
+    bool createDosDevices = false;
+    bool createDriveCLink = false;
+
+    bool anyWorkToDo() const {
+        return createDriveC || createDosDevices || createDriveCLink;
+    }
+};
+
+inline GuestWinePrefixSetup planGuestWinePrefixSetup(bool driveCExists,
+                                                     bool dosDevicesExists,
+                                                     bool driveCLinkExists) {
+    GuestWinePrefixSetup setup;
+    setup.createDriveC = !driveCExists;
+    setup.createDosDevices = !dosDevicesExists;
+    // An existing c: is left exactly as it is, wherever it points. It may be a
+    // link the user or a previous wineboot made deliberately, and replacing it
+    // would silently move the guest's C: drive.
+    setup.createDriveCLink = !driveCLinkExists;
+    return setup;
+}
+
+inline std::string guestWineDriveCPath(const std::string& prefix) {
+    return prefix + "/" + K_GUEST_WINE_DRIVE_C;
+}
+
+inline std::string guestWineDosDevicesPath(const std::string& prefix) {
+    return prefix + "/" + K_GUEST_WINE_DOSDEVICES;
+}
+
+inline std::string guestWineDriveCLinkPath(const std::string& prefix) {
+    return guestWineDosDevicesPath(prefix) + "/" + K_GUEST_WINE_C_LINK;
 }
 
 } // namespace boxedvn

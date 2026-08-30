@@ -578,12 +578,39 @@ bool StartUpArgs::apply() {
     // would simply not exist for a 64-bit session.
     const BString winePrefix = guestWinePrefixFromEnv(this->envValues);
     const BString wineDosDevices = winePrefix + "/dosdevices";
-    // Wine64 creates its prefix on first boot, so this directory legitimately
-    // does not exist yet and an otherwise-empty .wine64 is the expected state.
-    // Only create what is missing: for the bundled 32-bit prefix the node is
-    // already there and this does nothing at all.
-    if (!Fs::getNodeFromLocalPath(B(""), wineDosDevices, true)) {
+    // Wine64 creates its prefix on first boot, so these legitimately do not
+    // exist yet and an otherwise-empty .wine64 is the expected state. Only
+    // what is missing is created: for the bundled 32-bit prefix everything is
+    // already there and none of this does anything at all.
+    //
+    // wineboot --init exits 0 without producing the C: drive link in a prefix
+    // it did not create itself, and the guest then reopens the missing path
+    // forever -- one device run logged 468,768 failed opens of
+    // dosdevices/c:. Completing the prefix is what stops that, and nothing
+    // valid is replaced: an existing c: is left exactly where it points.
+    const BString wineDriveC = winePrefix + "/" K_GUEST_WINE_DRIVE_C;
+    const BString wineDriveCLink = wineDosDevices + "/" K_GUEST_WINE_C_LINK;
+    const boxedvn::GuestWinePrefixSetup prefixSetup =
+        boxedvn::planGuestWinePrefixSetup(
+            Fs::getNodeFromLocalPath(B(""), wineDriveC, true) != nullptr,
+            Fs::getNodeFromLocalPath(B(""), wineDosDevices, true) != nullptr,
+            Fs::getNodeFromLocalPath(B(""), wineDriveCLink, false) != nullptr);
+    if (prefixSetup.createDriveC) {
+        Fs::makeLocalDirs(wineDriveC);
+    }
+    if (prefixSetup.createDosDevices) {
         Fs::makeLocalDirs(wineDosDevices);
+    }
+    if (prefixSetup.createDriveCLink) {
+        std::shared_ptr<FsNode> dosDevicesNode =
+            Fs::getNodeFromLocalPath(B(""), wineDosDevices, true);
+        if (dosDevicesNode) {
+            // A relative target, the way Wine writes it, so the prefix stays
+            // relocatable. The guest resolves it against the link's own
+            // directory.
+            Fs::addFileNode(wineDriveCLink, B(K_GUEST_WINE_C_LINK_TARGET),
+                            B(""), false, dosDevicesNode);
+        }
     }
 
     if (!this->ddrawOverridePath.isEmpty()) {
@@ -760,10 +787,17 @@ bool StartUpArgs::apply() {
         const BString wineArch = guestWineArchFromEnv(this->envValues);
         const bool dosDevicesReady =
             Fs::getNodeFromLocalPath(B(""), wineDosDevices, true) != nullptr;
-        klog_fmt("BOXEDWINE_X64_PREFIX path=%s arch=%s dosdevices=%s cwd=%s",
+        const bool driveCReady =
+            Fs::getNodeFromLocalPath(B(""), wineDriveC, true) != nullptr;
+        const bool driveCLinkReady =
+            Fs::getNodeFromLocalPath(B(""), wineDriveCLink, false) != nullptr;
+        klog_fmt("BOXEDWINE_X64_PREFIX path=%s arch=%s dosdevices=%s "
+                 "drive_c=%s c_link=%s cwd=%s",
                  winePrefix.c_str(),
                  wineArch.length() ? wineArch.c_str() : "(default)",
                  dosDevicesReady ? "ready" : "missing",
+                 driveCReady ? "ready" : "missing",
+                 driveCLinkReady ? "ready" : "missing",
                  workingDir.c_str());
     }
     if (this->sdlFullScreen!=FULLSCREEN_NOTSET && !this->resolutionSet) {

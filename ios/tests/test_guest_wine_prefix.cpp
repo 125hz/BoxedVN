@@ -94,3 +94,85 @@ BOXEDVN_TEST(guest_wine_prefix_constants_keep_the_two_prefixes_apart) {
               .rfind(std::string(K_DEFAULT_GUEST_WINE_PREFIX) + "/", 0) !=
           0);
 }
+
+// wineboot --init exits 0 without creating the C: drive link in a prefix it
+// did not initialise itself, and the guest then reopens the missing path
+// forever: one device run logged 468,768 failed opens of
+// /home/username/.wine64/dosdevices/c:.
+
+BOXEDVN_TEST(guest_wine_prefix_completes_a_fresh_x64_prefix) {
+    // Nothing exists yet: Wine64 has been given a prefix directory and has not
+    // populated it.
+    const GuestWinePrefixSetup setup = planGuestWinePrefixSetup(false, false,
+                                                                false);
+    CHECK(setup.createDriveC);
+    CHECK(setup.createDosDevices);
+    CHECK(setup.createDriveCLink);
+    CHECK(setup.anyWorkToDo());
+}
+
+BOXEDVN_TEST(guest_wine_prefix_leaves_a_complete_prefix_alone) {
+    // The bundled 32-bit prefix, and any prefix Wine has already initialised.
+    const GuestWinePrefixSetup setup = planGuestWinePrefixSetup(true, true,
+                                                                true);
+    CHECK(!setup.createDriveC);
+    CHECK(!setup.createDosDevices);
+    CHECK(!setup.createDriveCLink);
+    CHECK(!setup.anyWorkToDo());
+}
+
+BOXEDVN_TEST(guest_wine_prefix_never_replaces_an_existing_c_link) {
+    // An existing c: is left exactly where it points, even when the rest of
+    // the prefix is missing. Replacing it would silently move the guest's C:
+    // drive out from under whatever created it.
+    const GuestWinePrefixSetup setup = planGuestWinePrefixSetup(false, true,
+                                                                true);
+    CHECK(setup.createDriveC);
+    CHECK(!setup.createDosDevices);
+    CHECK(!setup.createDriveCLink);
+}
+
+BOXEDVN_TEST(guest_wine_prefix_adds_only_the_missing_link) {
+    // The case the device hit: wineboot made the directories and exited 0
+    // without the link.
+    const GuestWinePrefixSetup setup = planGuestWinePrefixSetup(true, true,
+                                                                false);
+    CHECK(!setup.createDriveC);
+    CHECK(!setup.createDosDevices);
+    CHECK(setup.createDriveCLink);
+    CHECK(setup.anyWorkToDo());
+}
+
+BOXEDVN_TEST(guest_wine_prefix_paths_follow_the_resolved_prefix) {
+    // The paths come from the resolved WINEPREFIX, never from a hardcoded
+    // .wine64, so a caller-supplied prefix is completed rather than ignored.
+    const std::string x64 = resolveGuestWinePrefix(K_X64_GUEST_WINE_PREFIX);
+    CHECK(guestWineDriveCPath(x64) == "/home/username/.wine64/drive_c");
+    CHECK(guestWineDosDevicesPath(x64) == "/home/username/.wine64/dosdevices");
+    CHECK(guestWineDriveCLinkPath(x64) ==
+          "/home/username/.wine64/dosdevices/c:");
+
+    const std::string custom = resolveGuestWinePrefix("/opt/prefixes/x64");
+    CHECK(guestWineDriveCPath(custom) == "/opt/prefixes/x64/drive_c");
+    CHECK(guestWineDriveCLinkPath(custom) ==
+          "/opt/prefixes/x64/dosdevices/c:");
+
+    // And the 32-bit default is composed the same way, so existing prefixes
+    // are addressed exactly as before.
+    const std::string ia32 = resolveGuestWinePrefix(nullptr);
+    CHECK(guestWineDriveCLinkPath(ia32) ==
+          "/home/username/.wine/dosdevices/c:");
+}
+
+BOXEDVN_TEST(guest_wine_prefix_c_link_target_is_relative_to_dosdevices) {
+    // Wine writes a relative target so the prefix stays relocatable, and the
+    // guest resolves it against the link's own directory: dosdevices/../drive_c
+    // is the prefix's drive_c.
+    CHECK(std::string(K_GUEST_WINE_C_LINK_TARGET) == "../drive_c");
+    CHECK(std::string(K_GUEST_WINE_C_LINK) == "c:");
+    CHECK(std::string(K_GUEST_WINE_DRIVE_C) == "drive_c");
+    CHECK(std::string(K_GUEST_WINE_DOSDEVICES) == "dosdevices");
+    const std::string prefix = "/home/username/.wine64";
+    CHECK(guestWineDosDevicesPath(prefix) + "/" + K_GUEST_WINE_C_LINK_TARGET ==
+          "/home/username/.wine64/dosdevices/../drive_c");
+}

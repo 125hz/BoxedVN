@@ -180,6 +180,12 @@ public:
     // reported in full, and everything after it is bounded.
     boxedvn::BoundedSyscallReportLimiter unsupportedSyscallReports;
 
+    // The same bound for failed opens. A guest that reopens one missing path
+    // in a loop wrote 468,768 identical lines in a single device run, which
+    // buries the first sighting that would explain it. The key is the path, so
+    // a different missing file is still reported in full.
+    boxedvn::BoundedSyscallReportLimiter failedOpenReports;
+
     void run();
     // Run up to maxInsn instructions or until yield / decode failure.
     // Returns the number actually executed. Used by the self-test harness

@@ -475,6 +475,13 @@ void KMemory64::cloneFrom(const KMemory64* from) {
         return;
     }
 #endif
+    // The child inherits the parent's inaccessible reservations: they are part
+    // of the address space's shape even though nothing is mapped in them.
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+        sparseReservations = from->sparseReservations;
+    }
+
     // Lock both sides: `from` may be a live address space (the forking parent),
     // and we're populating `this` (the fresh child). The parent could fault new
     // pages concurrently in MT mode; take its lock for a consistent snapshot.
@@ -1165,6 +1172,128 @@ bool KMemory64::rangeCompletelyUnmapped(U64 addr, U64 len) const {
     return true;
 }
 
+// Wine reserves inaccessible address space it never touches, at high
+// addresses the native identity window cannot host. Refusing those made it
+// halve the request and retry without end: 8,916,993 mmaps in one device run,
+// 8,916,842 rejected, about 98% of a core. Such a range has nothing to read,
+// nothing to execute and no pointer FEX could be handed, so it is recorded as
+// one interval and nothing is mapped.
+U64 KMemory64::reserveSparseNoReplace(U64 addr, U64 len) {
+    if (len == 0) return (U64)-K_EINVAL;
+    if (addr == 0 || (addr & K64_PAGE_MASK)) return (U64)-K_EINVAL;
+    if (len > (U64)-1 - K64_PAGE_MASK || addr > (U64)-1 - len) {
+        return (U64)-K_EINVAL;
+    }
+    const U64 pageStart = addr >> K64_PAGE_SHIFT;
+    const U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    const U64 pageEnd = pageStart + pageCount;
+
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    // MAP_FIXED_NOREPLACE never replaces, so an overlap of any kind is EEXIST.
+    auto it = sparseReservations.upper_bound(pageStart);
+    if (it != sparseReservations.begin()) {
+        auto previous = std::prev(it);
+        if (previous->first + previous->second > pageStart) {
+            return (U64)-K_EEXIST;
+        }
+    }
+    if (it != sparseReservations.end() && it->first < pageEnd) {
+        return (U64)-K_EEXIST;
+    }
+    // Real pages win over a reservation: something already lives there.
+    for (U64 i = 0; i < pageCount; i++) {
+        if (isPageMapped(pageStart + i)) {
+            return (U64)-K_EEXIST;
+        }
+    }
+    // Coalesce with an immediate neighbour so a walk that reserves adjacent
+    // arenas does not accumulate one interval per call.
+    U64 mergedStart = pageStart;
+    U64 mergedEnd = pageEnd;
+    auto before = sparseReservations.find(mergedStart);
+    if (before == sparseReservations.end()) {
+        auto candidate = sparseReservations.lower_bound(mergedStart);
+        if (candidate != sparseReservations.begin()) {
+            auto previous = std::prev(candidate);
+            if (previous->first + previous->second == mergedStart) {
+                mergedStart = previous->first;
+                sparseReservations.erase(previous);
+            }
+        }
+    }
+    auto after = sparseReservations.find(mergedEnd);
+    if (after != sparseReservations.end()) {
+        mergedEnd = after->first + after->second;
+        sparseReservations.erase(after);
+    }
+    sparseReservations[mergedStart] = mergedEnd - mergedStart;
+    return addr;
+}
+
+bool KMemory64::sparseReservationOverlaps(U64 addr, U64 len) const {
+    if (len == 0) return false;
+    if (addr > (U64)-1 - len) return false;
+    const U64 pageStart = addr >> K64_PAGE_SHIFT;
+    const U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    const U64 pageEnd = pageStart + pageCount;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    auto it = sparseReservations.upper_bound(pageStart);
+    if (it != sparseReservations.begin()) {
+        auto previous = std::prev(it);
+        if (previous->first + previous->second > pageStart) return true;
+    }
+    return it != sparseReservations.end() && it->first < pageEnd;
+}
+
+bool KMemory64::releaseSparseReservation(U64 addr, U64 len) {
+    if (len == 0) return false;
+    if (addr & K64_PAGE_MASK) return false;
+    if (addr > (U64)-1 - len) return false;
+    const U64 pageStart = addr >> K64_PAGE_SHIFT;
+    const U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    const U64 pageEnd = pageStart + pageCount;
+
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    bool removed = false;
+    auto it = sparseReservations.lower_bound(pageStart);
+    if (it != sparseReservations.begin()) {
+        // The interval starting before the request may still reach into it.
+        --it;
+    }
+    while (it != sparseReservations.end() && it->first < pageEnd) {
+        const U64 start = it->first;
+        const U64 end = start + it->second;
+        if (end <= pageStart) {
+            ++it;
+            continue;
+        }
+        removed = true;
+        it = sparseReservations.erase(it);
+        // Whatever of this interval lies outside the request survives, so a
+        // munmap through the middle of a reservation splits it in two.
+        if (start < pageStart) {
+            sparseReservations[start] = pageStart - start;
+        }
+        if (end > pageEnd) {
+            sparseReservations[pageEnd] = end - pageEnd;
+            break;
+        }
+    }
+    return removed;
+}
+
+U64 KMemory64::sparseReservationCount() const {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    return (U64)sparseReservations.size();
+}
+
+U64 KMemory64::sparseReservationPages() const {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    U64 total = 0;
+    for (const auto& entry : sparseReservations) total += entry.second;
+    return total;
+}
+
 U64 KMemory64::mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot) {
     if (len == 0) return (U64)-K_EINVAL;
     if (addr == 0 || (addr & K64_PAGE_MASK)) return (U64)-K_EINVAL;
@@ -1393,6 +1522,16 @@ U64 KMemory64::munmap(U64 addr, U64 len) {
     if (len > (U64)-1 - K64_PAGE_MASK) return (U64)-K_EINVAL;
     U64 pageStart = addr >> K64_PAGE_SHIFT;
     U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+
+    // Sparse reservations sit outside the native window by construction, so
+    // they have to be released before the window guard below refuses their
+    // address. They have no pages and no host mapping: removing the interval
+    // IS the unmap, and the address becomes reservable again.
+    if (releaseSparseReservation(addr, pageCount << K64_PAGE_SHIFT)) {
+        if (rangeCompletelyUnmapped(addr, pageCount << K64_PAGE_SHIFT)) {
+            return 0;
+        }
+    }
 
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
     if (nativeIdentityMode()) {
