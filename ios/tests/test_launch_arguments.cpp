@@ -105,6 +105,8 @@ BOXEDVN_TEST(fex64_launch_mounts_runtime_layers_and_enters_wine64) {
         "-zip", "/runtime/glibc-rootfs64.zip",
         "-zip", "/runtime/wine64.zip",
         "-nozip", "-env", "BOXEDWINE_CPU64=fex",
+        "-env", "WINEPREFIX=/home/username/.wine64",
+        "-env", "WINEARCH=win64",
         "/usr/lib/wine/wine64", "d:\\probe.exe",
     };
     CHECK(actual == expected);
@@ -477,4 +479,96 @@ BOXEDVN_TEST(interpret_range_sentinel_rejects_what_it_cannot_parse) {
         // Still consumed: the guest must never see BoxedVN's own words.
         CHECK(launch.arguments.empty());
     }
+}
+
+// The root filesystem's only prefix is a 32-bit Wine installation, so Wine64
+// refused to start in it: "'/home/username/.wine' is a 32-bit installation,
+// it cannot support 64-bit applications". Giving the launch a separate
+// writable host root was not enough, because the guest path is what Wine
+// reads and that path still resolved to the bundled 32-bit prefix.
+
+BOXEDVN_TEST(fex64_launch_gets_its_own_prefix_and_win64_arch) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\game.exe";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::count(actual.begin(), actual.end(),
+                     "WINEPREFIX=/home/username/.wine64") == 1);
+    CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=win64") == 1);
+    // The 32-bit prefix is never named, and never converted or renamed: it
+    // stays exactly where it is as the default for 32-bit programs.
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "WINEPREFIX=/home/username/.wine") == actual.end());
+}
+
+BOXEDVN_TEST(fex64_launch_keeps_a_caller_supplied_prefix_and_arch) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\game.exe";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    launch.environment = {
+        "WINEPREFIX=/home/username/.wine-experiment",
+        "WINEARCH=win32",
+    };
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::count(actual.begin(), actual.end(),
+                     "WINEPREFIX=/home/username/.wine-experiment") == 1);
+    CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=win32") == 1);
+    // The defaults must not be appended alongside the caller's own choice:
+    // the guest would then see two assignments for the same variable.
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "WINEPREFIX=/home/username/.wine64") == actual.end());
+    CHECK(std::find(actual.begin(), actual.end(), "WINEARCH=win64") ==
+          actual.end());
+}
+
+BOXEDVN_TEST(fex64_launch_keeps_one_default_when_only_the_other_is_given) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\game.exe";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    launch.environment = {"WINEPREFIX=/home/username/.wine-experiment"};
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::count(actual.begin(), actual.end(),
+                     "WINEPREFIX=/home/username/.wine-experiment") == 1);
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "WINEPREFIX=/home/username/.wine64") == actual.end());
+    // WINEARCH was not supplied, so the 64-bit default still applies.
+    CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=win64") == 1);
+}
+
+BOXEDVN_TEST(ia32_launch_is_left_on_the_default_prefix) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.writableRootPath = "/prefixes/default";
+    launch.gameDirectoryHostPath = "/games/example";
+    launch.executablePath = "d:\\game.exe";
+    launch.runThroughWine = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    // A 32-bit launch must not be moved to a 64-bit prefix, and must not be
+    // told it is win64.
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "WINEPREFIX=/home/username/.wine64") == actual.end());
+    CHECK(std::find(actual.begin(), actual.end(), "WINEARCH=win64") ==
+          actual.end());
+    for (const std::string& entry : actual) {
+        CHECK(entry.rfind("WINEPREFIX=", 0) != 0);
+        CHECK(entry.rfind("WINEARCH=", 0) != 0);
+    }
+    // And it still enters Wine through the 32-bit loader.
+    CHECK(std::find(actual.begin(), actual.end(), "/bin/wine") != actual.end());
 }

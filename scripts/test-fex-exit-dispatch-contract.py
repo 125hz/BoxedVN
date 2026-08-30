@@ -1635,6 +1635,120 @@ def main() -> None:
             'the rootfs layer must ship the guest runtime directory'
         )
 
+    # ------------------------------------------------------------------ #
+    # The root filesystem ships one Wine prefix and it is a 32-bit          #
+    # installation, so Wine64 refused it: "'/home/username/.wine' is a      #
+    # 32-bit installation, it cannot support 64-bit applications". A        #
+    # 64-bit launch gets its own prefix, and everything that used to spell  #
+    # the one fixed prefix out has to resolve it from the environment       #
+    # instead -- a drive link written into a prefix the guest never opens   #
+    # is invisible to it.                                                   #
+    # ------------------------------------------------------------------ #
+    newline = chr(10)
+    prefix_header = read(repository / "include/guest_wine_prefix.h")
+    require_ordered(
+        prefix_header,
+        [
+            '#define K_DEFAULT_GUEST_WINE_PREFIX "/home/username/.wine"',
+            '#define K_X64_GUEST_WINE_PREFIX "/home/username/.wine64"',
+            '#define K_X64_GUEST_WINE_ARCH "win64"',
+            "inline bool isUsableGuestWinePrefix(",
+            "inline std::string resolveGuestWinePrefix(",
+            "inline const char* guestWinePrefixAssignment(",
+        ],
+        "BoxedVN guest Wine prefix contract",
+    )
+
+    launch_arguments = read(repository / "ios/runtime/src/BVNLaunchArguments.cpp")
+    require_ordered(
+        launch_arguments,
+        [
+            '#include "guest_wine_prefix.h"',
+            "if (launch.useFEX64) {",
+            'argv.push_back("BOXEDWINE_CPU64=fex");',
+            'if (entry.rfind("WINEPREFIX=", 0) == 0) {',
+            'if (entry.rfind("WINEARCH=", 0) == 0) {',
+            "if (!callerSetWinePrefix) {",
+            "K_X64_GUEST_WINE_PREFIX);",
+            "if (!callerSetWineArch) {",
+            "K_X64_GUEST_WINE_ARCH);",
+        ],
+        "BoxedVN x86-64 Wine prefix defaults",
+    )
+    # The defaults belong to the 64-bit path only. A 32-bit launch keeps the
+    # bundled prefix, which is never renamed, converted or migrated.
+    fex64_start = launch_arguments.index("if (launch.useFEX64) {" + newline +
+                                         '        argv.push_back("-env");')
+    fex64_end = launch_arguments.index(newline + "    }" + newline, fex64_start)
+    fex64_body = launch_arguments[fex64_start:fex64_end]
+    for required in ("K_X64_GUEST_WINE_PREFIX", "K_X64_GUEST_WINE_ARCH"):
+        if required not in fex64_body:
+            raise SystemExit(
+                "the x86-64 Wine prefix defaults must be inside the useFEX64 "
+                "branch"
+            )
+
+    startup_args = read(repository / "source/sdl/startupArgs.cpp")
+    require_ordered(
+        startup_args,
+        [
+            '#include "guest_wine_prefix.h"',
+            "static BString guestWinePrefixFromEnv(",
+            "boxedvn::guestWinePrefixAssignment(entry.c_str())",
+            "boxedvn::resolveGuestWinePrefix(selected)",
+            "static BString guestWineArchFromEnv(",
+            "const BString winePrefix = guestWinePrefixFromEnv(this->envValues);",
+            'const BString wineDosDevices = winePrefix + "/dosdevices";',
+            "Fs::makeLocalDirs(wineDosDevices);",
+            "BOXEDWINE_X64_PREFIX path=%s arch=%s dosdevices=%s cwd=%s",
+        ],
+        "BoxedVN startup prefix resolution",
+    )
+    # No launch-setup path may go back to assuming one fixed prefix. Comments
+    # may still name it; code may not.
+    for line in startup_args.split(newline):
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
+        if "/home/username/.wine" in stripped:
+            raise SystemExit(
+                "startupArgs.cpp must resolve the guest Wine prefix rather "
+                "than hardcoding it: " + stripped
+            )
+    # And the drive links have to be created under the resolved prefix.
+    for required in ('Fs::getNodeFromLocalPath(B(""), wineDosDevices, true)',
+                     'Fs::addFileNode(wineDosDevices + "/" + info.localPath',
+                     'Fs::addFileNode(wineDosDevices + "/t:"'):
+        if required not in startup_args:
+            raise SystemExit(
+                "the dosdevices drive links must use the resolved prefix: " +
+                required
+            )
+
+    # BoxedWine's -w takes a guest Linux directory. The x64 probe passed a
+    # Windows path, and the device log shows the result: open(".") -> -2.
+    app_model = read(repository / "ios/app/Sources/AppModel.swift")
+    if 'workingDirectory: "/mnt/drive_d/.boxedvn-x64-diagnostics"' not in app_model:
+        raise SystemExit(
+            "the x86-64 graphics probe must pass a guest Linux working "
+            "directory to BoxedWine -w"
+        )
+    x64_probe_start = app_model.index("func launchX64GraphicsProbe(")
+    x64_probe = app_model[x64_probe_start:]
+    x64_probe = x64_probe[:x64_probe.index(newline + "    func ")]
+    if 'workingDirectory: "d:' in x64_probe.lower():
+        raise SystemExit(
+            "the x86-64 graphics probe must not pass a Windows path as the "
+            "BoxedWine working directory"
+        )
+    # The executable argument stays a Windows path: Wine is what reads it.
+    if 'd:' + chr(92) + chr(92) + '.boxedvn-x64-diagnostics' + chr(92) + chr(92) + \
+            'boxedvn-d3d11-cube-x64.exe' not in x64_probe:
+        raise SystemExit(
+            "the x86-64 graphics probe must still pass its executable as a "
+            "Windows path"
+        )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

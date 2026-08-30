@@ -19,6 +19,8 @@
 #include "boxedwine.h"
 #include "startupArgs.h"
 
+#include "guest_wine_prefix.h"
+
 #include "devtty.h"
 #include "devurandom.h"
 #include "devnull.h"
@@ -83,6 +85,37 @@ static void addDefaultEnvValue(std::vector<BString>& envValues, const char* valu
     if (!hasEnvValue(envValues, name.c_str())) {
         envValues.push_back(BString::copy(value));
     }
+}
+
+// The guest Wine prefix this launch actually uses.
+//
+// WINEPREFIX in the guest environment is authoritative, because it is what
+// Wine itself reads. An x86-64 launch sets it to .wine64: the bundled
+// /home/username/.wine is a 32-bit installation and Wine64 refuses to run in
+// it. The last assignment wins, which is what the guest would see. With no
+// WINEPREFIX, or one that is not a usable absolute guest path, this is the
+// unchanged 32-bit default, so IA-32 launches behave exactly as before.
+static BString guestWinePrefixFromEnv(const std::vector<BString>& envValues) {
+    const char* selected = nullptr;
+    for (const BString& entry : envValues) {
+        const char* value = boxedvn::guestWinePrefixAssignment(entry.c_str());
+        if (value) {
+            selected = value;
+        }
+    }
+    return BString::copy(boxedvn::resolveGuestWinePrefix(selected).c_str());
+}
+
+// WINEARCH, for the launch marker only. Empty means the caller left it to
+// Wine, which is the ordinary 32-bit case.
+static BString guestWineArchFromEnv(const std::vector<BString>& envValues) {
+    BString selected;
+    for (const BString& entry : envValues) {
+        if (entry.startsWith("WINEARCH=")) {
+            selected = entry.substr(9);
+        }
+    }
+    return selected;
 }
 
 static void addDefaultUtf8LocaleEnv(std::vector<BString>& envValues, bool guestHasUtf8Locale) {
@@ -538,26 +571,42 @@ bool StartUpArgs::apply() {
     envValues.push_back(B("WINE_FAKE_WAIT_VBLANK=60"));
     addDefaultUtf8LocaleEnv(envValues, guestHasUtf8Locale());
 
+    // Everything below that used to spell out /home/username/.wine -- the
+    // dosdevices drive links, the T: mount, and the ddraw and DXVK overlays --
+    // has to agree with the prefix Wine will actually open. A link written
+    // into a prefix the guest never opens is invisible to it, so D: and E:
+    // would simply not exist for a 64-bit session.
+    const BString winePrefix = guestWinePrefixFromEnv(this->envValues);
+    const BString wineDosDevices = winePrefix + "/dosdevices";
+    // Wine64 creates its prefix on first boot, so this directory legitimately
+    // does not exist yet and an otherwise-empty .wine64 is the expected state.
+    // Only create what is missing: for the bundled 32-bit prefix the node is
+    // already there and this does nothing at all.
+    if (!Fs::getNodeFromLocalPath(B(""), wineDosDevices, true)) {
+        Fs::makeLocalDirs(wineDosDevices);
+    }
+
     if (!this->ddrawOverridePath.isEmpty()) {
         envValues.push_back(B("WINEDLLOVERRIDES=ddraw=n,b"));
         std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(BString::empty, this->ddrawOverridePath, true);
         if (!parent) {
             klog_fmt("-ddrawOverride %s not found", this->ddrawOverridePath.c_str());
         }
-        std::shared_ptr<FsNode> ddrawParent = Fs::getNodeFromLocalPath(BString::empty, B("/home/username/.wine/drive_c/ddraw"), true);
+        const BString ddrawDir = winePrefix + "/drive_c/ddraw";
+        std::shared_ptr<FsNode> ddrawParent = Fs::getNodeFromLocalPath(BString::empty, ddrawDir, true);
         if (!ddrawParent) {
-            klog("-ddrawOverride was specificied but /home/username/.wine/drive_c/ddraw was not found in the file system");
+            klog_fmt("-ddrawOverride was specificied but %s was not found in the file system", ddrawDir.c_str());
         }
         if (parent && ddrawParent) {
-            Fs::addFileNode(this->ddrawOverridePath + "/ddraw.dll", B("/home/username/.wine/drive_c/ddraw/ddraw.dll"), ddrawParent->nativePath.stringByApppendingPath("ddraw.dll"), false, parent);
-            Fs::addFileNode(this->ddrawOverridePath + "/ddraw.ini", B("/home/username/.wine/drive_c/ddraw/ddraw.ini"), ddrawParent->nativePath.stringByApppendingPath("ddraw.ini"), false, parent);
+            Fs::addFileNode(this->ddrawOverridePath + "/ddraw.dll", ddrawDir + "/ddraw.dll", ddrawParent->nativePath.stringByApppendingPath("ddraw.dll"), false, parent);
+            Fs::addFileNode(this->ddrawOverridePath + "/ddraw.ini", ddrawDir + "/ddraw.ini", ddrawParent->nativePath.stringByApppendingPath("ddraw.ini"), false, parent);
         }
     }
     if (this->enableDXVK) {
         envValues.push_back(B("DXVK_LOG_LEVEL=warn"));
         envValues.push_back(B("WINEDLLOVERRIDES=d3d11,d3d10core,d3d9,d3d8,dxgi=n,b"));
-        std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(BString::empty, B("/home/username/.wine/drive_c/windows/system32"), true);
-        std::shared_ptr<FsNode> dxvkParent = Fs::getNodeFromLocalPath(BString::empty, B("/home/username/.wine/drive_c/dxvk"), true);
+        std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(BString::empty, winePrefix + "/drive_c/windows/system32", true);
+        std::shared_ptr<FsNode> dxvkParent = Fs::getNodeFromLocalPath(BString::empty, winePrefix + "/drive_c/dxvk", true);
         if (!dxvkParent) {
             klog("-dxvk was enabled but not found in the file system");
         } else {
@@ -611,8 +660,13 @@ bool StartUpArgs::apply() {
         if (info.wine) {
             std::shared_ptr<FsNode> mntDir = Fs::getNodeFromLocalPath(B(""), B("/mnt"), true);
             std::shared_ptr<FsNode> drive_d = Fs::addRootDirectoryNode("/mnt/drive_"+info.localPath, info.nativePath, mntDir);
-            std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), B("/home/username/.wine/dosdevices"), true);
-            Fs::addFileNode("/home/username/.wine/dosdevices/"+info.localPath+":", "/mnt/drive_"+info.localPath, B(""), false, parent); 
+            std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), wineDosDevices, true);
+            if (parent) {
+                Fs::addFileNode(wineDosDevices + "/" + info.localPath + ":", "/mnt/drive_"+info.localPath, B(""), false, parent);
+            } else {
+                klog_fmt("drive %s: not linked because %s is missing",
+                         info.localPath.c_str(), wineDosDevices.c_str());
+            }
         } else {
             BString ext = info.nativePath.substr(info.nativePath.length()-4).toLowerCase();
             if (ext == ".zip") {
@@ -670,9 +724,9 @@ bool StartUpArgs::apply() {
                 }
                 
                 std::shared_ptr<FsNode> drive_d = Fs::addRootDirectoryNode(B("/mnt/drive_t"), dir, mntDir);
-                std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), B("/home/username/.wine/dosdevices"), true);
+                std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), wineDosDevices, true);
                 if (parent) {
-                    Fs::addFileNode(B("/home/username/.wine/dosdevices/t:"), B("/mnt/drive_t"), B(""), false, parent);
+                    Fs::addFileNode(wineDosDevices + "/t:", B("/mnt/drive_t"), B(""), false, parent);
                 }
 
                 if (!workingDirSet) {
@@ -695,6 +749,22 @@ bool StartUpArgs::apply() {
                 }
             }
         }
+    }
+
+    // One line, after the prefix, the drive links and the working directory
+    // are all settled. Which prefix a launch opened and whether its
+    // dosdevices survived used to be unanswerable from a device log: a
+    // 64-bit session that wrote its drive links into the 32-bit prefix
+    // looks exactly like one that wrote them nowhere.
+    {
+        const BString wineArch = guestWineArchFromEnv(this->envValues);
+        const bool dosDevicesReady =
+            Fs::getNodeFromLocalPath(B(""), wineDosDevices, true) != nullptr;
+        klog_fmt("BOXEDWINE_X64_PREFIX path=%s arch=%s dosdevices=%s cwd=%s",
+                 winePrefix.c_str(),
+                 wineArch.length() ? wineArch.c_str() : "(default)",
+                 dosDevicesReady ? "ready" : "missing",
+                 workingDir.c_str());
     }
     if (this->sdlFullScreen!=FULLSCREEN_NOTSET && !this->resolutionSet) {
         U32 width = 0;

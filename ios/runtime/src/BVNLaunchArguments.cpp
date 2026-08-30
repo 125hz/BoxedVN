@@ -7,6 +7,7 @@
 
 #include "boxedvn/direct3d_profile.h"
 #include "boxedvn/engine_profile.h"
+#include "guest_wine_prefix.h"
 
 #include <initializer_list>
 
@@ -506,6 +507,37 @@ std::vector<std::string> BVNBuildLaunchArguments(
     if (launch.useFEX64) {
         argv.push_back("-env");
         argv.push_back("BOXEDWINE_CPU64=fex");
+        // The root filesystem ships one prefix and it is a 32-bit Wine
+        // installation, so Wine64 refuses it outright: "'/home/username/.wine'
+        // is a 32-bit installation, it cannot support 64-bit
+        // applications". Giving the launch a separate writable host root
+        // does not help, because the guest path is what Wine reads and
+        // that path still resolved to the bundled 32-bit prefix. Give the
+        // 64-bit launch a prefix of its own and let Wine64 initialise it
+        // on first boot. /home/username/.wine is left exactly as it is,
+        // and stays the default for 32-bit programs.
+        //
+        // A caller that supplied either value keeps it: the point is a
+        // working default, not a policy the caller cannot escape.
+        bool callerSetWinePrefix = false;
+        bool callerSetWineArch = false;
+        for (const std::string& entry : launch.environment) {
+            if (entry.rfind("WINEPREFIX=", 0) == 0) {
+                callerSetWinePrefix = true;
+            } else if (entry.rfind("WINEARCH=", 0) == 0) {
+                callerSetWineArch = true;
+            }
+        }
+        if (!callerSetWinePrefix) {
+            argv.push_back("-env");
+            argv.push_back(std::string("WINEPREFIX=") +
+                           K_X64_GUEST_WINE_PREFIX);
+        }
+        if (!callerSetWineArch) {
+            argv.push_back("-env");
+            argv.push_back(std::string("WINEARCH=") +
+                           K_X64_GUEST_WINE_ARCH);
+        }
     }
     for (const std::string& entry : launch.environment) {
         argv.push_back("-env");

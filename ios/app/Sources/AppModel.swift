@@ -646,7 +646,13 @@ final class AppModel: ObservableObject {
                     "WINEDEBUG=warn+module,warn+seh",
                     "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
                 ],
-                workingDirectory: "d:\\.boxedvn-x64-diagnostics\\",
+                // BoxedWine -w takes a guest Linux directory, not a
+                // Windows path. The Windows form left the process with no
+                // valid current directory at all -- the device log shows
+                // open(".") -> -2 -- so give it the guest path that D:
+                // resolves to. The executable argument below stays a
+                // Windows path because Wine is what reads that one.
+                workingDirectory: "/mnt/drive_d/.boxedvn-x64-diagnostics",
                 width: container.width,
                 height: container.height,
                 soundEnabled: false,
