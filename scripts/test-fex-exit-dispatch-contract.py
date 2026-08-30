@@ -799,6 +799,142 @@ def main() -> None:
         "BoxedVN contained-fault guest state report",
     )
 
+    # ------------------------------------------------------------------ #
+    # Canonical low guest addresses served through a high host alias.      #
+    # Wine's TEB reservation is below 2 GiB and cannot be host-mapped at    #
+    # its own address, so it is dereferenced through the alias instead.     #
+    # ------------------------------------------------------------------ #
+    alias_header = read(repository / "include/guest_low_alias.h")
+    alias_patch = read(
+        repository / "scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
+    )
+    kmemory64_header_text = read(repository / "include/kmemory64.h")
+    kmemory64_text = read(repository / "source/kernel/kmemory64.cpp")
+    backend_text = read(repository / "ios/runtime/src/BVNFEXBackend.mm")
+
+    # The translation must be a single OR, which requires the base to be
+    # aligned to the limit and every high address to already carry its bits.
+    require_ordered(
+        alias_header,
+        [
+            "kGuestLowLimit = 0x200000000ULL",
+            "kGuestLowAliasBase = 0x7800000000ULL",
+            "kGuestHighBase = kGuestLowAliasEnd",
+            "static_assert((kGuestLowAliasBase & (kGuestLowLimit - 1)) == 0,",
+            "static_assert((kGuestHighBase & kGuestLowAliasBase) == "
+            "kGuestLowAliasBase,",
+            "guestToHostAddress(",
+            "return guestAddress | kGuestLowAliasBase;",
+            "hostToGuestAddress(",
+            "guestRangeHostable(",
+        ],
+        "BoxedVN low guest alias contract",
+    )
+
+    # The address space layout and the shared arithmetic must agree.
+    require_ordered(
+        kmemory64_header_text,
+        [
+            "#define K64_NATIVE_LOW_ALIAS_BASE",
+            "#define K64_NATIVE_LOW_GUEST_LIMIT",
+            "#define K64_NATIVE_GUEST_IMAGE_BASE   K64_NATIVE_LOW_ALIAS_END",
+            '#include "guest_low_alias.h"',
+            "K64_NATIVE_LOW_ALIAS_BASE == boxedvn::kGuestLowAliasBase",
+            "K64_NATIVE_GUEST_IMAGE_BASE == boxedvn::kGuestHighBase",
+            "k64GuestToHostAddress(",
+        ],
+        "BoxedVN aliased native layout",
+    )
+
+    # Every native host dereference derives its address through the alias, and
+    # the canonical low range is admitted so Wine's reservation can be placed.
+    require_ordered(
+        kmemory64_text,
+        [
+            "bool KMemory64::nativeGuestRangeAllowed(",
+            "if (end <= K64_NATIVE_LOW_GUEST_LIMIT) {",
+            "return addr >= K64_NATIVE_GUEST_IMAGE_BASE &&",
+            "end <= K64_NATIVE_GUEST_HIGH_END;",
+            "const U64 hostAddr = k64GuestToHostAddress(addr);",
+            "::memset((void*)(uintptr_t)hostAddr, 0, (size_t)len);",
+        ],
+        "BoxedVN aliased native mapping",
+    )
+    if "k64GuestToHostAddress(guestPageAddress)" not in kmemory64_text:
+        raise SystemExit(
+            "guest pages must adopt their aliased host backing, not their "
+            "canonical address"
+        )
+    # KUSER_SHARED_DATA must resolve through the same alias as every other low
+    # address rather than keeping a second, independent backing.
+    kuser_start = kmemory64_text.index("static bool k64IsKuserRange(")
+    kuser_end = kmemory64_text.index(chr(10) + "}" + chr(10), kuser_start)
+    if "return false;" not in kmemory64_text[kuser_start:kuser_end]:
+        raise SystemExit(
+            "KUSER_SHARED_DATA must fold into the low alias rather than "
+            "retaining a second host backing for 0x7ffe0000"
+        )
+
+    # The translator is told about the alias before any guest code compiles.
+    require_ordered(
+        backend_text,
+        [
+            '#include "guest_low_alias.h"',
+            "bundle->context->SetGuestLowAlias(boxedvn::kGuestLowAliasBase,",
+            "boxedvn::kGuestLowLimit);",
+            "BOXEDWINE_FEX64_LOW_ALIAS",
+            "if (!bundle->context->InitCore()) {",
+        ],
+        "BoxedVN translator alias arming",
+    )
+
+    # The downstream patch applies the translation only at host dereference
+    # boundaries, and encodes it as one logical-immediate OR.
+    require_ordered(
+        alias_patch,
+        [
+            "a/FEXCore/Source/Interface/Context/Context.h",
+            "+  void SetGuestLowAlias(uint64_t Base, uint64_t Limit) override {",
+            "+    GuestLowAliasBase = Base;",
+            "+  uint64_t GuestToHostAddress(uint64_t GuestAddress) const {",
+            "+    return GuestAddress | GuestLowAliasBase;",
+            "a/FEXCore/Source/Interface/Core/Core.cpp",
+            "+  return Thread.FrontendDecoder->CheckIfCacheable(Thread, "
+            "reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP))",
+            "+    GuestCode = reinterpret_cast<const uint8_t*>("
+            "GuestToHostAddress(GuestRIP));",
+            "a/FEXCore/Source/Interface/Core/JIT/JITClass.h",
+            "+  ARMEmitter::Register AliasGuestAddress(ARMEmitter::Register Base);",
+            "a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
+            "+ARMEmitter::Register Arm64JITCore::AliasGuestAddress(",
+            "+  if (AliasBase == 0) {",
+            "+    return Base;",
+            "+  orr(ARMEmitter::Size::i64Bit, TMP4, Base, AliasBase);",
+            "a/FEXCore/include/FEXCore/Core/Context.h",
+            "+  FEX_DEFAULT_VISIBILITY virtual void SetGuestLowAlias(",
+        ],
+        "BoxedVN translator low-address alias patch",
+    )
+    # An unarmed alias must leave every emitted address untouched, so the
+    # patch is inert until the runtime publishes a base.
+    alias_start = alias_patch.index("+ARMEmitter::Register Arm64JITCore::AliasGuestAddress(")
+    alias_body = alias_patch[alias_start:alias_start + 600]
+    if "AliasBase == 0" not in alias_body:
+        raise SystemExit(
+            "the translator alias must be inert when no base is published"
+        )
+
+    for label, text, fragment in (
+        ("iOS translator build", fex_build_script,
+         "apply_patch fex-boxedwine-low-address-alias.patch"),
+        ("VIXL probe", vixl_probe,
+         "fex-boxedwine-low-address-alias.patch"),
+    ):
+        if fragment not in text:
+            raise SystemExit(
+                f"{label} does not apply the low-address alias patch"
+            )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

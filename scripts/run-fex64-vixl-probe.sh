@@ -27,6 +27,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-arm64-context-indexed-unaligned-offset.patch"
     "${root}/scripts/fex64-patches/fex-arm64-addsub-immediate-range.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
 )
 
 die() {

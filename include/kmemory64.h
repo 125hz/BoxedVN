@@ -69,23 +69,63 @@ class KThread;
 // their normal Linux-style addresses and do not use these limits.
 #define K64_NATIVE_GUEST_WINDOW_START 0x7048000000ULL
 #define K64_NATIVE_GUEST_WINDOW_END   0x7fffff0000ULL
-#define K64_NATIVE_GUEST_IMAGE_BASE  (K64_NATIVE_GUEST_WINDOW_START)
+
+// Windows x86-64 binaries and Wine's loader genuinely require CANONICAL low
+// guest addresses: the initial TEB block is reserved below 2 GiB, KUSER_SHARED
+// _DATA lives at 0x7ffe0000, and ordinary PE images prefer 0x140000000. None
+// of those can be host-mapped at their own address on iOS -- everything below
+// 4 GiB is under __PAGEZERO and the band above it is taken. Refusing them made
+// Wine's TEB reservation fail and left it dereferencing a null block.
+//
+// So the low canonical range keeps its guest addresses and is dereferenced
+// through a deterministic high host alias. The alias base is chosen so that
+// translation is a single OR:
+//
+//   host = guest | K64_NATIVE_LOW_ALIAS_BASE
+//
+// which is exact for both halves at once. Low guest addresses have no bits in
+// common with the base, so OR is addition; every permitted HIGH guest address
+// already contains the base's bits, so OR is the identity there and high
+// mappings keep being dereferenced at their own address. One ARM64 `orr` with
+// an encodable logical immediate covers every guest memory access, with no
+// branch, no comparison and no extra register.
+#define K64_NATIVE_LOW_ALIAS_BASE     0x7800000000ULL
+#define K64_NATIVE_LOW_GUEST_LIMIT    0x200000000ULL
+#define K64_NATIVE_LOW_ALIAS_END      (K64_NATIVE_LOW_ALIAS_BASE + \
+                                       K64_NATIVE_LOW_GUEST_LIMIT)
+
+// The high identity lanes move above the alias window, into the 8 GiB block
+// whose every address already carries the alias base's bits.
+#define K64_NATIVE_GUEST_IMAGE_BASE   K64_NATIVE_LOW_ALIAS_END
+#define K64_NATIVE_GUEST_HIGH_END     (K64_NATIVE_GUEST_IMAGE_BASE + \
+                                       K64_NATIVE_LOW_GUEST_LIMIT)
 // Keep automatic mappings out of the executable's program-break growth lane.
 // Starting mmap(NULL, ...) at IMAGE_BASE let ld-linux place libc immediately
-// above a small PIE, so glibc's first brk expansion collided with libc. Four
+// above a small PIE, so glibc's first brk expansion collided with libc. One
 // GiB is ample initial brk space; larger allocations naturally use mmap.
-#define K64_NATIVE_GUEST_HEAP_LIMIT   (K64_NATIVE_GUEST_IMAGE_BASE + 0x100000000ULL)
+#define K64_NATIVE_GUEST_HEAP_LIMIT   (K64_NATIVE_GUEST_IMAGE_BASE + 0x40000000ULL)
 #define K64_NATIVE_GUEST_MMAP_BASE    K64_NATIVE_GUEST_HEAP_LIMIT
 // Darwin/iOS native mappings use 16 KiB host pages while the x86-64 guest uses
 // 4 KiB pages. The initial break must not share the executable's final host
 // page, because extending that partially tracked mapping cannot be done with a
 // destructive MAP_FIXED operation.
 #define K64_NATIVE_GUEST_LAYOUT_ALIGN 0x4000ULL
-#define K64_NATIVE_GUEST_INTERP_BASE (K64_NATIVE_GUEST_WINDOW_END - 0x200000000ULL)
-#define K64_NATIVE_GUEST_STACK_TOP   (K64_NATIVE_GUEST_WINDOW_END - 0x100000ULL)
-#define K64_NATIVE_GUEST_TLS_BASE    (K64_NATIVE_GUEST_STACK_TOP - 0x900000ULL)
+#define K64_NATIVE_GUEST_INTERP_BASE  (K64_NATIVE_GUEST_HIGH_END - 0x80000000ULL)
+#define K64_NATIVE_GUEST_STACK_TOP    (K64_NATIVE_GUEST_HIGH_END - 0x100000ULL)
+#define K64_NATIVE_GUEST_TLS_BASE     (K64_NATIVE_GUEST_STACK_TOP - 0x900000ULL)
 
 #if defined(__cplusplus)
+// The pure mirror the tests and the translator patch share. Cross-checked here
+// so the layout below and the arithmetic they use cannot drift apart.
+#include "guest_low_alias.h"
+static_assert(K64_NATIVE_LOW_ALIAS_BASE == boxedvn::kGuestLowAliasBase,
+              "alias base must match the shared translation contract");
+static_assert(K64_NATIVE_LOW_GUEST_LIMIT == boxedvn::kGuestLowLimit,
+              "low guest limit must match the shared translation contract");
+static_assert(K64_NATIVE_GUEST_IMAGE_BASE == boxedvn::kGuestHighBase,
+              "high lane base must match the shared translation contract");
+static_assert(K64_NATIVE_GUEST_HIGH_END == boxedvn::kGuestHighEnd,
+              "high lane end must match the shared translation contract");
 static_assert((K64_NATIVE_GUEST_WINDOW_START & K64_PAGE_MASK) == 0,
               "native guest window start must be guest-page aligned");
 static_assert((K64_NATIVE_GUEST_WINDOW_END & K64_PAGE_MASK) == 0,
@@ -95,8 +135,32 @@ static_assert((K64_NATIVE_GUEST_WINDOW_START & 0x3FFFULL) == 0 &&
               "native guest window must be 16 KiB host-page aligned");
 static_assert(K64_NATIVE_GUEST_WINDOW_START < K64_NATIVE_GUEST_WINDOW_END,
               "native guest window must have positive size");
-static_assert((K64_NATIVE_GUEST_LAYOUT_ALIGN & (K64_NATIVE_GUEST_LAYOUT_ALIGN - 1)) == 0,
-              "native guest layout alignment must be a power of two");
+// The whole aliased layout has to live inside the proven host window.
+static_assert(K64_NATIVE_LOW_ALIAS_BASE >= K64_NATIVE_GUEST_WINDOW_START,
+              "low alias window must start inside the proven host window");
+static_assert(K64_NATIVE_GUEST_HIGH_END <= K64_NATIVE_GUEST_WINDOW_END,
+              "aliased layout must end inside the proven host window");
+static_assert(K64_NATIVE_LOW_ALIAS_END == K64_NATIVE_GUEST_IMAGE_BASE,
+              "high identity lanes must begin exactly above the alias window");
+// OR-translation correctness. Low guest addresses must share no bit with the
+// alias base, so `guest | base` equals `guest + base`.
+static_assert((K64_NATIVE_LOW_GUEST_LIMIT &
+               (K64_NATIVE_LOW_GUEST_LIMIT - 1)) == 0,
+              "low guest limit must be a power of two");
+static_assert((K64_NATIVE_LOW_ALIAS_BASE &
+               (K64_NATIVE_LOW_GUEST_LIMIT - 1)) == 0,
+              "alias base must be aligned to the low guest limit so OR adds");
+// Every permitted high guest address must already carry the base's bits, so
+// OR is the identity for them and identity mapping is preserved.
+static_assert((K64_NATIVE_GUEST_IMAGE_BASE & K64_NATIVE_LOW_ALIAS_BASE) ==
+              K64_NATIVE_LOW_ALIAS_BASE,
+              "high identity lane base must contain the alias base bits");
+static_assert(((K64_NATIVE_GUEST_HIGH_END - 1) & K64_NATIVE_LOW_ALIAS_BASE) ==
+              K64_NATIVE_LOW_ALIAS_BASE,
+              "high identity lane end must contain the alias base bits");
+static_assert((K64_NATIVE_GUEST_IMAGE_BASE ^ (K64_NATIVE_GUEST_HIGH_END - 1)) <
+              K64_NATIVE_LOW_GUEST_LIMIT,
+              "high identity lane must not cross an alias-base bit boundary");
 static_assert((K64_NATIVE_GUEST_MMAP_BASE & (K64_NATIVE_GUEST_LAYOUT_ALIGN - 1)) == 0,
               "native mmap base must satisfy the iOS host-page layout contract");
 static_assert(K64_NATIVE_GUEST_IMAGE_BASE < K64_NATIVE_GUEST_HEAP_LIMIT,
@@ -105,7 +169,40 @@ static_assert(K64_NATIVE_GUEST_HEAP_LIMIT == K64_NATIVE_GUEST_MMAP_BASE,
               "native automatic mappings must begin after the heap lane");
 static_assert(K64_NATIVE_GUEST_INTERP_BASE > K64_NATIVE_GUEST_MMAP_BASE,
               "native interpreter base must follow the mmap region");
+static_assert(K64_NATIVE_GUEST_STACK_TOP > K64_NATIVE_GUEST_INTERP_BASE,
+              "native stack must sit above the interpreter lane");
+static_assert(K64_NATIVE_GUEST_TLS_BASE > K64_NATIVE_GUEST_INTERP_BASE,
+              "native TLS lane must sit above the interpreter lane");
+// KUSER_SHARED_DATA is inside the canonical low range, so it resolves through
+// the same alias as every other low address rather than a second mapping.
+static_assert(K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE <=
+              K64_NATIVE_LOW_GUEST_LIMIT,
+              "KUSER_SHARED_DATA must resolve through the low alias");
 #endif
+
+// Translate a canonical guest address to the host address its bytes live at.
+// Identity for every permitted high address by construction; the single OR is
+// what the ARM64 translator emits for guest dereferences as well.
+static inline U64 k64GuestToHostAddress(U64 guestAddress) {
+    return guestAddress | K64_NATIVE_LOW_ALIAS_BASE;
+}
+
+// Recover the canonical guest address from a host address inside the alias
+// window. Host addresses outside it are returned unchanged, so this is safe to
+// apply to a fault address of unknown provenance.
+static inline U64 k64HostToGuestAddress(U64 hostAddress) {
+    if (hostAddress >= K64_NATIVE_LOW_ALIAS_BASE &&
+        hostAddress < K64_NATIVE_LOW_ALIAS_END) {
+        return hostAddress - K64_NATIVE_LOW_ALIAS_BASE;
+    }
+    return hostAddress;
+}
+
+// True when the canonical guest address is served through the alias rather
+// than dereferenced at its own address.
+static inline int k64IsLowAliasedGuestAddress(U64 guestAddress) {
+    return guestAddress < K64_NATIVE_LOW_GUEST_LIMIT ? 1 : 0;
+}
 
 // A guest page slot. `data` is allocated lazily: a freshly reserved page (mmap
 // of an address wine may never touch — its huge PROT_NONE reservations) carries

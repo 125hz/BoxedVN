@@ -233,25 +233,26 @@ std::mutex g_k64KuserAliasMutex;
 K64KuserAlias g_k64KuserAlias;
 
 static bool k64IsKuserRange(U64 addr, U64 len) {
-    return addr >= K64_KUSER_SHARED_BASE &&
-           addr <= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE &&
-           len <= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE - addr;
+    // KUSER_SHARED_DATA is a canonical low address like any other now, so the
+    // deterministic low alias hosts it through the ordinary anonymous path.
+    // Keeping the old dedicated alias as well would leave two host backings
+    // for 0x7ffe0000 that could disagree.
+    static_assert(K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE <=
+                  K64_NATIVE_LOW_GUEST_LIMIT,
+                  "KUSER_SHARED_DATA must resolve through the low alias");
+    (void)addr;
+    (void)len;
+    return false;
 }
 
 static U8* k64KuserAliasFor(U64 guestAddress) {
-    if (guestAddress < K64_KUSER_SHARED_BASE ||
-        guestAddress >= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE) {
-        return nullptr;
-    }
-    // This helper is also called from the Darwin SA_SIGINFO path. The alias
-    // lifetime is protected by each owning KMemory64 and the release path
-    // publishes nullptr only after the last owner has stopped executing, so a
-    // lock-free acquire is required here: taking a pthread mutex in a signal
-    // handler can deadlock if the interrupted thread held it.
-    void* host = g_k64KuserAlias.host.load(std::memory_order_acquire);
-    if (!host) return nullptr;
-    return static_cast<U8*>(host) +
-           (guestAddress - K64_KUSER_SHARED_BASE);
+    // Superseded by the deterministic low alias. KUSER_SHARED_DATA is a
+    // canonical low guest address like any other now, so it is backed by the
+    // ordinary anonymous path through k64GuestToHostAddress. Returning null
+    // here keeps every caller -- including the Darwin SA_SIGINFO path, which
+    // must stay lock-free -- on that single backing rather than a second one.
+    (void)guestAddress;
+    return nullptr;
 }
 }
 #endif
@@ -411,14 +412,19 @@ bool KMemory64::nativeGuestRangeAllowed(U64 addr, U64 len) const {
     if (!nativeIdentityMode()) return true;
     if (len == 0 || addr > UINT64_MAX - len) return false;
     const U64 end = addr + len;
-    // KUSER_SHARED_DATA is deliberately backed by a high host alias because
-    // iOS leaves the canonical low address below __PAGEZERO unavailable.
-    if (addr >= K64_KUSER_SHARED_BASE &&
-        end <= K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE) {
+    // Canonical low guest addresses are hostable: they are dereferenced
+    // through the deterministic alias rather than at their own address. This
+    // is what lets Wine reserve its TEB block below 2 GiB, keep
+    // KUSER_SHARED_DATA at 0x7ffe0000 -- now served by the same alias rather
+    // than a second mapping -- and load PE images at their preferred bases.
+    if (end <= K64_NATIVE_LOW_GUEST_LIMIT) {
         return true;
     }
-    return addr >= K64_NATIVE_GUEST_WINDOW_START &&
-           end <= K64_NATIVE_GUEST_WINDOW_END;
+    // The identity lane is the block immediately above the alias window. A
+    // guest address inside the alias window itself is refused: it would be
+    // indistinguishable from the host address of some canonical low page.
+    return addr >= K64_NATIVE_GUEST_IMAGE_BASE &&
+           end <= K64_NATIVE_GUEST_HIGH_END;
 }
 
 U64 KMemory64::nativeAliasForGuest(U64 guestAddress) const {
@@ -649,8 +655,13 @@ bool KMemory64::nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh) {
     if (addr > UINT64_MAX - len) return false;
     const U64 guestEnd = addr + len;
     if (guestEnd > UINT64_MAX - (hostPage - 1)) return false;
-    const U64 hostStart = k64NativeAlignDown(addr, hostPage);
-    const U64 hostEnd = k64NativeAlignUp(guestEnd, hostPage);
+    // Canonical guest addresses keep their values; only the host address the
+    // bytes live at is translated. The alias is the identity for every
+    // permitted high address, so this is a no-op for the ordinary lanes.
+    const U64 hostAddr = k64GuestToHostAddress(addr);
+    const U64 hostGuestEnd = k64GuestToHostAddress(addr) + len;
+    const U64 hostStart = k64NativeAlignDown(hostAddr, hostPage);
+    const U64 hostEnd = k64NativeAlignUp(hostGuestEnd, hostPage);
     const U64 hostLength = hostEnd - hostStart;
 
     if (nativeRangeCovers(hostStart, hostEnd)) {
@@ -662,12 +673,13 @@ bool KMemory64::nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh) {
                        PROT_READ | PROT_WRITE) != 0) {
             return false;
         }
-        ::memset((void*)(uintptr_t)addr, 0, (size_t)len);
+        ::memset((void*)(uintptr_t)hostAddr, 0, (size_t)len);
         // A partial 4 KiB remap shares this host page with neighboring guest
         // pages. Keep the host page readable/writable in that case; guest
         // permissions remain in the per-4 KiB flags and enforcing PROT_NONE
         // here would revoke access from the neighboring subpages.
-        const bool partialHostPage = (hostStart != addr || hostEnd != guestEnd);
+        const bool partialHostPage =
+            (hostStart != hostAddr || hostEnd != hostGuestEnd);
         const int finalProt = partialHostPage ? (PROT_READ | PROT_WRITE)
                                               : k64NativeProt(prot);
         if (::mprotect((void*)(uintptr_t)hostStart, (size_t)hostLength,
@@ -901,7 +913,10 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
                 const U64 guestPageAddress = addr + (i << K64_PAGE_SHIFT);
                 U8* nativeAddress = k64KuserAliasFor(guestPageAddress);
                 if (prot && nativeAddress) page->adoptNative(nativeAddress);
-                else if (prot) page->adoptNative((U8*)(uintptr_t)guestPageAddress);
+                else if (prot) {
+                    page->adoptNative(
+                        (U8*)(uintptr_t)k64GuestToHostAddress(guestPageAddress));
+                }
                 else if (page->dataNative || page->dataShared) page->decommit();
                 if (prot && !nativeFresh && (prot & 0x2)) {
                     ::memset(page->hostData(), 0, K64_PAGE_SIZE);
@@ -971,7 +986,8 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
             std::shared_ptr<SharedFilePage> shared = findSharedFilePage(requestedPath, fpage);
             if (!shared) continue;
             const U8* current = shared->data->load(std::memory_order_acquire);
-            const U8* fixed = (const U8*)(uintptr_t)((pageStart + i) << K64_PAGE_SHIFT);
+            const U8* fixed = (const U8*)(uintptr_t)k64GuestToHostAddress(
+                (pageStart + i) << K64_PAGE_SHIFT);
             if (current != shared->localData && current != fixed) {
                 return (U64)-K_EBUSY;
             }
@@ -1035,7 +1051,8 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
             if (nativeIdentityMode()) {
                 U8* fixed = kuserRange
                     ? k64KuserAliasFor((pageStart + i) << K64_PAGE_SHIFT)
-                    : (U8*)(uintptr_t)((pageStart + i) << K64_PAGE_SHIFT);
+                    : (U8*)(uintptr_t)k64GuestToHostAddress(
+                          (pageStart + i) << K64_PAGE_SHIFT);
                 {
                     std::lock_guard<std::mutex> sharedLock(g_sharedFileMutex);
                     U8* previous = shared->data->load(std::memory_order_acquire);
@@ -1067,8 +1084,10 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
     if (nativeIdentityMode()) {
         if (!kuserRange) {
             const U64 hostPage = k64NativeHostPageSize();
-            const U64 hostStart = k64NativeAlignDown(addr, hostPage);
-            const U64 hostEnd = k64NativeAlignUp(addr + len, hostPage);
+            const U64 hostStart =
+                k64NativeAlignDown(k64GuestToHostAddress(addr), hostPage);
+            const U64 hostEnd = k64NativeAlignUp(
+                k64GuestToHostAddress(addr) + len, hostPage);
             // Native shared pages can be reached through the canonical pointer
             // by sparse aliases. Keep their host backing writable even when the
             // guest requested read-only/execute permissions.
@@ -1277,9 +1296,11 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
         }
         const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);
         const U64 hostPage = k64NativeHostPageSize();
-        const U64 hostStart = k64NativeAlignDown(addr, hostPage);
+        const U64 hostStart =
+            k64NativeAlignDown(k64GuestToHostAddress(addr), hostPage);
         if (addr + len > UINT64_MAX - (hostPage - 1)) return (U64)-K_EINVAL;
-        const U64 hostEnd = k64NativeAlignUp(addr + len, hostPage);
+        const U64 hostEnd =
+            k64NativeAlignUp(k64GuestToHostAddress(addr) + len, hostPage);
         U32 hostProtFlags = prot & 0x3u;
         {
             BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
@@ -1350,7 +1371,8 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
             if (nativeIdentityMode()) {
                 if (prot && !it->second->dataShared) {
-                    it->second->adoptNative((U8*)(uintptr_t)(addr + (i << K64_PAGE_SHIFT)));
+                    it->second->adoptNative((U8*)(uintptr_t)k64GuestToHostAddress(
+                    addr + (i << K64_PAGE_SHIFT)));
                 } else if (!prot && it->second->dataNative && !it->second->dataShared) {
                     it->second->decommit();
                 }

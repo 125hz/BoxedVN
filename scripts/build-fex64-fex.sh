@@ -113,6 +113,7 @@ apply_patch fex-arm64-pair-immediate-mask.patch
 apply_patch fex-arm64-context-indexed-unaligned-offset.patch
 apply_patch fex-arm64-addsub-immediate-range.patch
 apply_patch fex-boxedwine-ir-capture-arm.patch
+apply_patch fex-boxedwine-low-address-alias.patch
 
 # CMAKE_SYSTEM_PROCESSOR has to be stated. CMake leaves it empty when cross-
 # compiling unless a toolchain file sets it, and FEX selects its entire

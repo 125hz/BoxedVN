@@ -1,0 +1,139 @@
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 35a4212..34e7400 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -134,6 +134,22 @@ class ContextImpl final : public FEXCore::Context::Context, public CPU::CodeBuff
+ public:
+   // Context base class implementation.
+   bool InitCore() override;
++  void SetGuestLowAlias(uint64_t Base, uint64_t Limit) override {
++    // Published once, before any guest code is translated. The translation is
++    // applied only at host dereference boundaries: guest RIPs, GPR values,
++    // syscall arguments, code-cache keys and invalidation keys stay canonical.
++    GuestLowAliasBase = Base;
++    GuestLowAliasLimit = Limit;
++  }
++  uint64_t GetGuestLowAliasBase() const {
++    return GuestLowAliasBase;
++  }
++  // Canonical guest address to the host address its bytes live at. The alias
++  // base is chosen so this single OR is addition for canonical low addresses
++  // and the identity for every permitted high address.
++  uint64_t GuestToHostAddress(uint64_t GuestAddress) const {
++    return GuestAddress | GuestLowAliasBase;
++  }
+ 
+   void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) override;
+ 
+@@ -351,6 +367,9 @@ public:
+   } Config;
+ 
+   FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
++  // High host alias for canonical low guest addresses; zero preserves FEX.
++  uint64_t GuestLowAliasBase {};
++  uint64_t GuestLowAliasLimit {};
+ 
+   uint32_t StrictSplitLockMutex {};
+ 
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 92305f4..ebbdc7e 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -791,7 +791,8 @@ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter*
+ };
+ 
+ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Thread, uint64_t GuestRIP, uint64_t MaxInst) {
+-  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
++  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP)), GuestRIP,
++                                                 MaxInst);
+ }
+ 
+ /* iOS-Mythic ml623: targeted IR capture (PassManager.cpp). FEX_MythicIRCapTarget is the
+@@ -855,7 +856,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+ 
+   if (!HasCustomIR) {
+     const uint8_t* GuestCode {};
+-    GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
++    // Instruction fetch is a host dereference; the RIP itself stays canonical.
++    GuestCode = reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP));
+ 
+     /* perf-silenced GenerateIR GuestCode log */
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 3e01eeb..c89c963 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -315,6 +315,17 @@ private:
+     return IsFPR(IR::PhysicalRegister(Wrap).AsRegClass());
+   }
+ 
++  // Translates a canonical guest address register into the host address its
++  // bytes live at, for the memory operand about to be emitted. One ORR with a
++  // logical immediate: addition for canonical low addresses, the identity for
++  // every permitted high address, and idempotent, so applying it twice on the
++  // same value is harmless. Returns Base unchanged when no alias is armed.
++  //
++  // NOTE: clobbers TMP4, like GenerateSVEMemOperand already clobbers TMP1. The
++  //       result is only valid until the operand it was produced for is used.
++  [[nodiscard]]
++  ARMEmitter::Register AliasGuestAddress(ARMEmitter::Register Base);
++
+   [[nodiscard]]
+   ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
+                                                     IR::MemOffsetType OffsetType, uint8_t OffsetScale);
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index 2cf05d1..d570c9e 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -584,8 +584,22 @@ DEF_OP(ContextClear) {
+   }
+ }
+ 
++ARMEmitter::Register Arm64JITCore::AliasGuestAddress(ARMEmitter::Register Base) {
++  const uint64_t AliasBase = CTX->GetGuestLowAliasBase();
++  if (AliasBase == 0) {
++    return Base;
++  }
++  // The alias base is a single contiguous run of ones, so it encodes directly
++  // as an ARM64 logical immediate and needs no constant materialisation.
++  orr(ARMEmitter::Size::i64Bit, TMP4, Base, AliasBase);
++  return TMP4;
++}
++
+ ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(
+   IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType, uint8_t OffsetScale) {
++  // Every scalar and SSE load/store operand funnels through here. The logical
++  // address stays in the IR; only the emitted host operand is translated.
++  Base = AliasGuestAddress(Base);
+   if (Offset.IsInvalid()) {
+     return ARMEmitter::ExtendedMemOperand(Base.X(), ARMEmitter::IndexType::OFFSET, 0);
+   } else {
+@@ -652,6 +666,7 @@ ARMEmitter::Register Arm64JITCore::ApplyMemOperand(IR::OpSize AccessSize, ARMEmi
+ 
+ ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
+                                                               IR::MemOffsetType OffsetType, [[maybe_unused]] uint8_t OffsetScale) {
++  Base = AliasGuestAddress(Base);
+   if (Offset.IsInvalid()) {
+     return ARMEmitter::SVEMemOperand(Base.X(), 0);
+   }
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index ec61b90..441e0ec 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -68,6 +68,16 @@ public:
+    */
+   FEX_DEFAULT_VISIBILITY virtual bool InitCore() = 0;
+ 
++  // BoxedWine: canonical low guest addresses are dereferenced through a
++  // deterministic high host alias. `Base` must be aligned to `Limit` and every
++  // permitted high guest address must already contain its bits, so the
++  // translation is one OR and is the identity for the high lane. Zero (the
++  // default) leaves every guest pointer untouched.
++  FEX_DEFAULT_VISIBILITY virtual void SetGuestLowAlias(uint64_t Base, uint64_t Limit) {
++    (void)Base;
++    (void)Limit;
++  }
++
+   /**
+    * @brief Executes the supplied thread context on the current thread until a return is requested
+    */

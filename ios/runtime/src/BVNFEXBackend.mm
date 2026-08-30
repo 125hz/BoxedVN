@@ -38,6 +38,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "boxedvn/fex_code_buffer_layout.h"
 #include "boxedvn/fex_exit_dispatch_contract.h"
 #include "boxedvn/fex_guest_mode_policy.h"
+#include "guest_low_alias.h"
 #include "boxedvn/guest_address_space.h"
 #include "boxedvn/elf_inspector.h"
 
@@ -122,6 +123,9 @@ constexpr size_t kGuestStackBytes = 256u * 1024u;
 // The cold exec-replacement unwind is a one-shot sequence per launch. Bound it
 // so a looping scheduler cannot flood the device log with the same transition.
 constexpr uint32_t kUnwindReportLimit = 24;
+// The low-alias contract is a property of the whole address space, so it
+// is reported once rather than per context.
+std::atomic<bool> gLowAliasReported {false};
 constexpr uint64_t kExpectedExitCode = 47;
 
 std::mutex gProbeMutex;
@@ -873,6 +877,24 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     bundle->context->SetSignalDelegator(bundle->signals.get());
     bundle->context->SetSyscallHandler(bundle->syscalls.get());
     bundle->context->SetHardwareTSOSupport(true);
+    // Canonical low guest addresses -- Wine's below-2-GiB TEB reservation,
+    // KUSER_SHARED_DATA, and ordinary PE image bases -- cannot be host-mapped
+    // at their own address on iOS. KMemory64 backs them through a
+    // deterministic high alias, so the translator has to dereference them
+    // there too. Published before InitCore, so no guest code is ever
+    // translated without it. Guest RIPs, register values and syscall
+    // arguments stay canonical; only host dereferences are translated.
+    bundle->context->SetGuestLowAlias(boxedvn::kGuestLowAliasBase,
+                                      boxedvn::kGuestLowLimit);
+    if (!gLowAliasReported.exchange(true, std::memory_order_relaxed)) {
+        reportf("BOXEDWINE_FEX64_LOW_ALIAS guest=[0x0,0x%llx) "
+                "host=[0x%llx,0x%llx) high_identity=[0x%llx,0x%llx)",
+                static_cast<unsigned long long>(boxedvn::kGuestLowLimit),
+                static_cast<unsigned long long>(boxedvn::kGuestLowAliasBase),
+                static_cast<unsigned long long>(boxedvn::kGuestLowAliasEnd),
+                static_cast<unsigned long long>(boxedvn::kGuestHighBase),
+                static_cast<unsigned long long>(boxedvn::kGuestHighEnd));
+    }
     if (!bundle->context->InitCore()) {
         reportf("FEX failed to initialise its %s dispatcher",
                 boxedvn::fexGuestModeName(mode));

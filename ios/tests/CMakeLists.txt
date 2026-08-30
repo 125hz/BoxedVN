@@ -27,6 +27,7 @@ add_executable(boxedvn_tests
     test_guest_address_contract32.cpp
     test_guest_address_space.cpp
     test_guest_mmap_placement.cpp
+    test_guest_low_alias.cpp
     test_boot_diagnostics.cpp
     test_pixmap_formats.cpp
     test_getrusage_fairness.cpp
