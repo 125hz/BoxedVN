@@ -1524,6 +1524,62 @@ def main() -> None:
         "BoxedVN exec transition contract",
     )
 
+    # ------------------------------------------------------------------ #
+    # A 64-bit process must not exec a script. The interpreter resolves     #
+    # through the 32-bit loader, ElfLoader takes its ELF32 path while the    #
+    # process is still marked 64-bit, and loading reports success without    #
+    # installing a usable image.                                            #
+    # ------------------------------------------------------------------ #
+    require_ordered(
+        kprocess,
+        [
+            "BOXEDWINE_X64_EXEC pid=%u path=%s fex=%u native=%u",
+            "BOXEDWINE_X64_EXEC_RESOLVE pid=%u target=%s kind=%s ",
+            'interpreter.length() ? "script" : "elf",',
+            "if (interpreter.length()) {",
+            "BOXEDWINE_X64_EXEC_RESOLVE_INVALID pid=%u target=%s ",
+            "return -K_ENOEXEC;",
+        ],
+        "BoxedVN 64-bit exec resolution invariant",
+    )
+
+    # Wine64 execs /usr/lib/wine/wineserver directly, so both guest paths have
+    # to be the same real x86-64 executable; the distro ships a /bin/sh
+    # wrapper under the generic name.
+    wine_builder = read(repository / "scripts/build-wine64-runtime-ci.sh")
+    wine_validator = read(repository / "scripts/validate-wine64-runtime.sh")
+    require_ordered(
+        wine_builder,
+        [
+            "is_elf64_x86_64() {",
+            "find_first_elf64_x86_64() {",
+            'WINE_SERVER="$(find_first_elf64_x86_64',
+            'copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver64',
+            'copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver',
+        ],
+        "BoxedVN wineserver packaging",
+    )
+    if 'copy_as "${WINE_ROOT}/wineserver"' in wine_builder:
+        raise SystemExit(
+            "the distro shell wrapper must not be packaged as the guest "
+            "wineserver"
+        )
+    require_ordered(
+        wine_validator,
+        [
+            "check_zip_entry_elf64_x86_64() {",
+            "is not an ELF file",
+            "is not ELFCLASS64",
+            "is not EM_X86_64",
+            'check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver64',
+            'check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver',
+            'check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wineserver',
+            'wineserver_generic_sha=',
+            'wineserver64_sha=',
+        ],
+        "BoxedVN wineserver archive validation",
+    )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

@@ -44,6 +44,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${INPUT}" ]] || die "--input is required. Supply a Wine64 runtime directory or outer ZIP."
+require_command od
 require_command unzip
 
 sha256_file() {
@@ -217,6 +218,40 @@ check_zip_path() {
     ok "$(basename "${archive}"): ${path}"
 }
 
+# Wine64 execs /usr/lib/wine/wineserver directly. The distro ships a small
+# /bin/sh wrapper under that name which picks between wineserver64 and
+# wineserver32; packaged as the guest's wineserver it made a 64-bit process
+# exec a script, which resolved through a 32-bit interpreter and left the
+# guest with neither an x86-64 image nor a valid 32-bit state. Both guest
+# paths must be the same real x86-64 executable, so check the ELF header
+# rather than the name.
+check_zip_entry_elf64_x86_64() {
+    local archive="$1"
+    local path="$2"
+    local bytes
+    read -r -a bytes <<< "$(unzip -p "${archive}" "${path}" 2>/dev/null \
+        | od -An -tu1 -N20 | tr '\n' ' ')"
+    [[ ${#bytes[@]} -ge 20 ]] \
+        || die "'${path}' in $(basename "${archive}") is too small to be an ELF executable."
+    [[ "${bytes[0]}" == 127 && "${bytes[1]}" == 69 && "${bytes[2]}" == 76 && "${bytes[3]}" == 70 ]] \
+        || die "'${path}' in $(basename "${archive}") is not an ELF file.\nThe distro's /bin/sh wineserver wrapper must not be packaged as a guest executable."
+    [[ "${bytes[4]}" == 2 ]] \
+        || die "'${path}' in $(basename "${archive}") is not ELFCLASS64."
+    [[ "${bytes[18]}" == 62 && "${bytes[19]}" == 0 ]] \
+        || die "'${path}' in $(basename "${archive}") is not EM_X86_64."
+    ok "$(basename "${archive}"): ${path} is ELF64 EM_X86_64"
+}
+
+zip_entry_sha256() {
+    local archive="$1"
+    local path="$2"
+    if command -v sha256sum >/dev/null 2>&1; then
+        unzip -p "${archive}" "${path}" | sha256sum | awk '{print $1}'
+    else
+        unzip -p "${archive}" "${path}" | shasum -a 256 | awk '{print $1}'
+    fi
+}
+
 if ! unzip -tqq "${GLIBC_ARCHIVE}" >/dev/null 2>&1; then
     die "'${GLIBC_ARCHIVE}' is not a readable ZIP archive."
 fi
@@ -234,6 +269,15 @@ check_zip_path "${GLIBC_ARCHIVE}" lib64/ld-linux-x86-64.so.2
 check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libc.so.6
 check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wine64
 check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver64
+check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wine64
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wineserver64
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wineserver
+wineserver_generic_sha="$(zip_entry_sha256 "${WINE_ARCHIVE}" usr/lib/wine/wineserver)"
+wineserver64_sha="$(zip_entry_sha256 "${WINE_ARCHIVE}" usr/lib/wine/wineserver64)"
+[[ -n "${wineserver_generic_sha}" && "${wineserver_generic_sha}" == "${wineserver64_sha}" ]] \
+    || die "usr/lib/wine/wineserver and usr/lib/wine/wineserver64 differ.\nWine64 execs the generic path, so both must be the same x86-64 executable.\n  wineserver:   ${wineserver_generic_sha}\n  wineserver64: ${wineserver64_sha}"
+ok "$(basename "${WINE_ARCHIVE}"): wineserver matches wineserver64 (${wineserver64_sha})"
 check_zip_path "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/wine/x86_64-unix
 check_zip_path "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/wine/x86_64-windows
 if [[ "${MANIFEST_SOURCE}" == "scripts/build-wine64-runtime-ci.sh" ]]; then

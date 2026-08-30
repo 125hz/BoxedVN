@@ -248,6 +248,9 @@ jobs:
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
 
+      - name: Test Wine64 runtime packaging contract
+        run: python3 -m unittest scripts/test_wine64_runtime_packaging.py
+
   fex-translator-probe:
     name: FEX translator conformance probes
     runs-on: ubuntu-24.04

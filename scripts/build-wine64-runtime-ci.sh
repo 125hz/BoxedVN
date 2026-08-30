@@ -38,6 +38,7 @@ require_command find
 require_command ldd
 require_command readlink
 require_command file
+require_command od
 require_command unzip
 require_command zip
 if [[ -n "${DXMT_UNIXLIB}" ]]; then
@@ -54,6 +55,38 @@ find_first() {
     local candidate
     for candidate in "$@"; do
         if [[ -f "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Read the ELF header rather than trusting the file mode. The distro ships a
+# 382-byte /bin/sh wrapper named `wineserver` that picks between wineserver64
+# and wineserver32; packaging that as the guest's wineserver made a 64-bit
+# process exec a script, which resolved through a 32-bit interpreter and left
+# the guest with neither an x86-64 image nor a valid 32-bit state.
+is_elf64_x86_64() {
+    local path="$1"
+    [[ -f "${path}" ]] || return 1
+    local bytes
+    read -r -a bytes <<< "$(od -An -tu1 -N20 "${path}" 2>/dev/null | tr '\n' ' ')"
+    [[ ${#bytes[@]} -ge 20 ]] || return 1
+    # \x7fELF
+    [[ "${bytes[0]}" == 127 && "${bytes[1]}" == 69 ]] || return 1
+    [[ "${bytes[2]}" == 76 && "${bytes[3]}" == 70 ]] || return 1
+    # EI_CLASS == ELFCLASS64
+    [[ "${bytes[4]}" == 2 ]] || return 1
+    # e_machine == EM_X86_64 (62), little endian
+    [[ "${bytes[18]}" == 62 && "${bytes[19]}" == 0 ]] || return 1
+    return 0
+}
+
+find_first_elf64_x86_64() {
+    local candidate
+    for candidate in "$@"; do
+        if is_elf64_x86_64 "${candidate}"; then
             printf '%s\n' "${candidate}"
             return 0
         fi
@@ -86,12 +119,16 @@ done
 [[ -n "${WINE_UNIX}" && -n "${WINE_WINDOWS}" ]] \
     || die "Wine64 module trees were not found beside '${WINE64}'."
 
-WINE_SERVER="$(find_first \
+# A generic `wineserver` candidate is accepted only when its own ELF header
+# proves it is an x86-64 executable, never merely because it is executable.
+WINE_SERVER="$(find_first_elf64_x86_64 \
     /usr/lib/wine/wineserver64 \
     /usr/lib/x86_64-linux-gnu/wine/wineserver64 \
     /usr/lib/wine/wineserver \
     /usr/lib/x86_64-linux-gnu/wine/wineserver)" \
-    || die "The Ubuntu Wine package exposes no wineserver64 binary."
+    || die "The Ubuntu Wine package exposes no x86-64 ELF wineserver binary."
+is_elf64_x86_64 "${WINE64}" \
+    || die "'${WINE64}' is not an x86-64 ELF executable."
 
 log "Wine64 loader: ${WINE64}"
 log "Wine64 unix modules: ${WINE_UNIX}"
@@ -176,10 +213,11 @@ copy_abs /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
 # preserving Ubuntu's module-tree path. Some distro releases put wine64 under
 # /usr/lib/x86_64-linux-gnu/wine; the guest must not depend on that variation.
 copy_as "${WINE64}" /usr/lib/wine/wine64
+# Wine64 execs /usr/lib/wine/wineserver directly. Both guest paths therefore
+# have to be the same real x86-64 executable; the distro's shell wrapper is
+# deliberately not packaged at either of them.
 copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver64
-if [[ -f "${WINE_ROOT}/wineserver" ]]; then
-    copy_as "${WINE_ROOT}/wineserver" /usr/lib/wine/wineserver
-fi
+copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver
 mkdir -p "${STAGE}/usr/lib/x86_64-linux-gnu/wine"
 cp -aL "${WINE_UNIX}" "${STAGE}/usr/lib/x86_64-linux-gnu/wine/"
 cp -aL "${WINE_WINDOWS}" "${STAGE}/usr/lib/x86_64-linux-gnu/wine/"

@@ -1664,6 +1664,29 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         klog_fmt("BOXEDWINE_X64_EXEC pid=%u path=%s fex=%u native=%u",
                  this->id, path.c_str(), this->useFEX64 ? 1U : 0U,
                  this->memory64 && this->memory64->nativeIdentityMode() ? 1U : 0U);
+        // What was asked for, and what it actually resolved to. `interpreter`
+        // is set only for a #! script; `loader` is the ELF interpreter, whose
+        // path names the class of the image that will be loaded.
+        klog_fmt("BOXEDWINE_X64_EXEC_RESOLVE pid=%u target=%s kind=%s "
+                 "interpreter=%s loader=%s",
+                 this->id, path.c_str(),
+                 interpreter.length() ? "script" : "elf",
+                 interpreter.length() ? interpreter.c_str() : "(none)",
+                 loader.length() ? loader.c_str() : "(none)");
+        if (interpreter.length()) {
+            // A 64-bit process cannot exec a script: the interpreter resolves
+            // through the 32-bit loader, ElfLoader then takes its ELF32 path
+            // while this process is still marked 64-bit, so neither the
+            // 32-bit stack transition nor ElfLoader64's stack builder runs --
+            // and loading still reports success. The child is left with no
+            // usable image, produces nothing at all, and its parent waits on
+            // it forever. Refuse it visibly instead.
+            klog_fmt("BOXEDWINE_X64_EXEC_RESOLVE_INVALID pid=%u target=%s "
+                     "interpreter=%s reason=script-interpreter-in-64bit-process",
+                     this->id, path.c_str(), interpreter.c_str());
+            openNode->close();
+            return -K_ENOEXEC;
+        }
     }
 #endif
 #ifdef BOXEDWINE_MULTI_THREADED
