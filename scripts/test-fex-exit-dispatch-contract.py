@@ -824,7 +824,9 @@ def main() -> None:
             "static_assert((kGuestHighBase & kGuestLowAliasBase) == "
             "kGuestLowAliasBase,",
             "guestToHostAddress(",
-            "return guestAddress | kGuestLowAliasBase;",
+            # The OR still serves the low and identity lanes; the mask
+            # is a no-op on both and relocates only the top arena.
+            "return (guestAddress | kGuestLowAliasBase) & ~kGuestTopClearMask;",
             "hostToGuestAddress(",
             "guestRangeHostable(",
         ],
@@ -853,8 +855,8 @@ def main() -> None:
         [
             "bool KMemory64::nativeGuestRangeAllowed(",
             "if (end <= K64_NATIVE_LOW_GUEST_LIMIT) {",
-            "return addr >= K64_NATIVE_GUEST_IMAGE_BASE &&",
-            "end <= K64_NATIVE_GUEST_HIGH_END;",
+            "if (addr >= K64_NATIVE_GUEST_IMAGE_BASE &&",
+            "end <= K64_NATIVE_GUEST_HIGH_END) {",
             "const U64 hostAddr = k64GuestToHostAddress(addr);",
             "::memset((void*)(uintptr_t)hostAddr, 0, (size_t)len);",
         ],
@@ -897,7 +899,7 @@ def main() -> None:
             "+  void SetGuestLowAlias(uint64_t Base, uint64_t Limit) override {",
             "+    GuestLowAliasBase = Base;",
             "+  uint64_t GuestToHostAddress(uint64_t GuestAddress) const {",
-            "+    return GuestAddress | GuestLowAliasBase;",
+            "+    return (GuestAddress | GuestLowAliasBase) & ~GuestTopClearMask;",
             "a/FEXCore/Source/Interface/Core/JIT/JITClass.h",
             "+  ARMEmitter::Register AliasGuestAddress(ARMEmitter::Register Base);",
             "a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
@@ -2194,6 +2196,192 @@ def main() -> None:
         ],
         "BoxedVN diagnostic limiter contract",
     )
+
+    # ------------------------------------------------------------------ #
+    # Wine's top-down arena. It reserves [0x7ffffe000000, 0x7fffffff0000)     #
+    # and commits accessible subranges inside it; every one was refused as    #
+    # outside the identity lane, and the search that followed reached         #
+    # 8,388,609 mmaps at about 98% of a core.                                 #
+    # ------------------------------------------------------------------ #
+    alias_header = read(repository / "include/guest_low_alias.h")
+    require_ordered(
+        alias_header,
+        [
+            "inline constexpr std::uint64_t kGuestTopBase = 0x7FFFFE000000ULL;",
+            "inline constexpr std::uint64_t kGuestTopEnd = 0x7FFFFFFF0000ULL;",
+            "inline constexpr std::uint64_t kGuestTopClearMask = 0x7F8000000000ULL;",
+            "kGuestTopBase & ~kGuestTopClearMask;",
+            # The invariants that make clearing a bit field exact.
+            "(kGuestTopBase & kGuestTopClearMask) == kGuestTopClearMask,",
+            "((kGuestTopEnd - 1) & kGuestTopClearMask) == kGuestTopClearMask,",
+            "(kGuestHighEnd & kGuestTopClearMask) == 0,",
+            "((kGuestLowLimit - 1) & kGuestTopClearMask) == 0,",
+            "((kGuestLowAliasEnd - 1) & kGuestTopClearMask) == 0,",
+            "kGuestTopHostBase >= kGuestHighEnd,",
+            "(kGuestTopHostEnd - 1) < kGuestTopBase,",
+            "inline constexpr bool isTopArenaGuestAddress(",
+            "return (guestAddress | kGuestLowAliasBase) & ~kGuestTopClearMask;",
+            "inline constexpr bool isTopArenaHostAddress(",
+            "return hostAddress | kGuestTopClearMask;",
+            "return address >= kGuestTopBase && end <= kGuestTopEnd;",
+        ],
+        "BoxedVN guest top-arena alias contract",
+    )
+
+    memory_header = read(repository / "include/kmemory64.h")
+    require_ordered(
+        memory_header,
+        [
+            "#define K64_NATIVE_TOP_GUEST_BASE     0x7FFFFE000000ULL",
+            "#define K64_NATIVE_TOP_GUEST_END      0x7FFFFFFF0000ULL",
+            "#define K64_NATIVE_TOP_CLEAR_MASK     0x7F8000000000ULL",
+            # Mirrored constants must be asserted equal, not merely similar.
+            "K64_NATIVE_TOP_GUEST_BASE == boxedvn::kGuestTopBase,",
+            "K64_NATIVE_TOP_GUEST_END == boxedvn::kGuestTopEnd,",
+            "K64_NATIVE_TOP_CLEAR_MASK == boxedvn::kGuestTopClearMask,",
+            "K64_NATIVE_TOP_HOST_BASE == boxedvn::kGuestTopHostBase,",
+            "K64_NATIVE_TOP_HOST_BASE >= K64_NATIVE_GUEST_HIGH_END,",
+            "K64_NATIVE_TOP_HOST_END <= K64_NATIVE_GUEST_WINDOW_END,",
+            "static inline U64 k64GuestToHostAddress(U64 guestAddress) {",
+            "return (guestAddress | K64_NATIVE_LOW_ALIAS_BASE) &",
+            "~K64_NATIVE_TOP_CLEAR_MASK;",
+            "if (k64IsTopArenaHostAddress(hostAddress)) {",
+            "return hostAddress | K64_NATIVE_TOP_CLEAR_MASK;",
+        ],
+        "BoxedVN address-space top-arena contract",
+    )
+
+    memory = read(repository / "source/kernel/kmemory64.cpp")
+    require_ordered(
+        memory,
+        [
+            "bool KMemory64::nativeGuestRangeAllowed(",
+            "end <= K64_NATIVE_GUEST_HIGH_END) {",
+            "return addr >= K64_NATIVE_TOP_GUEST_BASE &&",
+            "end <= K64_NATIVE_TOP_GUEST_END;",
+        ],
+        "BoxedVN top-arena hostability contract",
+    )
+    # Every native operation names host addresses through the translation, and
+    # the guest page map through canonical ones. Mixing the two looked up an
+    # unrelated page for anything served through an alias.
+    for required in (
+        "const U64 guestOfFirstHostPage = k64HostToGuestAddress(hostStart);",
+        "k64HostToGuestAddress(hostEnd - hostPage);",
+        "const U64 guestOfHostPage = k64HostToGuestAddress(host);",
+        "k64NativeAlignDown(k64GuestToHostAddress(addr), hostPage);",
+    ):
+        if required not in memory:
+            raise SystemExit(
+                "a native operation still confuses host and guest addresses: " +
+                required
+            )
+    for line in code_lines(memory):
+        for banned in ("k64NativeAlignDown(addr,", "k64NativeAlignUp(addr +"):
+            if banned in line:
+                raise SystemExit(
+                    "a host page range must be computed from the translated "
+                    "address: " + line
+                )
+
+    # The translator has to be told about the lane, or a block would
+    # dereference the canonical arena at an address the host cannot map.
+    backend = read(repository / "ios/runtime/src/BVNFEXBackend.mm")
+    require_ordered(
+        backend,
+        [
+            "bundle->context->SetGuestLowAlias(boxedvn::kGuestLowAliasBase,",
+            "bundle->context->SetGuestTopClearMask(boxedvn::kGuestTopClearMask);",
+            "BOXEDWINE_FEX64_TOP_ALIAS guest=[0x%llx,0x%llx) ",
+            "bundle->context->InitCore()",
+        ],
+        "BoxedVN translator top-alias publication contract",
+    )
+
+    alias_patch = read(
+        repository / "scripts/fex64-patches/fex-boxedwine-low-address-alias.patch")
+    require_ordered(
+        alias_patch,
+        [
+            "+  void SetGuestTopClearMask(uint64_t Mask) override {",
+            "+    GuestTopClearMask = Mask;",
+            "+  uint64_t GetGuestTopClearMask() const {",
+            "+    return (GuestAddress | GuestLowAliasBase) & ~GuestTopClearMask;",
+            "+  uint64_t GuestTopClearMask {};",
+            # The patch is generated file by file: the JIT class declaration
+            # precedes its definition, and the public virtual comes last.
+            "+  void ApplyGuestTopRelocation(ARMEmitter::Register Reg);",
+            "+void Arm64JITCore::ApplyGuestTopRelocation(ARMEmitter::Register Reg) {",
+            "+  bic(ARMEmitter::Size::i64Bit, Reg, Reg, ClearMask);",
+            "+  FEX_DEFAULT_VISIBILITY virtual void SetGuestTopClearMask(uint64_t Mask) {",
+        ],
+        "BoxedVN FEX top-arena translation contract",
+    )
+    # Every path that ORs the alias base itself must relocate too, or that
+    # path alone would keep pointing at the unmappable canonical arena.
+    aliasOrs = alias_patch.count("orr(ARMEmitter::Size::i64Bit, TMP4,")
+    relocations = alias_patch.count("ApplyGuestTopRelocation(TMP4);")
+    if relocations != aliasOrs:
+        raise SystemExit(
+            "every alias OR must be followed by the top relocation: {} OR(s), "
+            "{} relocation(s)".format(aliasOrs, relocations))
+    # A compare inside operand generation would corrupt guest flags, which FEX
+    # keeps in the host NZCV register.
+    reloc_start = alias_patch.index(
+        "+void Arm64JITCore::ApplyGuestTopRelocation(")
+    reloc_body = alias_patch[reloc_start:reloc_start + 500]
+    for banned in ("tst(", "cmp(", "csel(", "ands("):
+        if banned in reloc_body:
+            raise SystemExit(
+                "the top relocation must not touch the flags FEX keeps guest "
+                "state in: " + banned)
+
+    # Behaviour, not source text: the emitter check drives the real emitter and
+    # the guest fixture runs the real JIT.
+    emitter_check = read(
+        repository / "scripts/guest-probes/fex64-emitter-encoding-check.cpp")
+    require_ordered(
+        emitter_check,
+        [
+            "void checkGuestAddressTranslationEncodings() {",
+            "constexpr uint64_t kGuestLowAliasBase = 0x7800000000ULL;",
+            "constexpr uint64_t kGuestTopClearMask = 0x7F8000000000ULL;",
+            "emitter.orr(ARMEmitter::Size::i64Bit, ARMEmitter::Register(13),",
+            "emitter.bic(ARMEmitter::Size::i64Bit, ARMEmitter::Register(13),",
+            "checkGuestAddressTranslationEncodings();",
+        ],
+        "BoxedVN emitter translation encoding contract",
+    )
+    # The copies in the emitter tool have to match the runtime's own values.
+    for constant in ("0x7800000000ULL", "0x7F8000000000ULL"):
+        if constant not in alias_header:
+            raise SystemExit(
+                "the emitter check's constant is not the runtime's: " +
+                constant)
+
+    probe = read(repository / "scripts/run-fex64-vixl-probe.sh")
+    require_ordered(
+        probe,
+        [
+            'fixture_top_alias="${root}/scripts/guest-probes/fex64-top-alias-contract.asm"',
+            'prepare_fixture "${fixture_top_alias}" fex64-top-alias',
+            'run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin"',
+        ],
+        "BoxedVN top-arena VIXL probe contract",
+    )
+    fixture = read(
+        repository / "scripts/guest-probes/fex64-top-alias-contract.asm")
+    for required in ("mov r10, ARENA", "lock xadd", "lock cmpxchg",
+                     "%define ARENA 0x7ffffe000000",
+                     "mov r10, 0x7ffffffefff8"):
+        if required not in fixture:
+            raise SystemExit(
+                "the top-arena fixture must exercise real accesses: " +
+                required)
+    workflow = read(repository / ".github/workflows/build-ios.yml")
+    if "scripts/guest-probes/fex64-top-alias-contract.asm" not in workflow:
+        raise SystemExit(
+            "the top-arena fixture must participate in the VIXL cache key")
 
     print("FEX exit-dispatch and loader-boundary contracts verified")
 

@@ -28,6 +28,7 @@ add_executable(boxedvn_tests
     test_guest_address_space.cpp
     test_guest_mmap_placement.cpp
     test_guest_low_alias.cpp
+    test_guest_top_alias.cpp
     test_launch_preflight.cpp
     test_exec_transition.cpp
     test_x64_runtime_dir.cpp

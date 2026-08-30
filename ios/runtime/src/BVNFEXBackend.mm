@@ -900,6 +900,12 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     // arguments stay canonical; only host dereferences are translated.
     bundle->context->SetGuestLowAlias(boxedvn::kGuestLowAliasBase,
                                       boxedvn::kGuestLowLimit);
+    // Wine's top-down arena is the one lane the OR cannot reach, so it is
+    // relocated by clearing one bit field of the address. Published beside the
+    // alias base and before InitCore for the same reason: no guest code may be
+    // translated without it, or a block would dereference the canonical arena
+    // at an address the host cannot map.
+    bundle->context->SetGuestTopClearMask(boxedvn::kGuestTopClearMask);
     if (!gLowAliasReported.exchange(true, std::memory_order_relaxed)) {
         reportf("BOXEDWINE_FEX64_LOW_ALIAS guest=[0x0,0x%llx) "
                 "host=[0x%llx,0x%llx) high_identity=[0x%llx,0x%llx)",
@@ -908,6 +914,13 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
                 static_cast<unsigned long long>(boxedvn::kGuestLowAliasEnd),
                 static_cast<unsigned long long>(boxedvn::kGuestHighBase),
                 static_cast<unsigned long long>(boxedvn::kGuestHighEnd));
+        reportf("BOXEDWINE_FEX64_TOP_ALIAS guest=[0x%llx,0x%llx) "
+                "host=[0x%llx,0x%llx) clear_mask=0x%llx",
+                static_cast<unsigned long long>(boxedvn::kGuestTopBase),
+                static_cast<unsigned long long>(boxedvn::kGuestTopEnd),
+                static_cast<unsigned long long>(boxedvn::kGuestTopHostBase),
+                static_cast<unsigned long long>(boxedvn::kGuestTopHostEnd),
+                static_cast<unsigned long long>(boxedvn::kGuestTopClearMask));
     }
     if (!bundle->context->InitCore()) {
         reportf("FEX failed to initialise its %s dispatcher",

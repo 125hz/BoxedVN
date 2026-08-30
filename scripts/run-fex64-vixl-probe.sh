@@ -13,6 +13,7 @@ fixture32="${root}/scripts/guest-probes/fex32-core-contract.asm"
 fixture_vector="${root}/scripts/guest-probes/fex64-vector-store-contract.asm"
 fixture_negative_add="${root}/scripts/guest-probes/fex64-negative-add-contract.asm"
 fixture_indexed_alias="${root}/scripts/guest-probes/fex64-indexed-alias-contract.asm"
+fixture_top_alias="${root}/scripts/guest-probes/fex64-top-alias-contract.asm"
 host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
@@ -53,6 +54,8 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
     die "fixture not found: ${fixture_negative_add}"
 [[ -f "${fixture_indexed_alias}" ]] || \
     die "fixture not found: ${fixture_indexed_alias}"
+[[ -f "${fixture_top_alias}" ]] || \
+    die "fixture not found: ${fixture_top_alias}"
 [[ -f "${host_word_check}" ]] || \
     die "host-word checker not found: ${host_word_check}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
@@ -203,6 +206,7 @@ prepare_fixture "${fixture32}" fex32-core-contract
 prepare_fixture "${fixture_vector}" fex64-vector-store
 prepare_fixture "${fixture_negative_add}" fex64-negative-add
 prepare_fixture "${fixture_indexed_alias}" fex64-indexed-alias
+prepare_fixture "${fixture_top_alias}" fex64-top-alias
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -280,4 +284,22 @@ run_one x64-indexed-alias-ircap "${tmp_dir}/fex64-indexed-alias.bin" \
     | tee "${indexed_alias_capture}"
 python3 "${host_word_check}" "${indexed_alias_capture}" \
     --label indexed-alias --forbid-word ffff0177
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add and indexed-alias fixtures completed in all modes"
+# Wine's top-down arena. Its pointers need 47 bits, a different shape
+# from every other guest address BoxedWine hosts: the canonical low lane
+# fits in 33 and the identity lane in 39. Loads, stores, sub-qword
+# accesses and two locked read-modify-writes are all read back and
+# compared, so a truncated or sign-extended address fails on the value.
+run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin" \
+    "${tmp_dir}/fex64-top-alias.config.bin" 1 0
+run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin" \
+    "${tmp_dir}/fex64-top-alias.config.bin" 500 0
+run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin" \
+    "${tmp_dir}/fex64-top-alias.config.bin" 500 1
+
+top_alias_capture="${tmp_dir}/fex64-top-alias.ircap.txt"
+run_one x64-top-alias-ircap "${tmp_dir}/fex64-top-alias.bin" \
+    "${tmp_dir}/fex64-top-alias.config.bin" 500 0 0x10100 \
+    | tee "${top_alias_capture}"
+python3 "${host_word_check}" "${top_alias_capture}" \
+    --label top-alias --forbid-word ffff0177
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias and top-alias fixtures completed in all modes"

@@ -423,8 +423,15 @@ bool KMemory64::nativeGuestRangeAllowed(U64 addr, U64 len) const {
     // The identity lane is the block immediately above the alias window. A
     // guest address inside the alias window itself is refused: it would be
     // indistinguishable from the host address of some canonical low page.
-    return addr >= K64_NATIVE_GUEST_IMAGE_BASE &&
-           end <= K64_NATIVE_GUEST_HIGH_END;
+    if (addr >= K64_NATIVE_GUEST_IMAGE_BASE &&
+        end <= K64_NATIVE_GUEST_HIGH_END) {
+        return true;
+    }
+    // Wine's top-down arena, served from its own host block. A range that
+    // straddles the arena boundary is refused rather than split: one mapping
+    // has to land in one host lane.
+    return addr >= K64_NATIVE_TOP_GUEST_BASE &&
+           end <= K64_NATIVE_TOP_GUEST_END;
 }
 
 U64 KMemory64::nativeAliasForGuest(U64 guestAddress) const {
@@ -1458,12 +1465,20 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
                 if (!target) hostProtFlags |= k64GuestProtFromPageFlags(it->second->flags);
                 if (it->second->dataShared) hostProtFlags |= 0x3u;
             };
+            // `pages` is keyed by CANONICAL guest page number, so the
+            // neighbours sharing the first and last host page have to be named
+            // in guest space. Translating back is exact: both alias windows
+            // preserve offsets and are aligned well past a host page, so the
+            // host page's base maps to the guest page's base.
             const U64 hostPages = hostPage >> K64_PAGE_SHIFT;
+            const U64 guestOfFirstHostPage = k64HostToGuestAddress(hostStart);
+            const U64 guestOfLastHostPage =
+                k64HostToGuestAddress(hostEnd - hostPage);
             for (U64 sub = 0; sub < hostPages; sub++) {
-                const U64 firstPage = (hostStart >> K64_PAGE_SHIFT) + sub;
+                const U64 firstPage = (guestOfFirstHostPage >> K64_PAGE_SHIFT) + sub;
                 includePage(firstPage, firstPage >= pageStart && firstPage < pageStart + pageCount);
                 if (hostEnd > hostStart + hostPage) {
-                    const U64 lastPage = ((hostEnd - hostPage) >> K64_PAGE_SHIFT) + sub;
+                    const U64 lastPage = (guestOfLastHostPage >> K64_PAGE_SHIFT) + sub;
                     includePage(lastPage, lastPage >= pageStart && lastPage < pageStart + pageCount);
                 }
             }
@@ -1545,8 +1560,12 @@ U64 KMemory64::munmap(U64 addr, U64 len) {
         const U64 hostPage = k64NativeHostPageSize();
         if ((hostPage % K64_PAGE_SIZE) != 0) return (U64)-K_EINVAL;
         if (addr + len > UINT64_MAX - (hostPage - 1)) return (U64)-K_EINVAL;
-        const U64 hostStart = k64NativeAlignDown(addr, hostPage);
-        const U64 hostEnd = k64NativeAlignUp(addr + len, hostPage);
+        // Host addresses, so ::munmap and the nativeRanges keys agree. The
+        // guest page map is indexed separately, in canonical space.
+        const U64 hostStart =
+            k64NativeAlignDown(k64GuestToHostAddress(addr), hostPage);
+        const U64 hostEnd =
+            k64NativeAlignUp(k64GuestToHostAddress(addr) + len, hostPage);
         {
             BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
             for (U64 i = 0; i < pageCount; i++) {
@@ -1568,10 +1587,14 @@ U64 KMemory64::munmap(U64 addr, U64 len) {
             BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
             for (U64 host = hostStart; host < hostEnd; host += hostPage) {
                 bool keepHostPage = false;
+                // Which guest pages share this host page. Naming them by host
+                // address would look up an unrelated entry for anything served
+                // through an alias, so the host page is translated back first.
+                const U64 guestOfHostPage = k64HostToGuestAddress(host);
                 {
                     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
                     for (U64 sub = 0; sub < hostPage; sub += K64_PAGE_SIZE) {
-                        auto it = pages.find((host + sub) >> K64_PAGE_SHIFT);
+                        auto it = pages.find((guestOfHostPage + sub) >> K64_PAGE_SHIFT);
                         if (it != pages.end() &&
                             (it->second->flags & (K64_PAGE_MAPPED | K64_PAGE_PINNED))) {
                             keepHostPage = true;

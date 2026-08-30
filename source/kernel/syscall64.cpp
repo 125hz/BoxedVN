@@ -649,6 +649,34 @@ struct GuestMmapCounters {
 GuestMmapCounters gGuestMmapCounters;
 
 constexpr U64 kGuestMmapDetailLines = 32;
+// Bounded on purpose: Wine reserves the arena once and commits a handful of
+// subranges inside it. A run that produces many of these is the failure this
+// exists to make visible, not something to narrate line by line.
+constexpr U64 kGuestTopAliasReports = 12;
+std::atomic<U64> gGuestTopAliasReports {0};
+
+// One line when the guest's top-down arena is reserved or committed, naming
+// both the canonical address the guest asked for and the host address its
+// bytes live at. Which of the two a log is showing was previously left to be
+// inferred.
+void reportGuestTopAlias(CPU64* cpu, const char* what, U64 guestAddress,
+                         U64 length, U32 protection) {
+    if (!boxedvn::isTopArenaGuestAddress(guestAddress)) {
+        return;
+    }
+    if (gGuestTopAliasReports.fetch_add(1, std::memory_order_relaxed) >=
+        kGuestTopAliasReports) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_TOP_ALIAS_%s pid=%d tid=%d guest=0x%llx "
+             "host=0x%llx len=0x%llx prot=0x%x",
+             what,
+             (int)(cpu->thread ? cpu->thread->process->id : -1),
+             (int)(cpu->thread ? cpu->thread->id : -1),
+             (unsigned long long)guestAddress,
+             (unsigned long long)boxedvn::guestToHostAddress(guestAddress),
+             (unsigned long long)length, (unsigned)protection);
+}
 
 const char* guestMmapPlacementName(boxedvn::GuestMmapPlacement placement) {
     switch (placement) {
@@ -787,6 +815,10 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
             }
             ret = cpu->memory->mmapAnonymousFixed(alignedAddr, length,
                                                   (U32)prot);
+            if ((S64)ret >= 0) {
+                reportGuestTopAlias(cpu, "COMMIT", alignedAddr, mapLen,
+                                    (U32)prot);
+            }
             break;
         case boxedvn::GuestMmapPlacement::MapExactNoReplace:
             ret = cpu->memory->mmapAnonymousNoReplace(alignedAddr, mapLen,
@@ -794,6 +826,9 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
             if ((S64)ret < 0) {
                 gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
                     1, std::memory_order_relaxed);
+            } else {
+                reportGuestTopAlias(cpu, "RESERVE", alignedAddr, mapLen,
+                                    (U32)prot);
             }
             break;
         case boxedvn::GuestMmapPlacement::RelocateHighWindow:

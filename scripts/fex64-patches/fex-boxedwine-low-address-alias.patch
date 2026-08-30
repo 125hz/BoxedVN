@@ -1,8 +1,8 @@
 diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
-index 35a4212..34e7400 100644
+index 35a42120..b10ed632 100644
 --- a/FEXCore/Source/Interface/Context/Context.h
 +++ b/FEXCore/Source/Interface/Context/Context.h
-@@ -134,6 +134,22 @@ class ContextImpl final : public FEXCore::Context::Context, public CPU::CodeBuff
+@@ -134,6 +134,37 @@ class ContextImpl final : public FEXCore::Context::Context, public CPU::CodeBuff
  public:
    // Context base class implementation.
    bool InitCore() override;
@@ -13,30 +13,47 @@ index 35a4212..34e7400 100644
 +    GuestLowAliasBase = Base;
 +    GuestLowAliasLimit = Limit;
 +  }
++  void SetGuestTopClearMask(uint64_t Mask) override {
++    // Wine's top-down arena is the one lane the OR cannot reach: those guest
++    // addresses already carry the alias base's bits, so the OR is the identity
++    // there and the host would have to map the arena at its own address. Every
++    // address in the arena has this bit field set and every other hostable
++    // guest address has it clear, so clearing the field relocates the arena and
++    // does nothing anywhere else. It is one extra flag-free instruction, which
++    // matters: guest arithmetic flags live in the host NZCV register, so a
++    // compare-and-select inside operand generation would corrupt them.
++    GuestTopClearMask = Mask;
++  }
 +  uint64_t GetGuestLowAliasBase() const {
 +    return GuestLowAliasBase;
 +  }
++  uint64_t GetGuestTopClearMask() const {
++    return GuestTopClearMask;
++  }
 +  // Canonical guest address to the host address its bytes live at. The alias
-+  // base is chosen so this single OR is addition for canonical low addresses
-+  // and the identity for every permitted high address.
++  // base is chosen so the OR is addition for canonical low addresses and the
++  // identity for every permitted high address; the mask relocates the top
++  // arena and is a no-op everywhere else.
 +  uint64_t GuestToHostAddress(uint64_t GuestAddress) const {
-+    return GuestAddress | GuestLowAliasBase;
++    return (GuestAddress | GuestLowAliasBase) & ~GuestTopClearMask;
 +  }
 
    void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) override;
 
-@@ -351,6 +367,9 @@ public:
+@@ -351,6 +382,11 @@ public:
    } Config;
 
    FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
 +  // High host alias for canonical low guest addresses; zero preserves FEX.
 +  uint64_t GuestLowAliasBase {};
 +  uint64_t GuestLowAliasLimit {};
++  // Bit field cleared to relocate the guest's top arena; zero preserves FEX.
++  uint64_t GuestTopClearMask {};
 
    uint32_t StrictSplitLockMutex {};
 
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 92305f4..c903139 100644
+index 92305f46..c9031394 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -855,6 +855,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
@@ -60,7 +77,7 @@ index 92305f4..c903139 100644
            if (ZYAN_SUCCESS(ZydisDisassembleIntel(ZydisMachineMode, InstAddress, InstBytes, DecodedInfo->InstSize, &ZydisInst))) {
              LogMan::Msg::IFmt("    {:#x}: {}", InstAddress, ZydisInst.text);
 diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
-index b03cb77..76e5d32 100644
+index b03cb777..76e5d32e 100644
 --- a/FEXCore/Source/Interface/Core/Frontend.cpp
 +++ b/FEXCore/Source/Interface/Core/Frontend.cpp
 @@ -13,6 +13,7 @@ $end_info$
@@ -106,7 +123,7 @@ index b03cb77..76e5d32 100644
  }
 
 diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
-index d451a7e..f7a88d8 100644
+index d451a7e8..f7a88d83 100644
 --- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
 @@ -20,7 +20,7 @@ DEF_OP(CASPair) {
@@ -200,10 +217,10 @@ index d451a7e..f7a88d8 100644
    if (CTX->HostFeatures.SupportsAtomics) {
      // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics
 diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
-index 3e01eeb..c89c963 100644
+index 3e01eeb7..9499c988 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
 +++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
-@@ -315,6 +315,17 @@ private:
+@@ -315,6 +315,22 @@ private:
      return IsFPR(IR::PhysicalRegister(Wrap).AsRegClass());
    }
 
@@ -218,14 +235,19 @@ index 3e01eeb..c89c963 100644
 +  [[nodiscard]]
 +  ARMEmitter::Register AliasGuestAddress(ARMEmitter::Register Base);
 +
++  // Applies the guest top-arena relocation in place. Every path that ORs the
++  // alias base itself, instead of calling AliasGuestAddress, must call this
++  // too, or that path would keep pointing at the unmappable canonical arena.
++  void ApplyGuestTopRelocation(ARMEmitter::Register Reg);
++
    [[nodiscard]]
    ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                      IR::MemOffsetType OffsetType, uint8_t OffsetScale);
 diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
-index 2cf05d1..b32240f 100644
+index 2cf05d14..224be447 100644
 --- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
-@@ -584,19 +584,63 @@ DEF_OP(ContextClear) {
+@@ -584,19 +584,79 @@ DEF_OP(ContextClear) {
    }
  }
 
@@ -237,7 +259,22 @@ index 2cf05d1..b32240f 100644
 +  // The alias base is a single contiguous run of ones, so it encodes directly
 +  // as an ARM64 logical immediate and needs no constant materialisation.
 +  orr(ARMEmitter::Size::i64Bit, TMP4, Base, AliasBase);
++  ApplyGuestTopRelocation(TMP4);
 +  return TMP4;
++}
++
++// Relocate the guest's top-down arena, in place, on a register that already
++// holds the OR'd address. Deliberately flag-free and scratch-free: FEX keeps
++// guest arithmetic flags in the host NZCV register, so a compare-and-select
++// here would corrupt them, and every spare temporary is already spoken for.
++// Exact because the cleared field is set in every arena address and clear in
++// every other hostable one, which makes this the identity outside the arena.
++void Arm64JITCore::ApplyGuestTopRelocation(ARMEmitter::Register Reg) {
++  const uint64_t ClearMask = CTX->GetGuestTopClearMask();
++  if (ClearMask == 0) {
++    return;
++  }
++  bic(ARMEmitter::Size::i64Bit, Reg, Reg, ClearMask);
 +}
 +
  ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(
@@ -286,12 +323,13 @@ index 2cf05d1..b32240f 100644
 +        default: LOGMAN_MSG_A_FMT("Unhandled GenerateMemOperand OffsetType: {}", OffsetType); break;
 +        }
 +        orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, AliasBase);
++        ApplyGuestTopRelocation(TMP4);
 +        return ARMEmitter::ExtendedMemOperand(TMP4, ARMEmitter::IndexType::OFFSET, 0);
 +      }
        switch (OffsetType) {
        case IR::MemOffsetType::SXTX:
          return ARMEmitter::ExtendedMemOperand(Base.X(), RegOffset.X(), ARMEmitter::ExtendedType::SXTX, FEXCore::ilog2(OffsetScale));
-@@ -652,6 +696,11 @@ ARMEmitter::Register Arm64JITCore::ApplyMemOperand(IR::OpSize AccessSize, ARMEmi
+@@ -652,6 +712,11 @@ ARMEmitter::Register Arm64JITCore::ApplyMemOperand(IR::OpSize AccessSize, ARMEmi
 
  ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                                IR::MemOffsetType OffsetType, [[maybe_unused]] uint8_t OffsetScale) {
@@ -303,31 +341,33 @@ index 2cf05d1..b32240f 100644
    if (Offset.IsInvalid()) {
      return ARMEmitter::SVEMemOperand(Base.X(), 0);
    }
-@@ -688,6 +737,11 @@ ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessS
+@@ -688,6 +753,12 @@ ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessS
      // If we can't do that for whatever reason, then unfortunately, we need
      // to move it over to a temporary to use as an offset.
      mov(TMP1, Const);
 +    if (SVEAliasBase != 0) {
 +      add(ARMEmitter::Size::i64Bit, TMP4, CanonicalBase, TMP1);
 +      orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, SVEAliasBase);
++      ApplyGuestTopRelocation(TMP4);
 +      return ARMEmitter::SVEMemOperand(TMP4, 0);
 +    }
      return ARMEmitter::SVEMemOperand(Base.X(), TMP1);
    }
 
-@@ -698,6 +752,11 @@ ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessS
+@@ -698,6 +769,12 @@ ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessS
    LOGMAN_THROW_A_FMT(OffsetType == IR::MemOffsetType::SXTX, "Currently only the default offset type (SXTX) is supported.");
 
    const auto RegOffset = GetReg(Offset);
 +  if (SVEAliasBase != 0) {
 +    add(ARMEmitter::Size::i64Bit, TMP4, CanonicalBase, RegOffset);
 +    orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, SVEAliasBase);
++    ApplyGuestTopRelocation(TMP4);
 +    return ARMEmitter::SVEMemOperand(TMP4, 0);
 +  }
    return ARMEmitter::SVEMemOperand(Base.X(), RegOffset.X());
  }
 
-@@ -740,7 +799,9 @@ DEF_OP(LoadMem) {
+@@ -740,7 +817,9 @@ DEF_OP(LoadMem) {
 
  DEF_OP(LoadMemPair) {
    const auto Op = IROp->C<IR::IROp_LoadMemPair>();
@@ -338,7 +378,7 @@ index 2cf05d1..b32240f 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      const auto Dst1 = GetReg(Op->OutValue1);
-@@ -768,7 +829,7 @@ DEF_OP(LoadMemTSO) {
+@@ -768,7 +847,7 @@ DEF_OP(LoadMemTSO) {
    const auto Op = IROp->C<IR::IROp_LoadMemTSO>();
    const auto OpSize = IROp->Size;
 
@@ -347,7 +387,7 @@ index 2cf05d1..b32240f 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
-@@ -1355,7 +1416,7 @@ DEF_OP(VLoadVectorElement) {
+@@ -1355,7 +1434,7 @@ DEF_OP(VLoadVectorElement) {
 
    const auto Dst = GetVReg(Node);
    const auto DstSrc = GetVReg(Op->DstSrc);
@@ -356,7 +396,7 @@ index 2cf05d1..b32240f 100644
 
    LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
                         ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
-@@ -1392,7 +1453,7 @@ DEF_OP(VStoreVectorElement) {
+@@ -1392,7 +1471,7 @@ DEF_OP(VStoreVectorElement) {
    const auto ElementSize = IROp->ElementSize;
 
    const auto Value = GetVReg(Op->Value);
@@ -365,7 +405,7 @@ index 2cf05d1..b32240f 100644
 
    LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
                         ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
-@@ -1694,7 +1755,7 @@ DEF_OP(StoreMemX87SVEOptPredicate) {
+@@ -1694,7 +1773,7 @@ DEF_OP(StoreMemX87SVEOptPredicate) {
    LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "StoreMemX87SVEOptPredicate needs SVE support");
 
    const auto RegData = GetVReg(Op->Value);
@@ -374,7 +414,7 @@ index 2cf05d1..b32240f 100644
    const auto MemDst = ARMEmitter::SVEMemOperand(MemReg.X(), 0);
 
    switch (IROp->ElementSize) {
-@@ -1722,7 +1783,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
+@@ -1722,7 +1801,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
    const auto Op = IROp->C<IR::IROp_LoadMemX87SVEOptPredicate>();
    const auto Dst = GetVReg(Node);
    const auto Predicate = PRED_X87_SVEOPT;
@@ -383,7 +423,7 @@ index 2cf05d1..b32240f 100644
 
    LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "LoadMemX87SVEOptPredicate needs SVE support");
 
-@@ -1752,7 +1813,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
+@@ -1752,7 +1831,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
  DEF_OP(StoreMemPair) {
    const auto Op = IROp->C<IR::IROp_StoreMemPair>();
    const auto OpSize = IROp->Size;
@@ -392,7 +432,7 @@ index 2cf05d1..b32240f 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      const auto Src1 = GetZeroableReg(Op->Value1);
-@@ -1779,7 +1840,7 @@ DEF_OP(StoreMemTSO) {
+@@ -1779,7 +1858,7 @@ DEF_OP(StoreMemTSO) {
    const auto Op = IROp->C<IR::IROp_StoreMemTSO>();
    const auto OpSize = IROp->Size;
 
@@ -401,7 +441,7 @@ index 2cf05d1..b32240f 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
-@@ -1882,6 +1943,12 @@ DEF_OP(MemSet) {
+@@ -1882,6 +1961,12 @@ DEF_OP(MemSet) {
      const auto Prefix = GetReg(Op->Prefix);
      add(TMP2, Prefix.X(), MemReg.X());
    }
@@ -414,7 +454,7 @@ index 2cf05d1..b32240f 100644
 
    if (!DirectionIsInline) {
      // Backward or forwards implementation depends on flag
-@@ -2116,6 +2183,14 @@ DEF_OP(MemCpy) {
+@@ -2116,6 +2201,14 @@ DEF_OP(MemCpy) {
    mov(TMP1, Length.X());
    mov(TMP2, MemRegDest.X());
    mov(TMP3, MemRegSrc.X());
@@ -429,7 +469,7 @@ index 2cf05d1..b32240f 100644
 
    // TMP1 = Length
    // TMP2 = Dest
-@@ -2396,7 +2471,7 @@ DEF_OP(CacheLineClear) {
+@@ -2396,7 +2489,7 @@ DEF_OP(CacheLineClear) {
 
    auto Op = IROp->C<IR::IROp_CacheLineClear>();
 
@@ -438,7 +478,7 @@ index 2cf05d1..b32240f 100644
 
    // Clear dcache only
    // icache doesn't matter here since the guest application shouldn't be calling clflush on JIT code.
-@@ -2426,7 +2501,7 @@ DEF_OP(CacheLineClean) {
+@@ -2426,7 +2519,7 @@ DEF_OP(CacheLineClean) {
 
    auto Op = IROp->C<IR::IROp_CacheLineClean>();
 
@@ -447,7 +487,7 @@ index 2cf05d1..b32240f 100644
 
    // Clean dcache only
    // check host cacheline size again x86_64 size to ensure at least 64 bytes are cleaned
-@@ -2445,7 +2520,7 @@ DEF_OP(CacheLineClean) {
+@@ -2445,7 +2538,7 @@ DEF_OP(CacheLineClean) {
  DEF_OP(CacheLineZero) {
    auto Op = IROp->C<IR::IROp_CacheLineZero>();
 
@@ -456,7 +496,7 @@ index 2cf05d1..b32240f 100644
 
    if (CTX->HostFeatures.SupportsCLZERO) {
      // We can use this instruction directly
-@@ -2465,7 +2540,7 @@ DEF_OP(CacheLineZero) {
+@@ -2465,7 +2558,7 @@ DEF_OP(CacheLineZero) {
 
  DEF_OP(Prefetch) {
    auto Op = IROp->C<IR::IROp_Prefetch>();
@@ -465,7 +505,7 @@ index 2cf05d1..b32240f 100644
 
    // Access size is only ever handled as 8-byte. Even though it is accesssed as a cacheline.
    const auto MemSrc = GenerateMemOperand(IR::OpSize::i64Bit, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
-@@ -2510,7 +2585,7 @@ DEF_OP(VStoreNonTemporal) {
+@@ -2510,7 +2603,7 @@ DEF_OP(VStoreNonTemporal) {
    const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
    const auto Value = GetVReg(Op->Value);
@@ -474,7 +514,7 @@ index 2cf05d1..b32240f 100644
    const auto Offset = Op->Offset;
 
    if (Is256Bit) {
-@@ -2537,7 +2612,7 @@ DEF_OP(VStoreNonTemporalPair) {
+@@ -2537,7 +2630,7 @@ DEF_OP(VStoreNonTemporalPair) {
    const auto ValueLow = GetVReg(Op->ValueLow);
    const auto ValueHigh = GetVReg(Op->ValueHigh);
 
@@ -483,7 +523,7 @@ index 2cf05d1..b32240f 100644
    const auto Offset = Op->Offset;
 
    stnp(ValueLow.Q(), ValueHigh.Q(), MemReg, Offset);
-@@ -2552,7 +2627,7 @@ DEF_OP(VLoadNonTemporal) {
+@@ -2552,7 +2645,7 @@ DEF_OP(VLoadNonTemporal) {
    const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
    const auto Dst = GetVReg(Node);
@@ -493,10 +533,10 @@ index 2cf05d1..b32240f 100644
 
    if (Is256Bit) {
 diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
-index ec61b90..441e0ec 100644
+index ec61b90b..80ebb7a3 100644
 --- a/FEXCore/include/FEXCore/Core/Context.h
 +++ b/FEXCore/include/FEXCore/Core/Context.h
-@@ -68,6 +68,16 @@ public:
+@@ -68,6 +68,25 @@ public:
     */
    FEX_DEFAULT_VISIBILITY virtual bool InitCore() = 0;
 
@@ -508,6 +548,15 @@ index ec61b90..441e0ec 100644
 +  FEX_DEFAULT_VISIBILITY virtual void SetGuestLowAlias(uint64_t Base, uint64_t Limit) {
 +    (void)Base;
 +    (void)Limit;
++  }
++
++  // BoxedWine: the guest's top-down arena is relocated by clearing one bit
++  // field of its address. Every address in the arena has the field set and
++  // every other hostable guest address has it clear, so this is exact and
++  // costs one flag-free instruction. Zero (the default) leaves every guest
++  // pointer untouched.
++  FEX_DEFAULT_VISIBILITY virtual void SetGuestTopClearMask(uint64_t Mask) {
++    (void)Mask;
 +  }
 +
    /**

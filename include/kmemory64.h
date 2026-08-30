@@ -99,6 +99,23 @@ class KThread;
 #define K64_NATIVE_GUEST_IMAGE_BASE   K64_NATIVE_LOW_ALIAS_END
 #define K64_NATIVE_GUEST_HIGH_END     (K64_NATIVE_GUEST_IMAGE_BASE + \
                                        K64_NATIVE_LOW_GUEST_LIMIT)
+
+// Wine's top-down arena and the host block it is served from. Wine reserves
+// [K64_NATIVE_TOP_GUEST_BASE, K64_NATIVE_TOP_GUEST_END) PROT_NONE and then
+// commits accessible subranges inside it. The single OR cannot reach it --
+// those addresses already carry the alias base's bits, so the OR is the
+// identity and the host would have to map 0x7ffffe000000 itself. Bits 39..46
+// are set in every arena address and clear in every other hostable one, so
+// clearing that field is the whole relocation and a no-op elsewhere.
+#define K64_NATIVE_TOP_GUEST_BASE     0x7FFFFE000000ULL
+#define K64_NATIVE_TOP_GUEST_END      0x7FFFFFFF0000ULL
+#define K64_NATIVE_TOP_GUEST_LENGTH   (K64_NATIVE_TOP_GUEST_END - \
+                                       K64_NATIVE_TOP_GUEST_BASE)
+#define K64_NATIVE_TOP_CLEAR_MASK     0x7F8000000000ULL
+#define K64_NATIVE_TOP_HOST_BASE      (K64_NATIVE_TOP_GUEST_BASE & \
+                                       ~K64_NATIVE_TOP_CLEAR_MASK)
+#define K64_NATIVE_TOP_HOST_END       (K64_NATIVE_TOP_HOST_BASE + \
+                                       K64_NATIVE_TOP_GUEST_LENGTH)
 // Keep automatic mappings out of the executable's program-break growth lane.
 // Starting mmap(NULL, ...) at IMAGE_BASE let ld-linux place libc immediately
 // above a small PIE, so glibc's first brk expansion collided with libc. One
@@ -178,13 +195,40 @@ static_assert(K64_NATIVE_GUEST_TLS_BASE > K64_NATIVE_GUEST_INTERP_BASE,
 static_assert(K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE <=
               K64_NATIVE_LOW_GUEST_LIMIT,
               "KUSER_SHARED_DATA must resolve through the low alias");
+// The top lane must agree with the shared translation header exactly, or the
+// emulator and the translator would compute different host addresses.
+static_assert(K64_NATIVE_TOP_GUEST_BASE == boxedvn::kGuestTopBase,
+              "top arena base must match the shared alias contract");
+static_assert(K64_NATIVE_TOP_GUEST_END == boxedvn::kGuestTopEnd,
+              "top arena end must match the shared alias contract");
+static_assert(K64_NATIVE_TOP_CLEAR_MASK == boxedvn::kGuestTopClearMask,
+              "top clear mask must match the shared alias contract");
+static_assert(K64_NATIVE_TOP_HOST_BASE == boxedvn::kGuestTopHostBase,
+              "top host alias base must match the shared alias contract");
+static_assert(K64_NATIVE_TOP_HOST_BASE >= K64_NATIVE_GUEST_HIGH_END,
+              "the top host alias must sit above the identity lane");
+static_assert(K64_NATIVE_TOP_HOST_END <= K64_NATIVE_GUEST_WINDOW_END,
+              "the top host alias must stay inside the proven host window");
+static_assert(K64_NATIVE_TOP_GUEST_BASE > K64_NATIVE_GUEST_HIGH_END,
+              "the arena must sit above the identity lane");
 #endif
 
 // Translate a canonical guest address to the host address its bytes live at.
 // Identity for every permitted high address by construction; the single OR is
 // what the ARM64 translator emits for guest dereferences as well.
+static inline int k64IsTopArenaGuestAddress(U64 guestAddress) {
+    return (guestAddress >= K64_NATIVE_TOP_GUEST_BASE &&
+            guestAddress < K64_NATIVE_TOP_GUEST_END) ? 1 : 0;
+}
+
+static inline int k64IsTopArenaHostAddress(U64 hostAddress) {
+    return (hostAddress >= K64_NATIVE_TOP_HOST_BASE &&
+            hostAddress < K64_NATIVE_TOP_HOST_END) ? 1 : 0;
+}
+
 static inline U64 k64GuestToHostAddress(U64 guestAddress) {
-    return guestAddress | K64_NATIVE_LOW_ALIAS_BASE;
+    return (guestAddress | K64_NATIVE_LOW_ALIAS_BASE) &
+           ~K64_NATIVE_TOP_CLEAR_MASK;
 }
 
 // Recover the canonical guest address from a host address inside the alias
@@ -194,6 +238,11 @@ static inline U64 k64HostToGuestAddress(U64 hostAddress) {
     if (hostAddress >= K64_NATIVE_LOW_ALIAS_BASE &&
         hostAddress < K64_NATIVE_LOW_ALIAS_END) {
         return hostAddress - K64_NATIVE_LOW_ALIAS_BASE;
+    }
+    // The top alias sits above the identity lane, so it can never be mistaken
+    // for a valid identity-lane guest address.
+    if (k64IsTopArenaHostAddress(hostAddress)) {
+        return hostAddress | K64_NATIVE_TOP_CLEAR_MASK;
     }
     return hostAddress;
 }

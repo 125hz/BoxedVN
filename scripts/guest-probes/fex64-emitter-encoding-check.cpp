@@ -159,12 +159,68 @@ void checkFullImmediateRange() {
     }
 }
 
+// BoxedWine's guest address translation is two ARM64 logical-immediate
+// instructions:
+//
+//     orr Xd, Xn, #kGuestLowAliasBase     -- canonical low -> host alias
+//     bic Xd, Xd, #kGuestTopClearMask     -- Wine's top arena -> its own block
+//
+// Both constants have to be encodable as logical immediates or the emitter
+// gives up at translation time, on device, with no way to see it coming. This
+// drives the real emitter with the exact constants the runtime publishes.
+void checkGuestAddressTranslationEncodings() {
+    // Kept as literals rather than including the runtime header: this tool
+    // links only the emitter, and a copy that silently drifted would be worse
+    // than one that fails loudly. The contract test pins them together.
+    constexpr uint64_t kGuestLowAliasBase = 0x7800000000ULL;
+    constexpr uint64_t kGuestTopClearMask = 0x7F8000000000ULL;
+
+    // ORR (immediate), 64-bit: sf=1 opc=01 100100.
+    constexpr uint32_t kLogicalImmMask = 0xFF800000u;
+    constexpr uint32_t kOrrImmOpcode = 0xB2000000u;
+    // AND (immediate), 64-bit; `bic` is emitted as AND with the complement.
+    constexpr uint32_t kAndImmOpcode = 0x92000000u;
+
+    const uint32_t aliasWord = emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.orr(ARMEmitter::Size::i64Bit, ARMEmitter::Register(13),
+                    ARMEmitter::Register(11), kGuestLowAliasBase);
+    });
+    if ((aliasWord & kLogicalImmMask) != kOrrImmOpcode) {
+        fail("the low alias base did not encode as ORR (immediate)",
+             kOrrImmOpcode, aliasWord & kLogicalImmMask);
+    }
+    if ((aliasWord & 0x1Fu) != 13u || ((aliasWord >> 5) & 0x1Fu) != 11u) {
+        fail("the low alias ORR named the wrong registers", 13u,
+             aliasWord & 0x1Fu);
+    }
+
+    const uint32_t clearWord = emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.bic(ARMEmitter::Size::i64Bit, ARMEmitter::Register(13),
+                    ARMEmitter::Register(13), kGuestTopClearMask);
+    });
+    if ((clearWord & kLogicalImmMask) != kAndImmOpcode) {
+        fail("the top clear mask did not encode as AND (immediate)",
+             kAndImmOpcode, clearWord & kLogicalImmMask);
+    }
+    if ((clearWord & 0x1Fu) != 13u || ((clearWord >> 5) & 0x1Fu) != 13u) {
+        fail("the top relocation BIC named the wrong registers", 13u,
+             clearWord & 0x1Fu);
+    }
+    // Two distinct instructions: a relocation that collapsed into the alias
+    // ORR would leave the arena pointing at an address the host cannot map.
+    if (aliasWord == clearWord) {
+        fail("the alias and relocation emitted the same word", aliasWord,
+             clearWord);
+    }
+}
+
 } // namespace
 
 int main() {
     checkDeviceFaultingInstruction();
     checkMaterializedAddressForm();
     checkFullImmediateRange();
+    checkGuestAddressTranslationEncodings();
 
     if (gFailures != 0) {
         std::fprintf(stderr, "emitter-encoding-check: FAIL (%d checks)\n", gFailures);
