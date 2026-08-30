@@ -296,10 +296,9 @@ run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin" \
 run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin" \
     "${tmp_dir}/fex64-top-alias.config.bin" 500 1
 
-top_alias_capture="${tmp_dir}/fex64-top-alias.ircap.txt"
-run_one x64-top-alias-ircap "${tmp_dir}/fex64-top-alias.bin" \
-    "${tmp_dir}/fex64-top-alias.config.bin" 500 0 0x10100 \
-    | tee "${top_alias_capture}"
-python3 "${host_word_check}" "${top_alias_capture}" \
-    --label top-alias --forbid-word ffff0177
+# No targeted IR capture here. The other fixtures pin one instruction at
+# guest 0x10100 because a specific host encoding was in question; this
+# fixture's claim is behavioural -- every access is read back and compared
+# -- and the encoding of the two translation instructions is proven
+# against the real emitter in fex64-emitter-encoding-check.cpp instead.
 echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias and top-alias fixtures completed in all modes"
