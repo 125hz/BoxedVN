@@ -1771,14 +1771,43 @@ def main() -> None:
             "at(-10) != 0xF6 || at(-9) != 0x04 || at(-8) != 0x25",
             "(uint64_t)dword(-7) != K_WINE_KUSER_SYSTEM_CALL_FLAG",
             "at(-2) != 0x75",
-            "at(0) != 0x0F || at(1) != 0x05",
-            "at(3) != 0xFF || at(4) != 0x14 || at(5) != 0x25",
-            "(uint64_t)dword(6) != K_WINE_KUSER_SYSCALL_DISPATCHER",
             "branchTarget != syscallAddress + 3",
+            "at(0) != 0x0F || at(1) != 0x05",
+            "at(2) != 0xC3",
+            "const uint8_t tailSelector = at(3);",
+            # The packaged layout: eb 01 hops the padding ret to the call.
+            "if (tailSelector == 0xEB) {",
+            "bridgeTarget != syscallAddress + 6",
+            "if (tailAt(5) != 0xC3) {",
+            "tailAt(6) != 0xFF || tailAt(7) != 0x14 || tailAt(8) != 0x25",
+            "(uint64_t)tailDword(9) != K_WINE_KUSER_SYSCALL_DISPATCHER",
+            "if (tailAt(13) != 0xC3) {",
+            # The direct layout, validated to the same depth.
+            "} else if (tailSelector == 0xFF) {",
+            "tailAt(4) != 0x14 || tailAt(5) != 0x25",
+            "(uint64_t)tailDword(6) != K_WINE_KUSER_SYSCALL_DISPATCHER",
+            "if (tailAt(10) != 0xC3) {",
+            # Anything else is not a thunk this code knows how to redirect.
+            "} else {",
             "dispatcher == 0 || dispatcher == ~(uint64_t)0",
         ],
         "BoxedVN Wine NT stub recognition contract",
     )
+    # The layout constants have to describe the thunk that actually ships.
+    for required in ("inline constexpr int kWineNtStubFirstOffset = -18;",
+                     "inline constexpr int kWineNtStubLastOffset = 13;",
+                     "inline constexpr unsigned kWineNtStubLength = 32;"):
+        if required not in nt_stub_header:
+            raise SystemExit(
+                "the Wine NT stub layout constants must describe the packaged "
+                "32-byte thunk: " + required
+            )
+    # Resuming anywhere but the jne target would be guessing at Wine's own
+    # control flow instead of following it.
+    if "out.indirectPath = branchTarget;" not in nt_stub_header:
+        raise SystemExit(
+            "the redirect must resume on the validated jne target"
+        )
     # Recognition must be by instruction shape. An address range is what broke
     # last time: ntdll moved and the check silently stopped matching. Comments
     # may still recount that history; code may not act on it.
