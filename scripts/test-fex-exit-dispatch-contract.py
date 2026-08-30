@@ -2007,6 +2007,9 @@ def main() -> None:
             "bool sparseReservationOverlaps(U64 addr, U64 len) const;",
             "bool releaseSparseReservation(U64 addr, U64 len);",
             "U64 sparseReservationCount() const;",
+            # The const reservation queries take this lock, so it has to
+            # be mutable the way pagesMutex already is.
+            "mutable BOXEDWINE_MUTEX mmapMutex;",
             "std::map<U64, U64> sparseReservations;",
         ],
         "BoxedVN sparse reservation address-space contract",

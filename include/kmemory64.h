@@ -520,7 +520,9 @@ private:
     // Separate from pagesMutex so a long scan doesn't block unrelated page
     // faults. Process-wide bump cursor (replaces the old per-CPU64 mmapNext so
     // every thread of the process advances the same pointer). 0 = uninitialised.
-    BOXEDWINE_MUTEX mmapMutex;
+    // Mutable for the same reason pagesMutex is: the const reservation
+    // queries (sparseReservationOverlaps/Count/Pages) have to take it.
+    mutable BOXEDWINE_MUTEX mmapMutex;
     U64 mmapNext = 0;
 
     // Reserved address-space ranges drawn from the active mmap region (the
