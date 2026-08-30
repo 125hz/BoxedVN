@@ -123,6 +123,20 @@ constexpr size_t kGuestStackBytes = 256u * 1024u;
 // The cold exec-replacement unwind is a one-shot sequence per launch. Bound it
 // so a looping scheduler cannot flood the device log with the same transition.
 constexpr uint32_t kUnwindReportLimit = 24;
+// Deterministic canonical guest ranges for the FEX correctness probe. The
+// image sits in the canonical low range so the probe exercises the host
+// alias the live guest depends on; the stack sits in the high identity lane,
+// matching where the live guest's stack lane lives. Both are clear of zero,
+// of KUSER_SHARED_DATA and of the addresses Wine prefers for PE images.
+constexpr uint64_t kProbeGuestImageBase = 0x00e0000000ULL;
+constexpr uint64_t kProbeGuestImageSpan = 16ull * 1024ull * 1024ull;
+constexpr uint64_t kProbeGuestStackBase =
+    boxedvn::kGuestHighBase + 0x20000000ULL;
+static_assert(kProbeGuestImageBase + kProbeGuestImageSpan <
+              boxedvn::kGuestLowLimit,
+              "probe image must stay inside the canonical low range");
+static_assert(kProbeGuestImageBase > 0x7ffe0000ULL + 0x10000ULL,
+              "probe image must clear KUSER_SHARED_DATA");
 // The low-alias contract is a property of the whole address space, so it
 // is reported once rather than per context.
 std::atomic<bool> gLowAliasReported {false};
@@ -971,15 +985,46 @@ bool mapBundledELFProbe() {
         return false;
     }
     const size_t mappingSize = static_cast<size_t>(last - first);
-    void* mapping = mmap(nullptr, mappingSize, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
-    gGuestStack = mmap(nullptr, kGuestStackBytes, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mapping == MAP_FAILED || gGuestStack == MAP_FAILED) {
-        reportf("the bundled ELF64 load span or stack could not be mapped");
+
+    // The probe deliberately runs from a CANONICAL LOW guest address so it
+    // validates the alias the live guest depends on. The old code mmap'd
+    // anonymously and used the iOS-selected host pointer as the guest address;
+    // once instruction fetch started translating, that address had nothing
+    // mapped behind it and the entry block was reported NoExec.
+    //
+    // The stack stays in the high identity lane on purpose: that is where the
+    // live guest's stack lane lives too, and the stack write-back paths
+    // (push/pop/call/ret) are not translated yet.
+    const uint64_t guestImageBase = kProbeGuestImageBase;
+    const uint64_t guestStackBase = kProbeGuestStackBase;
+    if (mappingSize > kProbeGuestImageSpan) {
+        reportf("the bundled ELF64 load span exceeds the probe image window");
         return false;
     }
-    std::memset(mapping, 0, mappingSize);
+
+    // KMemory64 owns the host mapping: in native-identity mode it maps the
+    // canonical range through the alias and adopts the translated backing for
+    // every page, so destroying it later releases exactly what it created.
+    gProbeMemory = std::make_unique<KMemory64>(nullptr, /*nativeIdentity*/ true);
+    gProbeCPU = std::make_unique<CPU64>(gProbeMemory.get());
+    const uint64_t mappedImage = gProbeMemory->mmapAnonymousFixed(
+        guestImageBase, mappingSize, 0x3);
+    const uint64_t mappedStack = gProbeMemory->mmapAnonymousFixed(
+        guestStackBase, kGuestStackBytes, 0x3);
+    if (mappedImage != guestImageBase || mappedStack != guestStackBase) {
+        reportf("the probe guest mapping failed: image=0x%llx stack=0x%llx",
+                static_cast<unsigned long long>(mappedImage),
+                static_cast<unsigned long long>(mappedStack));
+        return false;
+    }
+
+    // Host backings are reached only through the translation; the guest never
+    // sees these values.
+    uint8_t* const hostImage = reinterpret_cast<uint8_t*>(
+        static_cast<uintptr_t>(boxedvn::guestToHostAddress(guestImageBase)));
+    uint8_t* const hostStack = reinterpret_cast<uint8_t*>(
+        static_cast<uintptr_t>(boxedvn::guestToHostAddress(guestStackBase)));
+    std::memset(hostImage, 0, mappingSize);
     for (const boxedvn::ELFLoadSegment& segment : image.loadSegments) {
         const uint64_t destinationOffset = segment.virtualAddress - first;
         if (destinationOffset > mappingSize ||
@@ -987,7 +1032,7 @@ bool mapBundledELFProbe() {
             reportf("the bundled ELF64 segment escaped its checked load span");
             return false;
         }
-        std::memcpy(static_cast<uint8_t*>(mapping) + destinationOffset,
+        std::memcpy(hostImage + destinationOffset,
                     static_cast<const uint8_t*>(data.bytes) + segment.fileOffset,
                     static_cast<size_t>(segment.fileSize));
     }
@@ -996,46 +1041,39 @@ bool mapBundledELFProbe() {
         reportf("the bundled ELF64 entry lies outside its load span");
         return false;
     }
-    const auto addIdentity = [](void* pointer, size_t size, uint8_t access) {
-        return gAddressSpace.add({reinterpret_cast<uint64_t>(pointer), size,
-                                  reinterpret_cast<uintptr_t>(pointer), access});
+
+    // The syscall dispatcher reads guest buffers through gAddressSpace, so it
+    // must map the CANONICAL guest range onto the translated host backing.
+    const auto addAliased = [](uint64_t guestAddress, uint8_t* hostBacking,
+                               size_t size, uint8_t access) {
+        return gAddressSpace.add({guestAddress, size,
+                                  reinterpret_cast<uintptr_t>(hostBacking),
+                                  access});
     };
-    if (!addIdentity(mapping, mappingSize,
-                     boxedvn::GuestMemoryRead |
-                     boxedvn::GuestMemoryWrite |
-                     boxedvn::GuestMemoryExecute) ||
-        !addIdentity(gGuestStack, kGuestStackBytes,
-                     boxedvn::GuestMemoryRead | boxedvn::GuestMemoryWrite)) {
-        reportf("the bundled ELF64 mapping or stack could not be registered");
+    if (!addAliased(guestImageBase, hostImage, mappingSize,
+                    boxedvn::GuestMemoryRead |
+                    boxedvn::GuestMemoryWrite |
+                    boxedvn::GuestMemoryExecute) ||
+        !addAliased(guestStackBase, hostStack, kGuestStackBytes,
+                    boxedvn::GuestMemoryRead | boxedvn::GuestMemoryWrite)) {
+        reportf("the probe guest ranges could not be registered");
         return false;
     }
 
-    // FEX fetches and accesses the identity-mapped host image directly.  The
-    // BoxedWine CPU64 mirror is still required because write/exit return
-    // through the real syscall dispatcher, which reads guest buffers through
-    // KMemory64 rather than through FEX's host pointer.
-    gProbeMemory = std::make_unique<KMemory64>(nullptr);
-    gProbeCPU = std::make_unique<CPU64>(gProbeMemory.get());
-    const uint64_t mappingAddress = reinterpret_cast<uint64_t>(mapping);
-    const uint64_t stackAddress = reinterpret_cast<uint64_t>(gGuestStack);
-    const uint64_t mirroredImage = gProbeMemory->mmapAnonymousFixed(
-        mappingAddress, mappingSize, 0x7);
-    const uint64_t mirroredStack = gProbeMemory->mmapAnonymousFixed(
-        stackAddress, kGuestStackBytes, 0x3);
-    if (mirroredImage != mappingAddress || mirroredStack != stackAddress) {
-        reportf("the CPU64 correctness mirror failed: image=0x%llx stack=0x%llx",
-                static_cast<unsigned long long>(mirroredImage),
-                static_cast<unsigned long long>(mirroredStack));
-        return false;
-    }
-    gProbeMemory->memcpyToGuest(
-        mappingAddress, mapping, mappingSize);
-
-    gGuestCode = mapping;
-    gGuestEntry = reinterpret_cast<uint64_t>(mapping) + entryOffset;
+    // Only canonical values ever reach CPU64 or FEX.
+    gGuestCode = reinterpret_cast<void*>(static_cast<uintptr_t>(guestImageBase));
+    gGuestStack = reinterpret_cast<void*>(static_cast<uintptr_t>(guestStackBase));
+    gGuestEntry = guestImageBase + entryOffset;
     gProbeCPU->rip = gGuestEntry;
-    gProbeCPU->reg[X64_RSP].setU64(
-        reinterpret_cast<uint64_t>(gGuestStack) + kGuestStackBytes - 0x100);
+    gProbeCPU->reg[X64_RSP].setU64(guestStackBase + kGuestStackBytes - 0x100);
+    reportf("BOXEDWINE_FEX64_PROBE_MAP guest_image=0x%llx host_image=0x%llx "
+            "guest_stack=0x%llx host_stack=0x%llx alias=1",
+            static_cast<unsigned long long>(guestImageBase),
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(hostImage)),
+            static_cast<unsigned long long>(guestStackBase),
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(hostStack)));
     reportf("loaded bundled PIE ELF64 correctness process: %zu segments, entry=%p",
             image.loadSegments.size(), reinterpret_cast<void*>(gGuestEntry));
     return true;

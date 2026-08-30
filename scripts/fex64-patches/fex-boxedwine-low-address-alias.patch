@@ -22,43 +22,137 @@ index 35a4212..34e7400 100644
 +  uint64_t GuestToHostAddress(uint64_t GuestAddress) const {
 +    return GuestAddress | GuestLowAliasBase;
 +  }
- 
+
    void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) override;
- 
+
 @@ -351,6 +367,9 @@ public:
    } Config;
- 
+
    FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
 +  // High host alias for canonical low guest addresses; zero preserves FEX.
 +  uint64_t GuestLowAliasBase {};
 +  uint64_t GuestLowAliasLimit {};
- 
+
    uint32_t StrictSplitLockMutex {};
- 
+
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
 index 92305f4..ebbdc7e 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -791,7 +791,8 @@ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter*
  };
- 
+
  bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Thread, uint64_t GuestRIP, uint64_t MaxInst) {
 -  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
 +  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP)), GuestRIP,
 +                                                 MaxInst);
  }
- 
+
  /* iOS-Mythic ml623: targeted IR capture (PassManager.cpp). FEX_MythicIRCapTarget is the
 @@ -855,7 +856,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
- 
+
    if (!HasCustomIR) {
      const uint8_t* GuestCode {};
 -    GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 +    // Instruction fetch is a host dereference; the RIP itself stays canonical.
 +    GuestCode = reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP));
- 
+
      /* perf-silenced GenerateIR GuestCode log */
- 
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index d451a7e..f7a88d8 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -20,7 +20,7 @@ DEF_OP(CASPair) {
+   auto Expected1 = GetReg(Op->ExpectedHi);
+   auto Desired0 = GetReg(Op->DesiredLo);
+   auto Desired1 = GetReg(Op->DesiredHi);
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+
+   const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -99,7 +99,7 @@ DEF_OP(CAS) {
+
+   auto Expected = GetReg(Op->Expected);
+   auto Desired = GetReg(Op->Desired);
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Dst = GetReg(Node);
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -146,7 +146,7 @@ DEF_OP(AtomicSwap) {
+                                                                                                                                  "d CAS "
+                                                                                                                                  "size");
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Src = GetReg(Op->Value);
+
+   const auto EmitSize = ConvertSize(IROp);
+@@ -172,7 +172,7 @@ DEF_OP(AtomicFetchAdd) {
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Src = GetReg(Op->Value);
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -193,7 +193,7 @@ DEF_OP(AtomicFetchSub) {
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Src = GetReg(Op->Value);
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -215,7 +215,7 @@ DEF_OP(AtomicFetchAnd) {
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Src = GetReg(Op->Value);
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -237,7 +237,7 @@ DEF_OP(AtomicFetchCLR) {
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Src = GetReg(Op->Value);
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -258,7 +258,7 @@ DEF_OP(AtomicFetchOr) {
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Src = GetReg(Op->Value);
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -279,7 +279,7 @@ DEF_OP(AtomicFetchXor) {
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+   auto Src = GetReg(Op->Value);
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+@@ -300,7 +300,7 @@ DEF_OP(AtomicFetchNeg) {
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+
+-  auto MemSrc = GetReg(Op->Addr);
++  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
+
+   if (CTX->HostFeatures.SupportsAtomics) {
+     // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics
 diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
 index 3e01eeb..c89c963 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
@@ -66,7 +160,7 @@ index 3e01eeb..c89c963 100644
 @@ -315,6 +315,17 @@ private:
      return IsFPR(IR::PhysicalRegister(Wrap).AsRegClass());
    }
- 
+
 +  // Translates a canonical guest address register into the host address its
 +  // bytes live at, for the memory operand about to be emitted. One ORR with a
 +  // logical immediate: addition for canonical low addresses, the identity for
@@ -82,13 +176,13 @@ index 3e01eeb..c89c963 100644
    ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                      IR::MemOffsetType OffsetType, uint8_t OffsetScale);
 diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
-index 2cf05d1..d570c9e 100644
+index 2cf05d1..e0b3422 100644
 --- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 @@ -584,8 +584,22 @@ DEF_OP(ContextClear) {
    }
  }
- 
+
 +ARMEmitter::Register Arm64JITCore::AliasGuestAddress(ARMEmitter::Register Base) {
 +  const uint64_t AliasBase = CTX->GetGuestLowAliasBase();
 +  if (AliasBase == 0) {
@@ -109,13 +203,61 @@ index 2cf05d1..d570c9e 100644
      return ARMEmitter::ExtendedMemOperand(Base.X(), ARMEmitter::IndexType::OFFSET, 0);
    } else {
 @@ -652,6 +666,7 @@ ARMEmitter::Register Arm64JITCore::ApplyMemOperand(IR::OpSize AccessSize, ARMEmi
- 
+
  ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                                IR::MemOffsetType OffsetType, [[maybe_unused]] uint8_t OffsetScale) {
 +  Base = AliasGuestAddress(Base);
    if (Offset.IsInvalid()) {
      return ARMEmitter::SVEMemOperand(Base.X(), 0);
    }
+@@ -740,7 +755,9 @@ DEF_OP(LoadMem) {
+
+ DEF_OP(LoadMemPair) {
+   const auto Op = IROp->C<IR::IROp_LoadMemPair>();
+-  const auto Addr = GetReg(Op->Addr);
++  // Plain offset operand with no writeback, so translating the address
++  // register cannot reach guest-visible state.
++  const auto Addr = AliasGuestAddress(GetReg(Op->Addr));
+
+   if (Op->Class == IR::RegClass::GPR) {
+     const auto Dst1 = GetReg(Op->OutValue1);
+@@ -1752,7 +1769,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
+ DEF_OP(StoreMemPair) {
+   const auto Op = IROp->C<IR::IROp_StoreMemPair>();
+   const auto OpSize = IROp->Size;
+-  const auto Addr = GetReg(Op->Addr);
++  const auto Addr = AliasGuestAddress(GetReg(Op->Addr));
+
+   if (Op->Class == IR::RegClass::GPR) {
+     const auto Src1 = GetZeroableReg(Op->Value1);
+@@ -1882,6 +1899,12 @@ DEF_OP(MemSet) {
+     const auto Prefix = GetReg(Op->Prefix);
+     add(TMP2, Prefix.X(), MemReg.X());
+   }
++  // TMP2 is this op's internal working pointer. The result address is
++  // recomputed from the canonical MemReg and Length further down, so the
++  // translation never reaches guest-visible state.
++  if (const uint64_t AliasBase = CTX->GetGuestLowAliasBase()) {
++    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, AliasBase);
++  }
+
+   if (!DirectionIsInline) {
+     // Backward or forwards implementation depends on flag
+@@ -2116,6 +2139,14 @@ DEF_OP(MemCpy) {
+   mov(TMP1, Length.X());
+   mov(TMP2, MemRegDest.X());
+   mov(TMP3, MemRegSrc.X());
++  // TMP2/TMP3 are internal working pointers; the out-addresses are recomputed
++  // from the canonical MemRegDest/MemRegSrc registers below. TMP4 is this
++  // op's value temporary, so the translation is emitted inline rather than
++  // through the shared helper.
++  if (const uint64_t AliasBase = CTX->GetGuestLowAliasBase()) {
++    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, AliasBase);
++    orr(ARMEmitter::Size::i64Bit, TMP3, TMP3, AliasBase);
++  }
+
+   // TMP1 = Length
+   // TMP2 = Dest
 diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
 index ec61b90..441e0ec 100644
 --- a/FEXCore/include/FEXCore/Core/Context.h
@@ -123,7 +265,7 @@ index ec61b90..441e0ec 100644
 @@ -68,6 +68,16 @@ public:
     */
    FEX_DEFAULT_VISIBILITY virtual bool InitCore() = 0;
- 
+
 +  // BoxedWine: canonical low guest addresses are dereferenced through a
 +  // deterministic high host alias. `Base` must be aligned to `Limit` and every
 +  // permitted high guest address must already contain its bits, so the

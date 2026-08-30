@@ -935,6 +935,71 @@ def main() -> None:
                 f"{label} does not apply the low-address alias patch"
             )
 
+    # ------------------------------------------------------------------ #
+    # The correctness probe must exercise the alias it validates: a         #
+    # canonical low image, mapped by KMemory64 in native-identity mode and  #
+    # written through the translated host backing. The previous probe used  #
+    # an iOS-selected mmap pointer as the guest address, which had nothing  #
+    # mapped behind it once instruction fetch started translating.          #
+    # ------------------------------------------------------------------ #
+    require_ordered(
+        backend_text,
+        [
+            "constexpr uint64_t kProbeGuestImageBase =",
+            "constexpr uint64_t kProbeGuestStackBase =",
+            "probe image must stay inside the canonical low range",
+            "probe image must clear KUSER_SHARED_DATA",
+            "const uint64_t guestImageBase = kProbeGuestImageBase;",
+            "std::make_unique<KMemory64>(nullptr, /*nativeIdentity*/ true)",
+            "gProbeMemory->mmapAnonymousFixed(",
+            "boxedvn::guestToHostAddress(guestImageBase)",
+            "boxedvn::guestToHostAddress(guestStackBase)",
+            "std::memcpy(hostImage + destinationOffset,",
+            "gGuestEntry = guestImageBase + entryOffset;",
+            "gProbeCPU->reg[X64_RSP].setU64(guestStackBase + kGuestStackBytes",
+            "BOXEDWINE_FEX64_PROBE_MAP",
+        ],
+        "BoxedVN correctness probe canonical mapping",
+    )
+    probe_start = backend_text.index("bool mapBundledELFProbe() {")
+    probe_end = backend_text.index(chr(10) + "}" + chr(10), probe_start)
+    probe_body = backend_text[probe_start:probe_end]
+    if "mmap(nullptr" in probe_body:
+        raise SystemExit(
+            "the correctness probe must not take an iOS-selected host pointer "
+            "as its guest address"
+        )
+
+    # Translated paths that carry no guest-visible writeback.
+    require_ordered(
+        alias_patch,
+        [
+            "a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp",
+            "+  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));",
+            "a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
+            "DEF_OP(LoadMemPair) {",
+            "+  const auto Addr = AliasGuestAddress(GetReg(Op->Addr));",
+            "DEF_OP(StoreMemPair) {",
+            "+  const auto Addr = AliasGuestAddress(GetReg(Op->Addr));",
+            "+  if (const uint64_t AliasBase = CTX->GetGuestLowAliasBase()) {",
+            "+    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, AliasBase);",
+        ],
+        "BoxedVN translated pair, string and atomic paths",
+    )
+    if alias_patch.count("+  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));") != 10:
+        raise SystemExit(
+            "every atomic and locked operation must translate its address"
+        )
+    # The stack write-back paths are deliberately not translated yet, so no
+    # pre/post-indexed stack form may have been rewritten.
+    for forbidden in ("IndexType::PRE>(Src1.W(), Src2.W(), StoreAddr",
+                      "ldurb(Dst.W(), LoadAddr"):
+        if forbidden in alias_patch:
+            raise SystemExit(
+                "stack write-back translation is not part of this change; the "
+                "probe and guest stack lanes are high identity addresses"
+            )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 
