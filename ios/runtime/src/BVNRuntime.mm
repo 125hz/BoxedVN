@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,7 @@
 #include "BVNLaunchArguments.h"
 #include "boxedvn/boot_diagnostics.h"
 #include "boxedvn/engine_profile.h"
+#include "boxedvn/launch_preflight.h"
 #include "boxedvn/wine_prefix.h"
 #include "BVNRuntime.h"
 
@@ -83,6 +85,21 @@ std::atomic<bool> gJitProbeInFlight{false};
 // hanging rather than returning an error.  Track an abandoned worker exactly
 // as the executable-memory probe does so a later launch cannot race it.
 std::atomic<bool> gFexProbeInFlight{false};
+
+std::string preflightMarker(const char* name, uint64_t generation,
+                            int result) {
+    char line[160];
+    if (result < 0) {
+        snprintf(line, sizeof(line), "%s main=%d generation=%llu", name,
+                 [NSThread isMainThread] ? 1 : 0,
+                 (unsigned long long)generation);
+    } else {
+        snprintf(line, sizeof(line), "%s main=%d generation=%llu result=%d",
+                 name, [NSThread isMainThread] ? 1 : 0,
+                 (unsigned long long)generation, result);
+    }
+    return std::string(line);
+}
 
 void setState(BVNRuntimeState state) {
     pthread_mutex_lock(&gMutex);
@@ -820,42 +837,11 @@ void runSession(const BVNLaunchConfiguration& launch) {
         return;
     }
 
-    // probeJitWithTimeout(), not a direct call to BVNJITProbeExecute(): this
-    // is the one place in the app where actually confirming JIT works is
-    // worth the risk of a crash if it does not, because the user just
-    // pressed Launch/Run Wine Notepad and Boxedwine's real JIT is about to
-    // hit the identical risk moments later regardless. See BVNRuntime.h.
-    // The timeout wrapper exists because this call runs on the main thread -
-    // the only thread servicing UIKit's run loop - and a hang inside it, not
-    // just a crash, is a real possibility on iOS; see probeJitWithTimeout().
-    const BVNJITReport jit = probeJitWithTimeout();
-    BVNLogWrite(jit.status == BVNJITStatusAvailable ? BVNLogLevelInfo
-                                                    : BVNLogLevelWarning,
-                "jit", jit.detail);
-    if (jit.status != BVNJITStatusAvailable) {
-        setLastError(
-            std::string("JIT is not available, so the guest was not started. ") +
-            jit.detail);
-        setState(BVNRuntimeStateFailed);
-        return;
-    }
-
-    if (launch.useFEX64) {
-        const BVNFEXBackendStage fexStage = probeFexWithTimeout();
-        const char* fexReport = BVNFEXBackendReport();
-        BVNLogWrite(fexStage == BVNFEXBackendStageExecuted
-                        ? BVNLogLevelInfo : BVNLogLevelError,
-                    "fex64", fexReport ? fexReport : "FEX produced no report.");
-        if (fexStage != BVNFEXBackendStageExecuted) {
-            setLastError(
-                std::string("The FEX x86-64 correctness probe stopped at '") +
-                BVNFEXBackendStageName(fexStage) +
-                "', so the Wine64 guest was not started. See the FEX log "
-                "for its SSE2/call-ret result.");
-            setState(BVNRuntimeStateFailed);
-            return;
-        }
-    }
+    // The JIT and translator probes already ran, on a background queue, in
+    // runLaunchPreflight(). They must never run here: both are wrapped in a
+    // semaphore wait, and this function executes on the main thread, so a wait
+    // here stops UIKit for the whole timeout -- the "Starting Wine"
+    // presentation never renders and touches are dropped.
 
     const std::vector<std::string> argumentStrings =
         BVNBuildLaunchArguments(launch);
@@ -935,6 +921,54 @@ extern "C" void BVNRuntimeNotifyFrontendReady(void) {
     BVNLogWrite(BVNLogLevelInfo, "runtime", "frontend ready");
 }
 
+// Monotonic launch token. A completion that arrives after a newer launch was
+// accepted must not start an obsolete session or release a presentation it no
+// longer owns.
+std::atomic<uint64_t> gLaunchGeneration {0};
+
+// Runs the JIT and translator probes. MUST NOT run on the main thread: both
+// wrappers wait on a semaphore for their timeout, and the main thread is the
+// only one servicing UIKit's run loop.
+boxedvn::LaunchPreflightOutcome runLaunchPreflight(bool useFEX64,
+                                                  std::string& error) {
+    if ([NSThread isMainThread]) {
+        // A programming error, not a device condition. Reporting it beats
+        // silently reintroducing the freeze this function exists to remove.
+        BVNLogWrite(BVNLogLevelError, "runtime",
+                    "BOXEDWINE_PREFLIGHT_MISPLACED main=1");
+        error = "The launch preflight was scheduled on the main thread.";
+        return boxedvn::LaunchPreflightOutcome::Rejected;
+    }
+
+    const BVNJITReport jit = probeJitWithTimeout();
+    BVNLogWrite(jit.status == BVNJITStatusAvailable ? BVNLogLevelInfo
+                                                    : BVNLogLevelWarning,
+                "jit", jit.detail);
+    if (jit.status != BVNJITStatusAvailable) {
+        error = std::string(
+                    "JIT is not available, so the guest was not started. ") +
+                jit.detail;
+        return boxedvn::LaunchPreflightOutcome::TimedOut;
+    }
+
+    if (useFEX64) {
+        const BVNFEXBackendStage fexStage = probeFexWithTimeout();
+        const char* fexReport = BVNFEXBackendReport();
+        BVNLogWrite(fexStage == BVNFEXBackendStageExecuted
+                        ? BVNLogLevelInfo : BVNLogLevelError,
+                    "fex64", fexReport ? fexReport : "FEX produced no report.");
+        if (fexStage != BVNFEXBackendStageExecuted) {
+            error = std::string(
+                        "The FEX x86-64 correctness probe stopped at ") +
+                    BVNFEXBackendStageName(fexStage) +
+                    ", so the Wine64 guest was not started. See the FEX log "
+                    "for its SSE2/call-ret result.";
+            return boxedvn::LaunchPreflightOutcome::TimedOut;
+        }
+    }
+    return boxedvn::LaunchPreflightOutcome::Ready;
+}
+
 extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
                                         char* errorBuffer,
                                         size_t errorBufferSize) {
@@ -988,18 +1022,66 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
             // loop can service the library UI, the pump has to be turned back
             // on here or SDL_PumpEvents would be a no-op for the whole session.
             SDL_iPhoneSetEventPump(SDL_TRUE);
+
+            auto preflight = std::make_shared<boxedvn::LaunchPreflight>();
+            const uint64_t generation =
+                gLaunchGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+            preflight->begin(generation);
+            // One release path for the pump and the presentation, whether the
+            // attempt fails here, fails in preflight, or the session returns.
+            const auto releasePresentation = [preflight]() {
+                if (!preflight->claimCleanup()) return;
+                SDL_iPhoneSetEventPump(SDL_FALSE);
+                BVNFinishGuestPresentation();
+            };
+
             if (launch.useDXMT &&
                 !BVNDXMTDisplayPrepare(launch.width ? launch.width : 1280,
                                        launch.height ? launch.height : 720)) {
                 setLastError("The DXMT Metal presentation layer could not be prepared.");
                 setState(BVNRuntimeStateFailed);
-                SDL_iPhoneSetEventPump(SDL_FALSE);
-                BVNFinishGuestPresentation();
+                releasePresentation();
                 return;
             }
-            runSession(launch);
-            SDL_iPhoneSetEventPump(SDL_FALSE);
-            BVNFinishGuestPresentation();
+
+            // The presentation stays installed and the state stays Starting
+            // while the probes run. Returning to the run loop here is the
+            // point: UIKit can now render the starting presentation, scroll
+            // and deliver touches for the whole preflight.
+            BVNLogWrite(BVNLogLevelInfo, "runtime",
+                        preflightMarker("BOXEDWINE_PREFLIGHT_BEGIN",
+                                        generation, -1).c_str());
+            dispatch_async(
+                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    std::string preflightError;
+                    const boxedvn::LaunchPreflightOutcome outcome =
+                        runLaunchPreflight(launch.useFEX64, preflightError);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        BVNLogWrite(
+                            BVNLogLevelInfo, "runtime",
+                            preflightMarker("BOXEDWINE_PREFLIGHT_COMPLETE",
+                                            generation,
+                                            static_cast<int>(outcome)).c_str());
+                        const boxedvn::LaunchPreflightAction action =
+                            preflight->complete(
+                                outcome,
+                                gLaunchGeneration.load(
+                                    std::memory_order_acquire));
+                        if (action == boxedvn::LaunchPreflightAction::Ignore) {
+                            return;
+                        }
+                        if (action == boxedvn::LaunchPreflightAction::Fail) {
+                            setLastError(preflightError);
+                            setState(BVNRuntimeStateFailed);
+                            releasePresentation();
+                            return;
+                        }
+                        // boxedmain owns the main thread, which SDL's UIKit
+                        // backend requires.
+                        runSession(launch);
+                        releasePresentation();
+                    });
+                });
         });
     });
     return true;

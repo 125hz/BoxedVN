@@ -898,11 +898,6 @@ def main() -> None:
             "+    GuestLowAliasBase = Base;",
             "+  uint64_t GuestToHostAddress(uint64_t GuestAddress) const {",
             "+    return GuestAddress | GuestLowAliasBase;",
-            "a/FEXCore/Source/Interface/Core/Core.cpp",
-            "+  return Thread.FrontendDecoder->CheckIfCacheable(Thread, "
-            "reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP))",
-            "+    GuestCode = reinterpret_cast<const uint8_t*>("
-            "GuestToHostAddress(GuestRIP));",
             "a/FEXCore/Source/Interface/Core/JIT/JITClass.h",
             "+  ARMEmitter::Register AliasGuestAddress(ARMEmitter::Register Base);",
             "a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
@@ -999,6 +994,154 @@ def main() -> None:
                 "stack write-back translation is not part of this change; the "
                 "probe and guest stack lanes are high identity addresses"
             )
+
+    # ------------------------------------------------------------------ #
+    # The decoder's two address domains. InstStream feeds the executable   #
+    # range query and must stay canonical; AdjustedInstStream is the host   #
+    # pointer whose bytes are read. Collapsing them made the query run in   #
+    # host space, where no guest range is registered, and every entry block #
+    # decoded as NoExec.                                                    #
+    # ------------------------------------------------------------------ #
+    frontend = read(fex / "FEXCore/Source/Interface/Core/Frontend.cpp")
+    require_ordered(
+        frontend,
+        [
+            "std::optional<uint8_t> Decoder::PeekByte(",
+            "reinterpret_cast<uint64_t>(InstStream.InstStream",
+            "CheckRangeExecutable(ByteAddress, 1)",
+            "return InstStream.AdjustedInstStream[",
+        ],
+        "pinned FEX decoder address domains",
+    )
+
+    # Core.cpp must hand the decoder a CANONICAL entry stream. The broken form
+    # passed the translated pointer, which put both fields in host space.
+    for broken in (
+        "CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>("
+        "GuestToHostAddress(GuestRIP))",
+        "GuestCode = reinterpret_cast<const uint8_t*>("
+        "GuestToHostAddress(GuestRIP));",
+    ):
+        if broken in alias_patch:
+            raise SystemExit(
+                "the decoder must be entered in canonical guest space; "
+                "translating the entry stream puts the executable-range query "
+                "in the wrong domain and every entry block decodes as NoExec"
+            )
+    require_ordered(
+        alias_patch,
+        [
+            "a/FEXCore/Source/Interface/Core/Core.cpp",
+            "+    // The decoder is entered in CANONICAL guest space.",
+            "     GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);",
+            "+          const uint8_t* InstBytes = reinterpret_cast<const "
+            "uint8_t*>(GuestToHostAddress(InstAddress));",
+            "a/FEXCore/Source/Interface/Core/Frontend.cpp",
+            "+  const uint8_t* const CanonicalInstStream = _InstStream - "
+            "EntryPoint + RIP;",
+            "+  const uint8_t* const HostInstStream = reinterpret_cast<const "
+            "uint8_t*>(",
+            "+    CTX->GuestToHostAddress(reinterpret_cast<uint64_t>("
+            "CanonicalInstStream)));",
+            "BOXEDWINE_FEX64_FETCH_MAP",
+            "+    .InstStream = CanonicalInstStream,",
+            "+    .AdjustedInstStream = HostInstStream,",
+        ],
+        "BoxedVN decoder canonical and host stream split",
+    )
+    # The VSyscall region keeps its own dedicated backing.
+    require_ordered(
+        frontend,
+        [
+            "VSyscall",
+            ".InstStream = _InstStream - EntryPoint + RIP,",
+            ".AdjustedInstStream = VSyscallData + Offset,",
+        ],
+        "pinned FEX VSyscall stream mapping",
+    )
+
+    # The probe proves the translator's question can be answered before it is
+    # asked, using the canonical address the translator will use.
+    require_ordered(
+        backend_text,
+        [
+            "BOXEDWINE_FEX64_PROBE_MAP",
+            "gAddressSpace.executableRange(gGuestEntry)",
+            "BOXEDWINE_FEX64_PROBE_ENTRY_UNMAPPED",
+            "entryRange->contains(gGuestEntry)",
+            "boxedvn::guestToHostAddress(entryRange->guestBase)",
+            "BOXEDWINE_FEX64_PROBE_ENTRY_MISMATCH",
+            "BOXEDWINE_FEX64_PROBE_ENTRY entry=",
+        ],
+        "BoxedVN probe entry executability assertion",
+    )
+
+    # ------------------------------------------------------------------ #
+    # No JIT or translator probe may run on the main thread: both wait on   #
+    # a semaphore for their timeout, and the main thread is the only one    #
+    # servicing UIKit's run loop.                                          #
+    # ------------------------------------------------------------------ #
+    runtime = read(repository / "ios/runtime/src/BVNRuntime.mm")
+    preflight_header = read(
+        repository / "ios/support/include/boxedvn/launch_preflight.h"
+    )
+    require_ordered(
+        preflight_header,
+        [
+            "enum class LaunchPreflightOutcome",
+            "enum class LaunchPreflightAction",
+            "class LaunchPreflight",
+            "LaunchPreflightAction complete(",
+            "if (currentGeneration != generation_) {",
+            "return LaunchPreflightAction::Ignore;",
+            "bool claimCleanup() noexcept {",
+        ],
+        "BoxedVN launch preflight sequencing",
+    )
+    require_ordered(
+        runtime,
+        [
+            'boxedvn::LaunchPreflightOutcome runLaunchPreflight(',
+            "if ([NSThread isMainThread]) {",
+            "BOXEDWINE_PREFLIGHT_MISPLACED",
+            "probeJitWithTimeout();",
+            "probeFexWithTimeout();",
+            'extern "C" bool BVNRuntimeRequestLaunch(',
+            "preflight->begin(generation);",
+            "if (!preflight->claimCleanup()) return;",
+            "BOXEDWINE_PREFLIGHT_BEGIN",
+            "dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{",
+            "runLaunchPreflight(launch.useFEX64, preflightError);",
+            "dispatch_async(dispatch_get_main_queue(), ^{",
+            "BOXEDWINE_PREFLIGHT_COMPLETE",
+            "preflight->complete(",
+            "boxedvn::LaunchPreflightAction::Ignore",
+            "boxedvn::LaunchPreflightAction::Fail",
+            "runSession(launch);",
+            "releasePresentation();",
+        ],
+        "BoxedVN asynchronous launch preflight",
+    )
+    # runSession runs on the main thread and must contain no probe wait.
+    session_start = runtime.index("void runSession(const BVNLaunchConfiguration& launch) {")
+    session_end = runtime.index(chr(10) + "}" + chr(10), session_start)
+    session_body = runtime[session_start:session_end]
+    for forbidden in ("probeJitWithTimeout()", "probeFexWithTimeout()",
+                      "dispatch_semaphore_wait"):
+        if forbidden in session_body:
+            raise SystemExit(
+                f"runSession runs on the main thread and must not call "
+                f"{forbidden}: it would stop UIKit for the whole timeout"
+            )
+    # The presentation must not be torn down merely because preflight was
+    # scheduled; the release belongs to the single completion path.
+    launch_start = runtime.index('extern "C" bool BVNRuntimeRequestLaunch(')
+    launch_body = runtime[launch_start:]
+    if launch_body.count("SDL_iPhoneSetEventPump(SDL_FALSE)") != 1:
+        raise SystemExit(
+            "the event pump and presentation must be released through one "
+            "claimed cleanup path, not on every early return"
+        )
 
     print("FEX exit-dispatch and loader-boundary contracts verified")
 

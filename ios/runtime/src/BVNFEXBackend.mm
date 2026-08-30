@@ -1074,6 +1074,36 @@ bool mapBundledELFProbe() {
             static_cast<unsigned long long>(guestStackBase),
             static_cast<unsigned long long>(
                 reinterpret_cast<uintptr_t>(hostStack)));
+
+    // The translator asks this address space whether the canonical entry is
+    // executable, using the canonical address. Prove that here rather than
+    // discovering it as a NoExec entry block six seconds later.
+    const auto entryRange = gAddressSpace.executableRange(gGuestEntry);
+    if (!entryRange) {
+        reportf("BOXEDWINE_FEX64_PROBE_ENTRY_UNMAPPED entry=0x%llx",
+                static_cast<unsigned long long>(gGuestEntry));
+        return false;
+    }
+    if (!entryRange->contains(gGuestEntry) ||
+        entryRange->hostBase !=
+            static_cast<uintptr_t>(
+                boxedvn::guestToHostAddress(entryRange->guestBase))) {
+        reportf("BOXEDWINE_FEX64_PROBE_ENTRY_MISMATCH entry=0x%llx "
+                "range=[0x%llx,0x%llx) host=0x%llx expected_host=0x%llx",
+                static_cast<unsigned long long>(gGuestEntry),
+                static_cast<unsigned long long>(entryRange->guestBase),
+                static_cast<unsigned long long>(entryRange->end()),
+                static_cast<unsigned long long>(entryRange->hostBase),
+                static_cast<unsigned long long>(
+                    boxedvn::guestToHostAddress(entryRange->guestBase)));
+        return false;
+    }
+    reportf("BOXEDWINE_FEX64_PROBE_ENTRY entry=0x%llx range=[0x%llx,0x%llx) "
+            "host=0x%llx executable=1",
+            static_cast<unsigned long long>(gGuestEntry),
+            static_cast<unsigned long long>(entryRange->guestBase),
+            static_cast<unsigned long long>(entryRange->end()),
+            static_cast<unsigned long long>(entryRange->hostBase));
     reportf("loaded bundled PIE ELF64 correctness process: %zu segments, entry=%p",
             image.loadSegments.size(), reinterpret_cast<void*>(gGuestEntry));
     return true;

@@ -36,28 +36,74 @@ index 35a4212..34e7400 100644
    uint32_t StrictSplitLockMutex {};
 
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 92305f4..ebbdc7e 100644
+index 92305f4..c903139 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
-@@ -791,7 +791,8 @@ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter*
- };
-
- bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Thread, uint64_t GuestRIP, uint64_t MaxInst) {
--  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
-+  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP)), GuestRIP,
-+                                                 MaxInst);
- }
-
- /* iOS-Mythic ml623: targeted IR capture (PassManager.cpp). FEX_MythicIRCapTarget is the
-@@ -855,7 +856,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+@@ -855,6 +855,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
    if (!HasCustomIR) {
      const uint8_t* GuestCode {};
--    GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
-+    // Instruction fetch is a host dereference; the RIP itself stays canonical.
-+    GuestCode = reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP));
++    // The decoder is entered in CANONICAL guest space. It derives its own host
++    // pointer for byte reads; see Decoder::AdjustAddrForSpecialRegion.
+     GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
      /* perf-silenced GenerateIR GuestCode log */
+@@ -933,7 +935,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+
+ #ifdef ZYDIS_DISASSEMBLER
+         if (FEXCore::Config::Get_X86DISASSEMBLE()) {
+-          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(InstAddress);
++          // The displayed address stays canonical; only the byte read is
++          // translated.
++          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(GuestToHostAddress(InstAddress));
+           ZydisDisassembledInstruction ZydisInst;
+           if (ZYAN_SUCCESS(ZydisDisassembleIntel(ZydisMachineMode, InstAddress, InstBytes, DecodedInfo->InstSize, &ZydisInst))) {
+             LogMan::Msg::IFmt("    {:#x}: {}", InstAddress, ZydisInst.text);
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index b03cb77..76e5d32 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -13,6 +13,7 @@ $end_info$
+
+ #include <array>
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Core/X86Enums.h>
+@@ -1358,9 +1359,31 @@ const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _
+     };
+   }
+
++  // These two fields are deliberately in different domains.
++  //
++  //   InstStream         - CANONICAL guest space. PeekByte and ReadData derive
++  //                        the address they hand to the executable-range query
++  //                        from it, and the guest registers its ranges at
++  //                        canonical addresses.
++  //   AdjustedInstStream - the HOST pointer whose bytes are actually read.
++  //
++  // Collapsing them made the range query run in host space, where no guest
++  // range is registered, and every entry block decoded as NoExec.
++  const uint8_t* const CanonicalInstStream = _InstStream - EntryPoint + RIP;
++  const uint8_t* const HostInstStream = reinterpret_cast<const uint8_t*>(
++    CTX->GuestToHostAddress(reinterpret_cast<uint64_t>(CanonicalInstStream)));
++
++  // Bounded proof of the split, so a device log can show both domains rather
++  // than leaving the mapping to be inferred.
++  static std::atomic<uint32_t> FetchMapReports {0};
++  if (CanonicalInstStream != HostInstStream && FetchMapReports.fetch_add(1, std::memory_order_relaxed) < 8) {
++    LogMan::Msg::IFmt("BOXEDWINE_FEX64_FETCH_MAP guest={:#x} host={:#x}", reinterpret_cast<uint64_t>(CanonicalInstStream),
++                      reinterpret_cast<uint64_t>(HostInstStream));
++  }
++
+   return DecodeStream {
+-    .InstStream = _InstStream - EntryPoint + RIP,
+-    .AdjustedInstStream = _InstStream - EntryPoint + RIP,
++    .InstStream = CanonicalInstStream,
++    .AdjustedInstStream = HostInstStream,
+   };
+ }
 
 diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
 index d451a7e..f7a88d8 100644
