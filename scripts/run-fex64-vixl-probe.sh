@@ -10,6 +10,7 @@ fex_source="${FEX_SOURCE:-${root}/third_party/fex64/fex}"
 fex_build="${FEX_BUILD:-${root}/build/fex-vixl-probe}"
 fixture64="${root}/scripts/guest-probes/fex64-loader-stall.asm"
 fixture32="${root}/scripts/guest-probes/fex32-core-contract.asm"
+fixture_vector="${root}/scripts/guest-probes/fex64-vector-store-contract.asm"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
 cc="${CC:-clang}"
@@ -22,6 +23,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-apple-dual-map-cache-publish.patch"
     "${root}/scripts/fex64-patches/fex-arm64-pair-immediate-mask.patch"
     "${root}/scripts/fex64-patches/fex-arm64-context-indexed-unaligned-offset.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
 )
 
 die() {
@@ -40,6 +42,8 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
 [[ -d "${fex_source}/FEXCore" ]] || die "FEX source not found: ${fex_source}"
 [[ -f "${fixture64}" ]] || die "fixture not found: ${fixture64}"
 [[ -f "${fixture32}" ]] || die "fixture not found: ${fixture32}"
+[[ -f "${fixture_vector}" ]] || \
+    die "fixture not found: ${fixture_vector}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
 [[ -f "${encoding_check_source}" ]] || \
     die "encoding check not found: ${encoding_check_source}"
@@ -139,7 +143,9 @@ run_one() {
     local probe_config="$3"
     local maxinst="$4"
     local multiblock="$5"
+    local ircap_target="${6:-}"
     echo "[fex-vixl] fixture=${label} maxinst=${maxinst} multiblock=${multiblock}"
+    FEX_BOXEDWINE_IRCAP_TARGET="${ircap_target}" \
     FEX_SILENTLOG=0 \
     FEX_MAXINST="${maxinst}" \
     FEX_MULTIBLOCK="${multiblock}" \
@@ -183,6 +189,7 @@ prepare_fixture() {
 
 prepare_fixture "${fixture64}" fex64-loader-stall
 prepare_fixture "${fixture32}" fex32-core-contract
+prepare_fixture "${fixture_vector}" fex64-vector-store
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -202,4 +209,52 @@ run_one ia32-core "${tmp_dir}/fex32-core-contract.bin" \
     "${tmp_dir}/fex32-core-contract.config.bin" 500 0
 run_one ia32-core "${tmp_dir}/fex32-core-contract.bin" \
     "${tmp_dir}/fex32-core-contract.config.bin" 500 1
-echo "[fex-vixl] PASS: x64 loader and IA-32 core fixtures completed in all modes"
+
+# The unaligned 128-bit vector store the device reported as an invalid
+# host word. Run it through the real ARM64 JIT in every mode, then once
+# more with FEX's targeted IR capture armed on the pinned guest address,
+# so the host words emitted for that one instruction are proven rather
+# than inferred from a separate rebuild of the encoder.
+run_one x64-vector-store "${tmp_dir}/fex64-vector-store.bin" \
+    "${tmp_dir}/fex64-vector-store.config.bin" 1 0
+run_one x64-vector-store "${tmp_dir}/fex64-vector-store.bin" \
+    "${tmp_dir}/fex64-vector-store.config.bin" 500 0
+run_one x64-vector-store "${tmp_dir}/fex64-vector-store.bin" \
+    "${tmp_dir}/fex64-vector-store.config.bin" 500 1
+
+vector_capture="${tmp_dir}/fex64-vector-store.ircap.txt"
+run_one x64-vector-store-ircap "${tmp_dir}/fex64-vector-store.bin" \
+    "${tmp_dir}/fex64-vector-store.config.bin" 500 0 0x10100 \
+    | tee "${vector_capture}"
+
+python3 - "${vector_capture}" <<'CAPTURE'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+
+if "[ircap]" not in text:
+    raise SystemExit(
+        "error: targeted IR capture produced no output; the downstream "
+        "arming patch is not compiled into this translator"
+    )
+
+if "ml623 HOST bytes" not in text:
+    raise SystemExit(
+        "error: IR capture never reached the host-word stage for the "
+        "pinned guest target"
+    )
+
+words = re.findall(r"ircap[]][ ]+[+]0x[0-9a-f]+[ ]+([0-9a-f]{8})", text)
+if not words:
+    raise SystemExit("error: IR capture printed no emitted host words")
+
+if "ffff0177" in words:
+    raise SystemExit(
+        "error: the emitter produced the invalid device word 0xffff0177 "
+        "for movups [rax + 0x30], xmm0"
+    )
+
+print("[fex-vixl] ircap host words: " + " ".join(words))
+CAPTURE
+echo "[fex-vixl] PASS: x64 loader, IA-32 core and vector-store fixtures completed in all modes"

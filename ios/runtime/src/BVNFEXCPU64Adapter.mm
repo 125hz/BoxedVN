@@ -26,6 +26,8 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(BVNFEXCPU64Adapter*, void*, 
 extern "C" BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(const BVNFEXCPU64Adapter*) {
     return BVNFEXCPU64AdapterActionInvalid;
 }
+extern "C" void BVNFEXBackendPublishPendingIRCapTarget(uint64_t) {}
+extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
 
 #else
 
@@ -459,6 +461,28 @@ static bool recoverTranslatedLoaderHandoff(
     return machine->__ss.__pc != 0;
 }
 
+// Published from the host signal handler, consumed from ordinary code on the
+// next live x86-64 context creation. A relaxed atomic is the whole mechanism:
+// the signal path must not lock, allocate, or call into FEX, and the value has
+// to outlive teardown of the guest process that faulted.
+static std::atomic<uint64_t> gPendingIRCapTarget {0};
+static std::atomic<uint32_t> gExactRIPReports {0};
+static constexpr uint32_t kExactRIPReportLimit = 8;
+
+extern "C" void BVNFEXBackendPublishPendingIRCapTarget(uint64_t guestRIP) {
+    if (guestRIP == 0) return;
+    gPendingIRCapTarget.store(guestRIP, std::memory_order_relaxed);
+}
+
+extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) {
+    return gPendingIRCapTarget.exchange(0, std::memory_order_relaxed);
+}
+
+// FEX's own reconstruction, exported by the pinned translator. Takes the block
+// header recorded in the frame rather than the thread's current block, which
+// may already have moved on by the time the fault is examined.
+extern "C" uint64_t ios_fex_rip_from_hostpc(uint64_t BlockBegin, uint64_t HostPC);
+
 static bool containUnclassifiedFEXFault(
     BVNFEXCPU64Adapter* adapter, const FEXCore::SignalDelegatorConfig* config,
     ucontext_t* context, int signal, uint64_t faultAddress,
@@ -532,6 +556,37 @@ static bool containUnclassifiedFEXFault(
     }
     const bool aliasesMatch = hostCodeValid && writableCodeValid &&
         memcmp(hostCode, writableCode, sizeof(hostCode)) == 0;
+
+    // Reconstruct the EXACT faulting guest instruction before anything here
+    // rewrites the machine context or the frame. frame->State.rip is only the
+    // block boundary the dispatcher last published, so disassembling the guest
+    // image at that address can name a different instruction entirely. This
+    // reads the block header recorded in the frame and asks FEX's own RIP
+    // table, never RestoreRIPFromHostPC, whose thread-current block may have
+    // moved on since the fault was recorded.
+    const uint64_t blockBegin = frame->State.InlineJITBlockHeader;
+    uint64_t exactGuestRIP = 0;
+    if (inCodeBuffer && blockBegin != 0 && hostPC != 0) {
+        exactGuestRIP = ios_fex_rip_from_hostpc(blockBegin, hostPC);
+    }
+    if (gExactRIPReports.load(std::memory_order_relaxed) <
+        kExactRIPReportLimit) {
+        gExactRIPReports.fetch_add(1, std::memory_order_relaxed);
+        klog_fmt("BOXEDWINE_FEX64_EXACT_RIP pid=%d tid=%d signal=%d "
+                 "frame_rip=0x%llx exact_guest_rip=0x%llx block_begin=0x%llx "
+                 "host_pc=0x%llx in_buffer=%d",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1, signal,
+                 (unsigned long long)frame->State.rip,
+                 (unsigned long long)exactGuestRIP,
+                 (unsigned long long)blockBegin,
+                 (unsigned long long)hostPC, inCodeBuffer ? 1 : 0);
+    }
+    // Publish only. Arming FEX's capture, creating a context, or touching the
+    // translator in any way is not permitted on this path.
+    if (exactGuestRIP != 0) {
+        BVNFEXBackendPublishPendingIRCapTarget(exactGuestRIP);
+    }
 
     const auto faultData = frame->SynchronousFaultData;
     klog_fmt("BOXEDWINE_FEX64_HOST_FAULT_CONTAINED pid=%d tid=%d signal=%d "

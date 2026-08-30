@@ -268,7 +268,7 @@ jobs:
           path: |
             third_party/fex64/fex
             build/fex-vixl-probe
-          key: boxedvn-fex-vixl-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/run-fex64-vixl-probe.sh', 'scripts/fex64-patches/**', 'scripts/test-fex-exit-dispatch-contract.py', 'ios/support/include/boxedvn/fex_exit_dispatch_contract.h', 'scripts/guest-probes/fex64-loader-stall.asm', 'scripts/guest-probes/fex32-core-contract.asm', 'scripts/guest-probes/fex64-host-stubs.cpp', 'scripts/guest-probes/fex64-emitter-encoding-check.cpp') }}
+          key: boxedvn-fex-vixl-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/run-fex64-vixl-probe.sh', 'scripts/fex64-patches/**', 'scripts/test-fex-exit-dispatch-contract.py', 'ios/support/include/boxedvn/fex_exit_dispatch_contract.h', 'scripts/guest-probes/fex64-loader-stall.asm', 'scripts/guest-probes/fex32-core-contract.asm', 'scripts/guest-probes/fex64-host-stubs.cpp', 'scripts/guest-probes/fex64-emitter-encoding-check.cpp', 'scripts/guest-probes/fex64-vector-store-contract.asm') }}
 
       - name: Fetch pinned translator source
         shell: bash

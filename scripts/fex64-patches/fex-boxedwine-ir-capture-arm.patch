@@ -1,0 +1,85 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index dd16f0b..9b83672 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -1465,4 +1465,21 @@ fextl::unique_ptr<CPUBackend> CreateArm64JITCore(FEXCore::Context::ContextImpl*
+   return fextl::make_unique<Arm64JITCore>(ctx, Thread);
+ }
+ 
++/* BoxedWine emitter self-test. This lives inside the JIT translation unit on
++ * purpose: it is compiled with the same flags, from the same headers, into the
++ * same libFEXCore.a the application links, so a device-side run proves the
++ * production encoder rather than a host rebuild of it. The encoding under test
++ * is the unscaled 128-bit vector store the device reported as 0xffff0177. */
++extern "C" uint32_t FEX_BoxedWineEmitterSelfTest(uint32_t* ActualOut) {
++  alignas(4) uint8_t Buffer[16] {};
++  ARMEmitter::Emitter Emit(Buffer, sizeof(Buffer));
++  Emit.stur(ARMEmitter::QRegister(23), ARMEmitter::Register(11), -16);
++  uint32_t Word = 0;
++  __builtin_memcpy(&Word, Buffer, sizeof(Word));
++  if (ActualOut) {
++    *ActualOut = Word;
++  }
++  return 0x3c9f0177u;
++}
++
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Interface/IR/PassManager.cpp b/FEXCore/Source/Interface/IR/PassManager.cpp
+index f8d57d4..3609c19 100644
+--- a/FEXCore/Source/Interface/IR/PassManager.cpp
++++ b/FEXCore/Source/Interface/IR/PassManager.cpp
+@@ -211,6 +211,27 @@ extern "C" {
+ uint64_t FEX_MythicIRCapTarget = 0;
+ }
+ 
++namespace {
++/* BoxedWine: the native host has no InvalidationTracker, and host-side
++ * conformance runs have no runtime at all. Allow the absolute target to arrive
++ * through the environment as well, read once during static initialization so
++ * no translation is ever in flight and no signal handler is involved. */
++uint64_t BoxedWineIRCapEnvironmentTarget() {
++  const char* Value = getenv("FEX_BOXEDWINE_IRCAP_TARGET");
++  if (!Value || !Value[0]) {
++    return 0;
++  }
++  return strtoull(Value, nullptr, 0);
++}
++const bool BoxedWineIRCapEnvironmentArmed = [] {
++  const uint64_t Target = BoxedWineIRCapEnvironmentTarget();
++  if (Target) {
++    FEX_MythicIRCapTarget = Target;
++  }
++  return Target != 0;
++}();
++} // namespace
++
+ namespace {
+ 
+ /* Set by Core.cpp's decode loop when the block being compiled CONTAINS the
+@@ -422,6 +443,26 @@ extern "C" uint64_t FEX_MythicIRCapCurrentRIP() {
+   return IRCapRIP;
+ }
+ 
++/* BoxedWine arming surface. The runtime calls these from ordinary code only --
++ * never from a signal handler, and never while a FEX translation is running --
++ * after it has localized a faulting guest instruction of its own. This does not
++ * replace the capture implementation above; it only publishes its target and
++ * resets the bounded session counter so a later launch can capture afresh. */
++extern "C" void FEX_BoxedWineIRCapArm(uint64_t Target) {
++  FEX_MythicIRCapTarget = Target;
++  IRCapTaken.store(0, std::memory_order_relaxed);
++  IRCapRIP = 0;
++}
++extern "C" void FEX_BoxedWineIRCapDisarm() {
++  FEX_MythicIRCapTarget = 0;
++  IRCapTaken.store(0, std::memory_order_relaxed);
++  IRCapRIP = 0;
++}
++extern "C" uint64_t FEX_BoxedWineIRCapCurrentTarget() {
++  (void)BoxedWineIRCapEnvironmentArmed;
++  return FEX_MythicIRCapTarget;
++}
++
+ void PassManager::Run(IREmitter* IREmit) {
+   FEXCORE_PROFILE_SCOPED("PassManager::Run");
+ 

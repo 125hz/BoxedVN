@@ -333,6 +333,196 @@ def main() -> None:
         "BoxedVN ARM64 emitter encoding regression",
     )
 
+    # ------------------------------------------------------------------ #
+    # Device codegen provenance: exact guest RIP, targeted IR capture,     #
+    # production emitter self-test, and the cold exec-replacement unwind.  #
+    # ------------------------------------------------------------------ #
+    adapter = read(repository / "ios/runtime/src/BVNFEXCPU64Adapter.mm")
+    ircap_patch = read(
+        repository / "scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
+    )
+    vector_fixture = read(
+        repository / "scripts/guest-probes/fex64-vector-store-contract.asm"
+    )
+    core = read(fex / "FEXCore/Source/Interface/Core/Core.cpp")
+    pass_manager = read(fex / "FEXCore/Source/Interface/IR/PassManager.cpp")
+
+    # The pinned translator already exports the reconstruction and owns the
+    # capture implementation; the downstream patch only adds an arming surface.
+    require_ordered(
+        core,
+        [
+            'extern "C" uint64_t ios_fex_rip_from_hostpc(uint64_t BlockBegin,',
+            "InlineTail->NumberOfRIPEntries",
+            "return StartingGuestRIP;",
+        ],
+        "pinned FEX host-PC to guest-RIP reconstruction",
+    )
+    require_ordered(
+        pass_manager,
+        [
+            "uint64_t FEX_MythicIRCapTarget = 0;",
+            "std::atomic<uint32_t> IRCapTaken {0};",
+            'extern "C" void FEX_MythicIRCapMark(uint64_t GuestRIP) {',
+            "CONTAINS target",
+        ],
+        "pinned FEX targeted IR capture implementation",
+    )
+
+    # The signal path reconstructs the exact RIP from the frame's own block
+    # header, before it rewrites the machine context, and only publishes it.
+    require_ordered(
+        adapter,
+        [
+            "static bool containUnclassifiedFEXFault(",
+            "const uint64_t blockBegin = frame->State.InlineJITBlockHeader;",
+            "exactGuestRIP = ios_fex_rip_from_hostpc(blockBegin, hostPC);",
+            "BOXEDWINE_FEX64_EXACT_RIP",
+            "BVNFEXBackendPublishPendingIRCapTarget(exactGuestRIP);",
+            "BOXEDWINE_FEX64_HOST_FAULT_CONTAINED",
+        ],
+        "BoxedVN exact host-PC to guest-RIP reconstruction",
+    )
+    fault_start = adapter.index("static bool containUnclassifiedFEXFault(")
+    fault_end = adapter.index(chr(10) + "}" + chr(10), fault_start)
+    fault_body = adapter[fault_start:fault_end]
+    for forbidden in ("RestoreRIPFromHostPC(", "FEX_BoxedWineIRCapArm(",
+                      "createFEXContext("):
+        if forbidden in fault_body:
+            raise SystemExit(
+                "the contained-fault signal path must not use "
+                f"{forbidden!r}: it runs before the frame is repaired and must "
+                "not re-enter the translator"
+            )
+
+    # Publication is lock-free and outlives teardown of the failed guest.
+    require_ordered(
+        adapter,
+        [
+            "static std::atomic<uint64_t> gPendingIRCapTarget {0};",
+            'extern "C" void BVNFEXBackendPublishPendingIRCapTarget(',
+            "gPendingIRCapTarget.store(guestRIP, std::memory_order_relaxed);",
+            'extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(',
+            "gPendingIRCapTarget.exchange(0, std::memory_order_relaxed);",
+        ],
+        "BoxedVN pending capture-target publication",
+    )
+
+    # Arming happens on the next ordinary live x86-64 context, exactly once,
+    # after that context exists and before anything can execute on it.
+    require_ordered(
+        backend,
+        [
+            "LiveProcessState* getLiveProcessState(",
+            "const bool firstLiveProcess = gLiveProcesses.empty();",
+            "state->fex = createFEXContext(boxedvn::FexGuestMode::X86_64,",
+            "firstLiveProcess ? BVNFEXBackendTakePendingIRCapTarget() : 0;",
+            "FEX_BoxedWineIRCapArm(pendingIRCapTarget);",
+            "BOXEDWINE_FEX64_IRCAP_ARMED",
+            "gLiveProcesses.emplace(process, std::move(state));",
+        ],
+        "BoxedVN targeted capture arming on the next live context",
+    )
+    probe_context = backend.index("gProbeContext = createFEXContext(")
+    if "BVNFEXBackendTakePendingIRCapTarget" in backend[probe_context:]:
+        raise SystemExit(
+            "the backend startup probe must not consume the pending capture "
+            "target"
+        )
+
+    # The device self-test runs the production encoder out of the linked
+    # libFEXCore.a, not a constant and not a separate host rebuild of it.
+    require_ordered(
+        backend,
+        [
+            'extern "C" uint32_t FEX_BoxedWineEmitterSelfTest(uint32_t* actual);',
+            "const uint32_t expected = FEX_BoxedWineEmitterSelfTest(&emitted);",
+            "BOXEDWINE_FEX64_EMITTER_SELFTEST actual=0x%08x ",
+            "expected=0x%08x pass=%d",
+        ],
+        "BoxedVN device emitter self-test",
+    )
+    require_ordered(
+        ircap_patch,
+        [
+            "a/FEXCore/Source/Interface/Core/JIT/JIT.cpp",
+            '+extern "C" uint32_t FEX_BoxedWineEmitterSelfTest(uint32_t* ActualOut) {',
+            "+  ARMEmitter::Emitter Emit(Buffer, sizeof(Buffer));",
+            "+  Emit.stur(ARMEmitter::QRegister(23), ARMEmitter::Register(11), -16);",
+            "+  return 0x3c9f0177u;",
+            "a/FEXCore/Source/Interface/IR/PassManager.cpp",
+            '+extern "C" void FEX_BoxedWineIRCapArm(uint64_t Target) {',
+            "+  FEX_MythicIRCapTarget = Target;",
+            "+  IRCapTaken.store(0, std::memory_order_relaxed);",
+            '+extern "C" void FEX_BoxedWineIRCapDisarm() {',
+        ],
+        "BoxedVN targeted capture arming patch",
+    )
+
+    # Both consumers of the maintained patch set must apply it.
+    for label, text, fragment in (
+        ("iOS translator build", fex_build_script,
+         "apply_patch fex-boxedwine-ir-capture-arm.patch"),
+        ("VIXL probe", vixl_probe,
+         "fex-boxedwine-ir-capture-arm.patch"),
+    ):
+        if fragment not in text:
+            raise SystemExit(
+                f"{label} does not apply the targeted capture arming patch"
+            )
+
+    # The generic guest regression: the exact operation, at a pinned address,
+    # driven through the real JIT with the capture armed on it.
+    require_ordered(
+        vector_fixture,
+        [
+            "ORG 0x10000",
+            "times 0x100 - ($ - $$) db 0x90",
+            "vector_store_target:",
+            "movups  [rax + 0x30], xmm0",
+            "movups  [rbx - 0x10], xmm0",
+        ],
+        "BoxedVN unaligned vector-store guest fixture",
+    )
+    require_ordered(
+        vixl_probe,
+        [
+            'prepare_fixture "${fixture_vector}" fex64-vector-store',
+            "run_one x64-vector-store ",
+            "run_one x64-vector-store-ircap ",
+            "0x10100 ",
+            "ml623 HOST bytes",
+            "ffff0177",
+        ],
+        "VIXL vector-store regression and capture assertion",
+    )
+
+    # The cold exec-replacement unwind must be traceable in order: re-entry
+    # into a replacement epoch, the ExecuteThread return, and the return to
+    # the BoxedWine scheduler.
+    require_ordered(
+        backend,
+        [
+            "std::atomic<uint32_t> execEpoch {0};",
+            "BOXEDWINE_FEX64_UNWIND_REENTER",
+            "auto* enteredContext = processState->fex->context.get();",
+            "processState->fex->context->ExecuteThread(threadState->fexThread);",
+            "BOXEDWINE_FEX64_UNWIND_RETURN",
+            "BOXEDWINE_FEX64_CONTEXT_RESET_DEFERRED",
+            "BOXEDWINE_FEX64_UNWIND_RUN_RETURN",
+            "finish(retireThread, retireProcess);",
+        ],
+        "BoxedVN cold exec-replacement unwind trace",
+    )
+    epoch_advance = (
+        "processState->execEpoch.fetch_add(1, std::memory_order_acq_rel);"
+    )
+    if epoch_advance not in backend:
+        raise SystemExit(
+            "the exec-replacement path must advance the epoch identity the "
+            "unwind trace reports"
+        )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

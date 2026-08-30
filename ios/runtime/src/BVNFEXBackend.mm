@@ -119,6 +119,9 @@ constexpr size_t kPoolBytes = 64u * 1024u * 1024u;
 constexpr size_t kMinimumPoolBytes = 4u * 1024u * 1024u;
 constexpr size_t kGuestCodeBytes = kPageBytes;
 constexpr size_t kGuestStackBytes = 256u * 1024u;
+// The cold exec-replacement unwind is a one-shot sequence per launch. Bound it
+// so a looping scheduler cannot flood the device log with the same transition.
+constexpr uint32_t kUnwindReportLimit = 24;
 constexpr uint64_t kExpectedExitCode = 47;
 
 std::mutex gProbeMutex;
@@ -226,6 +229,10 @@ struct LiveProcessState {
     // Execution epochs retired by exec. Owned until process teardown; never
     // destroyed from inside a BVNFEXCPU64Run that is still running on them.
     std::vector<std::unique_ptr<RetiredFEXEpoch>> retiredEpochs;
+    // Bounded identity for the cold exec-replacement unwind trace: which epoch
+    // a runner entered, returned through, and was re-entered on.
+    std::atomic<uint32_t> execEpoch {0};
+    std::atomic<uint32_t> unwindReports {0};
     std::atomic<size_t> activeRuns {0};
     std::atomic<bool> retiring {false};
     std::atomic<bool> entryReported {false};
@@ -251,6 +258,14 @@ void disableLiveBlockLinking(FEXCore::Core::InternalThreadState* thread) {
     thread->CurrentFrame->Pointers.ExitFunctionLink =
         reinterpret_cast<uint64_t>(&dispatchExitWithoutBlockLinking);
 }
+
+// Published by the maintained downstream translator patch. Arming is only ever
+// called from ordinary code, with no FEX translation in flight; the self-test
+// is compiled into the same libFEXCore.a the application links, so running it
+// here proves this binary's production encoder rather than a host rebuild.
+extern "C" void FEX_BoxedWineIRCapArm(uint64_t target);
+extern "C" uint64_t FEX_BoxedWineIRCapCurrentTarget(void);
+extern "C" uint32_t FEX_BoxedWineEmitterSelfTest(uint32_t* actual);
 
 std::mutex gLiveMutex;
 std::unordered_map<void*, std::unique_ptr<LiveProcessState>> gLiveProcesses;
@@ -778,6 +793,16 @@ bool initializeFEXGlobals() {
         // linker-lock defect and changed a later stall into an immediate host
         // fault. The ordinary decoder limit preserves the last known-good
         // execution boundary while that linker path is diagnosed directly.
+        // Prove this binary's own encoder once. The device reported an
+        // invalid host word for an unscaled 128-bit vector store while CI
+        // proved the encoding correct from a separate host build; running the
+        // production helper from the linked libFEXCore.a removes that
+        // ambiguity from the next device log.
+        uint32_t emitted = 0;
+        const uint32_t expected = FEX_BoxedWineEmitterSelfTest(&emitted);
+        reportf("BOXEDWINE_FEX64_EMITTER_SELFTEST actual=0x%08x "
+                "expected=0x%08x pass=%d",
+                emitted, expected, emitted == expected ? 1 : 0);
         gFEXGlobalsReady = true;
     });
     return gFEXGlobalsReady;
@@ -1112,6 +1137,7 @@ LiveProcessState* getLiveProcessState(void* process) {
         return it->second.get();
     }
 
+    const bool firstLiveProcess = gLiveProcesses.empty();
     auto state = std::make_unique<LiveProcessState>();
     state->fex = createFEXContext(boxedvn::FexGuestMode::X86_64,
                                   &createLiveInitialThread);
@@ -1119,6 +1145,20 @@ LiveProcessState* getLiveProcessState(void* process) {
     if (!installFEXHostSignalHandlers()) {
         reportf("FEX host fault handlers could not be installed");
         return nullptr;
+    }
+    // A previous launch localized a faulting guest instruction exactly. Arm
+    // FEX's targeted IR capture on it now: the context exists but has compiled
+    // nothing, this runs under gLiveMutex with no other live process, and the
+    // startup probe never reaches here. Consuming the slot arms exactly once
+    // per pending target; creating a thread does not translate guest code.
+    const uint64_t pendingIRCapTarget =
+        firstLiveProcess ? BVNFEXBackendTakePendingIRCapTarget() : 0;
+    if (pendingIRCapTarget != 0) {
+        FEX_BoxedWineIRCapArm(pendingIRCapTarget);
+        reportf("BOXEDWINE_FEX64_IRCAP_ARMED target=0x%llx current=0x%llx",
+                static_cast<unsigned long long>(pendingIRCapTarget),
+                static_cast<unsigned long long>(
+                    FEX_BoxedWineIRCapCurrentTarget()));
     }
     LiveProcessState* result = state.get();
     result->activeRuns.store(1, std::memory_order_relaxed);
@@ -1365,6 +1405,7 @@ bool recreateLiveContextAfterExec(LiveProcessState* processState,
         processState->retiredEpochs.push_back(std::move(retiredEpoch));
         retainedEpochs = processState->retiredEpochs.size();
         processState->fex = std::move(replacementBundle);
+        processState->execEpoch.fetch_add(1, std::memory_order_acq_rel);
     }
     reportf("BOXEDWINE_FEX64_CONTEXT_RESET_RETAINED epochs=%zu thread=%p",
             retainedEpochs, static_cast<void*>(retired));
@@ -1975,7 +2016,24 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
                         static_cast<unsigned long long>(
                             threadState->fexThread->CurrentFrame->State.rip));
             }
+            const uint32_t enteredEpoch =
+                processState->execEpoch.load(std::memory_order_acquire);
+            if (enteredEpoch != 0 &&
+                processState->unwindReports.load(std::memory_order_relaxed) <
+                    kUnwindReportLimit) {
+                processState->unwindReports.fetch_add(
+                    1, std::memory_order_relaxed);
+                reportf("BOXEDWINE_FEX64_UNWIND_REENTER epoch=%u context=%p "
+                        "thread=%p rip=0x%llx",
+                        enteredEpoch,
+                        static_cast<void*>(processState->fex->context.get()),
+                        static_cast<void*>(threadState->fexThread),
+                        static_cast<unsigned long long>(
+                            threadState->fexThread->CurrentFrame->State.rip));
+            }
             bool returnedByGuard = false;
+            auto* enteredContext = processState->fex->context.get();
+            auto* enteredThread = threadState->fexThread;
             const int jumpResult = setjmp(gExitJump);
             if (jumpResult == 0) {
                 processState->fex->context->ExecuteThread(threadState->fexThread);
@@ -1985,6 +2043,22 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
 
             const BVNFEXCPU64AdapterAction action =
                 BVNFEXCPU64AdapterLastAction(adapter);
+            if (processState->unwindReports.load(std::memory_order_relaxed) <
+                kUnwindReportLimit) {
+                processState->unwindReports.fetch_add(
+                    1, std::memory_order_relaxed);
+                reportf("BOXEDWINE_FEX64_UNWIND_RETURN epoch=%u "
+                        "entered_context=%p live_context=%p entered_thread=%p "
+                        "live_thread=%p action=%d guard=%d rip=0x%llx",
+                        processState->execEpoch.load(std::memory_order_acquire),
+                        static_cast<void*>(enteredContext),
+                        static_cast<void*>(processState->fex->context.get()),
+                        static_cast<void*>(enteredThread),
+                        static_cast<void*>(threadState->fexThread),
+                        static_cast<int>(action), returnedByGuard ? 1 : 0,
+                        static_cast<unsigned long long>(
+                            threadState->fexThread->CurrentFrame->State.rip));
+            }
             terminalAction = action;
             if (action == BVNFEXCPU64AdapterActionInvalid) {
                 cleanReturn = false;
@@ -2054,6 +2128,27 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
         !cleanReturn ||
         terminalAction == BVNFEXCPU64AdapterActionProcessExit ||
         static_cast<KProcess*>(process)->terminated;
+    if (processState &&
+        processState->unwindReports.load(std::memory_order_relaxed) <
+            kUnwindReportLimit) {
+        processState->unwindReports.fetch_add(1, std::memory_order_relaxed);
+        reportf("BOXEDWINE_FEX64_UNWIND_RUN_RETURN epoch=%u context=%p "
+                "thread=%p action=%d clean=%d retire_thread=%d "
+                "retire_process=%d rip=0x%llx",
+                processState->execEpoch.load(std::memory_order_acquire),
+                static_cast<void*>(processState->fex
+                                       ? processState->fex->context.get()
+                                       : nullptr),
+                static_cast<void*>(threadState ? threadState->fexThread
+                                               : nullptr),
+                static_cast<int>(terminalAction), cleanReturn ? 1 : 0,
+                retireThread ? 1 : 0, retireProcess ? 1 : 0,
+                static_cast<unsigned long long>(
+                    (threadState && threadState->fexThread &&
+                     threadState->fexThread->CurrentFrame)
+                        ? threadState->fexThread->CurrentFrame->State.rip
+                        : 0));
+    }
     finish(retireThread, retireProcess);
     return cleanReturn;
 }

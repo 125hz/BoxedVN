@@ -101,6 +101,15 @@ uint64_t BVNFEXCPU64AdapterHandleSyscall(BVNFEXCPU64Adapter* adapter,
 BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(
     const BVNFEXCPU64Adapter* adapter);
 
+// A translated fault whose exact guest RIP the signal path reconstructed from
+// the faulting host PC. The signal handler only publishes it; the value is
+// consumed later, from ordinary code, to arm FEX's targeted IR capture on the
+// next live x86-64 context. Publishing is lock-free and survives teardown of
+// the guest process that faulted. `BVNFEXBackendTakePendingIRCapTarget`
+// returns zero when nothing is pending and clears the slot when it is.
+void BVNFEXBackendPublishPendingIRCapTarget(uint64_t guestRIP);
+uint64_t BVNFEXBackendTakePendingIRCapTarget(void);
+
 // Execute one live BoxedWine-owned x86-64 process thread through FEX. Returns
 // false when the process is not a native-identity 64-bit process or FEX is not
 // linked/initialised. A true return means the thread stopped at a syscall
