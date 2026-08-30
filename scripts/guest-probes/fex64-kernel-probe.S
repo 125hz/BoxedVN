@@ -7,6 +7,8 @@
     .global _start
     .type _start, @function
 _start:
+    call indexed_alias_probe
+
     lea equal_left(%rip), %rdi
     lea equal_right(%rip), %rsi
     call strcmp_vector_probe
@@ -79,6 +81,17 @@ unequal_failed:
     syscall
     ud2
 
+indexed_alias_failed:
+    mov $1, %rax
+    mov $1, %rdi
+    lea indexed_alias_failure(%rip), %rsi
+    mov $(indexed_alias_failure_end-indexed_alias_failure), %rdx
+    syscall
+    mov $60, %rax
+    mov $48, %rdi
+    syscall
+    ud2
+
 rep_stos_failed:
     mov $1, %rax
     mov $1, %rdi
@@ -120,6 +133,80 @@ strcmp_vector_found:
     movzbl (%rdi,%rcx), %eax
     movzbl (%rsi,%rcx), %edx
     sub %edx, %eax
+    ret
+
+/* A guest effective address may combine registers from different halves of
+ * the address space. The packaged loader faults on exactly this shape:
+ *
+ *     mov %rax, (%r10,%r14)
+ *
+ * with a small canonical LOW base and a large HIGH index. A host translation
+ * applied to the base alone, before the index contributes its own high bits,
+ * produces an address in neither half. The address has to be completed in
+ * guest space and translated once.
+ *
+ * The two components are split out of a real, mapped scratch address rather
+ * than written as literals, so this runs unchanged in the two places it has
+ * to: natively on the build host, where it is validated before packaging, and
+ * under the translator on device, where the stack lane is a high identity
+ * mapping and the in-page component is canonical low. Every store is read back
+ * through an absolute reference as well, so a store that landed elsewhere
+ * cannot be masked by a load repeating the same mistake.
+ */
+indexed_alias_probe:
+    endbr64
+    mov %rsp, %rax
+    sub $0x800, %rax
+    and $-16, %rax
+    mov %rax, %r14
+    and $-4096, %r14            /* large, page-aligned component */
+    mov %rax, %r10
+    and $4095, %r10             /* small in-page component */
+
+    /* Low base, high index, scale 1: the operand shape that faulted. */
+    movabs $0x5eed5eed5eed5eed, %rdx
+    mov %rdx, (%r10,%r14)
+    mov (%r10,%r14), %rcx
+    cmp %rdx, %rcx
+    jne indexed_alias_failed
+    mov (%rax), %rcx
+    cmp %rdx, %rcx
+    jne indexed_alias_failed
+
+    /* The reversed encoding, which can take a different lowering path. */
+    movabs $0x0dd0dd0dd0dd0dd0, %rsi
+    mov %rsi, (%r14,%r10)
+    mov (%r14,%r10), %rcx
+    cmp %rsi, %rcx
+    jne indexed_alias_failed
+    mov (%rax), %rcx
+    cmp %rsi, %rcx
+    jne indexed_alias_failed
+
+    /* A scaled index reaching the same address, so the shift is applied
+     * before the translation as well. The scratch address is 16-byte
+     * aligned, so the shifted component is exact. */
+    mov %r10, %r11
+    shr $3, %r11
+    movabs $0xbeefbeefbeefbeef, %r8
+    mov %r8, (%r14,%r11,8)
+    mov (%r14,%r11,8), %rcx
+    cmp %r8, %rcx
+    jne indexed_alias_failed
+    mov (%rax), %rcx
+    cmp %r8, %rcx
+    jne indexed_alias_failed
+
+    /* A displacement on top of a mixed-domain index must not move the
+     * address out of the completed range either. */
+    movabs $0x1234123412341234, %r9
+    mov %r9, 0x40(%r10,%r14)
+    mov 0x40(%rax), %rcx
+    cmp %r9, %rcx
+    jne indexed_alias_failed
+    mov (%rax), %rcx
+    cmp %r8, %rcx
+    jne indexed_alias_failed
     ret
 
 /* Semantically equivalent replacement for the loader's vector memset path.
@@ -165,7 +252,7 @@ unequal_left:
     .byte 0
     .fill 15, 1, 0
 success_message:
-    .ascii "BoxedWine FEX64 SSE2/REP STOS/call-ret PASS\n"
+    .ascii "BoxedWine FEX64 SSE2/REP STOS/indexed-alias/call-ret PASS\n"
 success_message_end:
 equal_failure:
     .ascii "BoxedWine FEX64 SSE2 equal comparison FAIL\n"
@@ -176,6 +263,9 @@ unequal_failure_end:
 rep_stos_failure:
     .ascii "BoxedWine FEX64 REP STOS fill FAIL\n"
 rep_stos_failure_end:
+indexed_alias_failure:
+    .ascii "BoxedWine FEX64 mixed-domain indexed addressing FAIL\n"
+indexed_alias_failure_end:
 
     .section .bss
     .balign 64

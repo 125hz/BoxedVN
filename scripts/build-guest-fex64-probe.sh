@@ -67,7 +67,7 @@ grep -Eq '[[:space:]]ret[[:space:]]*$' <<<"${disassembly}" || {
     echo "error: the kernel probe is missing its guest return path" >&2
     exit 1
 }
-strings "${output}" | grep -Fq 'BoxedWine FEX64 SSE2/REP STOS/call-ret PASS' || {
+strings "${output}" | grep -Fq 'BoxedWine FEX64 SSE2/REP STOS/indexed-alias/call-ret PASS' || {
     echo "error: the kernel probe is missing its translated-memory success marker" >&2
     exit 1
 }
@@ -81,7 +81,7 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
         echo "error: native kernel probe returned ${native_status}, expected 47" >&2
         exit 1
     }
-    [[ "${native_output}" == 'BoxedWine FEX64 SSE2/REP STOS/call-ret PASS' ]] || {
+    [[ "${native_output}" == 'BoxedWine FEX64 SSE2/REP STOS/indexed-alias/call-ret PASS' ]] || {
         echo "error: native kernel probe produced unexpected output" >&2
         printf '%s\n' "${native_output}" >&2
         exit 1

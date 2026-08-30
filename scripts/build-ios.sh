@@ -178,7 +178,7 @@ if [[ ${ENABLE_FEX64} -eq 1 ]]; then
     require_file "${BOXEDVN_ROOT}/build/guest-probes/boxedvn-fex64-kernel-probe" \
         "Run scripts/build-guest-fex64-probe.sh before enabling the optional FEX backend."
     strings "${BOXEDVN_ROOT}/build/guest-probes/boxedvn-fex64-kernel-probe" | \
-        grep -Fq 'BoxedWine FEX64 SSE2/REP STOS/call-ret PASS' || {
+        grep -Fq 'BoxedWine FEX64 SSE2/REP STOS/indexed-alias/call-ret PASS' || {
         echo "error: the bundled FEX correctness probe is stale; rebuild it" >&2
         exit 1
     }

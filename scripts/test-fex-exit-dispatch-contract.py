@@ -1279,6 +1279,151 @@ def main() -> None:
                 "it never acquired"
             )
 
+    # ------------------------------------------------------------------ #
+    # The alias belongs on the COMPLETE effective address. A guest          #
+    # `mov [r10 + r14], rax` with a canonical low base and a high index     #
+    # computed alias(base) + index, which lands in neither half of the      #
+    # address space; the loader faulted at exactly that address.            #
+    # ------------------------------------------------------------------ #
+    require_ordered(
+        alias_patch,
+        [
+            "ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(",
+            "+  const uint64_t AliasBase = CTX->GetGuestLowAliasBase();",
+            "+      if (AliasBase != 0) {",
+            "+        const uint32_t Shift = FEXCore::ilog2(OffsetScale);",
+            "+          add(ARMEmitter::Size::i64Bit, TMP4, Base, RegOffset, "
+            "ARMEmitter::ExtendedType::SXTX, Shift);",
+            "+        orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, AliasBase);",
+            "+        return ARMEmitter::ExtendedMemOperand(TMP4, "
+            "ARMEmitter::IndexType::OFFSET, 0);",
+        ],
+        "BoxedVN complete effective address before translation",
+    )
+    # The canonical ADD must precede the alias ORR, never the reverse.
+    add_at = alias_patch.index(
+        "add(ARMEmitter::Size::i64Bit, TMP4, Base, RegOffset,")
+    orr_at = alias_patch.index(
+        "orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, AliasBase);", add_at)
+    if not add_at < orr_at:
+        raise SystemExit(
+            "the effective address must be completed in canonical space "
+            "before the host alias is applied"
+        )
+    # Every extension form has to be covered, or a UXTW/SXTW index would fall
+    # back to the broken ordering.
+    for extension in ("SXTX", "UXTW", "SXTW"):
+        if ("add(ARMEmitter::Size::i64Bit, TMP4, Base, RegOffset, "
+                "ARMEmitter::ExtendedType::%s, Shift);" % extension
+                not in alias_patch):
+            raise SystemExit(
+                "the %s indexed form must complete its address canonically"
+                % extension
+            )
+    # The SVE operand carries the same rule.
+    require_ordered(
+        alias_patch,
+        [
+            "Arm64JITCore::GenerateSVEMemOperand(",
+            "+  const uint64_t SVEAliasBase = CTX->GetGuestLowAliasBase();",
+            "+  const ARMEmitter::Register CanonicalBase = Base;",
+            "+      add(ARMEmitter::Size::i64Bit, TMP4, CanonicalBase, TMP1);",
+            "+    add(ARMEmitter::Size::i64Bit, TMP4, CanonicalBase, RegOffset);",
+        ],
+        "BoxedVN complete SVE effective address before translation",
+    )
+
+    # The device probe must execute the faulting operand shape itself, before
+    # Wine is admitted, and fail with its own exit code.
+    kernel_probe = read(
+        repository / "scripts/guest-probes/fex64-kernel-probe.S"
+    )
+    require_ordered(
+        kernel_probe,
+        [
+            "_start:",
+            "call indexed_alias_probe",
+            "indexed_alias_failed:",
+            "mov $48, %rdi",
+            "indexed_alias_probe:",
+            "mov %rsp, %rax",
+            "and $-4096, %r14",
+            "and $4095, %r10",
+            "mov %rdx, (%r10,%r14)",
+            "mov (%r10,%r14), %rcx",
+            "jne indexed_alias_failed",
+            "mov %rsi, (%r14,%r10)",
+            "mov %r8, (%r14,%r11,8)",
+            "mov %r9, 0x40(%r10,%r14)",
+        ],
+        "BoxedVN device indexed-alias probe",
+    )
+    alias_probe_start = kernel_probe.index("indexed_alias_probe:")
+    alias_probe_body = kernel_probe[alias_probe_start:
+                                    kernel_probe.index("ret", alias_probe_start)]
+    if "movabs $0x7a" in alias_probe_body:
+        raise SystemExit(
+            "the indexed-alias probe must derive both address components from "
+            "a real mapped address; a hardcoded guest address cannot run "
+            "natively, where the packaged probe is validated"
+        )
+    probe_body = kernel_probe[kernel_probe.index("_start:"):]
+    if probe_body.index("call indexed_alias_probe") > probe_body.index(
+            "call strcmp_vector_probe"):
+        raise SystemExit(
+            "the indexed-alias contract must be proven before anything else "
+            "the translator reports about memory is trusted"
+        )
+    # A stale packaged probe must not satisfy the gate.
+    build_ios = read(repository / "scripts/build-ios.sh")
+    marker = "BoxedWine FEX64 SSE2/REP STOS/indexed-alias/call-ret PASS"
+    if marker not in kernel_probe or marker not in build_ios:
+        raise SystemExit(
+            "the packaged-probe staleness gate must name the current probe "
+            "contract"
+        )
+
+    # CI proves the same operand shape through the real ARM64 JIT.
+    indexed_fixture = read(
+        repository / "scripts/guest-probes/fex64-indexed-alias-contract.asm"
+    )
+    require_ordered(
+        indexed_fixture,
+        [
+            "times 0x0fc - ($ - $$) db 0x90",
+            "indexed_alias_target:",
+            "mov     [r10 + r14], rax",
+            "mov     rcx, [r10 + r14]",
+            "mov     [r14 + r10], rsi",
+            "mov     [r14 + r11*8], r8",
+            "mov     [r10 + r14 + 0x40], rdx",
+        ],
+        "BoxedVN indexed-alias VIXL fixture",
+    )
+    require_ordered(
+        vixl_probe,
+        [
+            'prepare_fixture "${fixture_indexed_alias}" fex64-indexed-alias',
+            "run_one x64-indexed-alias ",
+            '"${tmp_dir}/fex64-indexed-alias.config.bin" 1 0',
+            '"${tmp_dir}/fex64-indexed-alias.config.bin" 500 0',
+            '"${tmp_dir}/fex64-indexed-alias.config.bin" 500 1',
+            "run_one x64-indexed-alias-ircap ",
+            "--label indexed-alias",
+        ],
+        "VIXL indexed-alias regression",
+    )
+
+    # Both caches must see the new inputs, or a restored artifact could hide
+    # the change.
+    workflow = read(repository / ".github/workflows/build-ios.yml")
+    for cached in ("scripts/guest-probes/fex64-indexed-alias-contract.asm",
+                   "scripts/guest-probes/fex64-kernel-probe.S"):
+        if workflow.count("'%s'" % cached) < 1:
+            raise SystemExit(
+                "%s must participate in the workflow cache keys" % cached
+            )
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

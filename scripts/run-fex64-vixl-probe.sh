@@ -12,6 +12,7 @@ fixture64="${root}/scripts/guest-probes/fex64-loader-stall.asm"
 fixture32="${root}/scripts/guest-probes/fex32-core-contract.asm"
 fixture_vector="${root}/scripts/guest-probes/fex64-vector-store-contract.asm"
 fixture_negative_add="${root}/scripts/guest-probes/fex64-negative-add-contract.asm"
+fixture_indexed_alias="${root}/scripts/guest-probes/fex64-indexed-alias-contract.asm"
 host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
@@ -50,6 +51,8 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
     die "fixture not found: ${fixture_vector}"
 [[ -f "${fixture_negative_add}" ]] || \
     die "fixture not found: ${fixture_negative_add}"
+[[ -f "${fixture_indexed_alias}" ]] || \
+    die "fixture not found: ${fixture_indexed_alias}"
 [[ -f "${host_word_check}" ]] || \
     die "host-word checker not found: ${host_word_check}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
@@ -199,6 +202,7 @@ prepare_fixture "${fixture64}" fex64-loader-stall
 prepare_fixture "${fixture32}" fex32-core-contract
 prepare_fixture "${fixture_vector}" fex64-vector-store
 prepare_fixture "${fixture_negative_add}" fex64-negative-add
+prepare_fixture "${fixture_indexed_alias}" fex64-indexed-alias
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -257,4 +261,23 @@ run_one x64-negative-add-ircap "${tmp_dir}/fex64-negative-add.bin" \
 python3 "${host_word_check}" "${negative_add_capture}" \
     --label negative-add --forbid-word ffff0177 --require-addsub-register
 
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store and negative-add fixtures completed in all modes"
+
+# A guest effective address that combines a canonical low base with a high
+# index. The loader faulted on exactly this shape because the host
+# translation was applied to the base before the index contributed its own
+# high bits. Every store here is read back and compared, so a wrongly
+# ordered translation fails on the value rather than on an encoding scan.
+run_one x64-indexed-alias "${tmp_dir}/fex64-indexed-alias.bin" \
+    "${tmp_dir}/fex64-indexed-alias.config.bin" 1 0
+run_one x64-indexed-alias "${tmp_dir}/fex64-indexed-alias.bin" \
+    "${tmp_dir}/fex64-indexed-alias.config.bin" 500 0
+run_one x64-indexed-alias "${tmp_dir}/fex64-indexed-alias.bin" \
+    "${tmp_dir}/fex64-indexed-alias.config.bin" 500 1
+
+indexed_alias_capture="${tmp_dir}/fex64-indexed-alias.ircap.txt"
+run_one x64-indexed-alias-ircap "${tmp_dir}/fex64-indexed-alias.bin" \
+    "${tmp_dir}/fex64-indexed-alias.config.bin" 500 0 0x10100 \
+    | tee "${indexed_alias_capture}"
+python3 "${host_word_check}" "${indexed_alias_capture}" \
+    --label indexed-alias --forbid-word ffff0177
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add and indexed-alias fixtures completed in all modes"
