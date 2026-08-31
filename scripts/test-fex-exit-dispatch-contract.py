@@ -1716,6 +1716,22 @@ def main() -> None:
         ],
         "BoxedVN startup prefix resolution",
     )
+    require_ordered(
+        startup_args,
+        [
+            "static bool guestUsesFex64(",
+            "static void projectX64WineSystemModules(",
+            "Fs::makeLocalDirs(system32);",
+            "sourceDirectory->getAllChildren(sourceModules);",
+            "boxedvn::shouldProjectGuestWineSystemModule(",
+            "Fs::addFileNode(destination, source->path, B(\"\"), false,",
+            "BOXEDWINE_X64_SYSTEM32_OVERLAY source=%s destination=%s",
+            "const bool requestedFEX64 = guestUsesFex64(this->envValues);",
+            "if (requestedFEX64) {",
+            "projectX64WineSystemModules(winePrefix);",
+        ],
+        "BoxedVN x64 Wine system32 builtin overlay",
+    )
     # No launch-setup path may go back to assuming one fixed prefix. Comments
     # may still name it; code may not.
     for line in startup_args.split(newline):

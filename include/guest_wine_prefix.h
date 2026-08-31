@@ -38,6 +38,8 @@
 #define K_GUEST_WINE_DRIVE_C "drive_c"
 #define K_GUEST_WINE_DOSDEVICES "dosdevices"
 #define K_GUEST_WINE_C_LINK "c:"
+#define K_GUEST_WINE_WINDOWS "windows"
+#define K_GUEST_WINE_SYSTEM32 "system32"
 // Relative on purpose: it is what Wine writes, and it keeps the prefix
 // relocatable. The guest filesystem resolves a relative link target against
 // the link's own directory.
@@ -158,6 +160,21 @@ inline std::string guestWineDosDevicesPath(const std::string& prefix) {
 
 inline std::string guestWineDriveCLinkPath(const std::string& prefix) {
     return guestWineDosDevicesPath(prefix) + "/" + K_GUEST_WINE_C_LINK;
+}
+
+inline std::string guestWineSystem32Path(const std::string& prefix) {
+    return guestWineDriveCPath(prefix) + "/" + K_GUEST_WINE_WINDOWS + "/" +
+           K_GUEST_WINE_SYSTEM32;
+}
+
+// The x64 prefix exposes packaged Wine builtins as an in-memory overlay. A
+// real file already installed in the prefix always wins, and directories are
+// never projected as files. Keeping this decision independent of FsNode makes
+// the non-destructive rule testable on the host.
+inline bool shouldProjectGuestWineSystemModule(bool sourceExists,
+                                               bool sourceIsDirectory,
+                                               bool destinationExists) {
+    return sourceExists && !sourceIsDirectory && !destinationExists;
 }
 
 } // namespace boxedvn

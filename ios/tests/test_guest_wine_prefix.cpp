@@ -151,6 +151,8 @@ BOXEDVN_TEST(guest_wine_prefix_paths_follow_the_resolved_prefix) {
     CHECK(guestWineDosDevicesPath(x64) == "/home/username/.wine64/dosdevices");
     CHECK(guestWineDriveCLinkPath(x64) ==
           "/home/username/.wine64/dosdevices/c:");
+    CHECK(guestWineSystem32Path(x64) ==
+          "/home/username/.wine64/drive_c/windows/system32");
 
     const std::string custom = resolveGuestWinePrefix("/opt/prefixes/x64");
     CHECK(guestWineDriveCPath(custom) == "/opt/prefixes/x64/drive_c");
@@ -162,6 +164,17 @@ BOXEDVN_TEST(guest_wine_prefix_paths_follow_the_resolved_prefix) {
     const std::string ia32 = resolveGuestWinePrefix(nullptr);
     CHECK(guestWineDriveCLinkPath(ia32) ==
           "/home/username/.wine/dosdevices/c:");
+}
+
+BOXEDVN_TEST(guest_wine_system_overlay_projects_only_missing_files) {
+    CHECK(shouldProjectGuestWineSystemModule(true, false, false));
+    // Existing prefix content, including a user-supplied native override,
+    // always keeps precedence over the packaged builtin.
+    CHECK(!shouldProjectGuestWineSystemModule(true, false, true));
+    CHECK(!shouldProjectGuestWineSystemModule(true, true, false));
+    CHECK(!shouldProjectGuestWineSystemModule(false, false, false));
+    CHECK(std::string(K_GUEST_WINE_WINDOWS) == "windows");
+    CHECK(std::string(K_GUEST_WINE_SYSTEM32) == "system32");
 }
 
 BOXEDVN_TEST(guest_wine_prefix_c_link_target_is_relative_to_dosdevices) {

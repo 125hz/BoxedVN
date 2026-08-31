@@ -107,6 +107,73 @@ static BString guestWinePrefixFromEnv(const std::vector<BString>& envValues) {
     return BString::copy(boxedvn::resolveGuestWinePrefix(selected).c_str());
 }
 
+static bool guestUsesFex64(const std::vector<BString>& envValues) {
+    for (const BString& entry : envValues) {
+        if (entry == "BOXEDWINE_CPU64=fex") {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Wine normally installs small builtin placeholders into a new prefix's
+// system32 directory. On the BoxedWine x64 path wineboot completes with status
+// 0 but leaves that directory empty, and the FEX-translated parent then cannot
+// perform Wine's late Unix-side builtin fallback. Project the mounted PE tree
+// into system32 as guest links before any process starts. This is an in-memory
+// union: a real prefix file is never replaced, and the packaged module remains
+// the single backing copy.
+static void projectX64WineSystemModules(const BString& winePrefix) {
+    const BString system32 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
+                             K_GUEST_WINE_WINDOWS "/" K_GUEST_WINE_SYSTEM32;
+    Fs::makeLocalDirs(system32);
+
+    std::shared_ptr<FsNode> sourceDirectory =
+        Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_PE_DIR), true);
+    std::shared_ptr<FsNode> destinationDirectory =
+        Fs::getNodeFromLocalPath(B(""), system32, true);
+    if (!sourceDirectory || !sourceDirectory->isDirectory() ||
+        !destinationDirectory || !destinationDirectory->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_SYSTEM32_OVERLAY source=%s destination=%s "
+                 "projected=0 preserved=0 status=unavailable",
+                 K_X64_WINE_PE_DIR, system32.c_str());
+        return;
+    }
+
+    std::vector<std::shared_ptr<FsNode> > sourceModules;
+    sourceDirectory->getAllChildren(sourceModules);
+    U32 projected = 0;
+    U32 preserved = 0;
+    U32 skipped = 0;
+    destinationDirectory->reserveChildren(sourceModules.size());
+    for (const std::shared_ptr<FsNode>& source : sourceModules) {
+        if (!source || source->name.isEmpty()) {
+            ++skipped;
+            continue;
+        }
+        const BString destination = system32 + "/" + source->name;
+        const bool destinationExists =
+            Fs::getNodeFromLocalPath(B(""), destination, false) != nullptr;
+        if (!boxedvn::shouldProjectGuestWineSystemModule(
+                source != nullptr, source && source->isDirectory(),
+                destinationExists)) {
+            if (destinationExists) {
+                ++preserved;
+            } else {
+                ++skipped;
+            }
+            continue;
+        }
+        Fs::addFileNode(destination, source->path, B(""), false,
+                        destinationDirectory);
+        ++projected;
+    }
+    klog_fmt("BOXEDWINE_X64_SYSTEM32_OVERLAY source=%s destination=%s "
+             "projected=%u preserved=%u skipped=%u status=ready",
+             K_X64_WINE_PE_DIR, system32.c_str(), projected, preserved,
+             skipped);
+}
+
 // WINEARCH, for the launch marker only. Empty means the caller left it to
 // Wine, which is the ordinary 32-bit case.
 static BString guestWineArchFromEnv(const std::vector<BString>& envValues) {
@@ -626,6 +693,7 @@ bool StartUpArgs::apply() {
     // into a prefix the guest never opens is invisible to it, so D: and E:
     // would simply not exist for a 64-bit session.
     const BString winePrefix = guestWinePrefixFromEnv(this->envValues);
+    const bool requestedFEX64 = guestUsesFex64(this->envValues);
     const BString wineDosDevices = winePrefix + "/dosdevices";
     // Wine64 creates its prefix on first boot, so these legitimately do not
     // exist yet and an otherwise-empty .wine64 is the expected state. Only
@@ -660,6 +728,9 @@ bool StartUpArgs::apply() {
             Fs::addFileNode(wineDriveCLink, B(K_GUEST_WINE_C_LINK_TARGET),
                             B(""), false, dosDevicesNode);
         }
+    }
+    if (requestedFEX64) {
+        projectX64WineSystemModules(winePrefix);
     }
 
     if (!this->ddrawOverridePath.isEmpty()) {
@@ -895,13 +966,6 @@ bool StartUpArgs::apply() {
         bool result = false;
         {
             KProcessPtr process = KProcess::create();// keep in this small scope so we don't hold onto it for the life of the program
-            bool requestedFEX64 = false;
-            for (const BString& value : this->envValues) {
-                if (value == "BOXEDWINE_CPU64=fex") {
-                    requestedFEX64 = true;
-                    break;
-                }
-            }
             if (requestedFEX64) {
                 klog_fmt("BOXEDWINE_X64_LAUNCH request=fex executable=%s env_count=%u",
                          this->args[0].c_str(), (U32)this->envValues.size());
