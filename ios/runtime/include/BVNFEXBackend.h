@@ -116,6 +116,14 @@ uint64_t BVNFEXBackendTakePendingIRCapTarget(void);
 // boundary, yield, exec replacement, or normal FEX return.
 bool BVNFEXCPU64Run(void* process, void* thread);
 
+// Arm the translator's bounded block trace for one process, for the handoff
+// that follows the Wine-server reply that hands it its entry point. The
+// translator's own budget is spent hundreds of blocks earlier, which is why
+// that handoff has never appeared in a device log. Disarms itself after its
+// budget or after that process's first NT redirect.
+void BVNFEXBackendArmHandoffTrace(unsigned processId);
+void BVNFEXBackendDisarmHandoffTrace(unsigned processId);
+
 #ifdef __cplusplus
 }
 #endif

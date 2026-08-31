@@ -15,6 +15,10 @@
 #include "cpu64.h"
 #include "kmemory64.h"
 #include "guest_mmap_placement.h"
+#include "wine_server_reply.h"
+#ifdef BOXEDWINE_FEX64_BACKEND
+#include "BVNFEXBackend.h"
+#endif
 #include "krandom.h"
 #include "boxedwine_x64_hostcall.h"
 #include "kevent.h"
@@ -396,7 +400,12 @@ static void dumpX64DescendantSnapshot(KProcess* parent) {
                  (unsigned)child->exitCode, (unsigned)threadCount);
     }
     if (reported == 0) {
-        klog_fmt("  X64_EXIT_DESC none: no live descendant of pid=%u",
+        // Precisely what was measured, and nothing more. A daemon that
+        // reparented itself away is not a direct child any more, so its
+        // absence here says nothing about whether it is alive -- the socket
+        // ring is what shows that.
+        klog_fmt("  X64_EXIT_DESC none: no live DIRECT child of pid=%u "
+                 "(a reparented daemon would not appear here)",
                  (unsigned)parent->id);
     }
 }
@@ -469,6 +478,18 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     std::vector<U8> buffer((size_t)count + 1);
     cpu->memory->memcpyFromGuest(buffer.data(), buf, count);
     buffer[count] = 0;
+    // Wine's protocol union is a fixed size in both directions. Remember the
+    // opcode of the last whole request this process sent: the reply comes back
+    // on a different descriptor and carries no opcode of its own, so this is
+    // the only thing that identifies which exchange it belongs to.
+    if (cpu->thread && cpu->thread->process) {
+        const int opcode =
+            boxedvn::wineServerRequestOpcode(buffer.data(), count);
+        if (opcode >= 0) {
+            cpu->thread->process->lastServerRequestOpcode = opcode;
+            cpu->thread->process->lastServerRequestFd = (U32)fd;
+        }
+    }
     if (fd == 1 || fd == 2) {
         // Tee stdout/stderr to host console so ld-linux + glibc diagnostics
         // surface immediately. Also forward to the kobject so anything
@@ -1267,6 +1288,39 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     }
     crashRingRecordRead('R', (U32)cpu->thread->process->id, (U32)fd,
                         tmp.data(), got, (U32)count, (U32)got);
+    // The reply that hands this process its PE entry point is the last thing
+    // that happens before it should start running Windows code. The device
+    // shows it arriving intact and the process exiting anyway, so the handoff
+    // after it is what needs watching -- and the socket ring's sixteen-byte
+    // prefix stops one field short of `suspend`.
+    {
+        KProcess* replyProcess = cpu->thread->process.get();
+        if (!replyProcess->initProcessDoneReported &&
+            replyProcess->lastServerRequestOpcode ==
+                K_WINE_REQ_INIT_PROCESS_DONE &&
+            got == K_WINE_SERVER_MESSAGE_BYTES) {
+            const boxedvn::WineInitProcessDoneReply reply =
+                boxedvn::decodeWineInitProcessDoneReply(tmp.data(), got);
+            if (boxedvn::wineInitProcessDoneAdmitted(reply)) {
+                replyProcess->initProcessDoneReported = true;
+                klog_fmt("BOXEDWINE_X64_INIT_DONE_REPLY pid=%u error=%u "
+                         "reply_size=%u entry=0x%llx suspend=%d "
+                         "request_fd=%u reply_fd=%u",
+                         (unsigned)replyProcess->id, (unsigned)reply.error,
+                         (unsigned)reply.replySize,
+                         (unsigned long long)reply.entry, (int)reply.suspend,
+                         (unsigned)replyProcess->lastServerRequestFd,
+                         (unsigned)fd);
+                // Everything after this point is the loader-to-Windows
+                // handoff. Arm the translator's bounded block trace for it;
+                // the global budget it normally uses is spent hundreds of
+                // blocks earlier and showed nothing of this.
+#ifdef BOXEDWINE_FEX64_BACKEND
+                BVNFEXBackendArmHandoffTrace((unsigned)replyProcess->id);
+#endif
+            }
+        }
+    }
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
     }

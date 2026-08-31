@@ -1,0 +1,71 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 8ad72093..05723f6f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -4196,20 +4196,52 @@ void OpDispatchBuilder::CheckLegacySegmentWrite(Ref NewNode, uint32_t SegmentReg
+ }
+
+ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg) {
+-  // Use BFE to extract the selector index in bits [15,3] of the segment register.
+-  // In some cases the upper 16-bits of the 32-bit GPR contain garbage to ignore.
+-  auto GDT = _Bfe(OpSize::i32Bit, 1, 2, Segment);
+-  // Fun quirk, if we mask the selector then it is premultiplied by 8 which we need to do for accessing anyway.
+-  auto SegmentOffset = _And(OpSize::i32Bit, Segment, _Constant(0xfff8));
+-  Ref SegmentBase = _LoadContextGPRIndexed(GDT, OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, segment_arrays[0]), 8);
+-  Ref NewSegment = _LoadMemGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
+-  CheckLegacySegmentWrite(NewSegment, SegmentReg);
+-
+-  // Extract the 32-bit base from the GDT segment.
+-  auto Upper32 = _Lshr(OpSize::i64Bit, NewSegment, _Constant(32));
+-  auto Masked = _And(OpSize::i32Bit, Upper32, _Constant(0xFF00'0000));
+-  Ref Merged = _Orlshr(OpSize::i32Bit, Masked, NewSegment, 16);
+-  NewSegment = _Bfi(OpSize::i32Bit, 8, 16, Merged, Upper32);
++  // BoxedWine: the descriptor table is not guest memory.
++  //
++  // segment_arrays[] holds a HOST pointer to the thread's own descriptor
++  // array. The load below is an ordinary memory operation, so when the guest
++  // is hosted at an aliased address every memory operand this builder emits
++  // is translated at the dereference boundary -- including this one. Applying
++  // a guest translation to a host pointer produces an address in neither
++  // domain, and the first instruction a 64-bit Wine process executes that
++  // reaches here is the `iretq` that enters Windows code.
++  //
++  // There is nothing to fetch. In long mode the CS, SS, DS and ES bases are
++  // architecturally ignored and behave as zero, which is also what the
++  // descriptor holds; the one field anything else reads is L, and the
++  // frontend reads that from the host-side array directly when it decides how
++  // to decode the next block. So store the zero base the load would have
++  // produced and emit no load at all.
++  //
++  // FS and GS are deliberately excluded. Their bases are real and come from
++  // arch_prctl rather than from a descriptor, so inventing a zero for them
++  // would discard the thread's TEB. A 64-bit guest that loaded FS or GS as a
++  // segment register would still reach the untranslatable load; Wine's
++  // x86-64 path does not, and leaving that visible is better than papering
++  // over it with a base this code cannot know.
++  const bool HostSideDescriptorTable = Is64BitMode && CTX->GetGuestLowAliasBase() != 0 &&
++                                       SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX &&
++                                       SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX;
++
++  Ref NewSegment {};
++  if (HostSideDescriptorTable) {
++    NewSegment = _Constant(0);
++  } else {
++    // Use BFE to extract the selector index in bits [15,3] of the segment register.
++    // In some cases the upper 16-bits of the 32-bit GPR contain garbage to ignore.
++    auto GDT = _Bfe(OpSize::i32Bit, 1, 2, Segment);
++    // Fun quirk, if we mask the selector then it is premultiplied by 8 which we need to do for accessing anyway.
++    auto SegmentOffset = _And(OpSize::i32Bit, Segment, _Constant(0xfff8));
++    Ref SegmentBase = _LoadContextGPRIndexed(GDT, OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, segment_arrays[0]), 8);
++    NewSegment = _LoadMemGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
++    CheckLegacySegmentWrite(NewSegment, SegmentReg);
++
++    // Extract the 32-bit base from the GDT segment.
++    auto Upper32 = _Lshr(OpSize::i64Bit, NewSegment, _Constant(32));
++    auto Masked = _And(OpSize::i32Bit, Upper32, _Constant(0xFF00'0000));
++    Ref Merged = _Orlshr(OpSize::i32Bit, Masked, NewSegment, 16);
++    NewSegment = _Bfi(OpSize::i32Bit, 8, 16, Merged, Upper32);
++  }
+
+   switch (SegmentReg) {
+   case FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX:

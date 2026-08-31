@@ -28,6 +28,8 @@ extern "C" uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t) {
     return 0;
 }
 extern "C" bool BVNFEXCPU64Run(void*, void*) { return false; }
+extern "C" void BVNFEXBackendArmHandoffTrace(unsigned) {}
+extern "C" void BVNFEXBackendDisarmHandoffTrace(unsigned) {}
 extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
     return stage == BVNFEXBackendStageUnavailable ? "not linked" : "unknown";
 }
@@ -39,6 +41,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "boxedvn/fex_exit_dispatch_contract.h"
 #include "boxedvn/fex_guest_mode_policy.h"
 #include "guest_low_alias.h"
+#include "guest_segment_table.h"
 #include "boxedvn/guest_address_space.h"
 #include "boxedvn/elf_inspector.h"
 
@@ -173,6 +176,9 @@ boxedvn::FEX64Kernel gKernel(gAddressSpace,
     });
 
 thread_local std::jmp_buf gExitJump;
+// Enough blocks to cross the dispatcher return and reach Windows code,
+// small enough that an armed phase cannot become a firehose.
+constexpr unsigned kHandoffTraceBlockBudget = 128;
 thread_local bool gCanJump = false;
 std::unique_ptr<KMemory64> gProbeMemory;
 std::unique_ptr<CPU64> gProbeCPU;
@@ -219,11 +225,68 @@ struct RetiredFEXEpoch {
 
 std::unique_ptr<FEXContextBundle> gProbeContext;
 
+// The descriptor table a thread's segment selectors index into.
+//
+// This was one entry. Every selector a 64-bit guest had loaded until now was
+// zero, so index zero was the only one ever read and one entry was enough.
+// Wine's dispatcher return is the first instruction in the whole process to
+// load a non-zero selector: `iretq` takes __USER_CS = 0x33 and
+// __USER_DS = 0x2b off its frame, which are indices 6 and 5.
+//
+// Neither the processor nor FEX bounds-checks that. FEX indexes the array
+// directly, in two places that matter:
+//
+//   - the frontend reads the CS descriptor's L bit on the host side to decide
+//     whether to decode the next block as 64-bit or 32-bit code, and
+//   - the translated `iretq` reads the descriptor to recompute the cached
+//     segment base.
+//
+// Reading index 6 of a one-entry array returns whatever follows it in this
+// structure, so the decode mode for Windows code was being taken from
+// unrelated bytes. FEX's own Linux thread manager allocates thirty-two and
+// mirrors the LDT onto the same array; this now matches it.
+//
+// Every entry is a present, flat, long-mode descriptor. In long mode the
+// base and limit of CS, SS, DS and ES are ignored and only L is consulted, so
+// a uniform table cannot change any program's meaning -- and it means a
+// selector this port did not anticipate keeps the decoder in 64-bit mode
+// instead of reading past the end of the array.
+inline void initialiseGuestDescriptorTable(
+    FEXCore::Core::CPUState::gdt_segment* table) {
+    for (unsigned entry = 0; entry < K_GUEST_SEGMENT_TABLE_ENTRIES; ++entry) {
+        table[entry] = {};
+        FEXCore::Core::CPUState::SetGDTBase(&table[entry], 0);
+        FEXCore::Core::CPUState::SetGDTLimit(&table[entry], 0xF'FFFFU);
+        table[entry].P = 1;    // present
+        table[entry].S = 1;    // code/data, not a system descriptor
+        table[entry].Type = 0b1011;
+        table[entry].L = 1;    // long mode
+        table[entry].D = 0;    // reserved when L is set
+    }
+}
+
+// Point both tables at one array, the way FEX's Linux thread manager does.
+inline void publishGuestDescriptorTable(
+    FEXCore::Core::CPUState& state,
+    FEXCore::Core::CPUState::gdt_segment* table) {
+    initialiseGuestDescriptorTable(table);
+    state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] =
+        table;
+    // The LDT was left null. A selector with its table indicator set would
+    // have dereferenced it; mirroring is what FEX does for the same reason.
+    state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] =
+        table;
+    state.cs_idx =
+        (uint16_t)(FEXCore::Core::CPUState::DEFAULT_USER_CS << 3);
+    state.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(
+        *FEXCore::Core::CPUState::GetSegmentFromIndex(state, state.cs_idx));
+}
+
 struct LiveThreadState {
     FEXCore::Core::InternalThreadState* fexThread = nullptr;
     void* callRetMapping = nullptr;
     size_t callRetMappingSize = 0;
-    FEXCore::Core::CPUState::gdt_segment gdt[1] {};
+    FEXCore::Core::CPUState::gdt_segment gdt[K_GUEST_SEGMENT_TABLE_ENTRIES] {};
     // Context::ExecuteThread mutates CurrentFrame, the JIT backend, and the
     // call/return stack. A KThread must therefore have at most one active
     // FEX execution at a time, even if a scheduler bug attempts to dispatch
@@ -1319,12 +1382,8 @@ LiveThreadState* getLiveThreadState(LiveProcessState* processState,
         reinterpret_cast<uint64_t>(shadow) + shadowBytes / 4;
     state->fexThread->CurrentFrame->State.callret_sp_base =
         reinterpret_cast<uint64_t>(shadow);
-    state->gdt[0].L = 1;
-    state->gdt[0].P = 1;
-    state->gdt[0].S = 1;
-    state->gdt[0].Type = 0b1011;
-    state->fexThread->CurrentFrame->State.segment_arrays[0] = state->gdt;
-    state->fexThread->CurrentFrame->State.cs_idx = 0;
+    publishGuestDescriptorTable(state->fexThread->CurrentFrame->State,
+                                state->gdt);
     gLiveThreadContexts.emplace(state->fexThread, processState->fex->context.get());
     state->active = true;
     state->hostMachThread = pthread_mach_thread_np(pthread_self());
@@ -1465,8 +1524,8 @@ bool recreateLiveContextAfterExec(LiveProcessState* processState,
         replacement->CurrentFrame->State.callret_sp_base =
             reinterpret_cast<uint64_t>(shadow);
     }
-    replacement->CurrentFrame->State.segment_arrays[0] = threadState->gdt;
-    replacement->CurrentFrame->State.cs_idx = 0;
+    publishGuestDescriptorTable(replacement->CurrentFrame->State,
+                                threadState->gdt);
 
     // A newly-created dispatcher normally compiles its first block on a cache
     // miss. At the exec recovery boundary the iOS dispatcher instead observed
@@ -2052,6 +2111,24 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
     return "unknown";
 }
 
+// The translator's block trace normally spends a global budget during
+// startup, hundreds of blocks before anything interesting. These arm it again
+// for one process and a bounded number of blocks, over the handoff that
+// follows the Wine-server reply carrying the process's entry point.
+extern "C" void BVNFEXBackendArmHandoffTrace(unsigned processId) {
+    FEXCore::Context::BoxedWineArmBlockTrace(processId,
+                                             kHandoffTraceBlockBudget);
+    reportf("BOXEDWINE_FEX64_HANDOFF_TRACE_ARMED pid=%u budget=%u", processId,
+            kHandoffTraceBlockBudget);
+}
+
+extern "C" void BVNFEXBackendDisarmHandoffTrace(unsigned processId) {
+    if (FEXCore::Context::BoxedWineDisarmBlockTrace(processId)) {
+        reportf("BOXEDWINE_FEX64_HANDOFF_TRACE_DONE pid=%u reason=nt-redirect",
+                processId);
+    }
+}
+
 extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
     reportf("BOXEDWINE_FEX64_RUN attach process=%p thread=%p", process, thread);
     BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterAttach(process, thread);
@@ -2318,13 +2395,9 @@ extern "C" BVNFEXBackendStage BVNFEXBackendProbe(void) {
     thread->CurrentFrame->State.callret_sp_base =
         reinterpret_cast<uint64_t>(shadow);
 
-    static FEXCore::Core::CPUState::gdt_segment gdt[1] {};
-    gdt[0].L = 1;
-    gdt[0].P = 1;
-    gdt[0].S = 1;
-    gdt[0].Type = 0b1011;
-    thread->CurrentFrame->State.segment_arrays[0] = gdt;
-    thread->CurrentFrame->State.cs_idx = 0;
+    static FEXCore::Core::CPUState::gdt_segment
+        gdt[K_GUEST_SEGMENT_TABLE_ENTRIES] {};
+    publishGuestDescriptorTable(thread->CurrentFrame->State, gdt);
 
     gCanJump = true;
     gProbeExited.store(false, std::memory_order_release);

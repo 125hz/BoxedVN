@@ -114,6 +114,10 @@ apply_patch fex-arm64-context-indexed-unaligned-offset.patch
 apply_patch fex-arm64-addsub-immediate-range.patch
 apply_patch fex-boxedwine-ir-capture-arm.patch
 apply_patch fex-boxedwine-low-address-alias.patch
+# Depends on the alias patch above: it asks the context whether the guest is
+# hosted at an aliased address before deciding that a descriptor-table read
+# would be translated as if it were guest memory.
+apply_patch fex-boxedwine-longmode-segment-base.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

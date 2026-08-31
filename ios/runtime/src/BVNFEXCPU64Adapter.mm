@@ -48,6 +48,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
 #include "kthread.h"
 #include "syscall64.h"
 #include "wine_nt_syscall_memory.h"
+#include "BVNFEXBackend.h"
 
 #include <algorithm>
 #include <array>
@@ -899,6 +900,10 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
         boxedvn::reportWineNtSyscallRedirect(
             ntStub, (uint32_t)adapter->process->id,
             (uint32_t)adapter->thread->id, "fex");
+        // The first NT thunk this process takes is the end of the handoff:
+        // Windows code is running. Stop the armed block trace here rather
+        // than letting it spend its whole budget past the interesting part.
+        BVNFEXBackendDisarmHandoffTrace((uint32_t)adapter->process->id);
         if (!BVNFEXCPU64AdapterSyncToFEX(adapter, framePointer)) {
             adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
             return static_cast<uint64_t>(-K_EFAULT);

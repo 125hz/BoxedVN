@@ -399,6 +399,13 @@ public:
     // time it makes a syscall. Bounded by the number of processes.
     bool scheduleReported = false;
     bool firstSyscallReported = false;
+    // The opcode of the last whole Wine-server request this process wrote, and
+    // the descriptor it went out on. The reply arrives on a different
+    // descriptor with no opcode of its own, so this is what identifies it.
+    // Nothing here is specific to a pid or to a particular request.
+    int lastServerRequestOpcode = -1;
+    U32 lastServerRequestFd = 0;
+    bool initProcessDoneReported = false;
 #endif
     BString exe;
     BString name; // mainly used for logging

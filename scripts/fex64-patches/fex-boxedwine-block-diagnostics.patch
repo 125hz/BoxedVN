@@ -1,8 +1,54 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 92305f460..50c8cf656 100644
+index 92305f46..06de6c76 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
-@@ -1360,4 +1360,31 @@
+@@ -1357,7 +1357,112 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
+ }
+ #endif
+
++namespace FEXCore::Context {
++namespace {
++std::atomic<uint32_t> BoxedWineBlockTraceBudget {0};
++std::atomic<uint32_t> BoxedWineBlockTraceProcess {0};
++std::atomic<uint64_t> BoxedWineIRETRip {0};
++} // namespace
++
++void BoxedWineArmBlockTrace(uint32_t ProcessId, uint32_t Budget) {
++  BoxedWineBlockTraceProcess.store(ProcessId, std::memory_order_relaxed);
++  BoxedWineBlockTraceBudget.store(Budget, std::memory_order_release);
++}
++
++bool BoxedWineDisarmBlockTrace(uint32_t ProcessId) {
++  if (BoxedWineBlockTraceProcess.load(std::memory_order_relaxed) != ProcessId) {
++    return false;
++  }
++  return BoxedWineBlockTraceBudget.exchange(0, std::memory_order_acq_rel) != 0;
++}
++
++void BoxedWineNoteGuestIRET(uint64_t GuestRIP) {
++  if (BoxedWineBlockTraceBudget.load(std::memory_order_acquire) == 0) {
++    return;
++  }
++  BoxedWineIRETRip.store(GuestRIP, std::memory_order_release);
++  LogMan::Msg::IFmt("BOXEDWINE_FEX64_IRET_PRE rip={:#x}", GuestRIP);
++}
++
++uint64_t BoxedWineTakeGuestIRETNote() {
++  return BoxedWineIRETRip.exchange(0, std::memory_order_acq_rel);
++}
++
++bool BoxedWineTakeBlockTraceCredit() {
++  uint32_t Remaining = BoxedWineBlockTraceBudget.load(std::memory_order_acquire);
++  while (Remaining != 0) {
++    if (BoxedWineBlockTraceBudget.compare_exchange_weak(Remaining, Remaining - 1, std::memory_order_acq_rel,
++                                                        std::memory_order_acquire)) {
++      return true;
++    }
++  }
++  return false;
++}
++} // namespace FEXCore::Context
++
  uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
 +  /* BoxedWine: keep a bounded enter/leave trace around the whole compiler.
 +   * An unmatched enter identifies a translator-side stall, while a matched
@@ -11,30 +57,65 @@ index 92305f460..50c8cf656 100644
 +   * deterministic device log during backend bring-up. */
 +  static std::atomic<uint32_t> BoxedWineCompileOrdinal {0};
 +  const uint32_t BoxedWineOrdinal = BoxedWineCompileOrdinal.fetch_add(1, std::memory_order_relaxed);
++  /* The startup budget above is spent hundreds of blocks before anything
++   * interesting. BoxedWine can arm a second, bounded phase over a transition
++   * it wants to watch -- the loader handing control to Windows code, which
++   * has never appeared in a device log for exactly this reason. */
++  const bool BoxedWinePhase = FEXCore::Context::BoxedWineTakeBlockTraceCredit();
++  const bool BoxedWineTracing = BoxedWineOrdinal < 512 || BoxedWinePhase;
 +  struct BoxedWineCompileTrace final {
++    bool Tracing;
 +    uint32_t Ordinal;
 +    uint64_t RIP;
 +    ~BoxedWineCompileTrace() {
-+      if (Ordinal < 512) {
++      if (Tracing) {
 +        LogMan::Msg::IFmt("[boxedwine-block] leave ordinal={} rip={:#x}", Ordinal, RIP);
 +      }
 +    }
-+  } BoxedWineTrace {BoxedWineOrdinal, GuestRIP};
-+  if (BoxedWineOrdinal < 512) {
++  } BoxedWineTrace {BoxedWineTracing, BoxedWineOrdinal, GuestRIP};
++  if (BoxedWineTracing) {
++    /* The first instruction bytes make an iretq visible as the block's own
++     * terminator, and the segment bases say whether the guest has already
++     * installed its Windows TEB. Read through the same translation the
++     * translator itself uses, so a canonical low address resolves. */
++    uint64_t BoxedWineCode0 = 0, BoxedWineCode1 = 0;
++    if (BoxedWinePhase) {
++      const uint8_t* Bytes = reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP));
++      if (Bytes) {
++        memcpy(&BoxedWineCode0, Bytes, sizeof(BoxedWineCode0));
++        memcpy(&BoxedWineCode1, Bytes + sizeof(BoxedWineCode0), sizeof(BoxedWineCode1));
++      }
++    }
 +    LogMan::Msg::IFmt(
-+      "[boxedwine-block] enter ordinal={} rip={:#x} max_inst={} frame_rip={:#x} rsp={:#x} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x}",
-+      BoxedWineOrdinal, GuestRIP, MaxInst, Frame ? Frame->State.rip : 0,
++      "[boxedwine-block] enter ordinal={} phase={} rip={:#x} max_inst={} frame_rip={:#x} rsp={:#x} rax={:#x} rcx={:#x} rdi={:#x} rsi={:#x} rdx={:#x} fs={:#x} gs={:#x} code={:#018x}{:016x}",
++      BoxedWineOrdinal, BoxedWinePhase ? 1 : 0, GuestRIP, MaxInst, Frame ? Frame->State.rip : 0,
 +      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSP] : 0,
 +      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RAX] : 0,
++      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RCX] : 0,
 +      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RDI] : 0,
 +      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSI] : 0,
-+      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RDX] : 0);
++      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RDX] : 0,
++      Frame ? Frame->State.fs_cached : 0, Frame ? Frame->State.gs_cached : 0,
++      BoxedWineCode1, BoxedWineCode0);
++    /* An iretq was translated and this is the first block compiled after it,
++     * so this is where it landed: the selectors it loaded, the stack it
++     * switched to and the first bytes of the code it reached. A target block
++     * already in the cache would not be recompiled and so would not appear
++     * here -- which is not a limitation for the transition this watches,
++     * because Windows code has never been reached before. */
++    if (const uint64_t BoxedWineIRETFrom = FEXCore::Context::BoxedWineTakeGuestIRETNote()) {
++      LogMan::Msg::IFmt(
++        "BOXEDWINE_FEX64_IRET_POST from={:#x} rip={:#x} rsp={:#x} cs={:#x} ss={:#x} fs={:#x} gs={:#x} code={:#018x}{:016x}",
++        BoxedWineIRETFrom, GuestRIP, Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSP] : 0,
++        Frame ? Frame->State.cs_idx : 0, Frame ? Frame->State.ss_idx : 0, Frame ? Frame->State.fs_cached : 0,
++        Frame ? Frame->State.gs_cached : 0, BoxedWineCode1, BoxedWineCode0);
++    }
 +  }
 +
    if constexpr (BLOCK_DEBUGGING) {
      // Block debugging logic is hand-written and needs to be handled with care.
      // Force MaxInst to only be one in this case.
-@@ -1571,11 +1591,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+@@ -1571,12 +1676,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     *
     * Back to IsAddressInCodeBuffer alone, which is sound with no discrimination needed: FEX's own
     * emitted code is never guest code under any classification. */
@@ -51,3 +132,46 @@ index 92305f460..50c8cf656 100644
 +                        "FEX-CODE-BUFFER(host PC leak)",
                          GuestRIP, Frame ? Frame->State.rip : 0, __builtin_return_address(0),
                          Frame ? Frame->State.callret_sp : 0);
+
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index ec61b90b..fbd1e98d 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -34,6 +34,21 @@ class IREmitter;
+ } // namespace FEXCore::IR
+
+ namespace FEXCore::Context {
++// BoxedWine: arm the translator's block trace for a bounded number of blocks.
++// The startup budget is spent long before the transition worth watching, and a
++// permanent per-block trace is a firehose, so this is a phase with an explicit
++// budget that disarms itself when the budget runs out.
++FEX_DEFAULT_VISIBILITY void BoxedWineArmBlockTrace(uint32_t ProcessId, uint32_t Budget);
++// Returns true when it actually stopped something that was armed.
++FEX_DEFAULT_VISIBILITY bool BoxedWineDisarmBlockTrace(uint32_t ProcessId);
++// Consumes one credit; true while the phase is armed.
++FEX_DEFAULT_VISIBILITY bool BoxedWineTakeBlockTraceCredit();
++// Records that an iretq was translated at this guest address, while the phase
++// is armed. Wine enters Windows code through one, and no device log has ever
++// shown that instruction being reached.
++FEX_DEFAULT_VISIBILITY void BoxedWineNoteGuestIRET(uint64_t GuestRIP);
++// Returns and clears the address a pending iretq was translated at, or zero.
++FEX_DEFAULT_VISIBILITY uint64_t BoxedWineTakeGuestIRETNote();
+
+ enum OperatingMode {
+   MODE_32BIT,
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 8ad72093..8ea89f10 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -185,6 +185,11 @@ void OpDispatchBuilder::IRETOp(OpcodeArgs) {
+
+   const auto GPRSize = GetGPROpSize();
+
++  // BoxedWine: note the transition while its bounded trace is armed. This is
++  // the instruction Wine's dispatcher return uses to enter Windows code, and
++  // it costs nothing when the trace is not armed.
++  FEXCore::Context::BoxedWineNoteGuestIRET(Op->PC);
++
+   Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+
+   // RIP (64/32/16 bits)

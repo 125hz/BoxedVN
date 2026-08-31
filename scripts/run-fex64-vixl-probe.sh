@@ -16,6 +16,7 @@ fixture_indexed_alias="${root}/scripts/guest-probes/fex64-indexed-alias-contract
 fixture_top_alias="${root}/scripts/guest-probes/fex64-top-alias-contract.asm"
 fixture_top_alias_repmov="${root}/scripts/guest-probes/fex64-top-alias-repmov.asm"
 fixture_top_alias_stack="${root}/scripts/guest-probes/fex64-top-alias-stack.asm"
+fixture_dispatcher_return="${root}/scripts/guest-probes/fex64-dispatcher-return.asm"
 host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
@@ -32,6 +33,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-arm64-addsub-immediate-range.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-longmode-segment-base.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-harness-alias.patch"
 )
 
@@ -63,6 +65,8 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
     die "fixture not found: ${fixture_top_alias_repmov}"
 [[ -f "${fixture_top_alias_stack}" ]] || \
     die "fixture not found: ${fixture_top_alias_stack}"
+[[ -f "${fixture_dispatcher_return}" ]] || \
+    die "fixture not found: ${fixture_dispatcher_return}"
 [[ -f "${host_word_check}" ]] || \
     die "host-word checker not found: ${host_word_check}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
@@ -218,6 +222,7 @@ prepare_fixture "${fixture_indexed_alias}" fex64-indexed-alias
 prepare_fixture "${fixture_top_alias}" fex64-top-alias
 prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov
 prepare_fixture "${fixture_top_alias_stack}" fex64-top-alias-stack
+prepare_fixture "${fixture_dispatcher_return}" fex64-dispatcher-return
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -347,4 +352,34 @@ run_one x64-top-alias-stack "${tmp_dir}/fex64-top-alias-stack.bin" \
     "${tmp_dir}/fex64-top-alias-stack.config.bin" 500 0 "" 1
 run_one x64-top-alias-stack "${tmp_dir}/fex64-top-alias-stack.bin" \
     "${tmp_dir}/fex64-top-alias-stack.config.bin" 500 1 "" 1
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias and alias-enabled rep-movs and stack fixtures completed in all modes"
+# Wine's dispatcher return. server_init_process_done hands the process its PE
+# entry point, call_init_thunk installs the Windows TEB and builds a five-qword
+# iretq frame, and __wine_syscall_dispatcher_return takes it into
+# LdrInitializeThunk. The device gets through the whole exchange and the
+# arch_prctl pair and then exits without running a single Windows instruction,
+# so this transition is the one thing on that path never proven under this
+# backend.
+#
+# The fixture restores a saved register set and then crosses to a different
+# canonical low stack through iretq, with Wine's own selectors and RFLAGS. That
+# is what makes it different from FEX's Primary_CF.asm, which neither restores
+# a register set nor changes stacks.
+#
+# Run with the alias OFF first: that path takes FEX's ordinary descriptor-table
+# read, against the harness's real thirty-two entry GDT. Then with the alias
+# ON, which is the device's configuration -- there the descriptor table is a
+# host pointer that the guest memory funnel must not translate, and an
+# untranslated read of it would fault before reaching the target.
+run_one x64-dispatcher-return "${tmp_dir}/fex64-dispatcher-return.bin" \
+    "${tmp_dir}/fex64-dispatcher-return.config.bin" 1 0
+run_one x64-dispatcher-return "${tmp_dir}/fex64-dispatcher-return.bin" \
+    "${tmp_dir}/fex64-dispatcher-return.config.bin" 500 0
+run_one x64-dispatcher-return "${tmp_dir}/fex64-dispatcher-return.bin" \
+    "${tmp_dir}/fex64-dispatcher-return.config.bin" 500 1
+run_one x64-dispatcher-return-alias "${tmp_dir}/fex64-dispatcher-return.bin" \
+    "${tmp_dir}/fex64-dispatcher-return.config.bin" 1 0 "" 1
+run_one x64-dispatcher-return-alias "${tmp_dir}/fex64-dispatcher-return.bin" \
+    "${tmp_dir}/fex64-dispatcher-return.config.bin" 500 0 "" 1
+run_one x64-dispatcher-return-alias "${tmp_dir}/fex64-dispatcher-return.bin" \
+    "${tmp_dir}/fex64-dispatcher-return.config.bin" 500 1 "" 1
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, and dispatcher-return fixtures completed in all modes"

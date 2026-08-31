@@ -2779,6 +2779,199 @@ def main() -> None:
         raise SystemExit(
             "the probe must not enable the unbounded message dump")
 
+    # ---------------------------------------------------------------------
+    # The loader handoff: the Wine-server reply that admits the process, the
+    # bounded trace armed over the transition that follows it, and the
+    # descriptor table the transition indexes into.
+    # ---------------------------------------------------------------------
+
+    # The exchange is recognised by its opcode and the reply's size, never by
+    # a pid or an entry address one log happened to contain.
+    require_ordered(
+        syscalls,
+        [
+            "boxedvn::wineServerRequestOpcode(",
+            "lastServerRequestOpcode = opcode;",
+            "K_WINE_REQ_INIT_PROCESS_DONE",
+            "got == K_WINE_SERVER_MESSAGE_BYTES",
+            "boxedvn::decodeWineInitProcessDoneReply(",
+            "BOXEDWINE_X64_INIT_DONE_REPLY pid=%u error=%u ",
+            "suspend=%d",
+            "BVNFEXBackendArmHandoffTrace(",
+        ],
+        "init_process_done reply contract",
+    )
+    # The detection is bounded to the region that decodes the reply, and
+    # nothing in it may compare against a value a log happened to contain: a
+    # detector keyed on one run's pid or entry point proves nothing about the
+    # next one.
+    detection_start = syscalls.index("boxedvn::decodeWineInitProcessDoneReply(")
+    detection = syscalls[syscalls.rindex("{", 0, detection_start) - 400:
+                         syscalls.index("BVNFEXBackendArmHandoffTrace(",
+                                        detection_start)]
+    for forbidden in ("->id ==", "pid ==", "0x1400013d0", "entry ==",
+                      "== 0x1400"):
+        if forbidden in detection:
+            raise SystemExit(
+                "the handoff detection must not name a pid or an entry point "
+                "from a log: " + forbidden)
+
+    # One marker per process, so a process that loops through the exchange
+    # cannot grow the log.
+    if "bool initProcessDoneReported = false;" not in process_header:
+        raise SystemExit(
+            "the init_process_done marker must be one-shot per process")
+    if "replyProcess->initProcessDoneReported = true;" not in syscalls:
+        raise SystemExit(
+            "the init_process_done marker must set its one-shot flag")
+
+    # The trace is a bounded phase with a budget, and it stops at the first
+    # NT redirect rather than running to the end of the budget.
+    require_ordered(
+        backend,
+        [
+            "constexpr unsigned kHandoffTraceBlockBudget = ",
+            "BVNFEXBackendArmHandoffTrace(unsigned processId)",
+            "FEXCore::Context::BoxedWineArmBlockTrace(processId,",
+            "kHandoffTraceBlockBudget",
+            "BOXEDWINE_FEX64_HANDOFF_TRACE_ARMED pid=%u budget=%u",
+            "BVNFEXBackendDisarmHandoffTrace(unsigned processId)",
+            "FEXCore::Context::BoxedWineDisarmBlockTrace(processId)",
+            "BOXEDWINE_FEX64_HANDOFF_TRACE_DONE pid=%u reason=nt-redirect",
+        ],
+        "bounded handoff trace contract",
+    )
+    budget_line = backend.split(
+        "constexpr unsigned kHandoffTraceBlockBudget = ", 1)[1].split(";", 1)[0]
+    budget = int(budget_line.strip())
+    if not 64 <= budget <= 128:
+        raise SystemExit(
+            "the handoff trace budget must stay between 64 and 128 blocks, "
+            "got " + str(budget))
+
+    adapter = read(repository / "ios/runtime/src/BVNFEXCPU64Adapter.mm")
+    require_ordered(
+        adapter,
+        [
+            "reportWineNtSyscallRedirect(",
+            "BVNFEXBackendDisarmHandoffTrace(",
+        ],
+        "handoff trace stop contract",
+    )
+
+    # The budget is spent by the translator, so an armed phase cannot outlive
+    # it even if nothing disarms it.
+    block_patch = read(
+        repository
+        / "scripts/fex64-patches/fex-boxedwine-block-diagnostics.patch"
+    )
+    require_ordered(
+        block_patch,
+        [
+            "BoxedWineBlockTraceBudget",
+            "BOXEDWINE_FEX64_IRET_PRE rip=",
+            "uint64_t BoxedWineTakeGuestIRETNote() {",
+            "bool BoxedWineTakeBlockTraceCredit() {",
+            "Remaining - 1",
+            "BoxedWinePhase = FEXCore::Context::BoxedWineTakeBlockTraceCredit();",
+            "BOXEDWINE_FEX64_IRET_POST from=",
+        ],
+        "translator block-trace budget contract",
+    )
+    if "BoxedWineNoteGuestIRET(Op->PC)" not in block_patch:
+        raise SystemExit(
+            "the iretq marker must be taken at the translated instruction's "
+            "own guest address")
+
+    # The descriptor table Wine's dispatcher return indexes into. The
+    # selectors it loads are indices 6 and 5, so a table shorter than FEX's
+    # own is an out-of-bounds read, not a smaller table.
+    segment_header = read(repository / "include/guest_segment_table.h")
+    if "#define K_GUEST_SEGMENT_TABLE_ENTRIES 32" not in segment_header:
+        raise SystemExit(
+            "the descriptor table must hold as many entries as FEX's own")
+    thread_manager = read(
+        fex / "Source/Tools/LinuxEmulation/LinuxSyscalls/ThreadManager.cpp"
+    )
+    if "sizeof(ThreadStateObject->gdt) == (8 * 32)" not in thread_manager:
+        raise SystemExit(
+            "FEX's own per-thread descriptor table is no longer 32 entries; "
+            "K_GUEST_SEGMENT_TABLE_ENTRIES was matched to it deliberately")
+    require_ordered(
+        backend,
+        [
+            "publishGuestDescriptorTable(",
+            "SEGMENT_ARRAY_INDEX_GDT",
+            "SEGMENT_ARRAY_INDEX_LDT",
+            "gdt[K_GUEST_SEGMENT_TABLE_ENTRIES]",
+        ],
+        "guest descriptor table contract",
+    )
+    if "gdt_segment gdt[1]" in backend:
+        raise SystemExit(
+            "a one-entry descriptor table cannot hold the selectors Wine's "
+            "dispatcher return loads")
+
+    # The descriptor table is host memory. A translated read of it under the
+    # guest alias lands in neither domain, so the long-mode path must not
+    # emit that load at all -- and must still emit it for FS and GS, whose
+    # bases are real.
+    segment_patch = read(
+        repository
+        / "scripts/fex64-patches/fex-boxedwine-longmode-segment-base.patch"
+    )
+    require_ordered(
+        segment_patch,
+        [
+            "UpdatePrefixFromSegment",
+            "Is64BitMode && CTX->GetGuestLowAliasBase() != 0",
+            "SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX",
+            "SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX",
+            "if (HostSideDescriptorTable) {",
+            "NewSegment = _Constant(0);",
+            "_LoadMemGPR(OpSize::i64Bit, SegmentBase, SegmentOffset",
+        ],
+        "long-mode segment base contract",
+    )
+
+    # The dispatcher-return fixture runs through the real translator, with the
+    # alias on as well as off, because the alias is the device's configuration.
+    probe = read(repository / "scripts/run-fex64-vixl-probe.sh")
+    require_ordered(
+        probe,
+        [
+            "fixture_dispatcher_return=",
+            "fex-boxedwine-longmode-segment-base.patch",
+            "prepare_fixture \"${fixture_dispatcher_return}\"",
+            "run_one x64-dispatcher-return ",
+            "run_one x64-dispatcher-return-alias ",
+        ],
+        "dispatcher-return fixture contract",
+    )
+    fixture = read(
+        repository / "scripts/guest-probes/fex64-dispatcher-return.asm")
+    for required in ("WINE_CS 0x33", "WINE_SS 0x2b", "pushfq"):
+        if required not in fixture:
+            raise SystemExit(
+                "the dispatcher-return fixture must reproduce Wine's frame: "
+                + required)
+    # An `iretq` named in a comment is not an `iretq` executed. Require the
+    # instruction itself, on its own line.
+    instructions = [line.split(";", 1)[0].strip()
+                    for line in fixture.splitlines()]
+    if "iretq" not in instructions:
+        raise SystemExit(
+            "the dispatcher-return fixture must actually execute an iretq")
+    if "hlt" not in instructions:
+        raise SystemExit("the dispatcher-return fixture must terminate")
+
+    # The descendant snapshot says what it measured. A daemon that reparented
+    # itself away is not a direct child, and its absence here is not evidence
+    # that it died.
+    if "no live DIRECT child of pid=%u" not in syscalls:
+        raise SystemExit(
+            "the descendant snapshot must not claim more than it measured")
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 
