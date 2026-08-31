@@ -2362,19 +2362,44 @@ def main() -> None:
         call_witness_patch,
         [
             "FEXCore/include/FEXCore/Core/CoreState.h",
+            # The frame carries only a pointer. The ring itself must live
+            # outside it: CpuStateFrame is addressed by JIT load/store
+            # immediates whose range depends on access width, and a kilobyte of
+            # growth pushed an existing byte-sized access past its 4095-byte
+            # limit -- caught by the conformance probe, not by a device.
+            "uint64_t BoxedWineCallRingPointer {};",
             "struct BoxedWineCallRecord {",
             "uint64_t IntendedReturn;",
             "uint64_t SlotGuest;",
             "uint64_t SlotHost;",
             "uint64_t Readback;",
             "uint64_t StackBefore;",
-            "BoxedWineCallRingCount",
             # The record size and ring count must stay shiftable/maskable,
             # because the JIT scales the index rather than multiplying.
-            "sizeof(CpuStateFrame::BoxedWineCallRecord) == 64",
+            "sizeof(BoxedWineCallRecord) == 64",
+            "offsetof(BoxedWineCallRing, Records) == 0",
+            "BoxedWineCallRing::Count - 1)) == 0",
         ],
         "BoxedVN CALL history ring",
     )
+    # The ring must not be a member of the frame.
+    if "BoxedWineCallRing[" in call_witness_patch:
+        raise SystemExit(
+            "the CALL ring must not be embedded in CpuStateFrame; the frame's "
+            "load/store immediates cannot absorb its size"
+        )
+    require_ordered(
+        call_witness_patch,
+        [
+            "FEXCore/include/FEXCore/Debug/InternalThreadState.h",
+            "FEXCore::Core::BoxedWineCallRing BoxedWineCallRing {};",
+        ],
+        "BoxedVN CALL ring lives beside the thread",
+    )
+    if "Thread->CurrentFrame->BoxedWineCallRingPointer = reinterpret_cast<uint64_t>"             not in call_witness_patch:
+        raise SystemExit(
+            "the CALL ring pointer must be published when the thread is created"
+        )
     require_ordered(
         call_witness_patch,
         [
@@ -2384,11 +2409,14 @@ def main() -> None:
             "bool Arm64JITCore::IsCallReturnPush(",
             "OP_ENTRYPOINTOFFSET",
             "void Arm64JITCore::EmitCallReturnWitness(",
+            # One pointer load, then everything is relative to the ring base.
+            "BoxedWineCallRingPointer));",
+            "cbz(ARMEmitter::Size::i64Bit, TMP2, &NoRing)",
             # The read-back has to go through the SAME host address the store
             # used, or it proves nothing about that store.
             "ldur(TMP3, SlotHost, 0);",
-            "BoxedWineCallRecord, Readback",
-            "BoxedWineCallAnomalies",
+            "offsetof(Record, Readback)",
+            "offsetof(Ring, Anomalies)",
             "IsCallReturnPush(Op->Value)",
         ],
         "BoxedVN CALL return-address read-back",
