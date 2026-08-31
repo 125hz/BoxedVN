@@ -473,7 +473,39 @@ diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/S
 
    /* iOS-Mythic 2026-07-03 perf: probe the L1 cache FIRST at loop top.
     *
-@@ -454,10 +456,31 @@
+@@ -392,9 +394,28 @@
+     sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+     str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+
+-    // Trigger segfault if any deferred signals are pending
+-    strb(ARMEmitter::XReg::zr, STATE,
+-         offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
++    // Trigger segfault if any deferred signals are pending.
++    //
++    // BoxedWine: the access WIDTH has to be chosen from the offset, exactly as
++    // EmitSuspendInterruptCheck in JIT.cpp already does for the same address.
++    // InterruptFaultPage is page-aligned inside InternalThreadState, so its
++    // distance from BaseFrameState jumps by a page whenever CpuStateFrame
++    // crosses a page boundary -- and a byte store's unsigned immediate stops at
++    // 4095. Adding two witness fields to the frame was enough to push it over,
++    // and the emitter then refused the store outright.
++    //
++    // Which width is used does not matter: the page is PROT_NONE and the point
++    // is only to touch it. A 64-bit store reaches 32760, and the offset is
++    // 8-aligned because BaseFrameState is.
++    constexpr size_t InterruptPageOffset = offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
++                                           offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
++    static_assert(InterruptPageOffset % 8 == 0, "the interrupt page offset must be 64-bit store aligned");
++    if constexpr (InterruptPageOffset <= 4095) {
++      strb(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
++    } else {
++      static_assert(InterruptPageOffset <= 32760, "the interrupt page has moved out of store-immediate range entirely");
++      str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
++    }
+ #endif
+   };
+
+@@ -454,10 +475,31 @@
        FillStaticRegs();
      });
 

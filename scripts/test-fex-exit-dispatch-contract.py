@@ -2519,6 +2519,25 @@ def main() -> None:
         ],
         "BoxedVN dispatcher never branches to a null host target",
     )
+    # The interrupt-fault-page store has to pick its access width from the
+    # offset. InterruptFaultPage is page-aligned inside InternalThreadState, so
+    # its distance from BaseFrameState jumps a page whenever CpuStateFrame
+    # crosses a page boundary -- and a byte store's unsigned immediate stops at
+    # 4095. Two witness fields were enough to push it over, and the emitter
+    # refused the store. JIT.cpp's copy of the same address already chose its
+    # width this way; the dispatcher's did not.
+    require_ordered(
+        call_witness_patch,
+        [
+            "constexpr size_t InterruptPageOffset =",
+            "InterruptPageOffset % 8 == 0",
+            "if constexpr (InterruptPageOffset <= 4095) {",
+            "strb(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);",
+            "InterruptPageOffset <= 32760",
+            "str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);",
+        ],
+        "BoxedVN interrupt fault page store width",
+    )
 
     # ------------------------------------------------------------------ #
     # A fatal translator ending and a guest exit_group are different        #
