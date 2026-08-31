@@ -1014,26 +1014,38 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 
         NSMutableArray<NSString*>* activity = [NSMutableArray array];
         NSString* stage = @"Preparing the 64-bit guest runtime";
+        // No longer fed: the per-block translator trace it counted has been
+        // retired. Kept so the property it publishes keeps its type and its
+        // meaning of "nothing translated yet" rather than going stale.
         NSUInteger translationCount = 0;
         NSString* lastRIP = nil;
 
         for (NSString* line in [tail componentsSeparatedByCharactersInSet:
                                     NSCharacterSet.newlineCharacterSet]) {
             NSString* entry = nil;
-            if ([line containsString:@"[boxedwine-block] enter ordinal="]) {
-                NSString* ordinal = BVNStartupTokenAfter(line, @"ordinal=");
+            // The translator used to report every block it compiled, and this
+            // read the running count off those lines. That trace was two
+            // thousand lines of a device log and is gone; what is left is the
+            // one transition that matters, where the loader hands control to
+            // Windows code.
+            if ([line containsString:@"BOXEDWINE_FEX64_IRET_POST"]) {
                 NSString* rip = BVNStartupTokenAfter(line, @"rip=");
-                if (ordinal.length > 0) {
-                    translationCount = MAX(translationCount,
-                        static_cast<NSUInteger>(ordinal.longLongValue) + 1);
-                }
                 if (rip.length > 0) {
                     lastRIP = rip;
                 }
-                stage = @"Translating 64-bit guest code";
-                entry = [NSString stringWithFormat:@"translate #%@  %@",
-                                                    ordinal ?: @"?",
+                stage = @"Entering Windows code";
+                entry = [NSString stringWithFormat:@"Windows entry reached  %@",
                                                     rip ?: @"unknown RIP"];
+            } else if ([line containsString:@"BOXEDWINE_X64_BUILTIN_PREFLIGHT"]) {
+                NSString* open = BVNStartupTokenAfter(line, @"open=");
+                stage = @"Checking the Windows system modules";
+                entry = [NSString stringWithFormat:@"system module check  %@",
+                                                    open ?: @"?"];
+            } else if ([line containsString:@"BOXEDWINE_X64_DLL_SEARCH"]) {
+                NSString* op = BVNStartupTokenAfter(line, @"op=");
+                stage = @"Loading the Windows system modules";
+                entry = [NSString stringWithFormat:@"module search  %@",
+                                                    op ?: @"?"];
             } else if ([line containsString:@"BOXEDWINE_FEX64_SYSCALL_ENTER"]) {
                 NSString* number = BVNStartupTokenAfter(line, @"nr=");
                 NSString* rip = BVNStartupTokenAfter(line, @"rip=");

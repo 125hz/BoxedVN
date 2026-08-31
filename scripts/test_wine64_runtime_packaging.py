@@ -52,6 +52,29 @@ def elf(machine: int = 62, elf_class: int = 2, body: bytes = b"") -> bytes:
     return bytes(header) + body
 
 
+ROOT = "usr/lib/x86_64-linux-gnu/wine"
+PE_DIR = ROOT + "/x86_64-windows"
+
+
+def pe(machine: int = 0x8664, body: bytes = b"") -> bytes:
+    """A minimal PE32+ AMD64 image: DOS header, e_lfanew, PE signature, COFF.
+
+    The validator has to distinguish a real builtin from a truncated entry and
+    from the text of a link target stored as a plain file, so a two-byte "MZ"
+    is deliberately not enough to pass.
+    """
+    lfanew = 0x40
+    dos = bytearray(b"MZ" + b"\0" * (lfanew - 2))
+    dos[0x3c:0x40] = lfanew.to_bytes(4, "little")
+    coff = b"PE\0\0" + machine.to_bytes(2, "little") + b"\0" * 18
+    return bytes(dos) + coff + body
+
+
+def guest_link(target: str) -> bytes:
+    """BoxedWine reads a guest symlink from a `.link` entry's contents."""
+    return target.encode("utf-8")
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -63,10 +86,43 @@ class WineserverPackagingContract(unittest.TestCase):
         self.builder = BUILDER.read_text(encoding="utf-8")
 
     def test_builder_packages_the_real_executable_at_both_paths(self) -> None:
-        self.assertIn('copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver64',
+        self.assertIn(
+            'copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver64"',
+            self.builder)
+        self.assertIn(
+            'copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver"',
+            self.builder)
+
+    def test_builder_puts_the_loader_in_the_module_tree(self) -> None:
+        # Wine reads /proc/self/exe to decide where wineserver is, and takes
+        # its module root from ntdll.so's parent. A loader packaged outside the
+        # module tree makes those two derivations name different places, which
+        # is how a run reached Windows code and then failed to load kernel32.
+        self.assertIn('WINE_MODULE_ROOT="/usr/lib/x86_64-linux-gnu/wine"',
                       self.builder)
-        self.assertIn('copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver',
+        self.assertIn('copy_as "${WINE64}" "${WINE_MODULE_ROOT}/wine64"',
                       self.builder)
+        self.assertNotIn('copy_as "${WINE64}" /usr/lib/wine/wine64',
+                         self.builder)
+
+    def test_builder_writes_compatibility_paths_as_guest_links(self) -> None:
+        # BoxedWine's ZIP filesystem does not read POSIX symlinks out of an
+        # archive: it recognises a link by a `.link` suffix whose contents are
+        # the target. `ln -s` here produced a small regular file holding the
+        # target text, which is a silent failure.
+        self.assertIn('> "${STAGE}${link}.link"', self.builder)
+        self.assertNotIn("ln -s ", self.builder)
+        for link in ("/usr/lib/wine/wine64", "/usr/bin/wine64",
+                     "/usr/lib/wine/x86_64-windows"):
+            self.assertIn("guest_link \"${WINE_MODULE_ROOT}/", self.builder)
+            self.assertIn(link, self.builder)
+
+    def test_builder_refuses_an_archive_without_the_builtins(self) -> None:
+        # kernel32.dll present in the archive but unreachable is the failure
+        # this layout exists to prevent; kernel32.dll absent would be worse.
+        for builtin in ("ntdll.dll", "kernel32.dll", "kernelbase.dll"):
+            self.assertIn(builtin, self.builder)
+        self.assertIn("is not a PE image", self.builder)
 
     def test_builder_no_longer_packages_the_distro_wrapper(self) -> None:
         # The old shape copied ${WINE_ROOT}/wineserver -- the shell wrapper --
@@ -101,14 +157,37 @@ class WineserverArchiveValidation(unittest.TestCase):
             # Wine's server needs the modelled user's XDG runtime directory.
             archive.writestr("run/user/1000/", b"")
         with zipfile.ZipFile(wine, "w") as archive:
-            archive.writestr("usr/lib/wine/wine64", elf(body=b"wine64"))
-            archive.writestr("usr/lib/wine/wineserver64", server)
-            archive.writestr("usr/lib/wine/wineserver", wineserver_generic)
-            archive.writestr(
-                "usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winemetal.so", elf())
-            archive.writestr(
-                "usr/lib/x86_64-linux-gnu/wine/x86_64-windows/ntdll.dll", b"MZ")
+            self.write_wine_layout(archive, server, wineserver_generic)
         return glibc, wine, server
+
+    def write_wine_layout(self, archive, server: bytes,
+                          wineserver_generic: bytes) -> None:
+        """The canonical layout: loader and modules in one tree.
+
+        Wine takes the directory it looks for wineserver in from
+        /proc/self/exe and its module root from ntdll.so's parent, so the
+        loader has to live in the same tree as the modules it loads.
+        """
+        archive.writestr(ROOT + "/wine64", elf(body=b"wine64"))
+        archive.writestr(ROOT + "/wineserver64", server)
+        archive.writestr(ROOT + "/wineserver", wineserver_generic)
+        archive.writestr(ROOT + "/x86_64-unix/winemetal.so", elf())
+        for builtin in ("ntdll.dll", "kernel32.dll", "kernelbase.dll"):
+            archive.writestr(PE_DIR + "/" + builtin, pe(body=builtin.encode()))
+        for link, target in self.compatibility_links():
+            archive.writestr(link + ".link", guest_link(target))
+
+    @staticmethod
+    def compatibility_links():
+        return (
+            ("usr/lib/wine/wine64", "/" + ROOT + "/wine64"),
+            ("usr/lib/wine/wineserver", "/" + ROOT + "/wineserver"),
+            ("usr/lib/wine/wineserver64", "/" + ROOT + "/wineserver64"),
+            ("usr/lib/wine/x86_64-windows", "/" + PE_DIR),
+            ("usr/lib/wine/x86_64-unix", "/" + ROOT + "/x86_64-unix"),
+            ("usr/bin/wine64", "/" + ROOT + "/wine64"),
+            ("usr/bin/wineserver", "/" + ROOT + "/wineserver"),
+        )
 
     def run_validator(self, directory: Path, glibc: Path, wine: Path) -> tuple:
         manifest = directory / "manifest.txt"
@@ -178,18 +257,90 @@ class WineserverArchiveValidation(unittest.TestCase):
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
                 archive.writestr("run/user/1000/", b"")
             with zipfile.ZipFile(wine, "w") as archive:
-                archive.writestr("usr/lib/wine/wine64", elf())
-                archive.writestr("usr/lib/wine/wineserver64", server)
-                archive.writestr(
-                    "usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winemetal.so",
-                    elf())
-                archive.writestr(
-                    "usr/lib/x86_64-linux-gnu/wine/x86_64-windows/ntdll.dll",
-                    b"MZ")
+                self.write_wine_layout(archive, server, server)
+            self.rewrite_wine_archive(wine, drop=ROOT + "/wineserver")
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0)
-            self.assertIn("usr/lib/wine/wineserver", output)
+            self.assertIn("wineserver", output)
 
+
+    def test_a_missing_builtin_is_rejected(self) -> None:
+        for missing in ("kernel32.dll", "kernelbase.dll", "ntdll.dll"):
+            with self.subTest(missing=missing):
+                with tempfile.TemporaryDirectory() as raw:
+                    directory = Path(raw)
+                    server = elf(body=b"wineserver64 payload")
+                    glibc, wine, _ = self.build_archives(directory, server)
+                    self.rewrite_wine_archive(wine, drop=PE_DIR + "/" + missing)
+                    code, output = self.run_validator(directory, glibc, wine)
+                    self.assertNotEqual(code, 0, output)
+                    self.assertIn(missing, output)
+
+    def test_a_builtin_that_is_not_a_pe_image_is_rejected(self) -> None:
+        # Two bytes of "MZ" used to be enough. A truncated entry, or the text
+        # of a link target stored as a plain file, must not pass for a module.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.rewrite_wine_archive(
+                wine, replace={PE_DIR + "/kernel32.dll": b"MZ"})
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("kernel32.dll", output)
+
+    def test_a_32_bit_builtin_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.rewrite_wine_archive(
+                wine, replace={PE_DIR + "/kernel32.dll": pe(machine=0x014c)})
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("AMD64", output)
+
+    def test_a_posix_symlink_is_not_a_guest_link(self) -> None:
+        # The shape that shipped: `ln -s` stored as a real symlink, which
+        # BoxedWine reads as a regular file holding the target text.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.rewrite_wine_archive(
+                wine, drop="usr/bin/wine64.link",
+                add={"usr/bin/wine64": b"/" + ROOT.encode() + b"/wine64"})
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("usr/bin/wine64", output)
+
+    def test_a_guest_link_to_nothing_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.rewrite_wine_archive(
+                wine,
+                replace={"usr/bin/wine64.link": b"/usr/lib/wine/not-packaged"})
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("usr/bin/wine64", output)
+
+    def rewrite_wine_archive(self, wine: Path, drop: str = "",
+                             replace=None, add=None) -> None:
+        """Rebuild the Wine archive with one entry dropped, changed or added."""
+        replace = replace or {}
+        add = add or {}
+        with zipfile.ZipFile(wine) as archive:
+            entries = [(item.filename, archive.read(item.filename))
+                       for item in archive.infolist()]
+        with zipfile.ZipFile(wine, "w") as archive:
+            for name, data in entries:
+                if name == drop:
+                    continue
+                archive.writestr(name, replace.get(name, data))
+            for name, data in add.items():
+                archive.writestr(name, data)
 
     def test_a_missing_guest_runtime_directory_is_rejected(self) -> None:
         # Wine chooses /run/user/1000 for its server socket directory. If the
@@ -203,15 +354,7 @@ class WineserverArchiveValidation(unittest.TestCase):
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
             with zipfile.ZipFile(wine, "w") as archive:
-                archive.writestr("usr/lib/wine/wine64", elf())
-                archive.writestr("usr/lib/wine/wineserver64", server)
-                archive.writestr("usr/lib/wine/wineserver", server)
-                archive.writestr(
-                    "usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winemetal.so",
-                    elf())
-                archive.writestr(
-                    "usr/lib/x86_64-linux-gnu/wine/x86_64-windows/ntdll.dll",
-                    b"MZ")
+                self.write_wine_layout(archive, server, server)
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0)
             self.assertIn("run/user/1000", output)

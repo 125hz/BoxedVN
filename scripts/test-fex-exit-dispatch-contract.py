@@ -1545,19 +1545,22 @@ def main() -> None:
         "BoxedVN 64-bit exec resolution invariant",
     )
 
-    # Wine64 execs /usr/lib/wine/wineserver directly, so both guest paths have
-    # to be the same real x86-64 executable; the distro ships a /bin/sh
-    # wrapper under the generic name.
+    # The loader, server and module trees must share one canonical root. Both
+    # server names there have to be the same real x86-64 executable; the
+    # distro also ships a /bin/sh wrapper under the generic name.
     wine_builder = read(repository / "scripts/build-wine64-runtime-ci.sh")
     wine_validator = read(repository / "scripts/validate-wine64-runtime.sh")
     require_ordered(
         wine_builder,
         [
+            'WINE_MODULE_ROOT="/usr/lib/x86_64-linux-gnu/wine"',
             "is_elf64_x86_64() {",
             "find_first_elf64_x86_64() {",
             'WINE_SERVER="$(find_first_elf64_x86_64',
-            'copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver64',
-            'copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver',
+            'copy_as "${WINE64}" "${WINE_MODULE_ROOT}/wine64"',
+            'copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver64"',
+            'copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver"',
+            'guest_link "${WINE_MODULE_ROOT}/wine64" /usr/lib/wine/wine64',
         ],
         "BoxedVN wineserver packaging",
     )
@@ -1573,11 +1576,15 @@ def main() -> None:
             "is not an ELF file",
             "is not ELFCLASS64",
             "is not EM_X86_64",
-            'check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver64',
-            'check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver',
-            'check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wineserver',
+            "check_zip_entry_pe32plus_amd64() {",
+            "check_zip_guest_link() {",
+            "WINE_MODULE_ROOT=usr/lib/x86_64-linux-gnu/wine",
+            'check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver64"',
+            'check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver"',
+            'check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver"',
             'wineserver_generic_sha=',
             'wineserver64_sha=',
+            "for required_builtin in ntdll.dll kernel32.dll kernelbase.dll",
         ],
         "BoxedVN wineserver archive validation",
     )
@@ -1674,6 +1681,9 @@ def main() -> None:
             "K_X64_GUEST_WINE_PREFIX);",
             "if (!callerSetWineArch) {",
             "K_X64_GUEST_WINE_ARCH);",
+            "boxedvn::environmentSetsWineDllPath(launch.environment)",
+            "boxedvn::wineDllPathAssignment()",
+            "K_X64_WINE_LOADER",
         ],
         "BoxedVN x86-64 Wine prefix defaults",
     )
@@ -1720,12 +1730,35 @@ def main() -> None:
     # And the drive links have to be created under the resolved prefix.
     for required in ('Fs::getNodeFromLocalPath(B(""), wineDosDevices, true)',
                      'Fs::addFileNode(wineDosDevices + "/" + info.localPath',
-                     'Fs::addFileNode(wineDosDevices + "/t:"'):
+            'Fs::addFileNode(wineDosDevices + "/t:"'):
         if required not in startup_args:
             raise SystemExit(
                 "the dosdevices drive links must use the resolved prefix: " +
                 required
             )
+
+    wine64_layout = read(repository / "include/guest_wine64_layout.h")
+    require_ordered(
+        wine64_layout,
+        [
+            '#define K_X64_WINE_MODULE_ROOT "/usr/lib/x86_64-linux-gnu/wine"',
+            '#define K_X64_WINE_PE_DIR K_X64_WINE_MODULE_ROOT "/x86_64-windows"',
+            '#define K_X64_WINE_LOADER K_X64_WINE_MODULE_ROOT "/wine64"',
+            '#define K_X64_WINE_DLL_PATH_ASSIGNMENT "WINEDLLPATH=" K_X64_WINE_MODULE_ROOT',
+            '#define K_X64_WINE_BUILTIN_PROBE K_X64_WINE_PE_DIR "/kernel32.dll"',
+        ],
+        "BoxedVN Wine64 canonical layout",
+    )
+    require_ordered(
+        startup_args,
+        [
+            "static void reportX64BuiltinPreflight(",
+            "BOXEDWINE_X64_BUILTIN_PREFLIGHT path=%s open=ok",
+            "reportX64WineLayoutPreflight();",
+            "reportX64BuiltinPreflight(K_X64_WINE_BUILTIN_PROBE);",
+        ],
+        "BoxedVN Wine64 guest VFS preflight",
+    )
 
     # BoxedWine's -w takes a guest Linux directory. The x64 probe passed a
     # Windows path, and the device log shows the result: open(".") -> -2.

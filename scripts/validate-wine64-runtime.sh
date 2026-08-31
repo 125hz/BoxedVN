@@ -242,6 +242,60 @@ check_zip_entry_elf64_x86_64() {
     ok "$(basename "${archive}"): ${path} is ELF64 EM_X86_64"
 }
 
+# A builtin Windows module has to be a PE image the guest can map, not a
+# placeholder, not a truncated entry, and not the text of a link target that
+# was stored as a plain file. Check the DOS header, then follow e_lfanew to
+# the PE signature and the COFF machine field: AMD64 is 0x8664, little-endian.
+check_zip_entry_pe32plus_amd64() {
+    local archive="$1"
+    local path="$2"
+    local bytes
+    # -v is required: od otherwise folds repeated zero-filled DOS-header rows
+    # into a literal "*", which shifts every subsequent Bash-array index and
+    # makes a valid e_lfanew appear to be zero.
+    read -r -a bytes <<< "$(unzip -p "${archive}" "${path}" 2>/dev/null \
+        | od -An -tu1 -v -N4096 | tr '\n' ' ')"
+    [[ ${#bytes[@]} -ge 64 ]] \
+        || die "'${path}' in $(basename "${archive}") is too small to be a PE image."
+    [[ "${bytes[0]}" == 77 && "${bytes[1]}" == 90 ]] \
+        || die "'${path}' in $(basename "${archive}") does not start with MZ.\nA builtin module that is not a PE image cannot be loaded, however large it is."
+    local lfanew=$(( bytes[60] + bytes[61] * 256 + bytes[62] * 65536 + bytes[63] * 16777216 ))
+    (( lfanew > 0 && lfanew + 6 < ${#bytes[@]} )) \
+        || die "'${path}' in $(basename "${archive}") has an unusable PE header offset (${lfanew})."
+    [[ "${bytes[lfanew]}" == 80 && "${bytes[lfanew+1]}" == 69 \
+       && "${bytes[lfanew+2]}" == 0 && "${bytes[lfanew+3]}" == 0 ]] \
+        || die "'${path}' in $(basename "${archive}") has no PE signature at offset ${lfanew}."
+    local machine=$(( bytes[lfanew+4] + bytes[lfanew+5] * 256 ))
+    (( machine == 34404 )) \
+        || die "'${path}' in $(basename "${archive}") is not PE32+ AMD64 (machine 0x$(printf '%04x' "${machine}"))."
+    ok "$(basename "${archive}"): ${path} is a PE32+ AMD64 image"
+}
+
+# BoxedWine's ZIP filesystem does not read POSIX symlinks out of an archive:
+# it recognises a link by a `.link` suffix on the entry name whose contents are
+# the target path (EXT_LINK in source/io/fsnode.h). A real symlink stored in
+# the archive becomes a small regular file holding the target text, which is a
+# silent failure -- so compatibility paths are checked by that name, and their
+# targets are checked to exist.
+check_zip_guest_link() {
+    local archive="$1"
+    local link="$2"
+    local target="$3"
+    local target_entry="${target#/}"
+    local actual
+    # unzip exits nonzero for a missing member; keep that inside the explicit
+    # diagnostic below instead of letting `set -e` terminate without naming
+    # the bad compatibility path.
+    actual="$(unzip -p "${archive}" "${link}.link" 2>/dev/null || true)"
+    [[ -n "${actual}" ]] \
+        || die "'$(basename "${archive}")' has no guest link entry '${link}.link'.\nA POSIX symlink in the archive is not a guest symlink; BoxedWine reads the '.link' name."
+    [[ "${actual}" == "${target}" ]] \
+        || die "guest link '${link}.link' points at '${actual}', expected '${target}'."
+    zip_has "${archive}" "${target_entry}" \
+        || die "guest link '${link}.link' points at '${target}', which the archive does not contain."
+    ok "$(basename "${archive}"): ${link} -> ${target}"
+}
+
 zip_entry_sha256() {
     local archive="$1"
     local path="$2"
@@ -271,22 +325,55 @@ check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libc.so.6
 # directory. The rootfs has to ship it; BoxedWine's permission policy is what
 # makes it writable, because ZIP entries carry no Unix mode.
 check_zip_path "${GLIBC_ARCHIVE}" run/user/1000
-check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wine64
-check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver64
-check_zip_path "${WINE_ARCHIVE}" usr/lib/wine/wineserver
-check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wine64
-check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wineserver64
-check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/wine/wineserver
-wineserver_generic_sha="$(zip_entry_sha256 "${WINE_ARCHIVE}" usr/lib/wine/wineserver)"
-wineserver64_sha="$(zip_entry_sha256 "${WINE_ARCHIVE}" usr/lib/wine/wineserver64)"
+# Wine derives its search paths from where its own files are: the directory it
+# reads from /proc/self/exe is where it looks for wineserver, and its module
+# root is ntdll.so's parent. The loader therefore has to live in the same tree
+# as the modules. It used to be relocated to /usr/lib/wine while the module
+# trees stayed here, and a device run reached Windows code and then failed with
+# "could not load kernel32.dll, status c0000135" with kernel32.dll present in
+# this archive the whole time.
+WINE_MODULE_ROOT=usr/lib/x86_64-linux-gnu/wine
+check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wine64"
+check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver64"
+check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver"
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wine64"
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver64"
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver"
+wineserver_generic_sha="$(zip_entry_sha256 "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver")"
+wineserver64_sha="$(zip_entry_sha256 "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver64")"
 [[ -n "${wineserver_generic_sha}" && "${wineserver_generic_sha}" == "${wineserver64_sha}" ]] \
-    || die "usr/lib/wine/wineserver and usr/lib/wine/wineserver64 differ.\nWine64 execs the generic path, so both must be the same x86-64 executable.\n  wineserver:   ${wineserver_generic_sha}\n  wineserver64: ${wineserver64_sha}"
+    || die "${WINE_MODULE_ROOT}/wineserver and ${WINE_MODULE_ROOT}/wineserver64 differ.\nWine execs the generic name out of the loader's own directory, so both must be the same x86-64 executable.\n  wineserver:   ${wineserver_generic_sha}\n  wineserver64: ${wineserver64_sha}"
 ok "$(basename "${WINE_ARCHIVE}"): wineserver matches wineserver64 (${wineserver64_sha})"
-check_zip_path "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/wine/x86_64-unix
-check_zip_path "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/wine/x86_64-windows
+check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-unix"
+check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-windows"
+
+# The three builtins the loader needs before it can run anything. Named
+# exactly, case-sensitively, because that is how the guest looks them up.
+for required_builtin in ntdll.dll kernel32.dll kernelbase.dll; do
+    check_zip_path "${WINE_ARCHIVE}" \
+        "${WINE_MODULE_ROOT}/x86_64-windows/${required_builtin}"
+    check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" \
+        "${WINE_MODULE_ROOT}/x86_64-windows/${required_builtin}"
+done
+
+# The relocated layout stays reachable, as guest links rather than as copies.
+check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/wine64 \
+    "/${WINE_MODULE_ROOT}/wine64"
+check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/wineserver \
+    "/${WINE_MODULE_ROOT}/wineserver"
+check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/wineserver64 \
+    "/${WINE_MODULE_ROOT}/wineserver64"
+check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/x86_64-windows \
+    "/${WINE_MODULE_ROOT}/x86_64-windows"
+check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/x86_64-unix \
+    "/${WINE_MODULE_ROOT}/x86_64-unix"
+check_zip_guest_link "${WINE_ARCHIVE}" usr/bin/wine64 \
+    "/${WINE_MODULE_ROOT}/wine64"
+check_zip_guest_link "${WINE_ARCHIVE}" usr/bin/wineserver \
+    "/${WINE_MODULE_ROOT}/wineserver"
 if [[ "${MANIFEST_SOURCE}" == "scripts/build-wine64-runtime-ci.sh" ]]; then
     check_zip_path "${WINE_ARCHIVE}" \
-        usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winemetal.so
+        "${WINE_MODULE_ROOT}/x86_64-unix/winemetal.so"
     [[ "${MANIFEST_DXMT_UNIXLIB_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] \
         || die "Ubuntu CI Wine64 manifest is missing dxmt_unixlib_sha256."
     if command -v sha256sum >/dev/null 2>&1; then

@@ -107,7 +107,8 @@ BOXEDVN_TEST(fex64_launch_mounts_runtime_layers_and_enters_wine64) {
         "-nozip", "-env", "BOXEDWINE_CPU64=fex",
         "-env", "WINEPREFIX=/home/username/.wine64",
         "-env", "WINEARCH=win64",
-        "/usr/lib/wine/wine64", "d:\\probe.exe",
+        "-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine",
+        "/usr/lib/x86_64-linux-gnu/wine/wine64", "d:\\probe.exe",
     };
     CHECK(actual == expected);
 }
@@ -500,6 +501,10 @@ BOXEDVN_TEST(fex64_launch_gets_its_own_prefix_and_win64_arch) {
     CHECK(std::count(actual.begin(), actual.end(),
                      "WINEPREFIX=/home/username/.wine64") == 1);
     CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=win64") == 1);
+    CHECK(std::count(actual.begin(), actual.end(),
+                     "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine") == 1);
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "/usr/lib/x86_64-linux-gnu/wine/wine64") != actual.end());
     // The 32-bit prefix is never named, and never converted or renamed: it
     // stays exactly where it is as the default for 32-bit programs.
     CHECK(std::find(actual.begin(), actual.end(),
@@ -528,6 +533,24 @@ BOXEDVN_TEST(fex64_launch_keeps_a_caller_supplied_prefix_and_arch) {
     CHECK(std::find(actual.begin(), actual.end(),
                     "WINEPREFIX=/home/username/.wine64") == actual.end());
     CHECK(std::find(actual.begin(), actual.end(), "WINEARCH=win64") ==
+          actual.end());
+}
+
+BOXEDVN_TEST(fex64_launch_keeps_a_caller_supplied_wine_dll_path) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\game.exe";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    launch.environment = {"WINEDLLPATH=/opt/wine-experiment"};
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::count(actual.begin(), actual.end(),
+                     "WINEDLLPATH=/opt/wine-experiment") == 1);
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine") ==
           actual.end());
 }
 
@@ -568,6 +591,7 @@ BOXEDVN_TEST(ia32_launch_is_left_on_the_default_prefix) {
     for (const std::string& entry : actual) {
         CHECK(entry.rfind("WINEPREFIX=", 0) != 0);
         CHECK(entry.rfind("WINEARCH=", 0) != 0);
+        CHECK(entry.rfind("WINEDLLPATH=", 0) != 0);
     }
     // And it still enters Wine through the 32-bit loader.
     CHECK(std::find(actual.begin(), actual.end(), "/bin/wine") != actual.end());

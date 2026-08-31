@@ -1133,6 +1133,11 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
 #if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
     if (traceFEX64) {
         this->useFEX64 = true;
+        // Record how this launch's processes look for their Wine modules.
+        // Consulted rather than copied, so wineboot and every helper Wine
+        // execs or forks records under it too, each with its own budget.
+        // A 32-bit launch never gets here, so the IA-32 path is unchanged.
+        boxedvn::setDllSearchTraceEnabled(true);
     }
     if (traceFEX64) {
         klog_fmt("BOXEDWINE_FEX64_START resolve executable=%s cwd=%s",

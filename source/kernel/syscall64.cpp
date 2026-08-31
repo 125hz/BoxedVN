@@ -16,6 +16,7 @@
 #include "kmemory64.h"
 #include "guest_mmap_placement.h"
 #include "wine_server_reply.h"
+#include "dll_search_trace.h"
 #ifdef BOXEDWINE_FEX64_BACKEND
 #include "BVNFEXBackend.h"
 #endif
@@ -467,6 +468,31 @@ static void dumpX64ExitDiagnostics(CPU64* cpu, U64 status) {
     // is exactly the case that needed it.
     crashRingDump("non-zero exit");
     dumpX64DescendantSnapshot(process);
+}
+
+// Report one module-search path operation, or don't. Everything about the
+// bounding lives in DllSearchTrace; this is only the wording.
+//
+// `detail` is whatever distinguishes this operation -- the flags an open used,
+// the result a stat returned, what enumerating a directory produced. Callers
+// pass a formatted fragment rather than a second format string so that every
+// line has the same shape and stays greppable.
+static void reportDllSearch(KProcess* process, const char* op, const char* path,
+                            long long result, const char* detail) {
+    if (!process) {
+        return;
+    }
+    const boxedvn::DllSearchTrace::Decision decision =
+        process->dllSearch.record(path);
+    if (decision == boxedvn::DllSearchTrace::Decision::Silent) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_DLL_SEARCH pid=%u op=%s path='%s' result=%lld %s%s",
+             (unsigned)process->id, op, path ? path : "(null)", result,
+             detail ? detail : "",
+             decision == boxedvn::DllSearchTrace::Decision::Exhausted
+                 ? " [budget spent; further module-search paths are not reported]"
+                 : "");
 }
 
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
@@ -1371,6 +1397,16 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode
     }
     U32 rc = process->openat((FD)(S32)dirfd, BString::copy(path),
                              (U32)flags, (U32)mode);
+    {
+        // O_DIRECTORY is what the loader uses to enumerate a candidate module
+        // directory, and it is the operation whose result the packaged listing
+        // cannot predict, so say which kind of open this was.
+        char detail[64];
+        snprintf(detail, sizeof(detail), "flags=0x%llx dir=%d",
+                 (unsigned long long)flags, (flags & 0x10000) != 0 ? 1 : 0);
+        reportDllSearch(process.get(), (flags & 0x10000) != 0 ? "opendir" : "open",
+                        path, (long long)(S64)(S32)rc, detail);
+    }
     if ((S32)rc < 0) {
         if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
                                         strstr(path, "x86_64-windows") || strstr(path, "kernel32"))) {
@@ -1505,6 +1541,28 @@ static U64 sys_getdents64_real(CPU64* cpu, U64 fd, U64 dirp, U64 count) {
     U32 entries = openNode->getDirectoryEntryCount();
     U64 len = 0;
     U64 pos = dirp;
+    // The question the packaged archive cannot answer: when the loader
+    // enumerates a module directory, does the listing the guest gets back
+    // actually contain kernel32.dll? Reported once per enumeration, and only
+    // while the bounded budget lasts -- the scan below is over an in-memory
+    // directory, so it costs nothing the enumeration was not already doing.
+    if (cpu->thread->process->dllSearch.isArmed() &&
+        openNode->getFilePointer() == 0) {
+        bool hasKernel32 = false;
+        for (U32 j = 0; j < entries && !hasKernel32; j++) {
+            BString entryName;
+            std::shared_ptr<FsNode> entryNode =
+                openNode->getDirectoryEntry(j, entryName);
+            if (entryNode && strcasecmp(entryName.c_str(), "kernel32.dll") == 0) {
+                hasKernel32 = true;
+            }
+        }
+        char detail[64];
+        snprintf(detail, sizeof(detail), "entries=%u kernel32=%d", entries,
+                 hasKernel32 ? 1 : 0);
+        reportDllSearch(cpu->thread->process.get(), "getdents",
+                        openNode->node->path.c_str(), (long long)entries, detail);
+    }
     // BW64_DIRTRACE: log each getdents64 directory's path, entry count, file
     // pointer (resume index), and whether kernel32.dll is among the names. The
     // residual "could not load kernel32.dll" failure loops openat(O_DIRECTORY)+
@@ -1690,6 +1748,12 @@ static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSym
         klog_fmt("sys_stat_path64: '%s' (cwd='%s') -> %s", path,
                  cpu->thread->process->currentDirectory.c_str(),
                  node ? "OK" : "ENOENT");
+    }
+    {
+        char detail[48];
+        snprintf(detail, sizeof(detail), "follow=%d", followSymlink ? 1 : 0);
+        reportDllSearch(cpu->thread->process.get(), "stat", path,
+                        node ? 0 : -2, detail);
     }
     if (!node) return (U64)-2; // -ENOENT
     U64 size  = node->length();
@@ -3820,6 +3884,8 @@ void ksyscall64(CPU64* cpu) {
             std::shared_ptr<FsNode> n = Fs::getNodeFromLocalPath(
                 cpu->thread->process->currentDirectory, BString::copy(path), true);
             ret = n ? 0 : (U64)-2;
+            reportDllSearch(cpu->thread->process.get(), "access", path,
+                            (long long)(S64)ret, "");
             break;
         }
         case X64_SYS_mkdir:

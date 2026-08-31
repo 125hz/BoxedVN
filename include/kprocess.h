@@ -20,6 +20,7 @@
 #define __KPROCESS_H__
 
 #include "syscall_tail_ring.h"
+#include "dll_search_trace.h"
 #include <unordered_set>
 #include <map>
 
@@ -406,6 +407,12 @@ public:
     int lastServerRequestOpcode = -1;
     U32 lastServerRequestFd = 0;
     bool initProcessDoneReported = false;
+    // How this process looked for its Wine modules. Armed by the launch, spent
+    // on module-search paths only, and bounded per process: the failure it
+    // exists for -- "could not load kernel32.dll" with kernel32.dll present in
+    // the archive -- is answered by a few dozen lines, and an unbounded
+    // version of the same switch once wrote 468,768 of them.
+    boxedvn::DllSearchTrace dllSearch;
 #endif
     BString exe;
     BString name; // mainly used for logging

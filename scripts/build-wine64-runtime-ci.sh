@@ -15,6 +15,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 OUTPUT_DIR=""
 DXMT_UNIXLIB=""
+# The guest module root everything real is packaged under. Kept the same
+# as K_X64_WINE_MODULE_ROOT in include/guest_wine64_layout.h, which is what
+# the launch and the device preflight use.
+WINE_MODULE_ROOT="/usr/lib/x86_64-linux-gnu/wine"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir needs a value"
@@ -209,22 +213,40 @@ copy_abs /lib/x86_64-linux-gnu/libc.so.6
 copy_abs /lib/x86_64-linux-gnu/libgcc_s.so.1
 copy_abs /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
 
-# Normalize the loader paths expected by the BoxedWine64 launcher while
-# preserving Ubuntu's module-tree path. Some distro releases put wine64 under
-# /usr/lib/x86_64-linux-gnu/wine; the guest must not depend on that variation.
-copy_as "${WINE64}" /usr/lib/wine/wine64
-# Wine64 execs /usr/lib/wine/wineserver directly. Both guest paths therefore
-# have to be the same real x86-64 executable; the distro's shell wrapper is
+# Wine derives its search paths from where its own files are, so the loader
+# and the module trees have to agree. The loader used to be relocated to
+# /usr/lib/wine while the module trees stayed under Ubuntu's canonical root:
+# the directory Wine reads from /proc/self/exe named one place and ntdll.so's
+# parent named another, and a device run reached Windows code and then failed
+# with "could not load kernel32.dll" with kernel32.dll present in this archive
+# the whole time.
+#
+# Everything real therefore goes under the canonical module root. /usr/lib/wine
+# stays reachable through guest links below.
+mkdir -p "${STAGE}${WINE_MODULE_ROOT}"
+copy_as "${WINE64}" "${WINE_MODULE_ROOT}/wine64"
+# Wine execs `wineserver` out of the loader's own directory. Both names have to
+# be the same real x86-64 executable; the distro's /bin/sh wrapper is
 # deliberately not packaged at either of them.
-copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver64
-copy_as "${WINE_SERVER}" /usr/lib/wine/wineserver
-mkdir -p "${STAGE}/usr/lib/x86_64-linux-gnu/wine"
-cp -aL "${WINE_UNIX}" "${STAGE}/usr/lib/x86_64-linux-gnu/wine/"
-cp -aL "${WINE_WINDOWS}" "${STAGE}/usr/lib/x86_64-linux-gnu/wine/"
+copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver64"
+copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver"
+cp -aL "${WINE_UNIX}" "${STAGE}${WINE_MODULE_ROOT}/"
+cp -aL "${WINE_WINDOWS}" "${STAGE}${WINE_MODULE_ROOT}/"
 if [[ -n "${DXMT_UNIXLIB}" ]]; then
     cp "${DXMT_UNIXLIB}" \
-       "${STAGE}/usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winemetal.so"
+       "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/winemetal.so"
 fi
+
+# The builtin the loader reaches for first after the server handshake. If it is
+# not here, or is not a PE image, the guest gets as far as Windows code and no
+# further -- so fail the build rather than ship an archive that cannot load.
+for required_builtin in ntdll.dll kernel32.dll kernelbase.dll; do
+    builtin_path="${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${required_builtin}"
+    [[ -s "${builtin_path}" ]] \
+        || die "The Wine module tree has no ${required_builtin}: ${builtin_path}"
+    [[ "$(head -c 2 "${builtin_path}")" == "MZ" ]] \
+        || die "${required_builtin} is not a PE image."
+done
 
 if [[ -d /usr/share/wine ]]; then
     mkdir -p "${STAGE}/usr/share"
@@ -271,8 +293,30 @@ printf '%s\n' \
     'services: files' \
     > "${STAGE}/etc/nsswitch.conf"
 mkdir -p "${STAGE}/usr/bin" "${STAGE}/root"
-ln -s /usr/lib/wine/wine64 "${STAGE}/usr/bin/wine64"
-ln -s /usr/lib/wine/wineserver64 "${STAGE}/usr/bin/wineserver"
+# BoxedWine's ZIP filesystem does not read POSIX symlinks out of an archive.
+# It recognises a link by a `.link` suffix on the entry name whose contents are
+# the target path -- see EXT_LINK in source/io/fsnode.h. A real symlink stored
+# in the ZIP becomes a small regular file holding the target text, which is
+# what /usr/bin/wine64 and /usr/bin/wineserver silently were.
+#
+# No trailing newline: the guest reads the whole entry as the target.
+guest_link() {
+    local target="$1"
+    local link="$2"
+    mkdir -p "${STAGE}$(dirname "${link}")"
+    printf '%s' "${target}" > "${STAGE}${link}.link"
+}
+
+# Compatibility for anything that still names the relocated layout. Nothing in
+# a launch resolves through these; they exist so that naming them is not a
+# silent failure.
+guest_link "${WINE_MODULE_ROOT}/wine64" /usr/lib/wine/wine64
+guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/lib/wine/wineserver
+guest_link "${WINE_MODULE_ROOT}/wineserver64" /usr/lib/wine/wineserver64
+guest_link "${WINE_MODULE_ROOT}/x86_64-windows" /usr/lib/wine/x86_64-windows
+guest_link "${WINE_MODULE_ROOT}/x86_64-unix" /usr/lib/wine/x86_64-unix
+guest_link "${WINE_MODULE_ROOT}/wine64" /usr/bin/wine64
+guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/bin/wineserver
 
 # These directories are created by wineserver and by Wine's default prefix.
 mkdir -p "${STAGE}/tmp" "${STAGE}/run/user/1000" \

@@ -8,6 +8,7 @@
 #include "boxedvn/direct3d_profile.h"
 #include "boxedvn/engine_profile.h"
 #include "guest_wine_prefix.h"
+#include "guest_wine64_layout.h"
 
 #include <initializer_list>
 
@@ -538,6 +539,26 @@ std::vector<std::string> BVNBuildLaunchArguments(
             argv.push_back(std::string("WINEARCH=") +
                            K_X64_GUEST_WINE_ARCH);
         }
+        // Name the module root explicitly rather than relying on Wine
+        // deriving it from where its own files are. A device run reached
+        // Windows code and then failed with "could not load kernel32.dll,
+        // status c0000135" with kernel32.dll present in the packaged archive
+        // the whole time -- the derivation is what disagreed, not the
+        // packaging.
+        //
+        // This is the module ROOT, not the PE directory: Wine appends
+        // "/x86_64-windows" to every entry itself, so pointing it at the PE
+        // directory would make it search x86_64-windows/x86_64-windows.
+        //
+        // It goes into the launch environment, so wineboot, the wineserver
+        // spawn and every helper process inherit it rather than only the
+        // process that happens to load the program. Scoped to the 64-bit
+        // path: a 32-bit launch has a different module tree and is left
+        // exactly as it was.
+        if (!boxedvn::environmentSetsWineDllPath(launch.environment)) {
+            argv.push_back("-env");
+            argv.push_back(boxedvn::wineDllPathAssignment());
+        }
     }
     for (const std::string& entry : launch.environment) {
         argv.push_back("-env");
@@ -561,7 +582,13 @@ std::vector<std::string> BVNBuildLaunchArguments(
     if (launch.runThroughWine) {
         // Use the packaged ELF directly for the x64 path. This keeps the first
         // device bootstrap independent of merged-ZIP symlink resolution.
-        argv.push_back(launch.useFEX64 ? "/usr/lib/wine/wine64" : "/bin/wine");
+        //
+        // The canonical module root, not the relocated /usr/lib/wine: Wine
+        // reads /proc/self/exe to decide where to look for wineserver, and
+        // takes its module root from ntdll.so's parent directory. Launching
+        // the loader from anywhere but the tree its modules live in makes
+        // those two derivations name different places.
+        argv.push_back(launch.useFEX64 ? K_X64_WINE_LOADER : "/bin/wine");
     }
     argv.push_back(launch.executablePath);
     for (const std::string& argument : launch.arguments) {

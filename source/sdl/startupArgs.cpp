@@ -20,6 +20,7 @@
 #include "startupArgs.h"
 
 #include "guest_wine_prefix.h"
+#include "guest_wine64_layout.h"
 
 #include "devtty.h"
 #include "devurandom.h"
@@ -422,6 +423,54 @@ std::vector<BString> StartUpArgs::buildArgs() {
         args.push_back(a);
     }
     return args;
+}
+
+// The guest's own view of the packaged Wine64 module tree, taken through the
+// guest filesystem after every ZIP overlay is mounted and before Wine starts.
+// A packaged ZIP listing is not device acceptance: the archive that failed
+// with STATUS_DLL_NOT_FOUND already contained kernel32.dll.
+static void reportX64BuiltinPreflight(const char* path) {
+    std::shared_ptr<FsNode> node =
+        Fs::getNodeFromLocalPath(B(""), BString::copy(path), true);
+    if (!node) {
+        klog_fmt("BOXEDWINE_X64_BUILTIN_PREFLIGHT path=%s open=missing "
+                 "size=0 mz=0", path);
+        return;
+    }
+    if (node->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_BUILTIN_PREFLIGHT path=%s open=directory "
+                 "size=0 mz=0", path);
+        return;
+    }
+    FsOpenNode* probe = node->open(K_O_RDONLY);
+    if (!probe) {
+        klog_fmt("BOXEDWINE_X64_BUILTIN_PREFLIGHT path=%s open=denied "
+                 "size=%llu mz=0", path,
+                 (unsigned long long)node->length());
+        return;
+    }
+    U8 header[2] = {0, 0};
+    const U32 got = probe->readNative(header, (U32)sizeof(header));
+    const S64 size = probe->length();
+    probe->close();
+    delete probe;
+    klog_fmt("BOXEDWINE_X64_BUILTIN_PREFLIGHT path=%s open=ok size=%lld mz=%d",
+             path, (long long)size,
+             boxedvn::looksLikePeImage(header, got) ? 1 : 0);
+}
+
+static void reportX64WineLayoutPreflight() {
+    for (const char* path : {(const char*)K_X64_WINE_MODULE_ROOT,
+                             (const char*)K_X64_WINE_PE_DIR,
+                             (const char*)K_X64_WINE_LOADER}) {
+        std::shared_ptr<FsNode> node =
+            Fs::getNodeFromLocalPath(B(""), BString::copy(path), true);
+        klog_fmt("BOXEDWINE_X64_WINE_LAYOUT path=%s present=%d kind=%s "
+                 "size=%llu",
+                 path, node ? 1 : 0,
+                 !node ? "missing" : (node->isDirectory() ? "dir" : "file"),
+                 (unsigned long long)(node ? node->length() : 0));
+    }
 }
 
 bool StartUpArgs::apply() {
@@ -856,6 +905,11 @@ bool StartUpArgs::apply() {
             if (requestedFEX64) {
                 klog_fmt("BOXEDWINE_X64_LAUNCH request=fex executable=%s env_count=%u",
                          this->args[0].c_str(), (U32)this->envValues.size());
+                // All overlays are mounted and no guest process has started,
+                // so this reports the device-visible runtime rather than the
+                // host bundle's archive listing.
+                reportX64WineLayoutPreflight();
+                reportX64BuiltinPreflight(K_X64_WINE_BUILTIN_PROBE);
             }
             KThread* thread = process->startProcess(this->workingDir, this->args, this->envValues, this->userId, this->groupId, this->effectiveUserId, this->effectiveGroupId);
             result = thread != nullptr;
