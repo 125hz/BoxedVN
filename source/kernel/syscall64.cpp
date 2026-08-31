@@ -385,11 +385,9 @@ static void dumpX64DescendantSnapshot(KProcess* parent) {
             klog_fmt("  X64_EXIT_DESC ... more descendants not listed");
             break;
         }
-        U32 threadCount = 0;
-        {
-            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(child->threadsMutex);
-            threadCount = (U32)child->threads.size();
-        }
+        // KProcess already publishes this behind its own lock; reaching for
+        // the private map would only duplicate it.
+        const U32 threadCount = child->getThreadCount();
         klog_fmt("  X64_EXIT_DESC pid=%u parent=%u exe='%s' cmd='%s' "
                  "state=%s exit=%u threads=%u",
                  (unsigned)child->id, (unsigned)child->parentId,
