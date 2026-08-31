@@ -409,6 +409,25 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
         error = "DXMT is currently available only to an x86-64 FEX launch.";
         return false;
     }
+    if (launch.useFEX64 && launch.useDXMT) {
+        // The x86-64 graphics probe, and only it, turns on the two bounded
+        // socket diagnostics. They are host environment variables read once by
+        // the kernel's ring recorders, so they have to be set before any guest
+        // runs. Both are fixed-size rings printed only on a failing exit --
+        // deliberately not BW64_IPCDUMP, which logs every message and produced
+        // multi-gigabyte files.
+        //
+        // This is what makes the Wine-server reply header readable: the device
+        // shows the main process blocked in read(fd=9, count=16) and then
+        // exiting 1, with no record of what that read returned.
+        setenv("BW64_CRASHRING", "1", 1);
+        setenv("BW64_WSREAD", "1", 1);
+        BVNLogWrite(BVNLogLevelInfo, "cpu",
+                    "Bounded Wine-server socket diagnostics enabled for the "
+                    "x86-64 graphics probe: the last 64 socket events and each "
+                    "process's last syscalls are kept in memory and printed "
+                    "only if a guest process exits non-zero.");
+    }
     launch.requestedWineRenderer = static_cast<int>(request->wineRenderer);
     // Before everything else: these lines are BoxedVN's own vocabulary and
     // must be out of the argument list before anything reasons about it.

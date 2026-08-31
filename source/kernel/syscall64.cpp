@@ -354,6 +354,114 @@ static void crashRingDump(const char* why) {
     }
 }
 
+// A guest that exits non-zero after a blocked read leaves almost nothing
+// behind. This prints, once, everything that was already being collected: the
+// register state at the exit, the tail of that process's syscalls, the socket
+// ring, and what became of its descendants. Nothing here runs for a process
+// that exits cleanly.
+// Defined with the dispatcher below; the exit tail names its syscalls.
+static const char* x64SyscallName(U64 nr);
+
+static const char* x64SyscallTailStateName(boxedvn::SyscallTailState state) {
+    switch (state) {
+        case boxedvn::SyscallTailState::Pending: return "pending";
+        case boxedvn::SyscallTailState::Completed: return "ok";
+        case boxedvn::SyscallTailState::Restarted: return "restart";
+        case boxedvn::SyscallTailState::Unused: break;
+    }
+    return "unused";
+}
+
+static void dumpX64DescendantSnapshot(KProcess* parent) {
+    if (!parent) return;
+    // Bounded: the descendants of one process, one line each, plus a line per
+    // live thread. Wine forks a handful; a runaway is capped anyway.
+    constexpr U32 kMaxProcesses = 32;
+    U32 reported = 0;
+    for (U32 id : KSystem::getProcessIdsWithThreads()) {
+        KProcessPtr child = KSystem::getProcess(id);
+        if (!child || child->parentId != parent->id) continue;
+        if (reported++ >= kMaxProcesses) {
+            klog_fmt("  X64_EXIT_DESC ... more descendants not listed");
+            break;
+        }
+        U32 threadCount = 0;
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(child->threadsMutex);
+            threadCount = (U32)child->threads.size();
+        }
+        klog_fmt("  X64_EXIT_DESC pid=%u parent=%u exe='%s' cmd='%s' "
+                 "state=%s exit=%u threads=%u",
+                 (unsigned)child->id, (unsigned)child->parentId,
+                 child->exe.c_str(), child->commandLine.c_str(),
+                 child->terminated ? "terminated" : "running",
+                 (unsigned)child->exitCode, (unsigned)threadCount);
+    }
+    if (reported == 0) {
+        klog_fmt("  X64_EXIT_DESC none: no live descendant of pid=%u",
+                 (unsigned)parent->id);
+    }
+}
+
+static void dumpX64ExitDiagnostics(CPU64* cpu, U64 status) {
+    if (!cpu || !cpu->thread || !cpu->thread->process) return;
+    KProcess* process = cpu->thread->process.get();
+    if (!process->syscallTail.claimDump()) return;
+
+    klog_fmt("X64_EXIT_DIAG pid=%u status=%llu exe='%s' cmd='%s' "
+             "rip=0x%llx syscall_rip=0x%llx rsp=0x%llx rax=0x%llx "
+             "fs=0x%llx gs=0x%llx",
+             (unsigned)process->id, (unsigned long long)status,
+             process->exe.c_str(), process->commandLine.c_str(),
+             (unsigned long long)cpu->rip,
+             (unsigned long long)cpu->syscallRip,
+             (unsigned long long)cpu->reg[X64_RSP].u64,
+             (unsigned long long)cpu->reg[X64_RAX].u64,
+             (unsigned long long)cpu->fsbase,
+             (unsigned long long)cpu->gsbase);
+    klog_fmt("X64_EXIT_TAIL pid=%u recorded=%llu (oldest first)",
+             (unsigned)process->id,
+             (unsigned long long)process->syscallTail.recorded());
+    process->syscallTail.forEach([&](const boxedvn::SyscallTailRecord& r) {
+        // A pending record is a syscall that never came back. Printing a
+        // result for it would invent one.
+        if (r.state == boxedvn::SyscallTailState::Completed) {
+            klog_fmt("  X64_TAIL[%llu] pid=%u tid=%u nr=%llu (%s) "
+                     "rip=0x%llx a=(0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx) "
+                     "-> %lld state=ok",
+                     (unsigned long long)r.sequence, (unsigned)r.processId,
+                     (unsigned)r.threadId, (unsigned long long)r.number,
+                     x64SyscallName(r.number), (unsigned long long)r.syscallRip,
+                     (unsigned long long)r.arguments[0],
+                     (unsigned long long)r.arguments[1],
+                     (unsigned long long)r.arguments[2],
+                     (unsigned long long)r.arguments[3],
+                     (unsigned long long)r.arguments[4],
+                     (unsigned long long)r.arguments[5],
+                     (long long)r.result);
+        } else {
+            klog_fmt("  X64_TAIL[%llu] pid=%u tid=%u nr=%llu (%s) "
+                     "rip=0x%llx a=(0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx) "
+                     "-> none state=%s",
+                     (unsigned long long)r.sequence, (unsigned)r.processId,
+                     (unsigned)r.threadId, (unsigned long long)r.number,
+                     x64SyscallName(r.number), (unsigned long long)r.syscallRip,
+                     (unsigned long long)r.arguments[0],
+                     (unsigned long long)r.arguments[1],
+                     (unsigned long long)r.arguments[2],
+                     (unsigned long long)r.arguments[3],
+                     (unsigned long long)r.arguments[4],
+                     (unsigned long long)r.arguments[5],
+                     x64SyscallTailStateName(r.state));
+        }
+    });
+    // The socket ring was previously printed only when a guest wrote an abort
+    // message to stderr. A process that exits non-zero without saying anything
+    // is exactly the case that needed it.
+    crashRingDump("non-zero exit");
+    dumpX64DescendantSnapshot(process);
+}
+
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (count == 0) return 0;
     // Ceiling only (was a 1MB cap that silently truncated large writes for any
@@ -1008,9 +1116,21 @@ static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
         klog_fmt("CPU64: %s syscall, status=%lld  pid=%d exe='%s' cmd='%s'",
                  group ? "exit_group" : "exit", (long long)status,
                  (int)p->id, p->exe.c_str(), p->commandLine.c_str());
+        // The third of the three lifecycle markers, so a child's scheduling,
+        // first syscall and exit can be matched up without hunting.
+        klog_fmt("BOXEDWINE_X64_PROC_EXIT pid=%u parent=%u status=%lld "
+                 "group=%d exe='%s'",
+                 (unsigned)p->id, (unsigned)p->parentId, (long long)status,
+                 group ? 1 : 0, p->exe.c_str());
     } else {
         klog_fmt("CPU64: %s syscall, status=%lld",
                  group ? "exit_group" : "exit", (long long)status);
+    }
+    // Before anything is torn down, while the descendants and the register
+    // state are still real. Only for a failing exit: a clean one has nothing
+    // to explain.
+    if (status != 0) {
+        dumpX64ExitDiagnostics(cpu, status);
     }
     // Stop this thread's run loop now, whatever else happens below.
     cpu->yield = true;
@@ -1136,9 +1256,19 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
             got = fdesc->kobject->readNative(tmp.data(), (U32)count);
         }
     }
+    // Both outcomes of the read land in the socket ring, not just a success.
+    // The device's open question is precisely whether Wine's 16-byte reply
+    // header read returned 16, 0 or an error, and a recorder that only fires
+    // on success cannot answer it. extra0 carries the requested count and
+    // extra1 the signed result, so an EOF and an errno are distinguishable
+    // from a short read.
     if ((S32)got < 0) {
+        crashRingRecordRead('E', (U32)cpu->thread->process->id, (U32)fd,
+                            nullptr, 0, (U32)count, (U32)(S32)got);
         return (U64)(S64)(S32)got; // sign-extend kernel errno
     }
+    crashRingRecordRead('R', (U32)cpu->thread->process->id, (U32)fd,
+                        tmp.data(), got, (U32)count, (U32)got);
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
     }
@@ -3153,6 +3283,27 @@ void ksyscall64(CPU64* cpu) {
     U64 a6   = cpu->reg[X64_R9].u64;
     U64 ret  = (U64)-K_ENOSYS;
 
+    // Open a tail record before the syscall runs, so one that blocks and never
+    // returns is visible as pending rather than as a completed zero. Costs one
+    // ring slot; nothing is printed unless the process exits non-zero.
+    U64 tailToken = 0;
+    if (cpu->thread && cpu->thread->process) {
+        KProcess* tailProcess = cpu->thread->process.get();
+        const U64 tailArgs[6] = {a1, a2, a3, a4, a5, a6};
+        tailToken = tailProcess->syscallTail.begin(
+            (U32)tailProcess->id, (U32)cpu->thread->id, nr, cpu->syscallRip,
+            tailArgs);
+        if (!tailProcess->firstSyscallReported) {
+            tailProcess->firstSyscallReported = true;
+            klog_fmt("BOXEDWINE_X64_PROC_FIRST_SYSCALL pid=%u parent=%u tid=%u "
+                     "nr=%llu (%s) rip=0x%llx exe='%s'",
+                     (unsigned)tailProcess->id, (unsigned)tailProcess->parentId,
+                     (unsigned)cpu->thread->id, (unsigned long long)nr,
+                     x64SyscallName(nr), (unsigned long long)cpu->syscallRip,
+                     tailProcess->exe.c_str());
+        }
+    }
+
     // Set BW64_SYSTRACE=1 to log every 64-bit syscall — invaluable for wine
     // bring-up (finding where a guest stalls or which syscall is next missing).
     // BW64_TRACEPID=N traces ONLY process N (one cheap compare; doesn't slow the
@@ -4697,7 +4848,15 @@ void ksyscall64(CPU64* cpu) {
     // "the new image / restart already set the registers — do NOT overwrite RAX
     // with this sentinel." Mirrors the 32-bit dispatcher (syscall.cpp).
     if (ret == (U64)(S64)-K_CONTINUE || ret == (U64)(S64)-K_WAIT) {
+        // The register state belongs to a new image, or the syscall parked and
+        // will run again. Either way it did not produce a result.
+        if (tailToken && cpu->thread && cpu->thread->process) {
+            cpu->thread->process->syscallTail.restart(tailToken);
+        }
         return;
+    }
+    if (tailToken && cpu->thread && cpu->thread->process) {
+        cpu->thread->process->syscallTail.complete(tailToken, (S64)ret);
     }
     cpu->reg[X64_RAX].setU64(ret);
 }

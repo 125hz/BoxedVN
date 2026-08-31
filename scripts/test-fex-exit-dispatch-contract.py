@@ -2638,6 +2638,147 @@ def main() -> None:
                 "sys_brk64 must return the requested break, not one rounded "
                 "to the host page: " + banned)
 
+    # ------------------------------------------------------------------ #
+    # A guest that exits non-zero after a blocked read leaves nothing behind.  #
+    # The device shows the main process parked in read(fd=9, count=16) -- the  #
+    # Wine-server reply header -- and then exiting 1, with no record of what   #
+    # that read returned. The tail is collected always and printed only on a   #
+    # failing exit.                                                            #
+    # ------------------------------------------------------------------ #
+    tail_header = read(repository / "include/syscall_tail_ring.h")
+    require_ordered(
+        tail_header,
+        [
+            "enum class SyscallTailState : std::uint8_t {",
+            "Pending = 1,",
+            "Completed = 2,",
+            "Restarted = 3,",
+            "static constexpr unsigned kCapacity = 96;",
+            "std::uint64_t begin(",
+            "record.state = SyscallTailState::Pending;",
+            "void complete(",
+            "void restart(",
+            "void forEach(",
+            "bool claimDump() {",
+            "if (record.sequence != token) {",
+        ],
+        "BoxedVN syscall tail ring contract",
+    )
+    # Fixed storage: a guest making millions of syscalls must cost a fixed
+    # amount of memory and produce a fixed number of lines.
+    for banned in ("std::vector", "std::deque", "std::map", "new "):
+        if banned in tail_header:
+            raise SystemExit(
+                "the syscall tail must use fixed storage, not " + banned)
+
+    syscalls = read(repository / "source/kernel/syscall64.cpp")
+    require_ordered(
+        syscalls,
+        [
+            "static void dumpX64ExitDiagnostics(CPU64* cpu, U64 status) {",
+            "if (!process->syscallTail.claimDump()) return;",
+            "X64_EXIT_DIAG pid=%u status=%llu exe='%s' cmd='%s' ",
+            "rip=0x%llx syscall_rip=0x%llx rsp=0x%llx rax=0x%llx ",
+            "fs=0x%llx gs=0x%llx",
+            "X64_EXIT_TAIL pid=%u recorded=%llu (oldest first)",
+            'crashRingDump("non-zero exit");',
+            "dumpX64DescendantSnapshot(process);",
+            "tailToken = tailProcess->syscallTail.begin(",
+            "cpu->thread->process->syscallTail.restart(tailToken);",
+            "cpu->thread->process->syscallTail.complete(tailToken, (S64)ret);",
+        ],
+        "BoxedVN exit diagnostic contract",
+    )
+    # Only a failing exit prints anything.
+    exit_start = syscalls.index("static U64 sys_exit64(")
+    exit_body = syscalls[exit_start:exit_start + 3000]
+    # The guard has to be on the call itself, not merely somewhere nearby.
+    guarded = ("    if (status != 0) {" + newline +
+               "        dumpX64ExitDiagnostics(cpu, status);" + newline +
+               "    }")
+    if guarded not in exit_body:
+        raise SystemExit(
+            "the exit diagnostic must fire only for a non-zero exit status")
+    # And it must run before anything is torn down.
+    diag_at = exit_body.index("dumpX64ExitDiagnostics(cpu, status);")
+    teardown_at = exit_body.index("process->exitgroup(cpu->thread")
+    if diag_at > teardown_at:
+        raise SystemExit(
+            "the exit diagnostic must run before the process is torn down, "
+            "while its descendants and register state are still real")
+    # A pending record must never be printed with a result.
+    tail_dump_start = syscalls.index("X64_EXIT_TAIL pid=%u recorded=")
+    tail_dump = syscalls[tail_dump_start:tail_dump_start + 2600]
+    if "state == boxedvn::SyscallTailState::Completed" not in tail_dump or             "-> none state=%s" not in tail_dump:
+        raise SystemExit(
+            "a syscall that never returned must not be printed as a completed "
+            "result: an invented zero reads as EOF")
+
+    # Both outcomes of a read reach the socket ring, not only a success.
+    read_start = syscalls.index("static U64 sys_read64(")
+    read_body = syscalls[read_start:syscalls.index("static U64 sys_openat64(",
+                                                   read_start)]
+    for required in ("crashRingRecordRead('E'", "crashRingRecordRead('R'"):
+        if required not in read_body:
+            raise SystemExit(
+                "the read recorder must capture an error and a success alike, "
+                "or it cannot say what the reply-header read returned: " +
+                required)
+
+    # The bounded lifecycle markers, so a forked daemon's scheduling, first
+    # syscall and exit can be matched up.
+    for marker, where in (
+        ("BOXEDWINE_X64_PROC_FIRST_SYSCALL pid=%u parent=%u tid=%u ",
+         "source/kernel/syscall64.cpp"),
+        ("BOXEDWINE_X64_PROC_EXIT pid=%u parent=%u status=%lld ",
+         "source/kernel/syscall64.cpp"),
+        ("BOXEDWINE_X64_PROC_SCHEDULED pid=%u parent=%u tid=%u ",
+         "source/emulation/cpu/normal/normalPlatformMultiThreaded.cpp"),
+    ):
+        if marker not in read(repository / where):
+            raise SystemExit(
+                "a process lifecycle marker is missing from " + where + ": " +
+                marker)
+    # Bounded by a per-process flag, not by a counter that could run away.
+    process_header = read(repository / "include/kprocess.h")
+    for required in ("boxedvn::SyscallTailRing syscallTail;",
+                     "bool scheduleReported = false;",
+                     "bool firstSyscallReported = false;"):
+        if required not in process_header:
+            raise SystemExit(
+                "the lifecycle markers must be one-shot per process: " +
+                required)
+
+    # The descendant snapshot stays generic and bounded: no observed pid may
+    # be written into the emulator.
+    snapshot_start = syscalls.index("static void dumpX64DescendantSnapshot(")
+    snapshot = syscalls[snapshot_start:syscalls.index(
+        "static void dumpX64ExitDiagnostics(", snapshot_start)]
+    if "kMaxProcesses" not in snapshot:
+        raise SystemExit("the descendant snapshot must be bounded")
+    if "child->parentId != parent->id" not in snapshot:
+        raise SystemExit(
+            "the descendant snapshot must be found by parentage, never by a "
+            "hardcoded pid")
+
+    # Only the x86-64 graphics probe turns the socket rings on, and it uses
+    # the bounded ones rather than the unbounded firehose.
+    runtime = read(repository / "ios/runtime/src/BVNRuntime.mm")
+    require_ordered(
+        runtime,
+        [
+            "if (launch.useFEX64 && launch.useDXMT) {",
+            'setenv("BW64_CRASHRING", "1", 1);',
+            'setenv("BW64_WSREAD", "1", 1);',
+        ],
+        "BoxedVN probe diagnostic contract",
+    )
+    # A comment may explain why the firehose was not chosen; enabling it is a
+    # different matter.
+    if 'setenv("BW64_IPCDUMP"' in runtime:
+        raise SystemExit(
+            "the probe must not enable the unbounded message dump")
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

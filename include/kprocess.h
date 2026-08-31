@@ -19,6 +19,7 @@
 #ifndef __KPROCESS_H__
 #define __KPROCESS_H__
 
+#include "syscall_tail_ring.h"
 #include <unordered_set>
 #include <map>
 
@@ -388,6 +389,17 @@ public:
     KSigAction sigActions[MAX_SIG_ACTIONS];
     KProcessTimer timer;
     BString commandLine;
+#ifdef BOXEDWINE_GUEST_X64
+    // The last syscalls this process made. Collected always, printed only when
+    // the process exits non-zero: a guest that dies after a blocked read
+    // otherwise leaves nothing in the log, and tracing every syscall live
+    // buries the one that matters.
+    boxedvn::SyscallTailRing syscallTail;
+    // One line each, the first time this process is scheduled and the first
+    // time it makes a syscall. Bounded by the number of processes.
+    bool scheduleReported = false;
+    bool firstSyscallReported = false;
+#endif
     BString exe;
     BString name; // mainly used for logging
     std::vector<BString> path;        

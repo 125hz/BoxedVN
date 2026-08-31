@@ -80,6 +80,17 @@ static void platformThread(CPU* cpu) {
             if (!cpu64) {
                 break;
             }
+            if (!process->scheduleReported) {
+                process->scheduleReported = true;
+                // One line the first time a process is given the CPU. A forked
+                // wineserver daemon that is never scheduled, or scheduled and
+                // then silent, is otherwise indistinguishable in a log.
+                klog_fmt("BOXEDWINE_X64_PROC_SCHEDULED pid=%u parent=%u tid=%u "
+                         "rip=0x%llx exe='%s'",
+                         (unsigned)process->id, (unsigned)process->parentId,
+                         (unsigned)cpu->thread->id,
+                         (unsigned long long)cpu64->rip, process->exe.c_str());
+            }
             cpu64->yield = false;
             cpu64->deliverPendingSignals();
             try {
