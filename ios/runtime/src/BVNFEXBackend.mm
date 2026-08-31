@@ -27,7 +27,10 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {}
 extern "C" uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t) {
     return 0;
 }
-extern "C" bool BVNFEXCPU64Run(void*, void*) { return false; }
+extern "C" bool BVNFEXCPU64Run(void*, void*, BVNFEXCPU64RunOutcome* outcome) {
+    if (outcome) *outcome = BVNFEXCPU64RunOutcomeFatal;
+    return false;
+}
 extern "C" void BVNFEXBackendArmHandoffTrace(unsigned) {}
 extern "C" void BVNFEXBackendDisarmHandoffTrace(unsigned) {}
 extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
@@ -969,6 +972,21 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     // translated without it, or a block would dereference the canonical arena
     // at an address the host cannot map.
     bundle->context->SetGuestTopClearMask(boxedvn::kGuestTopClearMask);
+    // Every CALL then records the return address it pushed, the canonical and
+    // host addresses it pushed it to, and what an immediate read-back of that
+    // same host address returned. Nothing is printed until a return actually
+    // fails, at which point the ring names the CALL that was supposed to have
+    // written the slot.
+    //
+    // This is on for the device path on purpose: two runs ended with a guest
+    // frame chain whose saved frame pointers were all correct and whose return
+    // addresses were all zero, and nothing observable at RET time can say
+    // whether the push never landed or the slot was cleared afterwards. The
+    // environment variable is the off switch, so a throughput measurement does
+    // not need a different build.
+    const bool callWitness = getenv("BW64_NO_CALL_WITNESS") == nullptr;
+    bundle->context->SetBoxedWineCallWitness(callWitness);
+    reportf("BOXEDWINE_FEX64_CALL_WITNESS armed=%d", callWitness ? 1 : 0);
     if (!gLowAliasReported.exchange(true, std::memory_order_relaxed)) {
         reportf("BOXEDWINE_FEX64_LOW_ALIAS guest=[0x0,0x%llx) "
                 "host=[0x%llx,0x%llx) high_identity=[0x%llx,0x%llx)",
@@ -2129,7 +2147,17 @@ extern "C" void BVNFEXBackendDisarmHandoffTrace(unsigned processId) {
     }
 }
 
-extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
+extern "C" bool BVNFEXCPU64Run(void* process, void* thread,
+                               BVNFEXCPU64RunOutcome* outcome) {
+    // Written on every return path below. A caller that cannot tell a fatal
+    // ending from a guest exit_group either leaves a dead process with no exit
+    // status or reports a clean exit as a failure; both have happened.
+    auto publish = [&](BVNFEXCPU64RunOutcome value) {
+        if (outcome) {
+            *outcome = value;
+        }
+    };
+    publish(BVNFEXCPU64RunOutcomeFatal);
     reportf("BOXEDWINE_FEX64_RUN attach process=%p thread=%p", process, thread);
     BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterAttach(process, thread);
     if (!adapter) {
@@ -2303,11 +2331,23 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread) {
         !cleanReturn ||
         terminalAction == BVNFEXCPU64AdapterActionThreadExit ||
         terminalAction == BVNFEXCPU64AdapterActionProcessExit ||
+        terminalAction == BVNFEXCPU64AdapterActionFatalExit ||
         static_cast<KThread*>(thread)->terminating;
     const bool retireProcess =
         !cleanReturn ||
         terminalAction == BVNFEXCPU64AdapterActionProcessExit ||
+        terminalAction == BVNFEXCPU64AdapterActionFatalExit ||
         static_cast<KProcess*>(process)->terminated;
+    // A contained host fault returns cleanly through the dispatcher's own
+    // unwind, so `cleanReturn` says nothing about whether the guest is still
+    // viable. Only the action does.
+    const bool fatal =
+        !cleanReturn || terminalAction == BVNFEXCPU64AdapterActionFatalExit;
+    publish(fatal ? BVNFEXCPU64RunOutcomeFatal
+                  : (terminalAction == BVNFEXCPU64AdapterActionThreadExit ||
+                     terminalAction == BVNFEXCPU64AdapterActionProcessExit)
+                        ? BVNFEXCPU64RunOutcomeGuestExit
+                        : BVNFEXCPU64RunOutcomeYield);
     if (processState &&
         processState->unwindReports.load(std::memory_order_relaxed) <
             kUnwindReportLimit) {

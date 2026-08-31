@@ -762,7 +762,10 @@ static bool containUnclassifiedFEXFault(
         adapter->process->signalProcess(guestSignal);
     }
     adapter->cpu->yield = true;
-    adapter->lastAction = BVNFEXCPU64AdapterActionProcessExit;
+    // Fatal, not a guest exit. The guest never asked to stop and nothing has
+    // published an exit status for it; reporting this as ProcessExit is what
+    // left the process alive with no status while the session waited.
+    adapter->lastAction = BVNFEXCPU64AdapterActionFatalExit;
     frame->InSyscallInfo = 0;
     machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
     machine->__ss.__sp = returningStack;

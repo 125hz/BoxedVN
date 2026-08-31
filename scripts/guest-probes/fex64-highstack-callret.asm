@@ -52,6 +52,20 @@
 ;   - an indirect CALL through a register, whose return block is not known at
 ;     compile time, is the case that pushes the zeroed prediction entry. Its
 ;     RET has to be as correct as any other.
+;   - every register-overlap shape the Push lowering branches on, including
+;     `push rsp`, where the value register is the address register, and a pair
+;     of adjacent pushes, which the register allocator fuses into one paired
+;     store. Each is read back through an ordinary translated load.
+;   - the return address read straight off the stack on entry to a callee,
+;     before anything else touches it -- the guest-side equivalent of the
+;     read-back the CALL push itself now performs.
+;   - a dispatcher boundary between a frame's CALL and its RET, so the frame
+;     has to survive a round trip out of translated code and back.
+;
+; What this fixture deliberately does NOT cover: a guest RET to a null target.
+; That has to become a guest fault, and a guest fault ends the harness rather
+; than producing a pass or a fail, so the disposition is pinned in the host
+; test suite instead (see fex_null_guest_target_takes_the_guest_fault_path).
 ;
 ; Every address reaches memory through a register: an absolute x86-64 memory
 ; operand is disp32 and would truncate a 47-bit constant in the assembler.
@@ -205,10 +219,115 @@ run_nest_after_call:
     cmp r8, rsi
     jne run_nest_out
 
+    ; Every Push lowering shape, on this same lane.
+    lea rdi, [rel run_nest_after_shapes]
+    call push_shapes
+run_nest_after_shapes:
+    mov r11, PASS
+    cmp rbx, r11
+    jne run_nest_out
+
     mov r14, PASS
 
 run_nest_out:
     leave
+    ret
+
+; -------------------------------------------------------------------
+; push_shapes: the register-overlap shapes the Push lowering has to
+; handle, plus the immediate read-back a CALL's own return-address push
+; is now instrumented with.
+;
+; The lowering copies the pushed value into a temporary when it would
+; otherwise be destroyed by the address write or the result write. Those
+; branches are chosen by register allocation, which a guest fixture
+; cannot address directly -- but the x86 forms below are what force
+; them, and each one is read back through an ordinary translated load,
+; so a shape that stores to the wrong place fails on the value.
+;
+; In:  RDI = the return address this call site pushed
+; Out: RBX = PASS when every check held
+; -------------------------------------------------------------------
+push_shapes:
+    ; The return address, read straight off the stack before anything
+    ; else touches it. This is the guest-side equivalent of the
+    ; read-back the CALL push now performs: if the push never landed,
+    ; this is the first place it shows.
+    mov r8, qword [rsp]
+    mov rbx, FAIL
+    cmp r8, rdi
+    jne push_shapes_done_nostack
+
+    push rbp
+    mov rbp, rsp
+
+    ; Shape 1: value, address and result all distinct.
+    mov r8, CANARY
+    push r8
+    mov r9, qword [rsp]
+    cmp r9, r8
+    jne push_shapes_out
+    pop r10
+    cmp r10, r8
+    jne push_shapes_out
+
+    ; Shape 2: the value register IS the address register. x86 pushes
+    ; the stack pointer's value from BEFORE the decrement, so a lowering
+    ; that stores the already-adjusted pointer fails here.
+    mov r11, rsp
+    push rsp
+    mov r9, qword [rsp]
+    cmp r9, r11
+    jne push_shapes_out
+    add rsp, 8
+
+    ; Shape 3: a live caller-visible register that the epilogue still
+    ; needs afterwards.
+    push rbp
+    mov r9, qword [rsp]
+    cmp r9, rbp
+    jne push_shapes_out
+    add rsp, 8
+
+    ; Shape 4: two adjacent pushes, which the register allocator fuses
+    ; into a single paired store. The second push lands at the lower
+    ; address, so the order below is the one that has to hold.
+    mov r8, 0x1234567890abcdef
+    mov r9, 0x0fedcba987654321
+    push r8
+    push r9
+    mov r10, qword [rsp]
+    cmp r10, r9
+    jne push_shapes_out
+    mov r10, qword [rsp + 8]
+    cmp r10, r8
+    jne push_shapes_out
+    add rsp, 16
+
+    ; A dispatcher boundary between this frame's CALL and its RET: an
+    ; indirect branch whose target the translator cannot know at compile
+    ; time, so the block ends and control re-enters through the exit
+    ; path. (A syscall would do the same, but the harness has no kernel
+    ; behind it, and what matters here is only that the frame survives a
+    ; round trip out of translated code and back.)
+    lea rax, [rel push_shapes_resume]
+    jmp rax
+push_shapes_resume:
+
+    ; The frame is intact across that boundary.
+    mov r8, qword [rbp + 8]
+    cmp r8, rdi
+    jne push_shapes_out
+
+    mov rbx, PASS
+
+push_shapes_out:
+    leave
+    ret
+
+push_shapes_done_nostack:
+    ; The return address was already wrong on entry, so the frame this
+    ; routine would build cannot be trusted either. Return without one.
     ret
 
 ; -------------------------------------------------------------------

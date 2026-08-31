@@ -102,22 +102,32 @@ static void platformThread(CPU* cpu) {
                     klog_fmt("BOXEDWINE_FEX64_SCHED enter process=%d thread=%d rip=0x%llx",
                              process->id, cpu->thread->id,
                              (unsigned long long)cpu64->rip);
-                    if (!BVNFEXCPU64Run(process.get(), cpu->thread)) {
+                    BVNFEXCPU64RunOutcome outcome =
+                        BVNFEXCPU64RunOutcomeYield;
+                    const bool dispatched =
+                        BVNFEXCPU64Run(process.get(), cpu->thread, &outcome);
+                    // Only a FATAL ending owes the process an exit status.
+                    //
+                    // Gating this on the return value alone was wrong: a
+                    // contained host fault unwinds cleanly through the
+                    // dispatcher and returns true, so the fatal case never
+                    // reached here at all -- the process was left alive with no
+                    // status, no lifecycle marker, and a session still showing
+                    // a loading overlay. Gating it on the ACTION alone would be
+                    // wrong in the other direction: a guest exit_group is also
+                    // a process exit, and has already published its own status
+                    // through the syscall path, so ending it again here would
+                    // overwrite a clean exit with a failure.
+                    if (outcome == BVNFEXCPU64RunOutcomeFatal) {
                         klog_fmt("FEX CPU64 dispatch failed for process %d; "
                                  "terminating the explicitly translated launch",
                                  process->id);
-                        // Marking the thread terminating retires the thread and
-                        // the translator context but leaves the PROCESS with no
-                        // exit status at all: no lifecycle marker, nothing for a
-                        // waiter to collect, and nothing to tell the session its
-                        // program is gone. A device run ended exactly there --
-                        // the main process took a fatal fault, its thread went
-                        // away, and the surviving helper processes kept the
-                        // emulator alive under a loading overlay that never
-                        // cleared. Route it through the same completion
-                        // exit_group uses instead.
                         kfatalProcessExit64(cpu64, 127,
-                                            "fex64-translator-dispatch");
+                                            "fex64-translator-fatal");
+                        cpu->thread->terminating = true;
+                        break;
+                    }
+                    if (!dispatched) {
                         cpu->thread->terminating = true;
                         break;
                     }

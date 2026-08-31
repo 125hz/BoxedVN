@@ -31,7 +31,26 @@ typedef enum {
     BVNFEXCPU64AdapterActionExec = 2,
     BVNFEXCPU64AdapterActionThreadExit = 3,
     BVNFEXCPU64AdapterActionProcessExit = 4,
+    // The translator could not continue: a host fault was contained, or the
+    // dispatcher was handed something it must not execute. Deliberately
+    // distinct from ProcessExit, which is a guest exit_group and is a normal,
+    // successful ending that must not be reported as a failure.
+    BVNFEXCPU64AdapterActionFatalExit = 5,
 } BVNFEXCPU64AdapterAction;
+
+// What one BVNFEXCPU64Run call ended as. The caller needs this to decide
+// whether the guest process still owes anyone an exit status: a fatal ending
+// leaves the process alive with no status at all, while a guest exit has
+// already published one through the ordinary syscall path and must not be
+// given a second.
+typedef enum {
+    // Ordinary yield or reschedule; the thread is still live.
+    BVNFEXCPU64RunOutcomeYield = 0,
+    // The guest ended this thread or process itself.
+    BVNFEXCPU64RunOutcomeGuestExit = 1,
+    // The translator gave up. Nothing has published an exit status.
+    BVNFEXCPU64RunOutcomeFatal = 2,
+} BVNFEXCPU64RunOutcome;
 
 // True only when the FEX iPhoneOS archives are linked into this app.
 bool BVNFEXBackendBuilt(void);
@@ -114,7 +133,11 @@ uint64_t BVNFEXBackendTakePendingIRCapTarget(void);
 // false when the process is not a native-identity 64-bit process or FEX is not
 // linked/initialised. A true return means the thread stopped at a syscall
 // boundary, yield, exec replacement, or normal FEX return.
-bool BVNFEXCPU64Run(void* process, void* thread);
+// `outcome` is optional and always written when non-null; see
+// BVNFEXCPU64RunOutcome for why the caller cannot infer it from the return
+// value alone.
+bool BVNFEXCPU64Run(void* process, void* thread,
+                    BVNFEXCPU64RunOutcome* outcome);
 
 // Arm the translator's bounded block trace for one process, for the handoff
 // that follows the Wine-server reply that hands it its entry point. The

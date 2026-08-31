@@ -2346,6 +2346,241 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------ #
+    # A CALL's return-address push reads its own store back.               #
+    #                                                                      #
+    # Device evidence at 59fe87a2: the guest stopped with RIP zero out of   #
+    # the epilogue of __libc_sigaction, and a checked re-read of its stack   #
+    # showed the frame chain intact -- every saved frame pointer correct --  #
+    # while every return-address slot above it held zero. LEAVE and RET both #
+    # did the right arithmetic, so either the CALL never stored the address  #
+    # or something zeroed the slot before the RET. Nothing observable at RET #
+    # time separates those, which is what this witness exists to do.        #
+    # ------------------------------------------------------------------ #
+    call_witness_patch = read(
+        repository / "scripts/fex64-patches/fex-boxedwine-call-return-witness.patch")
+    require_ordered(
+        call_witness_patch,
+        [
+            "FEXCore/include/FEXCore/Core/CoreState.h",
+            "struct BoxedWineCallRecord {",
+            "uint64_t IntendedReturn;",
+            "uint64_t SlotGuest;",
+            "uint64_t SlotHost;",
+            "uint64_t Readback;",
+            "uint64_t StackBefore;",
+            "BoxedWineCallRingCount",
+            # The record size and ring count must stay shiftable/maskable,
+            # because the JIT scales the index rather than multiplying.
+            "sizeof(CpuStateFrame::BoxedWineCallRecord) == 64",
+        ],
+        "BoxedVN CALL history ring",
+    )
+    require_ordered(
+        call_witness_patch,
+        [
+            "FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
+            # Only a CALL's return-address push is recorded; a `push rbp` is
+            # not, so an ordinary push costs nothing.
+            "bool Arm64JITCore::IsCallReturnPush(",
+            "OP_ENTRYPOINTOFFSET",
+            "void Arm64JITCore::EmitCallReturnWitness(",
+            # The read-back has to go through the SAME host address the store
+            # used, or it proves nothing about that store.
+            "ldur(TMP3, SlotHost, 0);",
+            "BoxedWineCallRecord, Readback",
+            "BoxedWineCallAnomalies",
+            "IsCallReturnPush(Op->Value)",
+        ],
+        "BoxedVN CALL return-address read-back",
+    )
+    # The witness must be armed by the integration, not always on.
+    if "GetBoxedWineCallWitness()" not in call_witness_patch:
+        raise SystemExit(
+            "the CALL witness must be gated on an explicitly armed flag"
+        )
+    require_ordered(
+        read(repository / "scripts/build-fex64-fex.sh"),
+        [
+            "apply_patch fex-boxedwine-null-exit-target.patch",
+            "apply_patch fex-boxedwine-call-return-witness.patch",
+        ],
+        "BoxedVN CALL witness patch is applied by the device build",
+    )
+    require_ordered(
+        read(repository / "scripts/run-fex64-vixl-probe.sh"),
+        [
+            "fex-boxedwine-null-exit-target.patch",
+            "fex-boxedwine-call-return-witness.patch",
+        ],
+        "BoxedVN CALL witness patch is applied by the VIXL probe",
+    )
+    # It is armed on the device path, with an off switch that needs no rebuild.
+    backend_source = read(repository / "ios/runtime/src/BVNFEXBackend.mm")
+    require_ordered(
+        backend_source,
+        [
+            "SetGuestTopClearMask(boxedvn::kGuestTopClearMask);",
+            'getenv("BW64_NO_CALL_WITNESS")',
+            "SetBoxedWineCallWitness(callWitness);",
+            "BOXEDWINE_FEX64_CALL_WITNESS armed=",
+        ],
+        "BoxedVN CALL witness arming",
+    )
+
+    # The ring is retained, not narrated: it prints only when a return has
+    # already failed.
+    require_ordered(
+        call_witness_patch,
+        [
+            "BoxedWineCallRingDumpLimit",
+            "ContextImpl::BoxedWineDumpCallRing",
+            "BOXEDWINE_FEX64_CALL_RING",
+            "BOXEDWINE_FEX64_CALL_RECORD",
+        ],
+        "BoxedVN CALL ring dump",
+    )
+    for reason in ('"null-exit-target"', '"compile-low-rip"'):
+        if reason not in call_witness_patch:
+            raise SystemExit(
+                "the CALL ring must be dumped for " + reason
+            )
+
+    # ------------------------------------------------------------------ #
+    # The null-exit marker has to fire on the TARGET, not on which branch   #
+    # of the cache lookup happened to miss. Keying it on "the cached entry   #
+    # matched but its host half was null" made it unreachable once any block #
+    # occupied slot zero: two device runs reached CompileBlock with RIP zero #
+    # and neither produced a line.                                          #
+    # ------------------------------------------------------------------ #
+    require_ordered(
+        call_witness_patch,
+        [
+            "FEXCore/Source/Interface/Core/JIT/BranchOps.cpp",
+            "ARMEmitter::ForwardLabel TargetIsUsable;",
+            "cbnz(ARMEmitter::Size::i64Bit, RipReg.X(), &TargetIsUsable)",
+            "BoxedWineNullExitSource",
+        ],
+        "BoxedVN null-exit marker keyed on the target",
+    )
+
+    # ------------------------------------------------------------------ #
+    # A guest target the host can never execute must become a guest fault,  #
+    # and no path may hand the dispatcher a null host pointer to branch to.  #
+    # ------------------------------------------------------------------ #
+    low_rip_hunk = call_witness_patch.split("low/invalid RIP")[-1].split(
+        "diff --git")[0]
+    # Only ADDED lines describe the resulting code; the removed `return 0;`
+    # is the whole point of the change.
+    for line in low_rip_hunk.splitlines():
+        if line.startswith("+") and "return 0;" in line:
+            raise SystemExit(
+                "a refused low guest RIP must not be returned to the "
+                "dispatcher as a null host pointer"
+            )
+    if "-    return 0;" not in call_witness_patch:
+        raise SystemExit(
+            "the low guest RIP refusal must stop returning a null host pointer"
+        )
+    require_ordered(
+        call_witness_patch,
+        [
+            "FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp",
+            "ARMEmitter::ForwardLabel NullCompiledBlock;",
+            "cbz(ARMEmitter::Size::i64Bit, TMP1, &NullCompiledBlock)",
+            "Pointers.ThreadStopHandlerSpillSRA",
+        ],
+        "BoxedVN dispatcher never branches to a null host target",
+    )
+
+    # ------------------------------------------------------------------ #
+    # A fatal translator ending and a guest exit_group are different        #
+    # outcomes. A contained host fault unwinds cleanly and returns true, so  #
+    # the return value alone cannot tell them apart -- gating on it left the #
+    # process alive with no exit status while the session showed a loading   #
+    # overlay, and gating on the action alone would overwrite a clean guest  #
+    # exit with a failure.                                                  #
+    # ------------------------------------------------------------------ #
+    backend_header = read(repository / "ios/runtime/include/BVNFEXBackend.h")
+    require_ordered(
+        backend_header,
+        [
+            "BVNFEXCPU64AdapterActionProcessExit = 4,",
+            "BVNFEXCPU64AdapterActionFatalExit = 5,",
+            "BVNFEXCPU64RunOutcomeYield = 0,",
+            "BVNFEXCPU64RunOutcomeGuestExit = 1,",
+            "BVNFEXCPU64RunOutcomeFatal = 2,",
+            "bool BVNFEXCPU64Run(void* process, void* thread,",
+        ],
+        "BoxedVN explicit translator run outcome",
+    )
+    adapter_fatal = read(repository / "ios/runtime/src/BVNFEXCPU64Adapter.mm")
+    if "adapter->lastAction = BVNFEXCPU64AdapterActionFatalExit;" not in adapter_fatal:
+        raise SystemExit(
+            "a contained host fault must report a fatal ending, not a guest "
+            "process exit"
+        )
+    # exit_group keeps its own, non-fatal action.
+    if "syscallNumber == 231" not in adapter_fatal:
+        raise SystemExit("exit_group handling went missing")
+    exit_group_at = adapter_fatal.index("syscallNumber == 231")
+    exit_group_tail = adapter_fatal[exit_group_at:exit_group_at + 200]
+    if "BVNFEXCPU64AdapterActionProcessExit" not in exit_group_tail:
+        raise SystemExit(
+            "a guest exit_group must stay an ordinary process exit"
+        )
+    require_ordered(
+        backend_source,
+        [
+            "BVNFEXCPU64AdapterActionFatalExit ||",
+            "const bool fatal =",
+            "publish(fatal ? BVNFEXCPU64RunOutcomeFatal",
+        ],
+        "BoxedVN fatal outcome is derived from the action",
+    )
+    platform_fatal = read(
+        repository / "source/emulation/cpu/normal/normalPlatformMultiThreaded.cpp")
+    require_ordered(
+        platform_fatal,
+        [
+            "BVNFEXCPU64RunOutcome outcome =",
+            "BVNFEXCPU64Run(process.get(), cpu->thread, &outcome);",
+            "if (outcome == BVNFEXCPU64RunOutcomeFatal) {",
+            'kfatalProcessExit64(cpu64, 127,',
+        ],
+        "BoxedVN fatal-only exit routing",
+    )
+    # A guest exit must never be converted into a fatal one.
+    fatal_at = platform_fatal.index("if (outcome == BVNFEXCPU64RunOutcomeFatal) {")
+    fatal_block = platform_fatal[fatal_at:fatal_at + 600]
+    if "BVNFEXCPU64RunOutcomeGuestExit" in fatal_block:
+        raise SystemExit(
+            "a normal guest exit must not reach the fatal exit path"
+        )
+
+    # The fixture covers the lowering shapes a device register allocation can
+    # take, and the return address read straight off the stack on entry.
+    highstack_shapes = read(
+        repository / "scripts/guest-probes/fex64-highstack-callret.asm")
+    require_ordered(
+        highstack_shapes,
+        [
+            "push_shapes:",
+            # The immediate read-back, guest side.
+            "mov r8, qword [rsp]",
+            # Value register is the address register.
+            "push rsp",
+            # Adjacent pushes, which the allocator fuses into a paired store.
+            "push r8",
+            "push r9",
+            # A dispatcher boundary between the CALL and its RET.
+            "jmp rax",
+            "leave",
+            "ret",
+        ],
+        "BoxedVN push overlap shape coverage",
+    )
+
+    # ------------------------------------------------------------------ #
     # The fault report has to say what the guest stack held, read back    #
     # independently of whatever the translated code loaded from it.       #
     # ------------------------------------------------------------------ #
@@ -2424,7 +2659,8 @@ def main() -> None:
     require_ordered(
         platform_source,
         [
-            "if (!BVNFEXCPU64Run(process.get(), cpu->thread)) {",
+            "BVNFEXCPU64Run(process.get(), cpu->thread, &outcome);",
+            "if (outcome == BVNFEXCPU64RunOutcomeFatal) {",
             'kfatalProcessExit64(cpu64, 127,',
             "cpu->thread->terminating = true;",
         ],

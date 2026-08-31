@@ -1,0 +1,456 @@
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -498,6 +498,56 @@
+    * real block for the target, so it costs nothing in steady state. Appended
+    * after the existing witness slots, past Pointers, so no offset moves. */
+   uint64_t BoxedWineNullExitSource {};
++
++  /* BoxedWine: the last N guest CALLs, retained and never printed until
++   * something goes wrong with a return.
++   *
++   * Device evidence, revision 59fe87a2: the guest stopped with RIP zero out of
++   * the epilogue of __libc_sigaction, and a checked re-read of its stack showed
++   * the frame chain intact -- every saved frame pointer correct -- while every
++   * return-address slot above it held zero. LEAVE restored the caller's frame
++   * pointer from 0x7ffffe1fe938 correctly, RET advanced RSP to 0x7ffffe1fe948
++   * correctly, and the slot it consumed, 0x7ffffe1fe940, really did contain
++   * zero. So the return address was either never stored by the CALL or was
++   * overwritten before the RET, and nothing recorded at RET time can tell those
++   * apart.
++   *
++   * That is what this ring is for. Each CALL that pushes a return address
++   * records what it intended to store, where it stored it in both address
++   * spaces, and what an immediate read-back of that same host address returned.
++   * A push that never landed is then distinguishable from a slot that was
++   * zeroed later, at the first failure, without a line per CALL.
++   *
++   * Fixed size, no allocation, and addressed by the JIT through a base register
++   * computed from STATE, so growing it cannot push any other field out of the
++   * store-immediate range. */
++  struct BoxedWineCallRecord {
++    // Guest entry of the block containing the CALL.
++    uint64_t SourceBlock;
++    // The return address the CALL meant to push.
++    uint64_t IntendedReturn;
++    // Canonical guest address of the slot it was pushed to, which is also the
++    // guest stack pointer after the push.
++    uint64_t SlotGuest;
++    // The host address that canonical slot resolves to.
++    uint64_t SlotHost;
++    // What an immediate load from SlotHost returned, right after the store.
++    uint64_t Readback;
++    // Packed: value size, the Push lowering's register-overlap case, and
++    // whether the call was direct, indirect, or had no known return block.
++    uint64_t Info;
++    // The guest stack pointer before the push.
++    uint64_t StackBefore;
++    // Monotonic sequence number, so a wrapped ring can still be ordered.
++    uint64_t Sequence;
++  };
++  static constexpr uint64_t BoxedWineCallRingCount = 16;
++  BoxedWineCallRecord BoxedWineCallRing[BoxedWineCallRingCount] {};
++  // Index of the most recently written record.
++  uint64_t BoxedWineCallRingIndex {};
++  // Monotonic count of CALLs recorded, and of read-backs that did not match.
++  uint64_t BoxedWineCallSequence {};
++  uint64_t BoxedWineCallAnomalies {};
+ };
+ static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
+ // The JIT stores to this slot with a scaled unsigned 12-bit immediate, whose
+@@ -505,6 +555,14 @@
+ // store if the frame ever grows past it.
+ static_assert(offsetof(CpuStateFrame, BoxedWineNullExitSource) + sizeof(uint64_t) <= 32760,
+               "the null-exit witness slot must stay inside the JIT store immediate range");
++// The CALL ring is reached through a base register the JIT computes from STATE,
++// not through a store immediate, so it carries no such bound. Its record size
++// must stay a power of two: the JIT scales the ring index by shifting.
++static_assert(sizeof(CpuStateFrame::BoxedWineCallRecord) == 64,
++              "the CALL record size must stay a power of two the JIT can shift by");
++static_assert((CpuStateFrame::BoxedWineCallRingCount &
++               (CpuStateFrame::BoxedWineCallRingCount - 1)) == 0,
++              "the CALL ring count must be a power of two so the index masks");
+ static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
+ static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
+                                                                                             "than architecture maximum 32768");
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -166,6 +166,19 @@
+     return (GuestAddress | GuestLowAliasBase) & ~GuestTopClearMask;
+   }
+ 
++  void SetBoxedWineCallWitness(bool Enabled) override {
++    // Published once, before any guest code is translated, so the decision is
++    // made at block-compilation time and costs no runtime branch.
++    BoxedWineCallWitness = Enabled;
++  }
++  bool GetBoxedWineCallWitness() const {
++    return BoxedWineCallWitness;
++  }
++
++  // Print the retained CALL ring, newest first. Bounded, and called only when a
++  // return has already gone wrong.
++  void BoxedWineDumpCallRing(FEXCore::Core::CpuStateFrame* Frame, const char* Reason);
++
+   // Bounded report for an indirect exit whose cached host target was null.
+   // Consumes CpuStateFrame::BoxedWineNullExitSource; does nothing when the
+   // emitted lookup did not set it, which is every working path.
+@@ -392,6 +405,9 @@
+   uint64_t GuestLowAliasLimit {};
+   // Bit field cleared to relocate the guest's top arena; zero preserves FEX.
+   uint64_t GuestTopClearMask {};
++  // When set, every CALL return-address push records what it stored and what an
++  // immediate read-back of the same host address returned.
++  bool BoxedWineCallWitness {};
+ 
+   uint32_t StrictSplitLockMutex {};
+ 
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -102,6 +102,14 @@
+     (void)Mask;
+   }
+ 
++  // BoxedWine: arm the CALL return-address witness. Every CALL then records
++  // what it pushed, where in both address spaces, and what an immediate
++  // read-back of that host address returned. Retained, never printed, until a
++  // return goes wrong. Off by default, so no other integration pays for it.
++  FEX_DEFAULT_VISIBILITY virtual void SetBoxedWineCallWitness(bool Enabled) {
++    (void)Enabled;
++  }
++
+   /**
+    * @brief Executes the supplied thread context on the current thread until a return is requested
+    */
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -326,6 +326,15 @@
+   [[nodiscard]]
+   ARMEmitter::Register AliasGuestAddress(ARMEmitter::Register Base);
+ 
++  // True when this pushed value is a CALL's return address.
++  [[nodiscard]]
++  bool IsCallReturnPush(IR::OrderedNodeWrapper Value) const;
++
++  // Record one CALL return-address push, and read the slot back through the
++  // same host address the store used. See CpuStateFrame::BoxedWineCallRing.
++  void EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter::Register SlotGuest, ARMEmitter::Register SlotHost,
++                             ARMEmitter::Register Src, ARMEmitter::Register AddrSrc);
++
+   // Applies the guest top-arena relocation in place. Every path that ORs the
+   // alias base itself, instead of calling AliasGuestAddress, must call this
+   // too, or that path would keep pointing at the unmappable canonical arena.
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -618,6 +618,108 @@
+   bic(ARMEmitter::Size::i64Bit, Reg, Reg, ClearMask);
+ }
+ 
++// True when this pushed value is a CALL's return address. CALLOp materialises
++// it with _EntrypointOffset; no other push does.
++bool Arm64JITCore::IsCallReturnPush(IR::OrderedNodeWrapper Value) const {
++  if (Value.IsImmediate()) {
++    return false;
++  }
++  const auto Header = IR->GetOp<IR::IROp_Header>(Value);
++  return Header->Op == IR::IROps::OP_ENTRYPOINTOFFSET || Header->Op == IR::IROps::OP_INLINEENTRYPOINTOFFSET;
++}
++
++// Record one CALL return-address push into the frame's ring, and read the slot
++// back through the same host address the store just used.
++//
++// Register budget at the call site: TMP4 holds the translated slot address and
++// must survive; Dst holds the canonical slot and is the guest's new stack
++// pointer, so it must not be touched. `Value` is either an allocated GPR or
++// TMP1, so TMP2 and TMP3 are always free -- and Value is written to memory
++// before TMP1 is used for anything, which makes TMP1 free after that point.
++void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter::Register SlotGuest,
++                                         ARMEmitter::Register SlotHost, ARMEmitter::Register Src,
++                                         ARMEmitter::Register AddrSrc) {
++  using Frame = FEXCore::Core::CpuStateFrame;
++  constexpr uint64_t RecordBytes = sizeof(Frame::BoxedWineCallRecord);
++  constexpr uint64_t RingMask = Frame::BoxedWineCallRingCount - 1;
++
++  // TMP2 = &BoxedWineCallRingIndex, TMP3 = the slot index for this record.
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP2, offsetof(Frame, BoxedWineCallRingIndex));
++  add(ARMEmitter::Size::i64Bit, TMP2, STATE, TMP2);
++  ldr(TMP3, TMP2, 0);
++  add(ARMEmitter::Size::i64Bit, TMP3, TMP3, 1);
++  and_(ARMEmitter::Size::i64Bit, TMP3, TMP3, RingMask);
++  str(TMP3, TMP2, 0);
++
++  // TMP2 = &BoxedWineCallRing[index].
++  lsl(ARMEmitter::Size::i64Bit, TMP3, TMP3, FEXCore::ilog2(RecordBytes));
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP2, offsetof(Frame, BoxedWineCallRing));
++  add(ARMEmitter::Size::i64Bit, TMP2, STATE, TMP2);
++  add(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3);
++
++  // Everything that needs Value goes first, so TMP1 is free afterwards even
++  // when Value is TMP1.
++  str(Value.X(), TMP2, offsetof(Frame::BoxedWineCallRecord, IntendedReturn));
++  str(SlotGuest.X(), TMP2, offsetof(Frame::BoxedWineCallRecord, SlotGuest));
++  str(SlotHost.X(), TMP2, offsetof(Frame::BoxedWineCallRecord, SlotHost));
++  // The stack pointer before the push, derived from the slot rather than read
++  // out of AddrSrc: the lowering may have written the result into the address
++  // register, in which case AddrSrc no longer holds the pre-push value. The
++  // slot is the post-push pointer by construction, so this is exact for every
++  // overlap shape.
++  add(ARMEmitter::Size::i64Bit, TMP3, SlotGuest, 8);
++  str(TMP3, TMP2, offsetof(Frame::BoxedWineCallRecord, StackBefore));
++
++  // The read-back, through the very same host address the store used.
++  ldur(TMP3, SlotHost, 0);
++  str(TMP3, TMP2, offsetof(Frame::BoxedWineCallRecord, Readback));
++
++  // The block that issued the CALL, and the lowering shape it took.
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry);
++  str(TMP1, TMP2, offsetof(Frame::BoxedWineCallRecord, SourceBlock));
++
++  // Info: value size in bits 0..7, then one bit per overlap case, so a
++  // register-allocation shape that only occurs on device is still named.
++  uint64_t Info = 8;
++  if (Src == AddrSrc) {
++    Info |= 1ULL << 8;
++  }
++  if (Src == SlotGuest) {
++    Info |= 1ULL << 9;
++  }
++  if (Value != Src) {
++    // The value was copied to a temporary because it overlapped the address or
++    // the result.
++    Info |= 1ULL << 10;
++  }
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Info);
++  str(TMP1, TMP2, offsetof(Frame::BoxedWineCallRecord, Info));
++
++  // A monotonic sequence number, so a wrapped ring can still be ordered.
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, offsetof(Frame, BoxedWineCallSequence));
++  add(ARMEmitter::Size::i64Bit, TMP1, STATE, TMP1);
++  ldr(TMP3, TMP1, 0);
++  add(ARMEmitter::Size::i64Bit, TMP3, TMP3, 1);
++  str(TMP3, TMP1, 0);
++  str(TMP3, TMP2, offsetof(Frame::BoxedWineCallRecord, Sequence));
++
++  // Count a read-back that did not return what was stored. The value is reread
++  // from the record rather than kept live, because TMP1 has been reused.
++  {
++    ARMEmitter::ForwardLabel Matched;
++    ldr(TMP1, TMP2, offsetof(Frame::BoxedWineCallRecord, IntendedReturn));
++    ldr(TMP3, TMP2, offsetof(Frame::BoxedWineCallRecord, Readback));
++    sub(TMP3, TMP3, TMP1);
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &Matched);
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, offsetof(Frame, BoxedWineCallAnomalies));
++    add(ARMEmitter::Size::i64Bit, TMP1, STATE, TMP1);
++    ldr(TMP3, TMP1, 0);
++    add(ARMEmitter::Size::i64Bit, TMP3, TMP3, 1);
++    str(TMP3, TMP1, 0);
++    (void)Bind(&Matched);
++  }
++}
++
+ ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(
+   IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType, uint8_t OffsetScale) {
+   // Every scalar and SSE load/store operand funnels through here. The logical
+@@ -1590,6 +1692,22 @@
+     case 8: stur(Value.X(), HostAddr, 0); break;
+     default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
+     }
++
++    /* A CALL's return-address push, and only that, is recorded.
++     *
++     * The pushed value of a CALL is an EntrypointOffset node -- the address of
++     * the instruction after the call, materialised relative to the block entry
++     * -- which nothing else pushes. That makes it an exact discriminator, so a
++     * guest `push rbp` costs nothing here while the push whose result a later
++     * RET consumes is fully described.
++     *
++     * The device evidence this exists for: a frame chain whose saved frame
++     * pointers were all correct and whose return addresses were all zero. The
++     * read-back below is what separates "the store never landed" from "the slot
++     * was zeroed afterwards", which nothing observable at RET time can do. */
++    if (ValueSize == 8 && CTX->GetBoxedWineCallWitness() && IsCallReturnPush(Op->Value)) {
++      EmitCallReturnWitness(Value, Dst, HostAddr, Src, AddrSrc);
++    }
+     return;
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -355,14 +355,27 @@
+     (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1Unusable);
+     (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
+ 
+-    /* Key matched but the cached host pointer is null. Because invalidation
+-     * zeroes the key, the only key a null-host entry can match is zero, so
+-     * reaching here means the guest target itself was zero. Name the block
+-     * that produced it; the dispatcher reports the rest once, bounded. */
+-    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry);
+-    str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, BoxedWineNullExitSource));
+-
+     (void)Bind(&L1Unusable);
++
++    /* Name the block whenever the target itself is invalid, not only when a
++     * null-host entry happened to match it.
++     *
++     * The first version of this witness stored the source only on the
++     * "key matched but host null" branch. That branch is narrow: once any
++     * block whose address indexes slot zero has been cached, a target of zero
++     * fails the KEY compare instead and takes the ordinary miss path, so the
++     * marker never fired. Two device runs entered CompileBlock with RIP zero
++     * and neither produced a line. Keying on the target instead makes it
++     * reliable, and it costs one compare on a path that is already a cache
++     * miss. */
++    {
++      ARMEmitter::ForwardLabel TargetIsUsable;
++      (void)cbnz(ARMEmitter::Size::i64Bit, RipReg.X(), &TargetIsUsable);
++      LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry);
++      str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, BoxedWineNullExitSource));
++      (void)Bind(&TargetIsUsable);
++    }
++
+     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+ 
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1432,15 +1432,52 @@
+ namespace {
+ std::atomic<uint32_t> BoxedWineNullExitReports {0};
+ constexpr uint32_t BoxedWineNullExitReportLimit = 8;
++std::atomic<uint32_t> BoxedWineCallRingDumps {0};
++constexpr uint32_t BoxedWineCallRingDumpLimit = 4;
+ } // namespace
+ 
++/* The retained CALL history, printed only because a return has already gone
++ * wrong. Newest first, at most one line per record, at most a few dumps per
++ * run: enough to name the CALL whose return address the failing RET was
++ * supposed to consume, and to say whether that CALL's own read-back agreed
++ * with what it stored. */
++void ContextImpl::BoxedWineDumpCallRing(FEXCore::Core::CpuStateFrame* Frame, const char* Reason) {
++  if (!Frame) {
++    return;
++  }
++  if (BoxedWineCallRingDumps.fetch_add(1, std::memory_order_relaxed) >= BoxedWineCallRingDumpLimit) {
++    return;
++  }
++  LogMan::Msg::EFmt("BOXEDWINE_FEX64_CALL_RING reason={} recorded={} anomalies={} armed={}", Reason,
++                    Frame->BoxedWineCallSequence, Frame->BoxedWineCallAnomalies, BoxedWineCallWitness ? 1 : 0);
++  const uint64_t Count = FEXCore::Core::CpuStateFrame::BoxedWineCallRingCount;
++  for (uint64_t Step = 0; Step < Count; ++Step) {
++    // Newest first.
++    const uint64_t Index = (Frame->BoxedWineCallRingIndex + Count - Step) % Count;
++    const auto& Record = Frame->BoxedWineCallRing[Index];
++    if (Record.Sequence == 0) {
++      continue;
++    }
++    LogMan::Msg::EFmt("BOXEDWINE_FEX64_CALL_RECORD seq={} source_block={:#x} intended_return={:#x} "
++                      "slot_guest={:#x} slot_host={:#x} readback={:#x} match={} stack_before={:#x} "
++                      "value_size={} overlap_src_addr={} overlap_src_dst={} value_copied={}",
++                      Record.Sequence, Record.SourceBlock, Record.IntendedReturn, Record.SlotGuest, Record.SlotHost,
++                      Record.Readback, Record.Readback == Record.IntendedReturn ? 1 : 0, Record.StackBefore,
++                      Record.Info & 0xFF, (Record.Info >> 8) & 1, (Record.Info >> 9) & 1, (Record.Info >> 10) & 1);
++  }
++}
++
+ void ContextImpl::BoxedWineReportNullExitTarget(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+   if (!Frame) {
+     return;
+   }
+   const uint64_t Source = Frame->BoxedWineNullExitSource;
+   Frame->BoxedWineNullExitSource = 0;
+-  if (Source == 0) {
++  /* Report whenever the target is one the guest can never execute, whether or
++   * not the emitted lookup managed to name the block that produced it. A
++   * missing source is itself worth saying: it means the exit came from
++   * somewhere that does not set the witness. */
++  if (Source == 0 && GuestRIP >= 0x1000) {
+     return;
+   }
+   if (BoxedWineNullExitReports.fetch_add(1, std::memory_order_relaxed) >= BoxedWineNullExitReportLimit) {
+@@ -1477,6 +1514,10 @@
+                     PoppedSlot, GuestToHostAddress(PoppedSlot), GuestRBP, GuestToHostAddress(GuestRBP), GuestRBP + 8,
+                     GuestToHostAddress(GuestRBP + 8), CachedGuest == GuestRIP ? "l1-null-host" : "l1-miss",
+                     BoxedWineNullExitReports.load(std::memory_order_relaxed));
++
++  /* And the CALL that was supposed to have written the slot this return
++   * consumed. Bounded, and only reached because a return already failed. */
++  BoxedWineDumpCallRing(Frame, "null-exit-target");
+ }
+ 
+ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+@@ -1616,8 +1657,23 @@
+    * blocks before SEH unwinds. Returning 0 here raises C0000005 to the
+    * guest immediately so the first AV is the only AV. */
+   if (GuestRIP < 0x10000) {
+-    LogMan::Msg::IFmt("[iOS] CompileBlock: REFUSING low/invalid RIP={:#x}", GuestRIP);
+-    return 0;
++    /* BoxedWine: returning 0 here was itself a branch to host address zero.
++     *
++     * The comment above assumes an ARM64EC host, where returning null raises
++     * C0000005 through SEH. This backend has no such handler: the dispatcher
++     * branches to whatever CompileBlock returned, so a refusal produced exactly
++     * the crash it was meant to prevent -- host PC 0, fault address 0, with the
++     * guest RIP already lost. Two device runs ended that way.
++     *
++     * Let the ordinary path decode it instead. The guest has no executable
++     * mapping at a null-page address, so the decoder reports NOEXEC and
++     * NoExecOp raises a synchronous guest SIGSEGV -- the guest fault this
++     * always should have been. The dispatcher never sees a null host pointer,
++     * and the runaway the original comment worried about is bounded by the
++     * NOEXEC repeat guard below and by the guest process dying of its own
++     * fault. */
++    LogMan::Msg::EFmt("[iOS] CompileBlock: low/invalid RIP={:#x} -> guest fault", GuestRIP);
++    BoxedWineDumpCallRing(Frame, "compile-low-rip");
+   }
+ 
+ #ifdef FEX_IOS_HOST
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -245,6 +245,8 @@
+   (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &CompileSingleStep);
+ 
+   ARMEmitter::ForwardLabel NoBlock;
++  // Taken when CompileBlock hands back a null host pointer; see its use below.
++  ARMEmitter::ForwardLabel NullCompiledBlock;
+ 
+   /* iOS-Mythic 2026-07-03 perf: probe the L1 cache FIRST at loop top.
+    *
+@@ -454,10 +456,31 @@
+       FillStaticRegs();
+     });
+ 
++    /* BoxedWine: never branch to a null host pointer.
++     *
++     * CompileBlock can return zero -- it does so deliberately for a guest RIP
++     * it refuses, and it returns zero on any internal failure. Branching to it
++     * lands the host at PC 0 with the guest RIP already discarded, which is
++     * exactly the crash two device runs ended with and the hardest possible
++     * state to diagnose. Stop this thread instead: the frontend has already
++     * said why, and the integration turns a stopped thread into an ordinary
++     * guest process exit. The spill entry is used because the static registers
++     * are live here, having just been refilled.
++     */
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NullCompiledBlock);
++
+     // Jump to the compiled block
+     br(TMP1);
+   }
+ 
++  {
++    (void)Bind(&NullCompiledBlock);
++    // The stop handler spills the static registers itself, so they are handed
++    // over live exactly as every other entry to it expects.
++    ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.ThreadStopHandlerSpillSRA));
++    br(TMP1);
++  }
++
+   {
+     (void)Bind(&CompileSingleStep);
+ 

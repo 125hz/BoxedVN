@@ -119,6 +119,10 @@ apply_patch fex-boxedwine-low-address-alias.patch
 # published. Restores the missing null-host-target guard in the emitted L1
 # lookup, so an indirect exit can never branch to host address zero.
 apply_patch fex-boxedwine-null-exit-target.patch
+# Depends on the null-exit patch above: it extends the same witness slot with a
+# CALL history ring and an immediate read-back of every pushed return address,
+# which is what separates a push that never landed from a slot zeroed later.
+apply_patch fex-boxedwine-call-return-witness.patch
 # Depends on the alias patch above: it asks the context whether the guest is
 # hosted at an aliased address before deciding that a descriptor-table read
 # would be translated as if it were guest memory.

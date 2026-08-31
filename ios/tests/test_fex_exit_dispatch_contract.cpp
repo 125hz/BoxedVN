@@ -158,3 +158,128 @@ BOXEDVN_TEST(fex_nested_call_frames_walk_back_out_in_order) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The CALL return-address push, and the read-back that says whether it landed.
+//
+// The frame the second device pair reported: RSP 0x7ffffe1fe948 after the RET,
+// the consumed slot 0x7ffffe1fe940 holding zero, and the saved frame pointer
+// below it at 0x7ffffe1fe938 holding 0x7ffffe1ff1b8 -- correct.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr std::uint64_t kDeviceReturnSlot = 0x7ffffe1fe940ULL;
+constexpr std::uint64_t kDeviceStackAfterRet = 0x7ffffe1fe948ULL;
+constexpr std::uint64_t kPlausibleReturn = 0x7a4004d4bcULL;
+
+constexpr FexCallReturnPush devicePush(std::uint64_t readback) {
+    return FexCallReturnPush {
+        kPlausibleReturn,
+        kDeviceReturnSlot,
+        guestToHostAddress(kDeviceReturnSlot),
+        readback,
+    };
+}
+}  // namespace
+
+BOXEDVN_TEST(fex_call_push_readback_separates_the_two_causes) {
+    // A push that landed. A slot that later reads zero is then somebody else's
+    // write, and the CALL is exonerated.
+    CHECK(classifyCallReturnPush(devicePush(kPlausibleReturn)) ==
+          FexCallPushVerdict::Stored);
+    // A push that did not land at all: the exact shape the device stack shows.
+    CHECK(classifyCallReturnPush(devicePush(0)) ==
+          FexCallPushVerdict::NotStored);
+    // A push that landed somewhere, but not with the value it named.
+    CHECK(classifyCallReturnPush(devicePush(0x1122334455667788ULL)) ==
+          FexCallPushVerdict::Mismatched);
+}
+
+BOXEDVN_TEST(fex_call_push_record_is_well_formed_or_is_itself_the_anomaly) {
+    CHECK(fexCallReturnPushIsWellFormed(devicePush(kPlausibleReturn)));
+    // A CALL return address is the instruction after the call and can never be
+    // zero, so a record claiming otherwise is a defect in the witness, not
+    // evidence about the stack.
+    FexCallReturnPush broken = devicePush(0);
+    broken.intendedReturn = 0;
+    CHECK(!fexCallReturnPushIsWellFormed(broken));
+    // Nor can the slot it names be null in either address space.
+    broken = devicePush(0);
+    broken.slotHost = 0;
+    CHECK(!fexCallReturnPushIsWellFormed(broken));
+}
+
+BOXEDVN_TEST(fex_call_push_slot_matches_the_stack_pointer_after_the_push) {
+    // The slot a CALL pushes to is the stack pointer it leaves behind, and the
+    // slot the matching RET consumes is one qword below the pointer IT leaves
+    // behind. Those have to be the same address or the witness is describing a
+    // different push than the one that failed.
+    CHECK_EQ(fexPoppedSlotForStackPointer(kDeviceStackAfterRet),
+             kDeviceReturnSlot);
+    const auto push = devicePush(kPlausibleReturn);
+    CHECK_EQ(push.slotGuest, fexPoppedSlotForStackPointer(kDeviceStackAfterRet));
+    CHECK_EQ(push.slotHost, guestToHostAddress(push.slotGuest));
+}
+
+BOXEDVN_TEST(fex_push_overlap_shapes_round_trip_through_the_packed_info) {
+    // Every shape the Push lowering can take has to be recoverable from the
+    // record, because a register-allocation shape that only occurs on device is
+    // exactly what a host test cannot reproduce.
+    struct Shape {
+        bool valueIsAddress;
+        bool valueIsResult;
+        bool valueCopied;
+    };
+    const Shape shapes[] = {
+        {false, false, false},
+        {true, false, true},
+        {false, true, true},
+        {true, true, true},
+    };
+    for (const Shape& shape : shapes) {
+        const std::uint64_t info = fexPushInfo(
+            8, shape.valueIsAddress, shape.valueIsResult, shape.valueCopied);
+        CHECK_EQ(fexPushInfoValueSize(info), std::uint64_t{8});
+        CHECK(fexPushInfoHas(info, FexPushOverlap::ValueIsAddress) ==
+              shape.valueIsAddress);
+        CHECK(fexPushInfoHas(info, FexPushOverlap::ValueIsResult) ==
+              shape.valueIsResult);
+        CHECK(fexPushInfoHas(info, FexPushOverlap::ValueCopied) ==
+              shape.valueCopied);
+    }
+    // The size field does not collide with the overlap bits.
+    const std::uint64_t info = fexPushInfo(4, true, true, true);
+    CHECK_EQ(fexPushInfoValueSize(info), std::uint64_t{4});
+}
+
+BOXEDVN_TEST(fex_null_guest_target_takes_the_guest_fault_path) {
+    // Refusing to compile a null-page RIP is right; handing the dispatcher a
+    // null host pointer to branch to instead is what turned that refusal into a
+    // host crash at PC 0. The disposition is a guest fault, never a compile.
+    for (std::uint64_t rip : {std::uint64_t{0}, std::uint64_t{0x8},
+                              std::uint64_t{0x100}, std::uint64_t{0xfff}}) {
+        CHECK(dispositionForGuestTarget(rip) ==
+              FexInvalidTargetDisposition::GuestFault);
+        CHECK(dispositionForGuestTarget(rip) !=
+              FexInvalidTargetDisposition::Compile);
+    }
+    // Ordinary guest addresses are unaffected, on every lane.
+    for (std::uint64_t rip : {std::uint64_t{0x1000}, std::uint64_t{0x10000},
+                              std::uint64_t{0x7a4004d4bcULL},
+                              std::uint64_t{0x7ffffe1fe940ULL}}) {
+        CHECK(dispositionForGuestTarget(rip) ==
+              FexInvalidTargetDisposition::Compile);
+    }
+}
+
+BOXEDVN_TEST(fex_a_null_host_target_is_never_executable) {
+    // Whatever produced it -- an empty cache slot, a refused compile, an
+    // internal failure -- a null host pointer is never something to branch to.
+    CHECK(!fexHostTargetIsExecutable(0));
+    CHECK(fexHostTargetIsExecutable(0x00000001a45adf8cULL));
+    // And the dispatcher fallback target itself must be executable, or the
+    // miss path would be as bad as the hit path it replaced.
+    const auto exit = resolveIndirectExit(emptyLookupCacheEntry(), 0,
+                                          kDispatcherLoopTop);
+    CHECK(fexHostTargetIsExecutable(exit.hostTarget));
+}

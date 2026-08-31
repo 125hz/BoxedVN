@@ -127,6 +127,128 @@ constexpr std::uint64_t fexPoppedSlotForStackPointer(std::uint64_t rsp) noexcept
     return rsp - 8;
 }
 
+// ---------------------------------------------------------------------------
+// What one guest CALL's return-address push records, and what makes a return
+// slot trustworthy.
+//
+// Device evidence, revision 59fe87a2: the guest stopped with RIP zero out of
+// the epilogue of __libc_sigaction, and a checked re-read of its stack showed
+// the frame chain intact -- every saved frame pointer correct -- while every
+// return-address slot above it held zero. LEAVE and RET both did exactly the
+// right arithmetic. So either the CALL never stored the return address, or
+// something zeroed the slot before the RET, and nothing observable at RET time
+// separates those two.
+//
+// The push therefore reads its own store back, immediately, through the same
+// translated host address it just wrote. That single fact is the discriminator.
+// ---------------------------------------------------------------------------
+
+struct FexCallReturnPush final {
+    // The return address the CALL meant to push.
+    std::uint64_t intendedReturn;
+    // Canonical guest address of the slot, which is the stack pointer after
+    // the push.
+    std::uint64_t slotGuest;
+    // The host address that canonical slot resolves to.
+    std::uint64_t slotHost;
+    // What an immediate load from slotHost returned.
+    std::uint64_t readback;
+};
+
+enum class FexCallPushVerdict {
+    // The slot holds what the CALL stored. A later zero is somebody else's
+    // write, not a lost push.
+    Stored,
+    // The push did not land: the store never reached the slot it named.
+    NotStored,
+    // The slot holds something else entirely.
+    Mismatched,
+};
+
+constexpr FexCallPushVerdict classifyCallReturnPush(
+    const FexCallReturnPush& push) noexcept {
+    if (push.readback == push.intendedReturn) {
+        return FexCallPushVerdict::Stored;
+    }
+    return push.readback == 0 ? FexCallPushVerdict::NotStored
+                              : FexCallPushVerdict::Mismatched;
+}
+
+// A CALL's return address is never zero: it is the address of the instruction
+// after the call. A recorded push claiming otherwise is itself the anomaly.
+constexpr bool fexCallReturnPushIsWellFormed(
+    const FexCallReturnPush& push) noexcept {
+    return push.intendedReturn != 0 && push.slotGuest != 0 &&
+           push.slotHost != 0;
+}
+
+// The Push lowering copies the value into a temporary when it would otherwise
+// be destroyed by the address or result write. These are the shapes that can
+// occur, and the bits the witness packs them into.
+enum class FexPushOverlap : std::uint64_t {
+    // Value, address and result are all distinct.
+    None = 0,
+    // The value register is also the address register.
+    ValueIsAddress = 1ULL << 8,
+    // The value register is also the result register.
+    ValueIsResult = 1ULL << 9,
+    // The lowering copied the value to a temporary before storing it.
+    ValueCopied = 1ULL << 10,
+};
+
+constexpr std::uint64_t fexPushInfo(std::uint64_t valueSizeBytes,
+                                    bool valueIsAddress, bool valueIsResult,
+                                    bool valueCopied) noexcept {
+    std::uint64_t info = valueSizeBytes & 0xFF;
+    if (valueIsAddress) {
+        info |= static_cast<std::uint64_t>(FexPushOverlap::ValueIsAddress);
+    }
+    if (valueIsResult) {
+        info |= static_cast<std::uint64_t>(FexPushOverlap::ValueIsResult);
+    }
+    if (valueCopied) {
+        info |= static_cast<std::uint64_t>(FexPushOverlap::ValueCopied);
+    }
+    return info;
+}
+
+constexpr std::uint64_t fexPushInfoValueSize(std::uint64_t info) noexcept {
+    return info & 0xFF;
+}
+
+constexpr bool fexPushInfoHas(std::uint64_t info,
+                              FexPushOverlap overlap) noexcept {
+    return (info & static_cast<std::uint64_t>(overlap)) != 0;
+}
+
+// ---------------------------------------------------------------------------
+// What a guest target the host can never execute must become.
+// ---------------------------------------------------------------------------
+
+enum class FexInvalidTargetDisposition {
+    // Compile it. Only ever correct for an address the guest can execute.
+    Compile,
+    // Raise a synchronous guest fault at that address, which is what a real
+    // kernel does when a program jumps into an unmapped page.
+    GuestFault,
+};
+
+// A guest RIP inside the null page is not code and never will be. It must not
+// be compiled, and refusing it must not hand the dispatcher a null host
+// pointer to branch to -- that is a host crash at PC 0 with the guest RIP
+// already discarded, which is how two device runs ended.
+constexpr FexInvalidTargetDisposition dispositionForGuestTarget(
+    std::uint64_t guestRIP) noexcept {
+    return guestRIP < 0x1000 ? FexInvalidTargetDisposition::GuestFault
+                             : FexInvalidTargetDisposition::Compile;
+}
+
+// A compiled-block lookup that produced no host code. Branching to it is never
+// correct, whatever produced it.
+constexpr bool fexHostTargetIsExecutable(std::uint64_t hostTarget) noexcept {
+    return hostTarget != 0;
+}
+
 }  // namespace boxedvn
 
 #endif  // BOXEDVN_FEX_EXIT_DISPATCH_CONTRACT_H
