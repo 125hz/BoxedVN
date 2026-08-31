@@ -1,6 +1,8 @@
 #include "boxedvn_test.h"
 #include "guest_mmap_placement.h"
 
+#include <cstdint>
+
 using namespace boxedvn;
 
 namespace {
@@ -22,7 +24,8 @@ bool insideWindow(std::uint64_t address, std::uint64_t length) {
 GuestMmapRequest makeRequest(std::uint64_t address, std::uint64_t length,
                              std::uint32_t protection, bool fixed,
                              bool fixedNoReplace, bool nativeIdentity,
-                             bool anyAccessiblePage, bool anyMappedPage) {
+                             bool anyAccessiblePage, bool anyMappedPage,
+                             bool anonymous = false) {
     GuestMmapRequest request;
     request.address = address;
     request.length = length;
@@ -34,6 +37,7 @@ GuestMmapRequest makeRequest(std::uint64_t address, std::uint64_t length,
         !nativeIdentity || insideWindow(address, length);
     request.exactRangeFree = !anyAccessiblePage;
     request.exactRangeUnmapped = !anyMappedPage;
+    request.anonymous = anonymous;
     return request;
 }
 
@@ -87,16 +91,105 @@ BOXEDVN_TEST(guest_mmap_no_replace_never_consumes_the_high_window) {
     // A low, native-ineligible exact request cannot be satisfied at the
     // address demanded. It must fail outright: relocating is forbidden by the
     // flag, and drawing from the bounded window would consume the only region
-    // the guest can execute from.
+    // the guest can execute from. A file-backed reservation cannot be recorded
+    // as metadata either, so it is refused -- with -ENOMEM, because the range
+    // is empty and it is the address that cannot be provided.
     const auto request =
         makeRequest(0x10000, 0x67ff0000, kProtNone,
                     /*fixed*/ false, /*fixedNoReplace*/ true,
                     /*nativeIdentity*/ true,
                     /*anyAccessiblePage*/ false, /*anyMappedPage*/ false);
     const auto placement = chooseGuestMmapPlacement(request);
-    CHECK(placement == GuestMmapPlacement::FailExists);
+    CHECK(placement == GuestMmapPlacement::FailNoMemory);
     CHECK(placement != GuestMmapPlacement::RelocateHighWindow);
+    CHECK(placement != GuestMmapPlacement::ReserveSparse);
     CHECK(guestMmapPlacementIsFailure(placement));
+}
+
+BOXEDVN_TEST(guest_mmap_no_replace_on_an_unhostable_free_range_is_enomem) {
+    // The exact request the device shows repeating: MAP_FIXED_NOREPLACE,
+    // anonymous, accessible, on a completely unmapped range no hostable lane
+    // covers. EEXIST would assert an occupant that is not there, and a
+    // placement search answers EEXIST by stepping one granule and asking
+    // again -- 4,194,305 times in the run that produced this test, with the
+    // guest RIP parked on the syscall in the libc mmap wrapper throughout.
+    const std::uint32_t accessible[] = {0x1u, 0x2u, 0x3u, 0x4u, 0x5u, 0x7u};
+    for (std::uint32_t protection : accessible) {
+        const auto request =
+            makeRequest(0x300000000ULL, 0x10000, protection,
+                        /*fixed*/ false, /*fixedNoReplace*/ true,
+                        /*nativeIdentity*/ true,
+                        /*anyAccessiblePage*/ false, /*anyMappedPage*/ false,
+                        /*anonymous*/ true);
+        const auto placement = chooseGuestMmapPlacement(request);
+        CHECK(placement == GuestMmapPlacement::FailNoMemory);
+        CHECK(placement != GuestMmapPlacement::FailExists);
+        CHECK(placement != GuestMmapPlacement::ReserveSparse);
+        CHECK(placement != GuestMmapPlacement::RelocateHighWindow);
+        CHECK(guestMmapPlacementIsFailure(placement));
+    }
+}
+
+BOXEDVN_TEST(guest_mmap_no_replace_walk_never_reports_a_phantom_occupant) {
+    // A search stepping across the unhostable region must be told the same
+    // true thing at every step, and never that the range is occupied. If any
+    // step answered EEXIST the walk would continue; ENOMEM ends it at the
+    // first probe.
+    const std::uint64_t step = 0x10000;
+    int probes = 0;
+    for (std::uint64_t address = 0x300000000ULL;
+         address < 0x300000000ULL + 64 * step; address += step) {
+        const auto request =
+            makeRequest(address, step, kProtReadWrite, /*fixed*/ false,
+                        /*fixedNoReplace*/ true, /*nativeIdentity*/ true,
+                        /*anyAccessiblePage*/ false, /*anyMappedPage*/ false,
+                        /*anonymous*/ true);
+        CHECK(chooseGuestMmapPlacement(request) ==
+              GuestMmapPlacement::FailNoMemory);
+        ++probes;
+    }
+    CHECK(probes == 64);
+}
+
+BOXEDVN_TEST(guest_mmap_no_replace_still_reports_a_real_occupant_as_existing) {
+    // Occupancy is the stronger fact and keeps its own answer, whether the
+    // range is hostable or not. Only an EMPTY unhostable range became ENOMEM.
+    const auto outside =
+        makeRequest(0x300000000ULL, 0x10000, kProtReadWrite, /*fixed*/ false,
+                    /*fixedNoReplace*/ true, /*nativeIdentity*/ true,
+                    /*anyAccessiblePage*/ false, /*anyMappedPage*/ true,
+                    /*anonymous*/ true);
+    CHECK(chooseGuestMmapPlacement(outside) == GuestMmapPlacement::FailExists);
+
+    const auto inside =
+        makeRequest(kWindowStart + 0x40000, 0x10000, kProtReadWrite,
+                    /*fixed*/ false, /*fixedNoReplace*/ true,
+                    /*nativeIdentity*/ true,
+                    /*anyAccessiblePage*/ false, /*anyMappedPage*/ true,
+                    /*anonymous*/ true);
+    CHECK(chooseGuestMmapPlacement(inside) == GuestMmapPlacement::FailExists);
+}
+
+BOXEDVN_TEST(guest_mmap_sparse_address_space_behaviour_is_unchanged) {
+    // A sparse (non-identity) address space hosts every canonical address, so
+    // no request in it can reach the identity-window rules at all. This is
+    // what the 32-bit guest and every helper process runs with.
+    const bool noReplaceChoices[] = {false, true};
+    const std::uint32_t protections[] = {kProtNone, kProtReadWrite};
+    for (bool fixedNoReplace : noReplaceChoices) {
+        for (std::uint32_t protection : protections) {
+            const auto request = makeRequest(
+                0x10000, 0x67ff0000, protection, /*fixed*/ false,
+                fixedNoReplace, /*nativeIdentity*/ false,
+                /*anyAccessiblePage*/ false, /*anyMappedPage*/ false,
+                /*anonymous*/ true);
+            const auto placement = chooseGuestMmapPlacement(request);
+            CHECK(placement == (fixedNoReplace
+                                    ? GuestMmapPlacement::MapExactNoReplace
+                                    : GuestMmapPlacement::MapExact));
+            CHECK(!guestMmapPlacementIsFailure(placement));
+        }
+    }
 }
 
 BOXEDVN_TEST(guest_mmap_ordinary_hint_behaviour_is_unchanged) {

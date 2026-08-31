@@ -71,20 +71,45 @@ BOXEDVN_TEST(an_accessible_high_range_is_still_refused) {
     // Anything the guest could read, write or execute needs an identity-
     // mappable address. A sparse reservation has no backing store at all, so
     // it can never stand in for one.
+    //
+    // The refusal is -ENOMEM, not -EEXIST. The range is empty; what cannot be
+    // provided is the address. A caller searching for somewhere to put an
+    // accessible mapping reads EEXIST as "this spot is taken" and steps to the
+    // next one, and across a region where every address is equally unhostable
+    // that never terminates: the device log shows 4,194,305 such requests,
+    // 4,193,283 of them outside every hostable lane, 4,194,054 refused, with
+    // the guest RIP never leaving the syscall in the libc mmap wrapper.
     for (std::uint32_t protection : {1u, 2u, 3u, 4u, 5u, 7u}) {
         GuestMmapRequest request =
             highReservation(kWineReservation, 0x10000);
         request.protection = protection;
+        const GuestMmapPlacement placement = chooseGuestMmapPlacement(request);
+        CHECK(placement == GuestMmapPlacement::FailNoMemory);
+        CHECK(placement != GuestMmapPlacement::FailExists);
+        CHECK(placement != GuestMmapPlacement::ReserveSparse);
+        CHECK(guestMmapPlacementIsFailure(placement));
+    }
+}
+
+BOXEDVN_TEST(an_accessible_high_range_refusal_never_moves_with_the_address) {
+    // Every step of a search across the unhostable region gets the same
+    // answer, so the search cannot be encouraged to continue by any of them.
+    for (std::uint64_t step = 0; step < 32; ++step) {
+        GuestMmapRequest request = highReservation(
+            kWineReservation + step * 0x10000ULL, 0x10000);
+        request.protection = 3;
         CHECK(chooseGuestMmapPlacement(request) ==
-              GuestMmapPlacement::FailExists);
+              GuestMmapPlacement::FailNoMemory);
     }
 }
 
 BOXEDVN_TEST(a_file_backed_high_reservation_is_refused) {
-    // A file mapping has contents to read; there is nothing to reserve.
+    // A file mapping has contents to read; there is nothing to reserve. The
+    // range is still empty, so the refusal is -ENOMEM for the same reason.
     GuestMmapRequest request = highReservation(kWineReservation, 0x10000);
     request.anonymous = false;
-    CHECK(chooseGuestMmapPlacement(request) == GuestMmapPlacement::FailExists);
+    CHECK(chooseGuestMmapPlacement(request) ==
+          GuestMmapPlacement::FailNoMemory);
 }
 
 BOXEDVN_TEST(a_reservation_inside_the_native_window_is_mapped_normally) {
@@ -289,4 +314,94 @@ BOXEDVN_TEST(sparse_reservation_release_spanning_several_intervals) {
     CHECK(intervals.release(kReservationPage, 0x210));
     CHECK(intervals.count() == 0);
     CHECK(intervals.pages() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// The follow-up operations a guest performs inside a reservation it was
+// granted. Granting the reservation is only correct if the guest can then do
+// the valid things with that range without either being handed an invalid
+// host pointer or being told something that makes it retry without end.
+// ---------------------------------------------------------------------------
+
+BOXEDVN_TEST(a_commit_inside_a_granted_reservation_is_never_sparse) {
+    // Wine commits accessible subranges inside an arena it reserved. A commit
+    // is accessible memory, and accessible memory is never represented by a
+    // metadata-only reservation whatever the surrounding range is.
+    GuestMmapRequest commit = highReservation(kWineReservation, 0x10000);
+    commit.protection = 3;
+    commit.exactRangeUnmapped = false;  // the reservation occupies it
+    commit.exactRangeFree = true;       // but nothing accessible is there
+    CHECK(chooseGuestMmapPlacement(commit) != GuestMmapPlacement::ReserveSparse);
+    // Occupied by the reservation, so MAP_FIXED_NOREPLACE is EEXIST: that is
+    // the truth about the range, and it is what the flag exists to report.
+    CHECK(chooseGuestMmapPlacement(commit) == GuestMmapPlacement::FailExists);
+
+    // The same commit as a destructive MAP_FIXED replaces the reservation,
+    // which is exactly how a guest commits inside its own arena.
+    commit.fixedNoReplace = false;
+    commit.fixed = true;
+    CHECK(chooseGuestMmapPlacement(commit) == GuestMmapPlacement::MapExact);
+    CHECK(chooseGuestMmapPlacement(commit) != GuestMmapPlacement::ReserveSparse);
+}
+
+BOXEDVN_TEST(a_hint_inside_a_granted_reservation_is_taken_where_hostable) {
+    // A bare hint ignores a PROT_NONE reservation on purpose: Wine maps
+    // committed pages at hint addresses inside its own arenas, and relocating
+    // those would desynchronise its view tree.
+    GuestMmapRequest hint = highReservation(kWineReservation, 0x10000);
+    hint.fixedNoReplace = false;
+    hint.protection = 3;
+    hint.exactRangeUnmapped = false;
+    hint.exactRangeFree = true;
+    hint.exactRangeAllowed = true;
+    CHECK(chooseGuestMmapPlacement(hint) == GuestMmapPlacement::MapExact);
+}
+
+BOXEDVN_TEST(a_reservation_re_requested_after_release_is_granted_again) {
+    // Releasing the interval is the unmap. The address is then reservable
+    // again, and the decision has no memory of the earlier grant.
+    const GuestMmapRequest request =
+        highReservation(kWineReservation, 0x1ff0000);
+    CHECK(chooseGuestMmapPlacement(request) ==
+          GuestMmapPlacement::ReserveSparse);
+    GuestMmapRequest occupied = request;
+    occupied.exactRangeUnmapped = false;
+    CHECK(chooseGuestMmapPlacement(occupied) == GuestMmapPlacement::FailExists);
+    CHECK(chooseGuestMmapPlacement(request) ==
+          GuestMmapPlacement::ReserveSparse);
+}
+
+BOXEDVN_TEST(no_refused_probe_ever_reaches_an_allocator) {
+    // Neither refusal may consume a high-window allocation: the window is the
+    // only region a direct FEX guest can execute from, and a search that
+    // probes thousands of addresses would drain it.
+    GuestMmapRequest accessible = highReservation(kWineReservation, 0x10000);
+    accessible.protection = 3;
+    CHECK(guestMmapPlacementIsFailure(chooseGuestMmapPlacement(accessible)));
+
+    GuestMmapRequest occupied = highReservation(kWineReservation, 0x10000);
+    occupied.exactRangeUnmapped = false;
+    CHECK(guestMmapPlacementIsFailure(chooseGuestMmapPlacement(occupied)));
+
+    GuestMmapRequest probe = highReservation(kWineReservation, 0x10000);
+    probe.fixedNoReplace = false;
+    CHECK(chooseGuestMmapPlacement(probe) == GuestMmapPlacement::FailNoMemory);
+    CHECK(guestMmapPlacementIsFailure(chooseGuestMmapPlacement(probe)));
+}
+
+BOXEDVN_TEST(sparse_reservation_release_then_commit_leaves_no_reservation) {
+    // munmap through a reservation, then a real mapping in the hole: the hole
+    // must be genuinely free, so an exact no-replace mapping in it succeeds.
+    ReservationIntervals intervals;
+    CHECK(intervals.reserve(kReservationPage, 0x100));
+    CHECK(intervals.release(kReservationPage + 0x40, 0x20));
+    CHECK(!intervals.overlaps(kReservationPage + 0x40, 0x20));
+
+    GuestMmapRequest commit =
+        highReservation((kReservationPage + 0x40) << 12, 0x20000);
+    commit.protection = 3;
+    commit.exactRangeAllowed = true;   // inside the window after relocation
+    commit.exactRangeUnmapped = true;  // the hole really is empty
+    CHECK(chooseGuestMmapPlacement(commit) ==
+          GuestMmapPlacement::MapExactNoReplace);
 }

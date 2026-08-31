@@ -387,7 +387,12 @@ static void k64InvalidateProcessFetchCaches(KProcess* process) {
     }
 }
 
+// Monotonic across every address space this image ever builds, so an exec
+// replacement is never confused with the address space it replaced.
+static std::atomic<U64> g_addressSpaceGeneration {1};
+
 KMemory64::KMemory64(KProcess* process, bool nativeIdentity) : process(process) {
+    generation = g_addressSpaceGeneration.fetch_add(1, std::memory_order_relaxed);
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
     this->nativeIdentity = nativeIdentity;
 #else
@@ -1373,16 +1378,22 @@ U64 KMemory64::mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot) {
     // mmapMutex-then-pagesMutex order mmapReserveAndMap already establishes.
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
 
-    if (nativeIdentityMode() && !nativeGuestRangeAllowed(addr, mapLen)) {
-        // The exact range can never be provided at the address demanded, and
-        // MAP_FIXED_NOREPLACE forbids relocating. Report it the way Linux
-        // reports an unavailable exact range, without mapping anything and
-        // without advancing mmapNext.
+    // Occupancy first, so a range that is BOTH occupied and unhostable is
+    // reported as occupied -- that is the stronger, more specific fact.
+    if (!rangeCompletelyUnmapped(addr, mapLen) ||
+        sparseReservationOverlaps(addr, mapLen)) {
         return (U64)-K_EEXIST;
     }
 
-    if (!rangeCompletelyUnmapped(addr, mapLen)) {
-        return (U64)-K_EEXIST;
+    if (nativeIdentityMode() && !nativeGuestRangeAllowed(addr, mapLen)) {
+        // The range is empty; it is the ADDRESS this address space cannot
+        // provide, and MAP_FIXED_NOREPLACE forbids relocating. EEXIST would
+        // claim an occupant that does not exist, and a caller searching for a
+        // free address answers EEXIST by stepping one granule and asking
+        // again -- across a region where every address is equally unhostable
+        // that is an unbounded walk. -ENOMEM is the true answer and ends the
+        // search at the first probe.
+        return (U64)-K_ENOMEM;
     }
 
     const U64 mapped = mmapAnonymousFixed(addr, mapLen, prot);

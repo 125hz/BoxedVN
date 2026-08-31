@@ -14,6 +14,7 @@
 #include "syscall64.h"
 #include "cpu64.h"
 #include "kmemory64.h"
+#include "guest_mmap_diagnostics.h"
 #include "guest_mmap_placement.h"
 #include "wine_server_reply.h"
 #include "dll_search_trace.h"
@@ -801,6 +802,16 @@ struct GuestMmapCounters {
 
 GuestMmapCounters gGuestMmapCounters;
 
+// Per-address-space detail budgeting and repeat tracking. The old global
+// ordinal spent the whole detail budget on the loader and the short-lived
+// helper processes, so the requests the failing process made after the
+// Windows PE handoff were never described at all. These two are plain value
+// types (see guest_mmap_diagnostics.h) guarded by one mutex, because the
+// mmap path has no allocator lock of its own to borrow.
+std::mutex gGuestMmapDiagnosticsMutex;
+boxedvn::GuestMmapDetailBudget gGuestMmapDetailBudget;
+boxedvn::GuestMmapRepeatTracker gGuestMmapRepeats;
+
 constexpr U64 kGuestMmapDetailLines = 32;
 // Bounded on purpose: Wine reserves the arena once and commits a handful of
 // subranges inside it. A run that produces many of these is the failure this
@@ -878,6 +889,54 @@ bool guestMmapSummaryDue(U64 ordinal) {
 }
 
 } // namespace
+
+// The return address of whoever called the libc mmap wrapper, when it can be
+// had. glibc's wrapper issues SYSCALL with the caller's return address still
+// on top of the stack, so [rsp] identifies the caller in the common case. It
+// is a hint, not a contract: a wrapper that pushed anything, or a stack page
+// that is not mapped, yields zero rather than a guess.
+static U64 guestCallerReturnAddress(CPU64* cpu) {
+    if (!cpu || !cpu->memory) return 0;
+    const U64 rsp = cpu->reg[X64_RSP].u64;
+    if (rsp == 0 || (rsp & 0x7ULL) != 0) return 0;
+    if (!cpu->memory->isPageMapped(rsp >> K64_PAGE_SHIFT)) return 0;
+    if (((rsp + 7) >> K64_PAGE_SHIFT) != (rsp >> K64_PAGE_SHIFT) &&
+        !cpu->memory->isPageMapped((rsp + 7) >> K64_PAGE_SHIFT)) {
+        return 0;
+    }
+    return cpu->memory->readq(rsp);
+}
+
+// One line describing a single mmap request in full. Used both for the
+// per-address-space detailed prefix and for the bounded repeat reports, so a
+// reader never has to correlate two different formats.
+static void reportGuestMmapRequest(CPU64* cpu, const char* kind,
+                                   const boxedvn::GuestMmapSignature& signature,
+                                   const boxedvn::GuestMmapRequest& request,
+                                   boxedvn::GuestMmapPlacement placement,
+                                   bool sparseOverlap, U64 sparseCount,
+                                   U64 ret, U64 occurrences) {
+    klog_fmt("BOXEDWINE_X64_MMAP_%s pid=%llu tid=%llu space=%llu rip=0x%llx "
+             "caller=0x%llx addr=0x%llx len=0x%llx prot=0x%x flags=0x%x "
+             "fixed=%d noreplace=%d native=%d allowed=%d free=%d unmapped=%d "
+             "sparse_overlap=%d sparse_count=%llu placement=%s ret=0x%llx "
+             "errno=%lld repeat=%llu",
+             kind, (unsigned long long)signature.processId,
+             (unsigned long long)signature.threadId,
+             (unsigned long long)signature.addressSpace,
+             (unsigned long long)(cpu ? cpu->rip : 0),
+             (unsigned long long)guestCallerReturnAddress(cpu),
+             (unsigned long long)signature.address,
+             (unsigned long long)signature.length,
+             (unsigned)signature.protection, (unsigned)signature.flags,
+             request.fixed ? 1 : 0, request.fixedNoReplace ? 1 : 0,
+             request.nativeIdentity ? 1 : 0, request.exactRangeAllowed ? 1 : 0,
+             request.exactRangeFree ? 1 : 0, request.exactRangeUnmapped ? 1 : 0,
+             sparseOverlap ? 1 : 0, (unsigned long long)sparseCount,
+             guestMmapPlacementName(placement), (unsigned long long)ret,
+             (long long)((S64)ret < 0 ? -(S64)ret : 0),
+             (unsigned long long)occurrences);
+}
 
 // Forward decl for the file-backed path; defined below.
 static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
@@ -1019,27 +1078,59 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
             break;
     }
 
-    if (ordinal < kGuestMmapDetailLines ||
-        (lowIneligible && ordinal < kGuestMmapDetailLines * 4)) {
-        klog_fmt("BOXEDWINE_X64_MMAP ordinal=%llu pid=%d tid=%d addr=0x%llx "
-                 "len=0x%llx prot=0x%x flags=0x%llx fd=%lld off=0x%llx "
-                 "fixed=%d noreplace=%d native=%d allowed=%d free=%d "
-                 "unmapped=%d placement=%s ret=0x%llx",
-                 (unsigned long long)ordinal,
-                 (int)(cpu->thread ? cpu->thread->process->id : -1),
-                 (int)(cpu->thread ? cpu->thread->id : -1),
-                 (unsigned long long)addr, (unsigned long long)length,
-                 (unsigned)prot, (unsigned long long)flags, (long long)(S64)fd,
-                 (unsigned long long)offset, fixed ? 1 : 0,
-                 fixedNoReplace ? 1 : 0, nativeIdentity ? 1 : 0,
-                 request.exactRangeAllowed ? 1 : 0,
-                 request.exactRangeFree ? 1 : 0,
-                 request.exactRangeUnmapped ? 1 : 0,
-                 guestMmapPlacementName(placement),
-                 (unsigned long long)ret);
-    } else if (guestMmapSummaryDue(ordinal)) {
+    // Diagnostics. The budget is per address space, so a helper process
+    // cannot spend the evidence belonging to the one that is failing, and the
+    // repeat tracker describes a request that keeps coming back no matter how
+    // late in the run it starts. Both are bounded; neither restores a line
+    // per syscall.
+    boxedvn::GuestMmapSignature signature;
+    signature.processId = cpu->thread ? cpu->thread->process->id : 0;
+    signature.threadId = cpu->thread ? cpu->thread->id : 0;
+    signature.addressSpace = cpu->memory->addressSpaceGeneration();
+    signature.address = addr;
+    signature.length = length;
+    signature.protection = (U32)prot;
+    signature.flags = (U32)flags;
+
+    const char* reportKind = nullptr;
+    U64 occurrences = 0;
+    {
+        std::lock_guard<std::mutex> guard(gGuestMmapDiagnosticsMutex);
+        if (gGuestMmapDetailBudget.take(signature.processId,
+                                        signature.addressSpace)) {
+            reportKind = "DETAIL";
+            occurrences = 1;
+        } else {
+            const auto outcome = gGuestMmapRepeats.record(signature);
+            occurrences = outcome.occurrences;
+            switch (outcome.decision) {
+                case boxedvn::GuestMmapRepeatTracker::Decision::First:
+                    reportKind = "FIRST";
+                    break;
+                case boxedvn::GuestMmapRepeatTracker::Decision::Repeat:
+                    reportKind = "REPEAT";
+                    break;
+                case boxedvn::GuestMmapRepeatTracker::Decision::Suppress:
+                    reportKind = "LAST";
+                    break;
+                case boxedvn::GuestMmapRepeatTracker::Decision::Silent:
+                    break;
+            }
+        }
+    }
+    if (reportKind) {
+        const bool sparseOverlap =
+            addr != 0 && cpu->memory->sparseReservationOverlaps(alignedAddr,
+                                                                mapLen);
+        reportGuestMmapRequest(cpu, reportKind, signature, request, placement,
+                               sparseOverlap,
+                               cpu->memory->sparseReservationCount(), ret,
+                               occurrences);
+    }
+    if (guestMmapSummaryDue(ordinal)) {
         reportGuestMmapSummary("milestone");
     }
+    (void)fd;
     if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
         klog_fmt("MMAP [pid=%d] BIG anon exit  -> 0x%llx",
                  (int)(cpu->thread ? cpu->thread->process->id : -1),
@@ -1861,16 +1952,57 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         const bool hintAllowed =
             cpu->memory->nativeGuestRangeAllowed(hintAligned, hintMapLen);
         if (fixedNoReplace) {
-            if (!hintAllowed ||
-                !cpu->memory->rangeCompletelyUnmapped(hintAligned,
-                                                      hintMapLen)) {
+            const bool hintUnmapped =
+                cpu->memory->rangeCompletelyUnmapped(hintAligned, hintMapLen) &&
+                !cpu->memory->sparseReservationOverlaps(hintAligned, hintMapLen);
+            if (!hintUnmapped || !hintAllowed) {
                 gGuestMmapCounters.rejectedWithoutAllocating.fetch_add(
                     1, std::memory_order_relaxed);
-                klog_fmt("sys_mmap64_file: refuse no-replace mapping at "
-                         "0x%llx len=0x%llx allowed=%d",
-                         (unsigned long long)hintAligned,
-                         (unsigned long long)hintMapLen, hintAllowed ? 1 : 0);
-                return (U64)-K_EEXIST;
+                if (!hintAllowed) {
+                    gGuestMmapCounters.lowIneligibleHints.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                // Occupied is EEXIST; empty-but-unhostable is ENOMEM. A
+                // placement search answers EEXIST by stepping to the next
+                // address, so claiming an occupant that is not there turns a
+                // single refusal into a walk across the whole region.
+                const U64 error =
+                    hintUnmapped ? (U64)-K_ENOMEM : (U64)-K_EEXIST;
+                // Bounded on the same tracker the anonymous path uses: a
+                // refused hint the guest retries is a loop, and a loop must
+                // not be narrated line by line.
+                boxedvn::GuestMmapSignature signature;
+                signature.processId = cpu->thread->process->id;
+                signature.threadId = cpu->thread->id;
+                signature.addressSpace =
+                    cpu->memory->addressSpaceGeneration();
+                signature.address = hintAligned;
+                signature.length = hintMapLen;
+                signature.protection = (U32)prot;
+                signature.flags = (U32)flags;
+                boxedvn::GuestMmapRepeatTracker::Outcome outcome;
+                {
+                    std::lock_guard<std::mutex> guard(
+                        gGuestMmapDiagnosticsMutex);
+                    outcome = gGuestMmapRepeats.record(signature);
+                }
+                if (outcome.decision !=
+                    boxedvn::GuestMmapRepeatTracker::Decision::Silent) {
+                    klog_fmt("BOXEDWINE_X64_MMAP_FILE_REFUSE pid=%llu "
+                             "tid=%llu space=%llu rip=0x%llx addr=0x%llx "
+                             "len=0x%llx prot=0x%x flags=0x%x allowed=%d "
+                             "unmapped=%d errno=%lld repeat=%llu",
+                             (unsigned long long)signature.processId,
+                             (unsigned long long)signature.threadId,
+                             (unsigned long long)signature.addressSpace,
+                             (unsigned long long)cpu->rip,
+                             (unsigned long long)hintAligned,
+                             (unsigned long long)hintMapLen, (unsigned)prot,
+                             (unsigned)flags, hintAllowed ? 1 : 0,
+                             hintUnmapped ? 1 : 0, (long long)-(S64)error,
+                             (unsigned long long)outcome.occurrences);
+                }
+                return error;
             }
         } else if (!fixed && !hintAllowed) {
             gGuestMmapCounters.lowIneligibleHints.fetch_add(

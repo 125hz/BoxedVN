@@ -108,8 +108,25 @@ inline GuestMmapPlacement chooseGuestMmapPlacement(
             }
             // Anything the guest could actually touch still has to be refused:
             // direct execution needs identity-mappable addresses, and
-            // relocating is forbidden by the flag.
-            return GuestMmapPlacement::FailExists;
+            // relocating is forbidden by the flag. The refusal has to be
+            // -ENOMEM, not -EEXIST.
+            //
+            // EEXIST is a statement about the range's CONTENTS: something is
+            // already there, so try somewhere else. A placement search reads
+            // it exactly that way -- it steps to the next candidate address
+            // and asks again, and only a hard error ends the walk. Here the
+            // range is empty by construction (exactRangeUnmapped is true);
+            // what cannot be provided is the ADDRESS, and every neighbouring
+            // address is equally unprovidable. Answering EEXIST therefore
+            // invites a walk across the whole unhostable region one
+            // granularity step at a time, which is precisely the failure the
+            // device shows: 4,194,305 mmaps, 4,193,283 of them outside the
+            // hostable lanes, 4,194,054 refused, the guest RIP parked on the
+            // syscall inside glibc's mmap wrapper at 98% of a core, and no
+            // Vulkan, DXGI or first frame ever reached. -ENOMEM says what is
+            // actually true -- this address space cannot back that address --
+            // and ends the walk at the first probe instead of the last.
+            return GuestMmapPlacement::FailNoMemory;
         }
         return GuestMmapPlacement::MapExactNoReplace;
     }

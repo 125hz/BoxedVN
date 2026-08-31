@@ -695,10 +695,19 @@ def main() -> None:
             "FailNoMemory",
             "chooseGuestMmapPlacement(",
             "if (request.fixedNoReplace) {",
+            # Occupancy is the only thing that may be reported as EEXIST.
             "if (!request.exactRangeUnmapped) {",
             "return GuestMmapPlacement::FailExists;",
             "if (request.nativeIdentity && !request.exactRangeAllowed) {",
-            "return GuestMmapPlacement::FailExists;",
+            "return GuestMmapPlacement::ReserveSparse;",
+            # An EMPTY range whose address cannot be hosted is -ENOMEM, never
+            # -EEXIST. A placement search answers EEXIST by stepping one
+            # granule and asking again, so a phantom occupant turns a single
+            # refusal into a walk across the whole unhostable region: the
+            # device shows 4,194,305 mmaps, 4,193,283 outside every hostable
+            # lane, 4,194,054 refused, with the guest RIP never leaving the
+            # syscall in the libc mmap wrapper.
+            "return GuestMmapPlacement::FailNoMemory;",
             "return GuestMmapPlacement::MapExactNoReplace;",
             "if (request.fixed) {",
             "request.protection == 0",
@@ -706,6 +715,16 @@ def main() -> None:
         ],
         "BoxedVN guest mmap placement policy",
     )
+    fixed_no_replace_start = placement_header.index(
+        "if (request.fixedNoReplace) {")
+    fixed_no_replace_body = placement_header[
+        fixed_no_replace_start:placement_header.index(
+            "if (request.fixed) {", fixed_no_replace_start)]
+    if fixed_no_replace_body.count("FailExists") != 1:
+        raise SystemExit(
+            "MAP_FIXED_NOREPLACE may report -EEXIST for exactly one reason: "
+            "the range is occupied"
+        )
 
     # The address space owns the atomic no-replace operation; the syscall layer
     # must not open-code a check-then-MAP_FIXED sequence.
@@ -724,10 +743,14 @@ def main() -> None:
             "flags & K64_PAGE_MAPPED",
             "U64 KMemory64::mmapAnonymousNoReplace(",
             "BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);",
+            # Occupancy first: a range that is both occupied and unhostable is
+            # reported as occupied, which is the stronger, more specific fact.
+            "if (!rangeCompletelyUnmapped(addr, mapLen) ||",
+            "sparseReservationOverlaps(addr, mapLen)) {",
+            "return (U64)-K_EEXIST;",
+            # An empty range the address space cannot host is -ENOMEM.
             "nativeIdentityMode() && !nativeGuestRangeAllowed(addr, mapLen)",
-            "return (U64)-K_EEXIST;",
-            "if (!rangeCompletelyUnmapped(addr, mapLen)) {",
-            "return (U64)-K_EEXIST;",
+            "return (U64)-K_ENOMEM;",
             "mmapAnonymousFixed(addr, mapLen, prot);",
         ],
         "BoxedVN atomic no-replace mapping",
@@ -762,10 +785,22 @@ def main() -> None:
             "ret = (U64)-K_EEXIST;",
             "case boxedvn::GuestMmapPlacement::FailNoMemory:",
             "ret = (U64)-K_ENOMEM;",
-            "BOXEDWINE_X64_MMAP ordinal=",
+            "gGuestMmapDetailBudget.take(signature.processId,",
+            "gGuestMmapRepeats.record(signature);",
+            "reportGuestMmapRequest(cpu, reportKind, signature, request,",
         ],
         "BoxedVN anonymous mmap placement routing",
     )
+    # Every reported request names the address space, the guest RIP, the
+    # arguments, the derived facts, the placement and the repeat count, so one
+    # line is enough to act on.
+    for field in ("BOXEDWINE_X64_MMAP_%s pid=", "space=%llu", "rip=0x%llx",
+                  "caller=0x%llx", "sparse_overlap=%d", "sparse_count=%llu",
+                  "placement=%s", "errno=%lld", "repeat=%llu"):
+        if field not in syscall64:
+            raise SystemExit(
+                "the bounded mmap report must carry " + field
+            )
     require_ordered(
         syscall64,
         [
@@ -774,7 +809,10 @@ def main() -> None:
             "const bool fixedNoReplace = (flags & K_MAP_FIXED_NOREPLACE) != 0;",
             "if (fixedNoReplace) {",
             "cpu->memory->rangeCompletelyUnmapped(",
-            "return (U64)-K_EEXIST;",
+            # Same distinction as the anonymous path: occupied is EEXIST,
+            # empty-but-unhostable is ENOMEM.
+            "hintUnmapped ? (U64)-K_ENOMEM : (U64)-K_EEXIST;",
+            "BOXEDWINE_X64_MMAP_FILE_REFUSE pid=",
             "} else if (!fixed && !hintAllowed) {",
             "mmapReserveAndMap(length, loadProt);",
         ],
@@ -2037,7 +2075,9 @@ def main() -> None:
             "if (request.nativeIdentity && !request.exactRangeAllowed) {",
             "if (request.anonymous && request.protection == 0) {",
             "return GuestMmapPlacement::ReserveSparse;",
-            "return GuestMmapPlacement::FailExists;",
+            # Accessible or file-backed: no host memory can be provided at
+            # that address, and the range is empty, so it is -ENOMEM.
+            "return GuestMmapPlacement::FailNoMemory;",
         ],
         "BoxedVN sparse reservation placement contract",
     )
@@ -2133,6 +2173,61 @@ def main() -> None:
             'reportGuestMmapSummary("milestone");',
         ],
         "BoxedVN bounded mmap summary contract",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Detail budgeting keyed by address space. One global ordinal spent    #
+    # the whole budget on the loader and the short-lived helpers, so the   #
+    # 4,193,283 refused requests the failing process issued after the      #
+    # Windows PE handoff were never described at all.                      #
+    # ------------------------------------------------------------------ #
+    mmap_diagnostics = read(repository / "include/guest_mmap_diagnostics.h")
+    require_ordered(
+        mmap_diagnostics,
+        [
+            "struct GuestMmapSignature {",
+            "std::uint64_t addressSpace = 0;",
+            "class GuestMmapDetailBudget {",
+            "kLinesPerAddressSpace",
+            "kTotalLines",
+            "bool take(std::uint64_t processId,",
+            "class GuestMmapRepeatTracker {",
+            "kReportsPerSignature",
+            "kTotalReports",
+            "Outcome record(const GuestMmapSignature& signature) noexcept {",
+            "static bool shouldReport(std::uint64_t seen) noexcept {",
+            "return (seen & (seen - 1)) == 0;",
+        ],
+        "BoxedVN bounded mmap diagnostics contract",
+    )
+    # Both bounds must be real: fixed storage, no allocation, no growth.
+    for banned in ("std::map", "std::vector", "std::unordered_map", "new "):
+        if banned in mmap_diagnostics:
+            raise SystemExit(
+                "mmap diagnostics must use fixed storage keyed on nothing the "
+                "guest controls: " + banned
+            )
+    # An exec is a new address space, so the same pid before and after the
+    # Windows handoff cannot share a budget or a repeat count.
+    memory_header_text = read(repository / "include/kmemory64.h")
+    if "U64 addressSpaceGeneration() const" not in memory_header_text:
+        raise SystemExit(
+            "diagnostics must be able to tell one address space from the one "
+            "an exec replaced"
+        )
+    if "generation = g_addressSpaceGeneration.fetch_add(" not in memory:
+        raise SystemExit(
+            "every address space must take its own generation at construction"
+        )
+    require_ordered(
+        syscall_mmap,
+        [
+            '#include "guest_mmap_diagnostics.h"',
+            "boxedvn::GuestMmapDetailBudget gGuestMmapDetailBudget;",
+            "boxedvn::GuestMmapRepeatTracker gGuestMmapRepeats;",
+            "signature.addressSpace = cpu->memory->addressSpaceGeneration();",
+        ],
+        "BoxedVN mmap diagnostics routing",
     )
 
     # ------------------------------------------------------------------ #

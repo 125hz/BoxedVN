@@ -344,6 +344,15 @@ public:
     // mappings. The default sparse implementation returns false.
     bool nativeIdentityMode() const;
 
+    // A process-unique, monotonically increasing id for THIS address space.
+    // execve replaces the KMemory64 wholesale (see KProcess::exec), and fork
+    // gives the child its own, so this is the exec generation: two runs of the
+    // same pid before and after the Windows handoff are different ids.
+    // Diagnostics key their budgets on it so a short-lived helper process
+    // cannot spend the evidence budget belonging to the address space that is
+    // actually failing.
+    U64 addressSpaceGeneration() const { return generation; }
+
     // Guard a host MAP_FIXED operation before it reaches the OS. Sparse mode
     // accepts every canonical guest range; native identity mode accepts only
     // the proven iOS window (plus the special KUSER shared-data alias).
@@ -381,10 +390,13 @@ public:
     // a check-then-MAP_FIXED sequence would be a TOCTOU race whose loser
     // silently destroys the winner's mapping.
     //
-    // Returns addr on success, (U64)-K_EEXIST when any page is already mapped
-    // or (in native identity mode) when the exact range lies outside the
-    // guest window, and (U64)-errno otherwise. On every failure path the
-    // existing contents are untouched and no allocator cursor advances.
+    // Returns addr on success, (U64)-K_EEXIST when any page of the range is
+    // already mapped or reserved, (U64)-K_ENOMEM when (in native identity
+    // mode) the exact range lies outside every hostable lane, and
+    // (U64)-errno otherwise. The two refusals are deliberately distinct:
+    // EEXIST means "something is there, try elsewhere" and a placement search
+    // answers it by stepping to the next address, so it must never be used
+    // for an empty range whose address simply cannot be backed.
     U64 mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot);
 
     // True when no page in [addr, addr+len) is mapped at all, reservations
@@ -578,6 +590,10 @@ private:
     // queries (sparseReservationOverlaps/Count/Pages) have to take it.
     mutable BOXEDWINE_MUTEX mmapMutex;
     U64 mmapNext = 0;
+
+    // Assigned once at construction from a process-global counter. See
+    // addressSpaceGeneration().
+    U64 generation = 0;
 
     // Reserved address-space ranges drawn from the active mmap region (the
     // historical sparse base or K64_NATIVE_GUEST_MMAP_BASE).
