@@ -214,6 +214,72 @@ void checkGuestAddressTranslationEncodings() {
     }
 }
 
+// The aliased stack paths must issue their accesses with NO writeback: the
+// pre/post-indexed forms update the address register, and with a translated
+// address in it that would put a host pointer into the guest's RSP. This
+// drives the real emitter with the exact calls those paths make, so both the
+// overload resolution and the addressing mode are proven rather than assumed.
+//
+// It also exists because stp/ldp are IndexType templates with no plain
+// overload -- a fact that is invisible in the signature and cost a build.
+void checkStackAccessAddressingModes() {
+    // LDP/STP encode the addressing mode in bits 24:23; 0b10 is the
+    // no-writeback offset form.
+    constexpr uint32_t kPairModeShift = 23;
+    constexpr uint32_t kPairModeOffset = 0b10;
+    // LDUR/STUR are the unscaled-immediate form: bits 11:10 are zero, where
+    // the pre- and post-indexed forms carry 0b11 and 0b01.
+    constexpr uint32_t kUnscaledModeShift = 10;
+
+    const uint32_t pairStore = emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XRegister(4), ARMEmitter::XRegister(5),
+                                                   ARMEmitter::Register(13), 0);
+    });
+    if (((pairStore >> kPairModeShift) & 0b11) != kPairModeOffset) {
+        fail("PushTwo's aliased store is not the no-writeback pair form",
+             kPairModeOffset, (pairStore >> kPairModeShift) & 0b11);
+    }
+
+    const uint32_t pairLoad = emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.ldp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XRegister(4), ARMEmitter::XRegister(5),
+                                                   ARMEmitter::Register(13), 0);
+    });
+    if (((pairLoad >> kPairModeShift) & 0b11) != kPairModeOffset) {
+        fail("PopTwo's aliased load is not the no-writeback pair form",
+             kPairModeOffset, (pairLoad >> kPairModeShift) & 0b11);
+    }
+
+    const uint32_t store = emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.stur(ARMEmitter::XRegister(4), ARMEmitter::Register(13), 0);
+    });
+    if (((store >> kUnscaledModeShift) & 0b11) != 0) {
+        fail("Push's aliased store is not the unscaled no-writeback form", 0,
+             (store >> kUnscaledModeShift) & 0b11);
+    }
+
+    const uint32_t load = emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.ldur(ARMEmitter::XRegister(4), ARMEmitter::Register(13), 0);
+    });
+    if (((load >> kUnscaledModeShift) & 0b11) != 0) {
+        fail("Pop's aliased load is not the unscaled no-writeback form", 0,
+             (load >> kUnscaledModeShift) & 0b11);
+    }
+
+    // The sub-word forms the aliased Push and Pop also use.
+    (void)emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.sturb(ARMEmitter::Register(4), ARMEmitter::Register(13), 0);
+    });
+    (void)emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.sturh(ARMEmitter::Register(4), ARMEmitter::Register(13), 0);
+    });
+    (void)emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.ldurb(ARMEmitter::Register(4), ARMEmitter::Register(13), 0);
+    });
+    (void)emitLastWord([](ARMEmitter::Emitter& emitter) {
+        emitter.ldurh(ARMEmitter::Register(4), ARMEmitter::Register(13), 0);
+    });
+}
+
 } // namespace
 
 int main() {
@@ -221,6 +287,7 @@ int main() {
     checkMaterializedAddressForm();
     checkFullImmediateRange();
     checkGuestAddressTranslationEncodings();
+    checkStackAccessAddressingModes();
 
     if (gFailures != 0) {
         std::fprintf(stderr, "emitter-encoding-check: FAIL (%d checks)\n", gFailures);

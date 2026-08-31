@@ -2370,7 +2370,17 @@ def main() -> None:
             "constexpr uint64_t kGuestTopClearMask = 0x7F8000000000ULL;",
             "emitter.orr(ARMEmitter::Size::i64Bit, ARMEmitter::Register(13),",
             "emitter.bic(ARMEmitter::Size::i64Bit, ARMEmitter::Register(13),",
+            # stp/ldp are IndexType templates with no plain overload, a fact
+            # invisible in the signature. Drive the real emitter with the
+            # exact calls the aliased stack paths make, and prove the
+            # addressing mode carries no writeback.
+            "void checkStackAccessAddressingModes() {",
+            "emitter.stp<ARMEmitter::IndexType::OFFSET>(",
+            "emitter.ldp<ARMEmitter::IndexType::OFFSET>(",
+            "emitter.stur(ARMEmitter::XRegister(4), ARMEmitter::Register(13), 0);",
+            "emitter.ldur(ARMEmitter::XRegister(4), ARMEmitter::Register(13), 0);",
             "checkGuestAddressTranslationEncodings();",
+            "checkStackAccessAddressingModes();",
         ],
         "BoxedVN emitter translation encoding contract",
     )
@@ -2395,11 +2405,11 @@ def main() -> None:
             "+    case 8: stur(Value.X(), HostAddr, 0); break;",
             '+    LOGMAN_THROW_A_FMT(Dst != Src1 && Dst != Src2, "PushTwo address must not overlap its values");',
             "+    sub(ARMEmitter::Size::i64Bit, Dst, Dst, 2 * ValueSize);",
-            "+    case 8: stp(Src1.X(), Src2.X(), HostAddr, 0); break;",
+            "+    case 8: stp<ARMEmitter::IndexType::OFFSET>(Src1.X(), Src2.X(), HostAddr, 0); break;",
             "+    const auto HostAddr = AliasGuestAddress(Addr);",
             "+    case 8: ldur(Dst.X(), HostAddr, 0); break;",
             "+    add(ARMEmitter::Size::i64Bit, Addr, Addr, Size);",
-            "+    case 8: ldp(Dst1.X(), Dst2.X(), HostAddr, 0); break;",
+            "+    case 8: ldp<ARMEmitter::IndexType::OFFSET>(Dst1.X(), Dst2.X(), HostAddr, 0); break;",
             "+    add(ARMEmitter::Size::i64Bit, Addr, Addr, 2 * Size);",
         ],
         "BoxedVN aliased stack operation contract",

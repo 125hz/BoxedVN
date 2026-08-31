@@ -244,7 +244,7 @@ index 3e01eeb7..9499c988 100644
    ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                      IR::MemOffsetType OffsetType, uint8_t OffsetScale);
 diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
-index 2cf05d14..e8e7c2c9 100644
+index 2cf05d14..c06db9bc 100644
 --- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 @@ -584,19 +584,79 @@ DEF_OP(ContextClear) {
@@ -462,8 +462,8 @@ index 2cf05d14..e8e7c2c9 100644
 +    sub(ARMEmitter::Size::i64Bit, Dst, Dst, 2 * ValueSize);
 +    const auto HostAddr = AliasGuestAddress(Dst);
 +    switch (ValueSize) {
-+    case 4: stp(Src1.W(), Src2.W(), HostAddr, 0); break;
-+    case 8: stp(Src1.X(), Src2.X(), HostAddr, 0); break;
++    case 4: stp<ARMEmitter::IndexType::OFFSET>(Src1.W(), Src2.W(), HostAddr, 0); break;
++    case 8: stp<ARMEmitter::IndexType::OFFSET>(Src1.X(), Src2.X(), HostAddr, 0); break;
 +    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
 +    }
 +    return;
@@ -503,8 +503,8 @@ index 2cf05d14..e8e7c2c9 100644
 +  if (CTX->GetGuestLowAliasBase()) {
 +    const auto HostAddr = AliasGuestAddress(Addr);
 +    switch (Size) {
-+    case 4: ldp(Dst1.W(), Dst2.W(), HostAddr, 0); break;
-+    case 8: ldp(Dst1.X(), Dst2.X(), HostAddr, 0); break;
++    case 4: ldp<ARMEmitter::IndexType::OFFSET>(Dst1.W(), Dst2.W(), HostAddr, 0); break;
++    case 8: ldp<ARMEmitter::IndexType::OFFSET>(Dst1.X(), Dst2.X(), HostAddr, 0); break;
 +    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, Op->Size); break;
 +    }
 +    add(ARMEmitter::Size::i64Bit, Addr, Addr, 2 * Size);
