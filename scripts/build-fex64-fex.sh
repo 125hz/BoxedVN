@@ -93,15 +93,20 @@ log "source at $(git -C "${SOURCE}" rev-parse HEAD 2>/dev/null || echo unknown)"
 # archives predate these lines. Reported upstream rather than carried forever.
 apply_patch() {
     local patch="${BOXEDVN_ROOT}/scripts/fex64-patches/$1"
+    # Keep this array non-empty: macOS ships Bash 3.2, where expanding an
+    # empty array under `set -u` is treated as an unbound variable.
+    local -a apply_options=(apply)
+    [[ "$1" == "fex-boxedwine-inline-call-return.patch" ]] && \
+        apply_options+=(--unidiff-zero)
     require_file "${patch}"
-    if git -C "${SOURCE}" apply --reverse --check "${patch}" 2>/dev/null; then
+    if git -C "${SOURCE}" "${apply_options[@]}" --reverse --check "${patch}" 2>/dev/null; then
         ok "patch already applied: $1"
         return 0
     fi
-    git -C "${SOURCE}" apply --check "${patch}" || die "patch $1 no longer applies to FEX at $(git -C "${SOURCE}" rev-parse --short HEAD).
+    git -C "${SOURCE}" "${apply_options[@]}" --check "${patch}" || die "patch $1 no longer applies to FEX at $(git -C "${SOURCE}" rev-parse --short HEAD).
 
 The pin moved or upstream fixed this. Re-cut the patch deliberately."
-    git -C "${SOURCE}" apply "${patch}" || die "could not apply $1"
+    git -C "${SOURCE}" "${apply_options[@]}" "${patch}" || die "could not apply $1"
     ok "applied patch: $1"
 }
 
@@ -123,6 +128,10 @@ apply_patch fex-boxedwine-null-exit-target.patch
 # CALL history ring and an immediate read-back of every pushed return address,
 # which is what separates a push that never landed from a slot zeroed later.
 apply_patch fex-boxedwine-call-return-witness.patch
+# Depends on the call witness above. Carries the architectural return PC as
+# inline IR metadata so the exit-slot repair cannot reread a reused physical
+# register, and preserves the value while the bounded witness uses scratch.
+apply_patch fex-boxedwine-inline-call-return.patch
 # Depends on the alias patch above: it asks the context whether the guest is
 # hosted at an aliased address before deciding that a descriptor-table read
 # would be translated as if it were guest memory.

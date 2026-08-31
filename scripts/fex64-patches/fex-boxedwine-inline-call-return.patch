@@ -1,0 +1,111 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -533 +533,2 @@ void OpDispatchBuilder::CALLOp(OpcodeArgs) {
+-    ExitRelocatedPC(Op, TargetOffset, BranchHint::Call, ConstantPC, [&]() {
++    auto InlineReturnPC = _InlineEntrypointOffset(GPRSize, NextRIP - Entry);
++    ExitRelocatedPC(Op, TargetOffset, BranchHint::Call, InlineReturnPC, [&]() {
+@@ -557 +558,2 @@ void OpDispatchBuilder::CALLAbsoluteOp(OpcodeArgs) {
+-  ExitFunction(JMPPCOffset, BranchHint::Call, ConstantPC, [&]() {
++  auto InlineReturnPC = _InlineEntrypointOffset(Size, NextRIP - Entry);
++  ExitFunction(JMPPCOffset, BranchHint::Call, InlineReturnPC, [&]() {
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -48,0 +49,5 @@ DEF_OP(ExitFunction) {
++  uint64_t BoxedWineInlineCallReturn {};
++  const bool HasBoxedWineInlineCallReturn =
++    Op->Hint == IR::BranchHint::Call &&
++    IsInlineEntrypointOffset(Op->CallReturnAddress, &BoxedWineInlineCallReturn);
++
+@@ -69 +74,8 @@ DEF_OP(ExitFunction) {
+-    const auto ReturnAddress = GetReg(Op->CallReturnAddress);
++    /* Keep this value in a known scratch register. The IR deliberately carries
++     * an inline return PC here, independently of the ordinary Push value, so
++     * this repair cannot inherit a lost/reused register allocation. */
++    if (HasBoxedWineInlineCallReturn) {
++      InsertGuestRIPMove(TMP1, BoxedWineInlineCallReturn);
++    } else {
++      mov(ARMEmitter::Size::i64Bit, TMP1, GetReg(Op->CallReturnAddress).X());
++    }
+@@ -72 +84 @@ DEF_OP(ExitFunction) {
+-    stur(ReturnAddress.X(), HostStack, 0);
++    stur(TMP1, HostStack, 0);
+@@ -74,2 +86 @@ DEF_OP(ExitFunction) {
+-      EmitCallReturnWitness(ReturnAddress, GuestStack, HostStack,
+-                            ReturnAddress, GuestStack);
++      EmitCallReturnWitness(TMP1, GuestStack, HostStack, TMP1, GuestStack);
+@@ -236 +247,5 @@ DEF_OP(ExitFunction) {
+-          auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
++          if (HasBoxedWineInlineCallReturn) {
++            InsertGuestRIPMove(TMP3, BoxedWineInlineCallReturn);
++          } else {
++            mov(ARMEmitter::Size::i64Bit, TMP3, GetReg(Op->CallReturnAddress).X());
++          }
+@@ -239 +254 @@ DEF_OP(ExitFunction) {
+-          stp<ARMEmitter::IndexType::PRE>(CallReturnAddressReg, TMP1, REG_CALLRET_SP, -0x10);
++          stp<ARMEmitter::IndexType::PRE>(TMP3, TMP1, REG_CALLRET_SP, -0x10);
+@@ -436 +451,5 @@ DEF_OP(ExitFunction) {
+-        auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
++        if (HasBoxedWineInlineCallReturn) {
++          InsertGuestRIPMove(TMP3, BoxedWineInlineCallReturn);
++        } else {
++          mov(ARMEmitter::Size::i64Bit, TMP3, GetReg(Op->CallReturnAddress).X());
++        }
+@@ -439 +458 @@ DEF_OP(ExitFunction) {
+-        stp<ARMEmitter::IndexType::PRE>(CallReturnAddressReg, TMP1, REG_CALLRET_SP, -0x10);
++        stp<ARMEmitter::IndexType::PRE>(TMP3, TMP1, REG_CALLRET_SP, -0x10);
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -663,6 +663,6 @@ void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter:
+-  // Everything that needs Value goes first: Value may be TMP1, and TMP1 is
+-  // needed as scratch below. TMP2 stays the ring base until then.
+-  add(ARMEmitter::Size::i64Bit, TMP1, TMP2, TMP3);
+-  str(Value.X(), TMP1, offsetof(Record, IntendedReturn));
+-  str(SlotGuest.X(), TMP1, offsetof(Record, SlotGuest));
+-  str(SlotHost.X(), TMP1, offsetof(Record, SlotHost));
++  // Preserve TMP2 as the ring base and TMP3 as the record pointer. Value may
++  // be TMP1, so do not use TMP1 as scratch until IntendedReturn is stored.
++  add(ARMEmitter::Size::i64Bit, TMP3, TMP2, TMP3);
++  str(Value.X(), TMP3, offsetof(Record, IntendedReturn));
++  str(SlotGuest.X(), TMP3, offsetof(Record, SlotGuest));
++  str(SlotHost.X(), TMP3, offsetof(Record, SlotHost));
+@@ -675,2 +675,2 @@ void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter:
+-  add(ARMEmitter::Size::i64Bit, TMP3, SlotGuest, 8);
+-  str(TMP3, TMP1, offsetof(Record, StackBefore));
++  add(ARMEmitter::Size::i64Bit, TMP1, SlotGuest, 8);
++  str(TMP1, TMP3, offsetof(Record, StackBefore));
+@@ -679,2 +679,2 @@ void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter:
+-  ldur(TMP3, SlotHost, 0);
+-  str(TMP3, TMP1, offsetof(Record, Readback));
++  ldur(TMP1, SlotHost, 0);
++  str(TMP1, TMP3, offsetof(Record, Readback));
+@@ -683,2 +683,2 @@ void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter:
+-  LoadConstant(ARMEmitter::Size::i64Bit, TMP3, Entry);
+-  str(TMP3, TMP1, offsetof(Record, SourceBlock));
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry);
++  str(TMP1, TMP3, offsetof(Record, SourceBlock));
+@@ -700,2 +700,2 @@ void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter:
+-  LoadConstant(ARMEmitter::Size::i64Bit, TMP3, Info);
+-  str(TMP3, TMP1, offsetof(Record, Info));
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Info);
++  str(TMP1, TMP3, offsetof(Record, Info));
+@@ -704,4 +704,4 @@ void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter:
+-  ldr(TMP3, TMP2, offsetof(Ring, Sequence));
+-  add(ARMEmitter::Size::i64Bit, TMP3, TMP3, 1);
+-  str(TMP3, TMP2, offsetof(Ring, Sequence));
+-  str(TMP3, TMP1, offsetof(Record, Sequence));
++  ldr(TMP1, TMP2, offsetof(Ring, Sequence));
++  add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
++  str(TMP1, TMP2, offsetof(Ring, Sequence));
++  str(TMP1, TMP3, offsetof(Record, Sequence));
+@@ -713,4 +713,4 @@ void Arm64JITCore::EmitCallReturnWitness(ARMEmitter::Register Value, ARMEmitter:
+-    ldr(TMP3, TMP1, offsetof(Record, IntendedReturn));
+-    ldr(TMP1, TMP1, offsetof(Record, Readback));
+-    sub(TMP3, TMP3, TMP1);
+-    (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &Matched);
++    ldr(TMP1, TMP3, offsetof(Record, IntendedReturn));
++    ldr(TMP3, TMP3, offsetof(Record, Readback));
++    sub(TMP1, TMP1, TMP3);
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Matched);

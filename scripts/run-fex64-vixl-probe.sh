@@ -36,6 +36,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-null-exit-target.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-call-return-witness.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-inline-call-return.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-longmode-segment-base.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-harness-alias.patch"
 )
@@ -86,7 +87,7 @@ build_runner() (
     restore_source() {
         local index
         for ((index=${#applied_patches[@]} - 1; index >= 0; index--)); do
-            git -C "${fex_source}" apply --reverse \
+            git -C "${fex_source}" apply --unidiff-zero --reverse \
                 "${applied_patches[index]}" || true
         done
     }
@@ -95,13 +96,19 @@ build_runner() (
     # Exercise the same maintained translator patches as the iOS build. Apply
     # them only for this build and restore the fetched checkout on every exit.
     for runtime_patch in "${runtime_patches[@]}"; do
-        if git -C "${fex_source}" apply --reverse --check \
+        # Keep the command name in the array so nounset-safe expansion also
+        # works with the Bash 3.2 used by macOS.
+        local -a apply_options=(apply)
+        [[ "$(basename "${runtime_patch}")" == \
+            "fex-boxedwine-inline-call-return.patch" ]] && \
+            apply_options+=(--unidiff-zero)
+        if git -C "${fex_source}" "${apply_options[@]}" --reverse --check \
                 "${runtime_patch}" 2>/dev/null; then
             continue
         fi
-        git -C "${fex_source}" apply --check "${runtime_patch}" || \
+        git -C "${fex_source}" "${apply_options[@]}" --check "${runtime_patch}" || \
             die "runtime patch no longer applies: ${runtime_patch}"
-        git -C "${fex_source}" apply "${runtime_patch}"
+        git -C "${fex_source}" "${apply_options[@]}" "${runtime_patch}"
         applied_patches+=("${runtime_patch}")
     done
 

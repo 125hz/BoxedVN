@@ -2450,6 +2450,7 @@ def main() -> None:
         [
             "apply_patch fex-boxedwine-null-exit-target.patch",
             "apply_patch fex-boxedwine-call-return-witness.patch",
+            "apply_patch fex-boxedwine-inline-call-return.patch",
         ],
         "BoxedVN CALL witness patch is applied by the device build",
     )
@@ -2458,6 +2459,7 @@ def main() -> None:
         [
             "fex-boxedwine-null-exit-target.patch",
             "fex-boxedwine-call-return-witness.patch",
+            "fex-boxedwine-inline-call-return.patch",
         ],
         "BoxedVN CALL witness patch is applied by the VIXL probe",
     )
@@ -2577,6 +2579,51 @@ def main() -> None:
         ],
         "BoxedVN CALL exit-slot repair and witness",
     )
+
+    # Build 137 proved that re-storing the register-allocated return value is
+    # not independent repair: one indirect CALL recorded, wrote and read back
+    # an intended return of zero. The exit must receive its own inline return
+    # PC metadata, materialise it after RA, and preserve it until the witness
+    # has stored IntendedReturn.
+    inline_return_patch = read(
+        repository / "scripts/fex64-patches/fex-boxedwine-inline-call-return.patch")
+    for patch_driver in (
+        read(repository / "scripts/build-fex64-fex.sh"),
+        read(repository / "scripts/run-fex64-vixl-probe.sh"),
+    ):
+        if "fex-boxedwine-inline-call-return.patch" not in patch_driver or \
+                "apply_options=(apply)" not in patch_driver or \
+                "apply_options+=(--unidiff-zero)" not in patch_driver or \
+                '"${apply_options[@]}"' not in patch_driver:
+            raise SystemExit(
+                "the zero-context inline-return patch must be applied with "
+                "a Bash-3.2 nounset-safe git apply --unidiff-zero command")
+    require_ordered(
+        inline_return_patch,
+        [
+            "FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp",
+            "auto InlineReturnPC = _InlineEntrypointOffset(",
+            "ExitRelocatedPC(Op, TargetOffset, BranchHint::Call, InlineReturnPC",
+            "ExitFunction(JMPPCOffset, BranchHint::Call, InlineReturnPC",
+            "FEXCore/Source/Interface/Core/JIT/BranchOps.cpp",
+            "IsInlineEntrypointOffset(Op->CallReturnAddress",
+            "InsertGuestRIPMove(TMP1, BoxedWineInlineCallReturn)",
+            "stur(TMP1, HostStack, 0);",
+            "EmitCallReturnWitness(TMP1, GuestStack, HostStack",
+            "FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
+            "str(Value.X(), TMP3, offsetof(Record, IntendedReturn));",
+            "LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry);",
+        ],
+        "BoxedVN inline CALL return-PC repair",
+    )
+    added_inline_return_lines = [
+        line[1:] for line in inline_return_patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    if "add(ARMEmitter::Size::i64Bit, TMP1, TMP2, TMP3);" in added_inline_return_lines:
+        raise SystemExit(
+            "the witness must not overwrite a TMP1 return value while forming "
+            "the record pointer")
 
     # ------------------------------------------------------------------ #
     # A fatal translator ending and a guest exit_group are different        #
