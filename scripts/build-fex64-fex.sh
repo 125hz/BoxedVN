@@ -114,6 +114,11 @@ apply_patch fex-arm64-context-indexed-unaligned-offset.patch
 apply_patch fex-arm64-addsub-immediate-range.patch
 apply_patch fex-boxedwine-ir-capture-arm.patch
 apply_patch fex-boxedwine-low-address-alias.patch
+# Depends on the alias patch above: its witness reports the host address a
+# canonical guest stack slot resolves to, which only exists once the alias is
+# published. Restores the missing null-host-target guard in the emitted L1
+# lookup, so an indirect exit can never branch to host address zero.
+apply_patch fex-boxedwine-null-exit-target.patch
 # Depends on the alias patch above: it asks the context whether the guest is
 # hosted at an aliased address before deciding that a descriptor-table read
 # would be translated as if it were guest memory.

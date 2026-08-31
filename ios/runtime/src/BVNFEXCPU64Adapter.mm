@@ -409,6 +409,52 @@ static uint32_t hostSignalGuestNumber(int signal) {
     }
 }
 
+// Read one guest qword through the SAME canonical-to-host translation the
+// translator emits, without ever dereferencing the canonical address.
+//
+// The device fault report could say that a RET's target was zero but not
+// whether the memory it came from was zero: the popped value and the memory it
+// was popped from are the two facts that separate "the guest really returned to
+// zero" from "the pop read the wrong place". This re-reads that memory
+// independently.
+//
+// vm_read_overwrite is the same checked read the host-code capture above uses:
+// it reports failure for an unmapped page instead of faulting, which is what
+// makes this usable from a signal handler. Nothing here allocates or locks.
+struct GuestStackWord {
+    uint64_t guest = 0;
+    uint64_t host = 0;
+    uint64_t value = 0;
+    bool read = false;
+};
+
+static GuestStackWord readGuestStackWord(BVNFEXCPU64Adapter* adapter,
+                                         uint64_t guestAddress) {
+    GuestStackWord word;
+    word.guest = guestAddress;
+    if (!adapter || !adapter->process || !adapter->process->memory64 ||
+        guestAddress == 0) {
+        return word;
+    }
+    // Translation only; the canonical address is never dereferenced.
+    word.host = adapter->process->memory64->nativeIdentityMode()
+        ? k64GuestToHostAddress(guestAddress)
+        : 0;
+    if (word.host == 0) {
+        return word;
+    }
+    uint64_t value = 0;
+    vm_size_t bytes = 0;
+    word.read = vm_read_overwrite(
+        mach_task_self(), static_cast<vm_address_t>(word.host), sizeof(value),
+        reinterpret_cast<vm_address_t>(&value), &bytes) == KERN_SUCCESS &&
+        bytes == sizeof(value);
+    if (word.read) {
+        word.value = value;
+    }
+    return word;
+}
+
 static bool recoverTranslatedLoaderHandoff(
     BVNFEXCPU64Adapter* adapter, FEXCore::Core::CpuStateFrame* frame,
     const FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& faultData,
@@ -657,6 +703,53 @@ static bool containUnclassifiedFEXFault(
                  adapter->thread ? adapter->thread->id : -1,
                  (unsigned long long)hostPC,
                  (unsigned long long)machine->__ss.__sp, hostRegisters);
+
+        // The guest stack the faulting block was standing on, read back
+        // independently of whatever the translated code loaded from it. A RET
+        // whose target came out zero is only half an answer: this says whether
+        // the memory it was popped from held zero as well, and at which host
+        // address that memory actually lives.
+        //
+        // RSP-8 is the slot a RET has already consumed, RSP is the next one,
+        // and RBP / RBP+8 are the saved frame pointer and the return address of
+        // the frame LEAVE was about to unwind -- the exact three qwords the
+        // device's `leave; mov eax, edx; ret` epilogue touches.
+        const uint64_t guestRSP = guest.gregs[FEXCore::X86State::REG_RSP];
+        const uint64_t guestRBP = guest.gregs[FEXCore::X86State::REG_RBP];
+        const GuestStackWord stackWords[] = {
+            readGuestStackWord(adapter, guestRSP - 16),
+            readGuestStackWord(adapter, guestRSP - 8),
+            readGuestStackWord(adapter, guestRSP),
+            readGuestStackWord(adapter, guestRSP + 8),
+            readGuestStackWord(adapter, guestRBP),
+            readGuestStackWord(adapter, guestRBP + 8),
+        };
+        static const char* const stackLabels[] = {
+            "rsp-16", "rsp-8", "rsp", "rsp+8", "rbp", "rbp+8",
+        };
+        char stackSnapshot[640] = {};
+        size_t stackUsed = 0;
+        for (size_t i = 0; i < sizeof(stackWords) / sizeof(stackWords[0]) &&
+             stackUsed + 96 < sizeof(stackSnapshot); ++i) {
+            const int written = snprintf(
+                stackSnapshot + stackUsed, sizeof(stackSnapshot) - stackUsed,
+                "%s%s=[guest=0x%llx host=0x%llx read=%d value=0x%llx]",
+                i == 0 ? "" : " ", stackLabels[i],
+                (unsigned long long)stackWords[i].guest,
+                (unsigned long long)stackWords[i].host,
+                stackWords[i].read ? 1 : 0,
+                (unsigned long long)stackWords[i].value);
+            if (written <= 0) break;
+            stackUsed += static_cast<size_t>(written);
+        }
+        klog_fmt("BOXEDWINE_FEX64_FAULT_STACK pid=%d tid=%d rsp=0x%llx "
+                 "rbp=0x%llx native=%d %s",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1,
+                 (unsigned long long)guestRSP, (unsigned long long)guestRBP,
+                 (adapter->process && adapter->process->memory64 &&
+                  adapter->process->memory64->nativeIdentityMode()) ? 1 : 0,
+                 stackSnapshot);
     }
 
     // This is an active FEX thread and the fault is either in BoxedVN's

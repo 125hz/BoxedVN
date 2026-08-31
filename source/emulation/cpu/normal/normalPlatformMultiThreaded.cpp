@@ -18,6 +18,9 @@
 
 #include "boxedwine.h"
 #include "knativesystem.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "syscall64.h"
+#endif
 #if defined(BOXEDWINE_JIT_ARMV8)
 #include "../armv8/jitArmV8CodeGen.h"
 #endif
@@ -103,6 +106,18 @@ static void platformThread(CPU* cpu) {
                         klog_fmt("FEX CPU64 dispatch failed for process %d; "
                                  "terminating the explicitly translated launch",
                                  process->id);
+                        // Marking the thread terminating retires the thread and
+                        // the translator context but leaves the PROCESS with no
+                        // exit status at all: no lifecycle marker, nothing for a
+                        // waiter to collect, and nothing to tell the session its
+                        // program is gone. A device run ended exactly there --
+                        // the main process took a fatal fault, its thread went
+                        // away, and the surviving helper processes kept the
+                        // emulator alive under a loading overlay that never
+                        // cleared. Route it through the same completion
+                        // exit_group uses instead.
+                        kfatalProcessExit64(cpu64, 127,
+                                            "fex64-translator-dispatch");
                         cpu->thread->terminating = true;
                         break;
                     }

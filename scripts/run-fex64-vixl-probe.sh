@@ -17,6 +17,7 @@ fixture_top_alias="${root}/scripts/guest-probes/fex64-top-alias-contract.asm"
 fixture_top_alias_repmov="${root}/scripts/guest-probes/fex64-top-alias-repmov.asm"
 fixture_top_alias_stack="${root}/scripts/guest-probes/fex64-top-alias-stack.asm"
 fixture_dispatcher_return="${root}/scripts/guest-probes/fex64-dispatcher-return.asm"
+fixture_highstack_callret="${root}/scripts/guest-probes/fex64-highstack-callret.asm"
 host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
@@ -33,6 +34,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-arm64-addsub-immediate-range.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-null-exit-target.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-longmode-segment-base.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-harness-alias.patch"
 )
@@ -223,6 +225,7 @@ prepare_fixture "${fixture_top_alias}" fex64-top-alias
 prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov
 prepare_fixture "${fixture_top_alias_stack}" fex64-top-alias-stack
 prepare_fixture "${fixture_dispatcher_return}" fex64-dispatcher-return
+prepare_fixture "${fixture_highstack_callret}" fex64-highstack-callret
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -382,4 +385,19 @@ run_one x64-dispatcher-return-alias "${tmp_dir}/fex64-dispatcher-return.bin" \
     "${tmp_dir}/fex64-dispatcher-return.config.bin" 500 0 "" 1
 run_one x64-dispatcher-return-alias "${tmp_dir}/fex64-dispatcher-return.bin" \
     "${tmp_dir}/fex64-dispatcher-return.config.bin" 500 1 "" 1
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, and dispatcher-return fixtures completed in all modes"
+# Nested CALL/LEAVE/RET on a relocated stack, on both lanes. The device
+# stopped in the epilogue of __libc_sigaction with a stack in Wine's top-down
+# arena: the canary compare succeeded, the RET loaded its target from the
+# correctly translated host address, and the host then branched to PC 0 --
+# because the emitted L1 lookup compared only the cached GUEST key, so an empty
+# slot {host 0, guest 0} was a hit for a dynamic target of zero.
+#
+# The fixture carries each call site's return address in a register and has the
+# callee compare it against [rbp+8], so the push and an ordinary translated load
+# have to agree about where the guest stack lives. It runs each lane twice: cold
+# (every return site an L1 miss, which must reach the dispatcher and come back
+# with a real host target) and warm (the L1 hit path).
+run_one x64-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin"     "${tmp_dir}/fex64-highstack-callret.config.bin" 1 0 "" 1
+run_one x64-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin"     "${tmp_dir}/fex64-highstack-callret.config.bin" 500 0 "" 1
+run_one x64-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin"     "${tmp_dir}/fex64-highstack-callret.config.bin" 500 1 "" 1
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, dispatcher-return and high-stack call/ret fixtures completed in all modes"

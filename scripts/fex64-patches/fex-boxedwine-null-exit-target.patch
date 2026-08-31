@@ -1,0 +1,266 @@
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -166,6 +166,11 @@
+     return (GuestAddress | GuestLowAliasBase) & ~GuestTopClearMask;
+   }
+ 
++  // Bounded report for an indirect exit whose cached host target was null.
++  // Consumes CpuStateFrame::BoxedWineNullExitSource; does nothing when the
++  // emitted lookup did not set it, which is every working path.
++  void BoxedWineReportNullExitTarget(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
++
+   void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) override;
+ 
+   bool CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState&, uint64_t GuestRIP, uint64_t MaxInst) override;
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1406,7 +1406,84 @@
+   return false;
+ }
+ 
++/* BoxedWine: the bounded witness for an indirect exit that would have branched
++ * to host address zero.
++ *
++ * DEF_OP(ExitFunction)'s emitted L1 lookup compared only the cached GUEST key,
++ * so an empty slot -- {HostCode = 0, GuestCode = 0} -- was a hit for a dynamic
++ * guest target of zero, and the emitted `ret TMP2` branched to host address
++ * zero. A device run does exactly that in the `leave; mov eax, edx; ret`
++ * epilogue of __libc_sigaction: host PC 0, fault address 0, and nothing left in
++ * the report to say what the guest target was, where it came from, or what the
++ * cache actually held.
++ *
++ * The emitted lookup now requires a non-null host pointer and falls into this
++ * path instead. Everything the JIT knew at that moment is either in the frame
++ * (the target, the guest stack pointers) or in the cache entry itself, so the
++ * report is assembled here, where it can be bounded and where it costs nothing
++ * on any path that is working.
++ *
++ * The guest stack is deliberately NOT dereferenced here. The popped qword IS
++ * the dynamic target for a RET, which is reported; re-reading the memory it
++ * came from is what proves whether the pop misread it, and that read has to be
++ * fault-tolerant. BoxedWine's fault reporter does it with a checked read
++ * through its own address space, which is the only side that can tell a mapped
++ * guest page from an unmapped one. */
++namespace {
++std::atomic<uint32_t> BoxedWineNullExitReports {0};
++constexpr uint32_t BoxedWineNullExitReportLimit = 8;
++} // namespace
++
++void ContextImpl::BoxedWineReportNullExitTarget(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
++  if (!Frame) {
++    return;
++  }
++  const uint64_t Source = Frame->BoxedWineNullExitSource;
++  Frame->BoxedWineNullExitSource = 0;
++  if (Source == 0) {
++    return;
++  }
++  if (BoxedWineNullExitReports.fetch_add(1, std::memory_order_relaxed) >= BoxedWineNullExitReportLimit) {
++    return;
++  }
++
++  /* The cache entry the emitted lookup actually read, re-derived the same way
++   * it derives it: index = (RIP << ilog2(entry size)) & the pre-scaled mask. */
++  uint64_t CachedGuest = 0;
++  uint64_t CachedHost = 0;
++  uint64_t EntryAddress = 0;
++  if (Frame->State.L1Pointer) {
++    EntryAddress = Frame->State.L1Pointer +
++                   ((GuestRIP << FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry))) & Frame->State.L1Mask);
++    const auto* CacheEntry = reinterpret_cast<const LookupCache::LookupCacheEntry*>(EntryAddress);
++    CachedHost = CacheEntry->HostCode;
++    CachedGuest = CacheEntry->GuestCode;
++  }
++
++  /* A RET has already advanced the guest stack pointer past the qword it
++   * consumed, so the slot it read is one qword below the current RSP. Both the
++   * canonical address and the host address its bytes live at are reported: the
++   * translation is what a wrong lowering would get wrong, and it is pure
++   * arithmetic, so naming it costs nothing and dereferences nothing. */
++  const uint64_t GuestRSP = Frame->State.gregs[FEXCore::X86State::REG_RSP];
++  const uint64_t GuestRBP = Frame->State.gregs[FEXCore::X86State::REG_RBP];
++  const uint64_t PoppedSlot = GuestRSP - 8;
++
++  LogMan::Msg::EFmt("BOXEDWINE_FEX64_NULL_EXIT_TARGET source_block={:#x} guest_target={:#x} host_target={:#x} "
++                    "l1_entry={:#x} l1_key={:#x} l1_host={:#x} rsp_after_pop={:#x} rsp_before_pop={:#x} "
++                    "popped_slot={:#x} popped_slot_host={:#x} rbp={:#x} rbp_host={:#x} return_slot={:#x} "
++                    "return_slot_host={:#x} path={} repeat={}",
++                    Source, GuestRIP, CachedHost, EntryAddress, CachedGuest, CachedHost, GuestRSP, PoppedSlot,
++                    PoppedSlot, GuestToHostAddress(PoppedSlot), GuestRBP, GuestToHostAddress(GuestRBP), GuestRBP + 8,
++                    GuestToHostAddress(GuestRBP + 8), CachedGuest == GuestRIP ? "l1-null-host" : "l1-miss",
++                    BoxedWineNullExitReports.load(std::memory_order_relaxed));
++}
++
+ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
++  /* First, before the frame is touched: the emitted L1 lookup refused a null
++   * host target and sent us here. Consumes and clears the witness slot. */
++  BoxedWineReportNullExitTarget(Frame, GuestRIP);
++
+   /* BoxedWine: the loader-to-Windows transition, and nothing else.
+    *
+    * This was a per-block enter/leave trace, which is what proved that
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -299,7 +299,20 @@
+        * is eliminated for one run. */
+       (void)SkipFullLookup;
+ #else
+-      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++      /* A predicted entry is usable only when BOTH halves agree: its guest half
++       * matches the target AND its host half is a real code pointer.
++       *
++       * Every call whose return block is unknown pushes `stp xzr, xzr` -- an
++       * entry of {guest 0, host 0}. Comparing the guest half alone makes that
++       * entry a hit for a dynamic guest target of zero, and the `ret TMP2`
++       * below then branches to host address zero. A guest returning to zero has
++       * to become a guest fault, not a host branch to page zero. */
++      {
++        ARMEmitter::ForwardLabel PredictionUnusable;
++        (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &PredictionUnusable);
++        (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
++        (void)Bind(&PredictionUnusable);
++      }
+ #endif
+     }
+ 
+@@ -313,9 +326,43 @@
+ 
+     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+ 
+-    // Note: sub+cbnz used over cmp+br to preserve flags.
++    // Note: sub+cbnz used over cmp+br to preserve flags. cbz/cbnz set none.
+     sub(TMP1, TMP1, RipReg.X());
+-    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++
++    /* A cache hit needs BOTH halves, not just the key.
++     *
++     * The entry is {HostCode, GuestCode} and the table is zero-initialised, so
++     * an empty slot reads {0, 0}. Comparing the key alone therefore makes slot
++     * zero a hit for a dynamic guest target of zero, and the `ret TMP2` at the
++     * bottom of this function branches to host address zero. That is not a
++     * theoretical hazard: it is what a device run does at guest 0x7a4004d4b9,
++     * the `leave; mov eax, edx; ret` epilogue of __libc_sigaction, whose RET
++     * popped a zero return address -- host PC 0, fault address 0, and no way
++     * left to recover either the guest target or the block that produced it.
++     *
++     * The invalidation path relies on the same distinction from the other
++     * side: it clears an entry by zeroing its GuestCode, so a zero key means
++     * "no block here", and a null HostCode means the same thing. The
++     * dispatcher's own copy of this lookup has always tested both
++     * (`cbnz` on the key, then `cbz TMP4, &L1Miss` on the host pointer);
++     * this is that second test, restored here.
++     *
++     * On a miss, execution falls into the DispatcherLoopTop path below with
++     * State.rip set to the target, so an unbacked guest address is resolved by
++     * the ordinary block-compilation path -- which, for an address the guest
++     * has no executable mapping for, raises a normal guest fault. */
++    ARMEmitter::ForwardLabel L1Unusable;
++    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1Unusable);
++    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
++
++    /* Key matched but the cached host pointer is null. Because invalidation
++     * zeroes the key, the only key a null-host entry can match is zero, so
++     * reaching here means the guest target itself was zero. Name the block
++     * that produced it; the dispatcher reports the rest once, bounded. */
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry);
++    str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, BoxedWineNullExitSource));
++
++    (void)Bind(&L1Unusable);
+     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+ 
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -196,9 +196,16 @@
+   }
+ 
+   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+-    // Try L1, no lock needed
++    // Try L1, no lock needed.
++    //
++    // Both halves have to agree. An empty slot is {HostCode = 0, GuestCode =
++    // 0} and InvalidateCache marks an entry dead by zeroing its GuestCode, so
++    // a zero key means "no block here" -- and comparing the key alone reports
++    // an empty slot as a hit whenever the address being looked up is zero,
++    // handing the caller a null host pointer to branch to. Requiring a real
++    // host pointer is the same test the dispatcher's emitted lookup performs.
+     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+-    if (L1Entry.GuestCode == Address) {
++    if (L1Entry.GuestCode == Address && L1Entry.HostCode) {
+       return L1Entry.HostCode;
+     }
+ 
+@@ -325,10 +332,18 @@
+     // Do L1
+     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+     if (L1Entry.GuestCode == Address) {
++      // Clear the key first, so a concurrent reader that sees the stale key
++      // still sees the host pointer that went with it rather than a null one.
+       L1Entry.GuestCode = 0;
+-      // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
+-      // This is a soft guarantee for cross thread invalidation, as atomics are not used
+-      // and it hasn't been thoroughly tested
++      // Then clear the host pointer too. This used to be left in place
++      // precisely so a concurrent lookup could not read null -- but every
++      // reader now requires a non-null host pointer before branching to it
++      // (FindBlock above, the dispatcher's emitted lookup, and the emitted
++      // lookup in DEF_OP(ExitFunction)), so a null is a miss and a miss is
++      // always correct. Leaving it behind is the more dangerous option: an
++      // invalidated slot keeps a dead code pointer that a zero key would
++      // match, which is a branch into code that no longer exists.
++      L1Entry.HostCode = 0;
+     }
+ 
+     if (!DisableL2Cache()) {
+@@ -411,10 +426,12 @@
+       CachedCodePages[CodePage >> 12].insert(Address);
+     }
+ 
+-    // Do L1
++    // Do L1. Publish the host pointer before the key: a reader that sees the
++    // new key must never be able to pair it with the previous entry's host
++    // pointer. The reverse order left a window where exactly that happened.
+     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+-    L1Entry.GuestCode = Address;
+     L1Entry.HostCode = Entry.HostCode;
++    L1Entry.GuestCode = Address;
+ 
+     if (!DisableL2Cache() && !L1Only) {
+       // Do ful map
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -482,8 +482,29 @@
+    * offline. That makes the real bug "the dispatcher is being entered at the wrong address", of
+    * which the State.rip corruption is only the visible consequence. */
+   uint64_t IosLastCallbackLR {};
++
++  /* BoxedWine: the guest block that was about to branch to a null host target.
++   *
++   * The emitted L1 lookup in DEF_OP(ExitFunction) compared only the cached
++   * GUEST key. An empty L1 slot holds {HostCode = 0, GuestCode = 0}, so a
++   * dynamic guest target of zero matched slot zero and the emitted `ret TMP2`
++   * branched to host address zero -- a host crash at PC 0 with a fault address
++   * of 0, from which neither the guest target nor the block that produced it
++   * could be recovered. The dispatcher's own copy of the same lookup has
++   * always guarded this with `cbz TMP4, &L1Miss`; this is that guard's missing
++   * twin, and this slot is what names the source block when it fires.
++   *
++   * Written only on that path, which cannot be reached once the cache holds a
++   * real block for the target, so it costs nothing in steady state. Appended
++   * after the existing witness slots, past Pointers, so no offset moves. */
++  uint64_t BoxedWineNullExitSource {};
+ };
+ static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
++// The JIT stores to this slot with a scaled unsigned 12-bit immediate, whose
++// largest 64-bit offset is 32760. Fail the build rather than emit a truncated
++// store if the frame ever grows past it.
++static_assert(offsetof(CpuStateFrame, BoxedWineNullExitSource) + sizeof(uint64_t) <= 32760,
++              "the null-exit witness slot must stay inside the JIT store immediate range");
+ static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
+ static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
+                                                                                             "than architecture maximum 32768");

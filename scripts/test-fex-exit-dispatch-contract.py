@@ -2176,6 +2176,262 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------ #
+    # An indirect exit must never branch to a null host target. FEX caches   #
+    # {HostCode, GuestCode} in a zero-initialised direct-mapped table and    #
+    # marks an entry dead by zeroing its GuestCode, so an EMPTY slot reads   #
+    # {0, 0}. The emitted lookup in DEF_OP(ExitFunction) compared only the   #
+    # guest key, which made slot zero a hit for a dynamic target of zero and #
+    # `ret TMP2` a branch to host address zero: the device crashed with host #
+    # PC 0 and fault address 0 out of the `leave; mov eax, edx; ret`         #
+    # epilogue of __libc_sigaction at guest 0x7a4004d4b9.                    #
+    # ------------------------------------------------------------------ #
+    null_exit_patch = read(
+        repository / "scripts/fex64-patches/fex-boxedwine-null-exit-target.patch")
+    require_ordered(
+        null_exit_patch,
+        [
+            "FEXCore/Source/Interface/Core/JIT/BranchOps.cpp",
+            # The prediction path: a zeroed pair pushed by a call with no known
+            # return block must not be believed for a target of zero.
+            "PredictionUnusable",
+            # The L1 path: the key alone is not a hit.
+            "ARMEmitter::ForwardLabel L1Unusable;",
+            "cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1Unusable)",
+            "cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup)",
+            # The witness, named by the block that produced the null target.
+            "LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry)",
+            "BoxedWineNullExitSource",
+            "Pointers.DispatcherLoopTop",
+        ],
+        "BoxedVN null indirect-exit guard",
+    )
+    # The same rule on the C++ side of the cache, and no dead code pointer left
+    # behind by invalidation for a zero key to match.
+    require_ordered(
+        null_exit_patch,
+        [
+            "FEXCore/Source/Interface/Core/LookupCache.h",
+            "if (L1Entry.GuestCode == Address && L1Entry.HostCode) {",
+            "L1Entry.GuestCode = 0;",
+            "L1Entry.HostCode = 0;",
+            # Publication order: the host pointer before the key it belongs to.
+            "L1Entry.HostCode = Entry.HostCode;",
+            "L1Entry.GuestCode = Address;",
+        ],
+        "BoxedVN lookup cache null-host contract",
+    )
+    # The witness slot, and the bounded reporter that consumes it.
+    require_ordered(
+        null_exit_patch,
+        [
+            "FEXCore/include/FEXCore/Core/CoreState.h",
+            "uint64_t BoxedWineNullExitSource {};",
+            "<= 32760",
+        ],
+        "BoxedVN null-exit witness slot",
+    )
+    require_ordered(
+        null_exit_patch,
+        [
+            "FEXCore/Source/Interface/Core/Core.cpp",
+            "BoxedWineNullExitReportLimit",
+            "ContextImpl::BoxedWineReportNullExitTarget",
+            "Frame->BoxedWineNullExitSource = 0;",
+            "L1Pointer",
+            "BOXEDWINE_FEX64_NULL_EXIT_TARGET",
+            "BoxedWineReportNullExitTarget(Frame, GuestRIP);",
+        ],
+        "BoxedVN null-exit witness report",
+    )
+    for field in ("source_block=", "guest_target=", "host_target=", "l1_key=",
+                  "l1_host=", "rsp_after_pop=", "popped_slot=",
+                  "popped_slot_host=", "return_slot_host=", "path=",
+                  "repeat="):
+        if field not in null_exit_patch:
+            raise SystemExit(
+                "the null indirect-exit witness must carry " + field
+            )
+    # The witness must stay bounded: no unconditional per-exit logging.
+    if "BoxedWineNullExitReports.fetch_add" not in null_exit_patch:
+        raise SystemExit(
+            "the null indirect-exit witness must be bounded by a counter"
+        )
+
+    # It is a MAINTAINED patch, applied by both the device build and the
+    # translator conformance probe, not an edit to the checked-out tree.
+    fex_build_script = read(repository / "scripts/build-fex64-fex.sh")
+    require_ordered(
+        fex_build_script,
+        [
+            "apply_patch fex-boxedwine-low-address-alias.patch",
+            "apply_patch fex-boxedwine-null-exit-target.patch",
+        ],
+        "BoxedVN null-exit patch is applied by the device build",
+    )
+    vixl_probe = read(repository / "scripts/run-fex64-vixl-probe.sh")
+    require_ordered(
+        vixl_probe,
+        [
+            "fex-boxedwine-low-address-alias.patch",
+            "fex-boxedwine-null-exit-target.patch",
+        ],
+        "BoxedVN null-exit patch is applied by the VIXL probe",
+    )
+
+    # The behavioural regression: nested CALL / LEAVE / RET on both relocated
+    # stacks, run cold (every return site an L1 miss) and warm (the hit path).
+    highstack = read(
+        repository / "scripts/guest-probes/fex64-highstack-callret.asm")
+    require_ordered(
+        highstack,
+        [
+            # Both lanes BoxedWine relocates.
+            "0x7ffc0000",
+            "0x7ffffe000000",
+            # The device frame shape.
+            "push rbp",
+            "mov rbp, rsp",
+            # Each call site names the return address it pushes, so a callee
+            # reached from several sites checks the one that applies.
+            "cmp r8, rdi",
+            # A helper boundary whose return block is unknown at compile time.
+            "call rax",
+            "leave",
+            "ret",
+        ],
+        "BoxedVN high-stack call/ret fixture",
+    )
+    if "qword [rbp + 8]" not in highstack:
+        raise SystemExit(
+            "the high-stack fixture must read the pushed return address back "
+            "through an ordinary translated load"
+        )
+    require_ordered(
+        vixl_probe,
+        [
+            "fixture_highstack_callret=",
+            'prepare_fixture "${fixture_highstack_callret}" '
+            "fex64-highstack-callret",
+            "run_one x64-highstack-callret",
+        ],
+        "BoxedVN high-stack call/ret probe wiring",
+    )
+    # The fixture runs with the alias on, which is the device configuration.
+    highstack_runs = [
+        line for line in vixl_probe.splitlines()
+        if "fex64-highstack-callret.config.bin" in line
+    ]
+    if len(highstack_runs) < 3:
+        raise SystemExit(
+            "the high-stack fixture must run in single-block and multiblock "
+            "modes"
+        )
+    for line in highstack_runs:
+        if not line.rstrip().endswith('"" 1'):
+            raise SystemExit(
+                "the high-stack fixture must run with BoxedWine's address "
+                "translation enabled: " + line.strip()
+            )
+
+    # Every maintained FEX patch stays part of the CI cache key, and so does
+    # the new fixture.
+    workflow = read(repository / ".github/workflows/build-ios.yml")
+    if "scripts/fex64-patches/**" not in workflow:
+        raise SystemExit(
+            "the maintained FEX patches must be part of the CI cache key"
+        )
+    if "scripts/guest-probes/fex64-highstack-callret.asm" not in workflow:
+        raise SystemExit(
+            "the high-stack call/ret fixture must be part of the CI cache key"
+        )
+
+    # ------------------------------------------------------------------ #
+    # The fault report has to say what the guest stack held, read back    #
+    # independently of whatever the translated code loaded from it.       #
+    # ------------------------------------------------------------------ #
+    adapter_source = read(repository / "ios/runtime/src/BVNFEXCPU64Adapter.mm")
+    require_ordered(
+        adapter_source,
+        [
+            "static GuestStackWord readGuestStackWord(",
+            # Translation only. The canonical address is never dereferenced.
+            "k64GuestToHostAddress(guestAddress)",
+            # The same checked read the host-code capture uses.
+            "vm_read_overwrite(",
+            "BOXEDWINE_FEX64_FAULT_STACK",
+        ],
+        "BoxedVN guest stack fault snapshot",
+    )
+    for field in ('"rsp-16"', '"rsp-8"', '"rsp"', '"rsp+8"', '"rbp"',
+                  '"rbp+8"'):
+        if field not in adapter_source:
+            raise SystemExit(
+                "the guest stack snapshot must cover " + field
+            )
+    if "guest=0x%llx host=0x%llx read=%d value=0x%llx" not in adapter_source:
+        raise SystemExit(
+            "each guest stack word must report its canonical address, the host "
+            "address it was read through, whether the read succeeded, and the "
+            "value"
+        )
+    stack_reader_start = adapter_source.index(
+        "static GuestStackWord readGuestStackWord(")
+    stack_reader_body = adapter_source[
+        stack_reader_start:adapter_source.index(
+            newline + "}" + newline, stack_reader_start)]
+    for banned in ("malloc", "new ", "lock", "printf("):
+        if banned in stack_reader_body:
+            raise SystemExit(
+                "the guest stack snapshot runs in a signal handler and must "
+                "not " + banned.strip()
+            )
+
+    # ------------------------------------------------------------------ #
+    # A fatal translator failure ends the guest PROCESS the way exit_group  #
+    # does. Retiring only the thread left the pid with no exit status, no    #
+    # lifecycle marker, and a session that went on presenting a loading      #
+    # overlay while helper processes kept the emulator alive.                #
+    # ------------------------------------------------------------------ #
+    syscall_header = read(repository / "include/syscall64.h")
+    if "void kfatalProcessExit64(CPU64* cpu, U32 status, const char* reason);" \
+            not in syscall_header:
+        raise SystemExit(
+            "a fatal guest process exit needs one shared entry point"
+        )
+    syscall_source = read(repository / "source/kernel/syscall64.cpp")
+    require_ordered(
+        syscall_source,
+        [
+            "void kfatalProcessExit64(CPU64* cpu, U32 status, const char* reason) {",
+            "BOXEDWINE_X64_FATAL_EXIT",
+            # The same two markers a guest exit_group emits.
+            "CPU64: exit_group syscall, status=%u",
+            "BOXEDWINE_X64_PROC_EXIT",
+            # The same completion.
+            "process->exitgroup(cpu->thread, status);",
+            # The launched program's death ends the session; a helper's does not.
+            "KSystem::shutingDown = true;",
+            "KNativeSystem::postQuit();",
+        ],
+        "BoxedVN fatal guest process exit",
+    )
+    if "const bool sessionRoot = parentId <= 1;" not in syscall_source:
+        raise SystemExit(
+            "only the launched program's death may stop the emulator"
+        )
+    platform_source = read(
+        repository / "source/emulation/cpu/normal/normalPlatformMultiThreaded.cpp")
+    require_ordered(
+        platform_source,
+        [
+            "if (!BVNFEXCPU64Run(process.get(), cpu->thread)) {",
+            'kfatalProcessExit64(cpu64, 127,',
+            "cpu->thread->terminating = true;",
+        ],
+        "BoxedVN fatal translator failure routing",
+    )
+
+    # ------------------------------------------------------------------ #
     # Detail budgeting keyed by address space. One global ordinal spent    #
     # the whole budget on the loader and the short-lived helpers, so the   #
     # 4,193,283 refused requests the failing process issued after the      #

@@ -14,6 +14,7 @@
 #include "syscall64.h"
 #include "cpu64.h"
 #include "kmemory64.h"
+#include "knativesystem.h"
 #include "guest_mmap_diagnostics.h"
 #include "guest_mmap_placement.h"
 #include "wine_server_reply.h"
@@ -1286,6 +1287,53 @@ static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
         }
     }
     return 0;
+}
+
+// A guest process the emulator can no longer run. Routed through exit_group's
+// own completion so nothing downstream has to learn a second ending: the pid
+// gets a terminal status, the lifecycle marker is emitted, waiters wake, and
+// the session sees the process leave.
+//
+// When the process is the one the session launched -- its parent is the boot
+// process -- the emulator is also asked to stop. Otherwise the surviving helper
+// processes keep the platform thread count above zero, boxedmain never returns,
+// and the UI goes on presenting a loading state for a program that is gone.
+void kfatalProcessExit64(CPU64* cpu, U32 status, const char* reason) {
+    if (!cpu || !cpu->thread || !cpu->thread->process) {
+        klog_fmt("BOXEDWINE_X64_FATAL_EXIT reason='%s' status=%u "
+                 "(no live process to end)",
+                 reason ? reason : "unknown", (unsigned)status);
+        return;
+    }
+    KProcess* process = cpu->thread->process.get();
+    const U32 parentId = process->parentId;
+    klog_fmt("BOXEDWINE_X64_FATAL_EXIT pid=%u parent=%u status=%u reason='%s' "
+             "exe='%s'",
+             (unsigned)process->id, (unsigned)parentId, (unsigned)status,
+             reason ? reason : "unknown", process->exe.c_str());
+    // The same two markers a guest exit_group emits, so the exit reads the same
+    // way to every consumer of the log.
+    klog_fmt("CPU64: exit_group syscall, status=%u  pid=%d exe='%s' cmd='%s'",
+             (unsigned)status, (int)process->id, process->exe.c_str(),
+             process->commandLine.c_str());
+    klog_fmt("BOXEDWINE_X64_PROC_EXIT pid=%u parent=%u status=%u group=1 "
+             "exe='%s'",
+             (unsigned)process->id, (unsigned)parentId, (unsigned)status,
+             process->exe.c_str());
+    if (status != 0) {
+        dumpX64ExitDiagnostics(cpu, status);
+    }
+    cpu->yield = true;
+    // The launched program is the process whose parent is the boot process.
+    // Its death ends the session; a helper's does not.
+    const bool sessionRoot = parentId <= 1;
+    process->exitgroup(cpu->thread, status);
+    if (sessionRoot) {
+        klog_fmt("BOXEDWINE_X64_FATAL_EXIT session root pid=%u ended; "
+                 "stopping the emulator", (unsigned)process->id);
+        KSystem::shutingDown = true;
+        KNativeSystem::postQuit();
+    }
 }
 
 // struct utsname is 6 × 65-byte fixed strings on x86-64 Linux (390 bytes).

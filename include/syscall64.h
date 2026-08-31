@@ -26,5 +26,22 @@ class CPU64;
 // else returns -ENOSYS with a klog.
 void ksyscall64(CPU64* cpu);
 
+// End a 64-bit guest process that cannot continue, through the SAME completion
+// exit_group(2) uses: the terminal status, the lifecycle marker, and
+// KProcess::exitgroup.
+//
+// The translator backend had its own ending. When it failed a thread fatally it
+// set KThread::terminating and returned, which retires the thread and the FEX
+// context but never gives the PROCESS an exit status. A device run shows the
+// consequence exactly: the main process took a fatal fault, its thread went
+// away, no BOXEDWINE_X64_PROC_EXIT was ever emitted for it, and the session
+// stayed on "loading the Windows system modules" indefinitely while the
+// surviving helper processes kept the emulator's thread count above zero.
+//
+// `reason` names the subsystem that gave up, and appears in the log beside the
+// ordinary exit markers so an abnormal ending is never mistaken for a clean
+// one.
+void kfatalProcessExit64(CPU64* cpu, U32 status, const char* reason);
+
 #endif // BOXEDWINE_GUEST_X64
 #endif
