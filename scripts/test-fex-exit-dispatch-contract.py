@@ -1984,6 +1984,25 @@ def main() -> None:
                 "the FEX NT redirect is incomplete: " + required
             )
 
+    # FEX's generic-host SYSCALL lowering does not end a translated block. A
+    # syscall that changes RIP (most importantly rt_sigreturn) has to leave the
+    # block, or execution falls through after the SYSCALL in Wine's restorer
+    # and the restored RIP never takes effect.
+    syscall_tail = handler[ksyscall_at:]
+    require_ordered(
+        syscall_tail,
+        [
+            "ksyscall64(cpu);",
+            "fexSyscallMustLeaveCurrentBlock(postSyscallRip, cpu->rip)",
+            "BVNFEXCPU64AdapterSyncToFEX(adapter, framePointer)",
+            "BOXEDWINE_FEX64_SYSCALL_REDIRECT pid=%d tid=%d",
+            "adapter->lastAction = execSucceeded",
+            "? BVNFEXCPU64AdapterActionExec",
+            ": BVNFEXCPU64AdapterActionYield;",
+        ],
+        "FEX syscall control-flow replacement contract",
+    )
+
     # Why Yield rather than a bare RIP change: in the pinned FEX, SYSCALL is
     # not a block-ending instruction off Windows, so SyscallOp never reloads
     # RIP from the state and a changed frame RIP would simply be ignored. If a
@@ -2537,6 +2556,26 @@ def main() -> None:
             "str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);",
         ],
         "BoxedVN interrupt fault page store width",
+    )
+
+    # A CALL has no guest instruction between its architectural Push and the
+    # ExitFunction transfer. Reasserting the return qword there makes the slot
+    # authoritative across a second lowering seam, and gives the witness a
+    # reliable hook even when IR canonicalisation has changed the Push value's
+    # node type before MemoryOps sees it.
+    require_ordered(
+        call_witness_patch,
+        [
+            "DEF_OP(ExitFunction) {",
+            "Op->Hint == IR::BranchHint::Call",
+            "!Op->CallReturnAddress.IsInvalid()",
+            "const auto GuestStack = StaticRegisters[X86State::REG_RSP];",
+            "const auto HostStack = AliasGuestAddress(GuestStack);",
+            "stur(ReturnAddress.X(), HostStack, 0);",
+            "EmitCallReturnWitness(ReturnAddress, GuestStack, HostStack,",
+            "ResetStack();",
+        ],
+        "BoxedVN CALL exit-slot repair and witness",
     )
 
     # ------------------------------------------------------------------ #

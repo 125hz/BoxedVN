@@ -315,7 +315,46 @@ diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/In
 diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
 --- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
-@@ -355,14 +355,27 @@
+@@ -44,8 +44,38 @@
+ }
+
+ DEF_OP(ExitFunction) {
+   auto Op = IROp->C<IR::IROp_ExitFunction>();
++
++  /* BoxedWine: make a guest CALL's architectural return slot authoritative at
++   * the point where the call leaves its translated block.
++   *
++   * The ordinary Push lowering already stored this qword. Two physical-device
++   * runs nevertheless reached a RET with the saved frame pointer intact and
++   * the return-address qword above it zero. Repeating the exact architectural
++   * store here is safe -- no guest instruction exists between CALL's push and
++   * this exit -- and crosses a different lowering seam, so a missed/clobbered
++   * Push cannot turn a guest return into RIP zero.
++   *
++   * This runs only for BoxedWine's aliased address space. StaticRegisters[RSP]
++   * is still the canonical post-push stack pointer; translate only the memory
++   * operand, then immediately read it back into the bounded witness ring. The
++   * ring therefore records every CALL even if IR canonicalisation changed the
++   * Push value from EntrypointOffset into another node before MemoryOps saw it
++   * (the previous witness recorded zero calls on device for exactly that
++   * reason). */
++  if (Op->Hint == IR::BranchHint::Call &&
++      !Op->CallReturnAddress.IsInvalid() &&
++      CTX->GetGuestLowAliasBase()) {
++    const auto ReturnAddress = GetReg(Op->CallReturnAddress);
++    const auto GuestStack = StaticRegisters[X86State::REG_RSP];
++    const auto HostStack = AliasGuestAddress(GuestStack);
++    stur(ReturnAddress.X(), HostStack, 0);
++    if (CTX->GetBoxedWineCallWitness()) {
++      EmitCallReturnWitness(ReturnAddress, GuestStack, HostStack,
++                            ReturnAddress, GuestStack);
++    }
++  }
+
+   ResetStack();
+
+   if (CTX->HostFeatures.IsInstCountCI) [[unlikely]] {
+@@ -355,14 +385,27 @@
      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1Unusable);
      (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
 
@@ -505,7 +544,7 @@ diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/S
  #endif
    };
 
-@@ -454,10 +475,31 @@
+@@ -454,11 +475,32 @@
        FillStaticRegs();
      });
 
@@ -537,3 +576,4 @@ diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/S
    {
      (void)Bind(&CompileSingleStep);
 
+     EmitSignalGuardedRegion([&]() {

@@ -249,6 +249,18 @@ constexpr bool fexHostTargetIsExecutable(std::uint64_t hostTarget) noexcept {
     return hostTarget != 0;
 }
 
+// FEX does not make SYSCALL a block-ending instruction for this non-Windows
+// host configuration. If the BoxedWine syscall layer restores or otherwise
+// replaces RIP (rt_sigreturn, synchronous self-signal delivery, exec, ...),
+// returning normally would keep executing the already translated bytes after
+// SYSCALL and silently discard that replacement. Such a syscall must leave the
+// current FEX block and re-enter the dispatcher with the resulting RIP.
+constexpr bool fexSyscallMustLeaveCurrentBlock(
+    std::uint64_t postSyscallRIP,
+    std::uint64_t resultingRIP) noexcept {
+    return resultingRIP != postSyscallRIP;
+}
+
 }  // namespace boxedvn
 
 #endif  // BOXEDVN_FEX_EXIT_DISPATCH_CONTRACT_H

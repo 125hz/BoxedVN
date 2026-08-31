@@ -283,3 +283,20 @@ BOXEDVN_TEST(fex_a_null_host_target_is_never_executable) {
                                           kDispatcherLoopTop);
     CHECK(fexHostTargetIsExecutable(exit.hostTarget));
 }
+
+BOXEDVN_TEST(fex_syscall_rip_replacement_must_leave_the_current_block) {
+    constexpr std::uint64_t syscallRIP = 0x7a4004d337ULL;
+    constexpr std::uint64_t postSyscallRIP = syscallRIP + 2;
+
+    // An ordinary syscall resumes at the following instruction.
+    CHECK(!fexSyscallMustLeaveCurrentBlock(postSyscallRIP,
+                                           postSyscallRIP));
+    // rt_sigreturn restores the interrupted RIP. Continuing the current FEX
+    // block would instead fall through in Wine's restorer and repeat forever.
+    CHECK(fexSyscallMustLeaveCurrentBlock(postSyscallRIP,
+                                          0x7fffffa69170ULL));
+    // Synchronous signal delivery replaces RIP with the installed handler and
+    // has the same block-exit requirement.
+    CHECK(fexSyscallMustLeaveCurrentBlock(postSyscallRIP,
+                                          0x7a400a8000ULL));
+}

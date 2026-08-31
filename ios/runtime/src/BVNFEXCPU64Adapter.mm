@@ -41,6 +41,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
 #undef FSCALE
 #endif
 #include "boxedwine.h"
+#include "boxedvn/fex_exit_dispatch_contract.h"
 #include "cpu64.h"
 #include "fex64loaderhandoff.h"
 #include "kmemory64.h"
@@ -79,6 +80,7 @@ struct BVNFEXCPU64Adapter {
 
 static thread_local BVNFEXCPU64Adapter* gCurrentAdapter = nullptr;
 static std::atomic<uint32_t> gLiveSyscallTraceOrdinal {0};
+static std::atomic<uint32_t> gSyscallRedirectReports {0};
 
 // FEX stores x87 state in a stack-relative view (the MM array is indexed by
 // physical stack slot, while AbridgedFTW bits are indexed by ST(i)). CPU64's
@@ -1078,6 +1080,40 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
 
     const bool execSucceeded = arguments[0] == 59 &&
         static_cast<S64>(cpu->reg[X64_RAX].u64) >= 0;
+
+    // FEX's generic-host SYSCALL lowering is not a block end. A syscall that
+    // replaces RIP therefore cannot return through the ordinary Continue
+    // action: FEX would keep running the bytes after SYSCALL in the old block,
+    // ignoring the state RIP we just restored. That is exactly what the device
+    // logs show for rt_sigreturn: thousands of returns at Wine's restorer RIP,
+    // with one signal frame lost from RSP on each pass, before exit_group(1).
+    //
+    // Leave this block and let ExecuteThread re-enter the dispatcher with the
+    // synced RIP. This also covers synchronous self-signal delivery. exec keeps
+    // its stronger action because it replaced the whole image, not only RIP.
+    if (boxedvn::fexSyscallMustLeaveCurrentBlock(postSyscallRip, cpu->rip)) {
+        if (!BVNFEXCPU64AdapterSyncToFEX(adapter, framePointer)) {
+            adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
+            return static_cast<uint64_t>(-K_EFAULT);
+        }
+        if ((syscallNumber == 15 || syscallNumber == 13 ||
+             syscallNumber == 234 || syscallNumber == 200) &&
+            gSyscallRedirectReports.fetch_add(
+                1, std::memory_order_relaxed) < 32) {
+            klog_fmt("BOXEDWINE_FEX64_SYSCALL_REDIRECT pid=%d tid=%d "
+                     "nr=%llu from=0x%llx to=0x%llx rsp=0x%llx",
+                     adapter->process->id, adapter->thread->id,
+                     static_cast<unsigned long long>(syscallNumber),
+                     static_cast<unsigned long long>(postSyscallRip),
+                     static_cast<unsigned long long>(cpu->rip),
+                     static_cast<unsigned long long>(
+                         cpu->reg[X64_RSP].u64));
+        }
+        adapter->lastAction = execSucceeded
+            ? BVNFEXCPU64AdapterActionExec
+            : BVNFEXCPU64AdapterActionYield;
+        return cpu->reg[X64_RAX].u64;
+    }
     adapter->lastAction = execSucceeded
         ? BVNFEXCPU64AdapterActionExec
         : BVNFEXCPU64AdapterActionContinue;
