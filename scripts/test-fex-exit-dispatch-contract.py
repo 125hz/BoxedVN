@@ -2972,6 +2972,29 @@ def main() -> None:
         raise SystemExit(
             "the descendant snapshot must not claim more than it measured")
 
+    # No maintained patch may open a NAMED namespace.
+    #
+    # Core.cpp closes and reopens `namespace FEXCore::Context` around
+    # ContextImpl. A patch that writes that opener again lands inside the one
+    # already open, nesting FEXCore::Context::FEXCore::Context -- which
+    # introduces the name `FEXCore` inside FEXCore::Context, so every later
+    # `FEXCore::X86State` in the file resolves against the nearer one and the
+    # translation unit stops compiling, hundreds of lines away from the patch.
+    #
+    # These patches add code to namespaces the pinned source already has. An
+    # anonymous namespace is fine: it cannot be reopened by name, so it cannot
+    # shadow anything.
+    for patch_path in sorted(
+            (repository / "scripts/fex64-patches").glob("*.patch")):
+        for number, line in enumerate(
+                read(patch_path).splitlines(), 1):
+            if line.startswith("+namespace ") and line != "+namespace {":
+                raise SystemExit(
+                    "{}:{}: a maintained patch must not open a named "
+                    "namespace -- the pinned source already provides them, "
+                    "and reopening one nests it: {}".format(
+                        patch_path.name, number, line[1:]))
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

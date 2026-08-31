@@ -1,12 +1,15 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 92305f46..06de6c76 100644
+index 92305f46..c61119e2 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
-@@ -1357,7 +1357,112 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
+@@ -1357,7 +1357,114 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
  }
  #endif
 
-+namespace FEXCore::Context {
++/* Already inside namespace FEXCore::Context, which this file reopens around
++ * ContextImpl. Opening it again here would nest a second FEXCore::Context
++ * inside it, and every later FEXCore::X86State in the file would then resolve
++ * against the nearer FEXCore it introduced. */
 +namespace {
 +std::atomic<uint32_t> BoxedWineBlockTraceBudget {0};
 +std::atomic<uint32_t> BoxedWineBlockTraceProcess {0};
@@ -47,7 +50,6 @@ index 92305f46..06de6c76 100644
 +  }
 +  return false;
 +}
-+} // namespace FEXCore::Context
 +
  uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
 +  /* BoxedWine: keep a bounded enter/leave trace around the whole compiler.
@@ -115,7 +117,7 @@ index 92305f46..06de6c76 100644
    if constexpr (BLOCK_DEBUGGING) {
      // Block debugging logic is hand-written and needs to be handled with care.
      // Force MaxInst to only be one in this case.
-@@ -1571,12 +1676,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+@@ -1571,12 +1678,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     *
     * Back to IsAddressInCodeBuffer alone, which is sound with no discrimination needed: FEX's own
     * emitted code is never guest code under any classification. */
