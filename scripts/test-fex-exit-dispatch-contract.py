@@ -2553,6 +2553,91 @@ def main() -> None:
         raise SystemExit(
             "the top-arena fixture must participate in the VIXL cache key")
 
+    # ------------------------------------------------------------------ #
+    # The guest uses 4 KiB pages and iOS uses 16 KiB, so a guest mapping is   #
+    # rounded out to the enclosing host pages and routinely shares one with   #
+    # the request before it. glibc's heap does this on every brk growth, and  #
+    # the mixture of tracked and untracked host pages was refused outright.   #
+    # ------------------------------------------------------------------ #
+    plan_header = read(repository / "include/native_map_plan.h")
+    require_ordered(
+        plan_header,
+        [
+            "struct NativeHostRun {",
+            "bool reused = false;",
+            "GapOccupied = 2,",
+            "bool exactHostCover = false;",
+            "std::vector<NativeHostRun> runs;",
+            "inline NativeMapPlan planNativeAnonymousMap(",
+            "const bool isReused = covered(context, page, page + hostPageSize);",
+            "plan.status = NativeMapPlanStatus::GapOccupied;",
+            "plan.status = NativeMapPlanStatus::Ok;",
+        ],
+        "BoxedVN native map planning contract",
+    )
+
+    memory_impl = read(repository / "source/kernel/kmemory64.cpp")
+    require_ordered(
+        memory_impl,
+        [
+            '#include "native_map_plan.h"',
+            "bool KMemory64::nativeMapAnonymous(",
+            "boxedvn::planNativeAnonymousMap(",
+            "for (const boxedvn::NativeHostRun& run : plan.runs) {",
+            "if (run.reused) {",
+            "k64NativeReserveHostRange(run.start, run.length)",
+            "::mmap((void*)(uintptr_t)run.start, (size_t)run.length,",
+            "::memset((void*)(uintptr_t)hostAddr, 0, (size_t)len);",
+            "nativeForgetRange(hostStart, hostLength);",
+            "BOXEDWINE_X64_NATIVE_EXTEND guest=[0x%llx,0x%llx) ",
+        ],
+        "BoxedVN partial native map contract",
+    )
+    # The refusal this replaces is gone, and no single MAP_FIXED may span the
+    # whole mixed interval any more.
+    if "refusing partially tracked native map" in memory_impl:
+        raise SystemExit(
+            "a partially tracked host interval must be planned, not refused")
+    map_start = memory_impl.index("bool KMemory64::nativeMapAnonymous(")
+    map_end = memory_impl.index(newline + "bool KMemory64::nativeMapKuserAlias(",
+                                map_start)
+    map_body = memory_impl[map_start:map_end]
+    if "::mmap((void*)(uintptr_t)hostStart" in map_body:
+        raise SystemExit(
+            "the whole enclosing interval must never be mapped in one "
+            "destructive MAP_FIXED: it would replace the tracked pages it "
+            "was asked to preserve")
+    # Only the requested guest bytes are zeroed. Zeroing the enclosing host
+    # pages would destroy the neighbouring guest subpages.
+    if "::memset((void*)(uintptr_t)hostStart" in map_body:
+        raise SystemExit(
+            "only the requested guest bytes may be zeroed, never the "
+            "enclosing host pages")
+    # A failure must undo only what this call created.
+    for required in ("auto rollback = [&created]()", "rollback();",
+                     "it->mapped", "it->reserved"):
+        if required not in map_body:
+            raise SystemExit(
+                "a failed partial map must roll back only its own "
+                "reservations and mappings: " + required)
+    # An existing neighbour keeps its access: a shared host page stays
+    # readable and writable whatever protection the request asked for.
+    if "plan.exactHostCover ? k64NativeProt(prot)" not in map_body:
+        raise SystemExit(
+            "a host page shared with a mapped neighbour must keep the "
+            "protection that neighbour needs")
+
+    # Linux brk semantics are unchanged: the new break is returned as asked,
+    # not rounded out to a host page.
+    syscalls = read(repository / "source/kernel/syscall64.cpp")
+    brk_start = syscalls.index("U64 sys_brk64(")
+    brk_body = syscalls[brk_start:brk_start + 4000]
+    for banned in ("k64NativeAlignUp(newBrk", "k64NativeHostPageSize()"):
+        if banned in brk_body:
+            raise SystemExit(
+                "sys_brk64 must return the requested break, not one rounded "
+                "to the host page: " + banned)
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

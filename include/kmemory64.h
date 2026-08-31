@@ -349,6 +349,11 @@ public:
     // the proven iOS window (plus the special KUSER shared-data alias).
     bool nativeGuestRangeAllowed(U64 addr, U64 len) const;
 
+    // Whether [start, end) of HOST address space is already tracked by this
+    // address space. Public only so the mapping planner in native_map_plan.h
+    // can ask; it is the same question nativeRangeCovers answers.
+    bool nativeRangeCoversForPlan(U64 start, U64 end) const;
+
     // Return the host alias for a canonical KUSER_SHARED_DATA address, or 0
     // when this address space is sparse / has not mapped the alias. This is
     // intentionally narrow; it is not a general guest-pointer translation.

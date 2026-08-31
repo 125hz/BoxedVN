@@ -9,6 +9,7 @@
 
 #include "boxedwine.h"
 #include "kmemory64.h"
+#include "native_map_plan.h"
 #include "cpu64.h"   // CPU64 full def — BW64_MEMRING reads the running thread's rip
 
 #ifdef BOXEDWINE_GUEST_X64
@@ -657,6 +658,36 @@ void KMemory64::nativeForgetRange(U64 start, U64 length) {
     }
 }
 
+namespace {
+
+// Adapters so the planner can ask this address space its two questions
+// without knowing anything about it.
+struct NativeMapPlanContext {
+    const KMemory64* memory;
+};
+
+bool nativeMapPlanCovered(void* context, U64 start, U64 end) {
+    return static_cast<NativeMapPlanContext*>(context)->memory
+        ->nativeRangeCoversForPlan(start, end);
+}
+
+bool nativeMapPlanFree(void* context, U64 start, U64 end) {
+    (void)context;
+    return k64NativeHostRangeFree(start, end - start);
+}
+
+// Bounded: a handful of lines naming the interval, what was reused and what
+// was newly mapped. A guest heap grows constantly; this must not become a
+// line per brk.
+std::atomic<U32> gNativeExtendReports {0};
+constexpr U32 kNativeExtendReportLimit = 16;
+
+} // namespace
+
+bool KMemory64::nativeRangeCoversForPlan(U64 start, U64 end) const {
+    return nativeRangeCovers(start, end);
+}
+
 bool KMemory64::nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh) {
     if (!nativeGuestRangeAllowed(addr, len)) {
         klog_fmt("KMemory64: native host MAP_FIXED refused outside guest "
@@ -665,109 +696,131 @@ bool KMemory64::nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh) {
         return false;
     }
     const U64 hostPage = k64NativeHostPageSize();
-    if ((hostPage & (hostPage - 1)) != 0 || hostPage < K64_PAGE_SIZE) return false;
-    if (addr > UINT64_MAX - len) return false;
-    const U64 guestEnd = addr + len;
-    if (guestEnd > UINT64_MAX - (hostPage - 1)) return false;
     // Canonical guest addresses keep their values; only the host address the
     // bytes live at is translated. The alias is the identity for every
     // permitted high address, so this is a no-op for the ordinary lanes.
     const U64 hostAddr = k64GuestToHostAddress(addr);
-    const U64 hostGuestEnd = k64GuestToHostAddress(addr) + len;
-    const U64 hostStart = k64NativeAlignDown(hostAddr, hostPage);
-    const U64 hostEnd = k64NativeAlignUp(hostGuestEnd, hostPage);
+
+    // A guest mapping is rounded out to the enclosing host pages, so a request
+    // that starts mid-host-page shares that page with whatever the guest
+    // already mapped there. glibc's heap does this on every 4 KiB brk growth.
+    // Plan the interval page by page instead of treating it as all-or-nothing:
+    // reuse what is already owned, map only what is genuinely free, and refuse
+    // only when an untracked gap is occupied.
+    NativeMapPlanContext planContext {this};
+    const boxedvn::NativeMapPlan plan = boxedvn::planNativeAnonymousMap(
+        hostAddr, len, hostPage, K64_PAGE_SIZE, &nativeMapPlanCovered,
+        &nativeMapPlanFree, &planContext);
+    if (!plan.ok()) {
+        klog_fmt("BOXEDWINE_X64_NATIVE_EXTEND guest=[0x%llx,0x%llx) "
+                 "host=[0x%llx,0x%llx) result=%s",
+                 (unsigned long long)addr, (unsigned long long)(addr + len),
+                 (unsigned long long)plan.hostStart,
+                 (unsigned long long)plan.hostEnd,
+                 plan.status == boxedvn::NativeMapPlanStatus::GapOccupied
+                     ? "gap-occupied" : "invalid-request");
+        return false;
+    }
+
+    const U64 hostStart = plan.hostStart;
+    const U64 hostEnd = plan.hostEnd;
     const U64 hostLength = hostEnd - hostStart;
 
-    if (nativeRangeCovers(hostStart, hostEnd)) {
-        // MAP_FIXED|MAP_ANONYMOUS replaces the requested guest bytes with
-        // zeroes, even when the requested protection is PROT_NONE.  Temporarily
-        // make the enclosing host pages writable so this remains correct on a
-        // 16 KiB host page when only one 4 KiB guest subpage is remapped.
-        if (::mprotect((void*)(uintptr_t)hostStart, (size_t)hostLength,
-                       PROT_READ | PROT_WRITE) != 0) {
-            return false;
-        }
-        ::memset((void*)(uintptr_t)hostAddr, 0, (size_t)len);
-        // A partial 4 KiB remap shares this host page with neighboring guest
-        // pages. Keep the host page readable/writable in that case; guest
-        // permissions remain in the per-4 KiB flags and enforcing PROT_NONE
-        // here would revoke access from the neighboring subpages.
-        const bool partialHostPage =
-            (hostStart != hostAddr || hostEnd != hostGuestEnd);
-        const int finalProt = partialHostPage ? (PROT_READ | PROT_WRITE)
-                                              : k64NativeProt(prot);
-        if (::mprotect((void*)(uintptr_t)hostStart, (size_t)hostLength,
-                       finalProt) != 0) {
-            return false;
-        }
-        for (auto& entry : nativeRanges) {
-            NativeRange& range = entry.second;
-            if (range.hostStart < hostEnd && range.hostStart + range.hostLength > hostStart) {
-                range.prot = prot;
+    // Reserve and map only the runs that are not already owned. Each is
+    // recorded so a later failure can undo exactly what this call created and
+    // leave every pre-existing tracked page untouched.
+    struct CreatedRun { U64 start; U64 length; bool reserved; bool mapped; };
+    std::vector<CreatedRun> created;
+    auto rollback = [&created]() {
+        for (auto it = created.rbegin(); it != created.rend(); ++it) {
+            if (it->mapped) {
+                ::munmap((void*)(uintptr_t)it->start, (size_t)it->length);
+            }
+            if (it->reserved) {
+                k64NativeReleaseReservedHostRange(it->start, it->length);
             }
         }
-        fresh = false;
-        return true;
-    }
+    };
 
-    // Do not issue Darwin MAP_FIXED against an untracked address: it can
-    // replace the executable arena, the app image, or another runtime region.
-    // The Mach reservation is retained until mmap consumes it, closing the
-    // preflight-to-map race for the first identity mapping in this process.
-    bool reservedHostRange = false;
-    if (!nativeRangeCovers(hostStart, hostEnd)) {
-        // A partially tracked overlap cannot be safely replaced as one
-        // MAP_FIXED operation: it might contain an untracked host region in
-        // the gap. Native mappings are host-page aligned, so a partial overlap
-        // is a bookkeeping error and is rejected rather than guessed around.
-        for (const auto& entry : nativeRanges) {
-            const U64 rangeStart = entry.second.hostStart;
-            const U64 rangeEnd = rangeStart + entry.second.hostLength;
-            if (rangeStart < hostEnd && rangeEnd > hostStart) {
-                klog_fmt("KMemory64: refusing partially tracked native map "
-                         "[0x%llx,0x%llx)", (unsigned long long)hostStart,
-                         (unsigned long long)hostEnd);
-                return false;
-            }
+    for (const boxedvn::NativeHostRun& run : plan.runs) {
+        if (run.reused) {
+            continue;
         }
-        if (!k64NativeHostRangeFree(hostStart, hostLength)) {
-            klog_fmt("KMemory64: native host range is occupied, refusing map "
-                     "[0x%llx,0x%llx)", (unsigned long long)hostStart,
-                     (unsigned long long)hostEnd);
-            return false;
-        }
-        if (!k64NativeReserveHostRange(hostStart, hostLength)) {
+        // Do not issue Darwin MAP_FIXED against an untracked address without
+        // holding it first: it could replace the executable arena, the app
+        // image, or another runtime region. The Mach reservation is retained
+        // until mmap consumes it, closing the preflight-to-map race.
+        if (!k64NativeReserveHostRange(run.start, run.length)) {
             klog_fmt("KMemory64: native host reservation failed for "
-                     "[0x%llx,0x%llx)", (unsigned long long)hostStart,
-                     (unsigned long long)hostEnd);
+                     "[0x%llx,0x%llx)", (unsigned long long)run.start,
+                     (unsigned long long)(run.start + run.length));
+            rollback();
             return false;
         }
-        reservedHostRange = true;
+        created.push_back(CreatedRun{run.start, run.length, true, false});
+        const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_BOXEDWINE;
+        void* mapped = ::mmap((void*)(uintptr_t)run.start, (size_t)run.length,
+                              PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (mapped == MAP_FAILED || (U64)(uintptr_t)mapped != run.start) {
+            if (mapped != MAP_FAILED) ::munmap(mapped, (size_t)run.length);
+            rollback();
+            return false;
+        }
+        created.back().mapped = true;
+        ::memset(mapped, 0, (size_t)run.length);
     }
 
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_BOXEDWINE;
-    void* mapped = ::mmap((void*)(uintptr_t)hostStart, (size_t)hostLength,
-                          PROT_READ | PROT_WRITE, flags, -1, 0);
-    if (mapped == MAP_FAILED || (U64)(uintptr_t)mapped != hostStart) {
-        if (mapped != MAP_FAILED) ::munmap(mapped, (size_t)hostLength);
-        if (reservedHostRange) {
-            k64NativeReleaseReservedHostRange(hostStart, hostLength);
-        }
+    // MAP_FIXED|MAP_ANONYMOUS replaces the requested guest bytes with zeroes,
+    // even when the requested protection is PROT_NONE. Make the whole interval
+    // writable so that stays true across a reused host page whose other guest
+    // subpages must survive.
+    if (::mprotect((void*)(uintptr_t)hostStart, (size_t)hostLength,
+                   PROT_READ | PROT_WRITE) != 0) {
+        rollback();
         return false;
     }
-    ::memset(mapped, 0, (size_t)hostLength);
-    const int finalProt = k64NativeProt(prot);
+    // Exactly the requested guest bytes, and nothing else. Zeroing the whole
+    // enclosing host pages would destroy the neighbouring guest subpages this
+    // request shares them with.
+    ::memset((void*)(uintptr_t)hostAddr, 0, (size_t)len);
+
+    // A partial host page is shared with neighbouring guest pages. Keep it
+    // readable and writable in that case: guest permissions live in the
+    // per-4 KiB flags, and enforcing PROT_NONE here would revoke access from
+    // a neighbour that is still mapped.
+    const int finalProt = plan.exactHostCover ? k64NativeProt(prot)
+                                              : (PROT_READ | PROT_WRITE);
     if (finalProt != (PROT_READ | PROT_WRITE) &&
-        ::mprotect(mapped, (size_t)hostLength, finalProt) != 0) {
-        ::munmap(mapped, (size_t)hostLength);
+        ::mprotect((void*)(uintptr_t)hostStart, (size_t)hostLength,
+                   finalProt) != 0) {
+        rollback();
         return false;
     }
-    // MAP_FIXED may have replaced a partially overlapping tracked range. Do
-    // not leave stale/overlapping NativeRange entries behind (emplace would
-    // silently retain an old entry with the same key).
+
+    // One valid, non-overlapping entry across the completed interval, so
+    // nativeRangeCovers succeeds over all of it. Forgetting first keeps any
+    // tracked range that extends beyond this interval intact and prevents a
+    // stale entry from surviving under the same key.
     nativeForgetRange(hostStart, hostLength);
     nativeRanges.emplace(hostStart, NativeRange{hostStart, hostLength, prot});
-    fresh = true;
+
+    if (plan.mappedPages != 0 && plan.reusedPages != 0 &&
+        gNativeExtendReports.fetch_add(1, std::memory_order_relaxed) <
+            kNativeExtendReportLimit) {
+        klog_fmt("BOXEDWINE_X64_NATIVE_EXTEND guest=[0x%llx,0x%llx) "
+                 "host=[0x%llx,0x%llx) reused=%llu/%llu new=%llu/%llu "
+                 "result=ok",
+                 (unsigned long long)addr, (unsigned long long)(addr + len),
+                 (unsigned long long)hostStart, (unsigned long long)hostEnd,
+                 (unsigned long long)plan.reusedBytes,
+                 (unsigned long long)plan.reusedPages,
+                 (unsigned long long)plan.mappedBytes,
+                 (unsigned long long)plan.mappedPages);
+    }
+
+    // Something new was mapped, so the caller need not zero the guest pages
+    // again: the exact requested range was zeroed above.
+    fresh = plan.mappedPages != 0;
     return true;
 }
 
