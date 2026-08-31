@@ -1404,7 +1404,7 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode
         char detail[64];
         snprintf(detail, sizeof(detail), "flags=0x%llx dir=%d",
                  (unsigned long long)flags, (flags & 0x10000) != 0 ? 1 : 0);
-        reportDllSearch(process.get(), (flags & 0x10000) != 0 ? "opendir" : "open",
+        reportDllSearch(process, (flags & 0x10000) != 0 ? "opendir" : "open",
                         path, (long long)(S64)(S32)rc, detail);
     }
     if ((S32)rc < 0) {
