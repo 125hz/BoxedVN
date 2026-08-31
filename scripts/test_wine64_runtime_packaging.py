@@ -54,6 +54,8 @@ def elf(machine: int = 62, elf_class: int = 2, body: bytes = b"") -> bytes:
 
 ROOT = "usr/lib/x86_64-linux-gnu/wine"
 PE_DIR = ROOT + "/x86_64-windows"
+DATA_ROOT = "usr/share/wine"
+DERIVED_DATA_ROOT = "usr/lib/x86_64-linux-gnu/share/wine"
 
 
 def pe(machine: int = 0x8664, body: bytes = b"") -> bytes:
@@ -117,6 +119,13 @@ class WineserverPackagingContract(unittest.TestCase):
             self.assertIn("guest_link \"${WINE_MODULE_ROOT}/", self.builder)
             self.assertIn(link, self.builder)
 
+    def test_builder_links_wines_derived_data_root_to_packaged_nls(self) -> None:
+        self.assertIn("cp -aL /usr/share/wine", self.builder)
+        self.assertIn(
+            "guest_link /usr/share/wine /usr/lib/x86_64-linux-gnu/share/wine",
+            self.builder,
+        )
+
     def test_builder_refuses_an_archive_without_the_builtins(self) -> None:
         # kernel32.dll present in the archive but unreachable is the failure
         # this layout exists to prevent; kernel32.dll absent would be worse.
@@ -174,6 +183,8 @@ class WineserverArchiveValidation(unittest.TestCase):
         archive.writestr(ROOT + "/x86_64-unix/winemetal.so", elf())
         for builtin in ("ntdll.dll", "kernel32.dll", "kernelbase.dll"):
             archive.writestr(PE_DIR + "/" + builtin, pe(body=builtin.encode()))
+        for nls in ("c_20127.nls", "locale.nls", "l_intl.nls"):
+            archive.writestr(DATA_ROOT + "/nls/" + nls, b"nls:" + nls.encode())
         for link, target in self.compatibility_links():
             archive.writestr(link + ".link", guest_link(target))
 
@@ -187,6 +198,7 @@ class WineserverArchiveValidation(unittest.TestCase):
             ("usr/lib/wine/x86_64-unix", "/" + ROOT + "/x86_64-unix"),
             ("usr/bin/wine64", "/" + ROOT + "/wine64"),
             ("usr/bin/wineserver", "/" + ROOT + "/wineserver"),
+            (DERIVED_DATA_ROOT, "/" + DATA_ROOT),
         )
 
     def run_validator(self, directory: Path, glibc: Path, wine: Path) -> tuple:
@@ -275,6 +287,27 @@ class WineserverArchiveValidation(unittest.TestCase):
                     code, output = self.run_validator(directory, glibc, wine)
                     self.assertNotEqual(code, 0, output)
                     self.assertIn(missing, output)
+
+    def test_missing_nls_data_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.rewrite_wine_archive(
+                wine, drop=DATA_ROOT + "/nls/locale.nls")
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("locale.nls", output)
+
+    def test_missing_derived_data_root_link_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.rewrite_wine_archive(wine, drop=DERIVED_DATA_ROOT + ".link")
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn(DERIVED_DATA_ROOT, output)
 
     def test_a_builtin_that_is_not_a_pe_image_is_rejected(self) -> None:
         # Two bytes of "MZ" used to be enough. A truncated entry, or the text

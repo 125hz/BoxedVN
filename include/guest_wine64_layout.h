@@ -25,6 +25,13 @@
  * derives lands in the same tree. /usr/lib/wine stays reachable as guest
  * symlinks for anything that still names it.
  *
+ * Wine also derives its data directory by walking two parents up from this
+ * module root and appending `share/wine`. With Ubuntu's multiarch module root,
+ * that names `/usr/lib/x86_64-linux-gnu/share/wine`, while the distro packages
+ * the NLS tables under `/usr/share/wine`. The resource compatibility link below
+ * joins those two paths. Without it, ntdll initializes its locale tables from
+ * a null pointer before the first Windows process can start.
+ *
  * A note on those symlinks: BoxedWine's ZIP filesystem does not read POSIX
  * symlinks out of an archive. It recognises a link by a `.link` suffix on the
  * entry name, whose contents are the target path (see EXT_LINK in
@@ -46,6 +53,8 @@
 // Kept reachable for anything that still names the relocated layout. Nothing
 // in a launch resolves through these any more.
 #define K_X64_WINE_COMPAT_ROOT "/usr/lib/wine"
+#define K_X64_WINE_DERIVED_DATA_ROOT "/usr/lib/x86_64-linux-gnu/share/wine"
+#define K_X64_WINE_DATA_ROOT "/usr/share/wine"
 
 // WINEDLLPATH names module ROOTS, not the PE directory: Wine appends
 // "/x86_64-windows" to each entry itself. Pointing it straight at the PE

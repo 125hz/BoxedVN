@@ -356,6 +356,17 @@ for required_builtin in ntdll.dll kernel32.dll kernelbase.dll; do
         "${WINE_MODULE_ROOT}/x86_64-windows/${required_builtin}"
 done
 
+# ntdll needs these locale tables during its earliest process initialization.
+# With the multiarch module root Wine derives
+# /usr/lib/x86_64-linux-gnu/share/wine, so both the real data and the guest link
+# from that derived location must be present. A device run without this link
+# reached ntdll.so+0x12338 and dereferenced a null locale-table pointer.
+for required_nls in c_20127.nls locale.nls l_intl.nls; do
+    check_zip_path "${WINE_ARCHIVE}" "usr/share/wine/nls/${required_nls}"
+done
+check_zip_guest_link "${WINE_ARCHIVE}" \
+    usr/lib/x86_64-linux-gnu/share/wine /usr/share/wine
+
 # The relocated layout stays reachable, as guest links rather than as copies.
 check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/wine64 \
     "/${WINE_MODULE_ROOT}/wine64"

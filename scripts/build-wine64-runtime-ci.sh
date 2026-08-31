@@ -317,6 +317,11 @@ guest_link "${WINE_MODULE_ROOT}/x86_64-windows" /usr/lib/wine/x86_64-windows
 guest_link "${WINE_MODULE_ROOT}/x86_64-unix" /usr/lib/wine/x86_64-unix
 guest_link "${WINE_MODULE_ROOT}/wine64" /usr/bin/wine64
 guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/bin/wineserver
+# Wine derives its data root as ../../share/wine from the multiarch module
+# directory. That resolves to /usr/lib/x86_64-linux-gnu/share/wine, while the
+# Ubuntu package installs NLS tables in /usr/share/wine. Make the derived path
+# guest-visible without duplicating the resource tree in the IPA.
+guest_link /usr/share/wine /usr/lib/x86_64-linux-gnu/share/wine
 
 # These directories are created by wineserver and by Wine's default prefix.
 mkdir -p "${STAGE}/tmp" "${STAGE}/run/user/1000" \
