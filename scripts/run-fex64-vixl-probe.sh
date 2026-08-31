@@ -15,6 +15,7 @@ fixture_negative_add="${root}/scripts/guest-probes/fex64-negative-add-contract.a
 fixture_indexed_alias="${root}/scripts/guest-probes/fex64-indexed-alias-contract.asm"
 fixture_top_alias="${root}/scripts/guest-probes/fex64-top-alias-contract.asm"
 fixture_top_alias_repmov="${root}/scripts/guest-probes/fex64-top-alias-repmov.asm"
+fixture_top_alias_stack="${root}/scripts/guest-probes/fex64-top-alias-stack.asm"
 host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
@@ -60,6 +61,8 @@ command -v "${cxx}" >/dev/null || die "the Clang C++ compiler is required"
     die "fixture not found: ${fixture_top_alias}"
 [[ -f "${fixture_top_alias_repmov}" ]] || \
     die "fixture not found: ${fixture_top_alias_repmov}"
+[[ -f "${fixture_top_alias_stack}" ]] || \
+    die "fixture not found: ${fixture_top_alias_stack}"
 [[ -f "${host_word_check}" ]] || \
     die "host-word checker not found: ${host_word_check}"
 [[ -f "${host_stubs_source}" ]] || die "host stubs not found: ${host_stubs_source}"
@@ -214,6 +217,7 @@ prepare_fixture "${fixture_negative_add}" fex64-negative-add
 prepare_fixture "${fixture_indexed_alias}" fex64-indexed-alias
 prepare_fixture "${fixture_top_alias}" fex64-top-alias
 prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov
+prepare_fixture "${fixture_top_alias_stack}" fex64-top-alias-stack
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -326,4 +330,21 @@ run_one x64-top-alias-repmov "${tmp_dir}/fex64-top-alias-repmov.bin" \
     "${tmp_dir}/fex64-top-alias-repmov.config.bin" 500 0 "" 1
 run_one x64-top-alias-repmov "${tmp_dir}/fex64-top-alias-repmov.bin" \
     "${tmp_dir}/fex64-top-alias-repmov.config.bin" 500 1 "" 1
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias and alias-enabled rep-movs fixtures completed in all modes"
+# The stack ops, with the alias on. Push/PushTwo/Pop/PopTwo used ARM64
+# pre/post-indexed forms on the guest-visible address register, whose
+# writeback cannot be translated without putting a host address in RSP,
+# so they kept dereferencing the canonical stack. Wine's ntdll spun on a
+# `push rbp` writing canonical 0x7ffcfc78.
+#
+# The fixture deliberately never proves a push with a matching pop: the
+# harness maps both the canonical page and its alias, so two untranslated
+# operations would agree with each other. Each push is read back with an
+# ordinary translated load, and each pop is fed by an ordinary translated
+# store, so a missing translation fails on the value.
+run_one x64-top-alias-stack "${tmp_dir}/fex64-top-alias-stack.bin" \
+    "${tmp_dir}/fex64-top-alias-stack.config.bin" 1 0 "" 1
+run_one x64-top-alias-stack "${tmp_dir}/fex64-top-alias-stack.bin" \
+    "${tmp_dir}/fex64-top-alias-stack.config.bin" 500 0 "" 1
+run_one x64-top-alias-stack "${tmp_dir}/fex64-top-alias-stack.bin" \
+    "${tmp_dir}/fex64-top-alias-stack.config.bin" 500 1 "" 1
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias and alias-enabled rep-movs and stack fixtures completed in all modes"

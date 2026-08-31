@@ -2381,6 +2381,58 @@ def main() -> None:
                 "the emitter check's constant is not the runtime's: " +
                 constant)
 
+    # The stack ops used ARM64 pre/post-indexed forms on the guest-visible
+    # address register. That writeback cannot be aliased: it would put a host
+    # address into RSP. They kept dereferencing the canonical stack instead,
+    # and Wine's ntdll spun on a `push rbp` at guest 0x7a402602e4 writing
+    # 0x7ffcfc78, ninety-three million handled faults.
+    require_ordered(
+        alias_patch,
+        [
+            "+  if (CTX->GetGuestLowAliasBase()) {",
+            "+    sub(AddrSize, Dst, AddrSrc, ValueSize);",
+            "+    const auto HostAddr = AliasGuestAddress(Dst);",
+            "+    case 8: stur(Value.X(), HostAddr, 0); break;",
+            '+    LOGMAN_THROW_A_FMT(Dst != Src1 && Dst != Src2, "PushTwo address must not overlap its values");',
+            "+    sub(ARMEmitter::Size::i64Bit, Dst, Dst, 2 * ValueSize);",
+            "+    case 8: stp(Src1.X(), Src2.X(), HostAddr, 0); break;",
+            "+    const auto HostAddr = AliasGuestAddress(Addr);",
+            "+    case 8: ldur(Dst.X(), HostAddr, 0); break;",
+            "+    add(ARMEmitter::Size::i64Bit, Addr, Addr, Size);",
+            "+    case 8: ldp(Dst1.X(), Dst2.X(), HostAddr, 0); break;",
+            "+    add(ARMEmitter::Size::i64Bit, Addr, Addr, 2 * Size);",
+        ],
+        "BoxedVN aliased stack operation contract",
+    )
+    # Whatever the aliased path does, it must not index off the canonical
+    # address register: the writeback is the whole problem.
+    added = [line for line in alias_patch.split(newline) if line.startswith("+")]
+    depth = 0
+    inside = False
+    for line in added:
+        body = line[1:]
+        if not inside and "if (CTX->GetGuestLowAliasBase()) {" in body:
+            inside = True
+            depth = 0
+        if not inside:
+            continue
+        depth += body.count("{") - body.count("}")
+        for banned in ("IndexType::PRE", "IndexType::POST"):
+            if banned in body:
+                raise SystemExit(
+                    "an aliased stack path must not use an indexed form whose "
+                    "writeback would put a host address in the guest's stack "
+                    "pointer: " + body.strip())
+        if depth <= 0:
+            inside = False
+    # And each of the four has to reach the alias at all.
+    aliasedStackPaths = alias_patch.count(
+        "+  if (CTX->GetGuestLowAliasBase()) {")
+    if aliasedStackPaths != 4:
+        raise SystemExit(
+            "Push, PushTwo, Pop and PopTwo each need an aliased path; found " +
+            str(aliasedStackPaths))
+
     # A fixture that runs with the translation disabled cannot catch a
     # missing translation. The alias-enabled harness path exists for exactly
     # that, and the values it publishes must be the runtime's own.
@@ -2418,6 +2470,7 @@ def main() -> None:
             "every maintained patch must be applied by the FEX builder")
 
     probe = read(repository / "scripts/run-fex64-vixl-probe.sh")
+    workflow_key = read(repository / ".github/workflows/build-ios.yml")
     require_ordered(
         probe,
         [
@@ -2427,9 +2480,29 @@ def main() -> None:
             'prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov',
             'run_one x64-top-alias "${tmp_dir}/fex64-top-alias.bin"',
             'run_one x64-top-alias-repmov "${tmp_dir}/fex64-top-alias-repmov.bin"',
+            'run_one x64-top-alias-stack "${tmp_dir}/fex64-top-alias-stack.bin"',
         ],
         "BoxedVN top-arena VIXL probe contract",
     )
+    stack_fixture = read(
+        repository / "scripts/guest-probes/fex64-top-alias-stack.asm")
+    for required in ("push rbp", "push rsp", "pop rcx", "call callee", "ret",
+                     "%define LOW_STACK_TOP 0x7ffcfc80",
+                     "%define TOP_STACK_TOP 0x7ffffe008000"):
+        if required not in stack_fixture:
+            raise SystemExit(
+                "the stack fixture must exercise the operations that spun on "
+                "device: " + required)
+    # The harness maps the canonical page and its alias, so a push proved by
+    # its own pop proves nothing. Each side has to cross into the other world.
+    for required in ("mov rcx, qword [r10]", "mov qword [r10], rdx"):
+        if required not in stack_fixture:
+            raise SystemExit(
+                "the stack fixture must check a push with a translated load "
+                "and feed a pop with a translated store: " + required)
+    if "scripts/guest-probes/fex64-top-alias-stack.asm" not in workflow_key:
+        raise SystemExit(
+            "the stack fixture must participate in the VIXL cache key")
     # The alias is turned on for that fixture and nothing else.
     if 'FEX_BOXEDWINE_ALIAS="${boxedwine_alias}"' not in probe:
         raise SystemExit(
@@ -2453,7 +2526,6 @@ def main() -> None:
             raise SystemExit(
                 "the alias-enabled fixture must exercise the string ops that "
                 "faulted: " + required)
-    workflow_key = read(repository / ".github/workflows/build-ios.yml")
     if "scripts/guest-probes/fex64-top-alias-repmov.asm" not in workflow_key:
         raise SystemExit(
             "the alias-enabled fixture must participate in the VIXL cache key")

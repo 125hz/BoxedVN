@@ -244,7 +244,7 @@ index 3e01eeb7..9499c988 100644
    ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                      IR::MemOffsetType OffsetType, uint8_t OffsetScale);
 diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
-index 2cf05d14..1c4955b6 100644
+index 2cf05d14..e8e7c2c9 100644
 --- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
 @@ -584,19 +584,79 @@ DEF_OP(ContextClear) {
@@ -405,7 +405,116 @@ index 2cf05d14..1c4955b6 100644
 
    LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
                         ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
-@@ -1694,7 +1773,7 @@ DEF_OP(StoreMemX87SVEOptPredicate) {
+@@ -1472,6 +1551,40 @@ DEF_OP(Push) {
+   const auto AddrSrc = GetReg(Op->Addr);
+   const auto Dst = GetReg(Node);
+
++  // The guest stack lives at canonical addresses, so the store has to go to
++  // the host alias while the architectural stack pointer stays canonical.
++  // The pre-indexed forms below cannot do that: their writeback would put a
++  // host address into the guest's RSP. Split the two jobs instead.
++  //
++  // Wine's ntdll faulted on device in exactly this instruction -- a `push rbp`
++  // at guest 0x7a402602e4 writing canonical 0x7ffcfc78, ninety-three million
++  // times, because the store never reached the alias at 0x787ffcfc78.
++  if (CTX->GetGuestLowAliasBase()) {
++    // Preserve the value first: it may name the same register as the address
++    // or the result, both of which are about to be written.
++    auto Value = Src;
++    if (Value == AddrSrc || Value == Dst) {
++      mov(TMP1, Value.X());
++      Value = TMP1;
++    }
++    // The architectural pointer is computed in canonical space and stays
++    // there; this is what the guest goes on to see in RSP.
++    const auto AddrSize = IROp->Size == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
++    sub(AddrSize, Dst, AddrSrc, ValueSize);
++    // Translate the COMPLETED canonical address into a scratch register. The
++    // store below carries no writeback, so no host address can escape into
++    // guest-visible state.
++    const auto HostAddr = AliasGuestAddress(Dst);
++    switch (ValueSize) {
++    case 1: sturb(Value.W(), HostAddr, 0); break;
++    case 2: sturh(Value.W(), HostAddr, 0); break;
++    case 4: stur(Value.W(), HostAddr, 0); break;
++    case 8: stur(Value.X(), HostAddr, 0); break;
++    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
++    }
++    return;
++  }
++
+   bool NeedsMoveAfterwards = false;
+   if (Dst != AddrSrc) {
+     if (Dst == Src) {
+@@ -1557,6 +1670,25 @@ DEF_OP(PushTwo) {
+   auto Src2 = GetReg(Op->Value2);
+   const auto Dst = GetReg(Op->Addr);
+
++  // Same split as Push: the architectural pointer moves canonically and the
++  // pair is stored through a translated scratch pointer with no writeback.
++  if (CTX->GetGuestLowAliasBase()) {
++    // The pre-indexed form this replaces is undefined when the address
++    // register is also a source, so register allocation already guarantees
++    // they differ. Say so, rather than leaving it implied: here the pointer
++    // is decremented before the values are read, so an overlap would store
++    // the adjusted pointer instead of the value.
++    LOGMAN_THROW_A_FMT(Dst != Src1 && Dst != Src2, "PushTwo address must not overlap its values");
++    sub(ARMEmitter::Size::i64Bit, Dst, Dst, 2 * ValueSize);
++    const auto HostAddr = AliasGuestAddress(Dst);
++    switch (ValueSize) {
++    case 4: stp(Src1.W(), Src2.W(), HostAddr, 0); break;
++    case 8: stp(Src1.X(), Src2.X(), HostAddr, 0); break;
++    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
++    }
++    return;
++  }
++
+   switch (ValueSize) {
+   case 4: {
+     stp<ARMEmitter::IndexType::PRE>(Src1.W(), Src2.W(), Dst, -2 * ValueSize);
+@@ -1581,6 +1713,22 @@ DEF_OP(Pop) {
+
+   LOGMAN_THROW_A_FMT(Dst != Addr, "Invalid");
+
++  // The load reads the ORIGINAL canonical pointer through its host alias; the
++  // architectural pointer is advanced afterwards, in canonical space, so the
++  // post-index writeback the guest would otherwise see never happens.
++  if (CTX->GetGuestLowAliasBase()) {
++    const auto HostAddr = AliasGuestAddress(Addr);
++    switch (Size) {
++    case 1: ldurb(Dst.W(), HostAddr, 0); break;
++    case 2: ldurh(Dst.W(), HostAddr, 0); break;
++    case 4: ldur(Dst.W(), HostAddr, 0); break;
++    case 8: ldur(Dst.X(), HostAddr, 0); break;
++    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, Op->Size); break;
++    }
++    add(ARMEmitter::Size::i64Bit, Addr, Addr, Size);
++    return;
++  }
++
+   switch (Size) {
+   case 1: {
+     ldrb<ARMEmitter::IndexType::POST>(Dst.W(), Addr, Size);
+@@ -1620,6 +1768,18 @@ DEF_OP(PopTwo) {
+   LOGMAN_THROW_A_FMT(Dst1 != Addr && Dst2 != Addr, "Invalid");
+   LOGMAN_THROW_A_FMT(Dst1 != Dst2, "Invalid");
+
++  // Same split as Pop, for the fused pair.
++  if (CTX->GetGuestLowAliasBase()) {
++    const auto HostAddr = AliasGuestAddress(Addr);
++    switch (Size) {
++    case 4: ldp(Dst1.W(), Dst2.W(), HostAddr, 0); break;
++    case 8: ldp(Dst1.X(), Dst2.X(), HostAddr, 0); break;
++    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, Op->Size); break;
++    }
++    add(ARMEmitter::Size::i64Bit, Addr, Addr, 2 * Size);
++    return;
++  }
++
+   switch (Size) {
+   case 4: {
+     ldp<ARMEmitter::IndexType::POST>(Dst1.W(), Dst2.W(), Addr, 2 * Size);
+@@ -1694,7 +1854,7 @@ DEF_OP(StoreMemX87SVEOptPredicate) {
    LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "StoreMemX87SVEOptPredicate needs SVE support");
 
    const auto RegData = GetVReg(Op->Value);
@@ -414,7 +523,7 @@ index 2cf05d14..1c4955b6 100644
    const auto MemDst = ARMEmitter::SVEMemOperand(MemReg.X(), 0);
 
    switch (IROp->ElementSize) {
-@@ -1722,7 +1801,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
+@@ -1722,7 +1882,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
    const auto Op = IROp->C<IR::IROp_LoadMemX87SVEOptPredicate>();
    const auto Dst = GetVReg(Node);
    const auto Predicate = PRED_X87_SVEOPT;
@@ -423,7 +532,7 @@ index 2cf05d14..1c4955b6 100644
 
    LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "LoadMemX87SVEOptPredicate needs SVE support");
 
-@@ -1752,7 +1831,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
+@@ -1752,7 +1912,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
  DEF_OP(StoreMemPair) {
    const auto Op = IROp->C<IR::IROp_StoreMemPair>();
    const auto OpSize = IROp->Size;
@@ -432,7 +541,7 @@ index 2cf05d14..1c4955b6 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      const auto Src1 = GetZeroableReg(Op->Value1);
-@@ -1779,7 +1858,7 @@ DEF_OP(StoreMemTSO) {
+@@ -1779,7 +1939,7 @@ DEF_OP(StoreMemTSO) {
    const auto Op = IROp->C<IR::IROp_StoreMemTSO>();
    const auto OpSize = IROp->Size;
 
@@ -441,7 +550,7 @@ index 2cf05d14..1c4955b6 100644
 
    if (Op->Class == IR::RegClass::GPR) {
      LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
-@@ -1882,6 +1961,18 @@ DEF_OP(MemSet) {
+@@ -1882,6 +2042,18 @@ DEF_OP(MemSet) {
      const auto Prefix = GetReg(Op->Prefix);
      add(TMP2, Prefix.X(), MemReg.X());
    }
@@ -460,7 +569,7 @@ index 2cf05d14..1c4955b6 100644
 
    if (!DirectionIsInline) {
      // Backward or forwards implementation depends on flag
-@@ -2116,6 +2207,21 @@ DEF_OP(MemCpy) {
+@@ -2116,6 +2288,21 @@ DEF_OP(MemCpy) {
    mov(TMP1, Length.X());
    mov(TMP2, MemRegDest.X());
    mov(TMP3, MemRegSrc.X());
@@ -482,7 +591,7 @@ index 2cf05d14..1c4955b6 100644
 
    // TMP1 = Length
    // TMP2 = Dest
-@@ -2396,7 +2502,7 @@ DEF_OP(CacheLineClear) {
+@@ -2396,7 +2583,7 @@ DEF_OP(CacheLineClear) {
 
    auto Op = IROp->C<IR::IROp_CacheLineClear>();
 
@@ -491,7 +600,7 @@ index 2cf05d14..1c4955b6 100644
 
    // Clear dcache only
    // icache doesn't matter here since the guest application shouldn't be calling clflush on JIT code.
-@@ -2426,7 +2532,7 @@ DEF_OP(CacheLineClean) {
+@@ -2426,7 +2613,7 @@ DEF_OP(CacheLineClean) {
 
    auto Op = IROp->C<IR::IROp_CacheLineClean>();
 
@@ -500,7 +609,7 @@ index 2cf05d14..1c4955b6 100644
 
    // Clean dcache only
    // check host cacheline size again x86_64 size to ensure at least 64 bytes are cleaned
-@@ -2445,7 +2551,7 @@ DEF_OP(CacheLineClean) {
+@@ -2445,7 +2632,7 @@ DEF_OP(CacheLineClean) {
  DEF_OP(CacheLineZero) {
    auto Op = IROp->C<IR::IROp_CacheLineZero>();
 
@@ -509,7 +618,7 @@ index 2cf05d14..1c4955b6 100644
 
    if (CTX->HostFeatures.SupportsCLZERO) {
      // We can use this instruction directly
-@@ -2465,7 +2571,7 @@ DEF_OP(CacheLineZero) {
+@@ -2465,7 +2652,7 @@ DEF_OP(CacheLineZero) {
 
  DEF_OP(Prefetch) {
    auto Op = IROp->C<IR::IROp_Prefetch>();
@@ -518,7 +627,7 @@ index 2cf05d14..1c4955b6 100644
 
    // Access size is only ever handled as 8-byte. Even though it is accesssed as a cacheline.
    const auto MemSrc = GenerateMemOperand(IR::OpSize::i64Bit, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
-@@ -2510,7 +2616,7 @@ DEF_OP(VStoreNonTemporal) {
+@@ -2510,7 +2697,7 @@ DEF_OP(VStoreNonTemporal) {
    const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
    const auto Value = GetVReg(Op->Value);
@@ -527,7 +636,7 @@ index 2cf05d14..1c4955b6 100644
    const auto Offset = Op->Offset;
 
    if (Is256Bit) {
-@@ -2537,7 +2643,7 @@ DEF_OP(VStoreNonTemporalPair) {
+@@ -2537,7 +2724,7 @@ DEF_OP(VStoreNonTemporalPair) {
    const auto ValueLow = GetVReg(Op->ValueLow);
    const auto ValueHigh = GetVReg(Op->ValueHigh);
 
@@ -536,7 +645,7 @@ index 2cf05d14..1c4955b6 100644
    const auto Offset = Op->Offset;
 
    stnp(ValueLow.Q(), ValueHigh.Q(), MemReg, Offset);
-@@ -2552,7 +2658,7 @@ DEF_OP(VLoadNonTemporal) {
+@@ -2552,7 +2739,7 @@ DEF_OP(VLoadNonTemporal) {
    const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
    const auto Dst = GetVReg(Node);
