@@ -27,8 +27,8 @@
  *
  * Wine also derives its data directory by walking two parents up from this
  * module root and appending `share/wine`. With Ubuntu's multiarch module root,
- * that names `/usr/lib/x86_64-linux-gnu/share/wine`, while the distro packages
- * the NLS tables under `/usr/share/wine`. The resource compatibility link below
+ * `.../wine/../../share/wine` normalizes to `/usr/lib/share/wine`, while the
+ * distro packages the NLS tables under `/usr/share/wine`. The resource link below
  * joins those two paths. Without it, ntdll initializes its locale tables from
  * a null pointer before the first Windows process can start.
  *
@@ -53,7 +53,7 @@
 // Kept reachable for anything that still names the relocated layout. Nothing
 // in a launch resolves through these any more.
 #define K_X64_WINE_COMPAT_ROOT "/usr/lib/wine"
-#define K_X64_WINE_DERIVED_DATA_ROOT "/usr/lib/x86_64-linux-gnu/share/wine"
+#define K_X64_WINE_DERIVED_DATA_ROOT "/usr/lib/share/wine"
 #define K_X64_WINE_DATA_ROOT "/usr/share/wine"
 
 // WINEDLLPATH names module ROOTS, not the PE directory: Wine appends

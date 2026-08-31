@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import shutil
 import struct
 import subprocess
@@ -55,7 +56,7 @@ def elf(machine: int = 62, elf_class: int = 2, body: bytes = b"") -> bytes:
 ROOT = "usr/lib/x86_64-linux-gnu/wine"
 PE_DIR = ROOT + "/x86_64-windows"
 DATA_ROOT = "usr/share/wine"
-DERIVED_DATA_ROOT = "usr/lib/x86_64-linux-gnu/share/wine"
+DERIVED_DATA_ROOT = "usr/lib/share/wine"
 
 
 def pe(machine: int = 0x8664, body: bytes = b"") -> bytes:
@@ -122,9 +123,13 @@ class WineserverPackagingContract(unittest.TestCase):
     def test_builder_links_wines_derived_data_root_to_packaged_nls(self) -> None:
         self.assertIn("cp -aL /usr/share/wine", self.builder)
         self.assertIn(
-            "guest_link /usr/share/wine /usr/lib/x86_64-linux-gnu/share/wine",
+            "guest_link /usr/share/wine /usr/lib/share/wine",
             self.builder,
         )
+
+    def test_derived_data_root_matches_wines_real_request(self) -> None:
+        requested = posixpath.normpath("/" + ROOT + "/../../share/wine")
+        self.assertEqual(requested, "/" + DERIVED_DATA_ROOT)
 
     def test_builder_refuses_an_archive_without_the_builtins(self) -> None:
         # kernel32.dll present in the archive but unreachable is the failure

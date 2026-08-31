@@ -21,7 +21,7 @@ BOXEDVN_TEST(wine64_layout_keeps_loader_and_modules_under_one_root) {
     CHECK_EQ(std::string(K_X64_WINE_BUILTIN_PROBE),
              std::string(K_X64_WINE_PE_DIR) + "/kernel32.dll");
     CHECK_EQ(std::string(K_X64_WINE_DERIVED_DATA_ROOT),
-             std::string("/usr/lib/x86_64-linux-gnu/share/wine"));
+             std::string("/usr/lib/share/wine"));
     CHECK_EQ(std::string(K_X64_WINE_DATA_ROOT),
              std::string("/usr/share/wine"));
 }
