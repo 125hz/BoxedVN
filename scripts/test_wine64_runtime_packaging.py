@@ -41,6 +41,15 @@ exec "$(dirname "$0")/wineserver32" "$@"
 """
 
 
+# Wine searches for its font backend at both multiarch paths in turn. On the
+# runner /lib is a symlink to /usr/lib, but the guest archive has no symlinks,
+# so a single staged copy satisfies only one of the two lookups.
+FREETYPE_PATHS = (
+    "lib/x86_64-linux-gnu/libfreetype.so.6",
+    "usr/lib/x86_64-linux-gnu/libfreetype.so.6",
+)
+
+
 def elf(machine: int = 62, elf_class: int = 2, body: bytes = b"") -> bytes:
     """A minimal ELF header, enough for a header-only class/machine check."""
     header = bytearray(64)
@@ -161,13 +170,24 @@ class WineserverPackagingContract(unittest.TestCase):
 class WineserverArchiveValidation(unittest.TestCase):
     """Drive the real validator against synthetic layered archives."""
 
-    def build_archives(self, directory: Path, wineserver_generic: bytes):
+    def build_archives(self, directory: Path, wineserver_generic: bytes,
+                       freetype: bytes = None,
+                       freetype_paths=None):
         server = elf(body=b"wineserver64 payload")
+        if freetype is None:
+            freetype = elf(body=b"freetype payload")
+        if freetype_paths is None:
+            freetype_paths = FREETYPE_PATHS
         glibc = directory / "glibc-rootfs64.zip"
         wine = directory / "wine64.zip"
         with zipfile.ZipFile(glibc, "w") as archive:
             archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
             archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
+            # Wine dlopens FreeType by soname and searches both multiarch
+            # paths. A BoxedWine ZIP does not interpret POSIX symlinks, so
+            # both have to be real files.
+            for path in freetype_paths:
+                archive.writestr(path, freetype)
             # Wine's server needs the modelled user's XDG runtime directory.
             archive.writestr("run/user/1000/", b"")
         with zipfile.ZipFile(wine, "w") as archive:
@@ -272,6 +292,9 @@ class WineserverArchiveValidation(unittest.TestCase):
             with zipfile.ZipFile(glibc, "w") as archive:
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
+                # The font backend the validator now requires at both paths.
+                for freetype_path in FREETYPE_PATHS:
+                    archive.writestr(freetype_path, elf(body=b"freetype"))
                 archive.writestr("run/user/1000/", b"")
             with zipfile.ZipFile(wine, "w") as archive:
                 self.write_wine_layout(archive, server, server)
@@ -391,6 +414,9 @@ class WineserverArchiveValidation(unittest.TestCase):
             with zipfile.ZipFile(glibc, "w") as archive:
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
+                # The font backend the validator now requires at both paths.
+                for freetype_path in FREETYPE_PATHS:
+                    archive.writestr(freetype_path, elf(body=b"freetype"))
             with zipfile.ZipFile(wine, "w") as archive:
                 self.write_wine_layout(archive, server, server)
             code, output = self.run_validator(directory, glibc, wine)
@@ -414,3 +440,120 @@ class GuestRuntimeDirectoryStaging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("unzip")
+                     and shutil.which("od"),
+                     "the packaging validator needs bash, unzip and od")
+class FreeTypePackaging(unittest.TestCase):
+    """Wine's font backend has to be in the archive, and has to be loadable.
+
+    Two device runs reported "Wine cannot find the FreeType font library" after
+    failing to open libfreetype.so.6 at both multiarch paths in turn. The
+    archive simply did not contain it: nothing named it as a dynamically loaded
+    dependency, so nothing missed it.
+    """
+
+    def test_builder_seeds_freetype_as_a_required_dynamic_library(self) -> None:
+        builder = BUILDER.read_text(encoding="utf-8")
+        # A reusable mechanism, not another bare copy: the seed feeds the ldd
+        # closure so FreeType's own dependencies come from the runner.
+        self.assertIn("seed_dynamic_library()", builder)
+        self.assertIn("seed_dynamic_library libfreetype.so.6 required", builder)
+        # Required means the build fails without it.
+        self.assertIn("requirement}\" == \"required\"", builder)
+
+    def test_builder_stages_dynamic_libraries_at_both_multiarch_paths(self) -> None:
+        builder = BUILDER.read_text(encoding="utf-8")
+        self.assertIn('copy_as "${found}" "/lib/x86_64-linux-gnu/${soname}"',
+                      builder)
+        self.assertIn('copy_as "${found}" "/usr/lib/x86_64-linux-gnu/${soname}"',
+                      builder)
+
+    def test_builder_refuses_a_non_x86_64_font_library(self) -> None:
+        builder = BUILDER.read_text(encoding="utf-8")
+        # The repository also builds a static FreeType for the iOS host.
+        # Substituting it would satisfy a name check and leave Wine's Unix
+        # side with nothing it can load.
+        self.assertIn("is not an x86-64 ELF shared object", builder)
+
+    def test_builder_proves_every_seeded_library_landed(self) -> None:
+        builder = BUILDER.read_text(encoding="utf-8")
+        self.assertIn("was not staged at", builder)
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("unzip")
+                     and shutil.which("od"),
+                     "the packaging validator needs bash, unzip and od")
+class FreeTypeArchiveValidation(WineserverArchiveValidation):
+    """Drive the real validator against archives with and without FreeType.
+
+    Subclassed only to reuse the archive helpers. The parent's own tests are
+    detached below rather than inherited: re-running a two-and-a-half-minute
+    suite a second time to borrow two helper methods is not a trade worth
+    making, and a duplicate result is not a second piece of evidence.
+    """
+
+    def test_a_complete_font_backend_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertEqual(code, 0, output)
+            for path in FREETYPE_PATHS:
+                self.assertIn(path + " is ELF64 EM_X86_64", output)
+
+    def test_a_missing_font_library_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(
+                directory, server, freetype_paths=())
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("libfreetype.so.6", output)
+
+    def test_a_font_library_at_only_one_path_is_rejected(self) -> None:
+        # The shape a single staged copy produces: the guest archive has no
+        # symlink to make the other path resolve.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(
+                directory, server,
+                freetype_paths=("usr/lib/x86_64-linux-gnu/libfreetype.so.6",))
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("lib/x86_64-linux-gnu/libfreetype.so.6", output)
+
+    def test_a_non_x86_64_font_library_is_rejected(self) -> None:
+        # An ARM64 ELF passes every name check and cannot be loaded by the
+        # guest at all.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(
+                directory, server, freetype=elf(machine=183))
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("EM_X86_64", output)
+
+    def test_a_static_archive_masquerading_as_the_library_is_rejected(self) -> None:
+        # What copying the iOS FreeType build in would look like from here.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(
+                directory, server, freetype=b"!<arch>\n" + b"\0" * 64)
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("is not an ELF file", output)
+
+
+# Detach the inherited cases; see the class docstring. Assigning None leaves
+# the attribute present but not callable, which is what unittest's collector
+# filters on, so the helpers survive and the duplicate tests do not.
+for _inherited in list(vars(WineserverArchiveValidation)):
+    if _inherited.startswith("test_"):
+        setattr(FreeTypeArchiveValidation, _inherited, None)

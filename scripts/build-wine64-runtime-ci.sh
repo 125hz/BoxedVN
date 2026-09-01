@@ -163,35 +163,100 @@ SEEDS=("${WINE64}" "${WINE_SERVER}" /lib64/ld-linux-x86-64.so.2)
 while IFS= read -r module; do SEEDS+=("${module}"); done < <(
     find "${WINE_UNIX}" -maxdepth 1 -type f -name '*.so' -print
 )
-# winex11.drv resolves these client libraries with dlopen, so they do not
-# appear in the ELF DT_NEEDED closure above. Include their direct dependencies
-# as well; the Ubuntu job installs the corresponding runtime packages.
+
+# ---- Dynamically loaded libraries -----------------------------------------
+#
+# A library Wine reaches with dlopen never appears in the ELF DT_NEEDED closure
+# below, so it has to be named. Doing that with a bare `cp` per library is what
+# left FreeType out: nothing recorded which libraries the guest asks for by
+# name, and nothing failed when one of them was missing.
+#
+# seed_dynamic_library does the three things every such library needs:
+#
+#   1. finds it in either multiarch directory, following the distro's symlink
+#      to the real versioned file;
+#   2. adds it to the ldd seed set, so its OWN dependency closure -- for
+#      FreeType on Ubuntu 24.04 that means libpng, Brotli, bz2 and zlib -- is
+#      resolved from the runner rather than guessed here;
+#   3. stages it under BOTH /lib and /usr/lib multiarch paths.
+#
+# The third is not redundancy. On the runner /lib is a symlink to /usr/lib, so
+# only one real path exists -- but a BoxedWine ZIP does not interpret POSIX
+# symlinks, so inside the guest the two paths are unrelated. The device log
+# shows Wine trying both in turn and failing on both, which is exactly what one
+# staged copy at one of them would still produce.
+#
+# `required` means the build fails without it. A library the guest merely
+# prefers is seeded as `optional` and its absence is silent, as before.
+MULTIARCH_DIRS=(
+    /lib/x86_64-linux-gnu
+    /usr/lib/x86_64-linux-gnu
+    /lib64
+    /usr/lib64
+)
+DYNAMIC_SEEDS=()
+seed_dynamic_library() {
+    local soname="$1" requirement="${2:-optional}" dir found=""
+    for dir in "${MULTIARCH_DIRS[@]}"; do
+        if [[ -f "${dir}/${soname}" ]]; then found="${dir}/${soname}"; break; fi
+    done
+    if [[ -z "${found}" ]]; then
+        if [[ "${requirement}" == "required" ]]; then
+            die "The runner has no x86-64 '${soname}'. Install the Ubuntu amd64 runtime package that provides it before assembling the Wine64 layers."
+        fi
+        return 0
+    fi
+    if ! is_elf64_x86_64 "$(readlink -f "${found}")"; then
+        die "'${found}' is not an x86-64 ELF shared object. Wine's Unix side cannot load a host-architecture or static build of it."
+    fi
+    SEEDS+=("${found}")
+    DYNAMIC_SEEDS+=("${soname}")
+    # Both multiarch paths, dereferenced: the archive has no symlinks to follow.
+    copy_as "${found}" "/lib/x86_64-linux-gnu/${soname}"
+    copy_as "${found}" "/usr/lib/x86_64-linux-gnu/${soname}"
+}
+
+# winex11.drv resolves these client libraries with dlopen. The Ubuntu job
+# installs the corresponding runtime packages.
 for x11lib in \
-    /usr/lib/x86_64-linux-gnu/libXrender.so.1 \
-    /usr/lib/x86_64-linux-gnu/libXcursor.so.1 \
-    /usr/lib/x86_64-linux-gnu/libXfixes.so.3 \
-    /usr/lib/x86_64-linux-gnu/libXcomposite.so.1 \
-    /usr/lib/x86_64-linux-gnu/libXi.so.6 \
-    /usr/lib/x86_64-linux-gnu/libXinerama.so.1 \
-    /usr/lib/x86_64-linux-gnu/libXxf86vm.so.1 \
-    /usr/lib/x86_64-linux-gnu/libXrandr.so.2; do
-    [[ -f "${x11lib}" ]] || continue
-    SEEDS+=("${x11lib}")
+    libXrender.so.1 \
+    libXcursor.so.1 \
+    libXfixes.so.3 \
+    libXcomposite.so.1 \
+    libXi.so.6 \
+    libXinerama.so.1 \
+    libXxf86vm.so.1 \
+    libXrandr.so.2; do
+    seed_dynamic_library "${x11lib}"
 done
+
+# Wine's font support dlopens FreeType by soname. Without it win32u reports
+# "Wine cannot find the FreeType font library" and the guest has no font
+# backend at all -- which is the only explicit runtime error two device runs
+# produced. REQUIRED: shipping the archive without it is what those runs did.
+#
+# This must be the x86-64 Linux shared library for Wine's Unix side. The
+# repository also builds a static FreeType for the iOS host, which is a
+# different artifact for a different architecture and cannot stand in for it.
+seed_dynamic_library libfreetype.so.6 required
+# FreeType's own optional backends. They are dlopened rather than linked on
+# some builds, so seeding them keeps the closure complete either way; the ldd
+# pass above resolves whatever this particular build really links against.
+for fontlib in \
+    libfontconfig.so.1 \
+    libharfbuzz.so.0; do
+    seed_dynamic_library "${fontlib}"
+done
+
 # Wine's X11 and user/environment helpers load NSS modules dynamically. They
 # are not present in DT_NEEDED, but getpwuid/getaddrinfo can reach them before
 # the first window is created. Include the small glibc NSS set explicitly.
 for nsslib in \
-    /lib/x86_64-linux-gnu/libnss_files.so.2 \
-    /lib/x86_64-linux-gnu/libnss_dns.so.2 \
-    /lib/x86_64-linux-gnu/libnss_compat.so.2 \
-    /lib/x86_64-linux-gnu/libresolv.so.2 \
-    /usr/lib/x86_64-linux-gnu/libnss_files.so.2 \
-    /usr/lib/x86_64-linux-gnu/libnss_dns.so.2 \
-    /usr/lib/x86_64-linux-gnu/libnss_compat.so.2 \
-    /usr/lib/x86_64-linux-gnu/libresolv.so.2; do
-    [[ -f "${nsslib}" ]] || continue
-    SEEDS+=("${nsslib}")
+    libnss_files.so.2 \
+    libnss_dns.so.2 \
+    libnss_compat.so.2 \
+    libresolv.so.2; do
+    seed_dynamic_library "${nsslib}"
 done
 LIBS=""
 for seed in "${SEEDS[@]}"; do
@@ -206,6 +271,20 @@ done
 while IFS= read -r library; do
     [[ -n "${library}" ]] && copy_abs "${library}"
 done < <(printf '%s' "${LIBS}" | sort -u)
+
+# Every dynamically loaded library that was seeded has to be in the stage at
+# both guest paths, and has to still be an x86-64 ELF there. A silent miss is
+# what shipped an archive with no font backend.
+for soname in "${DYNAMIC_SEEDS[@]}"; do
+    for guest_dir in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+        staged="${STAGE}${guest_dir}/${soname}"
+        [[ -s "${staged}" ]] \
+            || die "Dynamically loaded library '${soname}' was not staged at ${guest_dir}."
+        is_elf64_x86_64 "${staged}" \
+            || die "Staged '${guest_dir}/${soname}' is not an x86-64 ELF shared object."
+    done
+done
+log "Dynamically loaded libraries staged: ${DYNAMIC_SEEDS[*]}"
 
 ld_loader="$(printf '%s\n' "${LIBS}" | awk '/ld-linux-x86-64\.so\.2$/ { print; exit }')"
 if [[ -n "${ld_loader}" ]]; then copy_abs "${ld_loader}"; fi

@@ -321,6 +321,21 @@ verify_or_report "${WINE_ARCHIVE}" wine_sha256
 # by run_wine64.sh's -root/-zip launch sequence.
 check_zip_path "${GLIBC_ARCHIVE}" lib64/ld-linux-x86-64.so.2
 check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libc.so.6
+
+# Wine's font support dlopens FreeType by soname. Two device runs reported
+# "Wine cannot find the FreeType font library" after failing to open it at BOTH
+# multiarch paths in turn, which is what an archive missing it looks like from
+# the guest side. On the runner /lib is a symlink to /usr/lib, but a BoxedWine
+# ZIP does not interpret POSIX symlinks, so both guest paths have to hold a
+# real x86-64 ELF -- one copy at one of them would still fail the other lookup.
+#
+# The ELF check is not decoration: the repository also builds a static FreeType
+# for the iOS host, and substituting that here would satisfy a name check while
+# leaving Wine's Unix side with nothing it can load.
+for freetype_path in     lib/x86_64-linux-gnu/libfreetype.so.6     usr/lib/x86_64-linux-gnu/libfreetype.so.6; do
+    check_zip_path "${GLIBC_ARCHIVE}" "${freetype_path}"
+    check_zip_entry_elf64_x86_64 "${GLIBC_ARCHIVE}" "${freetype_path}"
+done
 # Wine puts its server socket directory in the modelled user's XDG runtime
 # directory. The rootfs has to ship it; BoxedWine's permission policy is what
 # makes it writable, because ZIP entries carry no Unix mode.
