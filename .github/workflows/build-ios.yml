@@ -104,7 +104,9 @@ jobs:
             libxcomposite1 libxi6 libxinerama1 libxxf86vm1 libxrandr2 \
             libx11-data \
             libfreetype6 libfontconfig1 libharfbuzz0b \
-            libpng16-16t64 libbrotli1 libbz2-1.0 zlib1g
+            libpng16-16t64 libbrotli1 libbz2-1.0 zlib1g \
+            fontconfig fontconfig-config fonts-liberation \
+            fonts-wine libxext6
 
       - name: Build and validate Wine64 layers
         shell: bash

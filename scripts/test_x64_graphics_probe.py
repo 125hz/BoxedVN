@@ -169,3 +169,46 @@ class ProbeBuildAndStaging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowBoundaryDiagnostics(unittest.TestCase):
+    """What the probe reports around the window-creation boundary.
+
+    A device run stopped at CreateWindowExW with ERROR_INVALID_WINDOW_HANDLE
+    and no X11 activity anywhere in the log. The error names a handle, but not
+    which one, so the probe reports what the window would have been created
+    into before it tries.
+    """
+
+    def setUp(self) -> None:
+        self.source = PROBE_SOURCE.read_text(encoding="utf-8")
+
+    def test_the_desktop_environment_is_reported_before_the_attempt(self) -> None:
+        desktop_at = self.source.find("desktop-env")
+        attempt_at = self.source.find('stage_begin("create-window")')
+        self.assertNotEqual(desktop_at, -1, "the desktop state is never reported")
+        self.assertLess(desktop_at, attempt_at,
+                        "the desktop state is reported after the attempt that "
+                        "needs it")
+        for probe in ("GetDesktopWindow()", "GetThreadDesktop(",
+                      "GetProcessWindowStation()",
+                      'GetEnvironmentVariableA("DISPLAY"'):
+            self.assertIn(probe, self.source)
+
+    def test_the_popup_fallback_is_separate_and_never_success(self) -> None:
+        # A narrower window separates "no user driver at all" from "a driver
+        # that cannot build a full overlapped frame".
+        self.assertIn('stage_begin("create-window-popup")', self.source)
+        self.assertIn('stage_ok("create-window-popup"', self.source)
+        self.assertIn('stage_fail("create-window-popup"', self.source)
+        # It must not become the window the rest of the program uses: a frame
+        # the driver could not build properly is not a presentation surface.
+        popup_at = self.source.find('stage_begin("create-window-popup")')
+        tail = self.source[popup_at:popup_at + 1200]
+        self.assertIn("DestroyWindow(window);", tail)
+        self.assertIn("return BOXEDVN_EXIT_CREATE_WINDOW;", tail)
+
+    def test_the_fallback_does_not_change_the_reported_stage_code(self) -> None:
+        # The process still exits on the create-window stage, so the status
+        # keeps naming the boundary that actually failed.
+        self.assertNotIn("BOXEDVN_EXIT_CREATE_WINDOW_POPUP", self.source)

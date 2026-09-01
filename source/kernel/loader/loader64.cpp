@@ -8,6 +8,7 @@
  */
 
 #include "boxedwine.h"
+#include <atomic>
 
 #include "loader64.h"
 #include "elfloaderpolicy64.h"
@@ -1395,6 +1396,31 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         argv.push_back(BString::copy(exeName));
     }
     std::vector<BString> envp = process->startupEnv64;
+    /* One line naming the display this process will look for.
+     *
+     * Wine's X11 user driver is loaded by win32u and initialises by opening
+     * DISPLAY. If the variable does not survive into the x86-64 process the
+     * driver cannot connect, the process ends up with no desktop window, and
+     * every CreateWindowEx returns ERROR_INVALID_WINDOW_HANDLE -- which is
+     * what a device run showed, with nothing in the log to say whether the
+     * variable was there at all. Bounded: the first few processes only, which
+     * is where the answer is. */
+    {
+        static std::atomic<unsigned> displayReports {0};
+        if (displayReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            const char* displayValue = nullptr;
+            for (const BString& entry : envp) {
+                if (entry.startsWith("DISPLAY=")) {
+                    displayValue = entry.c_str() + 8;
+                    break;
+                }
+            }
+            klog_fmt("BOXEDWINE_X64_GUEST_DISPLAY pid=%u display='%s' env=%u",
+                     (unsigned)process->id,
+                     displayValue ? displayValue : "(unset)",
+                     (unsigned)envp.size());
+        }
+    }
     if (envp.empty()) {
         envp.push_back(BString::copy("PATH=/bin:/usr/bin"));
     }

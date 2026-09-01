@@ -1546,6 +1546,45 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode
         reportDllSearch(process, (flags & 0x10000) != 0 ? "opendir" : "open",
                         path, (long long)(S64)(S32)rc, detail);
     }
+    /* The user-driver chain, reported whether the open succeeded or failed.
+     *
+     * Every other open diagnostic here is either budgeted per process or fires
+     * only on failure, so a device run that loaded winex11 successfully after
+     * its module-search budget was spent produced no evidence either way. The
+     * question "did the X11 driver load at all" is exactly the one a window
+     * that cannot be created needs answered, so it gets its own bounded key.
+     *
+     * First sighting of each distinct path, capped; nothing per repeat. */
+    {
+        static const char* const kDriverChain[] = {
+            "winex11", "libX11.so", "libXext.so", "fonts.conf",
+        };
+        bool onDriverChain = false;
+        for (const char* needle : kDriverChain) {
+            if (strstr(path, needle)) { onDriverChain = true; break; }
+        }
+        if (onDriverChain) {
+            U64 chainKey = 1469598103934665603ULL;
+            for (const char* cursor = path; *cursor; ++cursor) {
+                chainKey = (chainKey ^ (U64)(U8)*cursor) * 1099511628211ULL;
+            }
+            static boxedvn::BoundedSyscallReportLimiter driverChainReports;
+            static std::mutex driverChainMutex;
+            boxedvn::BoundedSyscallReportLimiter::Outcome chain;
+            {
+                std::lock_guard<std::mutex> guard(driverChainMutex);
+                chain = driverChainReports.record((U64)process->id, 0, chainKey,
+                                                  (U64)(S64)(S32)rc);
+            }
+            if (chain.decision !=
+                boxedvn::BoundedSyscallReportLimiter::Decision::Silent) {
+                klog_fmt("BOXEDWINE_X64_USER_DRIVER pid=%u op=open path='%s' "
+                         "result=%d seen=%llu",
+                         (unsigned)process->id, path, (int)(S32)rc,
+                         (unsigned long long)chain.occurrences);
+            }
+        }
+    }
     if ((S32)rc < 0) {
         if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
                                         strstr(path, "x86_64-windows") || strstr(path, "kernel32"))) {
@@ -4238,6 +4277,29 @@ void ksyscall64(CPU64* cpu) {
             U32 s32 = bounceSockaddrTo32(cpu, a2, (U32)a3, nullptr);
             if (!s32) { ret = (U64)-K_EFAULT; break; }
             ret = (U64)(S64)(S32)kconnect(cpu->thread, (U32)a1, s32, (U32)a3);
+            /* Whether the guest ever reaches the X server, reported without an
+             * environment variable nobody sets on a device. A window that
+             * cannot be created and an X connection that never happened are
+             * the same failure seen from two ends; this is the other end.
+             * Bounded to the first few, which is where the answer is. */
+            {
+                const U16 connectFamily = cpu->memory->readw(a2);
+                if (connectFamily == 1 /*AF_UNIX*/) {
+                    char unixPath[128] = {0};
+                    cpu->memory->memcpyFromGuest(unixPath, a2 + 2,
+                                                 sizeof(unixPath) - 1);
+                    if (strstr(unixPath, "X11-unix") || strstr(unixPath, "/X")) {
+                        static std::atomic<unsigned> xConnectReports {0};
+                        if (xConnectReports.fetch_add(
+                                1, std::memory_order_relaxed) < 8) {
+                            klog_fmt("BOXEDWINE_X64_X11_CONNECT pid=%d "
+                                     "path='%s' result=%d",
+                                     (int)(cpu->thread ? cpu->thread->process->id : -1),
+                                     unixPath, (int)(S32)ret);
+                        }
+                    }
+                }
+            }
             if (getenv("BW64_SCDUMP")) {
                 // sockaddr_un: family@0 (2), sun_path@2. sockaddr_in: family@0,
                 // port@2 (BE u16), addr@4 (BE u32). Decode both so we can tell a

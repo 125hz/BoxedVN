@@ -159,6 +159,33 @@ int main(void) {
     stage_ok("register-class", NULL);
 
     /* ---------------------------------------------------------------- */
+    /* What the window would be created INTO, reported before trying.
+     *
+     * A device run returned ERROR_INVALID_WINDOW_HANDLE from CreateWindowExW
+     * with no failing handle of its own to blame -- the value points at
+     * something the window would have been parented to or associated with.
+     * A desktop window of zero means the user driver never initialised, which
+     * is a different failure from one that has a desktop and still refuses. */
+    {
+        HWND desktop = GetDesktopWindow();
+        HDESK threadDesktop = GetThreadDesktop(GetCurrentThreadId());
+        HWINSTA station = GetProcessWindowStation();
+        char display[128];
+        DWORD displayLength =
+            GetEnvironmentVariableA("DISPLAY", display, sizeof(display));
+        if (displayLength == 0 || displayLength >= sizeof(display)) {
+            display[0] = '\0';
+        }
+        snprintf(detail, sizeof(detail),
+                 "desktop-env display='%s' desktop=0x%llx thread_desktop=0x%llx "
+                 "window_station=0x%llx",
+                 display[0] != '\0' ? display : "(unset)",
+                 (unsigned long long)(ULONG_PTR)desktop,
+                 (unsigned long long)(ULONG_PTR)threadDesktop,
+                 (unsigned long long)(ULONG_PTR)station);
+        stage_line(detail);
+    }
+
     stage_begin("create-window");
     SetLastError(0);
     window = CreateWindowExW(0, kClassName, L"BoxedVN D3D11 probe",
@@ -167,6 +194,29 @@ int main(void) {
     captured = GetLastError();
     if (window == NULL) {
         stage_fail("create-window", captured, NULL);
+        /* One narrower attempt, to separate two very different failures: a
+         * user driver that is not there at all, and one that is there but
+         * cannot build a full overlapped frame -- the non-client area needs
+         * fonts and metrics that a plain popup does not.
+         *
+         * Reported as its own result and never treated as success. The
+         * program still exits on the create-window stage code, and no handle
+         * from here is passed to DXGI: a window the driver could not build
+         * properly is not a surface anything can present to. */
+        stage_begin("create-window-popup");
+        SetLastError(0);
+        window = CreateWindowExW(0, kClassName, L"BoxedVN D3D11 probe",
+                                 WS_POPUP, 0, 0, 640, 480, NULL, NULL,
+                                 instance, NULL);
+        captured = GetLastError();
+        if (window == NULL) {
+            stage_fail("create-window-popup", captured, NULL);
+        } else {
+            snprintf(detail, sizeof(detail), "hwnd=0x%llx",
+                     (unsigned long long)(ULONG_PTR)window);
+            stage_ok("create-window-popup", detail);
+            DestroyWindow(window);
+        }
         return BOXEDVN_EXIT_CREATE_WINDOW;
     }
     snprintf(detail, sizeof(detail), "hwnd=0x%llx",

@@ -340,6 +340,20 @@ check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libc.so.6
 # archive that actually carries it.
 check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libfreetype.so.6
 check_zip_entry_elf64_x86_64 "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libfreetype.so.6
+
+# Fontconfig loads without its configuration and then reports "Cannot load
+# default config file", which a device run showed leaves Wine with no font
+# backend even though libfreetype opened. A loaded library with no
+# configuration is the regression this guards.
+check_zip_path "${GLIBC_ARCHIVE}" etc/fonts/fonts.conf
+
+# The X11 client libraries winex11.so links against directly. Without them the
+# user driver cannot load, the process has no desktop window, and every
+# CreateWindowEx fails with ERROR_INVALID_WINDOW_HANDLE.
+for x11_core in libX11.so.6 libXext.so.6; do
+    check_zip_path "${GLIBC_ARCHIVE}" "lib/x86_64-linux-gnu/${x11_core}"
+    check_zip_entry_elf64_x86_64 "${GLIBC_ARCHIVE}" "lib/x86_64-linux-gnu/${x11_core}"
+done
 # Wine puts its server socket directory in the modelled user's XDG runtime
 # directory. The rootfs has to ship it; BoxedWine's permission policy is what
 # makes it writable, because ZIP entries carry no Unix mode.
@@ -354,6 +368,27 @@ check_zip_path "${GLIBC_ARCHIVE}" run/user/1000
 WINE_MODULE_ROOT=usr/lib/x86_64-linux-gnu/wine
 check_zip_path "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/libfreetype.so.6
 check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/libfreetype.so.6
+for x11_core in libX11.so.6 libXext.so.6; do
+    check_zip_path "${WINE_ARCHIVE}" "usr/lib/x86_64-linux-gnu/${x11_core}"
+done
+
+# Wine's X11 user driver, both halves. win32u loads the PE side out of the
+# Windows module tree and that side dlopens the Unix side. A runtime missing
+# either one runs with no user driver at all, which Wine does not report as an
+# error: it simply has no desktop window to parent a new window to.
+check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-windows/winex11.drv"
+check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" \
+    "${WINE_MODULE_ROOT}/x86_64-windows/winex11.drv"
+check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-unix/winex11.so"
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" \
+    "${WINE_MODULE_ROOT}/x86_64-unix/winex11.so"
+
+# Wine's built-in bitmap fonts, at the data root and reachable through the
+# derived path the guest actually asks for. A device run showed every one of
+# these opens failing.
+for wine_font in vgasys.fon vgaoem.fon vgafix.fon; do
+    check_zip_path "${WINE_ARCHIVE}" "usr/share/wine/fonts/${wine_font}"
+done
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wine64"
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver64"
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver"

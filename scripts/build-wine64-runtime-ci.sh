@@ -216,6 +216,13 @@ seed_dynamic_library() {
     copy_as "${found}" "/usr/lib/x86_64-linux-gnu/${soname}"
 }
 
+# The X11 client libraries. libX11 and libXext are what winex11.so links
+# against directly, so a runtime without them has no user driver at all and
+# every CreateWindowEx fails with ERROR_INVALID_WINDOW_HANDLE -- there is no
+# desktop window to parent to. Required for that reason.
+for x11core in libX11.so.6 libXext.so.6; do
+    seed_dynamic_library "${x11core}" required
+done
 # winex11.drv resolves these client libraries with dlopen. The Ubuntu job
 # installs the corresponding runtime packages.
 for x11lib in \
@@ -327,6 +334,53 @@ for required_builtin in ntdll.dll kernel32.dll kernelbase.dll; do
         || die "${required_builtin} is not a PE image."
 done
 
+# The X11 user driver, both halves. Wine's win32u loads the PE side out of the
+# Windows module tree and that side dlopens the Unix side; without either one
+# the process runs with no user driver, which is not an error Wine reports --
+# it simply has no desktop window, and every window creation fails.
+for driver_half in \
+    "x86_64-windows/winex11.drv" \
+    "x86_64-unix/winex11.so"; do
+    driver_path="${STAGE}${WINE_MODULE_ROOT}/${driver_half}"
+    [[ -s "${driver_path}" ]] \
+        || die "The Wine module tree has no ${driver_half}. Install the distro package that provides Wine's X11 user driver before assembling the runtime."
+done
+is_elf64_x86_64 "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/winex11.so" \
+    || die "The packaged winex11.so is not an x86-64 ELF shared object."
+[[ "$(head -c 2 "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/winex11.drv")" == "MZ" ]] \
+    || die "The packaged winex11.drv is not a PE image."
+log "X11 user driver packaged: winex11.drv + winex11.so"
+
+# Fontconfig's default configuration. Without /etc/fonts/fonts.conf the library
+# loads and then reports "Cannot load default config file", which leaves Wine
+# with no font backend even though libfreetype opened successfully.
+#
+# /etc/fonts/conf.d is a directory of symlinks into
+# /usr/share/fontconfig/conf.avail. A BoxedWine ZIP does not interpret POSIX
+# symlinks, so the tree is materialised with cp -aL: what lands in the archive
+# is the real configuration files, not dangling links.
+if [[ -d /etc/fonts ]]; then
+    mkdir -p "${STAGE}/etc"
+    cp -aL /etc/fonts "${STAGE}/etc/"
+else
+    die "The runner has no /etc/fonts. Install fontconfig-config before assembling the runtime."
+fi
+[[ -s "${STAGE}/etc/fonts/fonts.conf" ]] \
+    || die "The staged fontconfig tree has no fonts.conf."
+if [[ -d /usr/share/fontconfig ]]; then
+    mkdir -p "${STAGE}/usr/share"
+    cp -aL /usr/share/fontconfig "${STAGE}/usr/share/"
+fi
+# A minimal scalable font set, so fontconfig's configuration resolves to
+# something real rather than an empty set.
+if [[ -d /usr/share/fonts/truetype ]]; then
+    mkdir -p "${STAGE}/usr/share/fonts"
+    cp -aL /usr/share/fonts/truetype "${STAGE}/usr/share/fonts/"
+fi
+# Fontconfig writes its cache under HOME. The directory has to exist or every
+# lookup re-scans and re-fails.
+mkdir -p "${STAGE}/home/username/.cache/fontconfig" "${STAGE}/var/cache/fontconfig"
+
 if [[ -d /usr/share/wine ]]; then
     mkdir -p "${STAGE}/usr/share"
     cp -aL /usr/share/wine "${STAGE}/usr/share/"
@@ -401,6 +455,16 @@ guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/bin/wineserver
 # /usr/lib/share/wine, while Ubuntu installs NLS tables in /usr/share/wine.
 # Make the exact derived path guest-visible without duplicating the data.
 guest_link /usr/share/wine /usr/lib/share/wine
+# Wine's built-in bitmap fonts. The device log shows Wine opening
+# /usr/lib/share/wine/fonts/*.fon -- the derived data path above -- and failing
+# on every one, because the distro ships them in a separate package. They are
+# what the non-client area of a window is drawn with.
+[[ -d "${STAGE}/usr/share/wine/fonts" ]] \
+    || die "The staged Wine data root has no fonts directory. Install fonts-wine before assembling the runtime."
+staged_fon_count="$(find "${STAGE}/usr/share/wine/fonts" -type f -name '*.fon' | wc -l | tr -d ' ')"
+(( staged_fon_count > 0 )) \
+    || die "The staged Wine fonts directory contains no .fon files."
+log "Wine bitmap fonts packaged: ${staged_fon_count}"
 
 # These directories are created by wineserver and by Wine's default prefix.
 mkdir -p "${STAGE}/tmp" "${STAGE}/run/user/1000" \

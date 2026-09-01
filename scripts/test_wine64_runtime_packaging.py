@@ -52,6 +52,15 @@ exec "$(dirname "$0")/wineserver32" "$@"
 FREETYPE_GLIBC_PATH = "lib/x86_64-linux-gnu/libfreetype.so.6"
 FREETYPE_WINE_PATH = "usr/lib/x86_64-linux-gnu/libfreetype.so.6"
 
+# The X11 client libraries winex11.so links against directly. Without them the
+# user driver cannot load and the process has no desktop window at all.
+X11_CORE_LIBS = ("libX11.so.6", "libXext.so.6")
+# Fontconfig loads without its configuration and then reports that it cannot
+# load a default config file, which leaves Wine with no usable font backend.
+FONTCONFIG_PATH = "etc/fonts/fonts.conf"
+# Wine's own bitmap fonts, which the non-client area of a window is drawn with.
+WINE_FONTS = ("vgasys.fon", "vgaoem.fon", "vgafix.fon")
+
 
 def elf(machine: int = 62, elf_class: int = 2, body: bytes = b"") -> bytes:
     """A minimal ELF header, enough for a header-only class/machine check."""
@@ -176,12 +185,14 @@ class WineserverArchiveValidation(unittest.TestCase):
     def build_archives(self, directory: Path, wineserver_generic: bytes,
                        freetype: bytes = None,
                        glibc_freetype: bool = True,
-                       wine_freetype: bool = True):
+                       wine_freetype: bool = True,
+                       x11_driver: bool = True):
         server = elf(body=b"wineserver64 payload")
         if freetype is None:
             freetype = elf(body=b"freetype payload")
         self._freetype = freetype
         self._wine_freetype = wine_freetype
+        self._x11_driver = x11_driver
         glibc = directory / "glibc-rootfs64.zip"
         wine = directory / "wine64.zip"
         with zipfile.ZipFile(glibc, "w") as archive:
@@ -192,6 +203,9 @@ class WineserverArchiveValidation(unittest.TestCase):
             # both have to be real files; this is the glibc layer's copy.
             if glibc_freetype:
                 archive.writestr(FREETYPE_GLIBC_PATH, freetype)
+            archive.writestr(FONTCONFIG_PATH, b"<fontconfig/>\n")
+            for x11_lib in X11_CORE_LIBS:
+                archive.writestr("lib/x86_64-linux-gnu/" + x11_lib, elf())
             # Wine's server needs the modelled user's XDG runtime directory.
             archive.writestr("run/user/1000/", b"")
         with zipfile.ZipFile(wine, "w") as archive:
@@ -206,10 +220,18 @@ class WineserverArchiveValidation(unittest.TestCase):
         /proc/self/exe and its module root from ntdll.so's parent, so the
         loader has to live in the same tree as the modules it loads.
         """
-        # The Wine layer carries the /usr copy of the font backend.
+        # The Wine layer carries the /usr copy of the font backend, the X11
+        # client libraries, the user driver and Wine's bitmap fonts.
         if getattr(self, "_wine_freetype", True):
             archive.writestr(FREETYPE_WINE_PATH,
                              getattr(self, "_freetype", elf(body=b"freetype")))
+        for x11_lib in X11_CORE_LIBS:
+            archive.writestr("usr/lib/x86_64-linux-gnu/" + x11_lib, elf())
+        if getattr(self, "_x11_driver", True):
+            archive.writestr(PE_DIR + "/winex11.drv", pe(body=b"winex11"))
+            archive.writestr(ROOT + "/x86_64-unix/winex11.so", elf())
+        for wine_font in WINE_FONTS:
+            archive.writestr(DATA_ROOT + "/fonts/" + wine_font, b"fon:" + wine_font.encode())
         archive.writestr(ROOT + "/wine64", elf(body=b"wine64"))
         archive.writestr(ROOT + "/wineserver64", server)
         archive.writestr(ROOT + "/wineserver", wineserver_generic)
@@ -300,8 +322,11 @@ class WineserverArchiveValidation(unittest.TestCase):
             with zipfile.ZipFile(glibc, "w") as archive:
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
-                # The font backend the validator now requires in this layer.
+                # What the validator now requires in this layer.
                 archive.writestr(FREETYPE_GLIBC_PATH, elf(body=b"freetype"))
+                archive.writestr(FONTCONFIG_PATH, b"<fontconfig/>\n")
+                for x11_lib in X11_CORE_LIBS:
+                    archive.writestr("lib/x86_64-linux-gnu/" + x11_lib, elf())
                 archive.writestr("run/user/1000/", b"")
             with zipfile.ZipFile(wine, "w") as archive:
                 self.write_wine_layout(archive, server, server)
@@ -421,8 +446,11 @@ class WineserverArchiveValidation(unittest.TestCase):
             with zipfile.ZipFile(glibc, "w") as archive:
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
-                # The font backend the validator now requires in this layer.
+                # What the validator now requires in this layer.
                 archive.writestr(FREETYPE_GLIBC_PATH, elf(body=b"freetype"))
+                archive.writestr(FONTCONFIG_PATH, b"<fontconfig/>\n")
+                for x11_lib in X11_CORE_LIBS:
+                    archive.writestr("lib/x86_64-linux-gnu/" + x11_lib, elf())
             with zipfile.ZipFile(wine, "w") as archive:
                 self.write_wine_layout(archive, server, server)
             code, output = self.run_validator(directory, glibc, wine)
@@ -567,3 +595,85 @@ class FreeTypeArchiveValidation(WineserverArchiveValidation):
 for _inherited in list(vars(WineserverArchiveValidation)):
     if _inherited.startswith("test_"):
         setattr(FreeTypeArchiveValidation, _inherited, None)
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("unzip")
+                     and shutil.which("od"),
+                     "the packaging validator needs bash, unzip and od")
+class WindowDriverPackaging(WineserverArchiveValidation):
+    """The runtime has to contain everything a window needs to exist.
+
+    A device run reached CreateWindowExW and got ERROR_INVALID_WINDOW_HANDLE
+    with no X11 activity anywhere in the log. A process whose user driver never
+    loaded has no desktop window to parent to, and Wine does not report that as
+    an error of its own -- so the packaging is what has to be proven.
+    """
+
+    def test_a_complete_window_runtime_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertEqual(code, 0, output)
+            self.assertIn("winex11.drv", output)
+            self.assertIn("winex11.so", output)
+
+    def test_a_missing_x11_user_driver_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(
+                directory, server, x11_driver=False)
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("winex11", output)
+
+    def test_a_missing_fontconfig_configuration_is_rejected(self) -> None:
+        # Fontconfig loading with no default config is the exact shape a
+        # device run produced: the library opens, and then every font lookup
+        # fails.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.strip_from_archive(glibc, FONTCONFIG_PATH)
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("fonts.conf", output)
+
+    def test_missing_x11_client_libraries_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.strip_from_archive(glibc, "lib/x86_64-linux-gnu/libX11.so.6")
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("libX11.so.6", output)
+
+    def test_missing_wine_bitmap_fonts_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.strip_from_archive(wine, DATA_ROOT + "/fonts/vgasys.fon")
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("vgasys.fon", output)
+
+    @staticmethod
+    def strip_from_archive(path: Path, drop: str) -> None:
+        """Rewrite an archive without one entry, keeping the manifest valid."""
+        with zipfile.ZipFile(path) as source:
+            kept = [(item, source.read(item.filename))
+                    for item in source.infolist()
+                    if item.filename != drop]
+        with zipfile.ZipFile(path, "w") as target:
+            for item, payload in kept:
+                target.writestr(item, payload)
+
+
+for _inherited in list(vars(WineserverArchiveValidation)):
+    if _inherited.startswith("test_"):
+        setattr(WindowDriverPackaging, _inherited, None)
