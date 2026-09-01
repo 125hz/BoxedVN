@@ -2517,12 +2517,36 @@ def main() -> None:
         call_witness_patch,
         [
             "FEXCore/Source/Interface/Core/JIT/BranchOps.cpp",
+            # The dynamic target is copied once, before any scratch register
+            # is written, and every later use reads the copy. A device run
+            # reached this lowering with a target of zero while the slot it was
+            # popped from held the right address throughout -- the value was
+            # correct when popped and became zero before State.rip was stored.
+            "const auto TargetReg = TMP3;",
+            "mov(ARMEmitter::Size::i64Bit, TargetReg.R(), RipReg);",
             "ARMEmitter::ForwardLabel TargetIsUsable;",
-            "cbnz(ARMEmitter::Size::i64Bit, RipReg.X(), &TargetIsUsable)",
+            "cbnz(ARMEmitter::Size::i64Bit, TargetReg, &TargetIsUsable)",
             "BoxedWineNullExitSource",
         ],
         "BoxedVN null-exit marker keyed on the target",
     )
+    # Nothing after the copy may re-read the original register: the point of
+    # the copy is that a clobber between the pop and any of these uses cannot
+    # decide what the guest runs.
+    exit_start = call_witness_patch.index("const auto TargetReg = TMP3;")
+    exit_end = call_witness_patch.index("Bind(&SkipFullLookup)", exit_start)
+    for line in call_witness_patch[exit_start:exit_end].splitlines():
+        if line.startswith("+") and "RipReg" in line and "TargetReg" not in line:
+            raise SystemExit(
+                "the exit lowering re-reads the dynamic target's original "
+                "register after a scratch write: " + line.strip()
+            )
+    # And the invariant that makes TMP3 usable is stated, not assumed.
+    if "must not be allocated to a scratch temporary" not in call_witness_patch:
+        raise SystemExit(
+            "the exit lowering must assert that its target register is not a "
+            "scratch temporary"
+        )
 
     # ------------------------------------------------------------------ #
     # A guest target the host can never execute must become a guest fault,  #

@@ -300,3 +300,78 @@ BOXEDVN_TEST(fex_syscall_rip_replacement_must_leave_the_current_block) {
     CHECK(fexSyscallMustLeaveCurrentBlock(postSyscallRIP,
                                           0x7a400a8000ULL));
 }
+
+
+// ---------------------------------------------------------------------------
+// The dynamic target must survive the lookup that consumes it.
+// ---------------------------------------------------------------------------
+
+BOXEDVN_TEST(fex_every_target_use_reads_the_preserved_copy) {
+    // Each of these happens after at least one scratch register has been
+    // written. Reading the original register at any of them lets a clobber
+    // between the pop and that use decide what the guest runs.
+    for (FexTargetUse use : {FexTargetUse::CacheIndex, FexTargetUse::KeyCompare,
+                             FexTargetUse::UsabilityTest,
+                             FexTargetUse::PublishRip}) {
+        CHECK(fexTargetUseReadsPreservedCopy(use));
+    }
+}
+
+BOXEDVN_TEST(fex_the_preserved_target_does_not_share_a_lookup_scratch) {
+    // The copy is useless if the lookup overwrites it on the way past.
+    CHECK(!fexExitLookupWritesScratch(fexPreservedTargetRegister()));
+    // And the registers the lookup does write are exactly the ones it needs.
+    CHECK(fexExitLookupWritesScratch(FexExitScratch::Tmp1));
+    CHECK(fexExitLookupWritesScratch(FexExitScratch::Tmp2));
+    CHECK(fexExitLookupWritesScratch(FexExitScratch::Tmp4));
+}
+
+BOXEDVN_TEST(fex_a_missed_lookup_publishes_the_popped_return_address) {
+    // The device failure in one line: the slot held 0x7fffffa37b50 and the
+    // guest was told to run 0. Whatever the lookup found or did not find, the
+    // address published is the one the RET popped.
+    constexpr std::uint64_t poppedReturn = 0x7fffffa37b50ULL;
+    CHECK_EQ(fexPublishedRipOnMiss(poppedReturn), poppedReturn);
+    const auto exit = resolveIndirectExit(emptyLookupCacheEntry(), poppedReturn,
+                                          kDispatcherLoopTop);
+    CHECK(exit.path == FexIndirectExitPath::DispatcherFallback);
+    CHECK_EQ(exit.guestRIP, poppedReturn);
+    CHECK(exit.guestRIP != 0);
+}
+
+BOXEDVN_TEST(fex_a_top_arena_return_survives_pop_and_publish) {
+    // The exact relationship the device run had: a return address in the top
+    // arena, popped from a slot in the same arena, with a distinct host alias
+    // for each. Neither the address nor the value may pick up the other's
+    // translation.
+    constexpr std::uint64_t slot = 0x7ffffe1fd798ULL;
+    constexpr std::uint64_t returnAddress = 0x7fffffa37b50ULL;
+    constexpr std::uint64_t slotHost = 0x7ffe1fd798ULL;
+
+    // The slot resolves to the host address the device reported.
+    CHECK_EQ(guestToHostAddress(slot), slotHost);
+    // The return address is a GUEST value and is published unchanged: it is
+    // never put through the address translation, which is what makes it a
+    // value rather than a pointer to dereference.
+    CHECK_EQ(fexPublishedRipOnMiss(returnAddress), returnAddress);
+    CHECK(guestToHostAddress(returnAddress) != returnAddress);
+
+    // And the stack pointer arithmetic around it is the ordinary one.
+    CHECK_EQ(fexPoppedSlotForStackPointer(slot + 8), slot);
+
+    const FexCallReturnPush push {returnAddress, slot, slotHost, returnAddress};
+    CHECK(classifyCallReturnPush(push) == FexCallPushVerdict::Stored);
+    CHECK(fexCallReturnPushIsWellFormed(push));
+}
+
+BOXEDVN_TEST(fex_a_cache_hit_still_runs_the_address_that_was_popped) {
+    // The preserved copy is what the key is compared against, so a hit is a
+    // hit on the popped address and nothing else.
+    constexpr std::uint64_t poppedReturn = 0x7fffffa37b50ULL;
+    const FexLookupCacheEntry entry {0x00000001154430a0ULL, poppedReturn};
+    const auto exit =
+        resolveIndirectExit(entry, poppedReturn, kDispatcherLoopTop);
+    CHECK(exit.path == FexIndirectExitPath::CacheHit);
+    CHECK_EQ(exit.guestRIP, poppedReturn);
+    CHECK_EQ(exit.hostTarget, entry.hostCode);
+}

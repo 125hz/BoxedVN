@@ -261,6 +261,74 @@ constexpr bool fexSyscallMustLeaveCurrentBlock(
     return resultingRIP != postSyscallRIP;
 }
 
+// ---------------------------------------------------------------------------
+// The dynamic target's lifetime across an indirect exit.
+//
+// A device run showed a RET arriving at the exit lowering with a target of
+// zero while the stack slot it was popped from held the right address the
+// whole time: the CALL's own read-back matched, a re-read at the moment of
+// failure still matched, and the qwords around it were intact. The value was
+// correct in memory and correct when popped, and became zero between the pop
+// and the store of State.rip.
+//
+// The lowering read the target register repeatedly -- to index the cache, to
+// compare against the cached key, to decide whether the target was usable, and
+// finally to publish it. Every one of those reads assumed the register still
+// held what the pop put there. It does not need to: the target is copied once,
+// before any scratch register is touched, and every later use reads the copy.
+// ---------------------------------------------------------------------------
+
+// The scratch registers the exit lowering uses. The dynamic target must never
+// be allocated to one of them, and must never be re-read after they are.
+enum class FexExitScratch {
+    Tmp1,
+    Tmp2,
+    Tmp3,
+    Tmp4,
+};
+
+// Where the lowering reads the target. Each of these happens after at least
+// one scratch register has been written.
+enum class FexTargetUse {
+    CacheIndex,
+    KeyCompare,
+    UsabilityTest,
+    PublishRip,
+};
+
+// True when a use is served from the preserved copy rather than the original
+// register. Every use must be, or a clobber between the pop and that use is
+// silently absorbed into the value the guest is told to run.
+constexpr bool fexTargetUseReadsPreservedCopy(FexTargetUse use) noexcept {
+    switch (use) {
+    case FexTargetUse::CacheIndex:
+    case FexTargetUse::KeyCompare:
+    case FexTargetUse::UsabilityTest:
+    case FexTargetUse::PublishRip:
+        return true;
+    }
+    return false;
+}
+
+// The register the preserved copy lives in. It has to be a scratch the exit
+// sequence does not otherwise use, and it must not be allocatable.
+constexpr FexExitScratch fexPreservedTargetRegister() noexcept {
+    return FexExitScratch::Tmp3;
+}
+
+// The scratch registers the cache lookup itself writes.
+constexpr bool fexExitLookupWritesScratch(FexExitScratch scratch) noexcept {
+    return scratch == FexExitScratch::Tmp1 || scratch == FexExitScratch::Tmp2 ||
+           scratch == FexExitScratch::Tmp4;
+}
+
+// What the guest is told to run after a lookup that missed. It is the popped
+// return address, never a substitute and never a residue of the lookup.
+constexpr std::uint64_t fexPublishedRipOnMiss(
+    std::uint64_t poppedReturnAddress) noexcept {
+    return poppedReturnAddress;
+}
+
 }  // namespace boxedvn
 
 #endif  // BOXEDVN_FEX_EXIT_DISPATCH_CONTRACT_H

@@ -352,7 +352,67 @@ diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/In
    ResetStack();
 
    if (CTX->HostFeatures.IsInstCountCI) [[unlikely]] {
-@@ -355,14 +385,27 @@
+@@ -236,6 +266,33 @@
+     ARMEmitter::ForwardLabel SkipFullLookup;
+     auto RipReg = GetReg(Op->NewRIP);
+
++    /* Preserve the dynamic target before ANY of the lookup machinery runs.
++     *
++     * A device run showed a RET reaching this code with a target of zero while
++     * the stack slot it came from held the right address the whole time: the
++     * CALL's own read-back matched, the ring's re-read at the failure still
++     * matched, and the memory window around the slot was intact. So the value
++     * was correct in memory and correct when popped, and became zero somewhere
++     * between the pop and the store of State.rip.
++     *
++     * Everything below reads RipReg repeatedly -- to index the cache, to
++     * compare against the cached key, to decide whether the target is usable,
++     * and finally to publish it in State.rip. Each of those reads assumes the
++     * register still holds what the pop put there. That assumption is what
++     * failed, and it is not one this code needs to make.
++     *
++     * TMP3 is untouched by the sequence that follows (which uses TMP1, TMP2 and
++     * TMP4), and no allocatable register can collide with it: on this host the
++     * allocation set is x20-x24 and x30 plus the static registers, and the
++     * temporaries are x0-x3. The assertion below states that invariant rather
++     * than leaving it to be re-derived, so a future change to the register sets
++     * fails loudly instead of silently reintroducing this.
++     */
++    LOGMAN_THROW_A_FMT(RipReg != TMP1.R() && RipReg != TMP2.R() && RipReg != TMP3.R() && RipReg != TMP4.R(),
++                       "ExitFunction's dynamic target must not be allocated to a scratch temporary");
++    const auto TargetReg = TMP3;
++    mov(ARMEmitter::Size::i64Bit, TargetReg.R(), RipReg);
++
+     if (Op->Hint == IR::BranchHint::Return) {
+       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
+ #ifdef ARCHITECTURE_arm64ec
+@@ -266,7 +323,7 @@
+ #ifdef ARCHITECTURE_arm64ec
+       str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+ #endif
+-      sub(TMP1, TMP1, RipReg.X());
++      sub(TMP1, TMP1, TargetReg);
+ #ifdef FEX_IOS_HOST
+       /* iOS-Mythic ml305 (tasks #42 / #51 / #52): DO NOT TRUST THE CALL-RET PREDICTION ON iOS.
+        *
+@@ -321,13 +378,14 @@
+
+     // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+     // L1Mask is pre-shifted.
+-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
++    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TargetReg.R(), ARMEmitter::ShiftType::LSL,
++         FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+     add(TMP1, TMP1, TMP2);
+
+     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+
+     // Note: sub+cbnz used over cmp+br to preserve flags. cbz/cbnz set none.
+-    sub(TMP1, TMP1, RipReg.X());
++    sub(TMP1, TMP1, TargetReg);
+
+     /* A cache hit needs BOTH halves, not just the key.
+      *
+@@ -355,16 +413,29 @@
      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1Unusable);
      (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
 
@@ -378,15 +438,18 @@ diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/In
 +     * miss. */
 +    {
 +      ARMEmitter::ForwardLabel TargetIsUsable;
-+      (void)cbnz(ARMEmitter::Size::i64Bit, RipReg.X(), &TargetIsUsable);
++      (void)cbnz(ARMEmitter::Size::i64Bit, TargetReg, &TargetIsUsable);
 +      LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Entry);
 +      str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, BoxedWineNullExitSource));
 +      (void)Bind(&TargetIsUsable);
 +    }
 +
      ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
-     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+-    str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
++    str(TargetReg, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
+     (void)Bind(&SkipFullLookup);
+     if (Op->Hint == IR::BranchHint::Call) {
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
