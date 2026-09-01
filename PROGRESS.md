@@ -5218,3 +5218,17 @@ Next device evidence: `BOXEDWINE_X64_MODULE_OVERLAY ... status=projected`
 for all four names, a winemetal.dll search after d3d11-create begins, the
 first `BOXEDWINE_DXMT_CALL` lines, and then whatever D3D11CreateDevice
 reports.
+
+
+---
+
+### Module overlay ordered after the drive mounts
+
+Logs 182752 and 182918 at 012c6008 show the overlay running but reporting
+all four DXMT modules missing at `/mnt/drive_d/.boxedvn-x64-diagnostics`,
+while Wine later found the same files through the D: drive. The drive
+mounts are attached to the virtual filesystem in a later loop than the
+prefix preparation the overlay was placed in, so the guest path did not
+resolve yet. The projection now runs after the mounts. Everything else in
+those logs matches the previous accepted boundary: bridge markers through
+`map-window`, then `d3d11-create fail hr=0x887a0004` from wined3d.

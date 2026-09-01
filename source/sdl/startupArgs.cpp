@@ -773,9 +773,6 @@ bool StartUpArgs::apply() {
     }
     if (requestedFEX64) {
         projectX64WineSystemModules(winePrefix);
-        if (!this->x64ModuleOverlayPath.isEmpty()) {
-            overlayX64WineModules(this->x64ModuleOverlayPath);
-        }
         // The guest ld-linux resolves winex11.so's libX11/libXext through
         // LD_LIBRARY_PATH before the multiarch directories. Put BoxedWine's
         // own x86-64 X11 client libraries first so the driver binds to the
@@ -887,6 +884,14 @@ bool StartUpArgs::apply() {
                 Fs::addRootDirectoryNode(info.localPath, info.nativePath, parent);
             }
         }
+    }
+
+    // The DXMT module overlay resolves its sources through the drive mounts
+    // attached just above (the modules are staged on the game drive), so it
+    // has to run after them. A device run that projected before the mounts
+    // reported every module missing and Wine fell back to wined3d.
+    if (requestedFEX64 && !this->x64ModuleOverlayPath.isEmpty()) {
+        overlayX64WineModules(this->x64ModuleOverlayPath);
     }
 
     if (this->args.size()==0) {
