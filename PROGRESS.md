@@ -5161,3 +5161,26 @@ Proven so far: 461 host-independent tests, the shim and packaging contracts,
 and an MSVC syntax pass over the bridge. The ELF64 build, the Wine import
 measurement and the iPhoneOS compile are CI gates; nothing here is proven on
 a device yet.
+
+
+---
+
+### Interpreter: SSE4.2 packed string compares
+
+Logs 164722 and 164835 at efe0b427 never reach the bridge: no user-driver
+load, no X11 connect, and wineboot's forked child (pid 18) goes quiet after
+`CPU64: unimpl opcode at RIP=... bytes=66 0f 3a 63 04 16 1a`, so services
+and explorer are never started and the session sits on "loading the Windows
+system modules". That is PCMPISTRI with glibc's strcmp immediate. A forked
+child runs in the 64-bit interpreter until it execs, glibc's IFUNC picks
+the SSE4.2 strcmp because the translated guest reports SSE4.2, and the new
+LD_LIBRARY_PATH entry is what made the child compare a string before its
+exec. Neither accepted log contained the opcode.
+
+PCMPESTRM/PCMPESTRI/PCMPISTRM/PCMPISTRI are now implemented in CPU64 from
+the architectural definition in `include/sse42_string_compare.h` (all four
+aggregations, both polarities, index and mask outputs, explicit-length
+saturation, CF/ZF/SF/OF), covered by ten host tests including the exact
+strcmp, strcspn, strspn and strstr immediates glibc uses. 471 host tests
+pass. The X11 bridge itself is still unproven on a device; the acceptance
+markers from the previous note stand.

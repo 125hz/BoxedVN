@@ -14,6 +14,7 @@
 #include "cpu64.h"
 #include "wine_nt_syscall_memory.h"
 #include "cmpxchg16b.h"
+#include "sse42_string_compare.h"
 #include "kmemory64.h"
 #include "syscall64.h"
 #include "ksignal.h"   // K_SIGFPE
@@ -3811,6 +3812,68 @@ dsp_54:
                 for (int i = 0; i < 8; i++) nHi |= ((U64)dst[i+8]) << (i*8);
                 xmm[m.regField].lo = nLo;
                 xmm[m.regField].hi = nHi;
+                U32 used = opOff + 3 + m.length + 1;
+                rip += used;
+                return used;
+            }
+            // ---- SSE4.2 packed string compares: 66 0F 3A 60..63 /r ib ----
+            //
+            // PCMPESTRM (60), PCMPESTRI (61), PCMPISTRM (62), PCMPISTRI (63).
+            // glibc's SSE4.2 strcmp/strcspn/strspn/strstr are selected by
+            // IFUNC because the translated guest reports SSE4.2, and a forked
+            // child runs here until it execs. With LD_LIBRARY_PATH in the
+            // environment wineboot's child compared a string before its exec
+            // and stopped at "unimpl opcode ... 66 0f 3a 63 04 16 1a", so
+            // services and explorer were never started. The semantics live in
+            // include/sse42_string_compare.h, where they are unit tested.
+            if (op2 == 0x3A && (op3 >= 0x60 && op3 <= 0x63)) {
+                ModRM m = decodeModRM(rip + opOff + 3, p, 1);
+                U8 first[16];
+                U8 second[16];
+                for (int i = 0; i < 8; i++) first[i]    = (U8)(xmm[m.regField].lo >> (i*8));
+                for (int i = 0; i < 8; i++) first[i+8]  = (U8)(xmm[m.regField].hi >> (i*8));
+                if (m.isReg) {
+                    for (int i = 0; i < 8; i++) second[i]   = (U8)(xmm[m.rmIndex].lo >> (i*8));
+                    for (int i = 0; i < 8; i++) second[i+8] = (U8)(xmm[m.rmIndex].hi >> (i*8));
+                } else {
+                    // Implicit-length forms may legitimately run past a page
+                    // that holds only the terminator, but the whole 16 bytes
+                    // are still one aligned operand, so read them as such.
+                    const U64 lo = memory->readq(m.effAddr);
+                    const U64 hi = memory->readq(m.effAddr + 8);
+                    for (int i = 0; i < 8; i++) second[i]   = (U8)(lo >> (i*8));
+                    for (int i = 0; i < 8; i++) second[i+8] = (U8)(hi >> (i*8));
+                }
+                const U8 imm = fetchByte(rip + opOff + 3 + m.length);
+                const bool explicitLength = (op3 & 0x02) == 0;
+                const bool maskForm = (op3 & 0x01) == 0;
+                U32 firstLength;
+                U32 secondLength;
+                if (explicitLength) {
+                    firstLength = boxedvn::sse42StringExplicitLength(reg[X64_RAX].u64, rexW, imm);
+                    secondLength = boxedvn::sse42StringExplicitLength(reg[X64_RDX].u64, rexW, imm);
+                } else {
+                    firstLength = boxedvn::sse42StringImplicitLength(first, imm);
+                    secondLength = boxedvn::sse42StringImplicitLength(second, imm);
+                }
+                const boxedvn::Sse42StringResult result =
+                    boxedvn::sse42StringCompare(first, firstLength, second, secondLength, imm);
+                if (maskForm) {
+                    U64 nLo = 0, nHi = 0;
+                    for (int i = 0; i < 8; i++) nLo |= ((U64)result.xmm0[i])   << (i*8);
+                    for (int i = 0; i < 8; i++) nHi |= ((U64)result.xmm0[i+8]) << (i*8);
+                    xmm[0].lo = nLo;
+                    xmm[0].hi = nHi;
+                } else {
+                    // ECX is written as a 32-bit result: the upper half of
+                    // RCX is zeroed in both the 32- and 64-bit forms.
+                    reg[X64_RCX].setU64((U64)result.index);
+                }
+                rflags &= ~(X64_ZF | X64_CF | X64_OF | X64_SF | X64_AF | X64_PF);
+                if (result.cf) rflags |= X64_CF;
+                if (result.zf) rflags |= X64_ZF;
+                if (result.sf) rflags |= X64_SF;
+                if (result.of) rflags |= X64_OF;
                 U32 used = opOff + 3 + m.length + 1;
                 rip += used;
                 return used;

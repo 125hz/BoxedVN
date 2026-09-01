@@ -47,6 +47,7 @@ add_executable(boxedvn_tests
     test_pixmap_formats.cpp
     test_x11_layout64.cpp
     test_x11_bridge64_policy.cpp
+    test_sse42_string_compare.cpp
     test_getrusage_fairness.cpp
     test_kernel_random.cpp
     test_vk_pipeline_guard.cpp
