@@ -386,9 +386,15 @@ check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" \
 # Wine's built-in bitmap fonts, at the data root and reachable through the
 # derived path the guest actually asks for. A device run showed every one of
 # these opens failing.
-for wine_font in vgasys.fon vgaoem.fon vgafix.fon; do
-    check_zip_path "${WINE_ARCHIVE}" "usr/share/wine/fonts/${wine_font}"
-done
+#
+# Counted rather than named. Which .fon files a distro ships varies by package
+# version -- Ubuntu's fonts-wine 9.0 has vgasys.fon but no vgaoem.fon, and a
+# hard-coded list is a guess about someone else's packaging that fails the
+# build for the wrong reason. What matters is that the directory is populated.
+wine_font_count="$(unzip -Z1 "${WINE_ARCHIVE}" 'usr/share/wine/fonts/*.fon' 2>/dev/null | wc -l | tr -d ' ')"
+(( wine_font_count >= 8 ))     || die "'$(basename "${WINE_ARCHIVE}")' carries ${wine_font_count} Wine bitmap fonts under usr/share/wine/fonts.
+Wine draws a window's non-client area with these; install the distro's Wine font package before assembling the runtime."
+ok "$(basename "${WINE_ARCHIVE}"): ${wine_font_count} Wine bitmap fonts"
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wine64"
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver64"
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver"

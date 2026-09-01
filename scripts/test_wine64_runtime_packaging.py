@@ -59,7 +59,11 @@ X11_CORE_LIBS = ("libX11.so.6", "libXext.so.6")
 # load a default config file, which leaves Wine with no usable font backend.
 FONTCONFIG_PATH = "etc/fonts/fonts.conf"
 # Wine's own bitmap fonts, which the non-client area of a window is drawn with.
-WINE_FONTS = ("vgasys.fon", "vgaoem.fon", "vgafix.fon")
+# The validator counts rather than names them: which .fon files a distro ships
+# varies by package version, and a hard-coded list fails the build for the
+# wrong reason. The fixture writes enough to clear the floor.
+WINE_FONT_FLOOR = 8
+WINE_FONTS = tuple(f"wine{index:02d}.fon" for index in range(WINE_FONT_FLOOR + 2))
 
 
 def elf(machine: int = 62, elf_class: int = 2, body: bytes = b"") -> bytes:
@@ -652,15 +656,30 @@ class WindowDriverPackaging(WineserverArchiveValidation):
             self.assertNotEqual(code, 0, output)
             self.assertIn("libX11.so.6", output)
 
-    def test_missing_wine_bitmap_fonts_are_rejected(self) -> None:
+    def test_an_underpopulated_wine_font_directory_is_rejected(self) -> None:
+        # One font is not a font set. Wine draws every window's non-client
+        # area with these, and a device run failed to open all of them.
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)
             server = elf(body=b"wineserver64 payload")
             glibc, wine, _ = self.build_archives(directory, server)
-            self.strip_from_archive(wine, DATA_ROOT + "/fonts/vgasys.fon")
+            for wine_font in WINE_FONTS[1:]:
+                self.strip_from_archive(wine, DATA_ROOT + "/fonts/" + wine_font)
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0, output)
-            self.assertIn("vgasys.fon", output)
+            self.assertIn("bitmap fonts", output)
+
+    def test_the_font_set_is_counted_not_named(self) -> None:
+        # A distro that ships a different set of .fon files must still pass:
+        # hard-coding names is a guess about someone else's packaging.
+        validator = VALIDATOR.read_text(encoding="utf-8")
+        # Checked against the executable lines only. The comment above the
+        # check names the very font Ubuntu does not ship, which is the point
+        # it is making.
+        code = chr(10).join(line for line in validator.splitlines()
+                            if not line.lstrip().startswith("#"))
+        self.assertNotIn(".fon", code.replace("*.fon", ""))
+        self.assertIn("wine_font_count", code)
 
     @staticmethod
     def strip_from_archive(path: Path, drop: str) -> None:
