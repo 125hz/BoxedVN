@@ -52,7 +52,6 @@ mkdir -p "$(dirname "${OUTPUT}")"
 # -municode is NOT used: the entry point is main(), and the markers are ASCII.
 "${CC}" \
     -std=c11 -O1 -g0 -Wall -Wextra -Werror \
-    -DCOBJMACROS \
     "${SOURCE}" \
     -o "${OUTPUT}" \
     -ld3d11 -ldxgi -ldxguid -lgdi32 -luser32 -lole32 \

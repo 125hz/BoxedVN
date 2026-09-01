@@ -144,7 +144,10 @@ int main(void) {
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
     wc.lpfnWndProc = window_proc;
     wc.hInstance = instance;
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    /* IDC_ARROW expands to the ANSI form unless UNICODE is defined, and this
+     * file calls the W entry points explicitly rather than relying on that
+     * macro switch. Name the standard arrow cursor's resource id directly. */
+    wc.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
     wc.lpszClassName = kClassName;
     SetLastError(0);
     atom = RegisterClassExW(&wc);

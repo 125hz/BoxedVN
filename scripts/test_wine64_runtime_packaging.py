@@ -44,10 +44,13 @@ exec "$(dirname "$0")/wineserver32" "$@"
 # Wine searches for its font backend at both multiarch paths in turn. On the
 # runner /lib is a symlink to /usr/lib, but the guest archive has no symlinks,
 # so a single staged copy satisfies only one of the two lookups.
-FREETYPE_PATHS = (
-    "lib/x86_64-linux-gnu/libfreetype.so.6",
-    "usr/lib/x86_64-linux-gnu/libfreetype.so.6",
-)
+#
+# The two paths land in different archives: the builder partitions the stage by
+# top-level directory, so lib/ goes to the glibc layer and usr/ to the Wine
+# layer. Both are extracted into the same guest root, which is why one copy in
+# each is the correct shape rather than a duplicate.
+FREETYPE_GLIBC_PATH = "lib/x86_64-linux-gnu/libfreetype.so.6"
+FREETYPE_WINE_PATH = "usr/lib/x86_64-linux-gnu/libfreetype.so.6"
 
 
 def elf(machine: int = 62, elf_class: int = 2, body: bytes = b"") -> bytes:
@@ -172,12 +175,13 @@ class WineserverArchiveValidation(unittest.TestCase):
 
     def build_archives(self, directory: Path, wineserver_generic: bytes,
                        freetype: bytes = None,
-                       freetype_paths=None):
+                       glibc_freetype: bool = True,
+                       wine_freetype: bool = True):
         server = elf(body=b"wineserver64 payload")
         if freetype is None:
             freetype = elf(body=b"freetype payload")
-        if freetype_paths is None:
-            freetype_paths = FREETYPE_PATHS
+        self._freetype = freetype
+        self._wine_freetype = wine_freetype
         glibc = directory / "glibc-rootfs64.zip"
         wine = directory / "wine64.zip"
         with zipfile.ZipFile(glibc, "w") as archive:
@@ -185,9 +189,9 @@ class WineserverArchiveValidation(unittest.TestCase):
             archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
             # Wine dlopens FreeType by soname and searches both multiarch
             # paths. A BoxedWine ZIP does not interpret POSIX symlinks, so
-            # both have to be real files.
-            for path in freetype_paths:
-                archive.writestr(path, freetype)
+            # both have to be real files; this is the glibc layer's copy.
+            if glibc_freetype:
+                archive.writestr(FREETYPE_GLIBC_PATH, freetype)
             # Wine's server needs the modelled user's XDG runtime directory.
             archive.writestr("run/user/1000/", b"")
         with zipfile.ZipFile(wine, "w") as archive:
@@ -202,6 +206,10 @@ class WineserverArchiveValidation(unittest.TestCase):
         /proc/self/exe and its module root from ntdll.so's parent, so the
         loader has to live in the same tree as the modules it loads.
         """
+        # The Wine layer carries the /usr copy of the font backend.
+        if getattr(self, "_wine_freetype", True):
+            archive.writestr(FREETYPE_WINE_PATH,
+                             getattr(self, "_freetype", elf(body=b"freetype")))
         archive.writestr(ROOT + "/wine64", elf(body=b"wine64"))
         archive.writestr(ROOT + "/wineserver64", server)
         archive.writestr(ROOT + "/wineserver", wineserver_generic)
@@ -292,9 +300,8 @@ class WineserverArchiveValidation(unittest.TestCase):
             with zipfile.ZipFile(glibc, "w") as archive:
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
-                # The font backend the validator now requires at both paths.
-                for freetype_path in FREETYPE_PATHS:
-                    archive.writestr(freetype_path, elf(body=b"freetype"))
+                # The font backend the validator now requires in this layer.
+                archive.writestr(FREETYPE_GLIBC_PATH, elf(body=b"freetype"))
                 archive.writestr("run/user/1000/", b"")
             with zipfile.ZipFile(wine, "w") as archive:
                 self.write_wine_layout(archive, server, server)
@@ -414,9 +421,8 @@ class WineserverArchiveValidation(unittest.TestCase):
             with zipfile.ZipFile(glibc, "w") as archive:
                 archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
-                # The font backend the validator now requires at both paths.
-                for freetype_path in FREETYPE_PATHS:
-                    archive.writestr(freetype_path, elf(body=b"freetype"))
+                # The font backend the validator now requires in this layer.
+                archive.writestr(FREETYPE_GLIBC_PATH, elf(body=b"freetype"))
             with zipfile.ZipFile(wine, "w") as archive:
                 self.write_wine_layout(archive, server, server)
             code, output = self.run_validator(directory, glibc, wine)
@@ -501,7 +507,7 @@ class FreeTypeArchiveValidation(WineserverArchiveValidation):
             glibc, wine, _ = self.build_archives(directory, server)
             code, output = self.run_validator(directory, glibc, wine)
             self.assertEqual(code, 0, output)
-            for path in FREETYPE_PATHS:
+            for path in (FREETYPE_GLIBC_PATH, FREETYPE_WINE_PATH):
                 self.assertIn(path + " is ELF64 EM_X86_64", output)
 
     def test_a_missing_font_library_is_rejected(self) -> None:
@@ -509,23 +515,27 @@ class FreeTypeArchiveValidation(WineserverArchiveValidation):
             directory = Path(raw)
             server = elf(body=b"wineserver64 payload")
             glibc, wine, _ = self.build_archives(
-                directory, server, freetype_paths=())
+                directory, server, glibc_freetype=False, wine_freetype=False)
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0, output)
             self.assertIn("libfreetype.so.6", output)
 
-    def test_a_font_library_at_only_one_path_is_rejected(self) -> None:
-        # The shape a single staged copy produces: the guest archive has no
-        # symlink to make the other path resolve.
-        with tempfile.TemporaryDirectory() as raw:
-            directory = Path(raw)
-            server = elf(body=b"wineserver64 payload")
-            glibc, wine, _ = self.build_archives(
-                directory, server,
-                freetype_paths=("usr/lib/x86_64-linux-gnu/libfreetype.so.6",))
-            code, output = self.run_validator(directory, glibc, wine)
-            self.assertNotEqual(code, 0, output)
-            self.assertIn("lib/x86_64-linux-gnu/libfreetype.so.6", output)
+    def test_a_font_library_in_only_one_layer_is_rejected(self) -> None:
+        # The shape a single staged copy produces. The guest archive has no
+        # symlink to make the other path resolve, so each layer needs its own.
+        for glibc_has, wine_has, expected in (
+                (True, False, FREETYPE_WINE_PATH),
+                (False, True, FREETYPE_GLIBC_PATH)):
+            with self.subTest(glibc=glibc_has, wine=wine_has):
+                with tempfile.TemporaryDirectory() as raw:
+                    directory = Path(raw)
+                    server = elf(body=b"wineserver64 payload")
+                    glibc, wine, _ = self.build_archives(
+                        directory, server,
+                        glibc_freetype=glibc_has, wine_freetype=wine_has)
+                    code, output = self.run_validator(directory, glibc, wine)
+                    self.assertNotEqual(code, 0, output)
+                    self.assertIn(expected, output)
 
     def test_a_non_x86_64_font_library_is_rejected(self) -> None:
         # An ARM64 ELF passes every name check and cannot be loaded by the

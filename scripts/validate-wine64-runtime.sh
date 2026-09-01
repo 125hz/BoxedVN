@@ -332,10 +332,14 @@ check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libc.so.6
 # The ELF check is not decoration: the repository also builds a static FreeType
 # for the iOS host, and substituting that here would satisfy a name check while
 # leaving Wine's Unix side with nothing it can load.
-for freetype_path in     lib/x86_64-linux-gnu/libfreetype.so.6     usr/lib/x86_64-linux-gnu/libfreetype.so.6; do
-    check_zip_path "${GLIBC_ARCHIVE}" "${freetype_path}"
-    check_zip_entry_elf64_x86_64 "${GLIBC_ARCHIVE}" "${freetype_path}"
-done
+#
+# The two paths land in DIFFERENT archives, because the builder partitions the
+# stage by top-level directory: lib64/lib/etc/tmp/run/home/var go to the glibc
+# layer and usr/root to the Wine layer. Both are extracted into the same guest
+# root, so the guest sees both paths -- but each has to be checked against the
+# archive that actually carries it.
+check_zip_path "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libfreetype.so.6
+check_zip_entry_elf64_x86_64 "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libfreetype.so.6
 # Wine puts its server socket directory in the modelled user's XDG runtime
 # directory. The rootfs has to ship it; BoxedWine's permission policy is what
 # makes it writable, because ZIP entries carry no Unix mode.
@@ -348,6 +352,8 @@ check_zip_path "${GLIBC_ARCHIVE}" run/user/1000
 # "could not load kernel32.dll, status c0000135" with kernel32.dll present in
 # this archive the whole time.
 WINE_MODULE_ROOT=usr/lib/x86_64-linux-gnu/wine
+check_zip_path "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/libfreetype.so.6
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" usr/lib/x86_64-linux-gnu/libfreetype.so.6
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wine64"
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver64"
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/wineserver"
