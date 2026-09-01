@@ -347,6 +347,41 @@ check_zip_entry_elf64_x86_64 "${GLIBC_ARCHIVE}" lib/x86_64-linux-gnu/libfreetype
 # configuration is the regression this guards.
 check_zip_path "${GLIBC_ARCHIVE}" etc/fonts/fonts.conf
 
+# Not merely present: parseable. A device run reported "out of memory" at both
+# <include> lines of fonts.conf and then refused the whole file. Fontconfig
+# reports a parse failure that way, and the shape that produces it here is a
+# guest link's target text sitting where an XML file should be -- BoxedWine
+# writes links as a `.link` file whose contents are the target path, and a
+# tree that was meant to be materialised but was not looks exactly like that.
+check_zip_entry_is_xml() {
+    local archive="$1"
+    local path="$2"
+    local head
+    head="$(unzip -p "${archive}" "${path}" 2>/dev/null | head -c 512 | tr -d '\r')"
+    [[ -n "${head}" ]] \
+        || die "'${path}' in $(basename "${archive}") is empty."
+    case "${head}" in
+        '<?xml'*|'<fontconfig'*|'<!--'*|'<!DOCTYPE'*) ;;
+        *) die "'${path}' in $(basename "${archive}") does not begin as an XML document.\nA guest link's target text is not a configuration file; fontconfig reports that as a parse failure and then loads nothing." ;;
+    esac
+    ok "$(basename "${archive}"): ${path} is XML"
+}
+check_zip_entry_is_xml "${GLIBC_ARCHIVE}" etc/fonts/fonts.conf
+# fonts.conf includes conf.d; an empty include is the other half of the same
+# failure and is silent from the guest side.
+fontconfig_confd_count="$({ unzip -Z1 "${GLIBC_ARCHIVE}" 'etc/fonts/conf.d/*.conf' 2>/dev/null || true; } | wc -l | tr -d ' ')"
+(( fontconfig_confd_count > 0 )) \
+    || die "'$(basename "${GLIBC_ARCHIVE}")' carries no etc/fonts/conf.d/*.conf entries.\nfonts.conf includes that directory; an empty include leaves fontconfig with no configuration."
+while IFS= read -r conf_entry; do
+    [[ -n "${conf_entry}" ]] || continue
+    check_zip_entry_is_xml "${GLIBC_ARCHIVE}" "${conf_entry}"
+done < <({ unzip -Z1 "${GLIBC_ARCHIVE}" 'etc/fonts/conf.d/*.conf' 2>/dev/null || true; } | sed 's#^\./##')
+# A guest link anywhere under the configuration tree is the failure itself.
+if unzip -Z1 "${GLIBC_ARCHIVE}" | sed 's#^\./##' | grep -q '^etc/fonts/.*\.link$'; then
+    die "'$(basename "${GLIBC_ARCHIVE}")' stores guest links under etc/fonts. Fontconfig cannot follow them."
+fi
+ok "$(basename "${GLIBC_ARCHIVE}"): ${fontconfig_confd_count} fontconfig conf.d files"
+
 # The X11 client libraries winex11.so links against directly. Without them the
 # user driver cannot load, the process has no desktop window, and every
 # CreateWindowEx fails with ERROR_INVALID_WINDOW_HANDLE.
@@ -391,7 +426,7 @@ check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" \
 # version -- Ubuntu's fonts-wine 9.0 has vgasys.fon but no vgaoem.fon, and a
 # hard-coded list is a guess about someone else's packaging that fails the
 # build for the wrong reason. What matters is that the directory is populated.
-wine_font_count="$(unzip -Z1 "${WINE_ARCHIVE}" 'usr/share/wine/fonts/*.fon' 2>/dev/null | wc -l | tr -d ' ')"
+wine_font_count="$({ unzip -Z1 "${WINE_ARCHIVE}" 'usr/share/wine/fonts/*.fon' 2>/dev/null || true; } | wc -l | tr -d ' ')"
 (( wine_font_count >= 8 ))     || die "'$(basename "${WINE_ARCHIVE}")' carries ${wine_font_count} Wine bitmap fonts under usr/share/wine/fonts.
 Wine draws a window's non-client area with these; install the distro's Wine font package before assembling the runtime."
 ok "$(basename "${WINE_ARCHIVE}"): ${wine_font_count} Wine bitmap fonts"

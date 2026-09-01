@@ -315,12 +315,10 @@ diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/In
 diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
 --- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
-@@ -44,8 +44,38 @@
- }
-
+@@ -46,6 +46,36 @@
  DEF_OP(ExitFunction) {
    auto Op = IROp->C<IR::IROp_ExitFunction>();
-+
+
 +  /* BoxedWine: make a guest CALL's architectural return slot authoritative at
 +   * the point where the call leaves its translated block.
 +   *
@@ -350,7 +348,7 @@ diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/In
 +                            ReturnAddress, GuestStack);
 +    }
 +  }
-
++
    ResetStack();
 
    if (CTX->HostFeatures.IsInstCountCI) [[unlikely]] {
@@ -392,7 +390,15 @@ diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/In
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
-@@ -541,6 +541,11 @@
+@@ -59,6 +59,7 @@
+
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <atomic>
+ #include <chrono>
+ #include <cstring>
+@@ -541,6 +542,11 @@
      memcpy(&Thread->CurrentFrame->State, NewThreadState, sizeof(FEXCore::Core::CPUState));
    }
 
@@ -404,7 +410,7 @@ diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/C
    // Set up the thread manager state
    Thread->CurrentFrame->Thread = Thread;
 
-@@ -1432,15 +1437,57 @@
+@@ -1432,15 +1438,73 @@
  namespace {
  std::atomic<uint32_t> BoxedWineNullExitReports {0};
  constexpr uint32_t BoxedWineNullExitReportLimit = 8;
@@ -439,11 +445,27 @@ diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/C
 +    if (Record.Sequence == 0) {
 +      continue;
 +    }
++    /* What the slot holds NOW, beside what the CALL stored in it.
++     *
++     * A device run settled the first question and opened the next one: across
++     * 617,677 recorded calls the read-back matched every time, anomalies were
++     * zero, and the record for the very slot the failing RET popped shows the
++     * push landing correctly. The push is exonerated. So the slot was written
++     * again between the CALL and the RET, and what is needed now is which
++     * slots that happened to -- one, or a whole region.
++     *
++     * The address was read successfully once already, at the push, so reading
++     * it again here is as safe as that was; a slot whose page has since gone
++     * away would fault, which is why this is confined to the failure path and
++     * bounded by the dump limit above. */
++    const uint64_t Current = Record.SlotHost ? *reinterpret_cast<const uint64_t*>(Record.SlotHost) : 0;
 +    LogMan::Msg::EFmt("BOXEDWINE_FEX64_CALL_RECORD seq={} source_block={:#x} intended_return={:#x} "
-+                      "slot_guest={:#x} slot_host={:#x} readback={:#x} match={} stack_before={:#x} "
-+                      "value_size={} overlap_src_addr={} overlap_src_dst={} value_copied={}",
++                      "slot_guest={:#x} slot_host={:#x} readback={:#x} match={} current={:#x} "
++                      "intact={} stack_before={:#x} value_size={} overlap_src_addr={} "
++                      "overlap_src_dst={} value_copied={}",
 +                      Record.Sequence, Record.SourceBlock, Record.IntendedReturn, Record.SlotGuest, Record.SlotHost,
-+                      Record.Readback, Record.Readback == Record.IntendedReturn ? 1 : 0, Record.StackBefore,
++                      Record.Readback, Record.Readback == Record.IntendedReturn ? 1 : 0, Current,
++                      Current == Record.IntendedReturn ? 1 : 0, Record.StackBefore,
 +                      Record.Info & 0xFF, (Record.Info >> 8) & 1, (Record.Info >> 9) & 1, (Record.Info >> 10) & 1);
 +  }
 +}
@@ -463,10 +485,36 @@ diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/C
      return;
    }
    if (BoxedWineNullExitReports.fetch_add(1, std::memory_order_relaxed) >= BoxedWineNullExitReportLimit) {
-@@ -1477,6 +1524,10 @@
+@@ -1477,6 +1541,36 @@
                      PoppedSlot, GuestToHostAddress(PoppedSlot), GuestRBP, GuestToHostAddress(GuestRBP), GuestRBP + 8,
                      GuestToHostAddress(GuestRBP + 8), CachedGuest == GuestRIP ? "l1-null-host" : "l1-miss",
                      BoxedWineNullExitReports.load(std::memory_order_relaxed));
++
++  /* A window of the guest stack around the slot the return consumed, so a
++   * single zeroed qword is distinguishable from a zeroed region.
++   *
++   * One qword means something wrote through that address specifically. A run
++   * of them means a block write -- a memset, a signal frame, or a copy with
++   * the wrong length -- landed across the live stack. The two need different
++   * fixes, and nothing recorded so far separates them. */
++  if (PoppedSlot) {
++    const uint64_t WindowBase = PoppedSlot - 32;
++    char Window[512];
++    size_t Used = 0;
++    for (int Index = 0; Index < 9 && Used + 48 < sizeof(Window); ++Index) {
++      const uint64_t Slot = WindowBase + (uint64_t)Index * 8;
++      const uint64_t Host = GuestToHostAddress(Slot);
++      const int Written =
++        snprintf(Window + Used, sizeof(Window) - Used, "%s%+d:%#llx", Index ? " " : "", (Index - 4) * 8,
++                 (unsigned long long)*reinterpret_cast<const uint64_t*>(Host));
++      if (Written <= 0) {
++        break;
++      }
++      Used += (size_t)Written;
++    }
++    LogMan::Msg::EFmt("BOXEDWINE_FEX64_NULL_EXIT_WINDOW popped_slot={:#x} host={:#x} qwords=[{}]", PoppedSlot,
++                      GuestToHostAddress(PoppedSlot), Window);
++  }
 +
 +  /* And the CALL that was supposed to have written the slot this return
 +   * consumed. Bounded, and only reached because a return already failed. */
@@ -474,7 +522,7 @@ diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/C
  }
 
  uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
-@@ -1616,8 +1667,23 @@
+@@ -1616,8 +1710,23 @@
     * blocks before SEH unwinds. Returning 0 here raises C0000005 to the
     * guest immediately so the first AV is the only AV. */
    if (GuestRIP < 0x10000) {
@@ -544,7 +592,7 @@ diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/S
  #endif
    };
 
-@@ -454,11 +475,32 @@
+@@ -454,9 +475,30 @@
        FillStaticRegs();
      });
 
@@ -575,5 +623,3 @@ diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/S
 +
    {
      (void)Bind(&CompileSingleStep);
-
-     EmitSignalGuardedRegion([&]() {

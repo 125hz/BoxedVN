@@ -2488,6 +2488,18 @@ def main() -> None:
         ],
         "BoxedVN CALL ring dump",
     )
+    # A device run settled the first question: across 617,677 recorded calls
+    # the read-back matched every time and anomalies were zero, including for
+    # the very slot the failing RET popped. The push is exonerated, so the
+    # witness now has to say what the slot holds AT THE FAILURE and whether a
+    # neighbouring region went with it -- one zeroed qword and a zeroed run
+    # need different fixes.
+    for field in ("current=", "intact=", "BOXEDWINE_FEX64_NULL_EXIT_WINDOW",
+                  "qwords="):
+        if field not in call_witness_patch:
+            raise SystemExit(
+                "the CALL witness must report " + field
+            )
     for reason in ('"null-exit-target"', '"compile-low-rip"'):
         if reason not in call_witness_patch:
             raise SystemExit(

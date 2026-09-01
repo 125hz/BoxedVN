@@ -58,6 +58,13 @@ X11_CORE_LIBS = ("libX11.so.6", "libXext.so.6")
 # Fontconfig loads without its configuration and then reports that it cannot
 # load a default config file, which leaves Wine with no usable font backend.
 FONTCONFIG_PATH = "etc/fonts/fonts.conf"
+# fonts.conf includes conf.d. That directory is symlinks on the runner and
+# has to reach the archive materialised as real XML: a guest link's target
+# text sitting there is what fontconfig reports as a parse failure, which is
+# the shape a device run produced at both <include> lines.
+FONTCONFIG_CONFD = tuple(
+    f"etc/fonts/conf.d/{index:02d}-boxedvn.conf" for index in (10, 20, 30))
+FONTCONFIG_XML = b'<?xml version="1.0"?>\n<fontconfig></fontconfig>\n'
 # Wine's own bitmap fonts, which the non-client area of a window is drawn with.
 # The validator counts rather than names them: which .fon files a distro ships
 # varies by package version, and a hard-coded list fails the build for the
@@ -207,7 +214,9 @@ class WineserverArchiveValidation(unittest.TestCase):
             # both have to be real files; this is the glibc layer's copy.
             if glibc_freetype:
                 archive.writestr(FREETYPE_GLIBC_PATH, freetype)
-            archive.writestr(FONTCONFIG_PATH, b"<fontconfig/>\n")
+            archive.writestr(FONTCONFIG_PATH, FONTCONFIG_XML)
+            for fontconfig_conf in FONTCONFIG_CONFD:
+                archive.writestr(fontconfig_conf, FONTCONFIG_XML)
             for x11_lib in X11_CORE_LIBS:
                 archive.writestr("lib/x86_64-linux-gnu/" + x11_lib, elf())
             # Wine's server needs the modelled user's XDG runtime directory.
@@ -328,7 +337,9 @@ class WineserverArchiveValidation(unittest.TestCase):
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
                 # What the validator now requires in this layer.
                 archive.writestr(FREETYPE_GLIBC_PATH, elf(body=b"freetype"))
-                archive.writestr(FONTCONFIG_PATH, b"<fontconfig/>\n")
+                archive.writestr(FONTCONFIG_PATH, FONTCONFIG_XML)
+                for fontconfig_conf in FONTCONFIG_CONFD:
+                    archive.writestr(fontconfig_conf, FONTCONFIG_XML)
                 for x11_lib in X11_CORE_LIBS:
                     archive.writestr("lib/x86_64-linux-gnu/" + x11_lib, elf())
                 archive.writestr("run/user/1000/", b"")
@@ -452,7 +463,9 @@ class WineserverArchiveValidation(unittest.TestCase):
                 archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
                 # What the validator now requires in this layer.
                 archive.writestr(FREETYPE_GLIBC_PATH, elf(body=b"freetype"))
-                archive.writestr(FONTCONFIG_PATH, b"<fontconfig/>\n")
+                archive.writestr(FONTCONFIG_PATH, FONTCONFIG_XML)
+                for fontconfig_conf in FONTCONFIG_CONFD:
+                    archive.writestr(fontconfig_conf, FONTCONFIG_XML)
                 for x11_lib in X11_CORE_LIBS:
                     archive.writestr("lib/x86_64-linux-gnu/" + x11_lib, elf())
             with zipfile.ZipFile(wine, "w") as archive:
@@ -632,6 +645,56 @@ class WindowDriverPackaging(WineserverArchiveValidation):
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0, output)
             self.assertIn("winex11", output)
+
+    def test_a_conf_d_holding_link_text_is_rejected(self) -> None:
+        # The exact failure shape a device run produced: fontconfig reported
+        # "out of memory" at both <include> lines of fonts.conf and then
+        # refused the file. A guest link's target text where XML belongs
+        # parses as neither, and nothing before this noticed.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.replace_in_archive(glibc, FONTCONFIG_CONFD[0],
+                                    b"/usr/share/fontconfig/conf.avail/10-x.conf")
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("XML document", output)
+
+    def test_an_empty_conf_d_is_rejected(self) -> None:
+        # The other half of the same failure: fonts.conf includes a directory
+        # that has nothing in it, which is silent from the guest side.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            for conf in FONTCONFIG_CONFD:
+                self.strip_from_archive(glibc, conf)
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("conf.d", output)
+
+    def test_a_guest_link_under_the_font_config_tree_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            with zipfile.ZipFile(glibc, "a") as archive:
+                archive.writestr("etc/fonts/conf.d/99-link.conf.link",
+                                 b"/usr/share/fontconfig/conf.avail/99.conf")
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("guest links", output)
+
+    @staticmethod
+    def replace_in_archive(path: Path, entry: str, payload: bytes) -> None:
+        with zipfile.ZipFile(path) as source:
+            kept = [(item, payload if item.filename == entry
+                     else source.read(item.filename))
+                    for item in source.infolist()]
+        with zipfile.ZipFile(path, "w") as target:
+            for item, data in kept:
+                target.writestr(item, data)
 
     def test_a_missing_fontconfig_configuration_is_rejected(self) -> None:
         # Fontconfig loading with no default config is the exact shape a

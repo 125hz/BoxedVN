@@ -367,6 +367,45 @@ else
 fi
 [[ -s "${STAGE}/etc/fonts/fonts.conf" ]] \
     || die "The staged fontconfig tree has no fonts.conf."
+# Every configuration file has to be XML, not the text of a link target.
+#
+# A device run reported "out of memory" from fontconfig at the two <include>
+# lines of fonts.conf and then "Cannot load config file". Fontconfig reports a
+# parse failure that way, so the interesting question is what those includes
+# actually resolve to inside the guest. /etc/fonts/conf.d is a directory of
+# symlinks on the runner; if any of them reached the archive as a small file
+# containing its target path rather than the file it names, fontconfig would
+# read that text, fail to parse it, and say exactly this.
+#
+# Checked here rather than assumed: a .conf that does not parse fails the
+# build, and the count is logged so an empty conf.d is visible too.
+require_command python3
+staged_conf_total=0
+while IFS= read -r conf_file; do
+    staged_conf_total=$((staged_conf_total + 1))
+    python3 - "${conf_file}" <<'FONTCONFIG_XML_CHECK' \
+        || die "Staged fontconfig file '${conf_file}' is not parseable XML. A guest link's target text is not a configuration file."
+import sys
+import xml.etree.ElementTree as ET
+path = sys.argv[1]
+try:
+    ET.parse(path)
+except Exception as error:  # noqa: BLE001 - the message is the diagnostic
+    sys.stderr.write("not XML: {}: {}\n".format(path, error))
+    raise SystemExit(1)
+FONTCONFIG_XML_CHECK
+done < <(find "${STAGE}/etc/fonts" -type f -name '*.conf')
+(( staged_conf_total > 0 )) \
+    || die "The staged fontconfig tree contains no .conf files at all."
+staged_confd_count="$(find "${STAGE}/etc/fonts/conf.d" -type f -name '*.conf' 2>/dev/null | wc -l | tr -d ' ')"
+(( staged_confd_count > 0 )) \
+    || die "The staged /etc/fonts/conf.d is empty. fonts.conf includes that directory, and an empty include is what a materialised symlink tree looks like when it did not materialise."
+# No .link entries may exist under the configuration tree: BoxedWine reads that
+# suffix as a guest symlink, and fontconfig would never see a file at all.
+if find "${STAGE}/etc/fonts" -name '*.link' -print -quit | grep -q .; then
+    die "The staged fontconfig tree contains guest link entries. Fontconfig cannot follow them; materialise the files instead."
+fi
+log "Fontconfig configuration staged: ${staged_conf_total} files, ${staged_confd_count} in conf.d"
 if [[ -d /usr/share/fontconfig ]]; then
     mkdir -p "${STAGE}/usr/share"
     cp -aL /usr/share/fontconfig "${STAGE}/usr/share/"
