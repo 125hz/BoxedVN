@@ -110,6 +110,20 @@ The pin moved or upstream fixed this. Re-cut the patch deliberately."
     ok "applied patch: $1"
 }
 
+# Start from the pristine pin every time. The CI cache restores this tree
+# with every patch already applied, and the per-patch "already applied"
+# reverse check cannot recognise an earlier patch once a later one has
+# touched the same hunks: a run that restored a fully patched tree stopped at
+# "fex-boxedwine-block-diagnostics.patch no longer applies" although nothing
+# about the pin or the patch had changed. No patch creates a file, so
+# restoring the tracked files to the pinned commit is a complete reset; the
+# build directory is separate and only the patched sources rebuild.
+if ! git -C "${SOURCE}" diff --quiet 2>/dev/null; then
+    log "FEX sources carry local changes; restoring the pinned tree before patching"
+    git -C "${SOURCE}" checkout --quiet -- . \
+        || die "could not restore the pinned FEX sources in ${SOURCE}"
+fi
+
 apply_patch fex-ios-host-diagnostics-guard.patch
 apply_patch fex-ios-caspal-diagnostic-host.patch
 apply_patch fex-boxedwine-block-diagnostics.patch
