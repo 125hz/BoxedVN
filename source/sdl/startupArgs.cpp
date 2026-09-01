@@ -123,6 +123,44 @@ static bool guestUsesFex64(const std::vector<BString>& envValues) {
 // into system32 as guest links before any process starts. This is an in-memory
 // union: a real prefix file is never replaced, and the packaged module remains
 // the single backing copy.
+// Project DXMT's Wine-builtin modules over the packaged Wine module root.
+//
+// The DXMT DLLs carry Wine's builtin marker so winemetal.dll can reach its
+// winemetal.so through __wine_unix_call. Wine treats a builtin-marked PE found
+// anywhere but its module tree as a stale installed copy and loads its own
+// builtin of that name instead: a device run found d3d11.dll and dxgi.dll
+// beside the executable, resolved wined3d and opengl32, and never looked for
+// winemetal.dll, so D3D11CreateDevice failed with DXGI_ERROR_UNSUPPORTED.
+//
+// Replacing the module-root entries makes DXMT the builtin. The packaged
+// archive is untouched: this is the same in-memory union the system32
+// projection uses, applied after it so the system32 links, which name the
+// module-root guest paths, resolve to the DXMT copies as well.
+static void overlayX64WineModules(const BString& overlayDir) {
+    std::shared_ptr<FsNode> peDir =
+        Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_PE_DIR), true);
+    if (!peDir || !peDir->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY dir=%s status=no-module-root",
+                 overlayDir.c_str());
+        return;
+    }
+    for (const std::string& name : boxedvn::x64DxmtModuleNames()) {
+        const BString sourcePath = overlayDir + "/" + name.c_str();
+        std::shared_ptr<FsNode> source =
+            Fs::getNodeFromLocalPath(B(""), sourcePath, true);
+        if (!boxedvn::shouldOverlayX64WineModule(
+                source != nullptr, source && source->isDirectory())) {
+            klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY name=%s source=%s status=missing",
+                     name.c_str(), sourcePath.c_str());
+            continue;
+        }
+        const BString destination = B(K_X64_WINE_PE_DIR) + "/" + name.c_str();
+        Fs::addFileNode(destination, B(""), source->nativePath, false, peDir);
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY name=%s source=%s destination=%s status=projected",
+                 name.c_str(), sourcePath.c_str(), destination.c_str());
+    }
+}
+
 static void projectX64WineSystemModules(const BString& winePrefix) {
     const BString system32 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
                              K_GUEST_WINE_WINDOWS "/" K_GUEST_WINE_SYSTEM32;
@@ -460,6 +498,10 @@ std::vector<BString> StartUpArgs::buildArgs() {
     }
     args.push_back(B("-dxvk"));
     args.push_back(B(this->enableDXVK ? "1" : "0"));
+    if (!this->x64ModuleOverlayPath.isEmpty()) {
+        args.push_back(B("-x64modules"));
+        args.push_back(this->x64ModuleOverlayPath);
+    }
     if (this->disableHideCursor) {
         args.push_back(B("-disableHideCursor"));
     }
@@ -731,6 +773,9 @@ bool StartUpArgs::apply() {
     }
     if (requestedFEX64) {
         projectX64WineSystemModules(winePrefix);
+        if (!this->x64ModuleOverlayPath.isEmpty()) {
+            overlayX64WineModules(this->x64ModuleOverlayPath);
+        }
         // The guest ld-linux resolves winex11.so's libX11/libXext through
         // LD_LIBRARY_PATH before the multiarch directories. Put BoxedWine's
         // own x86-64 X11 client libraries first so the driver binds to the
@@ -1250,6 +1295,10 @@ bool StartUpArgs::parseStartupArgs(int argc, const char **argv) {
                 return false;
             }
             this->interpreterRanges.emplace_back(start, end);
+            i++;
+        }
+        else if (!strcmp(argv[i], "-x64modules")) {
+            this->x64ModuleOverlayPath = argv[i + 1];
             i++;
         }
         else if (!strcmp(argv[i], "-dxvk")) {

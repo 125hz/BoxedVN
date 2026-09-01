@@ -115,6 +115,10 @@ public:
 
     BString ddrawOverridePath;
     bool enableDXVK = false;
+    // A guest directory holding DXMT's Wine-builtin modules. For an x86-64
+    // launch they are projected over the Wine module root so Wine loads them
+    // as its d3d11, dxgi and d3d10core builtins with winemetal beside them.
+    BString x64ModuleOverlayPath;
     bool disableHideCursor = false;
     bool forceRelativeMouse = false;
     bool cacheReads = false;

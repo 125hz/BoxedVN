@@ -569,6 +569,16 @@ std::vector<std::string> BVNBuildLaunchArguments(
             argv.push_back("-env");
             argv.push_back(boxedvn::guestLibraryPathAssignment());
         }
+        // The DXMT modules are staged beside the program, in its working
+        // directory, but Wine will not load a builtin-marked PE from there:
+        // it treats one as a stale installed copy and loads its own builtin
+        // of that name, which is how a device run ended up in wined3d with
+        // DXGI_ERROR_UNSUPPORTED. Name the directory so the guest projects
+        // those modules over the Wine module root before Wine starts.
+        if (launch.useDXMT && !launch.workingDirectory.empty()) {
+            argv.push_back("-x64modules");
+            argv.push_back(launch.workingDirectory);
+        }
     }
     for (const std::string& entry : launch.environment) {
         argv.push_back("-env");

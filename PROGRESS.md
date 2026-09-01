@@ -5184,3 +5184,37 @@ saturation, CF/ZF/SF/OF), covered by ten host tests including the exact
 strcmp, strcspn, strspn and strstr immediates glibc uses. 471 host tests
 pass. The X11 bridge itself is still unproven on a device; the acceptance
 markers from the previous note stand.
+
+
+---
+
+### DXMT modules at the Wine module root
+
+Logs 174949 and 175206 at 9a226202 are the first device runs through the
+x86-64 X11 bridge: libX11 opened from `/usr/lib/boxedwine64-x11`, no X11
+connect, `init-threads`, three `open-display` results per process, explorer
+creating its desktop windows, the probe's CreateWindowExW succeeding
+(hwnd=0x20050), `map-window`, and `d3d11-create begin`. Both then fail with
+`hr=0x887a0004` (DXGI_ERROR_UNSUPPORTED). The module-search trace shows why:
+Wine found d3d11.dll and dxgi.dll beside the executable but resolved the
+import chain of its own d3d11 (wined3d, opengl32, then a search for
+libvulkan and libGL) and never looked for winemetal.dll. The DXMT DLLs are
+built with Wine's builtin marker (`-Dwine_builtin_dll=true`, which is what
+lets winemetal.dll reach winemetal.so), and Wine treats a builtin-marked PE
+outside its module tree as a stale installed copy and loads its own builtin
+of that name.
+
+A DXMT launch now passes `-x64modules <dir>`; before Wine starts, the guest
+projects d3d11.dll, dxgi.dll, d3d10core.dll and winemetal.dll from that
+directory over `/usr/lib/x86_64-linux-gnu/wine/x86_64-windows` with the same
+in-memory union the system32 projection uses, and reports each with
+`BOXEDWINE_X64_MODULE_OVERLAY`. The packaged archive is untouched and a
+plain FEX64 launch projects nothing. Two bounded named gaps were reported by
+the bridge on the way (XShapeCombineRectangles, XShmCreateImage); neither is
+on the window path. Log 175129 ended without diagnostics after explorer's
+second window, which reads as a host-side crash and is not yet understood.
+
+Next device evidence: `BOXEDWINE_X64_MODULE_OVERLAY ... status=projected`
+for all four names, a winemetal.dll search after d3d11-create begins, the
+first `BOXEDWINE_DXMT_CALL` lines, and then whatever D3D11CreateDevice
+reports.

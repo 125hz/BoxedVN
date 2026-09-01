@@ -576,6 +576,42 @@ BOXEDVN_TEST(fex64_launch_keeps_a_caller_supplied_library_path) {
                     "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11") == actual.end());
 }
 
+BOXEDVN_TEST(a_dxmt_launch_names_its_module_directory_for_the_module_root_overlay) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\.boxedvn-x64-diagnostics\\probe.exe";
+    launch.workingDirectory = "/mnt/drive_d/.boxedvn-x64-diagnostics";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    launch.useDXMT = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const auto option = std::find(actual.begin(), actual.end(), "-x64modules");
+    CHECK(option != actual.end());
+    if (option != actual.end() && option + 1 != actual.end()) {
+        CHECK_EQ(*(option + 1), std::string("/mnt/drive_d/.boxedvn-x64-diagnostics"));
+    }
+    // The working directory is still passed on its own; the overlay does
+    // not replace it.
+    CHECK(std::find(actual.begin(), actual.end(), "-w") != actual.end());
+}
+
+BOXEDVN_TEST(a_plain_fex64_launch_projects_no_module_overlay) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\game.exe";
+    launch.workingDirectory = "/mnt/drive_d";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::find(actual.begin(), actual.end(), "-x64modules") == actual.end());
+}
+
 BOXEDVN_TEST(a_32bit_launch_does_not_get_the_x64_library_path) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs.zip";

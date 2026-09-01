@@ -70,6 +70,18 @@
 #define K_X64_GUEST_X11_LIB_DIR "/usr/lib/boxedwine64-x11"
 #define K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT "LD_LIBRARY_PATH=" K_X64_GUEST_X11_LIB_DIR
 
+// The DXMT modules are built as Wine builtins (their DOS stub carries Wine's
+// builtin marker so winemetal.dll can bind to winemetal.so through
+// __wine_unix_call). Wine treats a builtin-marked PE found outside its module
+// tree as a stale installed copy and loads its own builtin of that name
+// instead: a device run found d3d11.dll and dxgi.dll beside the executable,
+// then resolved the import chain of Wine's wined3d-backed d3d11 and never
+// looked for winemetal.dll. The modules therefore have to be presented at the
+// module root, over Wine's own d3d11, dxgi and d3d10core, with winemetal
+// beside them. These are the names the overlay projects.
+#define K_X64_DXMT_MODULE_COUNT 4
+#define K_X64_DXMT_MODULE_NAMES {"d3d11.dll", "dxgi.dll", "d3d10core.dll", "winemetal.dll"}
+
 // The builtin whose absence is the failure this layout exists to prevent. It
 // is the first PE module Wine loads after the server handshake, so a guest
 // that cannot see this file gets as far as Windows code and no further.
@@ -128,6 +140,21 @@ inline bool environmentSetsLibraryPath(
 // than to the distro libX11 that tries to open an X socket.
 inline std::string guestLibraryPathAssignment() {
     return K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT;
+}
+
+// The DXMT module names, in the order they are projected over the module
+// root. Every name is a Wine builtin the DXMT copy must replace, except
+// winemetal.dll, which Wine does not ship and which binds to the packaged
+// winemetal.so once it is a module-root builtin.
+inline std::vector<std::string> x64DxmtModuleNames() {
+    return K_X64_DXMT_MODULE_NAMES;
+}
+
+// Only a real file is projected over a module-root builtin; a directory or a
+// missing source leaves Wine's own module in place so the launch still has a
+// (non-DXMT) Direct3D rather than none.
+inline bool shouldOverlayX64WineModule(bool sourceExists, bool sourceIsDirectory) {
+    return sourceExists && !sourceIsDirectory;
 }
 
 // True when the first bytes of a guest file are a PE image signature. Passed

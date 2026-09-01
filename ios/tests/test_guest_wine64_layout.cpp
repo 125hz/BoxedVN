@@ -8,6 +8,7 @@
 #include "dll_search_trace.h"
 #include "guest_wine64_layout.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,21 @@ BOXEDVN_TEST(wine64_layout_puts_the_bridge_x11_libraries_first_on_the_library_pa
     // directory the distro libraries live in, so those stay reachable.
     CHECK(std::string(K_X64_GUEST_X11_LIB_DIR).find("x86_64-linux-gnu") ==
           std::string::npos);
+}
+
+BOXEDVN_TEST(wine64_layout_projects_the_dxmt_modules_over_the_module_root) {
+    const std::vector<std::string> names = boxedvn::x64DxmtModuleNames();
+    CHECK_EQ(names.size(), (size_t)K_X64_DXMT_MODULE_COUNT);
+    // Wine's own d3d11, dxgi and d3d10core must be replaced, and winemetal
+    // has to sit beside them to bind to the packaged winemetal.so.
+    for (const char* expected : {"d3d11.dll", "dxgi.dll", "d3d10core.dll", "winemetal.dll"}) {
+        CHECK(std::find(names.begin(), names.end(), std::string(expected)) != names.end());
+    }
+    // Only a real file replaces a builtin; a missing or directory source
+    // leaves Wine's module in place.
+    CHECK(boxedvn::shouldOverlayX64WineModule(true, false));
+    CHECK(!boxedvn::shouldOverlayX64WineModule(false, false));
+    CHECK(!boxedvn::shouldOverlayX64WineModule(true, true));
 }
 
 BOXEDVN_TEST(wine64_preflight_accepts_only_a_complete_mz_signature) {
