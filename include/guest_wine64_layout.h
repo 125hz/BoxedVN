@@ -61,6 +61,15 @@
 // directory would make it search for x86_64-windows/x86_64-windows.
 #define K_X64_WINE_DLL_PATH_ASSIGNMENT "WINEDLLPATH=" K_X64_WINE_MODULE_ROOT
 
+// The x86-64 X11 client libraries BoxedWine ships in place of the distro
+// ones. winex11.so links libX11.so.6 and libXext.so.6 by DT_NEEDED and the
+// guest's own ld-linux resolves them, so WINEDLLPATH (which names Wine
+// module roots) has no say. LD_LIBRARY_PATH is what ld-linux consults first,
+// and this directory goes at its head for a 64-bit launch. The distro
+// libraries stay where they are; they are simply found second.
+#define K_X64_GUEST_X11_LIB_DIR "/usr/lib/boxedwine64-x11"
+#define K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT "LD_LIBRARY_PATH=" K_X64_GUEST_X11_LIB_DIR
+
 // The builtin whose absence is the failure this layout exists to prevent. It
 // is the first PE module Wine loads after the server handshake, so a guest
 // that cannot see this file gets as far as Windows code and no further.
@@ -97,6 +106,28 @@ inline bool environmentSetsWineDllPath(
 // The value BoxedVN supplies when the caller did not.
 inline std::string wineDllPathAssignment() {
     return K_X64_WINE_DLL_PATH_ASSIGNMENT;
+}
+
+// LD_LIBRARY_PATH follows the same rule: a caller that set one keeps it.
+inline bool isLibraryPathAssignment(const std::string& entry) {
+    return entry.rfind("LD_LIBRARY_PATH=", 0) == 0;
+}
+
+inline bool environmentSetsLibraryPath(
+    const std::vector<std::string>& environment) {
+    for (const std::string& entry : environment) {
+        if (isLibraryPathAssignment(entry)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The library path a 64-bit launch gets when the caller supplied none: the
+// BoxedWine X11 client libraries first, so winex11.so binds to them rather
+// than to the distro libX11 that tries to open an X socket.
+inline std::string guestLibraryPathAssignment() {
+    return K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT;
 }
 
 // True when the first bytes of a guest file are a PE image signature. Passed

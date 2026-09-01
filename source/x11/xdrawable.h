@@ -42,6 +42,10 @@ public:
 	int copy(KThread* thread, const std::shared_ptr<XGC>& gc, const std::shared_ptr<XDrawable>& src, S32 srcX, S32 srcY, U32 width, U32 height, S32 dstX, S32 dstY);
 
 	int copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height);
+	// Same transfer from a host buffer the caller has already copied out of
+	// guest memory. The x86-64 bridge validates and copies the image bytes
+	// through KMemory64 first; nothing here dereferences a guest pointer.
+	int copyHostImageData(const std::shared_ptr<XGC>& gc, const U8* src, U32 srcLength, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height);
 
 	U32 getImage(KThread* thread, S32 x, S32 y, U32 width, U32 height, U32 planeMask, U32 format, U32 redMask, U32 greenMask, U32 blueMask);
 

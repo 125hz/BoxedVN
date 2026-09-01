@@ -24,6 +24,8 @@
 #endif
 #include "krandom.h"
 #include "boxedwine_x64_hostcall.h"
+#include "boxedwine_x64_x11_bridge.h"
+#include "../x11/x11bridge64.h"
 #include "kevent.h"
 #include "ksocket.h"
 #include <thread>   // std::this_thread::yield() for sched_yield
@@ -3386,6 +3388,7 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
 static const char* x64SyscallName(U64 nr) {
 #ifdef BOXEDWINE_GUEST_X64
     if (nr == BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL) return "boxedwine_dxmt_unix_call";
+    if (nr == BOXEDWINE_X64_HOSTCALL_X11_BRIDGE) return "boxedwine_x11_bridge";
 #endif
 #ifdef BOXEDWINE_OPENGL
     if (nr == GL64_SYSCALL_NR) return "gl64_trap";
@@ -3671,6 +3674,11 @@ void ksyscall64(CPU64* cpu) {
         case BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL:
             // RDI = DXMT unix-call index, RSI = identity-mapped args block.
             ret = boxedwineDxmtUnixCall64(cpu, a1, a2);
+            break;
+        case BOXEDWINE_X64_HOSTCALL_X11_BRIDGE:
+            // The x86-64 guest libX11 shim. RDI = operation, RSI = guest
+            // argument array, RDX = argument count. See source/x11/x11bridge64.cpp.
+            ret = x11Bridge64(cpu, a1, a2, a3);
             break;
 #ifdef BOXEDWINE_OPENGL
         case GL64_SYSCALL_NR:

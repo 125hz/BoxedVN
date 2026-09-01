@@ -45,6 +45,8 @@ add_executable(boxedvn_tests
     test_cmpxchg16b.cpp
     test_boot_diagnostics.cpp
     test_pixmap_formats.cpp
+    test_x11_layout64.cpp
+    test_x11_bridge64_policy.cpp
     test_getrusage_fairness.cpp
     test_kernel_random.cpp
     test_vk_pipeline_guard.cpp

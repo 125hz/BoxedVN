@@ -34,6 +34,22 @@ BOXEDVN_TEST(wine64_layout_supplies_only_a_missing_dll_path) {
              std::string("WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine"));
 }
 
+BOXEDVN_TEST(wine64_layout_puts_the_bridge_x11_libraries_first_on_the_library_path) {
+    // WINEDLLPATH names Wine module roots and cannot redirect an ELF
+    // dependency; LD_LIBRARY_PATH is what the guest's ld-linux consults first.
+    CHECK_EQ(std::string(K_X64_GUEST_X11_LIB_DIR),
+             std::string("/usr/lib/boxedwine64-x11"));
+    CHECK_EQ(boxedvn::guestLibraryPathAssignment(),
+             std::string("LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11"));
+    CHECK(!boxedvn::environmentSetsLibraryPath({"WINEPREFIX=/tmp/prefix"}));
+    CHECK(boxedvn::environmentSetsLibraryPath(
+        {"WINEPREFIX=/tmp/prefix", "LD_LIBRARY_PATH=/opt/x11"}));
+    // The directory is dedicated to the shim: it is not the multiarch
+    // directory the distro libraries live in, so those stay reachable.
+    CHECK(std::string(K_X64_GUEST_X11_LIB_DIR).find("x86_64-linux-gnu") ==
+          std::string::npos);
+}
+
 BOXEDVN_TEST(wine64_preflight_accepts_only_a_complete_mz_signature) {
     const unsigned char valid[] = {'M', 'Z'};
     const unsigned char invalid[] = {'M', 'X'};

@@ -145,6 +145,7 @@ if [[ -n "${MANIFEST}" ]]; then
             wine_archive)   MANIFEST_WINE_ARCHIVE="${value}" ;;
             wine_sha256)    MANIFEST_WINE_SHA256="${value}" ;;
             dxmt_unixlib_sha256) MANIFEST_DXMT_UNIXLIB_SHA256="${value}" ;;
+            x11_shim_libx11_sha256) MANIFEST_X11_SHIM_LIBX11_SHA256="${value}" ;;
             source)         MANIFEST_SOURCE="${value}" ;;
             source_image)   MANIFEST_SOURCE_IMAGE="${value}" ;;
             wine_address_contract) MANIFEST_WINE_ADDRESS_CONTRACT="${value}" ;;
@@ -417,6 +418,19 @@ check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" \
 check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-unix/winex11.so"
 check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" \
     "${WINE_MODULE_ROOT}/x86_64-unix/winex11.so"
+
+# BoxedWine's own x86-64 X11 client libraries, which the 64-bit launch puts
+# first on LD_LIBRARY_PATH. Without them winex11.so binds to the distro
+# libX11, connects to /tmp/.X11-unix/X0, is refused, and the process has no
+# desktop window. Every library the driver links or dlopens has to be here as
+# an x86-64 shared object.
+X11_SHIM_DIR=usr/lib/boxedwine64-x11
+for x11_shim in libX11.so.6 libXext.so.6 libXrender.so.1 libXrandr.so.2 \
+                libXinerama.so.1 libXi.so.6 libXcursor.so.1 libXfixes.so.3 \
+                libXcomposite.so.1 libXxf86vm.so.1; do
+    check_zip_path "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/${x11_shim}"
+    check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/${x11_shim}"
+done
 
 # Wine's built-in bitmap fonts, at the data root and reachable through the
 # derived path the guest actually asks for. A device run showed every one of

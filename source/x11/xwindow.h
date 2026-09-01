@@ -193,6 +193,20 @@ public:
 	void input2Notify(const DisplayDataPtr& data, S32 x, S32 y, U32 type);
 
 	XWindowPtr getParent() {return parent;}
+	// Geometry and attributes as XGetWindowAttributes reports them. The
+	// x86-64 bridge writes its own layout from these rather than reaching
+	// into the 32-bit structure.
+	S32 x() const {return left;}
+	S32 y() const {return top;}
+	U32 borderWidth() const {return border_width;}
+	bool overrideRedirect() const {return attributes.override_redirect != 0;}
+	const XSetWindowAttributes& getAttributes() const {return attributes;}
+	void getChildIds(std::vector<U32>& ids) {
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(childrenMutex);
+		for (auto& child : zchildren) {
+			ids.push_back(child->id);
+		}
+	}
 	bool mapped() {return this->isMapped;}
 	bool isThisAndAncestorsMapped();
 	XWindowPtr getTopMappedChild();

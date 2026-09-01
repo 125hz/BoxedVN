@@ -108,6 +108,7 @@ BOXEDVN_TEST(fex64_launch_mounts_runtime_layers_and_enters_wine64) {
         "-env", "WINEPREFIX=/home/username/.wine64",
         "-env", "WINEARCH=win64",
         "-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine",
+        "-env", "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11",
         "/usr/lib/x86_64-linux-gnu/wine/wine64", "d:\\probe.exe",
     };
     CHECK(actual == expected);
@@ -503,6 +504,10 @@ BOXEDVN_TEST(fex64_launch_gets_its_own_prefix_and_win64_arch) {
     CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=win64") == 1);
     CHECK(std::count(actual.begin(), actual.end(),
                      "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine") == 1);
+    // The BoxedWine X11 client libraries come first on the guest's library
+    // path, so winex11.so binds to the bridge rather than the distro libX11.
+    CHECK(std::count(actual.begin(), actual.end(),
+                     "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11") == 1);
     CHECK(std::find(actual.begin(), actual.end(),
                     "/usr/lib/x86_64-linux-gnu/wine/wine64") != actual.end());
     // The 32-bit prefix is never named, and never converted or renamed: it
@@ -552,6 +557,37 @@ BOXEDVN_TEST(fex64_launch_keeps_a_caller_supplied_wine_dll_path) {
     CHECK(std::find(actual.begin(), actual.end(),
                     "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine") ==
           actual.end());
+}
+
+BOXEDVN_TEST(fex64_launch_keeps_a_caller_supplied_library_path) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "d:\\game.exe";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    launch.environment = {"LD_LIBRARY_PATH=/opt/x11-experiment"};
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::count(actual.begin(), actual.end(),
+                     "LD_LIBRARY_PATH=/opt/x11-experiment") == 1);
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11") == actual.end());
+}
+
+BOXEDVN_TEST(a_32bit_launch_does_not_get_the_x64_library_path) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.writableRootPath = "/prefix";
+    launch.executablePath = "d:\\game.exe";
+    launch.runThroughWine = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    // The IA-32 guest keeps its own int 0x9b libX11 from the rootfs; the
+    // x86-64 shim directory is never named for it.
+    CHECK(std::find(actual.begin(), actual.end(),
+                    "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11") == actual.end());
 }
 
 BOXEDVN_TEST(fex64_launch_keeps_one_default_when_only_the_other_is_given) {

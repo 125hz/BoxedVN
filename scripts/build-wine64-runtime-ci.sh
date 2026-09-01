@@ -9,12 +9,29 @@
 #
 # Usage:
 #   scripts/build-wine64-runtime-ci.sh --output-dir DIR \
-#       [--dxmt-unixlib PATH]
+#       [--dxmt-unixlib PATH] [--x11-shim-dir DIR]
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 OUTPUT_DIR=""
 DXMT_UNIXLIB=""
+# The x86-64 X11 client libraries built by scripts/build-boxedwine-x64-x11.sh.
+# Packaged under a directory of their own that a 64-bit launch places first
+# on LD_LIBRARY_PATH; see K_X64_GUEST_X11_LIB_DIR in include/guest_wine64_layout.h.
+X11_SHIM_DIR=""
+X11_SHIM_GUEST_DIR="/usr/lib/boxedwine64-x11"
+X11_SHIM_LIBRARIES=(
+    libX11.so.6
+    libXext.so.6
+    libXrender.so.1
+    libXrandr.so.2
+    libXinerama.so.1
+    libXi.so.6
+    libXcursor.so.1
+    libXfixes.so.3
+    libXcomposite.so.1
+    libXxf86vm.so.1
+)
 # The guest module root everything real is packaged under. Kept the same
 # as K_X64_WINE_MODULE_ROOT in include/guest_wine64_layout.h, which is what
 # the launch and the device preflight use.
@@ -25,6 +42,8 @@ while [[ $# -gt 0 ]]; do
                        OUTPUT_DIR="$2"; shift 2 ;;
         --dxmt-unixlib) [[ $# -ge 2 ]] || die "--dxmt-unixlib needs a value"
                          DXMT_UNIXLIB="$2"; shift 2 ;;
+        --x11-shim-dir) [[ $# -ge 2 ]] || die "--x11-shim-dir needs a value"
+                         X11_SHIM_DIR="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -323,6 +342,29 @@ if [[ -n "${DXMT_UNIXLIB}" ]]; then
        "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/winemetal.so"
 fi
 
+# BoxedWine's own x86-64 X11 client libraries. winex11.so links the distro
+# libX11 by DT_NEEDED, and that library connects to /tmp/.X11-unix/X0, which
+# BoxedWine does not serve: a device run showed the connect refused and every
+# CreateWindowEx failing for want of a desktop window. These replacements keep
+# the SONAMEs and exports the driver needs but reach BoxedWine's built-in X
+# server through a private syscall. They go in a directory of their own that
+# the 64-bit launch puts first on LD_LIBRARY_PATH; the distro libraries stay
+# at their multiarch paths for anything that still wants them.
+if [[ -n "${X11_SHIM_DIR}" ]]; then
+    [[ -d "${X11_SHIM_DIR}" ]] || die "--x11-shim-dir '${X11_SHIM_DIR}' is not a directory."
+    mkdir -p "${STAGE}${X11_SHIM_GUEST_DIR}"
+    for shim in "${X11_SHIM_LIBRARIES[@]}"; do
+        [[ -s "${X11_SHIM_DIR}/${shim}" ]] \
+            || die "The x86-64 X11 shim directory has no ${shim}. Run scripts/build-boxedwine-x64-x11.sh first."
+        is_elf64_x86_64 "${X11_SHIM_DIR}/${shim}" \
+            || die "'${X11_SHIM_DIR}/${shim}' is not an x86-64 ELF shared object."
+        cp "${X11_SHIM_DIR}/${shim}" "${STAGE}${X11_SHIM_GUEST_DIR}/${shim}"
+    done
+    log "BoxedWine x86-64 X11 client libraries packaged: ${X11_SHIM_GUEST_DIR} (${#X11_SHIM_LIBRARIES[@]})"
+else
+    warn "No --x11-shim-dir: the 64-bit user driver will bind to the distro libX11 and fail to connect."
+fi
+
 # The builtin the loader reaches for first after the server handshake. If it is
 # not here, or is not a PE image, the guest gets as far as Windows code and no
 # further -- so fail the build rather than ship an archive that cannot load.
@@ -541,6 +583,9 @@ sha256_file() {
     printf 'wine_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/wine64.zip")"
     if [[ -n "${DXMT_UNIXLIB}" ]]; then
         printf 'dxmt_unixlib_sha256=%s\n' "$(sha256_file "${DXMT_UNIXLIB}")"
+    fi
+    if [[ -n "${X11_SHIM_DIR}" ]]; then
+        printf 'x11_shim_libx11_sha256=%s\n' "$(sha256_file "${X11_SHIM_DIR}/libX11.so.6")"
     fi
 } > "${OUTPUT_DIR}/wine64-runtime.manifest"
 

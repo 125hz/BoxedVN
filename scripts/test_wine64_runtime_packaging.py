@@ -55,6 +55,16 @@ FREETYPE_WINE_PATH = "usr/lib/x86_64-linux-gnu/libfreetype.so.6"
 # The X11 client libraries winex11.so links against directly. Without them the
 # user driver cannot load and the process has no desktop window at all.
 X11_CORE_LIBS = ("libX11.so.6", "libXext.so.6")
+# BoxedWine's own x86-64 X11 client libraries, placed first on the 64-bit
+# launch's LD_LIBRARY_PATH so winex11.so binds to the bridge rather than to a
+# distro libX11 that connects to an X socket nobody serves. The validator
+# requires every library the driver links or dlopens.
+X11_SHIM_DIR = "usr/lib/boxedwine64-x11"
+X11_SHIM_LIBS = (
+    "libX11.so.6", "libXext.so.6", "libXrender.so.1", "libXrandr.so.2",
+    "libXinerama.so.1", "libXi.so.6", "libXcursor.so.1", "libXfixes.so.3",
+    "libXcomposite.so.1", "libXxf86vm.so.1",
+)
 # Fontconfig loads without its configuration and then reports that it cannot
 # load a default config file, which leaves Wine with no usable font backend.
 FONTCONFIG_PATH = "etc/fonts/fonts.conf"
@@ -240,6 +250,8 @@ class WineserverArchiveValidation(unittest.TestCase):
                              getattr(self, "_freetype", elf(body=b"freetype")))
         for x11_lib in X11_CORE_LIBS:
             archive.writestr("usr/lib/x86_64-linux-gnu/" + x11_lib, elf())
+        for x11_shim in X11_SHIM_LIBS:
+            archive.writestr(X11_SHIM_DIR + "/" + x11_shim, elf(body=b"shim"))
         if getattr(self, "_x11_driver", True):
             archive.writestr(PE_DIR + "/winex11.drv", pe(body=b"winex11"))
             archive.writestr(ROOT + "/x86_64-unix/winex11.so", elf())

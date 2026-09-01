@@ -731,6 +731,12 @@ bool StartUpArgs::apply() {
     }
     if (requestedFEX64) {
         projectX64WineSystemModules(winePrefix);
+        // The guest ld-linux resolves winex11.so's libX11/libXext through
+        // LD_LIBRARY_PATH before the multiarch directories. Put BoxedWine's
+        // own x86-64 X11 client libraries first so the driver binds to the
+        // bridge rather than to a distro libX11 that opens an X socket. A
+        // caller-supplied value is kept, as with every other default here.
+        addDefaultEnvValue(envValues, K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT);
     }
 
     if (!this->ddrawOverridePath.isEmpty()) {

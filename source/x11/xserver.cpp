@@ -712,6 +712,45 @@ U32 XServer::openDisplay(KThread* thread) {
 	return displayAddress;
 }
 
+DisplayDataPtr XServer::registerDisplay64(KThread* thread, U64 displayAddress, U32 clientFd, U32 serverFd) {
+	DisplayDataPtr data = std::make_shared<DisplayData>();
+	data->displayAddress = 0;
+	data->displayAddress64 = displayAddress;
+	data->pCurrentRequest = &data->requestCounter64;
+	data->displayId = XServer::getNextId();
+	data->root = root->id;
+	data->clientFd = clientFd;
+	data->serverFd = serverFd;
+	data->process = thread->process;
+	data->processId = thread->process->id;
+
+	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(displayMutex);
+	displays.set(data->displayId, data);
+	return data;
+}
+
+int XServer::unregisterDisplay64(const DisplayDataPtr& data) {
+	if (grabbedDisplayId == data->displayId) {
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(this->grabbedMutex);
+		ungrabPointer(0);
+	}
+	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(displayMutex);
+	displays.remove(data->displayId);
+	return Success;
+}
+
+void XServer::iterateHostVisuals(std::function<void(U32 depth, const VisualPtr& visual)> callback) {
+	for (auto& depth : depths) {
+		std::shared_ptr<std::vector<VisualPtr>> list = visualsByDepth.get(depth);
+		if (!list) {
+			continue;
+		}
+		for (const VisualPtr& visual : *list) {
+			callback(depth, visual);
+		}
+	}
+}
+
 void XServer::updateDisplayScreenSize(U32 width, U32 height) {
 	std::vector<DisplayDataPtr> activeDisplays;
 	{

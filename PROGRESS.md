@@ -5105,3 +5105,59 @@ two independent save locations. The policy names no title-specific path.
 169 host-independent tests pass locally. The iPhoneOS build and ARM64 source
 compile remain GitHub Actions gates; whether both games pass their prior device
 boundaries remains pending a fresh physical-device run.
+
+
+---
+
+### x86-64 X11 bridge, first vertical slice
+
+Both device logs at 0d8dfce2 (224750 and 224921) end at the same controlled
+boundary: explorer's winex11.so loads the distro `/lib/x86_64-linux-gnu/libX11.so.6`,
+that library connects to `/tmp/.X11-unix/X0`, BoxedWine reports
+`BOXEDWINE_X64_X11_CONNECT ... result=-111`, and the probe's CreateWindowExW
+fails with 1400 because no desktop window exists. Neither log contains a null
+exit target or a low RIP, so the 0d8dfce2 return-target repair is accepted
+provisionally and left alone.
+
+BoxedWine has no X wire-protocol server. Its 32-bit guest libX11 pushes
+arguments and executes `int 0x9b`, which CPU64 decodes as FWAIT, and its
+handlers read 32-bit stack words into 32-bit Xlib layouts. The x86-64 side
+now has its own path:
+
+- `include/boxedwine_x64_x11_bridge.h` is the ABI: private syscall
+  `0x7fff0002` (beside the DXMT unix-call number), RDI = operation index,
+  RSI = guest array of up to sixteen 64-bit arguments, RDX = count, result in
+  RAX. The array is in/out, so sized results report the bytes they need.
+- `include/x11_bridge64_policy.h` decides admission (known operation, count
+  0..16, canonical and page-mapped argument array) against an abstract page
+  probe, so it is unit tested on any host.
+- `source/x11/x11bridge64.cpp` dispatches the operation table against the
+  same XServer/XWindow/DisplayData objects the 32-bit path uses. The guest
+  owns every byte: XOpenDisplay hands the host a 16 KiB arena and the host
+  lays out Display, Screen, Depth[], Visual[] and ScreenFormat[] in the SysV
+  x86-64 Xlib layout (`source/x11/x11layout64.h`, asserted twice). Windows,
+  properties, events (converted per type into the 192-byte XEvent), pointer,
+  colormaps, GCs, PutImage, pixmaps, cursors, keyboard, atoms, selections and
+  extension queries are implemented; the rest report
+  `BOXEDWINE_X64_X11_UNIMPLEMENTED op=<name> ... count=1` once and fail
+  in a controlled way.
+- `tools/x11-64/` is the ELF64 guest side: libX11.so.6 and libXext.so.6 that
+  export every one of the 165 symbols measured from the packaged winex11.so
+  (`winex11-imports.txt`, re-measured in CI), plus deterministic stubs for
+  the eight extension libraries the driver dlopens, each answering "absent".
+  `layout_check.c` pins the layouts against the real headers at build time.
+- The runtime packages them under `/usr/lib/boxedwine64-x11`, and a 64-bit
+  launch places that directory first on LD_LIBRARY_PATH (WINEDLLPATH names
+  Wine module roots and cannot redirect an ELF dependency). The distro
+  libraries stay at their multiarch paths.
+
+Acceptance markers for the next device run: `BOXEDWINE_X64_USER_DRIVER`
+must show libX11 opened from `/usr/lib/boxedwine64-x11/`, no
+`BOXEDWINE_X64_X11_CONNECT` line, then `BOXEDWINE_X64_X11_BRIDGE op=init-threads`,
+`op=open-display result=ok display=...`, and either `op=create-window
+result=ok window=...` / `op=map-window` or a named `BOXEDWINE_X64_X11_UNIMPLEMENTED`.
+
+Proven so far: 461 host-independent tests, the shim and packaging contracts,
+and an MSVC syntax pass over the bridge. The ELF64 build, the Wine import
+measurement and the iPhoneOS compile are CI gates; nothing here is proven on
+a device yet.

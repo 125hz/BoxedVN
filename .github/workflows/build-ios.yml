@@ -100,6 +100,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             wine64 wine64-tools zip unzip gcc \
+            libx11-dev libxext-dev libxinerama-dev \
             libx11-6 libxext6 libxrender1 libxfixes3 libxcursor1 \
             libxcomposite1 libxi6 libxinerama1 libxxf86vm1 libxrandr2 \
             libx11-data \
@@ -115,9 +116,18 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/build-boxedwine-dxmt-unixlib.sh build/winemetal.so
+          # The guest X11 client libraries are validated against the very
+          # winex11.so that gets packaged, so a Wine update that imports a
+          # new Xlib symbol fails here rather than at the guest's dlopen.
+          winex11="$(find /usr/lib -path '*/x86_64-unix/winex11.so' -print -quit)"
+          test -n "${winex11}"
+          bash scripts/build-boxedwine-x64-x11.sh \
+            --output-dir build/x64-x11 \
+            --winex11 "${winex11}"
           bash scripts/build-wine64-runtime-ci.sh \
             --output-dir build/wine64-runtime \
-            --dxmt-unixlib build/winemetal.so
+            --dxmt-unixlib build/winemetal.so \
+            --x11-shim-dir build/x64-x11
           bash scripts/validate-wine64-runtime.sh \
             --input build/wine64-runtime \
             --manifest build/wine64-runtime/wine64-runtime.manifest
@@ -258,6 +268,9 @@ jobs:
       - name: Test Wine64 runtime packaging contract
         run: python3 -m unittest scripts/test_wine64_runtime_packaging.py
 
+      - name: Test x86-64 X11 shim contract
+        run: python3 -m unittest scripts/test_x64_x11_shim.py
+
       - name: Test x86-64 graphics probe contract
         run: python3 -m unittest scripts/test_x64_graphics_probe.py
 
@@ -363,7 +376,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: third_party
-          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/wine64-runtime-manifest.example') }}
+          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/build-boxedwine-x64-x11.sh', 'scripts/validate-x64-x11-shim.py', 'tools/x11-64/**', 'include/boxedwine_x64_x11_bridge.h', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/wine64-runtime-manifest.example') }}
 
       - name: Fetch pinned dependencies
         shell: bash

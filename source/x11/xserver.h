@@ -69,6 +69,15 @@ public:
 
 	U32 openDisplay(KThread* thread);
 	int closeDisplay(KThread* thread, const DisplayDataPtr& data);
+	// x86-64 clients own the guest Display memory themselves (see
+	// source/x11/x11bridge64.cpp). These register and drop the host-side
+	// state for such a display without touching 32-bit guest memory.
+	DisplayDataPtr registerDisplay64(KThread* thread, U64 displayAddress, U32 clientFd, U32 serverFd);
+	int unregisterDisplay64(const DisplayDataPtr& data);
+	// The screen's depth list and the visuals under each depth, in the order
+	// the 32-bit Screen is laid out, for a bridge that writes another layout.
+	void iterateHostVisuals(std::function<void(U32 depth, const VisualPtr& visual)> callback);
+	U32 getDepthCount() { return (U32)depths.size(); }
 	DisplayDataPtr getDisplayDataByAddressOfDisplay(KMemory* memory, U32 address);
 	DisplayDataPtr getDisplayDataById(U32 id);
 	void changeScreen(U32 width, U32 height);

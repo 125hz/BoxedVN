@@ -71,6 +71,12 @@ public:
 
 	U32 displayAddress;
 	U32* pCurrentRequest;
+	// x86-64 clients: the guest Display lives in memory the 64-bit shim owns,
+	// so the 32-bit address above stays zero and this carries the real
+	// pointer. The request counter is host-side because Display.request is an
+	// unsigned long the host cannot alias through a U32*.
+	U64 displayAddress64 = 0;
+	U32 requestCounter64 = 0;
 	U32 displayId;
 	U32 root;
 	U32 clientFd;

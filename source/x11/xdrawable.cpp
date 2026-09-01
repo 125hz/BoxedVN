@@ -120,6 +120,47 @@ int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage*
 	return copyImageData(thread, gc, image->data, image->bytes_per_line, image->bits_per_pixel, src_x, src_y, dest_x, dest_y, width, height);
 }
 
+int XDrawable::copyHostImageData(const std::shared_ptr<XGC>& gc, const U8* srcBase, U32 srcLength, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
+	if (bits_per_pixel != this->visual->bits_per_rgb) {
+		return BadMatch;
+	}
+	if (!srcBase || src_x < 0 || src_y < 0 || dst_x < 0 || dst_y < 0) {
+		return BadValue;
+	}
+	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
+	if (dst_x + width > w) {
+		if ((S32)w < dst_x) {
+			return Success;
+		}
+		width = w - dst_x;
+	}
+	if (dst_y + (S32)height > (S32)h) {
+		if ((S32)h < dst_y) {
+			return Success;
+		}
+		height = h - dst_y;
+	}
+	const U32 copyPerLine = (bits_per_pixel * width + 7) / 8;
+	U64 srcOffset = (U64)bytes_per_line * (U64)src_y + (U64)(bits_per_pixel * src_x + 7) / 8;
+	U8* dst = this->data + this->bytes_per_line * dst_y + (bits_per_pixel * dst_x + 7) / 8;
+	const S32 rasterFunction = gc ? gc->values.function : GXcopy;
+	const U32 planeMask = gc ? gc->values.plane_mask : 0xffffffff;
+	if (rasterFunction != GXcopy || planeMask != 0xffffffff) {
+		// Only the plain copy is needed by the window-surface path so far.
+		return BadImplementation;
+	}
+	for (U32 y = 0; y < height; y++) {
+		if (srcOffset + copyPerLine > srcLength) {
+			return BadValue;
+		}
+		memcpy(dst, srcBase + srcOffset, copyPerLine);
+		srcOffset += bytes_per_line;
+		dst += this->bytes_per_line;
+	}
+	setDirtyRect(dst_x, dst_y, width, height);
+	return Success;
+}
+
 int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
 	if (bits_per_pixel != this->visual->bits_per_rgb) {
 		return BadMatch;

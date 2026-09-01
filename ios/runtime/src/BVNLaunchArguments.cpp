@@ -559,6 +559,16 @@ std::vector<std::string> BVNBuildLaunchArguments(
             argv.push_back("-env");
             argv.push_back(boxedvn::wineDllPathAssignment());
         }
+        // winex11.so links the distro libX11 by DT_NEEDED and that library
+        // tries to open /tmp/.X11-unix/X0, which BoxedWine does not serve;
+        // every CreateWindowEx then fails for want of a desktop window.
+        // WINEDLLPATH cannot redirect an ELF dependency. LD_LIBRARY_PATH
+        // can: the guest's ld-linux searches it first, so the BoxedWine X11
+        // client libraries packaged there are what the driver binds to.
+        if (!boxedvn::environmentSetsLibraryPath(launch.environment)) {
+            argv.push_back("-env");
+            argv.push_back(boxedvn::guestLibraryPathAssignment());
+        }
     }
     for (const std::string& entry : launch.environment) {
         argv.push_back("-env");
