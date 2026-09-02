@@ -5745,3 +5745,22 @@ motion rather than page scrolling. The orientation lock, the preferred
 geometry wait and the keyboard's window fronting are skipped while a host
 is registered. Leaving the page returns the presentation to SDL's window.
 
+## f1f8b62c: the live view host was registered but never took the view
+
+The first live view run logged neither attach line: the host was set, the
+overlay and the DXMT layer went into it (`BVNGuestOverlayInstall` and the
+placement both choose the host), but SDL's root view stayed in SDL's
+window, which covered the screen. The window-visibility notification never
+matched SDL's window. The reparent now runs from the scene-attach hook,
+the place that already knows SDL's window is up, and the notification
+accepts any SDL-rooted window as a backup.
+
+The same run gave the null-target fault a clean instance in the cube's own
+code: after 1972 frames, `call qword ptr [rax+0x180]` (the
+UpdateSubresource vtable slot, decoded from the shipped probe) read zero
+once while rax still held the vtable. The fault path now decodes the call
+behind the return slot, reads the slot it used back, logs it as
+`BOXEDWINE_FEX64_NULL_CALL_SITE`, and publishes the call's address as the
+pending IR capture target, so running the cube again in the same app
+session compiles that instruction with the capture armed.
+

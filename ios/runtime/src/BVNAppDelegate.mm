@@ -250,7 +250,12 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     // SDL shows its window from inside boxedmain. When a live view host is
     // registered the presentation belongs there, so the window is taken over
     // as soon as it appears rather than covering the library.
-    if (gGuestPresentationHost == nil || notification.object != [super window]) {
+    UIWindow* shown = notification.object;
+    if (gGuestPresentationHost == nil || shown == nil ||
+        shown == self.libraryWindow ||
+        (shown != [super window] &&
+         ![NSStringFromClass([shown.rootViewController class])
+             containsString:@"SDL"])) {
         return;
     }
     UIView* host = gGuestPresentationHost;
@@ -896,6 +901,16 @@ extern "C" void BVNAttachGuestWindowToScene(void) {
     BVNDXMTDisplayAttach();
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "SDL guest window attached to the active UIWindowScene.");
+    // With a live view host registered, the presentation belongs inside the
+    // library page: SDL's view moves there now and the layer and overlay
+    // follow through the attach. The window-visibility notification was the
+    // only trigger before, and a device run showed it never matching SDL's
+    // window: the overlay and the DXMT layer went into the host while SDL's
+    // window covered the screen, so neither touches nor frames were seen.
+    if (gGuestPresentationHost != nil) {
+        [delegate attachGuestPresentationToHost:gGuestPresentationHost];
+        return;
+    }
 
     // SDL recreates its window when the guest switches from the software
     // renderer to Vulkan, and this runs for each one, so the overlay is

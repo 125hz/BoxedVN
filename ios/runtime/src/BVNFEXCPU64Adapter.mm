@@ -601,6 +601,91 @@ static bool emulateLegacySyscall(BVNFEXCPU64Adapter* adapter,
     return true;
 }
 
+// A jump to zero out of a memory-indirect call leaves the call's return
+// address on the guest stack. The call instruction ends there; its length is
+// found by decoding `ff /2` backwards, its operand names the slot the call
+// read, and that slot is read back now. The instruction's address is also
+// published as the pending IR capture target: the next launch in this app
+// session compiles it with the capture armed, which prints the IR and the
+// host words of the load that returned zero. Program images sit at fixed
+// addresses across runs, which is what makes that arming useful.
+struct NullCallSite {
+    uint64_t instruction = 0;
+    uint32_t length = 0;
+    bool memoryOperand = false;
+    uint64_t operandAddress = 0;
+    uint64_t slotValue = 0;
+    bool slotReadable = false;
+    uint8_t bytes[8] = {0};
+};
+
+static bool decodeNullCallSite(BVNFEXCPU64Adapter* adapter,
+                               const uint64_t* g, uint64_t returnAddress,
+                               NullCallSite* site) {
+    KMemory64* memory = adapter && adapter->cpu ? adapter->cpu->memory : nullptr;
+    if (!memory || returnAddress < 8) return false;
+    uint8_t window[8] = {0};
+    if (!memory->isPageMapped((returnAddress - 8) >> 12) ||
+        !memory->isPageMapped((returnAddress - 1) >> 12)) return false;
+    memory->memcpyFromGuest(window, returnAddress - 8, sizeof(window));
+    for (uint32_t length = 2; length <= 8; ++length) {
+        const uint8_t* code = window + (8 - length);
+        uint32_t index = 0;
+        uint8_t rex = 0;
+        if ((code[index] & 0xf0) == 0x40) rex = code[index++];
+        if (index >= length || code[index] != 0xff) continue;
+        ++index;
+        if (index >= length) continue;
+        const uint8_t modrm = code[index++];
+        const uint32_t mod = modrm >> 6, reg = (modrm >> 3) & 7;
+        uint32_t rm = modrm & 7;
+        if (reg != 2) continue;
+        uint64_t address = 0;
+        bool memoryOperand = true;
+        if (mod == 3) {
+            memoryOperand = false;
+            address = g[rm | ((rex & 1) << 3)];
+        } else {
+            bool ripRelative = false;
+            if (rm == 4) {
+                if (index >= length) continue;
+                const uint8_t sib = code[index++];
+                const uint32_t scale = sib >> 6, indexReg = ((sib >> 3) & 7) | ((rex & 2) << 2);
+                const uint32_t baseReg = (sib & 7) | ((rex & 1) << 3);
+                if (indexReg != 4) address += g[indexReg] << scale;
+                if ((sib & 7) == 5 && mod == 0) { /* disp32, no base */ }
+                else address += g[baseReg];
+            } else if (rm == 5 && mod == 0) {
+                ripRelative = true;
+            } else {
+                address += g[rm | ((rex & 1) << 3)];
+            }
+            if (mod == 1) {
+                if (index + 1 > length) continue;
+                address += (int64_t)(int8_t)code[index]; index += 1;
+            } else if (mod == 2 || (mod == 0 && (rm == 5 || (rm == 4 && (code[index - 1] & 7) == 5)))) {
+                if (index + 4 > length) continue;
+                int32_t disp = 0; std::memcpy(&disp, code + index, 4); index += 4;
+                address += (int64_t)disp;
+            }
+            if (ripRelative) address += returnAddress;
+        }
+        if (index != length) continue;
+        site->instruction = returnAddress - length;
+        site->length = length;
+        site->memoryOperand = memoryOperand;
+        site->operandAddress = address;
+        std::memcpy(site->bytes, code, length);
+        if (memoryOperand && memory->isPageMapped(address >> 12) &&
+            memory->isPageMapped((address + 7) >> 12)) {
+            site->slotValue = memory->readq(address);
+            site->slotReadable = true;
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool containUnclassifiedFEXFault(
     BVNFEXCPU64Adapter* adapter, const FEXCore::SignalDelegatorConfig* config,
     ucontext_t* context, int signal, uint64_t faultAddress,
@@ -1083,6 +1168,24 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                 probe("rdi", g[7]);
                 probe("r12", g[12]);
                 probe("r15", g[15]);
+                NullCallSite site;
+                if (returnSlot[0] != 0 &&
+                    decodeNullCallSite(adapter, g, returnSlot[0], &site)) {
+                    char hexBytes[24];
+                    for (uint32_t i = 0; i < site.length && i < 8; ++i) {
+                        snprintf(hexBytes + i * 2, sizeof(hexBytes) - i * 2, "%02x",
+                                 site.bytes[i]);
+                    }
+                    klog_fmt("BOXEDWINE_FEX64_NULL_CALL_SITE rip=0x%llx bytes=%s "
+                             "memory=%d operand=0x%llx slot_readable=%d slot_value=0x%llx "
+                             "ircap_armed_for_next_launch=1",
+                             (unsigned long long)site.instruction, hexBytes,
+                             site.memoryOperand ? 1 : 0,
+                             (unsigned long long)site.operandAddress,
+                             site.slotReadable ? 1 : 0,
+                             (unsigned long long)site.slotValue);
+                    BVNFEXBackendPublishPendingIRCapTarget(site.instruction);
+                }
             }
         }
     }
