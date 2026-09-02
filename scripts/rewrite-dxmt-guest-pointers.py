@@ -61,8 +61,53 @@ EXPECTED_PTR_READS = {
 }
 
 
+# DXMT hands CAMetalLayer property changes to the main thread with
+# dispatch_sync. Under BoxedWine the main thread is owned by the emulator's
+# SDL loop for the whole session, and a device run stopped at the first
+# layer update of the present stage: the call never returned and the guest
+# thread never resumed. Layer property changes are legal from any thread
+# inside a CoreAnimation transaction, so the helper applies the block
+# inline when it is not already on the main thread. Expected exactly once.
+MAIN_THREAD_HELPER = (
+    "void\n"
+    "execute_on_main(dispatch_block_t block) {\n"
+    "  if ([NSThread isMainThread]) {\n"
+    "    block();\n"
+    "  } else {\n"
+    "    dispatch_sync(dispatch_get_main_queue(), block);\n"
+    "  }\n"
+    "}\n"
+)
+MAIN_THREAD_HELPER_INLINE = (
+    "void\n"
+    "execute_on_main(dispatch_block_t block) {\n"
+    "  /* BoxedWine: the main thread runs the emulator loop for the whole\n"
+    "   * session, so waiting on it here never returns. Layer properties may\n"
+    "   * be set from any thread inside a transaction. */\n"
+    "  if ([NSThread isMainThread]) {\n"
+    "    block();\n"
+    "  } else {\n"
+    "    [CATransaction begin];\n"
+    "    [CATransaction setDisableActions:YES];\n"
+    "    block();\n"
+    "    [CATransaction commit];\n"
+    "  }\n"
+    "}\n"
+)
+MAIN_THREAD_HELPER_FILES = {"winemetal_unix.c"}
+
+
 class RewriteError(RuntimeError):
     pass
+
+
+def rewrite_main_thread_helper(text: str) -> str:
+    occurrences = text.count(MAIN_THREAD_HELPER)
+    if occurrences != 1:
+        raise RewriteError(
+            f"expected exactly one execute_on_main helper, found {occurrences}; "
+            "the pinned DXMT source changed, re-audit the main-thread dispatch")
+    return text.replace(MAIN_THREAD_HELPER, MAIN_THREAD_HELPER_INLINE, 1)
 
 
 def wrap(expression: str) -> str:
@@ -100,7 +145,10 @@ def rewrite_source(name: str, text: str) -> str:
         raise RewriteError(
             f"{name}: rewrote {count} .ptr reads, expected {expected}; "
             "the pinned DXMT source changed, re-audit the dereference sites")
-    return rewrite_raw_sites(rewritten, RAW_SITES.get(name, []))
+    rewritten = rewrite_raw_sites(rewritten, RAW_SITES.get(name, []))
+    if name in MAIN_THREAD_HELPER_FILES:
+        rewritten = rewrite_main_thread_helper(rewritten)
+    return rewritten
 
 
 def output_name(source: pathlib.Path) -> pathlib.Path:

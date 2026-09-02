@@ -5262,3 +5262,25 @@ sources.
 Next device evidence: `BOXEDWINE_DXMT_ARGS guest=0x7ffffe... host=0x7ffe...`,
 `BOXEDWINE_DXMT_RETURN ... status=0` for indices 119, 4 and 3, an adapter
 found, and whatever D3D11CreateDevice does after that.
+
+
+---
+
+### DXMT reaches the present stage; layer updates must not wait on the main thread
+
+Logs 191539 and 191742 at 1bc2b3ed: every DXMT call now carries a
+translated block (`BOXEDWINE_DXMT_ARGS guest=0x7ffffe... host=0x7ffe...`)
+and returns status 0; `d3d11-create ok` at feature level 11.0,
+`dxgi-factory ok`, `swapchain ok` (the host Metal view and CAMetalLayer are
+acquired), `render-target ok`, then `present begin`. The first
+set-layer-properties call (index 70) never returns and the session sits
+there. DXMT's `execute_on_main` hands the layer update to the main thread
+with `dispatch_sync`; the emulator's SDL loop owns that thread for the whole
+session. The rewrite now replaces the helper so the block runs inline
+inside a CoreAnimation transaction when it is not on the main thread. The
+wineserver "partial wakeup write" lines that follow are the stalled client
+starving its wakeup pipe, not a separate fault.
+
+Next device evidence: `BOXEDWINE_DXMT_RETURN ... status=0` for
+set-layer-properties (index 70), then next-drawable (67) and present (47)
+calls, and either a first visible frame or the next named stage.

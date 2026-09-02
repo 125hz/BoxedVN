@@ -90,6 +90,26 @@ class PointerReadRewrite(unittest.TestCase):
         with self.assertRaises(rewrite.RewriteError):
             rewrite.rewrite_source("other.c", "x = BOXEDWINE_GUEST_PTR(p.ptr);\n")
 
+    def test_main_thread_helper_runs_the_block_inline_off_the_main_thread(self) -> None:
+        text = rewrite.rewrite_main_thread_helper(rewrite.MAIN_THREAD_HELPER)
+        self.assertNotIn("dispatch_sync(dispatch_get_main_queue(), block);", text)
+        self.assertIn("[CATransaction begin];", text)
+        self.assertIn("[CATransaction commit];", text)
+        # On the main thread the block still runs directly.
+        self.assertIn("if ([NSThread isMainThread]) {\n    block();", text)
+
+    def test_main_thread_helper_rewrite_refuses_drift(self) -> None:
+        with self.assertRaises(rewrite.RewriteError):
+            rewrite.rewrite_main_thread_helper("void execute_on_main(void) {}\n")
+        with self.assertRaises(rewrite.RewriteError):
+            rewrite.rewrite_main_thread_helper(rewrite.MAIN_THREAD_HELPER * 2)
+
+    def test_main_thread_helper_is_rewritten_only_in_the_unix_source(self) -> None:
+        self.assertEqual(rewrite.MAIN_THREAD_HELPER_FILES, {"winemetal_unix.c"})
+        # cache.c has no helper, so its rewrite must not demand one.
+        text = rewrite.rewrite_source("cache.c", "x = p.ptr;\n" * 5)
+        self.assertEqual(text.count("BOXEDWINE_GUEST_PTR"), 5)
+
     def test_output_is_written_beside_the_source(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             source = pathlib.Path(raw) / "other.c"
