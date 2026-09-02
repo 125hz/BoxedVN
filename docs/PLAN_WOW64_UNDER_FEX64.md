@@ -154,7 +154,31 @@ This is the risk that decides the schedule.
   patch but do not fork. A second context in 32-bit mode is what the
   translator already offers, and it is the shape FEX's own WoW64 backend
   uses on Windows on ARM.
-- Shape (2) in BoxedVN terms:
+- Refinement (2026-09-02, after reading Wine 9.0's `dlls/wow64cpu/cpu.c`
+  and the pinned translator's far-transfer lowering): Wine's own
+  `wow64cpu.dll` already does every register marshal. It enters 32-bit
+  code with `ljmp *(%r14)` (an indirect far jump to the 32-bit code
+  selector) after loading the 32-bit registers into the 64-bit register
+  file, and the 32-bit ntdll returns with the same instruction the other
+  way (`ff 2d` far indirect jump to the 64-bit selector, written into a
+  page below 4 GiB by `BTCpuProcessInit`). The translator lowers RETF and
+  IRET as a RIP change plus a stored `cs_idx`, without a mode change. So
+  the mode switch can live in the translator's far-transfer lowering: a
+  far jump, far call, far return or iret whose new CS has the other
+  bitness exits to BoxedVN with the full register file, and BoxedVN
+  resumes the other context (64-bit or 32-bit) at that RIP with the same
+  registers, stack and memory. Nothing replaces `wow64cpu.dll`; steps 2
+  and 3 below reduce to that exit and the two contexts. The two selector
+  values are the ones BoxedWine reports in a captured context (the
+  backend reads `cs64_sel` from `RtlCaptureContext`).
+- Prerequisite found the same day: Wine's loader must be named `wine`,
+  not `wine64`, or a 32-bit image goes to `start.exe` instead of the
+  in-process WoW64 path (`dlls/ntdll/unix/env.c`,
+  `get_alternate_wineloader`). The lane launches through an alias now.
+  `BTCpuProcessInit` also refuses to run when `wow64cpu.dll` is mapped
+  above 4 GiB, so the loader's low-address mapping of WoW64 modules must
+  succeed inside `KMemory64`'s low window.
+- Shape (2) in BoxedVN terms (steps 2 and 3 superseded by the refinement):
   1. Context pair. `createFEXContext(FexGuestMode::X86_32, ...)` for the
      process, sharing `KMemory64` with its 64-bit context; the low-alias
      window and the fex32 window binding already exist for this.
