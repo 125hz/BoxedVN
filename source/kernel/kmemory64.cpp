@@ -1870,6 +1870,7 @@ void k64ReportMissingBacking(int pid, U64 pageNum, const char* op) {
                  (unsigned long long)pageNum, (unsigned long long)(n + 1));
     }
 }
+} // namespace
 
 void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
     // Data-TLB fast path: the whole span inside one already-seen page (the
@@ -1905,7 +1906,6 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
         len -= chunk;
     }
 }
-} // namespace
 
 void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
     noteGuestWriteRange(dstGuest, len);
