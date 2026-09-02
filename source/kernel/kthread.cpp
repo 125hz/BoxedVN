@@ -636,11 +636,19 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
             const U64 seconds = guestMemory->readq(timeoutAddress);
             const U64 nanos = guestMemory->readq(timeoutAddress + 8);
             U64 millis = seconds * 1000 + nanos / 1000000;
-            if (command == FUTEX_WAIT_BITSET &&
-                (op & FUTEX_CLOCK_REALTIME) != 0) {
-                const U64 realtime = KSystem::getSystemTimeAsMicroSeconds() / 1000;
-                millis = millis > realtime ? millis - realtime : 0;
+            if (command == FUTEX_WAIT_BITSET) {
+                // FUTEX_WAIT_BITSET carries an ABSOLUTE deadline: CLOCK_REALTIME
+                // with the flag, CLOCK_MONOTONIC without it. sys_clock_gettime64
+                // reports one clock for every id, so both convert against it.
+                // Treating the monotonic deadline as relative added the epoch
+                // (about 1.7e12 ms) and truncated it to 32 bits: some waits
+                // expired at once, and glibc's condvar loop re-entered futex at
+                // 100% CPU, while others never expired and parked for good.
+                const U64 nowMillis = KSystem::getSystemTimeAsMicroSeconds() / 1000;
+                millis = millis > nowMillis ? millis - nowMillis : 0;
             }
+            // A deadline beyond the 32-bit tick range is no deadline at all.
+            if (millis > 0x7ffffffeULL) millis = 0x7ffffffeULL;
             expires = static_cast<U32>(millis) +
                       KSystem::getMilliesSinceStart();
         }

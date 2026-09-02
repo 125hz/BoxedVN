@@ -5644,3 +5644,13 @@ user where to put it otherwise. Until phase 2's CPU backend exists the
 run is expected to stop at the first 64-to-32 mode switch; that log is
 the next input.
 
+Before that build finished, the clock base explained the storm without a
+witness: `sys_clock_gettime64` returns wall-clock time for every clock id,
+and the futex wait treated a `FUTEX_WAIT_BITSET` deadline without the
+realtime flag (an absolute CLOCK_MONOTONIC value in the guest's eyes, an
+epoch value here) as a relative timeout, added the current tick and
+truncated to 32 bits. Depending on the low bits the wait expired at once,
+which is the re-entry loop, or never, which is the parked worker. Both
+absolute forms now convert against the clock the guest was given, and a
+deadline beyond the 32-bit tick range is treated as none.
+
