@@ -81,10 +81,11 @@ extern UIWindow* BVNGuestUIWindow(void);
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    // The guest swapchain owns the pixel extent. UIKit may resize the view for
-    // rotation or safe-area changes, but must not silently resize its drawable.
-    self.metalLayer.contentsScale = 1.0;
-    self.metalLayer.drawableSize = self.guestDrawableSize;
+    // Deliberately leaves the layer's contentsScale and drawableSize alone.
+    // DXMT sets both from its swapchain (WMTLayerProps in winemetal_unix.c)
+    // and expects them to stay; resetting them here to the guest screen size
+    // put a 640x480 backbuffer in the top-left 80% of an 800x600 drawable on
+    // device. The pixel extent belongs to the swapchain, the frame to UIKit.
 }
 
 @end
@@ -210,6 +211,7 @@ bool BVNDXMTDisplayHasLayer(void) {
 // main thread by the placement below.
 static _Atomic(bool) gDisplayPresented = false;
 static _Atomic(bool) gDisplayPlacementQueued = false;
+static _Atomic(uint32_t) gDisplayPresenterPid = 0;
 static bool gDisplayFronted = false;
 static bool gDisplayPollReported = false;
 static bool gDisplayBlockedReported = false;
@@ -226,7 +228,8 @@ static void BVNDXMTDisplayQueuePlacement(void) {
     });
 }
 
-void BVNDXMTDisplayNotePresented(void) {
+void BVNDXMTDisplayNotePresented(uint32_t pid) {
+    atomic_store_explicit(&gDisplayPresenterPid, pid, memory_order_release);
     if (atomic_exchange_explicit(&gDisplayPresented, true,
                                  memory_order_acq_rel)) {
         return;
@@ -235,6 +238,38 @@ void BVNDXMTDisplayNotePresented(void) {
     // the view from the main queue as well. SDL's event pump services the run
     // loop, so this runs even if the poll never reaches the placement.
     BVNDXMTDisplayQueuePlacement();
+}
+
+void BVNDXMTDisplayNoteProcessExited(uint32_t pid) {
+    if (pid == 0 ||
+        atomic_load_explicit(&gDisplayPresenterPid, memory_order_acquire) !=
+            pid) {
+        return;
+    }
+    // The presenting process is gone: nothing will draw into the layer again
+    // until another process presents. Hide it so SDL's view, with the desktop
+    // and any dialog Wine raises for the exit, shows through. The next
+    // present from another process re-arms placement, which unhides it.
+    atomic_store_explicit(&gDisplayPresenterPid, 0, memory_order_release);
+    atomic_store_explicit(&gDisplayPresented, false, memory_order_release);
+    atomic_store_explicit(&gDisplayPlacementQueued, false,
+                          memory_order_release);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        pthread_mutex_lock(&gDisplayLock);
+        BVNDXMTMetalView* view = gDisplayView;
+        pthread_mutex_unlock(&gDisplayLock);
+        if (view == nil || view.hidden) {
+            return;
+        }
+        view.hidden = YES;
+        gDisplayFronted = false;
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "BOXEDVN_DXMT_LAYER_HIDDEN: presenting process %u exited; "
+                 "the desktop is visible again",
+                 (unsigned)pid);
+        BVNLogWrite(BVNLogLevelInfo, "dxmt", message);
+    });
 }
 
 static const char* BVNDXMTClassName(id object, const char* fallback) {
@@ -301,6 +336,10 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     // view controller's view, and below the overlay, which
     // BVNGuestOverlayInstall re-fronts.
     BOOL changed = NO;
+    if (view.hidden) {
+        view.hidden = NO;
+        changed = YES;
+    }
     if (view.superview != window) {
         [view removeFromSuperview];
         view.frame = window.bounds;
@@ -337,6 +376,7 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     }
     if (changed && !gDisplayFronted) {
         gDisplayFronted = true;
+        gDisplayPollReported = false;
         const CGSize drawable = view.metalLayer.drawableSize;
         char message[320];
         snprintf(message, sizeof(message),

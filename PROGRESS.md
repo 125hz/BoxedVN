@@ -5333,3 +5333,24 @@ dispatch on the first present, remembers the attach window as a fallback,
 tolerates a root view that is not a direct window subview, re-fronts the
 overlay after moving, and logs `BOXEDVN_DXMT_LAYER_POLL` (state on the first
 pass) or `BOXEDVN_DXMT_LAYER_BLOCKED` (why it could not place the view).
+
+## First visible x86-64 DXMT frame (07c964de)
+
+Two device runs on 07c964de showed the probe's clear colour on screen for
+its 240 frames (the probe only clears; the green channel ramps every 60
+frames and the last colour stays). `BOXEDVN_DXMT_LAYER_POLL` reported
+`root_in_window=0`: SDL's root view is not a direct window subview, which is
+why the earlier ordering check returned silently. Two follow-ups here:
+
+- The picture filled only the top-left 80% of the layer. DXMT sets the
+  layer's drawableSize to its 640x480 swapchain; the view's layoutSubviews
+  reset it to the 800x600 guest screen on every frame change, so the
+  backbuffer landed in the corner of a larger drawable. layoutSubviews now
+  leaves contentsScale and drawableSize to DXMT.
+- Once the presenting process exits (exit_group, or exit of the group), the
+  layer is hidden from the main queue (`BOXEDVN_DXMT_LAYER_HIDDEN`) so the
+  desktop and any Wine dialog show through; the next present re-arms
+  placement and unhides it.
+
+Still open: the process faults in ntdll (read of 0 at 0x7FFFFFA5B98C,
+thread 007c) after reporting completion, on every run.

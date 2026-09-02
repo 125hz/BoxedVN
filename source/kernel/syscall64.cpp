@@ -1272,6 +1272,13 @@ static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
     if (status != 0) {
         dumpX64ExitDiagnostics(cpu, status);
     }
+#if defined(BOXEDWINE_DXMT_NATIVE)
+    // A process-wide exit ends whatever it was presenting; hide the DXMT
+    // layer if it was this process, so the desktop shows through again.
+    if (group && cpu->thread && cpu->thread->process) {
+        BVNDXMTDisplayNoteProcessExited(cpu->thread->process->id);
+    }
+#endif
     // Stop this thread's run loop now, whatever else happens below.
     cpu->yield = true;
     if (cpu->thread && cpu->thread->process) {
@@ -1326,6 +1333,9 @@ void kfatalProcessExit64(CPU64* cpu, U32 status, const char* reason) {
     if (status != 0) {
         dumpX64ExitDiagnostics(cpu, status);
     }
+#if defined(BOXEDWINE_DXMT_NATIVE)
+    BVNDXMTDisplayNoteProcessExited(process->id);
+#endif
     cpu->yield = true;
     // The launched program is the process whose parent is the boot process.
     // Its death ends the session; a helper's does not.
@@ -3614,7 +3624,7 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         BVNGuestFrameLimiterWait();
         // A presented drawable means the DXMT layer carries frames; the main
         // loop raises it above SDL's later-created view on its next poll.
-        BVNDXMTDisplayNotePresented();
+        BVNDXMTDisplayNotePresented(cpu->thread->process->id);
     }
     const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
     if (logCall) {

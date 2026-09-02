@@ -30,8 +30,14 @@ void BVNDXMTDisplayFinish(void);
 bool BVNDXMTDisplayHasLayer(void);
 
 // Called from the DXMT dispatcher on any thread when the guest presents a
-// drawable. Records that the layer carries frames; nothing else.
-void BVNDXMTDisplayNotePresented(void);
+// drawable. Records which process draws into the layer and, on the first
+// present, queues the placement below on the main queue.
+void BVNDXMTDisplayNotePresented(uint32_t pid);
+
+// Called from the kernel when a guest process exits. If it was the process
+// presenting into the layer, the layer is hidden from the main queue so the
+// desktop shows through until another process presents.
+void BVNDXMTDisplayNoteProcessExited(uint32_t pid);
 
 // Main thread, polled from Boxedwine's own loop. Once a frame has been
 // presented, keeps the DXMT view a direct subview of the guest window,
