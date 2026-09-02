@@ -1,0 +1,213 @@
+# Plan: 32-bit Windows programs on the 64-bit FEX path (new WoW64)
+
+Status: planning only. Nothing in this document is implemented. It records
+the direction agreed on 2026-09-01 so the work can start later without
+re-deriving it.
+
+## Why
+
+BoxedVN runs two engines today:
+
+| Lane | CPU | Wine | Memory model | Direct3D | Used by |
+|---|---|---|---|---|---|
+| Legacy 32-bit | BoxedWine's own IA-32 JIT | 32-bit Wine, bundled prefix | software page table, per-access helpers | wined3d over OpenGL / MoltenVK | every existing title |
+| 64-bit FEX | FEX translator (ARM64) | Wine64 from the Ubuntu layer, `.wine64` prefix | direct dereference through KMemory64 alias windows | DXMT over Metal | the x86-64 probe |
+
+The legacy lane is adequate for 2D titles. A 32-bit 3D title would hit three
+ceilings there: the translator, the memory model, and the renderer. Swapping
+the translator alone (a "FEX32" backend inside the 32-bit kernel; see
+`docs/ARCHITECTURE_FEX32_IOS.md` and the `fex32_*` admission contracts in
+`ios/support`) removes one of the three.
+
+Wine's own answer is *new WoW64*: a Wine built for both architectures runs
+32-bit Windows programs inside a 64-bit Unix process. The 32-bit PE code is
+executed in the CPU's compatibility mode, every Unix-side call is thunked
+through 64-bit ntdll, and Direct3D from a 32-bit program reaches 64-bit
+graphics modules. No 32-bit Linux libraries are needed. Under BoxedVN that
+means a 32-bit game gets the FEX translator, the 64-bit memory model, the
+64-bit X11 bridge and DXMT, all of which exist or are being proven now.
+
+Decision: extend the 64-bit FEX lane with new WoW64. Keep the legacy lane
+selectable per container until the WoW64 lane has run the existing library,
+then make WoW64 the default for 32-bit programs. Do not port FEX into the
+32-bit kernel.
+
+## Prerequisites (must be true before phase 1 starts)
+
+- The x86-64 Direct3D 11 probe renders through DXMT on a device (the
+  current goal). WoW64 graphics thunk into the same DXMT modules; nothing
+  below is worth starting while 64-bit D3D11 is unproven.
+- At least one plain 64-bit Windows program runs end to end on the lane
+  (window, input, present), so the lane's stability is known independently
+  of the probe.
+
+## Architecture of the finished lane
+
+```
+ 32-bit PE (game.exe)      64-bit PE builtins            Unix side (x86-64 ELF)
+ ┌──────────────────┐      ┌────────────────────────┐    ┌──────────────────────┐
+ │ game code (i386) │ ──►  │ i386-windows/*.dll     │ ─► │ x86_64-unix/ntdll.so │
+ │ d3d11.dll (i386) │      │ (32-bit PE builtins)   │    │ winex11.so           │
+ └──────────────────┘      │ wow64.dll, wow64win.dll│    │ winemetal.so (DXMT)  │
+        compat mode        │ x86_64-windows/*.dll   │    └──────────────────────┘
+        (CPU in 32-bit)    │ (64-bit PE builtins,   │            ▲
+                           │  DXMT d3d11/dxgi)      │            │ private syscalls
+                           └────────────────────────┘            │
+                                        ▲                        │
+                                        │ FEX (mode switches)    │
+                                  BoxedWine kernel: KMemory64, syscall64, X11 bridge,
+                                  DXMT dispatcher, VFS overlays, SDL presentation
+```
+
+Everything stays under BoxedWine. FEX remains the CPU only. The process is
+64-bit from the kernel's point of view; the 32-bit code segments are a
+property of the guest's CS selector, which FEX must honour.
+
+## Phases
+
+Each phase has a host-side gate (CI) and a device gate (log markers). A phase
+is not done until its device gate is met on a physical device.
+
+### Phase 0: Inventory (no code)
+
+- Record which Wine version the runtime layer ships and whether the distro
+  provides a dual-architecture build. Ubuntu's `wine64` package does not ship
+  the `i386-windows` PE tree; `wine32` ships the old WoW64 (needs 32-bit
+  Unix libraries) and is not what we want.
+- Decide the Wine source: a Wine build configured with
+  `--enable-archs=i386,x86_64`, either built in the runtime job (Ubuntu,
+  long) or fetched as a pinned prebuilt with recorded hashes, in the style
+  of `scripts/dependencies.fex64.lock.sh`.
+- Confirm DXMT's 32-bit thunk story at the pinned commit
+  (`willfaust/dxmt` `ios-port`): its PE side already carries `wow64`
+  entries (`__wine_unix_call_wow64_funcs`, `UInt32ToPtr`), which is the path
+  a 32-bit d3d11.dll takes.
+
+Gate: a written note in this file naming the Wine source and the DXMT thunk
+status.
+
+### Phase 1: Dual-architecture Wine layer
+
+- Extend `scripts/build-wine64-runtime-ci.sh` to package the
+  `i386-windows` PE tree beside `x86_64-windows` and `x86_64-unix`, and
+  `wow64.dll` / `wow64win.dll` / `wow64cpu.dll` (Wine's own), under the same
+  module root (`include/guest_wine64_layout.h`).
+- Extend `scripts/validate-wine64-runtime.sh` and
+  `scripts/test_wine64_runtime_packaging.py` with the new required paths and
+  an ELF/PE class check (i386 PE builtins are PE32, not PE32+).
+- `projectX64WineSystemModules` must project both trees: Wine expects
+  `syswow64` for 32-bit builtins and `system32` for 64-bit ones.
+- The DXMT module overlay (`overlayX64WineModules`) must also place DXMT's
+  32-bit PE thunks (built with `-Dwine_builtin_dll=true` for i386) into
+  `i386-windows`, so a 32-bit program's `d3d11.dll` import resolves to
+  DXMT's 32-bit thunk, which forwards to the 64-bit DXMT modules.
+
+Gate (CI): validator passes with both trees; PE32 checks pass. Gate
+(device): a 32-bit `notepad.exe`-class builtin starts under the 64-bit prefix
+and reaches `BOXEDWINE_X64_PROC_FIRST_SYSCALL` from a WoW64 process.
+
+### Phase 2: Mode switching in the FEX integration
+
+This is the risk that decides the schedule.
+
+- Wine's WoW64 layer switches between the 64-bit and 32-bit code segments
+  with far transfers (`wow64cpu.dll`; on ARM64 Wine uses the FEX WoW64 DLL
+  instead of an x86 CPU). Decide which of the two shapes BoxedVN uses:
+  1. Let FEX translate the 32-bit code segments in the same context, i.e.
+     honour `CS` mode changes (the shape FEX's own WoW64 product uses).
+  2. Provide a BoxedVN `wow64cpu` replacement that hands 32-bit code to a
+     second FEX context configured for 32-bit mode.
+  Prototype (1) first; it needs no new Wine module.
+- `KMemory64` placement: 32-bit code needs its stack, heap and images below
+  4 GiB. On iOS those addresses are served through the low alias
+  (`include/guest_low_alias.h`, `K64_NATIVE_LOW_ALIAS_BASE`), which already
+  exists for Wine's TEB and KUSER_SHARED_DATA. The mmap placement policy
+  (`chooseGuestMmapPlacement`) needs a "32-bit process" mode that keeps
+  automatic placements under 4 GiB.
+- `syscall64.cpp`: WoW64 processes still enter the 64-bit syscall path (the
+  Unix side is 64-bit), so no 32-bit Linux syscall ABI is required. The
+  interpreter (`cpu64.cpp`) only runs forked children before exec and needs
+  no 32-bit decoding.
+- Signals and exceptions: a fault in 32-bit code must be delivered with a
+  32-bit context (`WOW64_CONTEXT`) through Wine's WoW64 exception path.
+  Reuse the existing `raiseSyncFault` plumbing; add the context shape.
+
+Gate (host): a freestanding fixture through the pinned translator simulator
+(the same harness `scripts/test-fex-exit-dispatch-contract.py` and the
+`fex-translator-probe` job use) that executes a 64-to-32 far call, 32-bit
+code touching a low-alias page, and the return, with register truncation
+checked. Gate (device): a 32-bit console program prints through the 64-bit
+ntdll and exits 0.
+
+### Phase 3: Windows and input for a 32-bit program
+
+- The X11 driver stays 64-bit (`winex11.so` through the x86-64 bridge in
+  `source/x11/x11bridge64.cpp`); user32 calls from 32-bit code are thunked
+  by `wow64win.dll`. Expect no new bridge operations, but expect new
+  `BOXEDWINE_X64_X11_UNIMPLEMENTED` markers from paths a real title takes
+  that the probe did not (XGetImage, XShm, XShape are the known gaps).
+- Verify keyboard and mouse delivery into a 32-bit window.
+
+Gate (device): a 32-bit windowed program shows a window, moves it, and
+receives input.
+
+### Phase 4: Direct3D from 32-bit through DXMT
+
+- Build DXMT's i386 PE thunks in `scripts/build-dxmt-x64-pe.sh` (a second
+  meson cross file targeting i386) and stage them in
+  `scripts/stage-x64-graphics-assets.sh` under `dxmt-i386/`.
+- The DXMT dispatcher (`boxedwineDxmtUnixCall64`) already translates the
+  parameter block and the rewritten unix sources translate nested pointers
+  (`scripts/rewrite-dxmt-guest-pointers.py`). The WoW64 entries use 32-bit
+  pointer fields (`UInt32ToPtr`); the rewrite must cover
+  `__wine_unix_call_wow64_funcs` sites too, and the 32-bit pointers go
+  through the low alias.
+- Extend the graphics probe: a 32-bit build of the same Direct3D 11 cube.
+
+Gate (device): the 32-bit cube renders its first frame through DXMT.
+
+### Phase 5: Library validation and default flip
+
+- Run every existing 32-bit title in the library on the WoW64 lane; record
+  boundaries the way `PROGRESS.md` does today.
+- Per-container engine selection in the app (`Runtime.swift` /
+  `AppModel.swift`): "Legacy 32-bit" vs "FEX (WoW64)", defaulting to WoW64
+  only once the library passes.
+- Keep the legacy lane buildable and tested until no container uses it.
+
+## Risks
+
+- **Mode switching under FEX inside BoxedWine (phase 2).** FEX supports
+  32-bit code, but BoxedVN's integration was built for a 64-bit-only
+  context per process. If honouring `CS` changes in one context proves
+  unworkable, the fallback is a second context per thread, which is
+  heavier and touches thread scheduling.
+- **Low-alias pressure.** All 32-bit allocations must live below 4 GiB and
+  are aliased; large 32-bit games can exhaust that space faster than under
+  the legacy lane. Measure early with a real title.
+- **Wine source.** A dual-arch Wine is not a distro package; building it in
+  CI is slow, so a pinned prebuilt with recorded hashes is preferable.
+- **DXMT 32-bit thunks.** The pinned fork carries them, but they have not
+  been exercised on iOS.
+
+## Non-goals
+
+- Porting FEX into the 32-bit BoxedWine kernel (FEX32). The admission
+  contract stays as a gate; no backend work follows it.
+- Replacing SDL or BoxedWine with a native Wine launcher.
+- Changing the legacy 32-bit lane while WoW64 is unproven.
+
+## Tracking
+
+Progress lands in `PROGRESS.md` per iteration, as now. This file is updated
+when a phase gate is met or a decision above changes; the date and commit
+of each gate go in the table below.
+
+| Phase | Gate met | Commit |
+|---|---|---|
+| 0 | | |
+| 1 | | |
+| 2 | | |
+| 3 | | |
+| 4 | | |
+| 5 | | |
