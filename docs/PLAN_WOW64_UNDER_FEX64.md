@@ -86,6 +86,31 @@ is not done until its device gate is met on a physical device.
 Gate: a written note in this file naming the Wine source and the DXMT thunk
 status.
 
+**Phase 0 result (2026-09-02).**
+
+- *Prerequisite met:* the x86-64 Direct3D 11 probe draws a rotating cube
+  through DXMT on device (commit b16685a4: `shaders ok`, `geometry ok`,
+  240 presents, `complete ok`).
+- *Wine source:* no change of source is needed. The runtime layer ships
+  Ubuntu 24.04's `libwine` 9.0~repack-4build3 (amd64), whose
+  `x86_64-windows` tree already contains `wow64.dll`, `wow64win.dll` and
+  `wow64cpu.dll`, and whose 64-bit unix libraries carry the WoW64 thunk
+  tables (they are compiled for every 64-bit build, not only
+  `--enable-archs` builds). The matching 32-bit PE tree is the same
+  version's `libwine:i386`, at `/usr/lib/i386-linux-gnu/wine/i386-windows/`
+  (`kernel32.dll`, `ntdll.dll`, `user32.dll`, `d3d11.dll`, ...). Its
+  `i386-unix` tree is the old WoW64 and is not packaged. The runtime job
+  downloads that one package and extracts only `i386-windows`, so the
+  PE builtins and the unix side always come from one Wine version.
+- *DXMT thunk status:* the pinned fork's unix side carries the 32-bit
+  entry points (`thunk32_SM50Initialize`, `thunk32_SM50Compile`,
+  `thunk32_SM50GetArgumentsInfo`, ... with `UInt32ToPtr`) beside the
+  64-bit ones, in a second dispatch table. They compile into the native
+  archive today and have not been exercised. The 32-bit PE thunks
+  (`d3d11.dll`, `dxgi.dll`, `winemetal.dll` for i386) still have to be
+  built with the pinned llvm-mingw for `i686-w64-mingw32`; that is phase
+  1's last bullet.
+
 ### Phase 1: Dual-architecture Wine layer
 
 - Extend `scripts/build-wine64-runtime-ci.sh` to package the
@@ -205,7 +230,7 @@ of each gate go in the table below.
 
 | Phase | Gate met | Commit |
 |---|---|---|
-| 0 | | |
+| 0 | 2026-09-02 | see PROGRESS.md, "WoW64 phase 0" |
 | 1 | | |
 | 2 | | |
 | 3 | | |

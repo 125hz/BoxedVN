@@ -292,7 +292,14 @@ struct ContainerDetailView: View {
                     save()
                     model.launchDesktop(container)
                 } label: {
-                    Label("Open desktop", systemImage: "macwindow")
+                    Label("Open 32-bit desktop", systemImage: "macwindow")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Button {
+                    save()
+                    model.launchX64Desktop(container)
+                } label: {
+                    Label("Open 64-bit desktop", systemImage: "macwindow.on.rectangle")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Button {

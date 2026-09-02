@@ -233,6 +233,10 @@ static void BVNDXMTDisplayQueuePlacement(void) {
 }
 
 void BVNDXMTDisplayNotePresented(uint32_t pid) {
+    // The performance overlay counts presented frames from the Vulkan and
+    // X11 paths; a DXMT present is a visible frame too, or the overlay reads
+    // 0 fps while the cube spins.
+    BVNGuestPerformanceFramePresented();
     atomic_store_explicit(&gDisplayPresenterPid, pid, memory_order_release);
     if (atomic_exchange_explicit(&gDisplayPresented, true,
                                  memory_order_acq_rel)) {

@@ -5436,3 +5436,24 @@ dereferences the pointer when it reports; by then the slot holds a guest
 address. The x86-64 PE build now patches the census to keep the device
 handle by value (guarded like the meson edits). The letterboxed placement
 was confirmed: `frame=402x301@0,286 window=402x874`.
+
+## The cube runs; 64-bit desktop; WoW64 phase 0 (after b16685a4)
+
+Device run on b16685a4: `geometry ok`, 240 presents, `complete ok`, the
+rotating cube letterboxed in the desktop rectangle. Two observations from
+that run, both expected: the cube stops after its 240 frames, and the
+process then faults in ntdll at teardown (read of 0 at 0x7FFFFFA5B98C,
+thread 0084, right after two rt_sigreturn redirects), which starts winedbg
+and keeps the process, and so the layer, alive. That teardown fault is the
+next defect on the 64-bit lane.
+
+- The performance overlay counts DXMT presents now (`BVNDXMTDisplayNotePresented`
+  feeds `BVNGuestPerformanceFramePresented`); it read 0 fps during the cube.
+- The container view has "Open 32-bit desktop" (unchanged path) and "Open
+  64-bit desktop": explorer `/desktop=shell,WxH` + winefile on the x86-64
+  lane (FEX, DXMT modules projected, separate `-x64` prefix), sharing the
+  staging helper with the cube probe.
+- WoW64 phase 0 is recorded in `docs/PLAN_WOW64_UNDER_FEX64.md`: Ubuntu's
+  Wine 9.0 already provides `wow64*.dll` in the 64-bit tree and the
+  matching `i386-windows` PE tree in `libwine:i386`; DXMT's unix side has
+  the 32-bit thunk table. Phase 1 (packaging both trees) is in progress.

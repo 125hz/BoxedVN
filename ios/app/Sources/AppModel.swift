@@ -575,52 +575,69 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Runs the bundled AMD64 Direct3D 11 probe through Wine64 and the
-    /// BoxedWine-owned FEX/DXMT path. Every resource is checked here so a
-    /// packaging omission becomes an actionable alert instead of a guest
-    /// loader failure several seconds later.
-    func launchX64GraphicsProbe(_ container: WineContainer) {
-        guard let rootFilesystem else {
-            alertMessage = "No root filesystem is installed."
-            return
+    /// The bundled resources every x86-64 (FEX + DXMT) launch needs, and the
+    /// per-container locations they are staged into. The DXMT PE modules are
+    /// copied into a hidden directory on the container's D: drive, which the
+    /// runtime projects over Wine's module root (`-x64modules`); the 64-bit
+    /// prefix is kept apart from the 32-bit one because the two Wine builds
+    /// cannot share a prefix.
+    private struct X64Runtime {
+        let glibc: URL
+        let wine64: URL
+        let dxmt: URL
+        let writableRoot: URL
+        let files: URL
+        let diagnostics: URL
+
+        /// The guest path D: resolves to for `diagnostics`. BoxedWine -w takes
+        /// a guest Linux directory, not a Windows path: the Windows form left
+        /// the process with no valid current directory at all (the device log
+        /// showed open(".") -> -2).
+        var guestWorkingDirectory: String {
+            "/mnt/drive_d/.boxedvn-x64-diagnostics"
         }
+
+        static let dxmtModules = ["d3d11.dll", "dxgi.dll", "d3d10core.dll",
+                                  "winemetal.dll"]
+        static let environment = [
+            "WINEDEBUG=warn+module,warn+seh",
+            "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
+        ]
+    }
+
+    /// Locates the bundled Wine64, glibc and DXMT resources for `container`
+    /// and stages the DXMT modules. Every resource is checked here so a
+    /// packaging omission becomes an actionable alert instead of a guest
+    /// loader failure several seconds later. Returns nil after setting the
+    /// alert when something is missing.
+    private func prepareX64Runtime(for container: WineContainer) -> X64Runtime? {
         guard let prefixes = Storage.winePrefixes else {
             alertMessage = "Could not create the Wine prefix directory."
-            return
+            return nil
         }
         guard let glibcPointer = BVNPathBundledWine64GlibcZip(),
               let winePointer = BVNPathBundledWine64Zip(),
-              let probePointer = BVNPathBundledX64GraphicsProbe(),
               let dxmtPointer = BVNPathBundledDXMTDirectory() else {
-            alertMessage = "This build does not contain the validated Wine64, "
-                         + "DXMT, and AMD64 graphics-probe resources."
-            return
+            alertMessage = "This build does not contain the validated Wine64 "
+                         + "and DXMT resources."
+            return nil
         }
-
-        let glibc = URL(fileURLWithPath: String(cString: glibcPointer))
-        let wine64 = URL(fileURLWithPath: String(cString: winePointer))
-        let probe = URL(fileURLWithPath: String(cString: probePointer))
-        let dxmt = URL(fileURLWithPath: String(cString: dxmtPointer))
-        let writableRoot = prefixes.appendingPathComponent(
-            container.prefixName + "-x64", isDirectory: true)
         let files = ContainerLibrary.filesDirectory(for: container)
-        let diagnostics = files.appendingPathComponent(
-            ".boxedvn-x64-diagnostics", isDirectory: true)
-
+        let runtime = X64Runtime(
+            glibc: URL(fileURLWithPath: String(cString: glibcPointer)),
+            wine64: URL(fileURLWithPath: String(cString: winePointer)),
+            dxmt: URL(fileURLWithPath: String(cString: dxmtPointer)),
+            writableRoot: prefixes.appendingPathComponent(
+                container.prefixName + "-x64", isDirectory: true),
+            files: files,
+            diagnostics: files.appendingPathComponent(
+                ".boxedvn-x64-diagnostics", isDirectory: true))
         do {
             try FileManager.default.createDirectory(
-                at: diagnostics, withIntermediateDirectories: true)
-            let probeTarget = diagnostics.appendingPathComponent(
-                "boxedvn-d3d11-cube-x64.exe")
-            if FileManager.default.fileExists(atPath: probeTarget.path) {
-                try FileManager.default.removeItem(at: probeTarget)
-            }
-            try FileManager.default.copyItem(at: probe, to: probeTarget)
-
-            for name in ["d3d11.dll", "dxgi.dll", "d3d10core.dll",
-                         "winemetal.dll"] {
-                let source = dxmt.appendingPathComponent(name)
-                let target = diagnostics.appendingPathComponent(name)
+                at: runtime.diagnostics, withIntermediateDirectories: true)
+            for name in X64Runtime.dxmtModules {
+                let source = runtime.dxmt.appendingPathComponent(name)
+                let target = runtime.diagnostics.appendingPathComponent(name)
                 guard FileManager.default.fileExists(atPath: source.path) else {
                     throw LaunchFailure(message: "The bundled DXMT runtime is "
                         + "missing \(name).")
@@ -630,29 +647,51 @@ final class AppModel: ObservableObject {
                 }
                 try FileManager.default.copyItem(at: source, to: target)
             }
+        } catch {
+            alertMessage = "The 64-bit runtime could not be staged: "
+                         + error.localizedDescription
+            return nil
+        }
+        return runtime
+    }
+
+    /// Runs the bundled AMD64 Direct3D 11 probe through Wine64 and the
+    /// BoxedWine-owned FEX/DXMT path.
+    func launchX64GraphicsProbe(_ container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let probePointer = BVNPathBundledX64GraphicsProbe() else {
+            alertMessage = "This build does not contain the AMD64 graphics probe."
+            return
+        }
+        guard let runtime = prepareX64Runtime(for: container) else { return }
+        let probe = URL(fileURLWithPath: String(cString: probePointer))
+
+        do {
+            let probeTarget = runtime.diagnostics.appendingPathComponent(
+                "boxedvn-d3d11-cube-x64.exe")
+            if FileManager.default.fileExists(atPath: probeTarget.path) {
+                try FileManager.default.removeItem(at: probeTarget)
+            }
+            try FileManager.default.copyItem(at: probe, to: probeTarget)
 
             Log.write("Launching bundled AMD64 Direct3D 11 graphics probe "
                       + "through BoxedWine FEX and DXMT", category: "container")
             try Session.launch(
                 rootFilesystem: rootFilesystem,
-                rootFilesystemOverlays: [glibc, wine64],
-                writableRoot: writableRoot,
-                gameDirectory: files,
+                rootFilesystemOverlays: [runtime.glibc, runtime.wine64],
+                writableRoot: runtime.writableRoot,
+                gameDirectory: runtime.files,
                 sharedDirectory: Storage.sharedFiles,
+                // The executable stays a Windows path because Wine is what
+                // reads that one.
                 executablePath:
                     "d:\\.boxedvn-x64-diagnostics\\boxedvn-d3d11-cube-x64.exe",
                 arguments: [],
-                environment: [
-                    "WINEDEBUG=warn+module,warn+seh",
-                    "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
-                ],
-                // BoxedWine -w takes a guest Linux directory, not a
-                // Windows path. The Windows form left the process with no
-                // valid current directory at all -- the device log shows
-                // open(".") -> -2 -- so give it the guest path that D:
-                // resolves to. The executable argument below stays a
-                // Windows path because Wine is what reads that one.
-                workingDirectory: "/mnt/drive_d/.boxedvn-x64-diagnostics",
+                environment: X64Runtime.environment,
+                workingDirectory: runtime.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,
                 soundEnabled: false,
@@ -663,9 +702,52 @@ final class AppModel: ObservableObject {
                 sharedDriveLetter:
                     container.sharedDriveLetter.lowercased().first ?? "e",
                 windowsVersion: container.windowsVersion,
-                compatibilityDirectory: diagnostics)
+                compatibilityDirectory: runtime.diagnostics)
         } catch {
             alertMessage = "The 64-bit graphics probe could not start: "
+                         + error.localizedDescription
+        }
+    }
+
+    /// Opens the container's desktop on the x86-64 lane: Wine64 through FEX,
+    /// with the DXMT Direct3D modules projected in, so a 64-bit program
+    /// started from the file manager renders the way the cube probe does. The
+    /// desktop itself is the same explorer/winefile pair the 32-bit desktop
+    /// uses, in the container's own resolution and its separate 64-bit
+    /// prefix.
+    func launchX64Desktop(_ container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let runtime = prepareX64Runtime(for: container) else { return }
+        do {
+            Log.write("Launching the 64-bit desktop through BoxedWine FEX and DXMT",
+                      category: "container")
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                rootFilesystemOverlays: [runtime.glibc, runtime.wine64],
+                writableRoot: runtime.writableRoot,
+                gameDirectory: runtime.files,
+                sharedDirectory: Storage.sharedFiles,
+                executablePath: "explorer",
+                arguments: ["/desktop=shell,\(container.width)x\(container.height)",
+                            "winefile", "D:\\"],
+                environment: X64Runtime.environment,
+                workingDirectory: runtime.guestWorkingDirectory,
+                width: container.width,
+                height: container.height,
+                soundEnabled: Preferences.soundEnabled,
+                runThroughWine: true,
+                useFEX64: true,
+                useDXMT: true,
+                wineRenderer: BVNWineRendererAutomatic,
+                sharedDriveLetter:
+                    container.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container.windowsVersion,
+                compatibilityDirectory: runtime.diagnostics)
+        } catch {
+            alertMessage = "The 64-bit desktop could not start: "
                          + error.localizedDescription
         }
     }
