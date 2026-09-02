@@ -77,6 +77,7 @@ extern "C" bool BVNLogStartSessionFile(void);
 - (UIWindow*)superWindowForGuest;
 - (void)attachGuestPresentationToHost:(UIView*)host;
 - (void)detachGuestPresentationFromHost;
+- (UIView*)fullscreenPresentationHost;
 - (void)logPresentationTree:(const char*)stage;
 @end
 
@@ -154,6 +155,8 @@ static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanSurfaceViews = nil;
 // The live view host (see BVNGuestPresentationSetHostView below). Declared
 // here because the class methods above the setter consult it.
 static __weak UIView* gGuestPresentationHost = nil;
+static __weak UIView* gActivePresentationHost = nil;
+static UIView* gFullscreenPresentationHost = nil;
 extern std::atomic<bool> gLiveKeyboardVisible;
 extern "C" void BVNGuestOverlayInstall(void);
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanWaitingOverlays = nil;
@@ -226,6 +229,8 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     if (host == nil || guestWindow == nil || root == nil) {
         return;
     }
+    // The metal view and the overlay place into whatever this reports.
+    gActivePresentationHost = host;
     if (root.superview != host) {
         [root removeFromSuperview];
         root.frame = host.bounds;
@@ -288,6 +293,9 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 
 - (void)detachGuestPresentationFromHost {
     NSAssert(NSThread.isMainThread, @"Guest presentation moves on main");
+    gActivePresentationHost = nil;
+    [gFullscreenPresentationHost removeFromSuperview];
+    gFullscreenPresentationHost = nil;
     UIWindow* guestWindow = [super window];
     UIView* root = guestWindow.rootViewController.view;
     if (guestWindow == nil || root == nil) {
@@ -317,7 +325,24 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 // full-screen path, and comes back into the host when the device is upright
 // again. Only the orientation-lock-off case can rotate; with the lock on the
 // interface never turns.
+- (UIView*)fullscreenPresentationHost {
+    if (gFullscreenPresentationHost == nil) {
+        UIView* host = [[UIView alloc] initWithFrame:self.libraryWindow.bounds];
+        host.backgroundColor = UIColor.blackColor;
+        host.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                UIViewAutoresizingFlexibleHeight;
+        gFullscreenPresentationHost = host;
+    }
+    gFullscreenPresentationHost.frame = self.libraryWindow.bounds;
+    if (gFullscreenPresentationHost.superview != self.libraryWindow) {
+        [self.libraryWindow addSubview:gFullscreenPresentationHost];
+    }
+    [self.libraryWindow bringSubviewToFront:gFullscreenPresentationHost];
+    return gFullscreenPresentationHost;
+}
+
 - (void)deviceOrientationDidChange:(NSNotification*)notification {
+    (void)notification;
     if (gGuestPresentationHost == nil || [super window] == nil) {
         return;
     }
@@ -328,12 +353,16 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
         self.liveViewFullscreen = YES;
         BVNLogWrite(BVNLogLevelInfo, "frontend",
                     "Landscape: the live view takes the whole screen.");
-        [self detachGuestPresentationFromHost];
+        // The guest moves into a full-screen host over the library window,
+        // not back to SDL's window (whose view cannot move, so it is black).
+        [self attachGuestPresentationToHost:[self fullscreenPresentationHost]];
     } else if (!landscape && self.liveViewFullscreen) {
         self.liveViewFullscreen = NO;
         BVNLogWrite(BVNLogLevelInfo, "frontend",
                     "Portrait: the guest returns to the live view.");
         [self attachGuestPresentationToHost:gGuestPresentationHost];
+        [gFullscreenPresentationHost removeFromSuperview];
+        gFullscreenPresentationHost = nil;
     }
 }
 
@@ -896,7 +925,10 @@ extern "C" UIWindow* BVNGuestUIWindow(void) {
 // size reporting key on.
 
 extern "C" UIView* BVNGuestPresentationHostView(void) {
-    return NSThread.isMainThread ? gGuestPresentationHost : nil;
+    if (!NSThread.isMainThread) {
+        return nil;
+    }
+    return gActivePresentationHost ?: gGuestPresentationHost;
 }
 
 extern "C" void BVNGuestPresentationSetHostView(void* pointer) {

@@ -5786,3 +5786,15 @@ resolution controls lock while a guest runs. The software desktop path
 still renders through SDL's own view, which cannot move into the host, so
 the 64-bit desktop's live view stays a separate task from the metal cube.
 
+## Landscape fullscreen moved to a host, not SDL's window
+
+On c17c2095 a landscape turn returned the presentation to SDL's window,
+which showed black: UIKit never let SDL's view move, so the cube's metal
+view stayed in the hidden page host while the empty SDL window came
+forward. The live view now follows an active host that
+BVNGuestPresentationHostView reports, which the metal view and the overlay
+place into. Landscape swaps the active host to a black full-screen view
+over the library window; portrait swaps it back to the page host and
+removes the full-screen one. Ending the session clears the active host and
+drops the full-screen view.
+
