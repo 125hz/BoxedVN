@@ -127,7 +127,9 @@ BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(
 // the guest process that faulted. `BVNFEXBackendTakePendingIRCapTarget`
 // returns zero when nothing is pending and clears the slot when it is.
 void BVNFEXBackendPublishPendingIRCapTarget(uint64_t guestRIP);
-uint64_t BVNFEXBackendTakePendingIRCapTarget(void);
+// Takes the target only when `commandLine` matches the program that
+// published it (NULL matches anything); otherwise it stays pending.
+uint64_t BVNFEXBackendTakePendingIRCapTarget(const char* commandLine);
 
 // Execute one live BoxedWine-owned x86-64 process thread through FEX. Returns
 // false when the process is not a native-identity 64-bit process or FEX is not
