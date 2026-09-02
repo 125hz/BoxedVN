@@ -350,7 +350,8 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     }
     UIView* host = gGuestPresentationHost;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (gGuestPresentationHost == host && host != nil) {
+        if (gGuestPresentationHost == host && host != nil &&
+            !self.liveViewFullscreen) {
             [self attachGuestPresentationToHost:host];
         }
     });
@@ -382,6 +383,12 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
         addObserver:self
            selector:@selector(guestWindowDidBecomeVisible:)
                name:UIWindowDidBecomeVisibleNotification
+             object:nil];
+    [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
+    [NSNotificationCenter.defaultCenter
+        addObserver:self
+           selector:@selector(deviceOrientationDidChange:)
+               name:UIDeviceOrientationDidChangeNotification
              object:nil];
 
     // Let SDL install its lifecycle observers and schedule -postFinishLaunch,
@@ -937,6 +944,11 @@ extern "C" void BVNApplyPreferredOrientation(void) {
 
     UIWindowScene* scene = guestWindow.windowScene
                                ?: delegate.libraryWindow.windowScene;
+    if (!BVNOrientationLockEnabled()) {
+        BVNLogWrite(BVNLogLevelInfo, "frontend",
+                    "Orientation lock off: the app follows the device.");
+        return;
+    }
     if (scene != nil) {
         UIWindowSceneGeometryPreferencesIOS* preferences =
             [[UIWindowSceneGeometryPreferencesIOS alloc]
@@ -1000,7 +1012,7 @@ extern "C" void BVNAttachGuestWindowToScene(void) {
     // only trigger before, and a device run showed it never matching SDL's
     // window: the overlay and the DXMT layer went into the host while SDL's
     // window covered the screen, so neither touches nor frames were seen.
-    if (gGuestPresentationHost != nil) {
+    if (gGuestPresentationHost != nil && !delegate.liveViewFullscreen) {
         [delegate attachGuestPresentationToHost:gGuestPresentationHost];
         return;
     }

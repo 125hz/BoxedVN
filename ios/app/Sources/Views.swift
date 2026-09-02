@@ -965,6 +965,8 @@ struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("BoxedVN.preferredOrientation")
     private var preferredOrientation = 1
+    @AppStorage("BoxedVN.orientationLock")
+    private var orientationLock = true
     @AppStorage(Preferences.soundEnabledKey)
     private var soundEnabled = true
     @AppStorage("BoxedVN.presentation.fillCropPercent")
@@ -974,11 +976,16 @@ struct SettingsView: View {
     var body: some View {
         List {
             Section {
+                Toggle("Orientation lock", isOn: $orientationLock)
+                    .onChange(of: orientationLock) { _ in
+                        BVNApplyPreferredOrientation()
+                    }
                 Picker("App orientation", selection: $preferredOrientation) {
                     Text("Portrait").tag(0)
                     Text("Landscape").tag(1)
                     Text("Landscape flipped").tag(2)
                 }
+                .disabled(!orientationLock)
                 .onChange(of: preferredOrientation) { _ in
                     BVNApplyPreferredOrientation()
                 }
@@ -998,9 +1005,11 @@ struct SettingsView: View {
             } header: {
                 Text("Display")
             } footer: {
-                Text("BoxedVN stays in this orientation in the library and "
-                      + "while Wine is running. Change it here before "
-                      + "launching a game. Fill crop controls the maximum "
+                Text("With the orientation lock on, BoxedVN stays in the "
+                      + "chosen orientation in the library and while Wine is "
+                      + "running. With it off, the app follows the device, "
+                      + "and turning the phone sideways gives a running guest "
+                      + "the whole screen. Fill crop controls the maximum "
                       + "zoom used by Fill aspect: increase it to reduce "
                       + "black bars, or use 0% for an uncropped fit.")
             }
