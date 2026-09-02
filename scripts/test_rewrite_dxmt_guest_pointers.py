@@ -164,6 +164,15 @@ class ShaderTranslatorThunks(unittest.TestCase):
         self.assertIn("SM50GetErrorMessage(params->error, ", rewritten)
         self.assertIn("SM50GetArgumentsInfo(params->shader, ", rewritten)
 
+    def test_the_compiled_bitcode_pointer_is_tagged_for_the_round_trip(self) -> None:
+        rewritten = "\n".join(new for _, new in rewrite.THUNK_REWRITES["winemetal_unix.c"])
+        self.assertIn("boxedwine_dxmt_tag_compiled_bitcode("
+                      "BOXEDWINE_GUEST_PTR(params->data_out));", rewritten)
+        source = (REPO / "tools" / "dxmt" /
+                  "boxedwine_dxmt_sm50_arguments.c").read_text(encoding="utf-8")
+        self.assertIn("void boxedwine_dxmt_tag_compiled_bitcode(void* compiled_bitcode)", source)
+        self.assertIn("boxedwine_dxmt_tag_host_pointer(", source)
+
     def test_a_missing_or_duplicated_thunk_site_is_refused(self) -> None:
         with self.assertRaises(rewrite.RewriteError):
             rewrite.rewrite_thunks("nothing\n", [("SM50Compile(a)", "x")])
@@ -201,10 +210,12 @@ class TranslationHeaderContract(unittest.TestCase):
         self.assertIn("0x7F8000000000ULL", header)
         self.assertIn("kGuestTopClearMask = 0x7F8000000000ULL", alias)
         self.assertIn("if (!guest) {", header)
-        # Host pointers (between the low range and the identity lane) pass
-        # through: the compiled bitcode comes back to the guest as one.
-        self.assertIn("BOXEDWINE_DXMT_GUEST_LOW_END 0x100000000ULL", header)
-        self.assertIn("boxedwine_dxmt_is_host_pointer", header)
+        # A tagged host pointer (the compiled bitcode the guest passes back)
+        # is returned unchanged; nothing is decided by address range, since
+        # the guest's low range and host allocations overlap below 8 GiB.
+        self.assertIn("BOXEDWINE_DXMT_HOST_POINTER_TAG 0x4000000000000000ULL", header)
+        self.assertIn("boxedwine_dxmt_tag_host_pointer", header)
+        self.assertNotIn("is_host_pointer", header)
         self.assertIn("BOXEDWINE_SM50_ARGS(p)", header)
 
 

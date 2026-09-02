@@ -108,3 +108,17 @@ const void* boxedwine_dxmt_sm50_arguments(const void* guest_chain)
     }
     return head;
 }
+
+/* SM50GetCompiledBitcode returns a host pointer to the bitcode. The guest
+ * only ever passes it back (WMT::MakeDispatchData -> dispatch_data_create,
+ * which copies the bytes), through a site the rewrite translates, so tag it
+ * here and the translation returns it unchanged. */
+void boxedwine_dxmt_tag_compiled_bitcode(void* compiled_bitcode)
+{
+    struct SM50_COMPILED_BITCODE* out = compiled_bitcode;
+    if (out == NULL) {
+        return;
+    }
+    out->Data = (sm50_ptr64_t)(uintptr_t)boxedwine_dxmt_tag_host_pointer(
+        (uint64_t)(uintptr_t)out->Data);
+}

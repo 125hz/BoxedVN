@@ -79,9 +79,13 @@ THUNK_REWRITES = {
          "BOXEDWINE_GUEST_PTR(params->func_name), "
          "BOXEDWINE_GUEST_PTR(params->bitcode), "
          "BOXEDWINE_GUEST_PTR(params->error))"),
-        ("SM50GetCompiledBitcode(params->bitcode, params->data_out)",
+        # The bitcode pointer the translator returns is a host pointer the
+        # guest will pass back; tag it so the translation recognises it.
+        ("SM50GetCompiledBitcode(params->bitcode, params->data_out);",
          "SM50GetCompiledBitcode(params->bitcode, "
-         "BOXEDWINE_GUEST_PTR(params->data_out))"),
+         "BOXEDWINE_GUEST_PTR(params->data_out));\n"
+         "  boxedwine_dxmt_tag_compiled_bitcode("
+         "BOXEDWINE_GUEST_PTR(params->data_out));"),
         ("SM50GetErrorMessage(params->error, params->buffer, "
          "params->buffer_size)",
          "SM50GetErrorMessage(params->error, "

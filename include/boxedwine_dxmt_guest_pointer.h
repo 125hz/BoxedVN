@@ -23,13 +23,13 @@
  * the rewritten unix sources apply to every nested guest pointer they read.
  * A null pointer stays null.
  *
- * Host pointers pass through unchanged. The guest occupies three ranges
- * (below 4 GiB, the identity lane from 0x7800000000, and the top arena above
- * the clear mask) and the host's own allocations sit between 4 GiB and the
- * identity lane, where no guest address can be. That matters because DXMT's
- * shader translator hands the guest a host pointer to its compiled bitcode
- * and the guest passes it straight back to create a Metal library: a
- * translation that treated it as a guest address would corrupt it.
+ * One host pointer crosses into the guest and comes back: DXMT's shader
+ * translator hands the guest a host pointer to its compiled bitcode and the
+ * guest passes it straight back to create a Metal library. It cannot be
+ * told from a guest address by value (the guest's low range runs to 8 GiB,
+ * where host allocations also live), so the thunk that returns it sets a
+ * tag bit no guest address carries, and the translation strips the tag and
+ * returns the host pointer unchanged.
  */
 #ifndef BOXEDWINE_DXMT_GUEST_POINTER_H
 #define BOXEDWINE_DXMT_GUEST_POINTER_H
@@ -38,14 +38,13 @@
 
 #define BOXEDWINE_DXMT_GUEST_LOW_ALIAS_BASE 0x7800000000ULL
 #define BOXEDWINE_DXMT_GUEST_TOP_CLEAR_MASK 0x7F8000000000ULL
-/* Guest addresses below this are the canonical low range (aliased high);
- * host allocations never sit below it on the arm64 iOS process layout. */
-#define BOXEDWINE_DXMT_GUEST_LOW_END 0x100000000ULL
+/* Set on a host pointer handed to the guest so it is recognised when the
+ * guest passes it back. Guest addresses are canonical and below 2^47. */
+#define BOXEDWINE_DXMT_HOST_POINTER_TAG 0x4000000000000000ULL
 
-static inline int boxedwine_dxmt_is_host_pointer(uint64_t address)
+static inline uint64_t boxedwine_dxmt_tag_host_pointer(uint64_t host)
 {
-    return address >= BOXEDWINE_DXMT_GUEST_LOW_END &&
-           address < BOXEDWINE_DXMT_GUEST_LOW_ALIAS_BASE;
+    return host ? (host | BOXEDWINE_DXMT_HOST_POINTER_TAG) : 0;
 }
 
 static inline uintptr_t boxedwine_dxmt_host_pointer(uintptr_t guest)
@@ -53,8 +52,8 @@ static inline uintptr_t boxedwine_dxmt_host_pointer(uintptr_t guest)
     if (!guest) {
         return 0;
     }
-    if (boxedwine_dxmt_is_host_pointer((uint64_t)guest)) {
-        return guest;
+    if ((uint64_t)guest & BOXEDWINE_DXMT_HOST_POINTER_TAG) {
+        return (uintptr_t)((uint64_t)guest & ~BOXEDWINE_DXMT_HOST_POINTER_TAG);
     }
     return (uintptr_t)(((uint64_t)guest | BOXEDWINE_DXMT_GUEST_LOW_ALIAS_BASE) &
                        ~BOXEDWINE_DXMT_GUEST_TOP_CLEAR_MASK);
@@ -72,6 +71,10 @@ static inline uintptr_t boxedwine_dxmt_host_pointer(uintptr_t guest)
 extern "C" {
 #endif
 const void* boxedwine_dxmt_sm50_arguments(const void* guest_chain);
+/* Tags the Data pointer of a struct SM50_COMPILED_BITCODE the translator
+ * just filled in, so the guest can hand it back through any translated
+ * site. Same translation unit as the chain copy. */
+void boxedwine_dxmt_tag_compiled_bitcode(void* compiled_bitcode);
 #if defined(__cplusplus)
 }
 #endif

@@ -5386,7 +5386,10 @@ compilation-argument chain. The rewrite left them untranslated. Now:
   chain into thread-local host storage, translating `next` links and the
   input-layout / stream-output `elements` arrays, because airconv walks the
   chain natively (`args_get_data`).
-- `boxedwine_dxmt_host_pointer` passes host pointers (between 4 GiB and the
-  identity lane) through unchanged: airconv hands the guest a host pointer to
-  the compiled bitcode and the guest feeds it back into
-  `dispatch_data_create`.
+- airconv hands the guest a host pointer to the compiled bitcode and the
+  guest feeds it back into `dispatch_data_create`. A host pointer cannot be
+  told from a guest address by range (the guest's low range runs to 8 GiB,
+  where host allocations also live; the host test suite caught a first
+  attempt that assumed 4 GiB), so the GetCompiledBitcode thunk tags the
+  pointer with bit 62 and `boxedwine_dxmt_host_pointer` strips the tag and
+  returns it unchanged.
