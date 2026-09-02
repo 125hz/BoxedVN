@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Rewrite DXMT's unix sources so every guest pointer they read is translated.
+
+DXMT's winemetal unix side reads guest memory through the `.ptr` field of
+WMTMemoryPointer/WMTConstMemoryPointer and through a few raw uint64_t fields
+it casts itself. Under BoxedWine the translated guest is dereferenced through
+one address rule (include/boxedwine_dxmt_guest_pointer.h): the identity for
+the high lane, an alias for the canonical low range, and a relocation for
+Wine's top-down arena, where every unix-call parameter block and every
+stack-resident descriptor lives. Reading those pointers untranslated is what
+a device run reported as EFAULT on every DXMT call.
+
+The rewrite wraps each *read* of such a pointer in BOXEDWINE_GUEST_PTR(...):
+
+  * `<expr>.ptr` that is not the target of an assignment;
+  * the raw casts DXMT applies to `params->buffer_ptr`, `params->arg` and
+    `params->handle` where the field is a guest address rather than a host
+    object handle (named explicitly, each expected exactly once).
+
+Object handles (the `(NSObject *)params->handle` family) are host pointers
+and are left alone. The rewritten copy is written beside the original so its
+relative includes still resolve, and the original is never modified. Every
+expected site must be found exactly once; a pinned-source change that adds
+or removes one fails the build rather than silently shipping an untranslated
+read.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+
+MACRO = "BOXEDWINE_GUEST_PTR"
+
+# `a->b.c.ptr` style chains, not preceded by the macro itself and not the
+# left-hand side of a plain assignment (`==` is a comparison and is allowed).
+PTR_READ = re.compile(
+    r"(?<![\w.>])"
+    r"(?P<expr>[A-Za-z_]\w*(?:\[[^\]]*\])?(?:(?:->|\.)[A-Za-z_]\w*(?:\[[^\]]*\])?)*)"
+    r"\.ptr\b(?!\s*=(?!=))"
+)
+
+# Raw guest addresses DXMT casts itself. Each entry is (file, literal) and
+# must appear exactly once in that file.
+RAW_SITES = {
+    "winemetal_unix.c": [
+        "(char *)params->buffer_ptr",
+        "(char *)params->arg",
+        "(struct WMTRenderPassInfo *)params->arg",
+        "(void *)params->handle",
+    ],
+    "cache.c": [],
+}
+
+# `.ptr` reads expected per file, so a drift in the pinned source is noticed.
+EXPECTED_PTR_READS = {
+    "winemetal_unix.c": 50,
+    "cache.c": 5,
+}
+
+
+class RewriteError(RuntimeError):
+    pass
+
+
+def wrap(expression: str) -> str:
+    return f"{MACRO}({expression})"
+
+
+def rewrite_ptr_reads(text: str) -> tuple[str, int]:
+    count = 0
+
+    def replace(match: re.Match) -> str:
+        nonlocal count
+        count += 1
+        return wrap(match.group("expr") + ".ptr")
+
+    return PTR_READ.sub(replace, text), count
+
+
+def rewrite_raw_sites(text: str, sites: list[str]) -> str:
+    for literal in sites:
+        occurrences = text.count(literal)
+        if occurrences != 1:
+            raise RewriteError(
+                f"expected exactly one occurrence of {literal!r}, found {occurrences}")
+        cast, _, field = literal.rpartition(")")
+        text = text.replace(literal, f"{cast}){wrap(field)}", 1)
+    return text
+
+
+def rewrite_source(name: str, text: str) -> str:
+    if MACRO in text:
+        raise RewriteError(f"{name}: already rewritten")
+    rewritten, count = rewrite_ptr_reads(text)
+    expected = EXPECTED_PTR_READS.get(name)
+    if expected is not None and count != expected:
+        raise RewriteError(
+            f"{name}: rewrote {count} .ptr reads, expected {expected}; "
+            "the pinned DXMT source changed, re-audit the dereference sites")
+    return rewrite_raw_sites(rewritten, RAW_SITES.get(name, []))
+
+
+def output_name(source: pathlib.Path) -> pathlib.Path:
+    return source.with_name(source.stem + ".boxedwine" + source.suffix)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("sources", nargs="+", type=pathlib.Path)
+    args = parser.parse_args(argv)
+    try:
+        for source in args.sources:
+            text = source.read_text(encoding="utf-8")
+            rewritten = rewrite_source(source.name, text)
+            target = output_name(source)
+            target.write_text(rewritten, encoding="utf-8", newline="\n")
+            print(f"rewrote {source} -> {target}")
+    except RewriteError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

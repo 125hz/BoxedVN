@@ -5232,3 +5232,33 @@ prefix preparation the overlay was placed in, so the guest path did not
 resolve yet. The projection now runs after the mounts. Everything else in
 those logs matches the previous accepted boundary: bridge markers through
 `map-window`, then `d3d11-create fail hr=0x887a0004` from wined3d.
+
+
+---
+
+### DXMT parameter blocks live on Wine's thread stacks
+
+Logs 184457 and 184712 at ce1f3a97 project all four DXMT modules
+(`status=projected`), and the Metal unix-call bridge fires on a device for
+the first time: `BOXEDWINE_DXMT_CALL` for index 119 (shader cache path),
+then 4 (MTLCopyAllDevices) and 3 (NSArray count) from D3D11CreateDevice.
+Every call returns `status=-14 reason=args`: the parameter block is at
+0x7ffffe1ff4e8, on the calling thread's stack in Wine's top-down arena,
+which the host serves through a relocated alias rather than at its own
+address. The dispatcher's identity check refused it, DXMT saw no adapter,
+and the probe failed with DXGI_ERROR_NOT_FOUND.
+
+Two changes. The dispatcher now translates the block with the translator's
+own rule (`guestToHostAddress`) and accepts only a host page this address
+space tracks. And DXMT's unix sources read nested guest pointers directly
+(fifty `.ptr` reads plus four raw casts in winemetal_unix.c, five in
+cache.c), so `scripts/rewrite-dxmt-guest-pointers.py` rewrites the two files
+beside the originals with every read wrapped in a translation macro that is
+force-included from `include/boxedwine_dxmt_guest_pointer.h`. The rewrite
+counts its sites and fails on drift. 477 host tests and the rewrite's own
+contract pass; the iOS native DXMT build is the gate for the rewritten
+sources.
+
+Next device evidence: `BOXEDWINE_DXMT_ARGS guest=0x7ffffe... host=0x7ffe...`,
+`BOXEDWINE_DXMT_RETURN ... status=0` for indices 119, 4 and 3, an adapter
+found, and whatever D3D11CreateDevice does after that.

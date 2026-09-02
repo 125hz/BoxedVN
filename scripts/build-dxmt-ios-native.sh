@@ -192,8 +192,26 @@ compile_one() {
 
 log "dxmt: compiling"
 
-compile_one objc "${DXMT_SRC}/winemetal/unix/winemetal_unix.c" winemetal_unix
-compile_one objc "${DXMT_SRC}/winemetal/unix/cache.c" cache
+# The unix side reads guest pointers directly. Under BoxedWine the guest is
+# dereferenced through one address rule (include/boxedwine_dxmt_guest_pointer.h)
+# that is not the identity for Wine's thread stacks, where every unix-call
+# parameter block and its stack-resident descriptors live; a device run had
+# every DXMT call refused for exactly that reason. The two unix sources are
+# rewritten beside the originals so each guest pointer read is translated,
+# and the translation helper is force-included into those translation units.
+# The originals are never modified; a pinned-source change that moves a
+# dereference site fails the rewrite rather than shipping an untranslated read.
+require_command python3
+python3 "${BOXEDVN_ROOT}/scripts/rewrite-dxmt-guest-pointers.py" \
+    "${DXMT_SRC}/winemetal/unix/winemetal_unix.c" \
+    "${DXMT_SRC}/winemetal/unix/cache.c" \
+    || die "dxmt: could not rewrite the unix side's guest pointer reads"
+GUEST_POINTER_HEADER="${BOXEDVN_ROOT}/include/boxedwine_dxmt_guest_pointer.h"
+require_file "${GUEST_POINTER_HEADER}"
+COMMON_FLAGS+=(-include "${GUEST_POINTER_HEADER}")
+
+compile_one objc "${DXMT_SRC}/winemetal/unix/winemetal_unix.boxedwine.c" winemetal_unix
+compile_one objc "${DXMT_SRC}/winemetal/unix/cache.boxedwine.c" cache
 
 for cpp in airconv_context air_type air_signature air_operations \
            dxbc_converter dxbc_converter_gs dxbc_converter_ts \

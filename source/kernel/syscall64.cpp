@@ -3564,19 +3564,38 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         }
         return (U64)(S64)-K_EINVAL;
     }
-    // The native table dereferences the unix-call parameter block directly.
-    // Accept only a mapped address from the guarded identity window; otherwise
-    // a guest could present an arbitrary host pointer to Objective-C/Metal code.
-    if (args < K64_NATIVE_GUEST_WINDOW_START ||
-        args >= K64_NATIVE_GUEST_WINDOW_END ||
-        !(cpu->memory->getPageFlags(args >> K64_PAGE_SHIFT) &
-          K64_PAGE_MAPPED)) {
+    // The native table dereferences the unix-call parameter block directly,
+    // so it needs the HOST address of the guest block. DXMT's PE side builds
+    // the block on the calling thread's stack, which Wine places in its
+    // top-down arena: canonical 0x7ffffe... addresses that the host serves
+    // through a relocated alias, not at their own address. A device run had
+    // every DXMT call refused here because that region failed the identity
+    // check. Translate with the same rule the translator uses and accept
+    // only a block whose host page this address space actually tracks;
+    // otherwise a guest could present an arbitrary host pointer to
+    // Objective-C/Metal code. The nested guest pointers inside the block are
+    // translated by the rewritten unix sources themselves (see
+    // scripts/rewrite-dxmt-guest-pointers.py).
+    const U64 hostArgs = boxedvn::guestToHostAddress(args);
+    const bool guestRangeValid =
+        args != 0 && boxedvn::guestRangeHostable(args, 8);
+    const bool hostTracked = guestRangeValid &&
+        cpu->memory->nativeRangeCoversForPlan(hostArgs, hostArgs + 8);
+    if (!hostTracked) {
         if (logCall) {
-            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=args",
-                     logOrdinal, -K_EFAULT);
+            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=args "
+                     "guest=0x%llx host=0x%llx hostable=%d",
+                     logOrdinal, -K_EFAULT, (unsigned long long)args,
+                     (unsigned long long)hostArgs, (int)guestRangeValid);
         }
         return (U64)(S64)-K_EFAULT;
     }
+    if (logCall && hostArgs != args) {
+        klog_fmt("BOXEDWINE_DXMT_ARGS ordinal=%u guest=0x%llx host=0x%llx",
+                 logOrdinal, (unsigned long long)args,
+                 (unsigned long long)hostArgs);
+    }
+    args = hostArgs;
 
 #if defined(BOXEDWINE_DXMT_NATIVE)
     using DxmtUnixEntry = S32 (*)(void*);
