@@ -38,8 +38,13 @@ STAGES = (
     "dxgi-factory",
     "swapchain",
     "render-target",
+    "shaders",
+    "geometry",
     "present",
 )
+SHADER_HLSL = REPO / "scripts" / "guest-probes" / "x64-d3d11-cube.hlsl"
+SHADER_HEADER = REPO / "scripts" / "guest-probes" / "x64-d3d11-cube-shaders.h"
+SHADER_GENERATOR = REPO / "scripts" / "generate-x64-probe-shaders.py"
 
 
 class ProbeMarkers(unittest.TestCase):
@@ -55,7 +60,8 @@ class ProbeMarkers(unittest.TestCase):
                 or f'stage_line("{stage}' in self.source,
                 f"{stage} never reports success")
         # A stage that can fail has to say so with the captured error.
-        for stage in ("register-class", "create-window", "d3d11-create"):
+        for stage in ("register-class", "create-window", "d3d11-create",
+                      "shaders", "geometry"):
             self.assertIn(f'stage_fail("{stage}"', self.source,
                           f"{stage} never reports failure")
 
@@ -115,6 +121,120 @@ class ProbeMarkers(unittest.TestCase):
         # and would also collapse two stages that fail for different reasons.
         self.assertIn("D3D11CreateDevice(", self.source)
         self.assertNotIn("D3D11CreateDeviceAndSwapChain", self.source)
+
+
+class CubeGeometryAndShaders(unittest.TestCase):
+    """The probe draws a cube through embedded DXBC.
+
+    The first device runs only cleared the render target, which proved
+    presentation and nothing about shaders: a clear is a render pass load
+    action, not a pipeline. The cube exercises the DXBC-to-Metal translation,
+    an input layout, three buffers, a viewport, and an indexed draw. The DXBC
+    is compiled ahead of time with fxc, which exists only in the Windows SDK,
+    so the generated header is committed and pinned to the HLSL it came from.
+    """
+
+    def setUp(self) -> None:
+        self.source = PROBE_SOURCE.read_text(encoding="utf-8")
+        self.header = SHADER_HEADER.read_text(encoding="utf-8")
+
+    def test_the_probe_draws_an_indexed_cube_every_frame(self) -> None:
+        loop_at = self.source.find('stage_begin("present")')
+        loop = self.source[loop_at:]
+        for call in ("ID3D11DeviceContext_UpdateSubresource(",
+                     "ID3D11DeviceContext_ClearRenderTargetView(",
+                     "ID3D11DeviceContext_DrawIndexed(",
+                     "IDXGISwapChain_Present("):
+            self.assertIn(call, loop)
+        # The clear precedes the draw, the draw precedes the present.
+        self.assertLess(loop.find("ClearRenderTargetView"),
+                        loop.find("DrawIndexed"))
+        self.assertLess(loop.find("DrawIndexed"), loop.find("_Present("))
+
+    def test_pipeline_state_is_complete(self) -> None:
+        # Direct3D 11 has no default viewport; a missing one draws nothing
+        # and reports nothing, which would look exactly like a DXMT defect.
+        for call in ("RSSetViewports", "IASetInputLayout", "IASetVertexBuffers",
+                     "IASetIndexBuffer", "IASetPrimitiveTopology",
+                     "VSSetShader", "VSSetConstantBuffers", "PSSetShader"):
+            self.assertIn(call, self.source, f"{call} is never called")
+
+    def test_shaders_and_geometry_report_the_failing_object(self) -> None:
+        for step in ("vertex-shader", "pixel-shader", "input-layout",
+                     "vertex-buffer", "index-buffer", "constant-buffer"):
+            self.assertIn(f"stage={step}", self.source,
+                          f"a failed {step} would not be named")
+
+    def test_the_cube_is_wound_clockwise_from_outside(self) -> None:
+        # Direct3D's default rasterizer culls counter-clockwise triangles in
+        # its left-handed convention. Without a depth buffer the cube only
+        # renders correctly if every triangle is clockwise seen from outside,
+        # which for these coordinates means the right-hand-rule normal points
+        # away from the centre.
+        vertex_block = re.search(r"kCubeVertices\[8\] = \{(.*?)\};",
+                                 self.source, re.S).group(1)
+        vertices = [tuple(float(v) for v in m)
+                    for m in re.findall(
+                        r"\{\{\s*(-?[\d.]+)f,\s*(-?[\d.]+)f,\s*(-?[\d.]+)f\}",
+                        vertex_block)]
+        self.assertEqual(len(vertices), 8)
+        index_block = re.search(r"kCubeIndices\[36\] = \{(.*?)\};",
+                                self.source, re.S).group(1)
+        indices = [int(v) for v in re.findall(r"\b(\d+)\b", index_block)]
+        self.assertEqual(len(indices), 36)
+        for t in range(0, 36, 3):
+            a, b, c = (vertices[i] for i in indices[t:t + 3])
+            ab = [b[i] - a[i] for i in range(3)]
+            ac = [c[i] - a[i] for i in range(3)]
+            n = (ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2],
+                 ab[0] * ac[1] - ab[1] * ac[0])
+            centre = [(a[i] + b[i] + c[i]) / 3 for i in range(3)]
+            self.assertGreater(sum(n[i] * centre[i] for i in range(3)), 0,
+                               f"triangle {indices[t:t + 3]} faces inward")
+
+    def test_the_matrix_layout_matches_the_hlsl(self) -> None:
+        # The C side uploads a row-major array applied as M * v; the HLSL
+        # declares the matrix row_major and multiplies mul(mvp, v). Either
+        # side changing alone would silently render nothing recognisable.
+        hlsl = SHADER_HLSL.read_text(encoding="utf-8")
+        self.assertIn("row_major float4x4 mvp", hlsl)
+        self.assertIn("mul(mvp, float4(input.position, 1.0))", hlsl)
+        self.assertIn("m[4][4]", self.source)
+        self.assertIn("r.m[0][3] = x;", self.source)
+
+    def test_the_embedded_dxbc_is_pinned_to_the_hlsl(self) -> None:
+        import hashlib
+        digest = hashlib.sha256(SHADER_HLSL.read_bytes()).hexdigest()
+        self.assertIn(f'#define BOXEDVN_PROBE_HLSL_SHA256 "{digest}"',
+                      self.header,
+                      "the HLSL changed; run scripts/generate-x64-probe-"
+                      "shaders.py on a machine with fxc")
+        self.assertIn('#include "x64-d3d11-cube-shaders.h"', self.source)
+        self.assertTrue(SHADER_GENERATOR.is_file())
+
+    def test_the_embedded_blobs_are_well_formed_dxbc(self) -> None:
+        import struct
+        for name in ("kProbeVertexShader", "kProbePixelShader"):
+            match = re.search(
+                rf"static const BYTE {name}\[(\d+)\] = \{{(.*?)\}};",
+                self.header, re.S)
+            self.assertIsNotNone(match, f"{name} is missing")
+            declared = int(match.group(1))
+            data = bytes(int(v, 16) for v in re.findall(r"0x([0-9a-f]{2})",
+                                                        match.group(2)))
+            self.assertEqual(len(data), declared)
+            self.assertEqual(data[:4], b"DXBC")
+            self.assertEqual(struct.unpack_from("<I", data, 24)[0], len(data))
+
+    def test_the_builder_checks_the_new_markers(self) -> None:
+        builder = PROBE_BUILDER.read_text(encoding="utf-8")
+        self.assertIn("'shaders'", builder)
+        self.assertIn("'geometry'", builder)
+
+    def test_the_shader_header_invalidates_the_cache(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("'scripts/guest-probes/x64-d3d11-cube-shaders.h'",
+                      workflow)
 
 
 class ProbeBuildAndStaging(unittest.TestCase):

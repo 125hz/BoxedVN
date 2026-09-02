@@ -5354,3 +5354,17 @@ why the earlier ordering check returned silently. Two follow-ups here:
 
 Still open: the process faults in ntdll (read of 0 at 0x7FFFFFA5B98C,
 thread 007c) after reporting completion, on every run.
+
+## The probe now draws a cube (after 571ef6c7)
+
+The x86-64 probe only ever cleared the render target; its device output was
+a flat, slowly changing colour, which proved presentation and nothing about
+shaders. It now draws a spinning per-face-coloured cube over that clear:
+DXBC vertex and pixel shaders compiled ahead of time with fxc (shader model
+4.0, `scripts/guest-probes/x64-d3d11-cube.hlsl` ->
+`x64-d3d11-cube-shaders.h` via `scripts/generate-x64-probe-shaders.py`,
+pinned by HLSL hash), an input layout, immutable vertex/index buffers, a
+default-usage constant buffer updated per frame, an explicit viewport, and
+an indexed draw. No depth buffer: the cube is convex and back faces are
+culled, so a depth defect cannot masquerade as a draw defect. New stages
+`shaders` and `geometry` name the failing object; exit codes 17 and 18.

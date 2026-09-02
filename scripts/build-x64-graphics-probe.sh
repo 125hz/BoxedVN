@@ -69,6 +69,8 @@ for marker in \
     'register-class' \
     'create-window' \
     'd3d11-create' \
+    'shaders' \
+    'geometry' \
     'present'; do
     grep -qa -- "${marker}" "${OUTPUT}" \
         || die "The built probe does not contain the '${marker}' marker string."
