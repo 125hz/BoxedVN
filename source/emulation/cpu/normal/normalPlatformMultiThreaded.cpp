@@ -99,9 +99,25 @@ static void platformThread(CPU* cpu) {
             try {
 #ifdef BOXEDWINE_FEX64_BACKEND
                 if (process->useFEX64) {
-                    klog_fmt("BOXEDWINE_FEX64_SCHED enter process=%d thread=%d rip=0x%llx",
-                             process->id, cpu->thread->id,
-                             (unsigned long long)cpu64->rip);
+                    {
+                        // A thread that keeps re-entering at one RIP is
+                        // making no progress; eight lines show it, and a
+                        // storm witness every 65536 entries keeps it
+                        // visible without a log that grows by the second.
+                        static thread_local unsigned long long lastEnterRip = 0;
+                        static thread_local unsigned long long sameRipEntries = 0;
+                        const unsigned long long rip = (unsigned long long)cpu64->rip;
+                        sameRipEntries = rip == lastEnterRip ? sameRipEntries + 1 : 0;
+                        lastEnterRip = rip;
+                        if (sameRipEntries < 8) {
+                            klog_fmt("BOXEDWINE_FEX64_SCHED enter process=%d thread=%d rip=0x%llx",
+                                     process->id, cpu->thread->id, rip);
+                        } else if ((sameRipEntries & 0xffff) == 0) {
+                            klog_fmt("BOXEDWINE_FEX64_REENTRY_STORM process=%d thread=%d "
+                                     "rip=0x%llx entries=%llu",
+                                     process->id, cpu->thread->id, rip, sameRipEntries);
+                        }
+                    }
                     BVNFEXCPU64RunOutcome outcome =
                         BVNFEXCPU64RunOutcomeYield;
                     const bool dispatched =

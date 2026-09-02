@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cstdio>
+#include <ctime>
 /*
  *  BoxedVN - iOS/iPadOS port of Boxedwine
  *  Copyright (C) 2026  The BoxedWine Team
@@ -179,6 +182,105 @@ void writeToSinks(const char* text, size_t length) {
     pthread_mutex_unlock(&gMutex);
 }
 
+// Flood limiter. A guest that spins through the same few lines (a thread
+// re-entering one instruction, a translator message per re-entry) wrote a
+// 190 MB session log in a minute. Each distinct line body gets an allowance
+// per window; beyond it the line is dropped and counted, and the count is
+// written once when the window rolls over. Timestamps are skipped so
+// BoxedVN's own stamped lines dedupe like the emulator's unstamped ones.
+struct FloodSlot {
+    uint64_t hash = 0;
+    uint32_t seen = 0;
+    uint32_t suppressed = 0;
+    char sample[100] = {0};
+};
+constexpr size_t kFloodSlots = 64;
+constexpr uint32_t kFloodAllowance = 24;
+constexpr double kFloodWindowSeconds = 2.0;
+FloodSlot gFloodSlots[kFloodSlots];
+double gFloodWindowStart = 0.0;
+pthread_mutex_t gFloodMutex = PTHREAD_MUTEX_INITIALIZER;
+
+double floodNow() {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+}
+
+uint64_t floodHash(const char* text, size_t length) {
+    size_t start = 0;
+    if (length > 24 && text[4] == '-' && text[7] == '-' && text[10] == ' ' &&
+        text[13] == ':' && text[16] == ':') {
+        start = 24; // "YYYY-MM-DD HH:MM:SS.mmm "
+    }
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = start; i < length; ++i) {
+        hash ^= (uint8_t)text[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+// True when the line should reach the sinks. Writes the previous window's
+// summaries itself. Caller must NOT hold gMutex.
+bool floodAdmit(const char* text, size_t length) {
+    const uint64_t hash = floodHash(text, length);
+    std::string summaries;
+    pthread_mutex_lock(&gFloodMutex);
+    const double now = floodNow();
+    if (now - gFloodWindowStart >= kFloodWindowSeconds) {
+        for (FloodSlot& slot : gFloodSlots) {
+            if (slot.suppressed > 0) {
+                char line[192];
+                const int written = snprintf(
+                    line, sizeof(line), "BOXEDVN_LOG_SUPPRESSED repeated=%u: %s\n",
+                    slot.suppressed, slot.sample);
+                if (written > 0) {
+                    summaries.append(line, (size_t)std::min<int>(written, (int)sizeof(line) - 1));
+                }
+            }
+            slot = FloodSlot();
+        }
+        gFloodWindowStart = now;
+    }
+    FloodSlot* match = nullptr;
+    FloodSlot* empty = nullptr;
+    for (FloodSlot& slot : gFloodSlots) {
+        if (slot.seen != 0 && slot.hash == hash) {
+            match = &slot;
+            break;
+        }
+        if (empty == nullptr && slot.seen == 0) {
+            empty = &slot;
+        }
+    }
+    bool admit = true;
+    if (match == nullptr) {
+        if (empty != nullptr) {
+            empty->hash = hash;
+            empty->seen = 1;
+            empty->suppressed = 0;
+            size_t copied = 0;
+            for (size_t i = 0; i < length && copied + 1 < sizeof(empty->sample); ++i) {
+                if (text[i] == '\n' || text[i] == '\r') break;
+                empty->sample[copied++] = text[i];
+            }
+            empty->sample[copied] = 0;
+        }
+    } else {
+        match->seen += 1;
+        if (match->seen > kFloodAllowance) {
+            match->suppressed += 1;
+            admit = false;
+        }
+    }
+    pthread_mutex_unlock(&gFloodMutex);
+    if (!summaries.empty()) {
+        writeToSinks(summaries.data(), summaries.size());
+    }
+    return admit;
+}
+
 int gCapturePipe[2] = {-1, -1};
 
 void* captureThread(void* /*context*/) {
@@ -188,15 +290,24 @@ void* captureThread(void* /*context*/) {
     while (true) {
         const ssize_t count = read(gCapturePipe[0], buffer, sizeof(buffer));
         if (count > 0) {
-            writeToSinks(buffer, static_cast<size_t>(count));
             pendingLine.append(buffer, static_cast<size_t>(count));
             std::size_t newline = 0;
             while ((newline = pendingLine.find('\n')) != std::string::npos) {
-                const std::string line = pendingLine.substr(0, newline);
+                // Whole lines reach the sinks, each through the flood
+                // limiter; a partial line waits for its newline.
+                const std::string line = pendingLine.substr(0, newline + 1);
                 if (line.find("BOXEDVN boot ") != std::string::npos) {
                     observeBootHeartbeat();
                 }
+                if (floodAdmit(line.data(), line.size())) {
+                    writeToSinks(line.data(), line.size());
+                }
                 pendingLine.erase(0, newline + 1);
+            }
+            if (pendingLine.size() > 64 * 1024) {
+                // A runaway unterminated line is flushed rather than held.
+                writeToSinks(pendingLine.data(), pendingLine.size());
+                pendingLine.clear();
             }
             // A guest can write an arbitrarily long unterminated line. Keep
             // enough tail to recognise the marker across reads without
@@ -331,7 +442,9 @@ extern "C" void BVNLogWrite(BVNLogLevel level, const char* category,
 
     // Written to the sinks directly rather than through stdout, so BoxedVN's
     // own entries do not depend on the capture pipe being healthy.
-    writeToSinks(line.data(), line.size());
+    if (floodAdmit(line.data(), line.size())) {
+        writeToSinks(line.data(), line.size());
+    }
 
     pthread_mutex_lock(&gMutex);
     os_log_t osLog = gOSLog;

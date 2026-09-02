@@ -446,6 +446,11 @@ void BVNGuestPerformanceSnapshot(double* framesPerSecond,
 // Monotonic count of presented guest frames, for the page's own FPS math.
 uint64_t BVNGuestPresentedFrameCount(void);
 
+// Frame-rate cap: 0 = unlocked, 1 = 60, 2 = 120, 3 = 30. Setting it applies
+// the software pacer and the display cadence at once. Main thread only.
+int BVNGuestFrameRateMode(void);
+void BVNGuestSetFrameRateMode(int mode);
+
 // Live-view control bar. Toggle the on-screen keyboard, read and set the
 // pointer mode (0 = direct tap, 1 = Wine cursor), and tap a key by its SDL
 // scancode name ("Return", "Space", "Escape", "Tab", ...). Main thread only.

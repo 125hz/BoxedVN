@@ -78,6 +78,11 @@ extern "C" bool BVNLogStartSessionFile(void);
 - (void)attachGuestPresentationToHost:(UIView*)host;
 - (void)detachGuestPresentationFromHost;
 - (UIView*)fullscreenPresentationHost;
+@end
+
+static void BVNSyncGuestX11PatchGeometry(UIView* presentation);
+
+@interface BVNAppDelegate ()
 - (void)logPresentationTree:(const char*)stage;
 @end
 
@@ -132,7 +137,12 @@ static BOOL BVNOrientationLockEnabled(void) {
 }
 static UIInterfaceOrientationMask BVNPreferredOrientationMask(void) {
     if (!BVNOrientationLockEnabled()) {
-        return UIInterfaceOrientationMaskAllButUpsideDown;
+        // The interface itself stays portrait: a landscape turn rotates the
+        // live view's full-screen host by a quarter-turn transform instead
+        // (deviceOrientationDidChange:). Rotating UIKit's windows while
+        // SDL's window is alive corrupted the page layout on the way back
+        // to portrait, the defect the lock was originally added to avoid.
+        return UIInterfaceOrientationMaskPortrait;
     }
     switch (BVNPreferredOrientationValue()) {
         case 0: return UIInterfaceOrientationMaskPortrait;
@@ -253,6 +263,7 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     [self.libraryWindow makeKeyAndVisible];
     BVNGuestOverlayInstall();
     BVNDXMTDisplayAttach();
+    BVNSyncGuestX11PatchGeometry(root);
     NSString* message = [NSString stringWithFormat:
         @"Guest presentation attached to the live view host (%.0fx%.0f pt).",
         host.bounds.size.width, host.bounds.size.height];
@@ -325,15 +336,29 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 // full-screen path, and comes back into the host when the device is upright
 // again. Only the orientation-lock-off case can rotate; with the lock on the
 // interface never turns.
+static UIDeviceOrientation gFullscreenOrientation = UIDeviceOrientationUnknown;
+
 - (UIView*)fullscreenPresentationHost {
+    const UIDeviceOrientation orientation = UIDevice.currentDevice.orientation;
+    const CGRect window = self.libraryWindow.bounds;
     if (gFullscreenPresentationHost == nil) {
-        UIView* host = [[UIView alloc] initWithFrame:self.libraryWindow.bounds];
+        UIView* host = [[UIView alloc] initWithFrame:window];
         host.backgroundColor = UIColor.blackColor;
-        host.autoresizingMask = UIViewAutoresizingFlexibleWidth |
-                                UIViewAutoresizingFlexibleHeight;
         gFullscreenPresentationHost = host;
     }
-    gFullscreenPresentationHost.frame = self.libraryWindow.bounds;
+    // The window stays portrait. The host is laid out landscape-sized and
+    // turned a quarter turn to match the way the phone is held; UIKit maps
+    // touches through the transform, so the overlay sees landscape points.
+    // Home button on the right (landscape left) turns the content clockwise.
+    const CGFloat longSide = MAX(window.size.width, window.size.height);
+    const CGFloat shortSide = MIN(window.size.width, window.size.height);
+    gFullscreenPresentationHost.transform = CGAffineTransformIdentity;
+    gFullscreenPresentationHost.bounds = CGRectMake(0.0, 0.0, longSide, shortSide);
+    gFullscreenPresentationHost.center =
+        CGPointMake(CGRectGetMidX(window), CGRectGetMidY(window));
+    gFullscreenPresentationHost.transform = CGAffineTransformMakeRotation(
+        orientation == UIDeviceOrientationLandscapeRight ? -M_PI_2 : M_PI_2);
+    gFullscreenOrientation = orientation;
     if (gFullscreenPresentationHost.superview != self.libraryWindow) {
         [self.libraryWindow addSubview:gFullscreenPresentationHost];
     }
@@ -343,26 +368,38 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 
 - (void)deviceOrientationDidChange:(NSNotification*)notification {
     (void)notification;
-    if (gGuestPresentationHost == nil || [super window] == nil) {
+    // The physical orientation, not the interface's: the interface is held
+    // portrait while the lock is off, and with the lock on the live view
+    // ignores turns altogether.
+    if (gGuestPresentationHost == nil || [super window] == nil ||
+        BVNOrientationLockEnabled()) {
         return;
     }
-    const UIInterfaceOrientation orientation =
-        self.libraryWindow.windowScene.interfaceOrientation;
-    const BOOL landscape = UIInterfaceOrientationIsLandscape(orientation);
-    if (landscape && !self.liveViewFullscreen) {
-        self.liveViewFullscreen = YES;
-        BVNLogWrite(BVNLogLevelInfo, "frontend",
-                    "Landscape: the live view takes the whole screen.");
-        // The guest moves into a full-screen host over the library window,
-        // not back to SDL's window (whose view cannot move, so it is black).
+    const UIDeviceOrientation orientation = UIDevice.currentDevice.orientation;
+    const BOOL landscape = orientation == UIDeviceOrientationLandscapeLeft ||
+                           orientation == UIDeviceOrientationLandscapeRight;
+    // Face up, face down and upside down leave things as they are.
+    const BOOL portrait = orientation == UIDeviceOrientationPortrait;
+    if (landscape) {
+        if (self.liveViewFullscreen && orientation == gFullscreenOrientation) {
+            return;
+        }
+        if (!self.liveViewFullscreen) {
+            self.liveViewFullscreen = YES;
+            BVNLogWrite(BVNLogLevelInfo, "frontend",
+                        "Landscape: the live view takes the whole screen.");
+        }
+        // The guest moves into a rotated full-screen host over the library
+        // window; neither UIKit window changes size or orientation.
         [self attachGuestPresentationToHost:[self fullscreenPresentationHost]];
-    } else if (!landscape && self.liveViewFullscreen) {
+    } else if (portrait && self.liveViewFullscreen) {
         self.liveViewFullscreen = NO;
         BVNLogWrite(BVNLogLevelInfo, "frontend",
                     "Portrait: the guest returns to the live view.");
         [self attachGuestPresentationToHost:gGuestPresentationHost];
         [gFullscreenPresentationHost removeFromSuperview];
         gFullscreenPresentationHost = nil;
+        gFullscreenOrientation = UIDeviceOrientationUnknown;
     }
 }
 
@@ -782,13 +819,19 @@ static std::atomic<int> gGuestFrameRateLimitHz{0};
 static std::mutex gGuestFramePacerMutex;
 static std::chrono::steady_clock::time_point gGuestNextFrameDeadline;
 
+// 0 = unlocked (no software pacing, the panel's fastest cadence),
+// 1 = 60, 2 = 120, 3 = 30.
+static int BVNGuestFrameRateLimitForMode(int mode) {
+    return mode == 1 ? 60 : mode == 2 ? 120 : mode == 3 ? 30 : 0;
+}
+
 extern "C" int BVNGuestFrameRateMode(void) {
-    return MAX(0, MIN(2, (int)[[NSUserDefaults standardUserDefaults]
+    return MAX(0, MIN(3, (int)[[NSUserDefaults standardUserDefaults]
         integerForKey:kBVNFrameRateModeKey]));
 }
 
 static void BVNResetGuestFramePacer(int mode) {
-    gGuestFrameRateLimitHz.store(mode == 1 ? 60 : mode == 2 ? 120 : 0,
+    gGuestFrameRateLimitHz.store(BVNGuestFrameRateLimitForMode(mode),
                                  std::memory_order_release);
     std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
     gGuestNextFrameDeadline = {};
@@ -822,9 +865,8 @@ static void BVNApplyGuestFrameRateMode(void) {
     const NSInteger deviceMaximum = MAX(
         60, screen.maximumFramesPerSecond);
     const int mode = BVNGuestFrameRateMode();
-    const NSInteger requested = mode == 1 ? 60
-                                : mode == 2 ? 120
-                                            : deviceMaximum;
+    const int limit = BVNGuestFrameRateLimitForMode(mode);
+    const NSInteger requested = limit > 0 ? limit : deviceMaximum;
     const NSInteger ceiling = MIN(requested, deviceMaximum);
     if (@available(iOS 15.0, *)) {
         if (mode == 0) {
@@ -848,14 +890,15 @@ static void BVNApplyGuestFrameRateMode(void) {
 extern "C" void BVNGuestSetFrameRateMode(int mode) {
     NSCAssert(NSThread.isMainThread,
               @"Guest frame-rate mode must change on the main thread");
-    mode = MAX(0, MIN(2, mode));
+    mode = MAX(0, MIN(3, mode));
     [[NSUserDefaults standardUserDefaults]
         setInteger:mode forKey:kBVNFrameRateModeKey];
     BVNResetGuestFramePacer(mode);
     BVNApplyGuestFrameRateMode();
-    NSString* message = [NSString stringWithFormat:
-        @"Guest display cadence set to %@.",
-        mode == 1 ? @"60 FPS" : mode == 2 ? @"120 FPS" : @"uncapped"];
+    const int limit = BVNGuestFrameRateLimitForMode(mode);
+    NSString* message = limit > 0
+        ? [NSString stringWithFormat:@"Guest display cadence set to %d FPS.", limit]
+        : @"Guest display cadence set to unlocked.";
     BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
 }
 
@@ -1375,8 +1418,28 @@ static void BVNRemoveGuestX11PatchView(void) {
     gGuestX11PatchVisible.store(false, std::memory_order_release);
 }
 
+extern "C" UIView* BVNGuestPresentationHostView(void);
+
 static void BVNSyncGuestX11PatchGeometry(UIView* presentation) {
     if (gGuestX11PatchView == nil || presentation == nil) {
+        return;
+    }
+    UIView* host = BVNGuestPresentationHostView();
+    if (host != nil) {
+        // The live view: the compositor fills the host, above SDL's view if
+        // UIKit let that view in and at the bottom otherwise, so the touch
+        // overlay and the cursor stay on top of the picture.
+        if (gGuestX11PatchView.superview != host) {
+            [gGuestX11PatchView removeFromSuperview];
+            NSUInteger index = 0;
+            if (presentation.superview == host) {
+                index = [host.subviews indexOfObject:presentation] + 1;
+            }
+            [host insertSubview:gGuestX11PatchView
+                        atIndex:MIN(index, host.subviews.count)];
+        }
+        gGuestX11PatchView.transform = CGAffineTransformIdentity;
+        gGuestX11PatchView.frame = host.bounds;
         return;
     }
     UIView* container = presentation.superview;

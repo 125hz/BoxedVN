@@ -150,6 +150,10 @@ apply_patch fex-boxedwine-inline-call-return.patch
 # hosted at an aliased address before deciding that a descriptor-table read
 # would be translated as if it were guest memory.
 apply_patch fex-boxedwine-longmode-segment-base.patch
+# A long-mode write to FS or GS (Wine's WoW64 layer does this right after
+# set_thread_area) stores the selector and traps to the host instead of
+# failing to decode, which re-entered the same instruction forever.
+apply_patch fex-boxedwine-longmode-segment-selector-write.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

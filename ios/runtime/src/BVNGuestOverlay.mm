@@ -1666,6 +1666,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                   forMode:NSRunLoopCommonModes];
         return;
     }
+    self.cursorGuestPoint = [self guestPointForTouch:touch];
+    [self positionCursor];
     self.directButtonHeld = [self sendGuestPointer:touch phase:1];
 }
 
@@ -1675,6 +1677,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         return;
     }
     if (!self.trackpadMode) {
+        self.cursorGuestPoint = [self guestPointForTouch:touch];
+        [self positionCursor];
         [self sendGuestPointer:touch phase:0];
         return;
     }
@@ -2049,7 +2053,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 - (void)positionCursor {
     CGFloat guestWidth = 0.0;
     CGFloat guestHeight = 0.0;
-    if (!self.trackpadMode || !self.startupNotice.hidden ||
+    // In the live view Wine's own cursor is drawn into SDL's hidden window,
+    // so the overlay shows the guest's cursor bitmap itself, in direct-tap
+    // mode too. The ring remains a trackpad-only aid.
+    const BOOL hosted = BVNGuestPresentationHostView() != nil;
+    if ((!self.trackpadMode && !hosted) || !self.startupNotice.hidden ||
         ![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         self.cursorView.hidden = YES;
         self.guestCursorView.hidden = YES;
@@ -2062,7 +2070,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     }
     const CGPoint cursorPoint =
         [self overlayPointForGuestPoint:self.cursorGuestPoint];
-    self.cursorView.hidden = self.guestCursorMode;
+    self.cursorView.hidden = self.guestCursorMode || !self.trackpadMode;
     self.cursorView.center = cursorPoint;
 
     [self applyGuestCursorState];
@@ -2070,7 +2078,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     // cursor so a touch-only trackpad never loses position feedback. The
     // Wine-only mode is deliberately literal: no bitmap and a guest hide
     // request both produce no cursor.
-    self.guestCursorView.hidden = !self.guestCursorMode ||
+    self.guestCursorView.hidden = (!self.guestCursorMode && !hosted) ||
                                   self.guestCursorView.image == nil ||
         (self.wineCursorOnlyMode && !self.guestCursorVisible);
     if (!self.guestCursorView.hidden) {

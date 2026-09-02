@@ -1,0 +1,53 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -1288,8 +1288,22 @@
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
+       } else {
+-        LogMan::Msg::EFmt("We don't support modifying GS selector in 64bit mode!");
+-        DecodeFailure = true;
++        // BoxedWine: a long-mode selector write is served by the host. The
++        // selector is stored first, then the instruction traps as a GP fault
++        // (trap 13, si_code 0x80, the way an unhandled int traps in long
++        // mode); the host fault handler reads the descriptor the selector
++        // names, sets the segment base, and resumes after the instruction.
++        // Wine's WoW64 layer writes FS this way right after set_thread_area.
++        // Left as a decode failure, the block compiled empty and the thread
++        // re-entered the same RIP forever.
++        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
++        _StoreContextGPR(GetGPROpSize(), GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
++        Break(FEXCore::IR::BreakDefinition {
++          .ErrorRegister = 0,
++          .Signal = Core::FAULT_SIGSEGV,
++          .TrapNumber = X86State::X86_TRAPNO_GP,
++          .si_code = 0x80,
++        });
+       }
+       break;
+     case FEXCore::X86State::REG_RSP: // FS
+@@ -1298,8 +1312,22 @@
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
+       } else {
+-        LogMan::Msg::EFmt("We don't support modifying FS selector in 64bit mode!");
+-        DecodeFailure = true;
++        // BoxedWine: a long-mode selector write is served by the host. The
++        // selector is stored first, then the instruction traps as a GP fault
++        // (trap 13, si_code 0x80, the way an unhandled int traps in long
++        // mode); the host fault handler reads the descriptor the selector
++        // names, sets the segment base, and resumes after the instruction.
++        // Wine's WoW64 layer writes FS this way right after set_thread_area.
++        // Left as a decode failure, the block compiled empty and the thread
++        // re-entered the same RIP forever.
++        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
++        _StoreContextGPR(GetGPROpSize(), GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
++        Break(FEXCore::IR::BreakDefinition {
++          .ErrorRegister = 0,
++          .Signal = Core::FAULT_SIGSEGV,
++          .TrapNumber = X86State::X86_TRAPNO_GP,
++          .si_code = 0x80,
++        });
+       }
+       break;
+     default: UnimplementedOp(Op); return;

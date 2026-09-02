@@ -5816,3 +5816,34 @@ absolute-deadline fix), a finger hold and the 64-bit desktop boot ended in
 the null-exit / NoExec fault class, and the cube stays at the panel refresh
 rate. These need the armed IR capture from a repeated 32-bit run.
 
+## Long-mode FS selector write, rotation by transform, log flood limiter
+
+The 32-bit probe on Wine64 stalled after set_thread_area: Wine then writes
+the FS selector, which FEX's long-mode decoder refused ("We don't support
+modifying FS selector in 64bit mode!"), compiling an empty block that the
+thread re-entered 726k times (a 190 MB log). A new FEX patch stores the
+selector and traps as a GP fault; the adapter reads the descriptor the
+selector names, sets the base (fs_cached via cpu->fsbase), and resumes after
+the instruction (BOXEDWINE_X64_SEGMENT_WRITE). The next stop should be the
+far jump into 32-bit code.
+
+Two log defences: the scheduler's per-entry line is throttled per RIP with a
+REENTRY_STORM witness, and BVNLog now drops any line body seen more than 24
+times in a two-second window, summarising the drops (BOXEDVN_LOG_SUPPRESSED).
+
+Rotation: turning the phone rotated UIKit's windows and corrupted the page
+layout on the way back (the fullscreen host was created at 402x874 while the
+overlay was 874x402). With the lock off the interface is now held portrait
+and a landscape turn rotates the full-screen host by a quarter-turn
+transform instead; the lock on ignores turns. The X11 software compositor
+now fills the live-view host (UIKit will not reparent SDL's view), so the
+64-bit desktop should appear in the page. The overlay shows Wine's cursor
+bitmap in the live view in direct-tap mode too and moves it with the finger.
+
+The cube's null call is decoded as `call [rax+0x180]` with a valid slot; the
+IR capture target is now persisted in defaults so the arming survives the
+app restart every faulting run has needed. Frame-rate cap: tapping the FPS
+text cycles 30/60/120/unlocked (mode 3 = 30 Hz added). "Unlocked" removes
+the software pacer; going past the panel's rate needs a mailbox present in
+DXMT's swapchain, not started.
+

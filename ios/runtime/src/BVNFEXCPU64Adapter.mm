@@ -33,6 +33,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
 
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
+#import <Foundation/Foundation.h>
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
@@ -523,10 +524,31 @@ static constexpr uint32_t kExactRIPReportLimit = 8;
 extern "C" void BVNFEXBackendPublishPendingIRCapTarget(uint64_t guestRIP) {
     if (guestRIP == 0) return;
     gPendingIRCapTarget.store(guestRIP, std::memory_order_relaxed);
+    // Persisted, so the arming survives an app restart: the runs that fault
+    // here have not been followed by a second launch in the same process.
+    [[NSUserDefaults standardUserDefaults]
+        setObject:@(static_cast<unsigned long long>(guestRIP))
+           forKey:@"BoxedVN.fex64.pendingIRCapTarget"];
 }
 
 extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) {
-    return gPendingIRCapTarget.exchange(0, std::memory_order_relaxed);
+    uint64_t target = gPendingIRCapTarget.exchange(0, std::memory_order_relaxed);
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    NSString* const key = @"BoxedVN.fex64.pendingIRCapTarget";
+    if (target == 0) {
+        id stored = [defaults objectForKey:key];
+        if ([stored respondsToSelector:@selector(unsignedLongLongValue)]) {
+            target = [stored unsignedLongLongValue];
+        }
+    }
+    if ([defaults objectForKey:key] != nil) {
+        [defaults removeObjectForKey:key];
+    }
+    if (target != 0) {
+        klog_fmt("BOXEDWINE_FEX64_IRCAP_TARGET_TAKEN rip=0x%llx",
+                 static_cast<unsigned long long>(target));
+    }
+    return target;
 }
 
 // FEX's own reconstruction, exported by the pinned translator. Takes the block
@@ -598,6 +620,68 @@ static bool emulateLegacySyscall(BVNFEXCPU64Adapter* adapter,
     }
     cpu->reg[X64_RAX].u64 = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(result)));
     cpu->rip += 2;
+    return true;
+}
+
+// `mov fs, r/m16` and `mov gs, r/m16` in long mode. The translator stores
+// the selector and traps (trap 13, si_code 0x80) at the instruction; the
+// segment base comes from the descriptor the selector names, which is what
+// a 64-bit Linux process gets when it reloads FS with an LDT/GDT selector.
+// Wine's WoW64 layer does exactly this after set_thread_area, then far-jumps
+// into 32-bit code that addresses its TEB through FS.
+static bool emulateSegmentSelectorWrite(BVNFEXCPU64Adapter* adapter,
+                                        FEXCore::Core::CpuStateFrame* frame) {
+    CPU64* cpu = adapter ? adapter->cpu : nullptr;
+    KMemory64* memory = cpu ? cpu->memory : nullptr;
+    if (!cpu || !memory || !frame) return false;
+    uint8_t bytes[12] = {0};
+    memory->memcpyFromGuest(bytes, cpu->rip, sizeof(bytes));
+    uint32_t i = 0;
+    while (i < 4 && (bytes[i] == 0x66 || (bytes[i] & 0xf0) == 0x40)) {
+        ++i;
+    }
+    if (bytes[i] != 0x8e) return false;
+    const uint8_t modrm = bytes[i + 1];
+    const uint32_t reg = (modrm >> 3) & 7;
+    const uint32_t mod = modrm >> 6;
+    const uint32_t rm = modrm & 7;
+    if (reg != 4 && reg != 5) return false; // FS, GS
+    uint32_t length = i + 2;
+    if (mod != 3) {
+        if (rm == 4) {
+            const uint8_t sib = bytes[i + 2];
+            length += 1;
+            if (mod == 0 && (sib & 7) == 5) length += 4;
+        } else if (mod == 0 && rm == 5) {
+            length += 4;
+        }
+        if (mod == 1) length += 1;
+        if (mod == 2) length += 4;
+    }
+    const bool fs = reg == 4;
+    const uint16_t selector = fs ? frame->State.fs_idx : frame->State.gs_idx;
+    uint32_t base = 0;
+    if ((selector & ~3u) != 0 && (selector >> 3) < K_GUEST_SEGMENT_TABLE_ENTRIES) {
+        FEXCore::Core::CPUState::gdt_segment* segment =
+            FEXCore::Core::CPUState::GetSegmentFromIndex(frame->State, selector);
+        base = FEXCore::Core::CPUState::CalculateGDTBase(*segment);
+    }
+    // The adapter copies these into fs_cached/gs_cached on the way back.
+    if (fs) {
+        cpu->fsbase = base;
+    } else {
+        cpu->gsbase = base;
+    }
+    static std::atomic<uint32_t> reports {0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+        klog_fmt("BOXEDWINE_X64_SEGMENT_WRITE pid=%d tid=%d seg=%s selector=0x%x "
+                 "base=0x%x length=%u rip=0x%llx",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1, fs ? "fs" : "gs",
+                 selector, base, length,
+                 static_cast<unsigned long long>(cpu->rip));
+    }
+    cpu->rip += length;
     return true;
 }
 
@@ -1190,7 +1274,8 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         }
     }
     if (generatedException && guestTrapNumber == 13 &&
-        emulateLegacySyscall(adapter, frame)) {
+        (emulateLegacySyscall(adapter, frame) ||
+         emulateSegmentSelectorWrite(adapter, frame))) {
         // Served in place: the registers carry the result and the RIP after
         // the gate; the guest never sees a fault.
         if (!BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {

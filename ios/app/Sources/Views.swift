@@ -274,6 +274,29 @@ struct GuestPerformanceReadout: View {
     @State private var fps = 0.0
     @State private var lastFrames: UInt64 = 0
     @State private var lastSample = Date()
+    @State private var capMode = Int(BVNGuestFrameRateMode())
+
+    private var capLabel: String {
+        switch capMode {
+        case 1: return "60"
+        case 2: return "120"
+        case 3: return "30"
+        default: return "\u{221E}"
+        }
+    }
+
+    // Tap order: 30, 60, 120, unlocked.
+    private func cycleCap() {
+        let next: Int
+        switch capMode {
+        case 3: next = 1
+        case 1: next = 2
+        case 2: next = 0
+        default: next = 3
+        }
+        capMode = next
+        BVNGuestSetFrameRateMode(Int32(next))
+    }
     private let tick = Timer.publish(every: 0.5, on: .main, in: .common)
         .autoconnect()
 
@@ -290,7 +313,10 @@ struct GuestPerformanceReadout: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            Text("FPS \(fps, specifier: "%.0f")")
+            Text("FPS \(fps, specifier: "%.0f") \u{00B7} \(capLabel)")
+                .contentShape(Rectangle())
+                .onTapGesture { cycleCap() }
+                .accessibilityLabel("Frame rate cap \(capLabel)")
             Text("Frame \(fps > 0.5 ? 1000.0 / fps : 0.0, specifier: "%.1f") ms")
             Spacer()
             Text("RAM \(memoryText)")
@@ -333,6 +359,14 @@ struct GuestLiveLog: View {
             let text = String(cString: buffer)
             let all = text.split(whereSeparator: \.isNewline).map(String.init)
                 .filter { !$0.isEmpty }
+                .map { line -> String in
+                    // "YYYY-MM-DD " is noise here; the time stays.
+                    if let range = line.range(of: #"^\d{4}-\d{2}-\d{2} "#,
+                                              options: .regularExpression) {
+                        return String(line[range.upperBound...])
+                    }
+                    return line
+                }
             lines = Array(all.suffix(4))
         }
     }
@@ -356,8 +390,8 @@ struct GuestControlBar: View {
             }
             control("return", "Enter") { BVNGuestControlsTapKeyNamed("Return") }
             control("space", "Space") { BVNGuestControlsTapKeyNamed("Space") }
-            control("escape", "Esc") { BVNGuestControlsTapKeyNamed("Escape") }
-            control("arrow.right.to.line", "Tab") { BVNGuestControlsTapKeyNamed("Tab") }
+            textControl("esc", "Esc") { BVNGuestControlsTapKeyNamed("Escape") }
+            textControl("tab", "Tab") { BVNGuestControlsTapKeyNamed("Tab") }
             control("stop.circle", "Stop", tint: .red) {
                 _ = BVNRuntimeRequestShutdown()
             }
@@ -365,6 +399,19 @@ struct GuestControlBar: View {
         .frame(maxWidth: .infinity)
         .disabled(!running)
         .opacity(running ? 1 : 0.4)
+    }
+
+    private func textControl(_ title: String, _ label: String,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 34, height: 30)
+        }
+        .buttonStyle(.plain)
+        .tint(.accentColor)
+        .foregroundStyle(Color.accentColor)
+        .accessibilityLabel(label)
     }
 
     private func control(_ glyph: String, _ label: String,
@@ -510,13 +557,6 @@ struct ContainerDetailView: View {
                     model.launchX64Desktop(container)
                 } label: {
                     Label("Open 64-bit desktop", systemImage: "macwindow.on.rectangle")
-                }
-                .disabled(model.rootFilesystem == nil || sessionIsBusy)
-                Button {
-                    save(); launched = true
-                    model.launchDirect3DTest(container)
-                } label: {
-                    Label("Run Direct3D test", systemImage: "cube.transparent")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Button {
