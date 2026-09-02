@@ -27,7 +27,7 @@ extern "C" BVNFEXCPU64AdapterAction BVNFEXCPU64AdapterLastAction(const BVNFEXCPU
     return BVNFEXCPU64AdapterActionInvalid;
 }
 extern "C" void BVNFEXBackendPublishPendingIRCapTarget(uint64_t) {}
-extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
+extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0; }
 
 #else
 
@@ -527,23 +527,41 @@ extern "C" void BVNFEXBackendPublishPendingIRCapTarget(uint64_t guestRIP) {
     gPendingIRCapTarget.store(guestRIP, std::memory_order_relaxed);
     // Persisted, so the arming survives an app restart: the runs that fault
     // here have not been followed by a second launch in the same process.
-    [[NSUserDefaults standardUserDefaults]
-        setObject:@(static_cast<unsigned long long>(guestRIP))
-           forKey:@"BoxedVN.fex64.pendingIRCapTarget"];
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:@(static_cast<unsigned long long>(guestRIP))
+                 forKey:@"BoxedVN.fex64.pendingIRCapTarget"];
+    // Scoped to the program that faulted: program images sit at fixed
+    // addresses across runs of the same program, not across programs, and
+    // the desktop launch had consumed a target the cube had armed.
+    BVNFEXCPU64Adapter* adapter = BVNFEXCPU64AdapterCurrent();
+    const char* command = adapter && adapter->process
+        ? adapter->process->commandLine.c_str() : "";
+    [defaults setObject:@(command) forKey:@"BoxedVN.fex64.pendingIRCapCommand"];
 }
 
-extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) {
+extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char* commandLine) {
     uint64_t target = gPendingIRCapTarget.exchange(0, std::memory_order_relaxed);
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
     NSString* const key = @"BoxedVN.fex64.pendingIRCapTarget";
+    NSString* const commandKey = @"BoxedVN.fex64.pendingIRCapCommand";
     if (target == 0) {
         id stored = [defaults objectForKey:key];
         if ([stored respondsToSelector:@selector(unsignedLongLongValue)]) {
             target = [stored unsignedLongLongValue];
         }
+        NSString* storedCommand = [defaults stringForKey:commandKey];
+        if (target != 0 && storedCommand.length > 0 && commandLine != nullptr &&
+            ![storedCommand isEqualToString:@(commandLine)]) {
+            // Another program is launching; the target stays for its own.
+            klog_fmt("BOXEDWINE_FEX64_IRCAP_TARGET_DEFERRED rip=0x%llx for='%s'",
+                     static_cast<unsigned long long>(target),
+                     storedCommand.UTF8String);
+            return 0;
+        }
     }
     if ([defaults objectForKey:key] != nil) {
         [defaults removeObjectForKey:key];
+        [defaults removeObjectForKey:commandKey];
     }
     if (target != 0) {
         klog_fmt("BOXEDWINE_FEX64_IRCAP_TARGET_TAKEN rip=0x%llx",
@@ -1189,6 +1207,24 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, frame)) {
         return false;
     }
+    // Faults the host serves in place (int 0x80, long-mode selector writes)
+    // are not guest faults. They are handled before the fault report budget
+    // and the null-target probes, which otherwise spent themselves on the
+    // selector write Wine repeats on every WoW64 syscall return.
+    if (generatedException && guestTrapNumber == 13 &&
+        (emulateLegacySyscall(adapter, frame) ||
+         emulateSegmentSelectorWrite(adapter, frame))) {
+        if (!BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
+            return containUnclassifiedFEXFault(
+                adapter, config, context, signal, guestFaultAddress,
+                inCodeBuffer);
+        }
+        frame->InSyscallInfo = 0;
+        machine->__ss.__x[1] = 0;
+        machine->__ss.__x[28] = reinterpret_cast<uint64_t>(frame);
+        machine->__ss.__pc = frame->Pointers.DispatcherLoopTopFillSRA;
+        return machine->__ss.__pc != 0;
+    }
     // Every device run of the x86-64 cube ended with Wine reporting a
     // "page fault on read access to 0" at RtlInterlockedPushEntrySList's
     // `lock cmpxchg16b [r8]` during process exit, with the loads of [r8]
@@ -1305,17 +1341,7 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             }
         }
     }
-    if (generatedException && guestTrapNumber == 13 &&
-        (emulateLegacySyscall(adapter, frame) ||
-         emulateSegmentSelectorWrite(adapter, frame))) {
-        // Served in place: the registers carry the result and the RIP after
-        // the gate; the guest never sees a fault.
-        if (!BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
-            return containUnclassifiedFEXFault(
-                adapter, config, context, signal, guestFaultAddress,
-                inCodeBuffer);
-        }
-    } else if (!adapter->cpu->raiseSyncFault(
+    if (!adapter->cpu->raiseSyncFault(
             guestSignal, guestTrapNumber,
             static_cast<int>(guestSignalCode), guestFaultAddress) ||
         !BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {

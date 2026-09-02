@@ -291,6 +291,11 @@ constexpr U32 K64_DTLB_SIZE = 64; // direct-mapped, per-thread (~2KB)
 thread_local K64DTlbEntry g_k64DTlb[K64_DTLB_SIZE];
 std::atomic<U32> g_k64DTlbGen{1};
 
+// A write whose page has no backing buffer (a failed or withdrawn commit)
+// is dropped and reported rather than written through NULL. Eight lines,
+// then one per 4096, so a runaway guest does not flood the log.
+void k64ReportMissingBacking(int pid, U64 pageNum, const char* op);
+
 inline U8* k64DTlbLookup(const void* mem, U64 pageNum) {
     const K64DTlbEntry& e = g_k64DTlb[pageNum & (K64_DTLB_SIZE - 1)];
     if (e.mem == mem && e.page == pageNum &&
@@ -644,7 +649,7 @@ bool KMemory64::isPageMapped(U64 pageNum) const {
 
 U8* KMemory64::getCommittedPagePtr(U64 pageNum) {
     K64Page* p = getPage(pageNum);
-    return (p && p->committed()) ? p->hostData() : nullptr;
+    return p ? p->hostData() : nullptr;
 }
 
 U32 KMemory64::getPageFlags(U64 pageNum) const {
@@ -1843,11 +1848,25 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-        k64DTlbInsert(this, pageNum, data);
-        ::memcpy(data + offsetInPage, s, (size_t)chunk); // commit-on-write (MT-safe)
+        if (data) {
+            k64DTlbInsert(this, pageNum, data);
+            ::memcpy(data + offsetInPage, s, (size_t)chunk); // commit-on-write (MT-safe)
+        } else {
+            k64ReportMissingBacking((int)(process ? process->id : -1), pageNum, "write");
+        }
         dstGuest += chunk;
         s += chunk;
         len -= chunk;
+    }
+}
+
+void k64ReportMissingBacking(int pid, U64 pageNum, const char* op) {
+    static std::atomic<U64> reports {0};
+    const U64 n = reports.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8 || (n & 0xfff) == 0) {
+        klog_fmt("BOXEDWINE_X64_SPARSE_PAGE_MISSING pid=%d op=%s page=0x%llx count=%llu",
+                 pid, op,
+                 (unsigned long long)pageNum, (unsigned long long)(n + 1));
     }
 }
 
@@ -1869,8 +1888,10 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         K64Page* page = getPage(pageNum);
-        if (page && page->committed()) {
-            U8* host = page->hostData();
+        // Read the backing pointer once: committed() is the same load, and
+        // a shared page's buffer can be withdrawn between the two.
+        U8* host = page ? page->hostData() : nullptr;
+        if (host) {
             k64DTlbInsert(this, pageNum, host);
             ::memcpy(d, host + offsetInPage, (size_t)chunk);
         } else {
@@ -1893,7 +1914,11 @@ void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-        ::memset(data + offsetInPage, value, (size_t)chunk); // commit-on-write (MT-safe)
+        if (data) {
+            ::memset(data + offsetInPage, value, (size_t)chunk); // commit-on-write (MT-safe)
+        } else {
+            k64ReportMissingBacking((int)(process ? process->id : -1), pageNum, "memset");
+        }
         dstGuest += chunk;
         len -= chunk;
     }
@@ -1903,8 +1928,8 @@ U8 KMemory64::readb(U64 addr) {
     U64 pageNum = addr >> K64_PAGE_SHIFT;
     if (U8* hit = k64DTlbLookup(this, pageNum)) return hit[addr & K64_PAGE_MASK];
     K64Page* p = getPage(pageNum);
-    if (p && p->committed()) {
-        U8* host = p->hostData();
+    U8* host = p ? p->hostData() : nullptr;
+    if (host) {
         k64DTlbInsert(this, pageNum, host);
         return host[addr & K64_PAGE_MASK];
     }

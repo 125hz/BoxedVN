@@ -825,14 +825,32 @@ static int BVNGuestFrameRateLimitForMode(int mode) {
     return mode == 1 ? 60 : mode == 2 ? 120 : mode == 3 ? 30 : 0;
 }
 
+// DXMT's native present path (winemetal) paces itself: 1 presents with a
+// minimum duration of 1/60 s (its default, which is what held the cube at
+// 60 whatever the app asked for), 0 presents every frame and free-runs to
+// the panel, 2 is a mailbox: the guest runs unthrottled, a drawable is
+// acquired at most every 18 ms, other frames are dropped, and its present
+// counter counts every guest present so the readout shows the guest rate.
+extern "C" void mythic_set_vsync_locked(int mode) __attribute__((weak));
+
+static void BVNApplyDXMTPresentMode(int mode) {
+    if (mythic_set_vsync_locked == nullptr) {
+        return;
+    }
+    const int dxmtMode = mode == 0 ? 2 : mode == 1 ? 1 : 0;
+    mythic_set_vsync_locked(dxmtMode);
+}
+
 extern "C" int BVNGuestFrameRateMode(void) {
     return MAX(0, MIN(3, (int)[[NSUserDefaults standardUserDefaults]
         integerForKey:kBVNFrameRateModeKey]));
 }
 
 static void BVNResetGuestFramePacer(int mode) {
-    gGuestFrameRateLimitHz.store(BVNGuestFrameRateLimitForMode(mode),
-                                 std::memory_order_release);
+    // Only the 30 Hz cap needs the host pacer; DXMT locks 60 itself and the
+    // panel bounds 120 and unlocked.
+    gGuestFrameRateLimitHz.store(mode == 3 ? 30 : 0, std::memory_order_release);
+    BVNApplyDXMTPresentMode(mode);
     std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
     gGuestNextFrameDeadline = {};
 }

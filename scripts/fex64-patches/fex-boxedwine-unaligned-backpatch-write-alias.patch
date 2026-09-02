@@ -32,6 +32,15 @@ diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/A
  static void ClearICache(void* Begin, std::size_t Length) {
    __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
  }
+@@ -2322,7 +2339,7 @@
+   // thread identity into the word (waiters only ever test zero/nonzero); on
+   // timeout, emulate this one access with the same helpers the !IsJIT path
+   // uses and leave the code unpatched.
+-  uint32_t* BPFutex = &InlineTail->SpinLockFutex;
++  uint32_t* BPFutex = FEXCore::DualMap::WriteAddr(&InlineTail->SpinLockFutex);
+   const uint32_t BPStamp = 0x80000000u | (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Thread) >> 4) & 0x7FFFFFFFu);
+   bool BPLocked = false;
+   for (int Attempt = 0; Attempt < 8; ++Attempt) {
 @@ -2383,9 +2400,10 @@
      LDR |= DataReg;
      if (HandleType != UnalignedHandlerType::NonAtomic) {

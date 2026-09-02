@@ -1489,8 +1489,10 @@ LiveProcessState* getLiveProcessState(void* process) {
     // nothing, this runs under gLiveMutex with no other live process, and the
     // startup probe never reaches here. Consuming the slot arms exactly once
     // per pending target; creating a thread does not translate guest code.
-    const uint64_t pendingIRCapTarget =
-        firstLiveProcess ? BVNFEXBackendTakePendingIRCapTarget() : 0;
+    const uint64_t pendingIRCapTarget = firstLiveProcess
+        ? BVNFEXBackendTakePendingIRCapTarget(
+              static_cast<KProcess*>(process)->commandLine.c_str())
+        : 0;
     if (pendingIRCapTarget != 0) {
         FEX_BoxedWineIRCapArm(pendingIRCapTarget);
         reportf("BOXEDWINE_FEX64_IRCAP_ARMED target=0x%llx current=0x%llx",
