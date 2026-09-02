@@ -1354,6 +1354,48 @@ void invalidateLiveExecutableRange(FEXCore::Core::InternalThreadState* thread,
     }
 }
 
+std::atomic<uint32_t> gCodeInvalidationReports {0};
+constexpr uint32_t kCodeInvalidationReportLimit = 16;
+
+// The kernel's mmap/munmap hook. The translator keeps blocks and lookup
+// entries by guest address across all of a process's threads; Boxedwine's
+// address space changes never reached it before, so a library unmapped and
+// another mapped at the same address kept executing the first library's
+// blocks (a `ret` from the old code where the new code has a `call`). This
+// mirrors the frontend the translator ships with: the invalidation mutex is
+// taken uniquely, every code buffer drops the range, then every thread's
+// cached entries and call-return stack follow. Only a live translated process
+// has anything to drop; the interpreter lane returns at the lookup.
+void invalidateTranslatedGuestCode(KProcess* process, U64 start, U64 length) {
+    std::lock_guard<std::mutex> guard(gLiveMutex);
+    auto it = gLiveProcesses.find(process);
+    if (it == gLiveProcesses.end() || !it->second || !it->second->fex ||
+        !it->second->fex->context || it->second->retiring.load(std::memory_order_acquire)) {
+        return;
+    }
+    FEXCore::Context::Context* context = it->second->fex->context.get();
+    std::scoped_lock codeLock(context->GetCodeInvalidationMutex());
+    context->InvalidateCodeBuffersCodeRange(start, length);
+    uint32_t threads = 0;
+    for (auto& entry : it->second->threads) {
+        if (!entry.second || !entry.second->fexThread) continue;
+        context->InvalidateThreadCachedCodeRange(entry.second->fexThread, start, length);
+        ++threads;
+    }
+    if (gCodeInvalidationReports.fetch_add(1, std::memory_order_relaxed) <
+        kCodeInvalidationReportLimit) {
+        reportf("BOXEDWINE_FEX64_CODE_INVALIDATE pid=%u start=0x%llx len=0x%llx threads=%u",
+                static_cast<unsigned>(process->id),
+                static_cast<unsigned long long>(start),
+                static_cast<unsigned long long>(length), threads);
+    }
+}
+
+const bool gTranslatedCodeInvalidatorRegistered = [] {
+    KMemory64::setTranslatedCodeInvalidator(&invalidateTranslatedGuestCode);
+    return true;
+}();
+
 bool createLiveInitialThread(FEXContextBundle& bundle) {
     bundle.initialThread = bundle.context->CreateThread(0, 0);
     return bundle.initialThread != nullptr;

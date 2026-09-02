@@ -387,6 +387,49 @@ static void k64InvalidateProcessFetchCaches(KProcess* process) {
     }
 }
 
+static void (*g_k64TranslatedCodeInvalidator)(KProcess*, U64, U64) = nullptr;
+
+void KMemory64::setTranslatedCodeInvalidator(
+    void (*invalidator)(KProcess* process, U64 addr, U64 len)) {
+    g_k64TranslatedCodeInvalidator = invalidator;
+}
+
+// Every path that changes what bytes a guest range holds ends here as well as
+// in k64InvalidateProcessFetchCaches: a fresh mapping over pages that were
+// mapped before, and an unmap. Queued, not applied: see the header. A queue
+// that grows past a bound collapses into one whole-window entry rather than
+// growing without limit while no translated thread drains it.
+void KMemory64::queueTranslatedCodeInvalidation(U64 addr, U64 len) {
+    if (!g_k64TranslatedCodeInvalidator || !process || len == 0) return;
+    std::lock_guard<std::mutex> guard(pendingTranslatedInvalidationsMutex);
+    if (pendingTranslatedInvalidations.size() >= 1024) {
+        pendingTranslatedInvalidations.clear();
+        pendingTranslatedInvalidations.emplace_back(0, ~0ULL);
+        return;
+    }
+    if (!pendingTranslatedInvalidations.empty()) {
+        auto& last = pendingTranslatedInvalidations.back();
+        if (last.first + last.second == addr) {
+            last.second += len;
+            return;
+        }
+    }
+    pendingTranslatedInvalidations.emplace_back(addr, len);
+}
+
+void KMemory64::flushTranslatedCodeInvalidations() {
+    if (!g_k64TranslatedCodeInvalidator || !process) return;
+    std::vector<std::pair<U64, U64>> pending;
+    {
+        std::lock_guard<std::mutex> guard(pendingTranslatedInvalidationsMutex);
+        if (pendingTranslatedInvalidations.empty()) return;
+        pending.swap(pendingTranslatedInvalidations);
+    }
+    for (const auto& range : pending) {
+        g_k64TranslatedCodeInvalidator(process, range.first, range.second);
+    }
+}
+
 // Monotonic across every address space this image ever builds, so an exec
 // replacement is never confused with the address space it replaced.
 static std::atomic<U64> g_addressSpaceGeneration {1};
@@ -1012,6 +1055,7 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
         }
     }
     k64InvalidateProcessFetchCaches(process);
+    queueTranslatedCodeInvalidation(addr, pageCount << K64_PAGE_SHIFT);
     // Keep the reservation map authoritative for the mmap region. A MAP_FIXED
     // landing here (wine remapping inside an earlier reservation, or the
     // allocator's own commit) updates `ranges` so later gap searches see the
@@ -1152,6 +1196,7 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
         }
     }
     k64InvalidateProcessFetchCaches(process);
+    queueTranslatedCodeInvalidation(addr, pageCount << K64_PAGE_SHIFT);
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
     if (nativeIdentityMode()) {
         if (!kuserRange) {
@@ -1675,6 +1720,7 @@ U64 KMemory64::munmap(U64 addr, U64 len) {
         }
         k64DTlbInvalidateAll();
         k64InvalidateProcessFetchCaches(process);
+        queueTranslatedCodeInvalidation(addr, pageCount << K64_PAGE_SHIFT);
     }
 #endif
 

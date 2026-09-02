@@ -1107,6 +1107,13 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
                  static_cast<unsigned long long>(cpu->syscallRip));
     }
     ksyscall64(cpu);
+    // Address space changes made by this syscall (munmap, MAP_FIXED over a
+    // mapped range, exec's teardown) are applied to the translator here, with
+    // no kernel lock held and before any translated code runs again.
+    if (syscallNumber != 60 && syscallNumber != 231 && adapter->process &&
+        adapter->process->memory64) {
+        adapter->process->memory64->flushTranslatedCodeInvalidations();
+    }
     if (traceSyscall) {
         klog_fmt("BOXEDWINE_FEX64_SYSCALL_RETURN ordinal=%u pid=%d tid=%d "
                  "nr=%llu result=0x%llx rip=0x%llx yield=%d restart=%d",

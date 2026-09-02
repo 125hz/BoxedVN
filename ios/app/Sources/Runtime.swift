@@ -554,7 +554,8 @@ enum Session {
         let argumentStorage = arguments.map { strdup($0) }
         let environmentStorage = environment.map { strdup($0) }
         let overlayStorage = rootFilesystemOverlays.map { strdup($0.path) }
-        let driveCStorage = winePrefixDriveC.map { strdup($0.path) }
+        let driveCStorage: UnsafeMutablePointer<CChar>? =
+            winePrefixDriveC.flatMap { strdup($0.path) }
         defer {
             if let driveCStorage { free(driveCStorage) }
             argumentStorage.forEach { free($0) }

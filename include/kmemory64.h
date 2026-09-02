@@ -17,6 +17,9 @@
 #include <unordered_map>
 #include <map>
 #include <cstring>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 class KProcess;
 class KThread;
@@ -338,6 +341,21 @@ struct K64Page {
 class KMemory64 {
 public:
     explicit KMemory64(KProcess* process, bool nativeIdentity = false);
+    // Registered by the translator backend. Receives every guest range that
+    // has been unmapped or replaced, so translated blocks compiled from the
+    // bytes that used to be at those addresses are dropped. The translator
+    // caches blocks by guest address and never saw these changes before: a
+    // library unmapped and another mapped in its place kept running the first
+    // library's translation. The interpreter's fetch cache is invalidated
+    // separately. Unregistered, or for a process the backend does not run,
+    // nothing happens.
+    static void setTranslatedCodeInvalidator(
+        void (*invalidator)(KProcess* process, U64 addr, U64 len));
+    // The mapping paths only queue: several of them run under mmapMutex, and
+    // the backend's invalidation takes the translator's code lock, which a
+    // compiling thread may hold while it asks this object about pages. The
+    // syscall exit and the run entry drain the queue with no kernel lock held.
+    void flushTranslatedCodeInvalidations();
     ~KMemory64();
 
     // True only when this build was explicitly compiled with native identity
@@ -568,6 +586,9 @@ public:
 
 private:
     KProcess* process;
+    std::mutex pendingTranslatedInvalidationsMutex;
+    std::vector<std::pair<U64, U64>> pendingTranslatedInvalidations;
+    void queueTranslatedCodeInvalidation(U64 addr, U64 len);
     bool nativeIdentity = false;
     std::unordered_map<U64, std::unique_ptr<K64Page>> pages;
     // Guards every mutation/lookup of `pages`. In the multi-threaded build all
