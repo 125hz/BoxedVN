@@ -159,14 +159,23 @@ This is the risk that decides the schedule.
      process, sharing `KMemory64` with its 64-bit context; the low-alias
      window and the fex32 window binding already exist for this.
   2. `wow64cpu.dll`. An x86-64 PE built with the probe toolchain, projected
-     over Wine's `wow64cpu.dll` in the prefix, exporting Wine's CPU backend
-     ABI (`BTCpuProcessInit`, `BTCpuThreadInit`, `BTCpuSimulate`,
-     `BTCpuGetContext`, `BTCpuSetContext`, `BTCpuResetToConsistentState`,
-     `BTCpuNotifyMemoryProtect`/`Alloc`/`Free`,
-     `BTCpuFlushInstructionCache2`, `BTCpuTurboThunkControl`).
-     `BTCpuSimulate` copies the `I386_CONTEXT` from the thread's WOW64 CPU
-     area into a private-syscall request (the DXMT dispatcher's pattern)
-     and asks the kernel to run the 32-bit context.
+     over Wine's `wow64cpu.dll` in the prefix, exporting the set the
+     packaged Wine 9.0 module exports (read from libwine 9.0~repack-4build3
+     amd64 on 2026-09-02): `BTCpuGetBopCode`, `BTCpuGetContext`,
+     `BTCpuIsProcessorFeaturePresent`, `BTCpuProcessInit`,
+     `BTCpuResetToConsistentState`, `BTCpuSetContext`, `BTCpuSimulate`,
+     `BTCpuTurboThunkControl`, `__wine_get_unix_opcode`. It imports only
+     `Wow64SystemServiceEx` from `wow64.dll` and `RtlWow64GetThreadContext`
+     / `RtlWow64SetThreadContext`, `NtProtectVirtualMemory`,
+     `RtlCaptureContext` and `RtlFindExportedRoutineByName` from ntdll.
+     `wow64.dll` picks the module by name (`wow64cpu.dll`, with
+     `xtajit.dll` as the other built-in choice), so the projection replaces
+     the file and nothing else changes. `BTCpuSimulate` copies the
+     `I386_CONTEXT` from the thread's WOW64 CPU area into a private-syscall
+     request (the DXMT dispatcher's pattern) and asks the kernel to run the
+     32-bit context; `BTCpuGetBopCode` and `__wine_get_unix_opcode` return
+     the 32-bit stubs the 32-bit ntdll jumps to for a system call and a
+     unix call, which under shape (2) are the trap addresses of step 3.
   3. Transition. The 32-bit ntdll leaves compat mode through
      `Wow64Transition`; the backend points it at a BoxedVN trap page in the
      low alias. The 32-bit context stops there, the kernel returns the
