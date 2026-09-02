@@ -1816,8 +1816,10 @@ def main() -> None:
 
     # BoxedWine's -w takes a guest Linux directory. The x64 probe passed a
     # Windows path, and the device log shows the result: open(".") -> -2.
+    # The x64 launchers (probe and desktop) share X64Runtime, whose
+    # guestWorkingDirectory is that guest path; each launcher must pass it.
     app_model = read(repository / "ios/app/Sources/AppModel.swift")
-    if 'workingDirectory: "/mnt/drive_d/.boxedvn-x64-diagnostics"' not in app_model:
+    if '"/mnt/drive_d/.boxedvn-x64-diagnostics"' not in app_model:
         raise SystemExit(
             "the x86-64 graphics probe must pass a guest Linux working "
             "directory to BoxedWine -w"
@@ -1825,6 +1827,21 @@ def main() -> None:
     x64_probe_start = app_model.index("func launchX64GraphicsProbe(")
     x64_probe = app_model[x64_probe_start:]
     x64_probe = x64_probe[:x64_probe.index(newline + "    func ")]
+    if ('workingDirectory: runtime.guestWorkingDirectory' not in x64_probe
+            and 'workingDirectory: "/mnt/drive_d/.boxedvn-x64-diagnostics"'
+            not in x64_probe):
+        raise SystemExit(
+            "the x86-64 graphics probe must pass the shared guest working "
+            "directory to BoxedWine -w"
+        )
+    x64_desktop_start = app_model.index("func launchX64Desktop(")
+    x64_desktop = app_model[x64_desktop_start:]
+    x64_desktop = x64_desktop[:x64_desktop.index(newline + "    func ")]         if newline + "    func " in x64_desktop else x64_desktop
+    if 'workingDirectory: runtime.guestWorkingDirectory' not in x64_desktop:
+        raise SystemExit(
+            "the 64-bit desktop must pass the shared guest working directory "
+            "to BoxedWine -w"
+        )
     if 'workingDirectory: "d:' in x64_probe.lower():
         raise SystemExit(
             "the x86-64 graphics probe must not pass a Windows path as the "

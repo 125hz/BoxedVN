@@ -920,6 +920,48 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, frame)) {
         return false;
     }
+    // Every device run of the x86-64 cube ended with Wine reporting a
+    // "page fault on read access to 0" at RtlInterlockedPushEntrySList's
+    // `lock cmpxchg16b [r8]` during process exit, with the loads of [r8]
+    // just before it succeeding. Nothing on this side said which host signal
+    // arrived, with which code, or what R8 held, so the first faults a guest
+    // is handed are recorded here with the instruction bytes and registers.
+    {
+        static std::atomic<uint32_t> reported {0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+            const uint64_t rip = frame->State.rip;
+            uint8_t bytes[16] = {0};
+            const uint64_t hostRip =
+                adapter->process->memory64->nativeAliasForGuest(rip);
+            if (hostRip != 0 &&
+                adapter->cpu->memory->nativeRangeCoversForPlan(hostRip, hostRip + 16)) {
+                std::memcpy(bytes, reinterpret_cast<const void*>(hostRip), sizeof(bytes));
+            }
+            char hex[40];
+            for (size_t i = 0; i < sizeof(bytes); ++i) {
+                snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02x", bytes[i]);
+            }
+            const auto& g = frame->State.gregs;
+            klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT pid=%d tid=%d host_signal=%d "
+                     "si_code=%d fault=0x%llx host_pc=0x%llx in_code=%d generated=%d "
+                     "guest_signal=%u trap=%u guest_rip=0x%llx bytes=%s",
+                     adapter->process->id, adapter->thread->id, signal,
+                     static_cast<int>(siginfo->si_code),
+                     static_cast<unsigned long long>(faultAddress),
+                     static_cast<unsigned long long>(hostPC), inCodeBuffer ? 1 : 0,
+                     generatedException ? 1 : 0, guestSignal, guestTrapNumber,
+                     static_cast<unsigned long long>(rip), hex);
+            klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_GPRS rax=0x%llx rcx=0x%llx rdx=0x%llx "
+                     "rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx "
+                     "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx",
+                     (unsigned long long)g[0], (unsigned long long)g[1],
+                     (unsigned long long)g[2], (unsigned long long)g[3],
+                     (unsigned long long)g[4], (unsigned long long)g[5],
+                     (unsigned long long)g[6], (unsigned long long)g[7],
+                     (unsigned long long)g[8], (unsigned long long)g[9],
+                     (unsigned long long)g[10], (unsigned long long)g[11]);
+        }
+    }
     if (!adapter->cpu->raiseSyncFault(
             guestSignal, guestTrapNumber,
             static_cast<int>(guestSignalCode), guestFaultAddress) ||
