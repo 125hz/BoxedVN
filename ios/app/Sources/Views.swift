@@ -272,7 +272,8 @@ struct LibraryView: View {
 struct GuestPerformanceReadout: View {
     @EnvironmentObject private var model: AppModel
     @State private var fps = 0.0
-    @State private var frameMs = 0.0
+    @State private var lastFrames: UInt64 = 0
+    @State private var lastSample = Date()
     private let tick = Timer.publish(every: 0.5, on: .main, in: .common)
         .autoconnect()
 
@@ -290,19 +291,49 @@ struct GuestPerformanceReadout: View {
     var body: some View {
         HStack(spacing: 16) {
             Text("FPS \(fps, specifier: "%.0f")")
-            Text("Frame \(frameMs, specifier: "%.1f") ms")
+            Text("Frame \(fps > 0.5 ? 1000.0 / fps : 0.0, specifier: "%.1f") ms")
             Spacer()
             Text("RAM \(memoryText)")
         }
         .font(.caption.monospacedDigit())
         .foregroundStyle(.secondary)
         .lineLimit(1)
+        .onReceive(tick) { now in
+            let frames = BVNGuestPresentedFrameCount()
+            let elapsed = max(0.001, now.timeIntervalSince(lastSample))
+            if frames >= lastFrames {
+                fps = Double(frames - lastFrames) / elapsed
+            }
+            lastFrames = frames
+            lastSample = now
+        }
+    }
+}
+
+/// A few lines of the most recent session log, shown below the live view so
+/// the startup detail no longer crowds the small live view itself.
+struct GuestLiveLog: View {
+    @State private var lines: [String] = []
+    private let tick = Timer.publish(every: 0.5, on: .main, in: .common)
+        .autoconnect()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                Text(line).lineLimit(1)
+            }
+        }
+        .font(.system(size: 11, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onReceive(tick) { _ in
-            var f = 0.0
-            var ms = 0.0
-            BVNGuestPerformanceSnapshot(&f, &ms)
-            fps = f
-            frameMs = ms
+            var buffer = [CChar](repeating: 0, count: 16 * 1024)
+            let copied = BVNLogCopyRecent(&buffer, buffer.count)
+            guard copied > 0 else { lines = []; return }
+            let text = String(cString: buffer)
+            let all = text.split(whereSeparator: \.isNewline).map(String.init)
+                .filter { !$0.isEmpty }
+            lines = Array(all.suffix(4))
         }
     }
 }
@@ -310,12 +341,10 @@ struct GuestPerformanceReadout: View {
 /// The control bar below the live view. Plain glyph buttons that drive the
 /// running guest through the runtime's control API.
 struct GuestControlBar: View {
-    @EnvironmentObject private var model: AppModel
+    let active: Bool
     @State private var pointerMode = Int(BVNGuestControlsPointerMode())
 
-    private var running: Bool {
-        model.runtimeState == .running || model.runtimeState == .starting
-    }
+    private var running: Bool { active }
 
     var body: some View {
         HStack(spacing: 22) {
@@ -431,8 +460,10 @@ struct ContainerDetailView: View {
 
     var body: some View {
         List {
-            Section("Live view") {
+            Section {
                 GuestPerformanceReadout()
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4))
                 ZStack {
                     GuestLiveView()
                     if !launched && model.runtimeState != .running
@@ -450,7 +481,16 @@ struct ContainerDetailView: View {
                 .frame(maxWidth: .infinity)
                 .background(Color.black)
                 .listRowInsets(EdgeInsets())
-                GuestControlBar()
+                GuestControlBar(active: launched)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 4, bottom: 6, trailing: 4))
+                if launched {
+                    GuestLiveLog()
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 6, trailing: 8))
+                }
+            } header: {
+                Text("Live view")
             }
             .onChange(of: model.runtimeState) { state in
                 if state == .stopped || state == .idle || state == .failed {
@@ -500,7 +540,7 @@ struct ContainerDetailView: View {
                             .tag(resolutionBinding.wrappedValue)
                     }
                 }
-                .disabled(sessionIsBusy)
+                .disabled(launched || sessionIsBusy)
                 HStack {
                     TextField("Width", value: $container.width, format: .number)
                         .keyboardType(.numberPad)
@@ -508,8 +548,8 @@ struct ContainerDetailView: View {
                     TextField("Height", value: $container.height, format: .number)
                         .keyboardType(.numberPad)
                 }
-                .disabled(sessionIsBusy)
-                if sessionIsBusy {
+                .disabled(launched || sessionIsBusy)
+                if launched || sessionIsBusy {
                     Text("The resolution is fixed while a guest is running.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)

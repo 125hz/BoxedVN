@@ -881,8 +881,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     UILabel* title = [[UILabel alloc] initWithFrame:CGRectZero];
     title.text = @"Starting Wine";
     title.textColor = UIColor.labelColor;
-    title.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleLargeTitle]
-        scaledFontForFont:[UIFont systemFontOfSize:32.0
+    title.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleTitle1]
+        scaledFontForFont:[UIFont systemFontOfSize:24.0
                                              weight:UIFontWeightBold]];
     title.adjustsFontForContentSizeCategory = YES;
     title.textAlignment = NSTextAlignmentLeft;
@@ -966,16 +966,20 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     footer.adjustsFontForContentSizeCategory = YES;
     footer.numberOfLines = 0;
 
+    // Only the title and the current action are shown in the live view. The
+    // body, badge, metrics, activity card and footer are built but not added,
+    // so their text setters elsewhere stay valid while the notice stays small.
+    (void)body;
+    (void)badge;
+    (void)metrics;
+    (void)activityCard;
+    (void)footer;
     UIStackView* content = [[UIStackView alloc] initWithArrangedSubviews:@[
-        title, body, badge, progress, metrics, activityCard, footer
+        title, progress
     ]];
     content.axis = UILayoutConstraintAxisVertical;
     content.alignment = UIStackViewAlignmentFill;
-    content.spacing = 10.0;
-    [content setCustomSpacing:22.0 afterView:body];
-    [content setCustomSpacing:4.0 afterView:badge];
-    [content setCustomSpacing:16.0 afterView:metrics];
-    [content setCustomSpacing:14.0 afterView:activityCard];
+    content.spacing = 8.0;
     content.translatesAutoresizingMaskIntoConstraints = NO;
 
     [notice addSubview:content];
@@ -2891,6 +2895,10 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
     if (parent != nil && parent.subviews.lastObject != gOverlay) {
         [parent bringSubviewToFront:gOverlay];
     }
+}
+
+extern "C" uint64_t BVNGuestPresentedFrameCount(void) {
+    return gPerformancePresentedFrames.load(std::memory_order_relaxed);
 }
 
 extern "C" void BVNGuestPerformanceSnapshot(double* framesPerSecond,

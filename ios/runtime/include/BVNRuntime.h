@@ -443,6 +443,9 @@ void BVNGuestPresentationSetHostView(void* uiView);
 void BVNGuestPerformanceSnapshot(double* framesPerSecond,
                                  double* frameMilliseconds);
 
+// Monotonic count of presented guest frames, for the page's own FPS math.
+uint64_t BVNGuestPresentedFrameCount(void);
+
 // Live-view control bar. Toggle the on-screen keyboard, read and set the
 // pointer mode (0 = direct tap, 1 = Wine cursor), and tap a key by its SDL
 // scancode name ("Return", "Space", "Escape", "Tab", ...). Main thread only.

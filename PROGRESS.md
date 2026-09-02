@@ -5798,3 +5798,21 @@ over the library window; portrait swaps it back to the page host and
 removes the full-screen one. Ending the session clears the active host and
 drops the full-screen view.
 
+## Live view UI: readout and controls off the card, compact log, locked size
+
+The performance line and the control bar were on the grouped list card
+attached to the live view; they move to clear rows. FPS is computed in the
+page from a presented-frame counter (BVNGuestPresentedFrameCount) rather
+than the in-guest timer, which does not run while the guest is hosted. The
+control bar is enabled from the page's own launched flag, since the polled
+runtime state lags while the guest holds the main thread. The in-guest
+startup notice is trimmed to the title and the current action; the detailed
+startup log moves below the live view as a four-line SwiftUI view fed by
+BVNLogCopyRecent. The resolution controls lock the moment a launch begins.
+
+Still open and tied to the translator work: run-one froze on a futex storm
+(a private FUTEX_WAIT returning EINTR in a loop, a different path from the
+absolute-deadline fix), a finger hold and the 64-bit desktop boot ended in
+the null-exit / NoExec fault class, and the cube stays at the panel refresh
+rate. These need the armed IR capture from a repeated 32-bit run.
+
