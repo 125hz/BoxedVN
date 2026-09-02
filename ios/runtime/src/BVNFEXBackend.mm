@@ -717,6 +717,59 @@ void chainFEXHostSignal(int signal, siginfo_t* info, void* ucontext) {
     raise(signal);
 }
 
+extern "C" void boxedwineDxmtReportRecentCalls(void);
+
+// A declined fault is about to end the process. Two device runs declined a
+// SIGSEGV at the same shared-cache PC reading a guest address, and the PC
+// alone named nothing: every translated pointer site had been audited. The
+// symbolicated frame chain says which host function was reading, and which
+// unix call it was reached from; the ring of recent DXMT calls says what the
+// guest asked for last. Frame records are copied with vm_read_overwrite so
+// a corrupt chain stops the walk instead of faulting inside the handler.
+static void reportDeclinedFaultContext(uint64_t pc, ucontext_t* context) {
+    auto describe = [](const char* tag, unsigned frame, uint64_t address) {
+        Dl_info image {};
+        if (address != 0 &&
+            dladdr(reinterpret_cast<const void*>(address), &image) != 0) {
+            const uint64_t imageBase = reinterpret_cast<uint64_t>(image.dli_fbase);
+            const uint64_t symbolBase = reinterpret_cast<uint64_t>(image.dli_saddr);
+            reportf("%s frame=%u pc=0x%llx image=%s image_offset=0x%llx symbol=%s "
+                    "symbol_offset=0x%llx",
+                    tag, frame, static_cast<unsigned long long>(address),
+                    image.dli_fname ? image.dli_fname : "(unknown)",
+                    static_cast<unsigned long long>(address - imageBase),
+                    image.dli_sname ? image.dli_sname : "(unknown)",
+                    static_cast<unsigned long long>(
+                        symbolBase != 0 ? address - symbolBase : 0));
+        } else {
+            reportf("%s frame=%u pc=0x%llx image=(none)", tag, frame,
+                    static_cast<unsigned long long>(address));
+        }
+    };
+    describe("BOXEDWINE_FEX64_FAULT_DECLINED_FRAME", 0, pc);
+    if (context == nullptr || context->uc_mcontext == nullptr) return;
+    uint64_t lr = context->uc_mcontext->__ss.__lr;
+    uint64_t fp = context->uc_mcontext->__ss.__fp;
+    describe("BOXEDWINE_FEX64_FAULT_DECLINED_FRAME", 1, lr);
+    for (unsigned frame = 2; frame < 24; ++frame) {
+        if (fp == 0 || (fp & 0xf) != 0) break;
+        uint64_t record[2] = {0, 0};
+        vm_size_t copied = 0;
+        if (vm_read_overwrite(mach_task_self(), static_cast<vm_address_t>(fp),
+                              sizeof(record),
+                              reinterpret_cast<vm_address_t>(record),
+                              &copied) != KERN_SUCCESS ||
+            copied != sizeof(record)) {
+            break;
+        }
+        if (record[1] == 0) break;
+        describe("BOXEDWINE_FEX64_FAULT_DECLINED_FRAME", frame, record[1]);
+        if (record[0] <= fp) break;
+        fp = record[0];
+    }
+    boxedwineDxmtReportRecentCalls();
+}
+
 void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
     gFEXHostFaultCount.fetch_add(1, std::memory_order_relaxed);
     gFEXLastHostSignal.store(static_cast<uint64_t>(signal),
@@ -768,6 +821,7 @@ void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
                     inDispatcher ? 1 : 0,
                     static_cast<unsigned long long>(config.DispatcherBegin),
                     static_cast<unsigned long long>(config.DispatcherEnd));
+            reportDeclinedFaultContext(pc, context);
         }
     }
     chainFEXHostSignal(signal, info, ucontext);

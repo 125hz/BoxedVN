@@ -76,6 +76,10 @@ extern UIWindow* BVNGuestUIWindow(void);
     layer.drawableSize = _guestDrawableSize;
     layer.maximumDrawableCount = 3;
     layer.presentsWithTransaction = NO;
+    // The swapchain's pixel extent rarely matches the view. Letterbox it
+    // rather than stretch it: a 640x480 frame filled a 402x874 window on
+    // device and the picture was unrecognisable.
+    layer.contentsGravity = kCAGravityResizeAspect;
     return self;
 }
 
@@ -293,6 +297,25 @@ static void BVNDXMTDisplayReportBlocked(const char* why, UIView* view,
     BVNLogWrite(BVNLogLevelWarning, "dxmt", message);
 }
 
+// Where the guest desktop is on screen. SDL letterboxes the emulated screen
+// (the container's resolution, 800x600 by default) inside its view; the
+// overlay's mapping helpers apply that exact transform. The DXMT layer is
+// confined to the same rectangle so the guest's picture sits where its
+// desktop does instead of covering the whole window. Falls back to the
+// window bounds when the mapping is unavailable.
+static CGRect BVNDXMTDesktopFrame(UIWindow* window) {
+    int width = 0, height = 0;
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (BVNGuestControlsScreenSize(&width, &height) && width > 0 && height > 0 &&
+        BVNGuestControlsMapSoftwarePointToWindow(0.0f, 0.0f, &x0, &y0) &&
+        BVNGuestControlsMapSoftwarePointToWindow((float)width, (float)height,
+                                                 &x1, &y1) &&
+        x1 > x0 + 1.0f && y1 > y0 + 1.0f) {
+        return CGRectMake(x0, y0, x1 - x0, y1 - y0);
+    }
+    return window.bounds;
+}
+
 static void BVNDXMTDisplayPlaceOnMain(void) {
     pthread_mutex_lock(&gDisplayLock);
     BVNDXMTMetalView* view = gDisplayView;
@@ -335,6 +358,7 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     // lives directly in the window, above whatever view SDL owns as the root
     // view controller's view, and below the overlay, which
     // BVNGuestOverlayInstall re-fronts.
+    const CGRect desktop = BVNDXMTDesktopFrame(window);
     BOOL changed = NO;
     if (view.hidden) {
         view.hidden = NO;
@@ -342,7 +366,8 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     }
     if (view.superview != window) {
         [view removeFromSuperview];
-        view.frame = window.bounds;
+        view.autoresizingMask = UIViewAutoresizingNone;
+        view.frame = desktop;
         [window addSubview:view];
         changed = YES;
     }
@@ -367,8 +392,9 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
         [window bringSubviewToFront:view];
         changed = YES;
     }
-    if (!CGRectEqualToRect(view.frame, window.bounds)) {
-        view.frame = window.bounds;
+    if (!CGRectEqualToRect(view.frame, desktop)) {
+        // Rotation or a container-resolution change moved the desktop.
+        view.frame = desktop;
     }
     if (changed) {
         // Keeps the menu button, cursor, and notices above the frames.
@@ -382,10 +408,12 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
         snprintf(message, sizeof(message),
                  "BOXEDVN_DXMT_LAYER_FRONT: placed the DXMT layer in the guest "
                  "window above SDL's root view (%s) after the first presented "
-                 "frame; frame=%.0fx%.0f drawable=%.0fx%.0f index=%lu/%lu "
-                 "hidden=%d alpha=%.2f",
+                 "frame; frame=%.0fx%.0f@%.0f,%.0f window=%.0fx%.0f "
+                 "drawable=%.0fx%.0f index=%lu/%lu hidden=%d alpha=%.2f",
                  BVNDXMTClassName(root, "none"),
-                 view.bounds.size.width, view.bounds.size.height,
+                 view.frame.size.width, view.frame.size.height,
+                 view.frame.origin.x, view.frame.origin.y,
+                 window.bounds.size.width, window.bounds.size.height,
                  drawable.width, drawable.height,
                  (unsigned long)[window.subviews indexOfObjectIdenticalTo:view],
                  (unsigned long)window.subviews.count,

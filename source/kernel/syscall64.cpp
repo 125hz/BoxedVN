@@ -3549,6 +3549,29 @@ static const char* dxmtUnixCallName64(U64 callIndex) {
     }
 }
 
+// The last DXMT unix calls, for a host fault the FEX handler declines. Only
+// the first 32 calls and the named ones are logged, so without this ring a
+// fault in native code during an unnamed call names nothing. Written racily
+// on purpose: it is a diagnostic, and a torn entry is still a hint.
+struct DxmtRecentCall {
+    U32 index;
+    U32 tid;
+    U32 ordinal;
+};
+static DxmtRecentCall gDxmtRecentCalls[32];
+static std::atomic<U32> gDxmtRecentCursor{0};
+
+extern "C" void boxedwineDxmtReportRecentCalls(void) {
+    const U32 cursor = gDxmtRecentCursor.load(std::memory_order_relaxed);
+    const U32 count = cursor < 32 ? cursor : 32;
+    for (U32 i = 0; i < count; ++i) {
+        const DxmtRecentCall& r = gDxmtRecentCalls[(cursor - count + i) % 32];
+        const char* name = dxmtUnixCallName64(r.index);
+        klog_fmt("BOXEDWINE_DXMT_RECENT ordinal=%u tid=%u index=%u name=%s",
+                 r.ordinal, r.tid, r.index, name ? name : "-");
+    }
+}
+
 static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     static std::atomic<U32> callLogCount{0};
     const U32 logOrdinal = callLogCount.fetch_add(1, std::memory_order_relaxed);
@@ -3625,6 +3648,12 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         // A presented drawable means the DXMT layer carries frames; the main
         // loop raises it above SDL's later-created view on its next poll.
         BVNDXMTDisplayNotePresented(cpu->thread->process->id);
+    }
+    {
+        const U32 slot = gDxmtRecentCursor.fetch_add(1, std::memory_order_relaxed) % 32;
+        gDxmtRecentCalls[slot].index = static_cast<U32>(callIndex);
+        gDxmtRecentCalls[slot].tid = cpu && cpu->thread ? cpu->thread->id : 0;
+        gDxmtRecentCalls[slot].ordinal = logOrdinal;
     }
     const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
     if (logCall) {

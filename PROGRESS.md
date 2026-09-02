@@ -5406,3 +5406,21 @@ never had it and asked for Managed. The x86-64 PE build now passes
 `-DDXMT_IOS=1` (and the native build too), and the unix-side rewrite wraps
 every forwarded resource-options value in a Managed-to-Shared remap so a
 mismatched guest DLL cannot take the process down.
+
+## The cube renders (816a2361)
+
+Two device runs drew the rotating cube through DXMT: `geometry ok`,
+`present ok`, ~30 presents, placed layer. Two defects remain:
+
+- The process dies after ~30 presents with a host SIGSEGV declined by the
+  FEX handler: same shared-cache PC in both runs (0x1899c0808), reading an
+  odd guest address inside a PE image (0x7fffff2c4799). Every translated
+  pointer site in the unix sources has been audited, and only the first 32
+  and the named unix calls are logged, so the decline path now prints a
+  symbolicated frame-pointer walk of the faulting host thread and a ring of
+  the last 32 DXMT unix calls (`BOXEDWINE_FEX64_FAULT_DECLINED_FRAME`,
+  `BOXEDWINE_DXMT_RECENT`).
+- The 640x480 frame was stretched over the whole window. The layer now
+  letterboxes its drawable (contentsGravity resizeAspect) and is confined to
+  the guest desktop's on-screen rectangle, derived from the overlay's
+  software-point mapping of the emulated screen size.
