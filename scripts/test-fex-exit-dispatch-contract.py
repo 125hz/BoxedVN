@@ -1821,27 +1821,43 @@ def main() -> None:
     # a "page fault on read access to 0": the address had become Expected1,
     # which is 0 for an empty SList header. The LL/SC fallbacks used TMP4 as
     # the store-exclusive status register, which is the address register.
-    atomic_ops = read(fex / "FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp")
-    if "AliasGuestAddress(GetReg(Op->Addr))" not in atomic_ops:
+    #
+    # Checked on the patch's added lines, not on the tree: this job holds the
+    # pristine pin, and the alias patch is what the device build applies.
+    alias_patch = read(repository / "scripts/fex64-patches/fex-boxedwine-low-address-alias.patch")
+    atomic_start = alias_patch.index(
+        "diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp")
+    atomic_end = alias_patch.find(newline + "diff --git ", atomic_start + 1)
+    atomic_section = alias_patch[atomic_start:atomic_end if atomic_end != -1 else len(alias_patch)]
+    atomic_added = newline.join(
+        line[1:] for line in atomic_section.split(newline)
+        if line.startswith("+") and not line.startswith("+++"))
+    atomic_removed = newline.join(
+        line[1:] for line in atomic_section.split(newline)
+        if line.startswith("-") and not line.startswith("---"))
+    if "AliasGuestAddress(GetReg(Op->Addr))" not in atomic_added:
         raise SystemExit("the atomic lowerings no longer translate their address")
     for forbidden in ("CaspalDst1 = TMP4;", "CaspalDst0 = TMP3;",
                       "stlxr(SubEmitSize, TMP4,", "mov(EmitSize, TMP4, TMP2);"):
-        if forbidden in atomic_ops:
+        if forbidden in atomic_added:
             raise SystemExit(
                 "an atomic lowering reuses TMP4, which carries the translated "
                 f"address: {forbidden!r}"
             )
+        if forbidden not in atomic_removed:
+            raise SystemExit(
+                "the alias patch no longer removes the upstream TMP4 reuse "
+                f"{forbidden!r}; re-audit AtomicOps.cpp against the pin"
+            )
     require_ordered(
-        atomic_ops,
+        atomic_added,
         [
-            "DEF_OP(CASPair) {",
             "auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));",
             "const bool DesiredPaired =",
             "const bool DstPaired =",
             "if (CTX->HostFeatures.SupportsAtomics && (DesiredPaired || DstPaired)) {",
             "CaspalDst0 = TMP1;",
             "CaspalDst1 = TMP2;",
-            "caspal(EmitSize, CaspalDst0, CaspalDst1, Desired0, Desired1, MemSrc);",
         ],
         "CASPair keeps the translated address out of its destination temporaries",
     )
