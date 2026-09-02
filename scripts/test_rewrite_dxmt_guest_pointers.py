@@ -250,6 +250,55 @@ class ResourceStorageMode(unittest.TestCase):
             self.assertEqual(remap(48 | extra), 48 | extra)     # Memoryless
 
 
+class MemoryCensusDevicePointer(unittest.TestCase):
+    """DXMT's memory census must not keep a pointer to a constructor argument.
+
+    mem_census_set_device(&device) is called from Buffer's constructor with
+    that constructor's own WMT::Device argument; the census dereferences the
+    pointer at report time. On device the slot held a guest address by then,
+    currentAllocatedSize was sent to it, and objc_msgSend faulted about
+    thirty frames in, identically in every run. The PE build patches the
+    census to keep the handle by value.
+    """
+
+    def test_the_pe_build_patches_the_census_to_keep_the_handle(self) -> None:
+        pe = (REPO / "scripts" / "build-dxmt-x64-pe.sh").read_text(encoding="utf-8")
+        self.assertIn("dxmt_mem_census.cpp", pe)
+        self.assertIn("g_census_device_handle = d ? d->handle : NULL_OBJECT_HANDLE", pe)
+        self.assertIn("MTLDevice_currentAllocatedSize(g_census_device_handle)", pe)
+        # Both the setter and the report must be verified after the edit,
+        # and a source that no longer matches must fail the build.
+        self.assertIn("the by-value device patch did not apply", pe)
+        self.assertIn("re-audit mem_census_set_device", pe)
+
+    def test_the_patch_applies_to_the_pinned_census_source(self) -> None:
+        # The exact three lines the sed expressions match, as pinned.
+        pinned = (
+            "static WMT::Device *g_census_device;\n"
+            "\n"
+            "void\n"
+            "mem_census_set_device(WMT::Device *d) { g_census_device = d; }\n"
+            "  uint64_t metal = g_census_device ? g_census_device->currentAllocatedSize() : 0;\n")
+        pe = (REPO / "scripts" / "build-dxmt-x64-pe.sh").read_text(encoding="utf-8")
+        for needle in ("static WMT::Device \\*g_census_device;",
+                       "mem_census_set_device(WMT::Device \\*d) { g_census_device = d; }",
+                       "g_census_device ? g_census_device->currentAllocatedSize() : 0;"):
+            self.assertIn(needle, pe)
+        import re
+        for pattern, replacement in (
+            (r"static WMT::Device \*g_census_device;",
+             "static obj_handle_t g_census_device_handle;"),
+            (r"mem_census_set_device\(WMT::Device \*d\) \{ g_census_device = d; \}",
+             "mem_census_set_device(WMT::Device *d) { g_census_device_handle = d ? d->handle : NULL_OBJECT_HANDLE; }"),
+            (r"uint64_t metal = g_census_device \? g_census_device->currentAllocatedSize\(\) : 0;",
+             "uint64_t metal = g_census_device_handle != NULL_OBJECT_HANDLE ? MTLDevice_currentAllocatedSize(g_census_device_handle) : 0;"),
+        ):
+            pinned, count = re.subn(pattern, replacement, pinned)
+            self.assertEqual(count, 1, pattern)
+        self.assertNotIn("g_census_device->", pinned)
+        self.assertNotIn("*g_census_device", pinned)
+
+
 class TranslationHeaderContract(unittest.TestCase):
     def test_header_constants_match_the_guest_alias_contract(self) -> None:
         header = HEADER.read_text(encoding="utf-8")

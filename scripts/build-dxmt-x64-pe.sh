@@ -124,6 +124,31 @@ elif ! grep -q '^if dxmt_native$' "${WINEMETAL_MESON}"; then
 fi
 ok "DXMT PE build: desktop-native helper targets excluded"
 
+# The memory census keeps a POINTER to the WMT::Device it is handed
+# (mem_census_set_device(&device) in Buffer's constructor, where `device` is
+# that constructor's own argument) and dereferences it at report time, long
+# after the frame is gone. On device the census read a stale stack slot, sent
+# currentAllocatedSize to a guest address, and objc_msgSend took the process
+# down about thirty frames in. Keep the handle by value instead: a handle is
+# a plain integer and outlives any frame. Guarded so a pinned-source change
+# that moves these lines fails the build rather than shipping the defect.
+CENSUS_SOURCE="${DXMT_SOURCE}/src/dxmt/dxmt_mem_census.cpp"
+require_file "${CENSUS_SOURCE}"
+if grep -q 'static WMT::Device \*g_census_device;' "${CENSUS_SOURCE}"; then
+    /usr/bin/sed -i '' \
+        -e 's/static WMT::Device \*g_census_device;/static obj_handle_t g_census_device_handle; \/* BoxedVN: by value, the pointer was to a constructor argument *\//' \
+        -e 's/mem_census_set_device(WMT::Device \*d) { g_census_device = d; }/mem_census_set_device(WMT::Device *d) { g_census_device_handle = d ? d->handle : NULL_OBJECT_HANDLE; }/' \
+        -e 's/uint64_t metal = g_census_device ? g_census_device->currentAllocatedSize() : 0;/uint64_t metal = g_census_device_handle != NULL_OBJECT_HANDLE ? MTLDevice_currentAllocatedSize(g_census_device_handle) : 0;/' \
+        "${CENSUS_SOURCE}"
+    grep -q 'g_census_device_handle = d ? d->handle' "${CENSUS_SOURCE}" \
+        || die "Pinned DXMT memory census setter changed; the by-value device patch did not apply."
+    grep -q 'MTLDevice_currentAllocatedSize(g_census_device_handle)' "${CENSUS_SOURCE}" \
+        || die "Pinned DXMT memory census report changed; the by-value device patch did not apply."
+elif ! grep -q 'g_census_device_handle' "${CENSUS_SOURCE}"; then
+    die "Pinned DXMT memory census no longer keeps a device pointer; re-audit mem_census_set_device."
+fi
+ok "DXMT PE build: memory census keeps the device handle by value"
+
 CROSS_FILE="${OUTPUT_DIR}/dxmt-win64.cross"
 NATIVE_FILE="${OUTPUT_DIR}/dxmt-host.native"
 cat > "${CROSS_FILE}" <<EOF

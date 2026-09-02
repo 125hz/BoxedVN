@@ -5424,3 +5424,15 @@ Two device runs drew the rotating cube through DXMT: `geometry ok`,
   letterboxes its drawable (contentsGravity resizeAspect) and is confined to
   the guest desktop's on-screen rectangle, derived from the overlay's
   software-point mapping of the emulated screen size.
+
+## Memory census pointer (after 24f00a6b)
+
+The new decline diagnostics named the crash on the first try: objc_msgSend
+under `_MTLDevice_currentAllocatedSize`, reached from the dispatcher on the
+probe's main thread, with a receiver of 0x7fffff2c4799 in both runs. DXMT's
+memory census (`dxmt_mem_census.cpp`) stores `&device` from Buffer's
+constructor, where `device` is that constructor's own argument, and
+dereferences the pointer when it reports; by then the slot holds a guest
+address. The x86-64 PE build now patches the census to keep the device
+handle by value (guarded like the meson edits). The letterboxed placement
+was confirmed: `frame=402x301@0,286 window=402x874`.
