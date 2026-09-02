@@ -5573,3 +5573,32 @@ change at runtime, so honouring `CS` in one context would mean a per-block
 mode through the frontend, dispatcher and JIT. The plan now lists the
 context pair, the CPU backend exports, the trap-page transition and the
 exception return; the host gate is reworded for that shape.
+
+## The null exit target was a stale translated block
+
+Re-reading the witness with the fault registers recovered from the session
+transcript settles the 9aaf8c1d faults: the exit that jumped to zero moved
+RSP from 0x7ffffe0f8e10 to 0x7ffffe0f8e18 (a pop), the popped slot and the
+new stack top both read zero, and the registers still held the argument
+setup of `call qword ptr [r12+0x70]` (rdi = the encoding table, rsi/rcx/r8
+pointers into the frame, rdx into the XML buffer). New code at that
+address performs a call; the translator executed a `ret`. That is a block
+compiled from whatever was mapped at 0x7a41321185 before libexpat, and the
+memory layer confirmed the gap: mmap, MAP_FIXED and munmap invalidated only
+the interpreter's fetch cache, never the translator's caches, while the
+backend's `InvalidateGuestCodeRange` was reachable only from the
+translator's own self-modifying-code path. Load order decides which
+library reuses an address, which is why the 32-bit tree made the fault
+deterministic and why the first desktop run hit it once at another base.
+
+Fix: `KMemory64` queues every unmapped or replaced range and the syscall
+exit drains the queue into `BVNFEXCPU64` with no kernel lock held (several
+mapping paths run under mmapMutex, and the translator's code lock can be
+held by a compiling thread that asks the memory layer about pages). The
+backend takes the code invalidation lock, drops the range from every code
+buffer and from each live thread's cached entries and call-return stack,
+and logs the first sixteen as `BOXEDWINE_FEX64_CODE_INVALIDATE`. The
+20:37 freeze (main thread in futex, a worker spinning at two host
+instructions after its own futex returned) is a separate host-side spin;
+the next log names its routine through `BOXEDWINE_FEX64_BUSY_HOST`.
+
