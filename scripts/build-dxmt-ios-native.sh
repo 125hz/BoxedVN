@@ -132,7 +132,7 @@ build_shader_headers
 
 COMMON_FLAGS=(-arch arm64 -isysroot "${SDK}"
               "-miphoneos-version-min=${IPHONEOS_MIN}"
-              -DDXMT_NATIVE=1 -fblocks -O2)
+              -DDXMT_NATIVE=1 -DDXMT_IOS=1 -fblocks -O2)
 INCLUDES=(-I"${DXMT_ROOT}/include" -I"${DXMT_ROOT}/libs"
           -I"${DXMT_SRC}/winemetal" -I"${DXMT_SRC}/airconv"
           -I"${BOXEDVN_ROOT}/include")

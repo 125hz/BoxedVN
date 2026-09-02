@@ -16,6 +16,9 @@ The rewrite wraps each *read* of such a pointer in BOXEDWINE_GUEST_PTR(...):
   * the raw casts DXMT applies to `params->buffer_ptr`, `params->arg` and
     `params->handle` where the field is a guest address rather than a host
     object handle (named explicitly, each expected exactly once);
+  * the resource-options value forwarded to Metal when a buffer or texture
+    is created, so a Managed storage mode (absent on iOS, where it fails an
+    assertion inside Metal) becomes Shared;
   * the shader translator thunks (thunk_SM50*), whose parameter blocks carry
     guest pointers with no cast at all: the DXBC, out-parameters on the
     caller's stack, the error buffer, and the compilation-argument chain,
@@ -127,6 +130,21 @@ THUNK_REWRITES = {
     "cache.c": [],
 }
 
+# Resource-options values the unix side forwards to Metal, each wrapped so a
+# Managed storage mode becomes Shared on iOS (see the header). Entries are
+# (old, new, expected occurrences).
+OPTION_REWRITES = {
+    "winemetal_unix.c": [
+        ("options:(enum MTLResourceOptions)info->options",
+         "options:(enum MTLResourceOptions)"
+         "BOXEDWINE_METAL_RESOURCE_OPTIONS(info->options)", 2),
+        ("desc.resourceOptions = (MTLResourceOptions)info->options;",
+         "desc.resourceOptions = (MTLResourceOptions)"
+         "BOXEDWINE_METAL_RESOURCE_OPTIONS(info->options);", 1),
+    ],
+    "cache.c": [],
+}
+
 # `.ptr` reads expected per file, so a drift in the pinned source is noticed.
 EXPECTED_PTR_READS = {
     "winemetal_unix.c": 50,
@@ -220,6 +238,17 @@ def rewrite_thunks(text: str, rewrites: list[tuple[str, str]]) -> str:
     return text
 
 
+def rewrite_options(text: str, rewrites: list[tuple[str, str, int]]) -> str:
+    for old, new, expected in rewrites:
+        occurrences = text.count(old)
+        if occurrences != expected:
+            raise RewriteError(
+                f"expected {expected} occurrence(s) of {old!r}, found {occurrences}; "
+                "the pinned DXMT source changed, re-audit the resource-options sites")
+        text = text.replace(old, new)
+    return text
+
+
 def rewrite_source(name: str, text: str) -> str:
     if MACRO in text:
         raise RewriteError(f"{name}: already rewritten")
@@ -231,6 +260,7 @@ def rewrite_source(name: str, text: str) -> str:
             "the pinned DXMT source changed, re-audit the dereference sites")
     rewritten = rewrite_raw_sites(rewritten, RAW_SITES.get(name, []))
     rewritten = rewrite_thunks(rewritten, THUNK_REWRITES.get(name, []))
+    rewritten = rewrite_options(rewritten, OPTION_REWRITES.get(name, []))
     if name in MAIN_THREAD_HELPER_FILES:
         rewritten = rewrite_main_thread_helper(rewritten)
     return rewritten

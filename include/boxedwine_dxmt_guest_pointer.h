@@ -79,6 +79,22 @@ void boxedwine_dxmt_tag_compiled_bitcode(void* compiled_bitcode);
 }
 #endif
 
+/*
+ * iOS Metal has no Managed storage mode: creating a resource with it fails
+ * an assertion inside Metal ("Invalid storageMode"). DXMT's guest side is
+ * built with DXMT_IOS so it never asks for it, and the unix side applies
+ * this to every resource-options value it forwards as well, so a stale or
+ * differently built guest DLL cannot take the process down. Storage mode is
+ * bits 4-5 of MTLResourceOptions; Managed is 1 (0x10), Shared is 0.
+ */
+#define BOXEDWINE_METAL_STORAGE_MODE_MASK 0x30ULL
+#define BOXEDWINE_METAL_STORAGE_MODE_MANAGED 0x10ULL
+#define BOXEDWINE_METAL_RESOURCE_OPTIONS(o) \
+    ((((uint64_t)(o) & BOXEDWINE_METAL_STORAGE_MODE_MASK) == \
+      BOXEDWINE_METAL_STORAGE_MODE_MANAGED) \
+         ? ((uint64_t)(o) & ~BOXEDWINE_METAL_STORAGE_MODE_MASK) \
+         : (uint64_t)(o))
+
 /* Keeps the pointer's own type: works for void*, const void*, char* and the
  * raw uint64_t fields DXMT casts itself. C++ (the host test suite) spells the
  * type query differently from the C the unix sources are compiled as. */

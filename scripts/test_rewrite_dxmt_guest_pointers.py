@@ -201,6 +201,55 @@ class ShaderTranslatorThunks(unittest.TestCase):
         self.assertIn("'tools/dxmt/**'", workflow)
 
 
+class ResourceStorageMode(unittest.TestCase):
+    """iOS Metal has no Managed storage mode.
+
+    Two device runs died at the geometry stage with Metal's own assertion,
+    "Invalid storageMode", on the first buffer: DXMT's meson build defines
+    DXMT_IOS (which remaps Managed to Shared in winemetal.h) only for its
+    aarch64-windows target, so the x86-64 guest DLLs asked for Managed. The
+    guest build now defines it, and the unix side remaps defensively.
+    """
+
+    def test_the_guest_and_native_builds_define_dxmt_ios(self) -> None:
+        pe = (REPO / "scripts" / "build-dxmt-x64-pe.sh").read_text(encoding="utf-8")
+        self.assertIn("-Dc_args=-DDXMT_IOS=1 -Dcpp_args=-DDXMT_IOS=1", pe)
+        native = (REPO / "scripts" / "build-dxmt-ios-native.sh").read_text(encoding="utf-8")
+        self.assertIn("-DDXMT_IOS=1", native)
+
+    def test_every_forwarded_options_value_is_remapped(self) -> None:
+        fixture = (
+            "    buffer = [device newBufferWithBytesNoCopy:x length:l "
+            "options:(enum MTLResourceOptions)info->options deallocator:NULL];\n"
+            "    buffer = [device newBufferWithLength:info->length "
+            "options:(enum MTLResourceOptions)info->options];\n"
+            "  desc.resourceOptions = (MTLResourceOptions)info->options;\n"
+            "  info->options = (enum WMTResourceOptions)desc.resourceOptions;\n")
+        text = rewrite.rewrite_options(fixture, rewrite.OPTION_REWRITES["winemetal_unix.c"])
+        self.assertEqual(text.count("BOXEDWINE_METAL_RESOURCE_OPTIONS(info->options)"), 3)
+        # The write-back of the actual options is not a forwarded value.
+        self.assertIn("info->options = (enum WMTResourceOptions)desc.resourceOptions;", text)
+
+    def test_a_drifted_options_site_count_is_refused(self) -> None:
+        with self.assertRaises(rewrite.RewriteError):
+            rewrite.rewrite_options("options:(enum MTLResourceOptions)info->options\n",
+                                    rewrite.OPTION_REWRITES["winemetal_unix.c"])
+
+    def test_the_macro_maps_managed_to_shared_and_nothing_else(self) -> None:
+        header = HEADER.read_text(encoding="utf-8")
+        self.assertIn("BOXEDWINE_METAL_STORAGE_MODE_MASK 0x30ULL", header)
+        self.assertIn("BOXEDWINE_METAL_STORAGE_MODE_MANAGED 0x10ULL", header)
+        # Evaluate the macro's arithmetic in Python for the four storage modes
+        # combined with the cache and hazard bits DXMT sets.
+        def remap(o: int) -> int:
+            return (o & ~0x30) if (o & 0x30) == 0x10 else o
+        for extra in (0, 1, 256, 512, 257):
+            self.assertEqual(remap(0 | extra), 0 | extra)       # Shared
+            self.assertEqual(remap(16 | extra), 0 | extra)      # Managed -> Shared
+            self.assertEqual(remap(32 | extra), 32 | extra)     # Private
+            self.assertEqual(remap(48 | extra), 48 | extra)     # Memoryless
+
+
 class TranslationHeaderContract(unittest.TestCase):
     def test_header_constants_match_the_guest_alias_contract(self) -> None:
         header = HEADER.read_text(encoding="utf-8")

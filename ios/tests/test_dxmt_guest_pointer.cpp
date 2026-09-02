@@ -66,3 +66,14 @@ BOXEDVN_TEST(dxmt_guest_pointer_macro_preserves_the_pointer_type) {
     uint64_t raw = 0x7ffffe1ff700ULL;
     CHECK_EQ(BOXEDWINE_GUEST_PTR(raw), 0x7ffe1ff700ULL);
 }
+
+BOXEDVN_TEST(dxmt_resource_options_remap_managed_to_shared_only) {
+    // iOS Metal has no Managed storage mode (0x10 in bits 4-5); everything
+    // else, including the cache-mode and hazard-tracking bits, is kept.
+    for (uint64_t extra : {0ULL, 1ULL, 256ULL, 512ULL, 257ULL}) {
+        CHECK_EQ(BOXEDWINE_METAL_RESOURCE_OPTIONS(0x00ULL | extra), 0x00ULL | extra);
+        CHECK_EQ(BOXEDWINE_METAL_RESOURCE_OPTIONS(0x10ULL | extra), 0x00ULL | extra);
+        CHECK_EQ(BOXEDWINE_METAL_RESOURCE_OPTIONS(0x20ULL | extra), 0x20ULL | extra);
+        CHECK_EQ(BOXEDWINE_METAL_RESOURCE_OPTIONS(0x30ULL | extra), 0x30ULL | extra);
+    }
+}

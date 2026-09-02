@@ -150,12 +150,18 @@ EOF
 BUILD_DIR="${OUTPUT_DIR}/build"
 if [[ ${FORCE} -eq 1 ]]; then rm -rf "${BUILD_DIR}"; fi
 if [[ ! -f "${BUILD_DIR}/build.ninja" ]]; then
+    # DXMT_IOS: iOS Metal has no Managed storage mode; DXMT's winemetal.h
+    # remaps Managed to Shared under this define, but its meson build only
+    # sets it for the aarch64-windows target. This x86-64 build runs on the
+    # same iOS device through FEX, and without the define the first buffer
+    # the guest creates asserts inside Metal ("Invalid storageMode").
     meson setup "${BUILD_DIR}" "${DXMT_SOURCE}" \
         --cross-file "${CROSS_FILE}" --native-file "${NATIVE_FILE}" \
         --buildtype release -Dwine_builtin_dll=true \
         -Dwine_install_path="${WINE_INSTALL}" \
         -Dbuild_airconv_for_windows=true -Ddxmt_native=false \
-        -Denable_nvapi=false -Denable_nvngx=false
+        -Denable_nvapi=false -Denable_nvngx=false \
+        -Dc_args=-DDXMT_IOS=1 -Dcpp_args=-DDXMT_IOS=1
 fi
 meson compile -C "${BUILD_DIR}" -j "${JOBS}"
 

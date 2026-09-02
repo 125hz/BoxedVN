@@ -5393,3 +5393,16 @@ compilation-argument chain. The rewrite left them untranslated. Now:
   attempt that assumed 4 GiB), so the GetCompiledBitcode thunk tags the
   pointer with bit 62 and `boxedwine_dxmt_host_pointer` strips the tag and
   returns it unchanged.
+
+## Storage mode (after 7e28ef80)
+
+With the translator thunks fixed, `shaders ok` is reached on device; the
+next two runs died at `geometry begin` with Metal's own assertion,
+`-[IOGPUMetalBuffer initWithDevice:...] failed assertion 'Invalid
+storageMode'`, on the first buffer. iOS has no Managed storage mode. DXMT's
+winemetal.h remaps Managed to Shared under DXMT_IOS, but its meson build
+defines that only for the aarch64-windows target; our x86-64 guest DLLs
+never had it and asked for Managed. The x86-64 PE build now passes
+`-DDXMT_IOS=1` (and the native build too), and the unix-side rewrite wraps
+every forwarded resource-options value in a Managed-to-Shared remap so a
+mismatched guest DLL cannot take the process down.
