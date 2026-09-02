@@ -5680,3 +5680,25 @@ stat (`dosdevices/<letter>:`) is now logged with its answer. A pointer
 drag lowered the cube's frame rate; motion events that pile up behind an
 unread one now coalesce to the newest position in the bridge queue.
 
+## The 32-bit probe never reached WoW64: Wine's loader name decides it
+
+Both WoW64 probe runs mounted the PE layer and then ran `start.exe`: Wine's
+`init_startup_info` (dlls/ntdll/unix/env.c) loads the 32-bit image, asks
+`get_alternate_wineloader` for a loader name by stripping "64" from its own
+name, and when that yields a name marks the image as a foreign format and
+hands it to `start.exe /exec`, which spawns that loader, which the layers do
+not ship. Upstream's WoW64 build names its loader `wine`, so stripping
+yields nothing and the image runs in-process through `load_wow64_ntdll`.
+The lane now launches through `.../wine`, aliased at startup to the
+packaged `wine64` (and `wine-preloader` to `wine64-preloader`); the loader
+takes its name from argv[0] and its directory from /proc/self/exe, so the
+alias is enough. Nothing changes for 64-bit images: the alternate loader is
+only consulted for a foreign machine.
+
+The desktop's missing drives have a matching shape: `GetLogicalDrives`
+enumerates the `\DosDevices` object directory, whose drive links the mount
+manager creates from `readlink` of `dosdevices/<letter>:`, and the mount
+manager's host process (winedevice.exe) exits with status 0 during boot in
+every 64-bit run. The launch environment adds the winedevice and mountmgr
+trace channels so the next log says why.
+

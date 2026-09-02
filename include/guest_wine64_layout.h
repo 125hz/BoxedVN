@@ -54,7 +54,17 @@
 // never be packaged.
 #define K_X64_WINE_PE32_DIR K_X64_WINE_MODULE_ROOT "/i386-windows"
 #define K_X64_WINE_UNIX_DIR K_X64_WINE_MODULE_ROOT "/x86_64-unix"
-#define K_X64_WINE_LOADER K_X64_WINE_MODULE_ROOT "/wine64"
+// The lane launches through the name upstream's WoW64 layout uses. Wine
+// derives the loader for a 32-bit image by stripping "64" from its own name
+// and hands the image to start.exe whenever that yields a name
+// (dlls/ntdll/unix/env.c); a loader called wine64 therefore never runs a
+// 32-bit program in-process. The packaged binaries keep their wine64 names
+// and are aliased under the wine names at startup.
+#define K_X64_WINE_LOADER K_X64_WINE_MODULE_ROOT "/wine"
+#define K_X64_WINE_LOADER64 K_X64_WINE_MODULE_ROOT "/wine64"
+#define K_X64_WINE_PRELOADER K_X64_WINE_MODULE_ROOT "/wine-preloader"
+#define K_X64_WINE_PRELOADER64_NAME "wine64-preloader"
+#define K_X64_WINE_LOADER64_NAME "wine64"
 #define K_X64_WINE_SERVER K_X64_WINE_MODULE_ROOT "/wineserver"
 
 // Kept reachable for anything that still names the relocated layout. Nothing

@@ -1797,7 +1797,8 @@ def main() -> None:
         [
             '#define K_X64_WINE_MODULE_ROOT "/usr/lib/x86_64-linux-gnu/wine"',
             '#define K_X64_WINE_PE_DIR K_X64_WINE_MODULE_ROOT "/x86_64-windows"',
-            '#define K_X64_WINE_LOADER K_X64_WINE_MODULE_ROOT "/wine64"',
+            '#define K_X64_WINE_LOADER K_X64_WINE_MODULE_ROOT "/wine"',
+            '#define K_X64_WINE_LOADER64 K_X64_WINE_MODULE_ROOT "/wine64"',
             '#define K_X64_WINE_DLL_PATH_ASSIGNMENT "WINEDLLPATH=" K_X64_WINE_MODULE_ROOT',
             '#define K_X64_WINE_BUILTIN_PROBE K_X64_WINE_PE_DIR "/kernel32.dll"',
         ],

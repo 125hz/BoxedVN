@@ -109,7 +109,7 @@ BOXEDVN_TEST(fex64_launch_mounts_runtime_layers_and_enters_wine64) {
         "-env", "WINEARCH=win64",
         "-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine",
         "-env", "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11",
-        "/usr/lib/x86_64-linux-gnu/wine/wine64", "d:\\probe.exe",
+        "/usr/lib/x86_64-linux-gnu/wine/wine", "d:\\probe.exe",
     };
     CHECK(actual == expected);
 }
@@ -509,7 +509,7 @@ BOXEDVN_TEST(fex64_launch_gets_its_own_prefix_and_win64_arch) {
     CHECK(std::count(actual.begin(), actual.end(),
                      "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11") == 1);
     CHECK(std::find(actual.begin(), actual.end(),
-                    "/usr/lib/x86_64-linux-gnu/wine/wine64") != actual.end());
+                    "/usr/lib/x86_64-linux-gnu/wine/wine") != actual.end());
     // The 32-bit prefix is never named, and never converted or renamed: it
     // stays exactly where it is as the default for 32-bit programs.
     CHECK(std::find(actual.begin(), actual.end(),

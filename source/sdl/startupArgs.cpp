@@ -213,6 +213,29 @@ static void projectX64WinePe32Modules(const BString& winePrefix) {
              syswow64.c_str(), pe32Projected);
 }
 
+// Wine strips "64" from its own loader name to find the loader for a 32-bit
+// image and hands the image to start.exe when that yields a name; start.exe
+// then spawns that loader, which the layers do not ship. Upstream's WoW64
+// layout names the loader wine, so the lane launches through that name and
+// the packaged wine64 binaries are aliased under it here. A link node with a
+// relative target resolves inside the module directory.
+static void aliasX64WineLoader(const char* aliasPath, const char* targetName) {
+    if (Fs::getNodeFromLocalPath(B(""), BString::copy(aliasPath), false)) {
+        return;
+    }
+    std::shared_ptr<FsNode> moduleRoot =
+        Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_MODULE_ROOT), true);
+    if (!moduleRoot || !moduleRoot->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_LOADER_ALIAS alias=%s target=%s status=no-module-root",
+                 aliasPath, targetName);
+        return;
+    }
+    Fs::addFileNode(BString::copy(aliasPath), BString::copy(targetName), B(""),
+                    false, moduleRoot);
+    klog_fmt("BOXEDWINE_X64_LOADER_ALIAS alias=%s target=%s status=linked",
+             aliasPath, targetName);
+}
+
 static void projectX64WineSystemModules(const BString& winePrefix) {
     const BString system32 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
                              K_GUEST_WINE_WINDOWS "/" K_GUEST_WINE_SYSTEM32;
@@ -843,6 +866,8 @@ bool StartUpArgs::apply() {
         }
     }
     if (requestedFEX64) {
+        aliasX64WineLoader(K_X64_WINE_LOADER, K_X64_WINE_LOADER64_NAME);
+        aliasX64WineLoader(K_X64_WINE_PRELOADER, K_X64_WINE_PRELOADER64_NAME);
         projectX64WineSystemModules(winePrefix);
         // The guest ld-linux resolves winex11.so's libX11/libXext through
         // LD_LIBRARY_PATH before the multiarch directories. Put BoxedWine's

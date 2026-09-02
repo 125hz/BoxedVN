@@ -620,7 +620,9 @@ final class AppModel: ObservableObject {
         static let dxmtModules = ["d3d11.dll", "dxgi.dll", "d3d10core.dll",
                                   "winemetal.dll"]
         static let environment = [
-            "WINEDEBUG=warn+module,warn+seh",
+            // winedevice and the mount manager trace why the 64-bit
+            // desktop's drive links never appear; both are quiet at boot.
+            "WINEDEBUG=warn+module,warn+seh,+winedevice,+mountmgr",
             "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
         ]
     }
