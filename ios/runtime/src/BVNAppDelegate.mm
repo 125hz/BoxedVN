@@ -928,14 +928,24 @@ static void BVNStartRefreshRateHold(void) {
     CADisplayLink* link =
         [CADisplayLink displayLinkWithTarget:gRefreshRateHold
                                     selector:@selector(tick:)];
-    // Common modes, so it keeps firing while UIKit is tracking a touch. The
-    // guest owns the main thread, but SDL's UIKit_PumpEvents cycles the main
-    // run loop on every SDL_PollEvent, which is often enough to keep this
-    // scheduled.
-    [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     gRefreshRateHold.link = link;
     BVNResetGuestFramePacer(BVNGuestFrameRateMode());
     BVNApplyGuestFrameRateMode();
+    // On its own thread and run loop: the main run loop is pumped only as
+    // often as SDL polls while the guest holds it, and a display link that
+    // is not serviced does not keep its frame-rate request with the panel.
+    BVNRefreshRateHold* holder = gRefreshRateHold;
+    NSThread* thread = [[NSThread alloc] initWithBlock:^{
+        [link addToRunLoop:NSRunLoop.currentRunLoop forMode:NSDefaultRunLoopMode];
+        while (gRefreshRateHold == holder && holder.link == link) {
+            [NSRunLoop.currentRunLoop
+                runMode:NSDefaultRunLoopMode
+             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+        }
+    }];
+    thread.name = @"BoxedVN display cadence";
+    thread.qualityOfService = NSQualityOfServiceUserInteractive;
+    [thread start];
     const int mode = BVNGuestFrameRateMode();
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 mode == 1 ? "Requesting a locked 60 Hz guest display cadence."

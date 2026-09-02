@@ -5873,3 +5873,31 @@ same frame), a suppressed blank line is labelled, and host faults on
 non-translator threads plus uncaught ObjC exceptions are logged before the
 app dies (the 64-bit desktop took the app down with nothing in the log).
 
+## Host-fault logging paid off: interpreter NULL page, FEX lock alias, DXMT 60 lock
+
+With host faults logged, the app-killing crash in both the 64-bit desktop
+and the cube (after its guest crash forked winedbg) is CPU64::step on a
+forked helper: the interpreter dereferenced a page with no backing buffer at
+a bare page offset (0x944, 0x5a2). The sparse memory paths now read the
+backing pointer once and never cache or write through NULL, reporting
+BOXEDWINE_X64_SPARSE_PAGE_MISSING instead. Note: every process except the
+explicitly translated launch runs on the interpreter (fork children cannot
+own a second identity mapping), which is where the desktop's helpers live.
+
+Strict memory ordering spun forever inside FEX's unaligned handler: the
+backpatch lock word sits in the code buffer and was CASed through the
+executable alias. It is now taken through the writable alias.
+
+The 60 fps ceiling was DXMT's own present pacing, defaulting to a locked
+presentDrawable:afterMinimumDuration:1/60. The cap now drives
+mythic_set_vsync_locked: unlocked = mailbox (guest unthrottled, true guest
+rate from DXMT's counter), 120 = free-run, 60 = DXMT lock, 30 = pacer. The
+display link moved to its own thread so the panel request stays registered.
+
+Served faults (int 0x80, selector writes) are handled before the fault
+report budget, which the per-syscall FS write had exhausted, hiding the
+access violation that ended the 32-bit run. The capture target is scoped to
+the faulting program's command line, so the desktop no longer consumes the
+cube's target. (cfe01cc5 carried all of this except the display-link
+thread and the counter readout, added in the following commit.)
+
