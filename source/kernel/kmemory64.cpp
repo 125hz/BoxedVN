@@ -1860,6 +1860,7 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
     }
 }
 
+namespace {
 void k64ReportMissingBacking(int pid, U64 pageNum, const char* op) {
     static std::atomic<U64> reports {0};
     const U64 n = reports.fetch_add(1, std::memory_order_relaxed);
@@ -1904,6 +1905,7 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
         len -= chunk;
     }
 }
+} // namespace
 
 void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
     noteGuestWriteRange(dstGuest, len);
