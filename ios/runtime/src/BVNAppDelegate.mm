@@ -71,10 +71,13 @@ extern "C" bool BVNLogStartSessionFile(void);
 @interface BVNAppDelegate : SDLUIKitDelegate
 @property (nonatomic, strong) UIWindow* libraryWindow;
 @property (nonatomic, assign) BOOL guestOrientationLocked;
+// The live view handed the screen to the guest for a landscape turn.
+@property (nonatomic, assign) BOOL liveViewFullscreen;
 - (void)createLibraryWindowForScene:(UIWindowScene*)scene;
 - (UIWindow*)superWindowForGuest;
 - (void)attachGuestPresentationToHost:(UIView*)host;
 - (void)detachGuestPresentationFromHost;
+- (void)logPresentationTree:(const char*)stage;
 @end
 
 @interface BVNSceneDelegate : NSObject <UIWindowSceneDelegate>
@@ -116,7 +119,20 @@ static NSInteger BVNPreferredOrientationValue(void) {
     return MIN(2, MAX(0, value));
 }
 
+// Orientation lock. On (the default), the library and the guest stay in the
+// preferred orientation above. Off, both follow the device the way iOS
+// reports it, and a landscape turn with the live view on screen hands the
+// guest the whole screen (see deviceOrientationDidChange:).
+static NSString* const kBVNOrientationLockKey = @"BoxedVN.orientationLock";
+static BOOL BVNOrientationLockEnabled(void) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    return [defaults objectForKey:kBVNOrientationLockKey]
+        ? [defaults boolForKey:kBVNOrientationLockKey] : YES;
+}
 static UIInterfaceOrientationMask BVNPreferredOrientationMask(void) {
+    if (!BVNOrientationLockEnabled()) {
+        return UIInterfaceOrientationMaskAllButUpsideDown;
+    }
     switch (BVNPreferredOrientationValue()) {
         case 0: return UIInterfaceOrientationMaskPortrait;
         case 2: return UIInterfaceOrientationMaskLandscapeLeft;
@@ -125,6 +141,9 @@ static UIInterfaceOrientationMask BVNPreferredOrientationMask(void) {
 }
 
 static BOOL BVNOrientationMatchesPreference(UIInterfaceOrientation orientation) {
+    if (!BVNOrientationLockEnabled()) {
+        return YES;
+    }
     switch (BVNPreferredOrientationValue()) {
         case 0: return orientation == UIInterfaceOrientationPortrait;
         case 2: return orientation == UIInterfaceOrientationLandscapeLeft;
@@ -213,7 +232,17 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
                                 UIViewAutoresizingFlexibleHeight;
         [host insertSubview:root atIndex:0];
     }
-    guestWindow.hidden = YES;
+    // Not hidden: the platform layer shows and raises SDL's window again on
+    // the first frame (KNativeScreenSDL::showWindow), which un-hid the
+    // emptied window and painted the whole screen black on the first live
+    // view run. A transparent, non-interactive window below the library
+    // window stays out of sight whatever SDL does to it, while SDL still
+    // sees a visible window and keeps drawing.
+    guestWindow.windowLevel = UIWindowLevelNormal - 1.0;
+    guestWindow.alpha = 0.0;
+    guestWindow.userInteractionEnabled = NO;
+    guestWindow.hidden = NO;
+    self.libraryWindow.windowLevel = UIWindowLevelNormal;
     self.libraryWindow.hidden = NO;
     [self.libraryWindow makeKeyAndVisible];
     BVNGuestOverlayInstall();
@@ -222,6 +251,38 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
         @"Guest presentation attached to the live view host (%.0fx%.0f pt).",
         host.bounds.size.width, host.bounds.size.height];
     BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
+    [self logPresentationTree:"attach"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self logPresentationTree:"attach+3s"];
+    });
+}
+
+// One line per window of the scene plus the host: enough to tell from a
+// device log which window is on top, whether it can be seen, and where the
+// presentation view actually is.
+- (void)logPresentationTree:(const char*)stage {
+    UIWindowScene* scene = self.libraryWindow.windowScene;
+    NSMutableString* text = [NSMutableString stringWithFormat:
+        @"BOXEDVN_PRESENTATION_TREE stage=%s", stage];
+    for (UIWindow* window in scene.windows) {
+        [text appendFormat:@" | %@ level=%.0f hidden=%d alpha=%.2f key=%d frame=%.0fx%.0f root=%@ subviews=%lu",
+            NSStringFromClass([window class]), (double)window.windowLevel,
+            window.hidden, window.alpha, window.isKeyWindow,
+            window.bounds.size.width, window.bounds.size.height,
+            NSStringFromClass([window.rootViewController class]),
+            (unsigned long)window.subviews.count];
+    }
+    UIView* host = gGuestPresentationHost;
+    UIView* root = [super window].rootViewController.view;
+    [text appendFormat:@" | host=%@ hostWindow=%@ hostFrame=%.0fx%.0f rootSuperview=%@ rootFrame=%.0fx%.0f rootInHost=%d",
+        host ? NSStringFromClass([host class]) : @"nil",
+        host.window ? NSStringFromClass([host.window class]) : @"nil",
+        host.bounds.size.width, host.bounds.size.height,
+        root.superview ? NSStringFromClass([root.superview class]) : @"nil",
+        root.bounds.size.width, root.bounds.size.height,
+        root != nil && root.superview == host];
+    BVNLogWrite(BVNLogLevelInfo, "frontend", text.UTF8String);
 }
 
 - (void)detachGuestPresentationFromHost {
@@ -238,12 +299,41 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
                                 UIViewAutoresizingFlexibleHeight;
         [guestWindow insertSubview:root atIndex:0];
     }
+    guestWindow.windowLevel = UIWindowLevelNormal;
+    guestWindow.alpha = 1.0;
+    guestWindow.userInteractionEnabled = YES;
     guestWindow.hidden = NO;
     [guestWindow makeKeyAndVisible];
     BVNGuestOverlayInstall();
     BVNDXMTDisplayAttach();
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "Guest presentation returned to SDL's window.");
+    [self logPresentationTree:"detach"];
+}
+
+// Landscape with the live view on screen means the guest gets the whole
+// screen: the presentation goes back to SDL's window, which is the existing
+// full-screen path, and comes back into the host when the device is upright
+// again. Only the orientation-lock-off case can rotate; with the lock on the
+// interface never turns.
+- (void)deviceOrientationDidChange:(NSNotification*)notification {
+    if (gGuestPresentationHost == nil || [super window] == nil) {
+        return;
+    }
+    const UIInterfaceOrientation orientation =
+        self.libraryWindow.windowScene.interfaceOrientation;
+    const BOOL landscape = UIInterfaceOrientationIsLandscape(orientation);
+    if (landscape && !self.liveViewFullscreen) {
+        self.liveViewFullscreen = YES;
+        BVNLogWrite(BVNLogLevelInfo, "frontend",
+                    "Landscape: the live view takes the whole screen.");
+        [self detachGuestPresentationFromHost];
+    } else if (!landscape && self.liveViewFullscreen) {
+        self.liveViewFullscreen = NO;
+        BVNLogWrite(BVNLogLevelInfo, "frontend",
+                    "Portrait: the guest returns to the live view.");
+        [self attachGuestPresentationToHost:gGuestPresentationHost];
+    }
 }
 
 - (void)guestWindowDidBecomeVisible:(NSNotification*)notification {
@@ -811,8 +901,11 @@ extern "C" void BVNGuestPresentationSetHostView(void* pointer) {
     UIView* host = (__bridge UIView*)pointer;
     gGuestPresentationHost = host;
     if (host != nil) {
-        [gAppDelegate attachGuestPresentationToHost:host];
+        if (!gAppDelegate.liveViewFullscreen) {
+            [gAppDelegate attachGuestPresentationToHost:host];
+        }
     } else {
+        gAppDelegate.liveViewFullscreen = NO;
         [gAppDelegate detachGuestPresentationFromHost];
     }
 }
