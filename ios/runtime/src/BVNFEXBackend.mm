@@ -2003,6 +2003,51 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     static_cast<unsigned long long>(snapshot.lastFaultAddress),
                     static_cast<unsigned long long>(snapshot.lastFaultPC),
                     history);
+            // A thread that is running with the CPU pinned while its host PC sits
+            // outside translated code is spinning in the host, not in the guest.
+            // Name the host routine and its caller now: the stall report only
+            // covers a PC that stays put, and a spin's PC moves.
+            if (snapshot.runState == TH_STATE_RUNNING && cpuPercent >= 25.0 &&
+                snapshot.hostPC != 0) {
+                Dl_info pcInfo {};
+                Dl_info lrInfo {};
+                const bool havePC =
+                    dladdr(reinterpret_cast<const void*>(snapshot.hostPC), &pcInfo) != 0;
+                const bool haveLR = snapshot.hostLR != 0 &&
+                    dladdr(reinterpret_cast<const void*>(snapshot.hostLR), &lrInfo) != 0;
+                auto baseName = [](const char* path) -> const char* {
+                    if (!path) return "(unknown)";
+                    const char* slash = strrchr(path, '/');
+                    return slash ? slash + 1 : path;
+                };
+                auto offsetIn = [](uint64_t address, const Dl_info& info) -> uint64_t {
+                    const uint64_t base = reinterpret_cast<uint64_t>(info.dli_fbase);
+                    return base != 0 && address >= base ? address - base : 0;
+                };
+                auto symbolOffset = [](uint64_t address, const Dl_info& info) -> uint64_t {
+                    const uint64_t base = reinterpret_cast<uint64_t>(info.dli_saddr);
+                    return base != 0 && address >= base ? address - base : 0;
+                };
+                reportf("BOXEDWINE_FEX64_BUSY_HOST poll=%llu pid=%u tid=%u cpu=%.1f%% "
+                        "pc=0x%llx pc_image=%s pc_offset=0x%llx pc_symbol=%s+0x%llx "
+                        "lr=0x%llx lr_image=%s lr_offset=0x%llx lr_symbol=%s+0x%llx",
+                        static_cast<unsigned long long>(snapshot.poll),
+                        snapshot.processId, snapshot.threadId, cpuPercent,
+                        static_cast<unsigned long long>(snapshot.hostPC),
+                        havePC ? baseName(pcInfo.dli_fname) : "(unknown)",
+                        static_cast<unsigned long long>(
+                            havePC ? offsetIn(snapshot.hostPC, pcInfo) : 0),
+                        havePC && pcInfo.dli_sname ? pcInfo.dli_sname : "(unknown)",
+                        static_cast<unsigned long long>(
+                            havePC ? symbolOffset(snapshot.hostPC, pcInfo) : 0),
+                        static_cast<unsigned long long>(snapshot.hostLR),
+                        haveLR ? baseName(lrInfo.dli_fname) : "(unknown)",
+                        static_cast<unsigned long long>(
+                            haveLR ? offsetIn(snapshot.hostLR, lrInfo) : 0),
+                        haveLR && lrInfo.dli_sname ? lrInfo.dli_sname : "(unknown)",
+                        static_cast<unsigned long long>(
+                            haveLR ? symbolOffset(snapshot.hostLR, lrInfo) : 0));
+            }
         }
         if (snapshot.emitWarning) {
             reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx entry_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",

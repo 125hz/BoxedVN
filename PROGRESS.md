@@ -5511,3 +5511,45 @@ gains `K_X64_WINE_PE32_DIR` and the wow64 module names, and
 `syswow64`. 138 host tests pass. Phase 1's device gate (a 32-bit builtin
 starting under the 64-bit prefix through WoW64) and its last bullet (32-bit
 DXMT PE thunks built for i686) remain open.
+
+## 9aaf8c1d regressed the cube; the 32-bit tree now ships apart
+
+Four runs on 9aaf8c1d: two stalled in `register-class` while explorer was
+started twice, two ended the app at explorer's second display. In the two
+stalled runs the cube process took a guest fault at RIP 0 seventeen seconds
+in, and the witness names it: `BOXEDWINE_FEX64_NULL_EXIT_TARGET
+source_block=0x7a41321185 guest_target=0x0 ... path=l1-miss`. Matching
+the four recorded call distances against the shipped libraries places the
+block in libexpat 2.6.1 loaded at 0x7a41304000: the exit is the indirect
+`call qword ptr [r12+0x70]` at vaddr 0x1d19f, r12 is the static encoding
+table in `.data.rel.ro` (0x2ac00), and slot 0x2ac70 carries an
+`R_X86_64_RELATIVE` relocation whose file content is zero. Earlier
+iterations of the same loop had called through that slot, so the relocated
+value was present and then read back as the file image. The 64-bit memory
+layer does not remap on `mprotect` (in place) and a forked child copies
+every committed page rather than aliasing it, so the mechanism is still
+open; it also fits the `Fontconfig error: out of memory` lines every run
+prints. The same witness fired once in the first 64-bit desktop run
+(24f00a6b, source block 0x7a412d8fae), so it predates the 32-bit tree.
+
+The other 9aaf8c1d failure is a freeze, not a fault: the cube presented
+200 frames, then the main thread parked in `futex` (libc `syscall+0x1b`,
+op FUTEX_WAIT|PRIVATE on a word in the unix heap page 0x7a450c8000),
+a second thread parked on a neighbouring word, and a third came back from
+its own futex wait (RIP already advanced past `syscall`) and spun at 98%
+CPU at two adjacent host instructions in the app binary with a constant
+link register. That is a host-side busy loop in the post-syscall path,
+not guest code. The stall report never names it because it only fires for
+a PC that stays put, so the sampler now writes a
+`BOXEDWINE_FEX64_BUSY_HOST` line for any running thread above 25% CPU with
+`dladdr` image, offset and symbol for both the PC and the link register,
+the guest fault dump gains r12..r15, and the IPA job uploads a sorted
+`nm` symbol map of the shipped binary (`host-symbols-<config>`) plus a
+bundle size table in the step summary.
+
+The 32-bit PE tree and its guest link now ship in `wine64-pe32.zip`, pinned
+by `pe32_archive`/`pe32_sha256`; wine64.zip is back to its pre-Phase-1
+contents and the validator rejects an i386-windows tree inside it. The app
+bundles only the two layers, so the IPA returns to its earlier size and the
+prefix projection logs `tree=i386-windows status=missing` until phase 2
+mounts the archive.

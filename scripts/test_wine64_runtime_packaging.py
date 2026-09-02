@@ -238,6 +238,12 @@ class WineserverArchiveValidation(unittest.TestCase):
         self._wow64_modules = wow64_modules
         glibc = directory / "glibc-rootfs64.zip"
         wine = directory / "wine64.zip"
+        # The 32-bit PE tree ships in its own archive: inside wine64.zip it
+        # is what the app mounts, and mounting it broke the 64-bit lane on
+        # device (the cube probe stalled in RegisterClass in four of four
+        # runs) and grew the IPA to 400 MB.
+        self._pe32_archive = directory / "wine64-pe32.zip"
+        self.write_pe32_archive(self._pe32_archive)
         with zipfile.ZipFile(glibc, "w") as archive:
             archive.writestr("lib64/ld-linux-x86-64.so.2", elf())
             archive.writestr("lib/x86_64-linux-gnu/libc.so.6", elf())
@@ -289,16 +295,22 @@ class WineserverArchiveValidation(unittest.TestCase):
         for wow64_module in getattr(self, "_wow64_modules", WOW64_MODULES):
             archive.writestr(PE_DIR + "/" + wow64_module,
                              pe(body=wow64_module.encode()))
-        # The 32-bit builtins, in their own tree and as PE32 images.
-        pe32_machine = getattr(self, "_pe32_machine", PE32_MACHINE)
-        for pe32_module in getattr(self, "_pe32_modules", PE32_MODULES):
-            archive.writestr(PE32_DIR + "/" + pe32_module,
-                             pe(machine=pe32_machine,
-                                body=b"i386:" + pe32_module.encode()))
         for nls in ("c_20127.nls", "locale.nls", "l_intl.nls"):
             archive.writestr(DATA_ROOT + "/nls/" + nls, b"nls:" + nls.encode())
         for link, target in self.compatibility_links():
             archive.writestr(link + ".link", guest_link(target))
+
+    def write_pe32_archive(self, pe32: Path) -> None:
+        """The 32-bit builtins, in their own tree, as PE32 images, with the
+        compatibility link that names the tree; all in the third archive."""
+        pe32_machine = getattr(self, "_pe32_machine", PE32_MACHINE)
+        with zipfile.ZipFile(pe32, "w") as archive:
+            for pe32_module in getattr(self, "_pe32_modules", PE32_MODULES):
+                archive.writestr(PE32_DIR + "/" + pe32_module,
+                                 pe(machine=pe32_machine,
+                                    body=b"i386:" + pe32_module.encode()))
+            archive.writestr("usr/lib/wine/i386-windows.link",
+                             guest_link("/" + PE32_DIR))
 
     @staticmethod
     def compatibility_links():
@@ -308,41 +320,48 @@ class WineserverArchiveValidation(unittest.TestCase):
             ("usr/lib/wine/wineserver64", "/" + ROOT + "/wineserver64"),
             ("usr/lib/wine/x86_64-windows", "/" + PE_DIR),
             ("usr/lib/wine/x86_64-unix", "/" + ROOT + "/x86_64-unix"),
-            ("usr/lib/wine/i386-windows", "/" + PE32_DIR),
             ("usr/bin/wine64", "/" + ROOT + "/wine64"),
             ("usr/bin/wineserver", "/" + ROOT + "/wineserver"),
             (DERIVED_DATA_ROOT, "/" + DATA_ROOT),
         )
 
     @staticmethod
-    def wow64_manifest_pins(wine: Path) -> dict:
+    def wow64_manifest_pins(wine: Path, pe32: Path) -> dict:
         """The WoW64 pins the validator requires beside the layer hashes.
 
         A runtime that lost its 32-bit tree between build and packaging still
         satisfies every 64-bit path the checker knew about before, so the tree
-        is pinned by count and by the hash of the module a WoW64 process loads
-        first.
+        is pinned by its archive hash, by count and by the hash of the module
+        a WoW64 process loads first; the thunk modules are pinned in the
+        64-bit archive.
         """
-        with zipfile.ZipFile(wine) as archive:
-            names = {item.filename for item in archive.infolist()}
+        def archive_pins(path: Path, entries: dict) -> dict:
+            if not path.is_file():
+                # A missing archive still gets syntactically valid pins, so
+                # the archive check is what reports it rather than the parser.
+                return {key: "0" * 64 for key in entries}
+            with zipfile.ZipFile(path) as archive:
+                names = {item.filename for item in archive.infolist()}
+                return {key: (sha256(archive.read(name)) if name in names
+                              else "0" * 64)
+                        for key, name in entries.items()}
 
-            def entry_sha(name: str) -> str:
-                if name in names:
-                    return sha256(archive.read(name))
-                # A dropped entry still gets a syntactically valid pin, so the
-                # path check is what reports it rather than the parser.
-                return "0" * 64
-
-            pins = {
-                "i386_windows_module_count": str(sum(
-                    1 for name in names
-                    if name.startswith(PE32_DIR + "/")
-                    and not name.endswith("/"))),
-                "i386_windows_ntdll_sha256": entry_sha(PE32_DIR + "/ntdll.dll"),
-            }
-            for wow64_module in WOW64_MODULES:
-                pins[wow64_module[:-len(".dll")] + "_dll_sha256"] = \
-                    entry_sha(PE_DIR + "/" + wow64_module)
+        pins = {"pe32_archive": "wine64-pe32.zip",
+                "pe32_sha256": (sha256(pe32.read_bytes()) if pe32.is_file()
+                                else "0" * 64)}
+        if pe32.is_file():
+            with zipfile.ZipFile(pe32) as archive:
+                pins["i386_windows_module_count"] = str(sum(
+                    1 for item in archive.infolist()
+                    if item.filename.startswith(PE32_DIR + "/")
+                    and not item.filename.endswith("/")))
+        else:
+            pins["i386_windows_module_count"] = "0"
+        pins.update(archive_pins(
+            pe32, {"i386_windows_ntdll_sha256": PE32_DIR + "/ntdll.dll"}))
+        pins.update(archive_pins(wine, {
+            wow64_module[:-len(".dll")] + "_dll_sha256": PE_DIR + "/" + wow64_module
+            for wow64_module in WOW64_MODULES}))
         return pins
 
     def run_validator(self, directory: Path, glibc: Path, wine: Path,
@@ -355,7 +374,12 @@ class WineserverArchiveValidation(unittest.TestCase):
             "glibc_sha256": sha256(glibc.read_bytes()),
             "wine_sha256": sha256(wine.read_bytes()),
         }
-        entries.update(self.wow64_manifest_pins(wine))
+        pe32 = getattr(self, "_pe32_archive", None) or (directory / "wine64-pe32.zip")
+        if not pe32.is_file() and not getattr(self, "_pe32_absent", False):
+            # Cases that build wine64.zip by hand are about the 64-bit layer;
+            # give them the third archive so the validator reaches their check.
+            self.write_pe32_archive(pe32)
+        entries.update(self.wow64_manifest_pins(wine, pe32))
         entries.update(manifest_overrides or {})
         for dropped in drop_manifest_keys:
             entries.pop(dropped, None)
@@ -876,10 +900,23 @@ class Wow64LayerBuilderContract(unittest.TestCase):
         self.assertIn(
             'I386_PE_GUEST_DIR="${WINE_MODULE_ROOT}/i386-windows"',
             self.builder)
-        self.assertIn('mkdir -p "${STAGE}${I386_PE_GUEST_DIR}"', self.builder)
+        self.assertIn('mkdir -p "${PE32_STAGE}${I386_PE_GUEST_DIR}"', self.builder)
         self.assertIn(
-            'guest_link "${I386_PE_GUEST_DIR}" /usr/lib/wine/i386-windows',
+            'pe32_guest_link "${I386_PE_GUEST_DIR}" /usr/lib/wine/i386-windows',
             self.builder)
+
+    def test_builder_archives_the_32_bit_tree_apart(self) -> None:
+        # Inside wine64.zip the tree is what the app mounts; mounting it broke
+        # the 64-bit lane on device and grew the IPA to 400 MB, so it ships in
+        # wine64-pe32.zip, pinned in the manifest, and the app leaves it out.
+        self.assertIn('zip -qry9 "${OUTPUT_DIR}/wine64-pe32.zip" usr', self.builder)
+        self.assertIn("pe32_archive=wine64-pe32.zip", self.builder)
+        self.assertIn("pe32_sha256=%s", self.builder)
+        self.assertIn('"${PE32_STAGE}${I386_PE_GUEST_DIR}"', self.builder)
+        build_ios = (REPO / "scripts" / "build-ios.sh").read_text(encoding="utf-8")
+        self.assertNotIn("wine64-pe32.zip", build_ios)
+        validator = VALIDATOR.read_text(encoding="utf-8")
+        self.assertIn("carries an i386-windows tree", validator)
 
     def test_builder_never_packages_the_old_wow64_unix_tree(self) -> None:
         # i386-unix is old WoW64: ELF32 objects needing a 32-bit Linux loader
@@ -904,7 +941,7 @@ class Wow64LayerBuilderContract(unittest.TestCase):
         self.assertIn("require_pe_machine", self.builder)
         # 0x014c for the 32-bit tree, 0x8664 for the 64-bit one.
         self.assertIn(
-            'require_pe_machine "${STAGE}${I386_PE_GUEST_DIR}/ntdll.dll" 332',
+            'require_pe_machine "${PE32_STAGE}${I386_PE_GUEST_DIR}/ntdll.dll" 332',
             self.builder)
         self.assertIn(
             'require_pe_machine "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/ntdll.dll" 34404',
@@ -951,10 +988,49 @@ class Wow64ArchiveValidation(WineserverArchiveValidation):
             server = elf(body=b"wineserver64 payload")
             glibc, wine, _ = self.build_archives(
                 directory, server, pe32_modules=())
-            self.rewrite_wine_archive(wine, drop="usr/lib/wine/i386-windows.link")
+            self.rewrite_wine_archive(self._pe32_archive,
+                                      drop="usr/lib/wine/i386-windows.link")
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0, output)
             self.assertIn("i386-windows", output)
+
+    def test_a_32_bit_tree_inside_the_64_bit_archive_is_rejected(self) -> None:
+        # The archive the app mounts must stay 64-bit only: shipping the tree
+        # inside it is what regressed the lane on device.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self.rewrite_wine_archive(
+                wine, add={PE32_DIR + "/ntdll.dll": pe(machine=PE32_MACHINE)})
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("wine64-pe32.zip", output)
+
+    def test_a_missing_32_bit_archive_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            self._pe32_archive.unlink()
+            self._pe32_absent = True
+            try:
+                code, output = self.run_validator(directory, glibc, wine)
+            finally:
+                self._pe32_absent = False
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("wine64-pe32.zip", output)
+
+    def test_a_manifest_pinning_a_different_32_bit_archive_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            code, output = self.run_validator(
+                directory, glibc, wine,
+                manifest_overrides={"pe32_sha256": sha256(b"other")})
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("pe32_sha256", output)
 
     def test_a_missing_32_bit_builtin_is_rejected(self) -> None:
         for missing in ("ntdll.dll", "kernel32.dll"):
@@ -964,7 +1040,7 @@ class Wow64ArchiveValidation(WineserverArchiveValidation):
                     server = elf(body=b"wineserver64 payload")
                     glibc, wine, _ = self.build_archives(directory, server)
                     self.rewrite_wine_archive(
-                        wine, drop=PE32_DIR + "/" + missing)
+                        self._pe32_archive, drop=PE32_DIR + "/" + missing)
                     code, output = self.run_validator(directory, glibc, wine)
                     self.assertNotEqual(code, 0, output)
                     self.assertIn(missing, output)
@@ -1000,7 +1076,7 @@ class Wow64ArchiveValidation(WineserverArchiveValidation):
             server = elf(body=b"wineserver64 payload")
             glibc, wine, _ = self.build_archives(directory, server)
             self.rewrite_wine_archive(
-                wine, replace={PE32_DIR + "/kernel32.dll": b"MZ"})
+                self._pe32_archive, replace={PE32_DIR + "/kernel32.dll": b"MZ"})
             code, output = self.run_validator(directory, glibc, wine)
             self.assertNotEqual(code, 0, output)
             self.assertIn("kernel32.dll", output)
@@ -1034,7 +1110,7 @@ class Wow64ArchiveValidation(WineserverArchiveValidation):
 
     def test_a_manifest_without_the_wow64_pins_is_rejected(self) -> None:
         for missing in ("i386_windows_module_count",
-                        "i386_windows_ntdll_sha256",
+                        "i386_windows_ntdll_sha256", "pe32_sha256",
                         "wow64_dll_sha256", "wow64win_dll_sha256",
                         "wow64cpu_dll_sha256"):
             with self.subTest(missing=missing):

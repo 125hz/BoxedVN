@@ -29,3 +29,7 @@ i386_windows_ntdll_sha256=REPLACE_WITH_64_HEX_SHA256
 wow64_dll_sha256=REPLACE_WITH_64_HEX_SHA256
 wow64win_dll_sha256=REPLACE_WITH_64_HEX_SHA256
 wow64cpu_dll_sha256=REPLACE_WITH_64_HEX_SHA256
+# The 32-bit PE tree ships in its own archive (validated, not bundled by
+# the app until the WoW64 lane runs it).
+pe32_archive=wine64-pe32.zip
+pe32_sha256=REPLACE_WITH_64_HEX_SHA256

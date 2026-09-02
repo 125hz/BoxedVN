@@ -93,7 +93,13 @@ fi
 
 OUTPUT_DIR="$(mkdir -p "${OUTPUT_DIR}" && cd "${OUTPUT_DIR}" && pwd)"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/boxedvn-wine64-stage.XXXXXX")"
-cleanup() { rm -rf "${STAGE}"; }
+# The 32-bit PE tree is staged apart and archived apart (wine64-pe32.zip).
+# Shipping it inside wine64.zip regressed the 64-bit lane on device: the cube
+# probe stalled in RegisterClass or the app died at explorer's second display
+# in four of four runs, and the IPA grew to 400 MB. Until the WoW64 lane can
+# run it, the tree is packaged and validated but not mounted by the app.
+PE32_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/boxedvn-wine64-pe32-stage.XXXXXX")"
+cleanup() { rm -rf "${STAGE}" "${PE32_STAGE}"; }
 trap cleanup EXIT
 
 find_first() {
@@ -414,16 +420,16 @@ fi
 # 32-bit process.
 I386_PE_MODULE_COUNT=0
 if [[ -n "${I386_PE_DIR}" ]]; then
-    mkdir -p "${STAGE}${I386_PE_GUEST_DIR}"
-    cp -aL "${I386_PE_DIR}/." "${STAGE}${I386_PE_GUEST_DIR}/"
+    mkdir -p "${PE32_STAGE}${I386_PE_GUEST_DIR}"
+    cp -aL "${I386_PE_DIR}/." "${PE32_STAGE}${I386_PE_GUEST_DIR}/"
     for required_pe32 in ntdll.dll kernel32.dll; do
-        pe32_path="${STAGE}${I386_PE_GUEST_DIR}/${required_pe32}"
+        pe32_path="${PE32_STAGE}${I386_PE_GUEST_DIR}/${required_pe32}"
         [[ -s "${pe32_path}" ]] \
             || die "The i386 PE tree has no ${required_pe32}: ${pe32_path}. Extract libwine:i386 of the same version as the installed amd64 libwine."
     done
-    require_pe_machine "${STAGE}${I386_PE_GUEST_DIR}/ntdll.dll" 332 \
+    require_pe_machine "${PE32_STAGE}${I386_PE_GUEST_DIR}/ntdll.dll" 332 \
         "32-bit PE builtin"
-    I386_PE_MODULE_COUNT="$(find "${STAGE}${I386_PE_GUEST_DIR}" -type f | wc -l | tr -d ' ')"
+    I386_PE_MODULE_COUNT="$(find "${PE32_STAGE}${I386_PE_GUEST_DIR}" -type f | wc -l | tr -d ' ')"
     (( I386_PE_MODULE_COUNT > 0 )) \
         || die "The staged i386-windows tree is empty."
     log "32-bit PE builtins packaged: ${I386_PE_GUEST_DIR} (${I386_PE_MODULE_COUNT})"
@@ -628,6 +634,16 @@ guest_link() {
     printf '%s' "${target}" > "${STAGE}${link}.link"
 }
 
+# The same shape, written into the 32-bit archive's own stage. A link inside
+# wine64.zip to a tree that ships in another archive would dangle whenever
+# that archive is not mounted, which today is always.
+pe32_guest_link() {
+    local target="$1"
+    local link="$2"
+    mkdir -p "${PE32_STAGE}$(dirname "${link}")"
+    printf '%s' "${target}" > "${PE32_STAGE}${link}.link"
+}
+
 # Compatibility for anything that still names the relocated layout. Nothing in
 # a launch resolves through these; they exist so that naming them is not a
 # silent failure.
@@ -636,7 +652,9 @@ guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/lib/wine/wineserver
 guest_link "${WINE_MODULE_ROOT}/wineserver64" /usr/lib/wine/wineserver64
 guest_link "${WINE_MODULE_ROOT}/x86_64-windows" /usr/lib/wine/x86_64-windows
 guest_link "${WINE_MODULE_ROOT}/x86_64-unix" /usr/lib/wine/x86_64-unix
-guest_link "${I386_PE_GUEST_DIR}" /usr/lib/wine/i386-windows
+if [[ -n "${I386_PE_DIR}" ]]; then
+    pe32_guest_link "${I386_PE_GUEST_DIR}" /usr/lib/wine/i386-windows
+fi
 guest_link "${WINE_MODULE_ROOT}/wine64" /usr/bin/wine64
 guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/bin/wineserver
 # Wine derives its data root as ../../share/wine from the multiarch module
@@ -660,10 +678,13 @@ mkdir -p "${STAGE}/tmp" "${STAGE}/run/user/1000" \
          "${STAGE}/home/username" "${STAGE}/var/tmp"
 
 rm -f "${OUTPUT_DIR}/glibc-rootfs64.zip" "${OUTPUT_DIR}/wine64.zip" \
-      "${OUTPUT_DIR}/wine64-runtime.manifest"
+      "${OUTPUT_DIR}/wine64-pe32.zip" "${OUTPUT_DIR}/wine64-runtime.manifest"
 ( cd "${STAGE}" && zip -qry9 "${OUTPUT_DIR}/glibc-rootfs64.zip" \
       lib64 lib etc tmp run home var )
 ( cd "${STAGE}" && zip -qry9 "${OUTPUT_DIR}/wine64.zip" usr root )
+if [[ -n "${I386_PE_DIR}" ]]; then
+    ( cd "${PE32_STAGE}" && zip -qry9 "${OUTPUT_DIR}/wine64-pe32.zip" usr )
+fi
 
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -689,13 +710,18 @@ sha256_file() {
     printf 'glibc_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/glibc-rootfs64.zip")"
     printf '%s\n' 'wine_archive=wine64.zip'
     printf 'wine_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/wine64.zip")"
+    # The 32-bit PE tree ships apart, pinned the same way as the two layers.
+    if [[ -f "${OUTPUT_DIR}/wine64-pe32.zip" ]]; then
+        printf '%s\n' 'pe32_archive=wine64-pe32.zip'
+        printf 'pe32_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/wine64-pe32.zip")"
+    fi
     # The WoW64 half of the layer, recorded so the validator can prove the
     # archive it is given is the one this build produced rather than a 64-bit
     # runtime with the same paths.
     printf 'i386_windows_module_count=%s\n' "${I386_PE_MODULE_COUNT}"
     if (( I386_PE_MODULE_COUNT > 0 )); then
         printf 'i386_windows_ntdll_sha256=%s\n' \
-            "$(sha256_file "${STAGE}${I386_PE_GUEST_DIR}/ntdll.dll")"
+            "$(sha256_file "${PE32_STAGE}${I386_PE_GUEST_DIR}/ntdll.dll")"
     fi
     for wow64_module in wow64 wow64win wow64cpu; do
         printf '%s_dll_sha256=%s\n' "${wow64_module}" \

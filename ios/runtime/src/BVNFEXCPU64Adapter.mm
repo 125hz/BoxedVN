@@ -969,13 +969,16 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      static_cast<unsigned long long>(rip), hex);
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_GPRS rax=0x%llx rcx=0x%llx rdx=0x%llx "
                      "rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx "
-                     "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx",
+                     "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx "
+                     "r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx",
                      (unsigned long long)g[0], (unsigned long long)g[1],
                      (unsigned long long)g[2], (unsigned long long)g[3],
                      (unsigned long long)g[4], (unsigned long long)g[5],
                      (unsigned long long)g[6], (unsigned long long)g[7],
                      (unsigned long long)g[8], (unsigned long long)g[9],
-                     (unsigned long long)g[10], (unsigned long long)g[11]);
+                     (unsigned long long)g[10], (unsigned long long)g[11],
+                     (unsigned long long)g[12], (unsigned long long)g[13],
+                     (unsigned long long)g[14], (unsigned long long)g[15]);
         }
     }
     if (!adapter->cpu->raiseSyncFault(

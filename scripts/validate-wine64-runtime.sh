@@ -88,7 +88,7 @@ elif [[ -f "${INPUT}" ]]; then
                 [[ "${normalized}" != /* && "${normalized}" != *../* && "${normalized}" != ../* ]] \
                     || die "Outer runtime ZIP contains an unsafe path '${entry}'."
             done < <(unzip -Z1 "${INPUT}")
-            for expected in glibc-rootfs64.zip wine64.zip wine64-runtime.manifest; do
+            for expected in glibc-rootfs64.zip wine64.zip wine64-pe32.zip wine64-runtime.manifest; do
                 matched="$(unzip -Z1 "${INPUT}" | awk -v expected="${expected}" \
                     '$0 == expected || $0 == "./" expected { print; exit }')"
                 if [[ -n "${matched}" ]]; then
@@ -130,6 +130,11 @@ MANIFEST_GLIBC_ARCHIVE=""
 MANIFEST_GLIBC_SHA256=""
 MANIFEST_WINE_ARCHIVE=""
 MANIFEST_WINE_SHA256=""
+# The 32-bit PE tree's own archive. It is validated here and never bundled by
+# the app until the WoW64 lane can run it; shipping it inside wine64.zip
+# regressed the 64-bit lane on device.
+MANIFEST_PE32_ARCHIVE=""
+MANIFEST_PE32_SHA256=""
 MANIFEST_DXMT_UNIXLIB_SHA256=""
 # The WoW64 half of the layer: the 32-bit PE tree and Wine's own thunk modules.
 MANIFEST_I386_WINDOWS_MODULE_COUNT=""
@@ -150,6 +155,8 @@ if [[ -n "${MANIFEST}" ]]; then
             glibc_sha256)   MANIFEST_GLIBC_SHA256="${value}" ;;
             wine_archive)   MANIFEST_WINE_ARCHIVE="${value}" ;;
             wine_sha256)    MANIFEST_WINE_SHA256="${value}" ;;
+            pe32_archive)   MANIFEST_PE32_ARCHIVE="${value}" ;;
+            pe32_sha256)    MANIFEST_PE32_SHA256="${value}" ;;
             dxmt_unixlib_sha256) MANIFEST_DXMT_UNIXLIB_SHA256="${value}" ;;
             i386_windows_module_count) MANIFEST_I386_WINDOWS_MODULE_COUNT="${value}" ;;
             i386_windows_ntdll_sha256) MANIFEST_I386_WINDOWS_NTDLL_SHA256="${value}" ;;
@@ -191,6 +198,11 @@ fi
     || die "Manifest glibc_archive must be exactly glibc-rootfs64.zip."
 [[ -z "${MANIFEST}" || "${MANIFEST_WINE_ARCHIVE:-wine64.zip}" == "wine64.zip" ]] \
     || die "Manifest wine_archive must be exactly wine64.zip."
+[[ -z "${MANIFEST}" || "${MANIFEST_PE32_ARCHIVE:-wine64-pe32.zip}" == "wine64-pe32.zip" ]] \
+    || die "Manifest pe32_archive must be exactly wine64-pe32.zip."
+PE32_ARCHIVE="${RUNTIME_DIR}/wine64-pe32.zip"
+require_file "${PE32_ARCHIVE}" \
+    "Expected wine64-pe32.zip beside wine64.zip: the 32-bit PE builtins ship in their own archive so the app can bundle the 64-bit layer alone."
 
 is_sha256() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
 verify_or_report() {
@@ -204,6 +216,7 @@ verify_or_report() {
         case "${key}" in
             glibc_sha256) expected="${MANIFEST_GLIBC_SHA256}" ;;
             wine_sha256)  expected="${MANIFEST_WINE_SHA256}" ;;
+            pe32_sha256)  expected="${MANIFEST_PE32_SHA256}" ;;
             *)             die "Internal error: unknown checksum key '${key}'." ;;
         esac
         is_sha256 "${expected}" \
@@ -355,6 +368,7 @@ fi
 log "Validating BoxedWine64 layered runtime"
 verify_or_report "${GLIBC_ARCHIVE}" glibc_sha256
 verify_or_report "${WINE_ARCHIVE}" wine_sha256
+verify_or_report "${PE32_ARCHIVE}" pe32_sha256
 
 # These are the paths emitted by the audited build-wine64-zip.sh and consumed
 # by run_wine64.sh's -root/-zip launch sequence.
@@ -512,10 +526,15 @@ done
 # either half has no 32-bit lane, and Wine reports that only as a failure to
 # start the image, which is indistinguishable from a broken program.
 PE32_DIR="${WINE_MODULE_ROOT}/i386-windows"
-check_zip_path "${WINE_ARCHIVE}" "${PE32_DIR}"
+# The tree lives in its own archive. A copy inside wine64.zip is what the app
+# would mount, and mounting it is what broke the 64-bit lane on device.
+if zip_has "${WINE_ARCHIVE}" "${PE32_DIR}"; then
+    die "'$(basename "${WINE_ARCHIVE}")' carries an i386-windows tree; the 32-bit builtins belong in wine64-pe32.zip until the app mounts them."
+fi
+check_zip_path "${PE32_ARCHIVE}" "${PE32_DIR}"
 for required_pe32 in ntdll.dll kernel32.dll; do
-    check_zip_path "${WINE_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
-    check_zip_entry_pe32_i386 "${WINE_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
+    check_zip_path "${PE32_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
+    check_zip_entry_pe32_i386 "${PE32_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
 done
 # The 64-bit tree staying 64-bit is what the loop above already proves for
 # ntdll, kernel32 and kernelbase; the thunk modules are held to the same class,
@@ -527,7 +546,7 @@ for wow64_module in wow64.dll wow64win.dll wow64cpu.dll; do
     check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" \
         "${WINE_MODULE_ROOT}/x86_64-windows/${wow64_module}"
 done
-check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/i386-windows \
+check_zip_guest_link "${PE32_ARCHIVE}" usr/lib/wine/i386-windows \
     "/${PE32_DIR}"
 
 # The manifest pins the WoW64 half the same way it pins the layer archives: a
@@ -536,17 +555,22 @@ check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/i386-windows \
 if [[ -n "${MANIFEST}" ]]; then
     [[ "${MANIFEST_I386_WINDOWS_MODULE_COUNT}" =~ ^[0-9]+$ ]] \
         || die "Wine64 manifest is missing i386_windows_module_count."
-    pe32_entry_count="$(unzip -Z1 "${WINE_ARCHIVE}" \
+    pe32_entry_count="$(unzip -Z1 "${PE32_ARCHIVE}" \
         | sed 's#^\./##' \
         | awk -v prefix="${PE32_DIR}/" \
             'index($0, prefix) == 1 && $0 != prefix && substr($0, length($0)) != "/" { count++ } END { print count + 0 }')"
     (( pe32_entry_count > 0 )) \
-        || die "'$(basename "${WINE_ARCHIVE}")' carries no files under ${PE32_DIR}."
+        || die "'$(basename "${PE32_ARCHIVE}")' carries no files under ${PE32_DIR}."
     (( pe32_entry_count == MANIFEST_I386_WINDOWS_MODULE_COUNT )) \
-        || die "The Wine64 archive holds ${pe32_entry_count} 32-bit PE modules; its manifest records ${MANIFEST_I386_WINDOWS_MODULE_COUNT}."
-    ok "$(basename "${WINE_ARCHIVE}"): ${pe32_entry_count} 32-bit PE modules"
+        || die "The 32-bit PE archive holds ${pe32_entry_count} 32-bit PE modules; its manifest records ${MANIFEST_I386_WINDOWS_MODULE_COUNT}."
+    ok "$(basename "${PE32_ARCHIVE}"): ${pe32_entry_count} 32-bit PE modules"
+    is_sha256 "${MANIFEST_I386_WINDOWS_NTDLL_SHA256}" \
+        || die "Wine64 manifest i386_windows_ntdll_sha256 is missing or not a 64-hex SHA-256 value."
+    pe32_ntdll_actual="$(zip_entry_sha256 "${PE32_ARCHIVE}" "${PE32_DIR}/ntdll.dll")"
+    [[ "${pe32_ntdll_actual}" == "${MANIFEST_I386_WINDOWS_NTDLL_SHA256}" ]] \
+        || die "Checksum mismatch for '${PE32_DIR}/ntdll.dll'.\n  expected SHA-256: ${MANIFEST_I386_WINDOWS_NTDLL_SHA256}\n  actual   SHA-256: ${pe32_ntdll_actual}"
+    ok "i386_windows_ntdll_sha256 verified"
     for pinned in \
-        "i386_windows_ntdll_sha256:${MANIFEST_I386_WINDOWS_NTDLL_SHA256}:${PE32_DIR}/ntdll.dll" \
         "wow64_dll_sha256:${MANIFEST_WOW64_DLL_SHA256}:${WINE_MODULE_ROOT}/x86_64-windows/wow64.dll" \
         "wow64win_dll_sha256:${MANIFEST_WOW64WIN_DLL_SHA256}:${WINE_MODULE_ROOT}/x86_64-windows/wow64win.dll" \
         "wow64cpu_dll_sha256:${MANIFEST_WOW64CPU_DLL_SHA256}:${WINE_MODULE_ROOT}/x86_64-windows/wow64cpu.dll"; do
@@ -619,14 +643,16 @@ if [[ -n "${RECORD_MANIFEST}" ]]; then
         printf 'glibc_sha256=%s\n' "$(sha256_file "${GLIBC_ARCHIVE}")"
         printf '%s\n' 'wine_archive=wine64.zip'
         printf 'wine_sha256=%s\n' "$(sha256_file "${WINE_ARCHIVE}")"
+        printf '%s\n' 'pe32_archive=wine64-pe32.zip'
+        printf 'pe32_sha256=%s\n' "$(sha256_file "${PE32_ARCHIVE}")"
         # A recorded manifest has to be one this checker would accept on the
         # next run, so it carries the WoW64 pins the block above requires.
-        printf 'i386_windows_module_count=%s\n' "$(unzip -Z1 "${WINE_ARCHIVE}" \
+        printf 'i386_windows_module_count=%s\n' "$(unzip -Z1 "${PE32_ARCHIVE}" \
             | sed 's#^\./##' \
             | awk -v prefix="${PE32_DIR}/" \
                 'index($0, prefix) == 1 && $0 != prefix && substr($0, length($0)) != "/" { count++ } END { print count + 0 }')"
         printf 'i386_windows_ntdll_sha256=%s\n' \
-            "$(zip_entry_sha256 "${WINE_ARCHIVE}" "${PE32_DIR}/ntdll.dll")"
+            "$(zip_entry_sha256 "${PE32_ARCHIVE}" "${PE32_DIR}/ntdll.dll")"
         for recorded_wow64 in wow64 wow64win wow64cpu; do
             printf '%s_dll_sha256=%s\n' "${recorded_wow64}" \
                 "$(zip_entry_sha256 "${WINE_ARCHIVE}" \
@@ -640,6 +666,9 @@ if [[ -n "${OUTPUT_DIR}" ]]; then
     mkdir -p "${OUTPUT_DIR}"
     cp "${GLIBC_ARCHIVE}" "${OUTPUT_DIR}/glibc-rootfs64.zip"
     cp "${WINE_ARCHIVE}" "${OUTPUT_DIR}/wine64.zip"
+    # Staged beside the layers for inspection; the app bundle copies only
+    # the two layers and the manifest (scripts/build-ios.sh).
+    cp "${PE32_ARCHIVE}" "${OUTPUT_DIR}/wine64-pe32.zip"
     if [[ -n "${MANIFEST}" ]]; then
         cp "${MANIFEST}" "${OUTPUT_DIR}/wine64-runtime.manifest"
     elif [[ -n "${RECORD_MANIFEST}" ]]; then

@@ -539,6 +539,35 @@ jobs:
               "${app}/boxedvn-fex64-kernel-probe"
           echo "Wine64 and x86-64 DXMT resources present in app bundle."
 
+      - name: Record bundle sizes and the host symbol map
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="build/ci/DerivedData/Build/Products/${BUILD_CONFIGURATION}-iphoneos/BoxedVN.app"
+          mkdir -p build/artifacts
+          # Device logs name busy host frames by image offset. A sorted symbol
+          # map of the shipped binary resolves those offsets after the fact,
+          # so a spin inside the runtime can be read without a debugger.
+          nm -n -arch arm64 "${app}/BoxedVN" | gzip -9 > build/artifacts/BoxedVN.symbols.txt.gz
+          symbol_count="$(gzip -dc build/artifacts/BoxedVN.symbols.txt.gz | grep -c ' [tT] ' || true)"
+          {
+            echo "## Bundle sizes"
+            echo '```'
+            du -sh "${app}"
+            du -sh "${app}/boxedwine64-runtime"/*.zip "${app}/boxedwine64-runtime"/dxmt-x64 2>/dev/null || true
+            find "${app}" -maxdepth 1 -name '*.zip' -exec du -sh {} + 2>/dev/null || true
+            echo '```'
+            echo "- Host text symbols in the shipped binary: ${symbol_count}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload host symbol map
+        uses: actions/upload-artifact@v7
+        with:
+          name: host-symbols-${{ inputs.configuration || 'Release' }}
+          path: build/artifacts/BoxedVN.symbols.txt.gz
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Package increased-memory entitlement template
         shell: bash
         run: |
