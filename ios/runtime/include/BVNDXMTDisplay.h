@@ -29,6 +29,18 @@ void BVNDXMTDisplayFinish(void);
 /* True only while a presentation layer is registered for DXMT. */
 bool BVNDXMTDisplayHasLayer(void);
 
+// Called from the DXMT dispatcher on any thread when the guest presents a
+// drawable. Records that the layer carries frames; nothing else.
+void BVNDXMTDisplayNotePresented(void);
+
+// Main thread, polled from Boxedwine's own loop. Once a frame has been
+// presented, brings the DXMT view above SDL's views in the guest window.
+// SDL creates its renderer view after the DXMT view was attached, and a
+// device run drew 240 frames into a layer nobody could see because that
+// later view covered it. The overlay is a subview of the window itself, so
+// it stays above both.
+void BVNDXMTDisplaySyncOrdering(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

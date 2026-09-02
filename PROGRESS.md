@@ -5284,3 +5284,24 @@ starving its wakeup pipe, not a separate fault.
 Next device evidence: `BOXEDWINE_DXMT_RETURN ... status=0` for
 set-layer-properties (index 70), then next-drawable (67) and present (47)
 calls, and either a first visible frame or the next named stage.
+
+
+---
+
+### The cube renders; its layer was under SDL's view
+
+Logs 203438 and 203708 at a4bd2f74: `present ok hr=0x00000000 first-frame`,
+then 200 to 240 present cycles per run at display cadence, each
+next-drawable taking about 7.5 ms and every DXMT call returning status 0.
+DXMT is drawing the probe into the host CAMetalLayer at 60 Hz. The screen
+stays black because that layer is covered: the DXMT view is attached to the
+guest window's root view when the SDL window is attached to the scene, and
+SDL adds its own renderer view afterwards, on top. The overlay's FPS counter
+reads 0 because it counts SDL presents. The dispatcher now records the first
+present, and Boxedwine's own main-loop poll (the same 200 ms poll that keeps
+the overlay above SDL) raises the DXMT view above SDL's views, logging
+`BOXEDVN_DXMT_LAYER_FRONT` once. The overlay is a subview of the window
+itself and stays on top, so the cursor and keyboard remain.
+
+Next device evidence: `BOXEDVN_DXMT_LAYER_FRONT` in the log within a
+quarter second of the first present, and the cube visible.

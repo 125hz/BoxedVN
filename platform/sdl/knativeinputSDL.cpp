@@ -27,6 +27,9 @@ extern "C" void BVNGuestPointerPositionChanged(int x, int y);
 #endif
 #include "knativesystem.h"
 #include "kdspaudio.h"
+#ifdef BOXEDWINE_IOS
+#include "BVNDXMTDisplay.h"
+#endif
 
 #ifdef BOXEDWINE_IOS
 // Implemented in ios/runtime/src/BVNAppDelegate.mm and
@@ -436,6 +439,9 @@ bool KNativeInputSDL::processEvents() {
         // even with no Vulkan surface: the software-rendered Wine desktop is
         // exactly where the overlay was being buried.
         BVNGuestOverlayApplyPendingState();
+        // Once DXMT has presented a frame, its Metal view has to sit above
+        // the SDL view created after it; see BVNDXMTDisplaySyncOrdering.
+        BVNDXMTDisplaySyncOrdering();
     }
 #endif
 

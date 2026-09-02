@@ -14,6 +14,7 @@
 #import <UIKit/UIKit.h>
 
 #include <dispatch/dispatch.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -196,6 +197,44 @@ void BVNDXMTDisplayFinish(void) {
 
 bool BVNDXMTDisplayHasLayer(void) {
     return BVNDXMTRegisteredLayer() != nil;
+}
+
+// Set from the DXMT dispatcher's thread on the first present; consumed on the
+// main thread by the ordering poll below.
+static _Atomic(bool) gDisplayPresented = false;
+static bool gDisplayFronted = false;
+
+void BVNDXMTDisplayNotePresented(void) {
+    atomic_store_explicit(&gDisplayPresented, true, memory_order_release);
+}
+
+void BVNDXMTDisplaySyncOrdering(void) {
+    if (!NSThread.isMainThread) {
+        return;
+    }
+    if (!atomic_load_explicit(&gDisplayPresented, memory_order_acquire)) {
+        return;
+    }
+    pthread_mutex_lock(&gDisplayLock);
+    BVNDXMTMetalView* view = gDisplayView;
+    pthread_mutex_unlock(&gDisplayLock);
+    UIView* container = view.superview;
+    if (view == nil || container == nil) {
+        return;
+    }
+    // Already frontmost: nothing to do. SDL may add views later (it recreates
+    // its window when the renderer changes), so this is re-checked each poll.
+    if (container.subviews.lastObject == view) {
+        return;
+    }
+    view.frame = container.bounds;
+    [container bringSubviewToFront:view];
+    if (!gDisplayFronted) {
+        gDisplayFronted = true;
+        BVNLogWrite(BVNLogLevelInfo, "dxmt",
+                    "BOXEDVN_DXMT_LAYER_FRONT: raised the DXMT layer above "
+                    "SDL's views after the first presented frame.");
+    }
 }
 
 static struct macdrv_win_data* BVNDXMTGetWinData(HWND hwnd) {

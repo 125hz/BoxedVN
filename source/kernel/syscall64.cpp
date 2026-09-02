@@ -39,6 +39,7 @@
 #endif
 #if defined(BOXEDWINE_DXMT_NATIVE)
 #include "BVNFrameRate.h"
+#include "BVNDXMTDisplay.h"
 extern "C" const void *dxmt_winemetal_unix_call_funcs[];
 #endif
 
@@ -3611,6 +3612,9 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     const auto entry = reinterpret_cast<DxmtUnixEntry>(const_cast<void*>(raw));
     if (callIndex == 47 || callIndex == 48) {
         BVNGuestFrameLimiterWait();
+        // A presented drawable means the DXMT layer carries frames; the main
+        // loop raises it above SDL's later-created view on its next poll.
+        BVNDXMTDisplayNotePresented();
     }
     const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
     if (logCall) {
