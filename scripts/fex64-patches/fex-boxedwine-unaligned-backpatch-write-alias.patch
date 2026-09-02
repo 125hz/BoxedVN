@@ -1,0 +1,87 @@
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -14,6 +14,9 @@
+ #include <atomic>
+ #include <cstdint>
+ #include <cstdlib>
++#if defined(__APPLE__)
++#include <libkern/OSCacheControl.h>
++#endif
+ 
+ namespace FEXCore::ArchHelpers::Arm64 {
+ constexpr uint32_t CASPAL_MASK = 0xBF'E0'FC'00;
+@@ -121,6 +124,20 @@
+   return (Instr >> RM_OFFSET) & REGISTER_MASK;
+ }
+ 
++// BoxedWine: the code buffer is dual-mapped on iOS, where the executable
++// alias is never writable. A backpatch writes through the writable alias,
++// then cleans that alias's data-cache lines before the executable alias's
++// instruction cache is invalidated (the alias that owns the dirty lines is
++// what the cache maintenance has to name).
++static void FlushWriteAlias(void* Begin, std::size_t Length) {
++#if defined(__APPLE__)
++  sys_dcache_flush(FEXCore::DualMap::WriteAddr(Begin), Length);
++#else
++  (void)Begin;
++  (void)Length;
++#endif
++}
++
+ static void ClearICache(void* Begin, std::size_t Length) {
+   __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
+ }
+@@ -2383,9 +2400,10 @@
+     LDR |= DataReg;
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+       // Ordering matters with cross-thread visibility!
+-      std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(LDR, std::memory_order_release);
++    std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[0]).store(LDR, std::memory_order_release);
++    FlushWriteAlias(&PC[0], 8);
+     ClearICache(&PC[0], 8);
+     // With the instruction modified, now execute again.
+     return 0;
+@@ -2395,9 +2413,10 @@
+     STR |= AddrReg << 5;
+     STR |= DataReg;
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+-      std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(STR, std::memory_order_release);
++    std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[0]).store(STR, std::memory_order_release);
++    FlushWriteAlias(&PC[-1], 8);
+     ClearICache(&PC[-1], 8);
+     // Back up one instruction and have another go
+     return -4;
+@@ -2410,9 +2429,10 @@
+     LDUR |= Instr & (0b1'1111'1111 << 12);
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+       // Ordering matters with cross-thread visibility!
+-      std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(LDUR, std::memory_order_release);
++    std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[0]).store(LDUR, std::memory_order_release);
++    FlushWriteAlias(&PC[0], 8);
+     ClearICache(&PC[0], 8);
+     // With the instruction modified, now execute again.
+     return 0;
+@@ -2423,10 +2443,11 @@
+     STUR |= DataReg;
+     STUR |= Instr & (0b1'1111'1111 << 12);
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+-      std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(STUR, std::memory_order_release);
++    std::atomic_ref<uint32_t>(FEXCore::DualMap::WriteAddr(PC)[0]).store(STUR, std::memory_order_release);
+ 
++    FlushWriteAlias(&PC[-1], 8);
+     ClearICache(&PC[-1], 8);
+     // Back up one instruction and have another go
+     return -4;

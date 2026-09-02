@@ -1145,6 +1145,8 @@ struct SettingsView: View {
     private var preferredOrientation = 1
     @AppStorage("BoxedVN.orientationLock")
     private var orientationLock = true
+    @AppStorage("BoxedVN.fex64.strictMemoryOrdering")
+    private var strictMemoryOrdering = false
     @AppStorage(Preferences.soundEnabledKey)
     private var soundEnabled = true
     @AppStorage("BoxedVN.presentation.fillCropPercent")
@@ -1153,6 +1155,14 @@ struct SettingsView: View {
 
     var body: some View {
         List {
+            Section {
+                Toggle("Strict memory ordering", isOn: $strictMemoryOrdering)
+            } footer: {
+                Text("Emulates x86 memory ordering in the 64-bit translator "
+                     + "instead of assuming the hardware provides it. Slower, "
+                     + "but the fix for crashes where a pointer reads as zero. "
+                     + "Takes effect on the next launch.")
+            }
             Section {
                 Toggle("Orientation lock", isOn: $orientationLock)
                     .onChange(of: orientationLock) { _ in

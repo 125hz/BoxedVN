@@ -5847,3 +5847,29 @@ text cycles 30/60/120/unlocked (mode 3 = 30 Hz added). "Unlocked" removes
 the software pacer; going past the panel's rate needs a mailbox present in
 DXMT's swapchain, not started.
 
+## Unaligned-access handling, strict memory ordering toggle, prefix fix
+
+Wine's FS write is `mov fs, word ptr gs:[0x338]`: a GS segment prefix the
+selector-write emulation did not skip, so the trap fell through to the
+guest. Segment and address-size prefixes are skipped now.
+
+A landscape run ended in a host SIGBUS BUS_ADRALN in translated code (an
+x86 atomic on an unaligned address), re-taken forever because the adapter
+never called FEX's unaligned-access handler. It does now (BOXEDWINE_FEX64_
+UNALIGNED); a FEX patch makes the handler's backpatch writes go through the
+dual-mapped code buffer's writable alias, since iOS never lets the
+executable alias be written.
+
+The backend told FEX the hardware orders memory the x86 way
+(SetHardwareTSOSupport(true)); iOS apps cannot enable Apple's TSO mode, so
+lock-free traffic between Wine and DXMT threads has run weakly ordered,
+which fits the "pointer reads as zero" crash class (null call target, the
+30 fps crash's garbage pointer). A Settings toggle, "Strict memory
+ordering", makes FEX emit acquire/release accesses instead; off by default
+until a device run shows the backpatch path working.
+
+Also: the frame pacer waits on present only (the delayed present is the
+same frame), a suppressed blank line is labelled, and host faults on
+non-translator threads plus uncaught ObjC exceptions are logged before the
+app dies (the 64-bit desktop took the app down with nothing in the log).
+

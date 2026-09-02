@@ -823,8 +823,33 @@ void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
                     static_cast<unsigned long long>(config.DispatcherEnd));
             reportDeclinedFaultContext(pc, context);
         }
+    } else {
+        static std::atomic<uint32_t> hostFaults {0};
+        if (hostFaults.fetch_add(1, std::memory_order_relaxed) < 4) {
+            const uint64_t pc = context && context->uc_mcontext
+                ? context->uc_mcontext->__ss.__pc : 0;
+            reportf("BOXEDWINE_HOST_FAULT signal=%d host_pc=0x%llx address=0x%llx "
+                    "mach_thread=0x%x main=%d",
+                    signal, static_cast<unsigned long long>(pc),
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(info ? info->si_addr : nullptr)),
+                    static_cast<unsigned>(pthread_mach_thread_np(pthread_self())),
+                    pthread_main_np() ? 1 : 0);
+            if (context) reportDeclinedFaultContext(pc, context);
+        }
     }
     chainFEXHostSignal(signal, info, ucontext);
+}
+
+static void hostUncaughtExceptionHandler(NSException* exception) {
+    reportf("BOXEDWINE_HOST_EXCEPTION name=%s reason=%s",
+            exception.name.UTF8String ?: "?",
+            exception.reason.UTF8String ?: "?");
+    NSUInteger index = 0;
+    for (NSString* frame in exception.callStackSymbols) {
+        if (index++ >= 32) break;
+        reportf("BOXEDWINE_HOST_EXCEPTION_FRAME %s", frame.UTF8String);
+    }
 }
 
 // An abort (a failed assertion, std::terminate, a libc++ hard error) ended
@@ -873,6 +898,7 @@ bool installFEXHostSignalHandlers() {
         abortAction.sa_sigaction = hostAbortHandler;
         abortAction.sa_flags = SA_SIGINFO;
         sigaction(SIGABRT, &abortAction, nullptr);
+        NSSetUncaughtExceptionHandler(&hostUncaughtExceptionHandler);
         gFEXSignalHandlersInstalled.store(true, std::memory_order_release);
     });
     return gFEXSignalHandlersInstalled.load(std::memory_order_acquire);
@@ -1033,7 +1059,16 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     }
     bundle->context->SetSignalDelegator(bundle->signals.get());
     bundle->context->SetSyscallHandler(bundle->syscalls.get());
-    bundle->context->SetHardwareTSOSupport(true);
+    // The translator emits plain loads and stores when told the hardware
+    // orders memory the x86 way. iOS apps cannot enable Apple's TSO mode, so
+    // that leaves lock-free traffic between Wine and DXMT threads weakly
+    // ordered. Strict ordering makes FEX emit acquire/release accesses
+    // instead; unaligned ones then trap once and are backpatched.
+    const bool strictOrdering = [[NSUserDefaults standardUserDefaults]
+        boolForKey:@"BoxedVN.fex64.strictMemoryOrdering"];
+    bundle->context->SetHardwareTSOSupport(!strictOrdering);
+    reportf("FEX memory ordering: %s",
+            strictOrdering ? "emulated TSO (strict)" : "hardware TSO assumed");
     // Canonical low guest addresses -- Wine's below-2-GiB TEB reservation,
     // KUSER_SHARED_DATA, and ordinary PE image bases -- cannot be host-mapped
     // at their own address on iOS. KMemory64 backs them through a

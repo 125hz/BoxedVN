@@ -154,6 +154,9 @@ apply_patch fex-boxedwine-longmode-segment-base.patch
 # set_thread_area) stores the selector and traps to the host instead of
 # failing to decode, which re-entered the same instruction forever.
 apply_patch fex-boxedwine-longmode-segment-selector-write.patch
+# The unaligned-access backpatcher writes the code buffer through its
+# writable alias; iOS never lets the executable alias be written.
+apply_patch fex-boxedwine-unaligned-backpatch-write-alias.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

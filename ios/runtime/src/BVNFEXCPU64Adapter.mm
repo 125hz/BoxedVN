@@ -33,6 +33,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
 
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #import <Foundation/Foundation.h>
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -637,7 +638,12 @@ static bool emulateSegmentSelectorWrite(BVNFEXCPU64Adapter* adapter,
     uint8_t bytes[12] = {0};
     memory->memcpyFromGuest(bytes, cpu->rip, sizeof(bytes));
     uint32_t i = 0;
-    while (i < 4 && (bytes[i] == 0x66 || (bytes[i] & 0xf0) == 0x40)) {
+    // Operand-size, address-size, segment and REX prefixes; Wine's own
+    // write is `mov fs, word ptr gs:[0x338]` (65 8e 24 25 38 03 00 00).
+    while (i < 5 && (bytes[i] == 0x66 || bytes[i] == 0x67 || bytes[i] == 0x26 ||
+                     bytes[i] == 0x2e || bytes[i] == 0x36 || bytes[i] == 0x3e ||
+                     bytes[i] == 0x64 || bytes[i] == 0x65 ||
+                     (bytes[i] & 0xf0) == 0x40)) {
         ++i;
     }
     if (bytes[i] != 0x8e) return false;
@@ -1047,6 +1053,32 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     const uint64_t faultAddress = reinterpret_cast<uint64_t>(siginfo->si_addr);
     const bool inCodeBuffer =
         adapter->context->IsAddressInCodeBuffer(adapter->fexThread, hostPC);
+    // An x86 atomic on an unaligned address (and, with strict memory
+    // ordering, any unaligned load-acquire/store-release) raises SIGBUS
+    // BUS_ADRALN inside translated code. FEX emulates the atomic in place or
+    // backpatches the access, and returns how far the host PC moves; without
+    // this the fault was handed to the guest as SIGBUS and re-taken forever.
+    if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inCodeBuffer) {
+        const uint32_t instruction = *reinterpret_cast<const uint32_t*>(hostPC);
+        const auto handled = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
+            adapter->fexThread,
+            FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier,
+            hostPC, machine->__ss.__x, true);
+        static std::atomic<uint32_t> reports {0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+            klog_fmt("BOXEDWINE_FEX64_UNALIGNED pid=%d tid=%d host_pc=0x%llx "
+                     "instruction=0x%08x address=0x%llx handled=%d advance=%d",
+                     adapter->process ? adapter->process->id : -1,
+                     adapter->thread ? adapter->thread->id : -1,
+                     (unsigned long long)hostPC, instruction,
+                     (unsigned long long)faultAddress, handled.has_value() ? 1 : 0,
+                     handled.has_value() ? (int)*handled : 0);
+        }
+        if (handled.has_value()) {
+            machine->__ss.__pc = hostPC + (int64_t)*handled;
+            return true;
+        }
+    }
     // FEX reports a synchronous guest fault (an invalid or unimplemented x86
     // instruction, a guest #GP, an int3) by writing SynchronousFaultData into
     // the frame and branching to one of the dispatcher's GuestSignal_* stubs.

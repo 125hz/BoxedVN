@@ -234,7 +234,8 @@ bool floodAdmit(const char* text, size_t length) {
                 char line[192];
                 const int written = snprintf(
                     line, sizeof(line), "BOXEDVN_LOG_SUPPRESSED repeated=%u: %s\n",
-                    slot.suppressed, slot.sample);
+                    slot.suppressed,
+                    slot.sample[0] != 0 ? slot.sample : "(blank line)");
                 if (written > 0) {
                     summaries.append(line, (size_t)std::min<int>(written, (int)sizeof(line) - 1));
                 }
