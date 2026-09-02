@@ -5457,3 +5457,21 @@ next defect on the 64-bit lane.
   Wine 9.0 already provides `wow64*.dll` in the 64-bit tree and the
   matching `i386-windows` PE tree in `libwine:i386`; DXMT's unix side has
   the 32-bit thunk table. Phase 1 (packaging both trees) is in progress.
+
+## Process-exit fault: CASPair clobbered its translated address (after 2cf0a851)
+
+Every 64-bit run ended, after the probe completed, with Wine's "Unhandled
+page fault on read access to 0000000000000000 at 00007FFFFFA5B98C". With
+ntdll's image base recovered from the KiUserExceptionDispatcher redirect
+(0x7fffffa10000) and Ubuntu's ntdll.dll disassembled, that address is the
+`lock cmpxchg16b [r8]` in RtlInterlockedPushEntrySList, whose loads of the
+same [r8] just before it succeed. In the alias patch, AliasGuestAddress
+returns the translated address in TMP4, and the CASPair lowering parked an
+unpaired destination in TMP3/TMP4 before the CASPAL: the address became
+Expected1, the header's second qword, 0 for an empty SList. An unpaired
+destination now uses TMP1/TMP2 (free whenever the desired pair did not need
+them) and the doubly-unpaired case takes the LL/SC loop; the LL/SC
+fallbacks' store-exclusive status register and AtomicFetchNeg's saved value
+moved off TMP4 as well. The exit-dispatch contract now checks the patched
+AtomicOps.cpp for TMP4 reuse; the patch series was re-applied from the
+pristine pin locally to prove it still applies.

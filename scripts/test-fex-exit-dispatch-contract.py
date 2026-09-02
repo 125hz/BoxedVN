@@ -1814,6 +1814,38 @@ def main() -> None:
         "BoxedVN Wine64 guest VFS preflight",
     )
 
+    # AliasGuestAddress returns the translated address in TMP4, so no lowering
+    # that consumes it may reuse TMP4 before the access. The CASPair lowering
+    # parked an unpaired destination in TMP3/TMP4 and every 64-bit process
+    # died at exit inside RtlInterlockedPushEntrySList's lock cmpxchg16b with
+    # a "page fault on read access to 0": the address had become Expected1,
+    # which is 0 for an empty SList header. The LL/SC fallbacks used TMP4 as
+    # the store-exclusive status register, which is the address register.
+    atomic_ops = read(fex / "FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp")
+    if "AliasGuestAddress(GetReg(Op->Addr))" not in atomic_ops:
+        raise SystemExit("the atomic lowerings no longer translate their address")
+    for forbidden in ("CaspalDst1 = TMP4;", "CaspalDst0 = TMP3;",
+                      "stlxr(SubEmitSize, TMP4,", "mov(EmitSize, TMP4, TMP2);"):
+        if forbidden in atomic_ops:
+            raise SystemExit(
+                "an atomic lowering reuses TMP4, which carries the translated "
+                f"address: {forbidden!r}"
+            )
+    require_ordered(
+        atomic_ops,
+        [
+            "DEF_OP(CASPair) {",
+            "auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));",
+            "const bool DesiredPaired =",
+            "const bool DstPaired =",
+            "if (CTX->HostFeatures.SupportsAtomics && (DesiredPaired || DstPaired)) {",
+            "CaspalDst0 = TMP1;",
+            "CaspalDst1 = TMP2;",
+            "caspal(EmitSize, CaspalDst0, CaspalDst1, Desired0, Desired1, MemSrc);",
+        ],
+        "CASPair keeps the translated address out of its destination temporaries",
+    )
+
     # BoxedWine's -w takes a guest Linux directory. The x64 probe passed a
     # Windows path, and the device log shows the result: open(".") -> -2.
     # The x64 launchers (probe and desktop) share X64Runtime, whose

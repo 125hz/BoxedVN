@@ -123,99 +123,233 @@ index b03cb777..76e5d32e 100644
  }
 
 diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
-index d451a7e8..f7a88d83 100644
+index d451a7e85..e7f94e411 100644
 --- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
-@@ -20,7 +20,7 @@ DEF_OP(CASPair) {
+@@ -20,14 +20,26 @@ DEF_OP(CASPair) {
    auto Expected1 = GetReg(Op->ExpectedHi);
    auto Desired0 = GetReg(Op->DesiredLo);
    auto Desired1 = GetReg(Op->DesiredHi);
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
-
+ 
    const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
-   if (CTX->HostFeatures.SupportsAtomics) {
-@@ -99,7 +99,7 @@ DEF_OP(CAS) {
-
+-  if (CTX->HostFeatures.SupportsAtomics) {
++  // BoxedWine: AliasGuestAddress hands the translated address back in TMP4,
++  // so TMP4 is not a free temporary here. Upstream parked an unpaired
++  // destination in TMP3/TMP4, which overwrote the address with Expected1
++  // before the CASPAL: Wine's RtlInterlockedPushEntrySList, whose Expected1
++  // is the header's second qword and 0 for an empty list, then executed the
++  // CASPAL against address 0 and every 64-bit process died at exit with a
++  // "page fault on read access to 0". An unpaired destination now uses
++  // TMP1/TMP2, which are free whenever the desired pair did not need them,
++  // and the one case that needs both temporaries takes the LL/SC loop,
++  // which never touches TMP4.
++  const bool DesiredPaired = Desired1.Idx() == (Desired0.Idx() + 1) && !(Desired0.Idx() & 1);
++  const bool DstPaired = Dst1.Idx() == (Dst0.Idx() + 1) && !(Dst0.Idx() & 1);
++  if (CTX->HostFeatures.SupportsAtomics && (DesiredPaired || DstPaired)) {
+     // RA has heuristics to try to pair sources, but we need to handle the cases
+     // where they fail. We do so by moving to temporaries. Note we use 64-bit
+     // moves here even for 32-bit cmpxchg, for the Firestorm register renamer.
+-    if (Desired1.Idx() != (Desired0.Idx() + 1) || Desired0.Idx() & 1) {
++    if (!DesiredPaired) {
+       mov(ARMEmitter::Size::i64Bit, TMP1, Desired0);
+       mov(ARMEmitter::Size::i64Bit, TMP2, Desired1);
+       Desired0 = TMP1;
+@@ -36,9 +48,9 @@ DEF_OP(CASPair) {
+ 
+     auto CaspalDst0 = Dst0;
+     auto CaspalDst1 = Dst1;
+-    if (CaspalDst1.Idx() != (CaspalDst0.Idx() + 1) || CaspalDst0.Idx() & 1) {
+-      CaspalDst0 = TMP3;
+-      CaspalDst1 = TMP4;
++    if (!DstPaired) {
++      CaspalDst0 = TMP1;
++      CaspalDst1 = TMP2;
+     }
+ 
+     // We can't clobber the source, these moves are inherently required due to
+@@ -99,7 +111,7 @@ DEF_OP(CAS) {
+ 
    auto Expected = GetReg(Op->Expected);
    auto Desired = GetReg(Op->Desired);
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Dst = GetReg(Node);
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
-@@ -146,7 +146,7 @@ DEF_OP(AtomicSwap) {
+@@ -146,7 +158,7 @@ DEF_OP(AtomicSwap) {
                                                                                                                                   "d CAS "
                                                                                                                                   "size");
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Src = GetReg(Op->Value);
-
+ 
    const auto EmitSize = ConvertSize(IROp);
-@@ -172,7 +172,7 @@ DEF_OP(AtomicFetchAdd) {
+@@ -161,8 +173,8 @@ DEF_OP(AtomicSwap) {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+-    stlxr(SubEmitSize, TMP4, Src, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, Src, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     ubfm(EmitSize, GetReg(Node), TMP2, 0, IR::OpSizeAsBits(OpSize) - 1);
+   }
+ }
+@@ -172,7 +184,7 @@ DEF_OP(AtomicFetchAdd) {
    const auto EmitSize = ConvertSize(IROp);
    const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Src = GetReg(Op->Value);
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
-@@ -193,7 +193,7 @@ DEF_OP(AtomicFetchSub) {
+@@ -182,8 +194,8 @@ DEF_OP(AtomicFetchAdd) {
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+     add(EmitSize, TMP3, TMP2, Src);
+-    stlxr(SubEmitSize, TMP4, TMP3, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, TMP3, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   }
+ }
+@@ -193,7 +205,7 @@ DEF_OP(AtomicFetchSub) {
    const auto EmitSize = ConvertSize(IROp);
    const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Src = GetReg(Op->Value);
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
-@@ -215,7 +215,7 @@ DEF_OP(AtomicFetchAnd) {
+@@ -204,8 +216,8 @@ DEF_OP(AtomicFetchSub) {
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+     sub(EmitSize, TMP3, TMP2, Src);
+-    stlxr(SubEmitSize, TMP4, TMP3, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, TMP3, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   }
+ }
+@@ -215,7 +227,7 @@ DEF_OP(AtomicFetchAnd) {
    const auto EmitSize = ConvertSize(IROp);
    const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Src = GetReg(Op->Value);
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
-@@ -237,7 +237,7 @@ DEF_OP(AtomicFetchCLR) {
+@@ -226,8 +238,8 @@ DEF_OP(AtomicFetchAnd) {
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+     and_(EmitSize, TMP3, TMP2, Src);
+-    stlxr(SubEmitSize, TMP4, TMP3, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, TMP3, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   }
+ }
+@@ -237,7 +249,7 @@ DEF_OP(AtomicFetchCLR) {
    const auto EmitSize = ConvertSize(IROp);
    const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Src = GetReg(Op->Value);
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
-@@ -258,7 +258,7 @@ DEF_OP(AtomicFetchOr) {
+@@ -247,8 +259,8 @@ DEF_OP(AtomicFetchCLR) {
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+     bic(EmitSize, TMP3, TMP2, Src);
+-    stlxr(SubEmitSize, TMP4, TMP3, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, TMP3, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   }
+ }
+@@ -258,7 +270,7 @@ DEF_OP(AtomicFetchOr) {
    const auto EmitSize = ConvertSize(IROp);
    const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Src = GetReg(Op->Value);
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
-@@ -279,7 +279,7 @@ DEF_OP(AtomicFetchXor) {
+@@ -268,8 +280,8 @@ DEF_OP(AtomicFetchOr) {
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+     orr(EmitSize, TMP3, TMP2, Src);
+-    stlxr(SubEmitSize, TMP4, TMP3, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, TMP3, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   }
+ }
+@@ -279,7 +291,7 @@ DEF_OP(AtomicFetchXor) {
    const auto EmitSize = ConvertSize(IROp);
    const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
    auto Src = GetReg(Op->Value);
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
-@@ -300,7 +300,7 @@ DEF_OP(AtomicFetchNeg) {
+@@ -289,8 +301,8 @@ DEF_OP(AtomicFetchXor) {
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+     eor(EmitSize, TMP3, TMP2, Src);
+-    stlxr(SubEmitSize, TMP4, TMP3, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, TMP3, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   }
+ }
+@@ -300,17 +312,17 @@ DEF_OP(AtomicFetchNeg) {
    const auto EmitSize = ConvertSize(IROp);
    const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
-
+ 
 -  auto MemSrc = GetReg(Op->Addr);
 +  auto MemSrc = AliasGuestAddress(GetReg(Op->Addr));
-
+ 
    if (CTX->HostFeatures.SupportsAtomics) {
      // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics
+     ldr(SubEmitSize, TMP2, MemSrc);
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+-    mov(EmitSize, TMP4, TMP2);
++    mov(EmitSize, TMP1, TMP2);
+     neg(EmitSize, TMP3, TMP2);
+     casal(SubEmitSize, TMP2, TMP3, MemSrc);
+-    sub(EmitSize, TMP3, TMP2, TMP4);
++    sub(EmitSize, TMP3, TMP2, TMP1);
+     (void)cbnz(EmitSize, TMP3, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   } else {
+@@ -318,8 +330,8 @@ DEF_OP(AtomicFetchNeg) {
+     (void)Bind(&LoopTop);
+     ldaxr(SubEmitSize, TMP2, MemSrc);
+     neg(EmitSize, TMP3, TMP2);
+-    stlxr(SubEmitSize, TMP4, TMP3, MemSrc);
+-    (void)cbnz(EmitSize, TMP4, &LoopTop);
++    stlxr(SubEmitSize, TMP1, TMP3, MemSrc);
++    (void)cbnz(EmitSize, TMP1, &LoopTop);
+     mov(EmitSize, GetReg(Node), TMP2.R());
+   }
+ }
 diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
 index 3e01eeb7..9499c988 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
