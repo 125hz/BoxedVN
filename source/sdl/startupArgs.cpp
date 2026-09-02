@@ -802,6 +802,22 @@ bool StartUpArgs::apply() {
     // forever -- one device run logged 468,768 failed opens of
     // dosdevices/c:. Completing the prefix is what stops that, and nothing
     // valid is replaced: an existing c: is left exactly where it points.
+    // A plain directory mount that lands inside the prefix (the app mounts a
+    // Files-visible folder over drive_c) has to be attached before the prefix
+    // is completed and the system modules are projected into it. Attached
+    // afterwards, with the other mounts below, it replaced the drive_c node
+    // together with the 959 projected modules, and the guest's first load
+    // ended with STATUS_DLL_NOT_FOUND. Zip mounts and drive letters stay
+    // below: the letter links need dosdevices, which does not exist yet.
+    for (auto&& info : this->mountInfo) {
+        if (info.wine || info.nativePath.length() < 4) continue;
+        const BString ext = info.nativePath.substr(info.nativePath.length() - 4).toLowerCase();
+        if (ext == ".zip") continue;
+        Fs::makeLocalDirs(info.localPath);
+        std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), Fs::getParentPath(info.localPath), true);
+        Fs::addRootDirectoryNode(info.localPath, info.nativePath, parent);
+        klog_fmt("BOXEDWINE_MOUNT_DIRECTORY guest=%s stage=before-prefix", info.localPath.c_str());
+    }
     const BString wineDriveC = winePrefix + "/" K_GUEST_WINE_DRIVE_C;
     const BString wineDriveCLink = wineDosDevices + "/" K_GUEST_WINE_C_LINK;
     const boxedvn::GuestWinePrefixSetup prefixSetup =
@@ -933,11 +949,8 @@ bool StartUpArgs::apply() {
     #else
                 klog_fmt("% not mounted because zlib was not compiled in", info.nativePath.c_str());
     #endif
-            } else {
-                Fs::makeLocalDirs(info.localPath);
-                std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), Fs::getParentPath(info.localPath), true);
-                Fs::addRootDirectoryNode(info.localPath, info.nativePath, parent);
             }
+            // Plain directories were attached before the prefix setup above.
         }
     }
 

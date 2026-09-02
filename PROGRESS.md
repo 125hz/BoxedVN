@@ -5602,3 +5602,15 @@ and logs the first sixteen as `BOXEDWINE_FEX64_CODE_INVALIDATE`. The
 instructions after its own futex returned) is a separate host-side spin;
 the next log names its routine through `BOXEDWINE_FEX64_BUSY_HOST`.
 
+## 679176a1: the drive C mount replaced the projected system modules
+
+Two runs on 679176a1 ended the cube process with STATUS_DLL_NOT_FOUND right
+after wineboot. The stale-block fix worked as intended (sixteen
+`BOXEDWINE_FEX64_CODE_INVALIDATE` lines, no null exit target), and the
+prefix migration moved two drive C entries into the Files-visible folder.
+The failure was ordering: `projectX64WineSystemModules` ran before the
+mount loop, so the plain directory mount over drive_c replaced the node
+that held the 959 projected modules. Plain directory mounts now attach
+before the prefix setup and the projection; zip mounts and drive letters
+keep their place after dosdevices exists.
+
