@@ -5368,3 +5368,25 @@ default-usage constant buffer updated per frame, an explicit viewport, and
 an indexed draw. No depth buffer: the cube is convex and back faces are
 culled, so a depth defect cannot masquerade as a draw defect. New stages
 `shaders` and `geometry` name the failing object; exit codes 17 and 18.
+
+## Shader translator thunks (after c79482e2)
+
+Three device runs of the cube probe died at `shaders begin`: a host-side
+SIGSEGV (declined by the FEX fault handler, so native code, not translated
+code) reading a guest top-arena stack address. DXMT's shader translator
+(airconv) runs natively on this port and is entered through the
+`thunk_SM50*` unix calls, whose parameter blocks carry guest pointers with
+no cast: the DXBC, out-parameters on the caller's stack (`shader`, `error`,
+`bitcode`), the reflection struct, the error buffer, and the
+compilation-argument chain. The rewrite left them untranslated. Now:
+
+- `rewrite-dxmt-guest-pointers.py` rewrites each SM50 thunk call (exactly
+  once each, verified against the pinned source locally); handles stay raw.
+- `tools/dxmt/boxedwine_dxmt_sm50_arguments.c` deep-copies the argument
+  chain into thread-local host storage, translating `next` links and the
+  input-layout / stream-output `elements` arrays, because airconv walks the
+  chain natively (`args_get_data`).
+- `boxedwine_dxmt_host_pointer` passes host pointers (between 4 GiB and the
+  identity lane) through unchanged: airconv hands the guest a host pointer to
+  the compiled bitcode and the guest feeds it back into
+  `dispatch_data_create`.

@@ -122,6 +122,76 @@ class PointerReadRewrite(unittest.TestCase):
             self.assertEqual(source.read_text(encoding="utf-8"), "y = params->info.ptr;\n")
 
 
+class ShaderTranslatorThunks(unittest.TestCase):
+    """The SM50 thunks pass guest pointers with no cast at all.
+
+    A device run faulted in host code at a guest stack address at the first
+    CreateVertexShader: SM50Initialize wrote its out-parameter through the
+    untranslated pointer to the caller's stack. Every guest pointer those
+    thunks forward has to be translated, the argument chain deep-copied, and
+    the handles left alone.
+    """
+
+    def test_every_thunk_site_is_rewritten_exactly_once(self) -> None:
+        fixture = "\n".join(old for old, _ in rewrite.THUNK_REWRITES["winemetal_unix.c"])
+        text = rewrite.rewrite_thunks(
+            fixture, rewrite.THUNK_REWRITES["winemetal_unix.c"])
+        for old, new in rewrite.THUNK_REWRITES["winemetal_unix.c"]:
+            self.assertIn(new, text)
+            self.assertNotIn(old, text)
+
+    def test_out_parameters_and_buffers_are_translated(self) -> None:
+        rewritten = "\n".join(new for _, new in rewrite.THUNK_REWRITES["winemetal_unix.c"])
+        for guest in ("params->bytecode", "params->shader)", "params->reflection",
+                      "params->error)", "params->func_name", "params->bitcode)",
+                      "params->data_out", "params->buffer)",
+                      "params->constant_buffers", "params->arguments"):
+            self.assertIn(f"BOXEDWINE_GUEST_PTR({guest}", rewritten, guest)
+
+    def test_argument_chains_are_deep_copied_not_just_translated(self) -> None:
+        rewritten = "\n".join(new for _, new in rewrite.THUNK_REWRITES["winemetal_unix.c"])
+        for chain in ("params->args", "params->hull_args", "params->domain_args",
+                      "params->vertex_args", "params->geometry_args"):
+            self.assertIn(f"BOXEDWINE_SM50_ARGS({chain})", rewritten)
+            self.assertNotIn(f"BOXEDWINE_GUEST_PTR({chain})", rewritten)
+
+    def test_handles_are_not_translated(self) -> None:
+        # sm50_shader_t / sm50_bitcode_t / sm50_error_t values are host
+        # pointers airconv returned; translating them would corrupt them.
+        rewritten = "\n".join(new for _, new in rewrite.THUNK_REWRITES["winemetal_unix.c"])
+        self.assertIn("SM50Compile(params->shader, ", rewritten)
+        self.assertIn("SM50GetCompiledBitcode(params->bitcode, ", rewritten)
+        self.assertIn("SM50GetErrorMessage(params->error, ", rewritten)
+        self.assertIn("SM50GetArgumentsInfo(params->shader, ", rewritten)
+
+    def test_a_missing_or_duplicated_thunk_site_is_refused(self) -> None:
+        with self.assertRaises(rewrite.RewriteError):
+            rewrite.rewrite_thunks("nothing\n", [("SM50Compile(a)", "x")])
+        with self.assertRaises(rewrite.RewriteError):
+            rewrite.rewrite_thunks("SM50Compile(a) SM50Compile(a)\n",
+                                   [("SM50Compile(a)", "x")])
+
+    def test_the_chain_copier_covers_every_argument_type(self) -> None:
+        source = (REPO / "tools" / "dxmt" /
+                  "boxedwine_dxmt_sm50_arguments.c").read_text(encoding="utf-8")
+        for kind in ("SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT", "SM50_SHADER_COMMON",
+                     "SM50_SHADER_PSO_PIXEL_SHADER", "SM50_SHADER_IA_INPUT_LAYOUT",
+                     "SM50_SHADER_GS_PASS_THROUGH", "SM50_SHADER_PSO_GEOMETRY_SHADER",
+                     "SM50_SHADER_PSO_TESSELLATOR"):
+            self.assertIn(f"case {kind}:", source)
+        # The two nested arrays are translated, and the links re-point at
+        # the host copies.
+        self.assertEqual(source.count(".elements =\n                BOXEDWINE_GUEST_PTR("), 2)
+        self.assertIn("previous->header.next = node;", source)
+        self.assertIn("_Thread_local", source)
+
+    def test_the_native_build_compiles_the_chain_copier(self) -> None:
+        build = (REPO / "scripts" / "build-dxmt-ios-native.sh").read_text(encoding="utf-8")
+        self.assertIn("tools/dxmt/boxedwine_dxmt_sm50_arguments.c", build)
+        workflow = (REPO / ".github" / "workflows" / "build-ios.yml").read_text(encoding="utf-8")
+        self.assertIn("'tools/dxmt/**'", workflow)
+
+
 class TranslationHeaderContract(unittest.TestCase):
     def test_header_constants_match_the_guest_alias_contract(self) -> None:
         header = HEADER.read_text(encoding="utf-8")
@@ -131,6 +201,11 @@ class TranslationHeaderContract(unittest.TestCase):
         self.assertIn("0x7F8000000000ULL", header)
         self.assertIn("kGuestTopClearMask = 0x7F8000000000ULL", alias)
         self.assertIn("if (!guest) {", header)
+        # Host pointers (between the low range and the identity lane) pass
+        # through: the compiled bitcode comes back to the guest as one.
+        self.assertIn("BOXEDWINE_DXMT_GUEST_LOW_END 0x100000000ULL", header)
+        self.assertIn("boxedwine_dxmt_is_host_pointer", header)
+        self.assertIn("BOXEDWINE_SM50_ARGS(p)", header)
 
 
 if __name__ == "__main__":

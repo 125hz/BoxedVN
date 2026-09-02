@@ -134,7 +134,8 @@ COMMON_FLAGS=(-arch arm64 -isysroot "${SDK}"
               "-miphoneos-version-min=${IPHONEOS_MIN}"
               -DDXMT_NATIVE=1 -fblocks -O2)
 INCLUDES=(-I"${DXMT_ROOT}/include" -I"${DXMT_ROOT}/libs"
-          -I"${DXMT_SRC}/winemetal" -I"${DXMT_SRC}/airconv")
+          -I"${DXMT_SRC}/winemetal" -I"${DXMT_SRC}/airconv"
+          -I"${BOXEDVN_ROOT}/include")
 INCLUDES_DIRECTX=(-I"${DXMT_ROOT}/include/native/directx"
                   -I"${DXMT_ROOT}/include/native/windows")
 INCLUDES_SHADERS=(-I"${SHADER_DIR}")
@@ -212,6 +213,10 @@ COMMON_FLAGS+=(-include "${GUEST_POINTER_HEADER}")
 
 compile_one objc "${DXMT_SRC}/winemetal/unix/winemetal_unix.boxedwine.c" winemetal_unix
 compile_one objc "${DXMT_SRC}/winemetal/unix/cache.boxedwine.c" cache
+# The shader translator walks its compilation-argument chain natively, so the
+# rewritten SM50 thunks hand it a host-side copy built by this helper (plain
+# C; it includes airconv_public.h for the node layouts).
+compile_one objc "${BOXEDVN_ROOT}/tools/dxmt/boxedwine_dxmt_sm50_arguments.c" boxedwine_dxmt_sm50_arguments
 
 for cpp in airconv_context air_type air_signature air_operations \
            dxbc_converter dxbc_converter_gs dxbc_converter_ts \

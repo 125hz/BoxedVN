@@ -21,8 +21,15 @@
  *
  * The dispatcher translates the parameter block itself; this macro is what
  * the rewritten unix sources apply to every nested guest pointer they read.
- * A null pointer stays null. Host object handles are never passed through
- * it: they are host pointers already.
+ * A null pointer stays null.
+ *
+ * Host pointers pass through unchanged. The guest occupies three ranges
+ * (below 4 GiB, the identity lane from 0x7800000000, and the top arena above
+ * the clear mask) and the host's own allocations sit between 4 GiB and the
+ * identity lane, where no guest address can be. That matters because DXMT's
+ * shader translator hands the guest a host pointer to its compiled bitcode
+ * and the guest passes it straight back to create a Metal library: a
+ * translation that treated it as a guest address would corrupt it.
  */
 #ifndef BOXEDWINE_DXMT_GUEST_POINTER_H
 #define BOXEDWINE_DXMT_GUEST_POINTER_H
@@ -31,15 +38,43 @@
 
 #define BOXEDWINE_DXMT_GUEST_LOW_ALIAS_BASE 0x7800000000ULL
 #define BOXEDWINE_DXMT_GUEST_TOP_CLEAR_MASK 0x7F8000000000ULL
+/* Guest addresses below this are the canonical low range (aliased high);
+ * host allocations never sit below it on the arm64 iOS process layout. */
+#define BOXEDWINE_DXMT_GUEST_LOW_END 0x100000000ULL
+
+static inline int boxedwine_dxmt_is_host_pointer(uint64_t address)
+{
+    return address >= BOXEDWINE_DXMT_GUEST_LOW_END &&
+           address < BOXEDWINE_DXMT_GUEST_LOW_ALIAS_BASE;
+}
 
 static inline uintptr_t boxedwine_dxmt_host_pointer(uintptr_t guest)
 {
     if (!guest) {
         return 0;
     }
+    if (boxedwine_dxmt_is_host_pointer((uint64_t)guest)) {
+        return guest;
+    }
     return (uintptr_t)(((uint64_t)guest | BOXEDWINE_DXMT_GUEST_LOW_ALIAS_BASE) &
                        ~BOXEDWINE_DXMT_GUEST_TOP_CLEAR_MASK);
 }
+
+/*
+ * DXMT's shader translator receives a linked chain of compilation-argument
+ * structures whose `next` links and `elements` arrays are guest pointers,
+ * and walks them natively. This returns a host-side copy of the chain with
+ * every nested pointer translated; the copy lives in thread-local storage
+ * and is valid until the calling thread's next chain. Implemented in
+ * tools/dxmt/boxedwine_dxmt_sm50_arguments.c, compiled beside the unix side.
+ */
+#if defined(__cplusplus)
+extern "C" {
+#endif
+const void* boxedwine_dxmt_sm50_arguments(const void* guest_chain);
+#if defined(__cplusplus)
+}
+#endif
 
 /* Keeps the pointer's own type: works for void*, const void*, char* and the
  * raw uint64_t fields DXMT casts itself. C++ (the host test suite) spells the
@@ -47,9 +82,13 @@ static inline uintptr_t boxedwine_dxmt_host_pointer(uintptr_t guest)
 #if defined(__cplusplus)
 #define BOXEDWINE_GUEST_PTR(p) \
     ((decltype(p))boxedwine_dxmt_host_pointer((uintptr_t)(p)))
+#define BOXEDWINE_SM50_ARGS(p) \
+    ((decltype(p))boxedwine_dxmt_sm50_arguments((const void*)(p)))
 #else
 #define BOXEDWINE_GUEST_PTR(p) \
     ((__typeof__(p))boxedwine_dxmt_host_pointer((uintptr_t)(p)))
+#define BOXEDWINE_SM50_ARGS(p) \
+    ((__typeof__(p))boxedwine_dxmt_sm50_arguments((const void*)(p)))
 #endif
 
 #endif /* BOXEDWINE_DXMT_GUEST_POINTER_H */

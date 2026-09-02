@@ -40,6 +40,24 @@ BOXEDVN_TEST(dxmt_guest_pointer_translation_keeps_null_and_identity) {
     CHECK_EQ((uint64_t)boxedwine_dxmt_host_pointer(0x140001000ULL), 0x7940001000ULL);
 }
 
+BOXEDVN_TEST(dxmt_guest_pointer_passes_host_pointers_through) {
+    // airconv hands the guest a host pointer to its compiled bitcode and the
+    // guest passes it straight back to build a Metal library. Host
+    // allocations sit between the low guest range and the identity lane,
+    // where no guest address can be, so they must come back unchanged.
+    for (uint64_t host : {0x104f3c000ULL, 0x15b4dc000ULL, 0x2fffff000ULL,
+                          0x77ffffff00ULL}) {
+        CHECK(boxedwine_dxmt_is_host_pointer(host));
+        CHECK_EQ((uint64_t)boxedwine_dxmt_host_pointer((uintptr_t)host), host);
+    }
+    // Every guest range still translates.
+    CHECK(!boxedwine_dxmt_is_host_pointer(0x7ffffe1ff4e8ULL));
+    CHECK(!boxedwine_dxmt_is_host_pointer(0x7a00094050ULL));
+    CHECK(!boxedwine_dxmt_is_host_pointer(0x140001000ULL));
+    CHECK(!boxedwine_dxmt_is_host_pointer(boxedvn::kGuestLowLimit - 1));
+    CHECK(!boxedwine_dxmt_is_host_pointer(boxedvn::kGuestLowAliasBase));
+}
+
 BOXEDVN_TEST(dxmt_guest_pointer_macro_preserves_the_pointer_type) {
     const char* guestString = (const char*)(uintptr_t)0x7ffffe1ff600ULL;
     const char* host = BOXEDWINE_GUEST_PTR(guestString);

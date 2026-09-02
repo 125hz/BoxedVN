@@ -15,7 +15,15 @@ The rewrite wraps each *read* of such a pointer in BOXEDWINE_GUEST_PTR(...):
   * `<expr>.ptr` that is not the target of an assignment;
   * the raw casts DXMT applies to `params->buffer_ptr`, `params->arg` and
     `params->handle` where the field is a guest address rather than a host
-    object handle (named explicitly, each expected exactly once).
+    object handle (named explicitly, each expected exactly once);
+  * the shader translator thunks (thunk_SM50*), whose parameter blocks carry
+    guest pointers with no cast at all: the DXBC, out-parameters on the
+    caller's stack, the error buffer, and the compilation-argument chain,
+    which is deep-copied by BOXEDWINE_SM50_ARGS because airconv walks its
+    `next` links and `elements` arrays natively. Handles (sm50_shader_t,
+    sm50_bitcode_t, sm50_error_t) are host pointers and are left alone. A
+    device run faulted in host code at a guest stack address at the first
+    CreateVertexShader for exactly this reason.
 
 Object handles (the `(NSObject *)params->handle` family) are host pointers
 and are left alone. The rewritten copy is written beside the original so its
@@ -50,6 +58,67 @@ RAW_SITES = {
         "(char *)params->arg",
         "(struct WMTRenderPassInfo *)params->arg",
         "(void *)params->handle",
+    ],
+    "cache.c": [],
+}
+
+# Shader translator thunks: exact call text -> the same call with its guest
+# pointers translated. Each `old` must occur exactly once in the file. The
+# multi-line calls are matched on their argument line alone.
+THUNK_REWRITES = {
+    "winemetal_unix.c": [
+        ("SM50Initialize(params->bytecode, params->bytecode_size, "
+         "params->shader, params->reflection, params->error)",
+         "SM50Initialize(BOXEDWINE_GUEST_PTR(params->bytecode), "
+         "params->bytecode_size, BOXEDWINE_GUEST_PTR(params->shader), "
+         "BOXEDWINE_GUEST_PTR(params->reflection), "
+         "BOXEDWINE_GUEST_PTR(params->error))"),
+        ("SM50Compile(params->shader, params->args, params->func_name, "
+         "params->bitcode, params->error)",
+         "SM50Compile(params->shader, BOXEDWINE_SM50_ARGS(params->args), "
+         "BOXEDWINE_GUEST_PTR(params->func_name), "
+         "BOXEDWINE_GUEST_PTR(params->bitcode), "
+         "BOXEDWINE_GUEST_PTR(params->error))"),
+        ("SM50GetCompiledBitcode(params->bitcode, params->data_out)",
+         "SM50GetCompiledBitcode(params->bitcode, "
+         "BOXEDWINE_GUEST_PTR(params->data_out))"),
+        ("SM50GetErrorMessage(params->error, params->buffer, "
+         "params->buffer_size)",
+         "SM50GetErrorMessage(params->error, "
+         "BOXEDWINE_GUEST_PTR(params->buffer), params->buffer_size)"),
+        ("      params->vertex, params->hull, params->hull_args, "
+         "params->func_name, params->bitcode, params->error",
+         "      params->vertex, params->hull, "
+         "BOXEDWINE_SM50_ARGS(params->hull_args), "
+         "BOXEDWINE_GUEST_PTR(params->func_name), "
+         "BOXEDWINE_GUEST_PTR(params->bitcode), "
+         "BOXEDWINE_GUEST_PTR(params->error)"),
+        ("      params->hull, params->domain, params->domain_args, "
+         "params->func_name, params->bitcode, params->error",
+         "      params->hull, params->domain, "
+         "BOXEDWINE_SM50_ARGS(params->domain_args), "
+         "BOXEDWINE_GUEST_PTR(params->func_name), "
+         "BOXEDWINE_GUEST_PTR(params->bitcode), "
+         "BOXEDWINE_GUEST_PTR(params->error)"),
+        ("      params->vertex, params->geometry, params->vertex_args, "
+         "params->func_name, params->bitcode, params->error",
+         "      params->vertex, params->geometry, "
+         "BOXEDWINE_SM50_ARGS(params->vertex_args), "
+         "BOXEDWINE_GUEST_PTR(params->func_name), "
+         "BOXEDWINE_GUEST_PTR(params->bitcode), "
+         "BOXEDWINE_GUEST_PTR(params->error)"),
+        ("      params->vertex, params->geometry, params->geometry_args, "
+         "params->func_name, params->bitcode, params->error",
+         "      params->vertex, params->geometry, "
+         "BOXEDWINE_SM50_ARGS(params->geometry_args), "
+         "BOXEDWINE_GUEST_PTR(params->func_name), "
+         "BOXEDWINE_GUEST_PTR(params->bitcode), "
+         "BOXEDWINE_GUEST_PTR(params->error)"),
+        ("SM50GetArgumentsInfo(params->shader, params->constant_buffers, "
+         "params->arguments)",
+         "SM50GetArgumentsInfo(params->shader, "
+         "BOXEDWINE_GUEST_PTR(params->constant_buffers), "
+         "BOXEDWINE_GUEST_PTR(params->arguments))"),
     ],
     "cache.c": [],
 }
@@ -136,6 +205,17 @@ def rewrite_raw_sites(text: str, sites: list[str]) -> str:
     return text
 
 
+def rewrite_thunks(text: str, rewrites: list[tuple[str, str]]) -> str:
+    for old, new in rewrites:
+        occurrences = text.count(old)
+        if occurrences != 1:
+            raise RewriteError(
+                f"expected exactly one occurrence of {old!r}, found {occurrences}; "
+                "the pinned DXMT source changed, re-audit the SM50 thunks")
+        text = text.replace(old, new, 1)
+    return text
+
+
 def rewrite_source(name: str, text: str) -> str:
     if MACRO in text:
         raise RewriteError(f"{name}: already rewritten")
@@ -146,6 +226,7 @@ def rewrite_source(name: str, text: str) -> str:
             f"{name}: rewrote {count} .ptr reads, expected {expected}; "
             "the pinned DXMT source changed, re-audit the dereference sites")
     rewritten = rewrite_raw_sites(rewritten, RAW_SITES.get(name, []))
+    rewritten = rewrite_thunks(rewritten, THUNK_REWRITES.get(name, []))
     if name in MAIN_THREAD_HELPER_FILES:
         rewritten = rewrite_main_thread_helper(rewritten)
     return rewritten
