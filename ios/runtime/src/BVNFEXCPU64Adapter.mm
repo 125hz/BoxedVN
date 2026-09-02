@@ -946,8 +946,12 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             // took one 16 s in, from unix-side code, and carried on).
             uint64_t returnSlot[2] = {0, 0};
             const uint64_t guestRsp = frame->State.gregs[4];
+            // The translator dereferences guest addresses through the
+            // deterministic alias; the kuser alias helper answers zero for a
+            // stack address, which used to print an empty return slot.
             const uint64_t hostRsp =
-                adapter->process->memory64->nativeAliasForGuest(guestRsp);
+                adapter->cpu->memory->nativeIdentityMode()
+                    ? k64GuestToHostAddress(guestRsp) : 0;
             if (hostRsp != 0 &&
                 adapter->cpu->memory->nativeRangeCoversForPlan(hostRsp, hostRsp + 16)) {
                 std::memcpy(returnSlot, reinterpret_cast<const void*>(hostRsp),
@@ -979,6 +983,39 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      (unsigned long long)g[10], (unsigned long long)g[11],
                      (unsigned long long)g[12], (unsigned long long)g[13],
                      (unsigned long long)g[14], (unsigned long long)g[15]);
+            if (rip == 0) {
+                // A jump to zero out of a memory-indirect call: the slot the
+                // call read is the memory that matters. Every device case so
+                // far read a function table at +0x70 through rdi or r15, so
+                // those slots are read back now through the kernel's view and
+                // through the host alias. A non-zero value here means the
+                // translated load misread; zero means the memory was zero.
+                KMemory64* memory = adapter->cpu->memory;
+                auto probe = [&](const char* name, uint64_t base) {
+                    const uint64_t slot = base + 0x70;
+                    uint64_t kernelView = 0;
+                    uint64_t hostView = 0;
+                    uint32_t flags = 0;
+                    bool mapped = false;
+                    if (memory && base != 0 && memory->isPageMapped(slot >> 12)) {
+                        mapped = true;
+                        flags = memory->getPageFlags(slot >> 12);
+                        kernelView = memory->readq(slot);
+                        const uint64_t host = k64GuestToHostAddress(slot);
+                        if (memory->nativeRangeCoversForPlan(host, host + 8)) {
+                            std::memcpy(&hostView, reinterpret_cast<const void*>(host), 8);
+                        }
+                    }
+                    klog_fmt("BOXEDWINE_FEX64_NULL_TARGET_PROBE reg=%s base=0x%llx slot=0x%llx "
+                             "mapped=%d flags=0x%x kernel=0x%llx host=0x%llx",
+                             name, (unsigned long long)base, (unsigned long long)slot,
+                             mapped ? 1 : 0, flags, (unsigned long long)kernelView,
+                             (unsigned long long)hostView);
+                };
+                probe("rdi", g[7]);
+                probe("r12", g[12]);
+                probe("r15", g[15]);
+            }
         }
     }
     if (!adapter->cpu->raiseSyncFault(

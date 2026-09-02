@@ -31,6 +31,17 @@ DisplayData::DisplayData()
 void DisplayData::putEvent(const XEvent& event, bool inFront) {
 	{
 		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(eventMutex);
+		if (!inFront && event.type == MotionNotify && !eventQueue.empty() &&
+		    eventQueue.back().type == MotionNotify &&
+		    eventQueue.back().xmotion.window == event.xmotion.window) {
+			// A drag delivers far more samples than the guest can turn into
+			// messages, and each one costs a server round trip on the thread
+			// that also renders. Only the newest position matters, so it
+			// replaces a motion event still waiting at the back of the queue.
+			// The wake byte for the original is still in the socket.
+			eventQueue.back() = event;
+			return;
+		}
 		if (inFront) {
 			eventQueue.push_front(event);
 		} else {

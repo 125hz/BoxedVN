@@ -28,6 +28,7 @@
 #include "../x11/x11bridge64.h"
 #include "kevent.h"
 #include "ksocket.h"
+#include <cstring>
 #include <thread>   // std::this_thread::yield() for sched_yield
 #include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
 #include <atomic>   // bounded guest mmap placement counters
@@ -1946,6 +1947,20 @@ static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSym
         reportDllSearch(cpu->thread->process.get(), "stat", path,
                         node ? 0 : -2, detail);
     }
+    {
+        // Wine's drive map is a stat of dosdevices/<letter>: per drive. My
+        // Computer on the 64-bit desktop lists no drive, so the answer each
+        // of those stats gets is recorded, bounded.
+        static std::atomic<U32> dosDeviceReports {0};
+        const size_t pathLength = strlen(path);
+        if (pathLength >= 2 && path[pathLength - 1] == ':' &&
+            strstr(path, "/dosdevices/") &&
+            dosDeviceReports.fetch_add(1, std::memory_order_relaxed) < 64) {
+            klog_fmt("BOXEDWINE_X64_DOSDEVICE_STAT pid=%d path='%s' follow=%d found=%d mode=0%o",
+                     cpu->thread->process->id, path, followSymlink ? 1 : 0,
+                     node ? 1 : 0, node ? node->getMode() : 0);
+        }
+    }
     if (!node) return (U64)-2; // -ENOENT
     U64 size  = node->length();
     U32 mode  = node->getMode();
@@ -2026,7 +2041,9 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     static std::atomic<U32> fileMapLogCount{0};
     const U32 logOrdinal =
         fileMapLogCount.fetch_add(1, std::memory_order_relaxed);
-    const bool boundedLog = logOrdinal < 32;
+    // 32 covered the loader's first modules only; a fault seventeen seconds
+    // in, at a library mapped during font enumeration, needs the whole run.
+    const bool boundedLog = logOrdinal < 512;
     const U64 requestedAddress = addr;
     bool reserved = false;
     const bool fixed = (flags & K_MAP_FIXED) != 0;

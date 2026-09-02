@@ -5654,3 +5654,29 @@ which is the re-entry loop, or never, which is the parked worker. Both
 absolute forms now convert against the clock the guest was given, and a
 deadline beyond the 32-bit tick range is treated as none.
 
+## 83a5ab87: the cube runs steadily; the WoW64 probe hits the expat call again
+
+With the deadline conversion the 64-bit cube presented 1611 frames without
+parking (about 55 per second, the display's refresh: iOS presents drawables
+in step with the panel, so the counter cannot exceed it). The 32-bit probe
+under WoW64 mounted the PE layer (784 modules into syswow64) and then took
+the same null call target as before, now with the full register set: rdi
+and r15 hold the libexpat encoding table, the call at table+0x70 pushed its
+return address correctly (`BOXEDWINE_FEX64_CALL_RECORD ... match=1`), and
+the loaded target was zero while two other call sites in the same loop had
+just called through the same slot. So the stale-block theory does not
+cover this case: the block is the right code, and either the load misread
+or the slot was zero at that instant. The fault path now reads the slot at
+rdi/r12/r15+0x70 back through the kernel's view and the host alias
+(`BOXEDWINE_FEX64_NULL_TARGET_PROBE`), the stack readback uses the
+translator's alias instead of the kuser helper (which printed an empty
+return slot), and the file-mapping log covers 512 maps so a mapping landing
+over a live library would show.
+
+The desktop's double-click now opens My Computer, and it opens nothing:
+the shell enumerates no drives, so winefile falls back to executing the
+item and reports that no program is configured for it. Every drive-letter
+stat (`dosdevices/<letter>:`) is now logged with its answer. A pointer
+drag lowered the cube's frame rate; motion events that pile up behind an
+unread one now coalesce to the newest position in the bridge queue.
+
