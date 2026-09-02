@@ -88,7 +88,10 @@ jobs:
   wine64-runtime:
     name: Build x86-64 Wine runtime layers
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The i386 Wine package is 100 MB from the runner's Ubuntu mirror, which
+    # served it at 110 kB/s on one run (15 minutes); the package is cached
+    # below, but an uncached run still has to fit.
+    timeout-minutes: 45
     steps:
       - name: Check out BoxedVN
         uses: actions/checkout@v6
@@ -109,6 +112,22 @@ jobs:
             fontconfig fontconfig-config fonts-liberation \
             fonts-wine libxext6
 
+      - name: Record the installed Wine version
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/wine-i386
+          dpkg-query -W -f='${Version}' libwine > build/wine-i386/version.txt
+          cat build/wine-i386/version.txt
+
+      # Keyed on the exact amd64 libwine version so a mismatched pair can
+      # never be restored: a new Wine version misses the cache and fetches.
+      - name: Restore the cached 32-bit Wine package
+        uses: actions/cache@v4
+        with:
+          path: build/wine-i386/deb
+          key: libwine-i386-${{ runner.os }}-${{ hashFiles('build/wine-i386/version.txt') }}
+
       - name: Fetch the matching 32-bit Wine PE builtins
         shell: bash
         run: |
@@ -124,13 +143,21 @@ jobs:
           # pull in a whole i386 library chain, and the i386-unix tree inside
           # the package is the OLD WoW64, which is what needs those libraries.
           # Only the PE tree is handed to the packaging script.
-          libwine_version="$(dpkg-query -W -f='${Version}' libwine)"
+          libwine_version="$(cat build/wine-i386/version.txt)"
           echo "installed amd64 libwine: ${libwine_version}"
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          mkdir -p build/wine-i386
-          (cd build/wine-i386 && apt-get download "libwine:i386=${libwine_version}")
-          i386_deb="$(find build/wine-i386 -maxdepth 1 -name '*_i386.deb' -print -quit)"
+          mkdir -p build/wine-i386/deb
+          i386_deb="$(find build/wine-i386/deb -maxdepth 1 -name "libwine_${libwine_version//:/%3a}_i386.deb" -print -quit)"
+          if [[ -z "${i386_deb}" ]]; then
+            # Not cached for this version: fetch it. The mirror served this
+            # 100 MB package at 110 kB/s on one run, so the cache above is
+            # what keeps the job inside its time limit on later runs.
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            (cd build/wine-i386/deb && apt-get download "libwine:i386=${libwine_version}")
+            i386_deb="$(find build/wine-i386/deb -maxdepth 1 -name '*_i386.deb' -print -quit)"
+          else
+            echo "libwine:i386 ${libwine_version} restored from the cache"
+          fi
           test -n "${i386_deb}"
           dpkg-deb -x "${i386_deb}" build/wine-i386/root
           pe32_dir=build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows
