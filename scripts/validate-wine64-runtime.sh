@@ -131,6 +131,12 @@ MANIFEST_GLIBC_SHA256=""
 MANIFEST_WINE_ARCHIVE=""
 MANIFEST_WINE_SHA256=""
 MANIFEST_DXMT_UNIXLIB_SHA256=""
+# The WoW64 half of the layer: the 32-bit PE tree and Wine's own thunk modules.
+MANIFEST_I386_WINDOWS_MODULE_COUNT=""
+MANIFEST_I386_WINDOWS_NTDLL_SHA256=""
+MANIFEST_WOW64_DLL_SHA256=""
+MANIFEST_WOW64WIN_DLL_SHA256=""
+MANIFEST_WOW64CPU_DLL_SHA256=""
 if [[ -n "${MANIFEST}" ]]; then
     require_file "${MANIFEST}" \
         "Copy scripts/wine64-runtime-manifest.example and fill in both layer SHA-256 values."
@@ -145,6 +151,11 @@ if [[ -n "${MANIFEST}" ]]; then
             wine_archive)   MANIFEST_WINE_ARCHIVE="${value}" ;;
             wine_sha256)    MANIFEST_WINE_SHA256="${value}" ;;
             dxmt_unixlib_sha256) MANIFEST_DXMT_UNIXLIB_SHA256="${value}" ;;
+            i386_windows_module_count) MANIFEST_I386_WINDOWS_MODULE_COUNT="${value}" ;;
+            i386_windows_ntdll_sha256) MANIFEST_I386_WINDOWS_NTDLL_SHA256="${value}" ;;
+            wow64_dll_sha256)    MANIFEST_WOW64_DLL_SHA256="${value}" ;;
+            wow64win_dll_sha256) MANIFEST_WOW64WIN_DLL_SHA256="${value}" ;;
+            wow64cpu_dll_sha256) MANIFEST_WOW64CPU_DLL_SHA256="${value}" ;;
             x11_shim_libx11_sha256) MANIFEST_X11_SHIM_LIBX11_SHA256="${value}" ;;
             source)         MANIFEST_SOURCE="${value}" ;;
             source_image)   MANIFEST_SOURCE_IMAGE="${value}" ;;
@@ -270,6 +281,33 @@ check_zip_entry_pe32plus_amd64() {
     (( machine == 34404 )) \
         || die "'${path}' in $(basename "${archive}") is not PE32+ AMD64 (machine 0x$(printf '%04x' "${machine}"))."
     ok "$(basename "${archive}"): ${path} is a PE32+ AMD64 image"
+}
+
+# The same header walk for the 32-bit tree. Under new WoW64 the i386 builtins
+# are PE32 images (COFF machine 0x014c) executed in the CPU's compatibility
+# mode; a 64-bit image staged there, or a 32-bit image staged in the 64-bit
+# tree, passes every path check and cannot be mapped by the guest at all.
+check_zip_entry_pe32_i386() {
+    local archive="$1"
+    local path="$2"
+    local bytes
+    # -v for the same reason as above: od folds repeated zero rows into "*".
+    read -r -a bytes <<< "$(unzip -p "${archive}" "${path}" 2>/dev/null \
+        | od -An -tu1 -v -N4096 | tr '\n' ' ')"
+    [[ ${#bytes[@]} -ge 64 ]] \
+        || die "'${path}' in $(basename "${archive}") is too small to be a PE image."
+    [[ "${bytes[0]}" == 77 && "${bytes[1]}" == 90 ]] \
+        || die "'${path}' in $(basename "${archive}") does not start with MZ.\nA 32-bit builtin that is not a PE image cannot be loaded, however large it is."
+    local lfanew=$(( bytes[60] + bytes[61] * 256 + bytes[62] * 65536 + bytes[63] * 16777216 ))
+    (( lfanew > 0 && lfanew + 6 < ${#bytes[@]} )) \
+        || die "'${path}' in $(basename "${archive}") has an unusable PE header offset (${lfanew})."
+    [[ "${bytes[lfanew]}" == 80 && "${bytes[lfanew+1]}" == 69 \
+       && "${bytes[lfanew+2]}" == 0 && "${bytes[lfanew+3]}" == 0 ]] \
+        || die "'${path}' in $(basename "${archive}") has no PE signature at offset ${lfanew}."
+    local machine=$(( bytes[lfanew+4] + bytes[lfanew+5] * 256 ))
+    (( machine == 332 )) \
+        || die "'${path}' in $(basename "${archive}") is not PE32 i386 (machine 0x$(printf '%04x' "${machine}")).\nThe 32-bit PE tree must come from the i386 libwine package, not from the 64-bit one."
+    ok "$(basename "${archive}"): ${path} is a PE32 i386 image"
 }
 
 # BoxedWine's ZIP filesystem does not read POSIX symlinks out of an archive:
@@ -467,6 +505,64 @@ for required_builtin in ntdll.dll kernel32.dll kernelbase.dll; do
         "${WINE_MODULE_ROOT}/x86_64-windows/${required_builtin}"
 done
 
+# The WoW64 lane. Wine runs 32-bit Windows programs inside the 64-bit Unix
+# process: the 32-bit PE builtins live in a third architecture directory under
+# the same module root, and Wine's own thunk modules -- which are 64-bit
+# builtins -- are what build and enter that 32-bit context. A runtime missing
+# either half has no 32-bit lane, and Wine reports that only as a failure to
+# start the image, which is indistinguishable from a broken program.
+PE32_DIR="${WINE_MODULE_ROOT}/i386-windows"
+check_zip_path "${WINE_ARCHIVE}" "${PE32_DIR}"
+for required_pe32 in ntdll.dll kernel32.dll; do
+    check_zip_path "${WINE_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
+    check_zip_entry_pe32_i386 "${WINE_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
+done
+# The 64-bit tree staying 64-bit is what the loop above already proves for
+# ntdll, kernel32 and kernelbase; the thunk modules are held to the same class,
+# because the packaging step that adds a second tree is exactly where the two
+# architectures can be swapped without any name changing.
+for wow64_module in wow64.dll wow64win.dll wow64cpu.dll; do
+    check_zip_path "${WINE_ARCHIVE}" \
+        "${WINE_MODULE_ROOT}/x86_64-windows/${wow64_module}"
+    check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" \
+        "${WINE_MODULE_ROOT}/x86_64-windows/${wow64_module}"
+done
+check_zip_guest_link "${WINE_ARCHIVE}" usr/lib/wine/i386-windows \
+    "/${PE32_DIR}"
+
+# The manifest pins the WoW64 half the same way it pins the layer archives: a
+# runtime that lost its 32-bit tree between build and packaging still has every
+# 64-bit path this checker requires.
+if [[ -n "${MANIFEST}" ]]; then
+    [[ "${MANIFEST_I386_WINDOWS_MODULE_COUNT}" =~ ^[0-9]+$ ]] \
+        || die "Wine64 manifest is missing i386_windows_module_count."
+    pe32_entry_count="$(unzip -Z1 "${WINE_ARCHIVE}" \
+        | sed 's#^\./##' \
+        | awk -v prefix="${PE32_DIR}/" \
+            'index($0, prefix) == 1 && $0 != prefix && substr($0, length($0)) != "/" { count++ } END { print count + 0 }')"
+    (( pe32_entry_count > 0 )) \
+        || die "'$(basename "${WINE_ARCHIVE}")' carries no files under ${PE32_DIR}."
+    (( pe32_entry_count == MANIFEST_I386_WINDOWS_MODULE_COUNT )) \
+        || die "The Wine64 archive holds ${pe32_entry_count} 32-bit PE modules; its manifest records ${MANIFEST_I386_WINDOWS_MODULE_COUNT}."
+    ok "$(basename "${WINE_ARCHIVE}"): ${pe32_entry_count} 32-bit PE modules"
+    for pinned in \
+        "i386_windows_ntdll_sha256:${MANIFEST_I386_WINDOWS_NTDLL_SHA256}:${PE32_DIR}/ntdll.dll" \
+        "wow64_dll_sha256:${MANIFEST_WOW64_DLL_SHA256}:${WINE_MODULE_ROOT}/x86_64-windows/wow64.dll" \
+        "wow64win_dll_sha256:${MANIFEST_WOW64WIN_DLL_SHA256}:${WINE_MODULE_ROOT}/x86_64-windows/wow64win.dll" \
+        "wow64cpu_dll_sha256:${MANIFEST_WOW64CPU_DLL_SHA256}:${WINE_MODULE_ROOT}/x86_64-windows/wow64cpu.dll"; do
+        pinned_key="${pinned%%:*}"
+        pinned_rest="${pinned#*:}"
+        pinned_expected="${pinned_rest%%:*}"
+        pinned_path="${pinned_rest#*:}"
+        is_sha256 "${pinned_expected}" \
+            || die "Wine64 manifest ${pinned_key} is missing or not a 64-hex SHA-256 value."
+        pinned_actual="$(zip_entry_sha256 "${WINE_ARCHIVE}" "${pinned_path}")"
+        [[ "${pinned_actual}" == "${pinned_expected}" ]] \
+            || die "Checksum mismatch for '${pinned_path}'.\n  expected SHA-256: ${pinned_expected}\n  actual   SHA-256: ${pinned_actual}"
+        ok "${pinned_key} verified"
+    done
+fi
+
 # ntdll needs these locale tables during its earliest process initialization.
 # With the multiarch module root Wine derives
 # /usr/lib/x86_64-linux-gnu/wine/../../share/wine = /usr/lib/share/wine, so both
@@ -523,6 +619,19 @@ if [[ -n "${RECORD_MANIFEST}" ]]; then
         printf 'glibc_sha256=%s\n' "$(sha256_file "${GLIBC_ARCHIVE}")"
         printf '%s\n' 'wine_archive=wine64.zip'
         printf 'wine_sha256=%s\n' "$(sha256_file "${WINE_ARCHIVE}")"
+        # A recorded manifest has to be one this checker would accept on the
+        # next run, so it carries the WoW64 pins the block above requires.
+        printf 'i386_windows_module_count=%s\n' "$(unzip -Z1 "${WINE_ARCHIVE}" \
+            | sed 's#^\./##' \
+            | awk -v prefix="${PE32_DIR}/" \
+                'index($0, prefix) == 1 && $0 != prefix && substr($0, length($0)) != "/" { count++ } END { print count + 0 }')"
+        printf 'i386_windows_ntdll_sha256=%s\n' \
+            "$(zip_entry_sha256 "${WINE_ARCHIVE}" "${PE32_DIR}/ntdll.dll")"
+        for recorded_wow64 in wow64 wow64win wow64cpu; do
+            printf '%s_dll_sha256=%s\n' "${recorded_wow64}" \
+                "$(zip_entry_sha256 "${WINE_ARCHIVE}" \
+                    "${WINE_MODULE_ROOT}/x86_64-windows/${recorded_wow64}.dll")"
+        done
     } > "${RECORD_MANIFEST}"
     ok "recorded manifest: ${RECORD_MANIFEST}"
 fi

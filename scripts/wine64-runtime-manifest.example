@@ -19,3 +19,13 @@ glibc_archive=glibc-rootfs64.zip
 glibc_sha256=REPLACE_WITH_64_HEX_SHA256
 wine_archive=wine64.zip
 wine_sha256=REPLACE_WITH_64_HEX_SHA256
+# The WoW64 half of the layer: the 32-bit PE builtin tree and Wine's own
+# thunk modules. A runtime that lost the i386-windows tree between build and
+# packaging still satisfies every 64-bit path the checker requires, so the
+# tree is pinned by file count and by the hash of the module a WoW64 process
+# loads first.
+i386_windows_module_count=REPLACE_WITH_FILE_COUNT
+i386_windows_ntdll_sha256=REPLACE_WITH_64_HEX_SHA256
+wow64_dll_sha256=REPLACE_WITH_64_HEX_SHA256
+wow64win_dll_sha256=REPLACE_WITH_64_HEX_SHA256
+wow64cpu_dll_sha256=REPLACE_WITH_64_HEX_SHA256

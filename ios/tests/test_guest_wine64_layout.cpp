@@ -66,6 +66,31 @@ BOXEDVN_TEST(wine64_layout_projects_the_dxmt_modules_over_the_module_root) {
     CHECK(!boxedvn::shouldOverlayX64WineModule(true, true));
 }
 
+BOXEDVN_TEST(wine64_layout_places_the_32_bit_pe_tree_beside_the_64_bit_one) {
+    // New WoW64 runs 32-bit PE builtins inside the 64-bit Unix process, so the
+    // i386 tree is a third architecture directory under the SAME module root
+    // Wine derives from ntdll.so's parent -- not a second Wine installation.
+    CHECK_EQ(std::string(K_X64_WINE_PE32_DIR),
+             std::string(K_X64_WINE_MODULE_ROOT) + "/i386-windows");
+    CHECK(std::string(K_X64_WINE_PE32_DIR) != std::string(K_X64_WINE_PE_DIR));
+    // There is deliberately no i386-unix constant: the Unix side stays 64-bit,
+    // which is what removes the need for 32-bit Linux libraries.
+    CHECK_EQ(std::string(K_X64_WINE_UNIX_DIR),
+             std::string(K_X64_WINE_MODULE_ROOT) + "/x86_64-unix");
+}
+
+BOXEDVN_TEST(wine64_layout_names_wines_own_wow64_thunk_modules) {
+    const char* const names[] = K_X64_WOW64_MODULE_NAMES;
+    CHECK_EQ(sizeof(names) / sizeof(names[0]),
+             (size_t)K_X64_WOW64_MODULE_COUNT);
+    // These are 64-bit builtins: ntdll loads wow64.dll to build the 32-bit
+    // process, wow64win.dll thunks user/GDI syscalls into the 64-bit win32u,
+    // and wow64cpu.dll performs the mode transfer.
+    CHECK_EQ(std::string(names[0]), std::string("wow64.dll"));
+    CHECK_EQ(std::string(names[1]), std::string("wow64win.dll"));
+    CHECK_EQ(std::string(names[2]), std::string("wow64cpu.dll"));
+}
+
 BOXEDVN_TEST(wine64_preflight_accepts_only_a_complete_mz_signature) {
     const unsigned char valid[] = {'M', 'Z'};
     const unsigned char invalid[] = {'M', 'X'};

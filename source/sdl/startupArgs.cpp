@@ -161,10 +161,65 @@ static void overlayX64WineModules(const BString& overlayDir) {
     }
 }
 
+// The 32-bit half of the same projection. New WoW64 keeps the i386 PE builtins
+// in a third tree under the packaged module root, and Wine looks for them in
+// the prefix's syswow64 rather than system32; a prefix whose syswow64 is empty
+// gives a 32-bit image nothing to bind to, which Wine reports only as a
+// failure to start it.
+//
+// Silent when the tree is not mounted: a 64-bit-only runtime layer is still a
+// working 64-bit lane, so the absence is logged and the launch continues.
+static void projectX64WinePe32Modules(const BString& winePrefix) {
+    const BString syswow64 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
+                             K_GUEST_WINE_WINDOWS "/syswow64";
+
+    std::shared_ptr<FsNode> pe32Directory =
+        Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_PE32_DIR), true);
+    if (!pe32Directory || !pe32Directory->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=i386-windows status=missing source=%s",
+                 K_X64_WINE_PE32_DIR);
+        return;
+    }
+    Fs::makeLocalDirs(syswow64);
+    std::shared_ptr<FsNode> pe32Destination =
+        Fs::getNodeFromLocalPath(B(""), syswow64, true);
+    if (!pe32Destination || !pe32Destination->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=i386-windows status=missing destination=%s",
+                 syswow64.c_str());
+        return;
+    }
+
+    std::vector<std::shared_ptr<FsNode> > pe32Modules;
+    pe32Directory->getAllChildren(pe32Modules);
+    U32 pe32Projected = 0;
+    pe32Destination->reserveChildren(pe32Modules.size());
+    for (const std::shared_ptr<FsNode>& source : pe32Modules) {
+        if (!source || source->name.isEmpty()) {
+            continue;
+        }
+        const BString destination = syswow64 + "/" + source->name;
+        const bool destinationExists =
+            Fs::getNodeFromLocalPath(B(""), destination, false) != nullptr;
+        if (!boxedvn::shouldProjectGuestWineSystemModule(
+                source != nullptr, source && source->isDirectory(),
+                destinationExists)) {
+            continue;
+        }
+        Fs::addFileNode(destination, source->path, B(""), false,
+                        pe32Destination);
+        ++pe32Projected;
+    }
+    klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=i386-windows status=projected destination=%s projected=%u",
+             syswow64.c_str(), pe32Projected);
+}
+
 static void projectX64WineSystemModules(const BString& winePrefix) {
     const BString system32 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
                              K_GUEST_WINE_WINDOWS "/" K_GUEST_WINE_SYSTEM32;
     Fs::makeLocalDirs(system32);
+    // The 32-bit builtins go to syswow64, beside this; Wine keeps the two
+    // architectures in separate prefix directories.
+    projectX64WinePe32Modules(winePrefix);
 
     std::shared_ptr<FsNode> sourceDirectory =
         Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_PE_DIR), true);

@@ -5496,3 +5496,18 @@ the user: the start menu flickers, double-clicking My Computer opens
 nothing (no process was spawned), and drives from the 32-bit desktop are
 not visible (expected: the 64-bit lane has its own prefix; only D: and the
 shared drive are mounted).
+
+## WoW64 phase 1: dual-architecture runtime layer (packaging half)
+
+Packaged by a subagent from the phase 0 facts: the `wine64-runtime` job now
+downloads (never installs) `libwine:i386` at the exact version of the
+installed amd64 `libwine`, extracts only `i386-windows`, and the packaging
+script stages it beside `x86_64-windows` and `x86_64-unix`, requires
+`wow64.dll`/`wow64win.dll`/`wow64cpu.dll`, checks PE32 (0x14c) against
+PE32+ (0x8664) by COFF machine, and records module count and hashes in the
+manifest; the validator repeats the checks on the archive. The layout header
+gains `K_X64_WINE_PE32_DIR` and the wow64 module names, and
+`projectX64WineSystemModules` projects the i386 tree into the prefix's
+`syswow64`. 138 host tests pass. Phase 1's device gate (a 32-bit builtin
+starting under the 64-bit prefix through WoW64) and its last bullet (32-bit
+DXMT PE thunks built for i686) remain open.

@@ -109,6 +109,39 @@ jobs:
             fontconfig fontconfig-config fonts-liberation \
             fonts-wine libxext6
 
+      - name: Fetch the matching 32-bit Wine PE builtins
+        shell: bash
+        run: |
+          set -euo pipefail
+          # New WoW64 runs 32-bit PE code inside the 64-bit Unix process, so
+          # the runtime needs the i386-windows PE tree that Ubuntu's wine64
+          # package does not ship. It lives in libwine:i386, at the same
+          # version as the amd64 libwine already installed -- a mismatched pair
+          # would have the 32-bit builtins calling into a 64-bit ntdll they
+          # were not built against.
+          #
+          # The package is UNPACKED, never installed: apt-get install would
+          # pull in a whole i386 library chain, and the i386-unix tree inside
+          # the package is the OLD WoW64, which is what needs those libraries.
+          # Only the PE tree is handed to the packaging script.
+          libwine_version="$(dpkg-query -W -f='${Version}' libwine)"
+          echo "installed amd64 libwine: ${libwine_version}"
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          mkdir -p build/wine-i386
+          (cd build/wine-i386 && apt-get download "libwine:i386=${libwine_version}")
+          i386_deb="$(find build/wine-i386 -maxdepth 1 -name '*_i386.deb' -print -quit)"
+          test -n "${i386_deb}"
+          dpkg-deb -x "${i386_deb}" build/wine-i386/root
+          pe32_dir=build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows
+          for required in ntdll.dll kernel32.dll; do
+            test -s "${pe32_dir}/${required}" || {
+              echo "libwine:i386 ${libwine_version} has no ${required} under ${pe32_dir}" >&2
+              exit 1
+            }
+          done
+          echo "32-bit PE builtins: $(find "${pe32_dir}" -type f | wc -l)"
+
       - name: Build and validate Wine64 layers
         shell: bash
         env:
@@ -127,7 +160,8 @@ jobs:
           bash scripts/build-wine64-runtime-ci.sh \
             --output-dir build/wine64-runtime \
             --dxmt-unixlib build/winemetal.so \
-            --x11-shim-dir build/x64-x11
+            --x11-shim-dir build/x64-x11 \
+            --i386-pe-dir build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows
           bash scripts/validate-wine64-runtime.sh \
             --input build/wine64-runtime \
             --manifest build/wine64-runtime/wine64-runtime.manifest

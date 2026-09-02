@@ -319,6 +319,24 @@ void writeEvent64(const XEvent& event, U64 display, U8* out) {
         break;
     case ButtonPress:
     case ButtonRelease:
+        // The first 64-bit desktop run reported double-clicks that opened
+        // nothing while single clicks worked. Wine derives its double-click
+        // from consecutive button events' time, position and button, all
+        // of which cross here; the first few are recorded so a stale time,
+        // a moving position, or a missing release can be seen in the log.
+        {
+            static std::atomic<U32> reported {0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+                klog_fmt("BOXEDWINE_X64_X11_BUTTON %s window=0x%llx time=%llu "
+                         "x=%d y=%d root=%d,%d button=%u state=0x%x",
+                         event.type == ButtonPress ? "press" : "release",
+                         (unsigned long long)event.xbutton.window,
+                         (unsigned long long)event.xbutton.time,
+                         event.xbutton.x, event.xbutton.y,
+                         event.xbutton.x_root, event.xbutton.y_root,
+                         event.xbutton.button, event.xbutton.state);
+            }
+        }
         L::put64(out, any::window, event.xbutton.window);
         L::put64(out, key::root, event.xbutton.root);
         L::put64(out, key::subwindow, event.xbutton.subwindow);

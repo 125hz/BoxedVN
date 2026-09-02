@@ -46,6 +46,13 @@
 // Ubuntu's own module root, and the one every derived path agrees on.
 #define K_X64_WINE_MODULE_ROOT "/usr/lib/x86_64-linux-gnu/wine"
 #define K_X64_WINE_PE_DIR K_X64_WINE_MODULE_ROOT "/x86_64-windows"
+// New WoW64 keeps the 32-bit PE builtins in a third tree beside the two above,
+// under the same module root, and Wine appends the architecture directory to
+// each root it searches. The 32-bit builtins are PE32 images executed in the
+// CPU's compatibility mode; there is no i386-unix tree, which is the whole
+// point of new WoW64 and the reason the distro's old-WoW64 i386-unix tree must
+// never be packaged.
+#define K_X64_WINE_PE32_DIR K_X64_WINE_MODULE_ROOT "/i386-windows"
 #define K_X64_WINE_UNIX_DIR K_X64_WINE_MODULE_ROOT "/x86_64-unix"
 #define K_X64_WINE_LOADER K_X64_WINE_MODULE_ROOT "/wine64"
 #define K_X64_WINE_SERVER K_X64_WINE_MODULE_ROOT "/wineserver"
@@ -81,6 +88,15 @@
 // beside them. These are the names the overlay projects.
 #define K_X64_DXMT_MODULE_COUNT 4
 #define K_X64_DXMT_MODULE_NAMES {"d3d11.dll", "dxgi.dll", "d3d10core.dll", "winemetal.dll"}
+
+// Wine's own WoW64 thunking layer, which lives in the 64-bit PE tree even
+// though it exists to serve 32-bit code: ntdll loads wow64.dll to build the
+// 32-bit process, wow64win.dll thunks the user/GDI syscalls the 32-bit side
+// makes into the 64-bit win32u, and wow64cpu.dll performs the mode transfer
+// itself. A packaged 64-bit tree missing any of the three has no 32-bit lane
+// at all, and Wine reports that only as a failure to start the image.
+#define K_X64_WOW64_MODULE_COUNT 3
+#define K_X64_WOW64_MODULE_NAMES {"wow64.dll", "wow64win.dll", "wow64cpu.dll"}
 
 // The builtin whose absence is the failure this layout exists to prevent. It
 // is the first PE module Wine loads after the server handshake, so a guest

@@ -9,7 +9,8 @@
 #
 # Usage:
 #   scripts/build-wine64-runtime-ci.sh --output-dir DIR \
-#       [--dxmt-unixlib PATH] [--x11-shim-dir DIR]
+#       [--dxmt-unixlib PATH] [--x11-shim-dir DIR] \
+#       [--i386-pe-dir DIR]
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
@@ -36,6 +37,14 @@ X11_SHIM_LIBRARIES=(
 # as K_X64_WINE_MODULE_ROOT in include/guest_wine64_layout.h, which is what
 # the launch and the device preflight use.
 WINE_MODULE_ROOT="/usr/lib/x86_64-linux-gnu/wine"
+# The 32-bit PE builtin tree for new WoW64, extracted from the SAME libwine
+# version's i386 package by the caller. Ubuntu's wine64 package ships only the
+# 64-bit trees; the i386 package's i386-unix tree is the OLD WoW64 (it needs
+# 32-bit Linux libraries) and is deliberately not consumed here -- only the
+# i386-windows PE images are, which run in the CPU's compatibility mode inside
+# the 64-bit Unix process.
+I386_PE_DIR=""
+I386_PE_GUEST_DIR="${WINE_MODULE_ROOT}/i386-windows"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir needs a value"
@@ -44,14 +53,27 @@ while [[ $# -gt 0 ]]; do
                          DXMT_UNIXLIB="$2"; shift 2 ;;
         --x11-shim-dir) [[ $# -ge 2 ]] || die "--x11-shim-dir needs a value"
                          X11_SHIM_DIR="$2"; shift 2 ;;
+        --i386-pe-dir) [[ $# -ge 2 ]] || die "--i386-pe-dir needs a value"
+                        I386_PE_DIR="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) die "Unknown argument '$1'. Run with --help." ;;
     esac
 done
 
 [[ -n "${OUTPUT_DIR}" ]] || die "--output-dir is required."
+# Required in CI: a runtime without the 32-bit PE tree has no WoW64 lane, and
+# nothing downstream reports that as an error -- a 32-bit image simply fails to
+# start. A local inspection build may still be assembled without it.
+if [[ -z "${I386_PE_DIR}" ]]; then
+    [[ "${CI:-}" != "true" ]] \
+        || die "--i386-pe-dir is required in CI. Extract libwine:i386 of the same version as the installed amd64 libwine and pass its i386-windows tree."
+    warn "No --i386-pe-dir: the runtime will carry no 32-bit PE builtins and cannot run a WoW64 process."
+else
+    [[ -d "${I386_PE_DIR}" ]] \
+        || die "--i386-pe-dir '${I386_PE_DIR}' is not a directory."
+fi
 if [[ -n "${DXMT_UNIXLIB}" ]]; then
     require_file "${DXMT_UNIXLIB}" \
         "Build the x86-64 guest DXMT unixlib before assembling the runtime."
@@ -104,6 +126,45 @@ is_elf64_x86_64() {
     # e_machine == EM_X86_64 (62), little endian
     [[ "${bytes[18]}" == 62 && "${bytes[19]}" == 0 ]] || return 1
     return 0
+}
+
+# The PE counterpart of the ELF check above, and needed for the same reason: a
+# name is not evidence of an architecture. Ubuntu's i386 libwine package also
+# carries an i386-unix tree (the old WoW64), and a mis-pointed --i386-pe-dir
+# would stage 64-bit images under i386-windows or 32-bit ones under
+# x86_64-windows. Either shape passes every name check and leaves the guest
+# unable to load the image at all.
+#
+# Prints the COFF machine as a decimal number, or nothing when the file is not
+# a PE image. Always succeeds, so a caller under `set -e` can test the value.
+pe_coff_machine() {
+    local path="$1"
+    [[ -f "${path}" ]] || return 0
+    local bytes
+    # -v is required: od otherwise folds the repeated zero-filled DOS-header
+    # rows into a literal "*", which shifts every later array index and makes a
+    # valid e_lfanew read as zero.
+    read -r -a bytes <<< "$(od -An -tu1 -v -N4096 "${path}" 2>/dev/null | tr '\n' ' ')"
+    [[ ${#bytes[@]} -ge 64 ]] || return 0
+    # "MZ"
+    [[ "${bytes[0]}" == 77 && "${bytes[1]}" == 90 ]] || return 0
+    local lfanew=$(( bytes[60] + bytes[61] * 256 + bytes[62] * 65536 + bytes[63] * 16777216 ))
+    (( lfanew > 0 && lfanew + 6 < ${#bytes[@]} )) || return 0
+    # "PE\0\0"
+    [[ "${bytes[lfanew]}" == 80 && "${bytes[lfanew+1]}" == 69 \
+       && "${bytes[lfanew+2]}" == 0 && "${bytes[lfanew+3]}" == 0 ]] || return 0
+    printf '%d\n' $(( bytes[lfanew+4] + bytes[lfanew+5] * 256 ))
+    return 0
+}
+
+# 0x014c = IMAGE_FILE_MACHINE_I386, 0x8664 = IMAGE_FILE_MACHINE_AMD64.
+require_pe_machine() {
+    local path="$1" expected="$2" description="$3" actual
+    actual="$(pe_coff_machine "${path}")"
+    [[ -n "${actual}" ]] \
+        || die "'${path}' is not a PE image, so it cannot be a ${description}."
+    (( actual == expected )) \
+        || die "'${path}' has COFF machine 0x$(printf '%04x' "${actual}"), expected 0x$(printf '%04x' "${expected}") for a ${description}."
 }
 
 find_first_elf64_x86_64() {
@@ -342,6 +403,32 @@ if [[ -n "${DXMT_UNIXLIB}" ]]; then
        "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/winemetal.so"
 fi
 
+# The 32-bit PE builtins, under the same module root as the two 64-bit trees.
+# Wine appends the architecture directory to each module root it searches, so
+# a tree anywhere else is invisible to the same derivation that already had to
+# be fixed for x86_64-windows.
+#
+# Only the PE tree is copied. The i386 package's i386-unix tree is old WoW64 --
+# ELF32 objects that need a 32-bit Linux loader and libraries the guest does
+# not have -- and staging it would give Wine a second, unusable way to start a
+# 32-bit process.
+I386_PE_MODULE_COUNT=0
+if [[ -n "${I386_PE_DIR}" ]]; then
+    mkdir -p "${STAGE}${I386_PE_GUEST_DIR}"
+    cp -aL "${I386_PE_DIR}/." "${STAGE}${I386_PE_GUEST_DIR}/"
+    for required_pe32 in ntdll.dll kernel32.dll; do
+        pe32_path="${STAGE}${I386_PE_GUEST_DIR}/${required_pe32}"
+        [[ -s "${pe32_path}" ]] \
+            || die "The i386 PE tree has no ${required_pe32}: ${pe32_path}. Extract libwine:i386 of the same version as the installed amd64 libwine."
+    done
+    require_pe_machine "${STAGE}${I386_PE_GUEST_DIR}/ntdll.dll" 332 \
+        "32-bit PE builtin"
+    I386_PE_MODULE_COUNT="$(find "${STAGE}${I386_PE_GUEST_DIR}" -type f | wc -l | tr -d ' ')"
+    (( I386_PE_MODULE_COUNT > 0 )) \
+        || die "The staged i386-windows tree is empty."
+    log "32-bit PE builtins packaged: ${I386_PE_GUEST_DIR} (${I386_PE_MODULE_COUNT})"
+fi
+
 # BoxedWine's own x86-64 X11 client libraries. winex11.so links the distro
 # libX11 by DT_NEEDED, and that library connects to /tmp/.X11-unix/X0, which
 # BoxedWine does not serve: a device run showed the connect refused and every
@@ -375,6 +462,26 @@ for required_builtin in ntdll.dll kernel32.dll kernelbase.dll; do
     [[ "$(head -c 2 "${builtin_path}")" == "MZ" ]] \
         || die "${required_builtin} is not a PE image."
 done
+
+# Wine's own WoW64 thunking layer. These are 64-bit builtins even though they
+# exist to serve 32-bit code: ntdll loads wow64.dll to build the 32-bit
+# process, wow64win.dll thunks the user/GDI syscalls into the 64-bit win32u,
+# and wow64cpu.dll performs the mode transfer. Ubuntu's amd64 libwine already
+# ships all three; a tree missing one has no 32-bit lane, and Wine reports that
+# only as a failure to start the image.
+for wow64_module in wow64.dll wow64win.dll wow64cpu.dll; do
+    wow64_path="${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${wow64_module}"
+    [[ -s "${wow64_path}" ]] \
+        || die "The Wine 64-bit module tree has no ${wow64_module}: ${wow64_path}. Without Wine's WoW64 layer the runtime cannot run a 32-bit process at all."
+    require_pe_machine "${wow64_path}" 34404 "64-bit WoW64 thunk module"
+done
+log "WoW64 thunk modules packaged: wow64.dll wow64win.dll wow64cpu.dll"
+
+# The two trees must not be each other. A build that staged the 64-bit tree at
+# i386-windows, or the i386 package's images at x86_64-windows, satisfies every
+# name check above and leaves the guest with images it cannot map.
+require_pe_machine "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/ntdll.dll" 34404 \
+    "64-bit PE builtin"
 
 # The X11 user driver, both halves. Wine's win32u loads the PE side out of the
 # Windows module tree and that side dlopens the Unix side; without either one
@@ -529,6 +636,7 @@ guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/lib/wine/wineserver
 guest_link "${WINE_MODULE_ROOT}/wineserver64" /usr/lib/wine/wineserver64
 guest_link "${WINE_MODULE_ROOT}/x86_64-windows" /usr/lib/wine/x86_64-windows
 guest_link "${WINE_MODULE_ROOT}/x86_64-unix" /usr/lib/wine/x86_64-unix
+guest_link "${I386_PE_GUEST_DIR}" /usr/lib/wine/i386-windows
 guest_link "${WINE_MODULE_ROOT}/wine64" /usr/bin/wine64
 guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/bin/wineserver
 # Wine derives its data root as ../../share/wine from the multiarch module
@@ -581,6 +689,18 @@ sha256_file() {
     printf 'glibc_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/glibc-rootfs64.zip")"
     printf '%s\n' 'wine_archive=wine64.zip'
     printf 'wine_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/wine64.zip")"
+    # The WoW64 half of the layer, recorded so the validator can prove the
+    # archive it is given is the one this build produced rather than a 64-bit
+    # runtime with the same paths.
+    printf 'i386_windows_module_count=%s\n' "${I386_PE_MODULE_COUNT}"
+    if (( I386_PE_MODULE_COUNT > 0 )); then
+        printf 'i386_windows_ntdll_sha256=%s\n' \
+            "$(sha256_file "${STAGE}${I386_PE_GUEST_DIR}/ntdll.dll")"
+    fi
+    for wow64_module in wow64 wow64win wow64cpu; do
+        printf '%s_dll_sha256=%s\n' "${wow64_module}" \
+            "$(sha256_file "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${wow64_module}.dll")"
+    done
     if [[ -n "${DXMT_UNIXLIB}" ]]; then
         printf 'dxmt_unixlib_sha256=%s\n' "$(sha256_file "${DXMT_UNIXLIB}")"
     fi
