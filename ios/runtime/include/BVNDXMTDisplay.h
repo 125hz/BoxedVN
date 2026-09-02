@@ -34,11 +34,11 @@ bool BVNDXMTDisplayHasLayer(void);
 void BVNDXMTDisplayNotePresented(void);
 
 // Main thread, polled from Boxedwine's own loop. Once a frame has been
-// presented, brings the DXMT view above SDL's views in the guest window.
-// SDL creates its renderer view after the DXMT view was attached, and a
-// device run drew 240 frames into a layer nobody could see because that
-// later view covered it. The overlay is a subview of the window itself, so
-// it stays above both.
+// presented, keeps the DXMT view a direct subview of the guest window,
+// immediately above the root view controller's view. SDL replaces that root
+// view with each renderer view it creates and removes the previous one from
+// the window, so a DXMT view parented under it silently leaves the window.
+// The overlay is installed as a later window subview, so it stays on top.
 void BVNDXMTDisplaySyncOrdering(void);
 
 #ifdef __cplusplus

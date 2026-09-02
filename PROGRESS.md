@@ -5305,3 +5305,22 @@ itself and stays on top, so the cursor and keyboard remain.
 
 Next device evidence: `BOXEDVN_DXMT_LAYER_FRONT` in the log within a
 quarter second of the first present, and the cube visible.
+
+## DXMT layer placement (after 225c02d5)
+
+Device run on 225c02d5 presented 240 frames (`present ok ... first-frame`,
+`BOXEDVN_X64_CUBE_STAGE complete ok`) but `BOXEDVN_DXMT_LAYER_FRONT` never
+fired and the screen stayed black. SDL 2.32's `SDL_uikitview setSDLWindow:`
+replaces the root view controller's view with each renderer view it creates
+and removes the previous view from the window; the DXMT view attached under
+the earlier root view left the window with it, so it was "frontmost" inside
+a detached container. The ordering poll now keeps the DXMT view a direct
+window subview immediately above the current root view (below the overlay)
+and logs frame, drawable size, and subview count once.
+
+Open, not addressed here: one run died silently right after explorer's
+second display created window 0x10025 (second time at that spot, no host
+diagnostics; needs the iOS crash report), and one run raised an access
+violation (RIP=0 after a call from ntdll code) in a worker thread during
+D3D11 device creation before any frame; a third run faulted in ntdll only
+after the probe reported completion.

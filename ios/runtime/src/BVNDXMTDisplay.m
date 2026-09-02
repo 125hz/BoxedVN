@@ -17,6 +17,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "BVNDXMTDisplay.h"
@@ -218,22 +219,55 @@ void BVNDXMTDisplaySyncOrdering(void) {
     pthread_mutex_lock(&gDisplayLock);
     BVNDXMTMetalView* view = gDisplayView;
     pthread_mutex_unlock(&gDisplayLock);
-    UIView* container = view.superview;
-    if (view == nil || container == nil) {
+    UIWindow* window = BVNGuestUIWindow();
+    if (view == nil || window == nil) {
         return;
     }
-    // Already frontmost: nothing to do. SDL may add views later (it recreates
-    // its window when the renderer changes), so this is re-checked each poll.
-    if (container.subviews.lastObject == view) {
+    // SDL 2.32 (SDL_uikitview setSDLWindow:) replaces the root view
+    // controller's view with each renderer view it creates and removes the
+    // previous one from the window. A DXMT view attached under that earlier
+    // view left the window with it: a device run presented 240 frames into a
+    // layer that was "frontmost" in a detached container. The view therefore
+    // lives directly in the window, immediately above whatever view SDL owns
+    // as the root view controller's view, and below the overlay that
+    // BVNGuestOverlayInstall keeps at the front.
+    UIView* root = window.rootViewController.view;
+    if (root == nil || root.superview != window) {
         return;
     }
-    view.frame = container.bounds;
-    [container bringSubviewToFront:view];
-    if (!gDisplayFronted) {
+    BOOL changed = NO;
+    if (view.superview != window) {
+        [view removeFromSuperview];
+        view.frame = window.bounds;
+        [window addSubview:view];
+        changed = YES;
+    }
+    NSArray<UIView*>* subviews = window.subviews;
+    const NSUInteger rootIndex = [subviews indexOfObjectIdenticalTo:root];
+    const NSUInteger viewIndex = [subviews indexOfObjectIdenticalTo:view];
+    if (rootIndex == NSNotFound || viewIndex == NSNotFound) {
+        return;
+    }
+    if (viewIndex != rootIndex + 1) {
+        [window insertSubview:view aboveSubview:root];
+        changed = YES;
+    }
+    if (!CGRectEqualToRect(view.frame, window.bounds)) {
+        view.frame = window.bounds;
+    }
+    if (changed && !gDisplayFronted) {
         gDisplayFronted = true;
-        BVNLogWrite(BVNLogLevelInfo, "dxmt",
-                    "BOXEDVN_DXMT_LAYER_FRONT: raised the DXMT layer above "
-                    "SDL's views after the first presented frame.");
+        const CGSize drawable = view.metalLayer.drawableSize;
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "BOXEDVN_DXMT_LAYER_FRONT: placed the DXMT layer in the guest "
+                 "window above SDL's root view (%s) after the first presented "
+                 "frame; frame=%.0fx%.0f drawable=%.0fx%.0f window_subviews=%lu",
+                 NSStringFromClass(root.class).UTF8String,
+                 view.bounds.size.width, view.bounds.size.height,
+                 drawable.width, drawable.height,
+                 (unsigned long)window.subviews.count);
+        BVNLogWrite(BVNLogLevelInfo, "dxmt", message);
     }
 }
 
