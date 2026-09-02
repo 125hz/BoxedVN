@@ -5702,3 +5702,28 @@ manager's host process (winedevice.exe) exits with status 0 during boot in
 every 64-bit run. The launch environment adds the winedevice and mountmgr
 trace channels so the next log says why.
 
+## 80c7a1c2: the WoW64 probe reaches thread setup; two runs died silently
+
+With the loader named `wine`, both 32-bit probe runs loaded the image
+in-process: the 64-bit unix ntdll opened `i386-windows/ntdll.dll` and then
+took a general protection fault at `int 0x80` with eax=243, Wine's
+`alloc_fs_sel` asking set_thread_area for the 32-bit FS selector through
+the legacy gate, which the translator refuses in 64-bit mode. That call
+is now served from the fault: the descriptor is written into the thread's
+segment table (the same table the translator reads for every
+segment-relative access), the entry number goes back to the guest, and
+execution resumes after the gate. Other legacy calls report
+`BOXEDWINE_X64_LEGACY_SYSCALL ... ENOSYS` so the next one is visible.
+
+Two other runs (one cube, one desktop) ended with the log stopping at the
+moment explorer mapped its first window, with no fault line, so whatever
+ended the app was not a fault signal: an abort or a kill. SIGABRT now logs
+`BOXEDWINE_HOST_ABORT` with the thread and frames before the default
+action, and the post-syscall invalidation flush skips a thread or process
+that is already terminating.
+
+The 60 fps ceiling is the display: iOS presents Metal drawables in step
+with the panel, and the counter counts presented frames. A render rate
+above the panel's refresh needs a mailbox-style present path in DXMT
+(render off-screen, present the newest at each refresh); not started.
+

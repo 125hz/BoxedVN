@@ -827,6 +827,24 @@ void fexHostSignalHandler(int signal, siginfo_t* info, void* ucontext) {
     chainFEXHostSignal(signal, info, ucontext);
 }
 
+// An abort (a failed assertion, std::terminate, a libc++ hard error) ended
+// the app with nothing in the session log: the translator's handlers cover
+// the fault signals only. The abort now names its thread and frames the
+// same way a declined fault does, then continues to the default action.
+static void hostAbortHandler(int signal, siginfo_t*, void* ucontext) {
+    ucontext_t* context = static_cast<ucontext_t*>(ucontext);
+    const uint64_t pc = context ? context->uc_mcontext->__ss.__pc : 0;
+    reportf("BOXEDWINE_HOST_ABORT signal=%d pc=0x%llx mach_thread=0x%x",
+            signal, static_cast<unsigned long long>(pc),
+            static_cast<unsigned>(pthread_mach_thread_np(pthread_self())));
+    if (context) reportDeclinedFaultContext(pc, context);
+    struct sigaction restore {};
+    restore.sa_handler = SIG_DFL;
+    sigemptyset(&restore.sa_mask);
+    sigaction(signal, &restore, nullptr);
+    raise(signal);
+}
+
 bool installFEXHostSignalHandlers() {
     std::call_once(gFEXSignalInstallOnce, [] {
         bool installed = true;
@@ -850,6 +868,11 @@ bool installFEXHostSignalHandlers() {
             }
             return;
         }
+        struct sigaction abortAction {};
+        sigemptyset(&abortAction.sa_mask);
+        abortAction.sa_sigaction = hostAbortHandler;
+        abortAction.sa_flags = SA_SIGINFO;
+        sigaction(SIGABRT, &abortAction, nullptr);
         gFEXSignalHandlersInstalled.store(true, std::memory_order_release);
     });
     return gFEXSignalHandlersInstalled.load(std::memory_order_acquire);

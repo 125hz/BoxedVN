@@ -43,6 +43,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) { return 0; }
 #include "boxedwine.h"
 #include "boxedvn/fex_exit_dispatch_contract.h"
 #include "cpu64.h"
+#include "guest_segment_table.h"
 #include "fex64loaderhandoff.h"
 #include "kmemory64.h"
 #include "kprocess.h"
@@ -533,6 +534,73 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(void) {
 // may already have moved on by the time the fault is examined.
 extern "C" uint64_t ios_fex_rip_from_hostpc(uint64_t BlockBegin, uint64_t HostPC);
 
+// Wine's 64-bit unix ntdll allocates the 32-bit FS selector of a WoW64
+// thread with set_thread_area through the legacy `int 0x80` gate
+// (dlls/ntdll/unix/signal_x86_64.c, alloc_fs_sel). The translator refuses
+// that gate in 64-bit mode and raises a general protection fault. The few
+// legacy calls WoW64 setup needs are served from that fault: the descriptor
+// lands in the thread's own segment table, which the translator already
+// reads for every segment-relative access, and execution resumes after the
+// two-byte instruction with the 32-bit ABI result in eax.
+static bool emulateLegacySyscall(BVNFEXCPU64Adapter* adapter,
+                                 FEXCore::Core::CpuStateFrame* frame) {
+    CPU64* cpu = adapter ? adapter->cpu : nullptr;
+    KMemory64* memory = cpu ? cpu->memory : nullptr;
+    if (!cpu || !memory || !frame) return false;
+    uint8_t opcode[2] = {0, 0};
+    memory->memcpyFromGuest(opcode, cpu->rip, sizeof(opcode));
+    if (opcode[0] != 0xcd || opcode[1] != 0x80) return false;
+    static std::atomic<uint32_t> reports {0};
+    const bool report = reports.fetch_add(1, std::memory_order_relaxed) < 32;
+    const uint32_t number = static_cast<uint32_t>(cpu->reg[X64_RAX].u64);
+    int64_t result = -38; // ENOSYS
+    if (number == 243) { // set_thread_area
+        const uint64_t descriptor = static_cast<uint32_t>(cpu->reg[X64_RBX].u64);
+        int32_t entry = static_cast<int32_t>(memory->readd(descriptor));
+        const uint32_t base = memory->readd(descriptor + 4);
+        const uint32_t limit = memory->readd(descriptor + 8);
+        const uint32_t flags = memory->readd(descriptor + 12);
+        // GDT_ENTRY_TLS_MIN..MAX: the three slots Linux hands to user space.
+        if (entry == -1) entry = 12;
+        if (entry < 12 || entry > 14 || entry >= K_GUEST_SEGMENT_TABLE_ENTRIES) {
+            result = -22; // EINVAL
+        } else {
+            const uint16_t selector = static_cast<uint16_t>((entry << 3) | 3);
+            FEXCore::Core::CPUState::gdt_segment* segment =
+                FEXCore::Core::CPUState::GetSegmentFromIndex(frame->State, selector);
+            *segment = {};
+            FEXCore::Core::CPUState::SetGDTBase(segment, base);
+            // The descriptor's limit field is 20 bits; the flag chooses the
+            // page granularity, as the kernel's fill_ldt does.
+            FEXCore::Core::CPUState::SetGDTLimit(segment, limit & 0xfffff);
+            segment->G = (flags >> 4) & 1;
+            segment->D = flags & 1;
+            segment->P = ((flags >> 5) & 1) ? 0 : 1;
+            segment->S = 1;
+            segment->DPL = 3;
+            segment->Type = 0x3; // data, read/write, accessed
+            memory->writed(descriptor, static_cast<uint32_t>(entry));
+            result = 0;
+        }
+        if (report) {
+            klog_fmt("BOXEDWINE_X64_LEGACY_SYSCALL pid=%d tid=%d nr=set_thread_area "
+                     "entry=%d base=0x%x limit=0x%x flags=0x%x result=%lld rip=0x%llx",
+                     adapter->process ? adapter->process->id : -1,
+                     adapter->thread ? adapter->thread->id : -1, entry, base, limit,
+                     flags, static_cast<long long>(result),
+                     static_cast<unsigned long long>(cpu->rip));
+        }
+    } else if (report) {
+        klog_fmt("BOXEDWINE_X64_LEGACY_SYSCALL pid=%d tid=%d nr=%u result=ENOSYS rip=0x%llx",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1, number,
+                 static_cast<unsigned long long>(cpu->rip));
+    }
+    cpu->reg[X64_RAX].u64 = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(result)));
+    cpu->rip += 2;
+    return true;
+}
+
 static bool containUnclassifiedFEXFault(
     BVNFEXCPU64Adapter* adapter, const FEXCore::SignalDelegatorConfig* config,
     ucontext_t* context, int signal, uint64_t faultAddress,
@@ -1018,7 +1086,16 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             }
         }
     }
-    if (!adapter->cpu->raiseSyncFault(
+    if (generatedException && guestTrapNumber == 13 &&
+        emulateLegacySyscall(adapter, frame)) {
+        // Served in place: the registers carry the result and the RIP after
+        // the gate; the guest never sees a fault.
+        if (!BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
+            return containUnclassifiedFEXFault(
+                adapter, config, context, signal, guestFaultAddress,
+                inCodeBuffer);
+        }
+    } else if (!adapter->cpu->raiseSyncFault(
             guestSignal, guestTrapNumber,
             static_cast<int>(guestSignalCode), guestFaultAddress) ||
         !BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
@@ -1148,7 +1225,8 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     // mapped range, exec's teardown) are applied to the translator here, with
     // no kernel lock held and before any translated code runs again.
     if (syscallNumber != 60 && syscallNumber != 231 && adapter->process &&
-        adapter->process->memory64) {
+        adapter->thread && !adapter->thread->terminating &&
+        !adapter->process->terminated && adapter->process->memory64) {
         adapter->process->memory64->flushTranslatedCodeInvalidations();
     }
     if (traceSyscall) {
