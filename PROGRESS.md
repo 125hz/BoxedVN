@@ -5553,3 +5553,23 @@ contents and the validator rejects an i386-windows tree inside it. The app
 bundles only the two layers, so the IPA returns to its earlier size and the
 prefix projection logs `tree=i386-windows status=missing` until phase 2
 mounts the archive.
+
+## The 64-bit prefix's C: drive is a Files-app folder; Phase 2 decision
+
+Both desktops already share the container's `Files` folder as D:, so the
+gap for the 64-bit lane was its C: drive, buried in the private writable
+root under `home/username/.wine64/drive_c`. The launch request gains
+`winePrefixDriveCHostPath`; the argument builder turns it into a plain
+`-mount <host dir> <prefix>/drive_c` (the `.wine64` prefix for a FEX
+launch, `.wine` otherwise), which Boxedwine applies before wineboot runs.
+The app mounts `Containers/<id>/Drive C (64-bit)` for both 64-bit launches
+and moves an existing prefix's drive_c entries into that folder once, so
+installed programs survive. Three launch-argument tests cover the mount.
+
+Phase 2 of the WoW64 plan is decided for shape (2), a second FEX context
+in 32-bit mode driven by a BoxedVN `wow64cpu.dll`: the pinned translator
+chooses its decode mode per context and asserts that the mode does not
+change at runtime, so honouring `CS` in one context would mean a per-block
+mode through the frontend, dispatcher and JIT. The plan now lists the
+context pair, the CPU backend exports, the trap-page transition and the
+exception return; the host gate is reworded for that shape.

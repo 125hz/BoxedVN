@@ -60,8 +60,10 @@ then make WoW64 the default for 32-bit programs. Do not port FEX into the
 ```
 
 Everything stays under BoxedWine. FEX remains the CPU only. The process is
-64-bit from the kernel's point of view; the 32-bit code segments are a
-property of the guest's CS selector, which FEX must honour.
+64-bit from the kernel's point of view. The 32-bit code segments run in a
+second FEX context configured for 32-bit mode; a BoxedVN `wow64cpu.dll`
+hands each 32-bit slice to it and takes the registers back (phase 2
+decision below).
 
 ## Phases
 
@@ -142,7 +144,40 @@ This is the risk that decides the schedule.
      honour `CS` mode changes (the shape FEX's own WoW64 product uses).
   2. Provide a BoxedVN `wow64cpu` replacement that hands 32-bit code to a
      second FEX context configured for 32-bit mode.
-  Prototype (1) first; it needs no new Wine module.
+  Decision (2026-09-02): shape (2). The pinned translator fixes the
+  operating mode per context: the decoder picks its machine mode from
+  `Config.Is64BitMode` when a block is compiled (`Core.cpp`), and the
+  dispatcher asserts `Is64BitMode == CTX->Config.Is64BitMode` with the
+  message "Expected operating mode to not change at runtime!"
+  (`OpcodeDispatcher.cpp`). Honouring `CS` inside one context means a
+  per-block mode across the frontend, dispatcher and JIT of a translator we
+  patch but do not fork. A second context in 32-bit mode is what the
+  translator already offers, and it is the shape FEX's own WoW64 backend
+  uses on Windows on ARM.
+- Shape (2) in BoxedVN terms:
+  1. Context pair. `createFEXContext(FexGuestMode::X86_32, ...)` for the
+     process, sharing `KMemory64` with its 64-bit context; the low-alias
+     window and the fex32 window binding already exist for this.
+  2. `wow64cpu.dll`. An x86-64 PE built with the probe toolchain, projected
+     over Wine's `wow64cpu.dll` in the prefix, exporting Wine's CPU backend
+     ABI (`BTCpuProcessInit`, `BTCpuThreadInit`, `BTCpuSimulate`,
+     `BTCpuGetContext`, `BTCpuSetContext`, `BTCpuResetToConsistentState`,
+     `BTCpuNotifyMemoryProtect`/`Alloc`/`Free`,
+     `BTCpuFlushInstructionCache2`, `BTCpuTurboThunkControl`).
+     `BTCpuSimulate` copies the `I386_CONTEXT` from the thread's WOW64 CPU
+     area into a private-syscall request (the DXMT dispatcher's pattern)
+     and asks the kernel to run the 32-bit context.
+  3. Transition. The 32-bit ntdll leaves compat mode through
+     `Wow64Transition`; the backend points it at a BoxedVN trap page in the
+     low alias. The 32-bit context stops there, the kernel returns the
+     32-bit registers to `BTCpuSimulate`, which calls
+     `Wow64SystemServiceEx` (64-bit) and re-enters 32-bit with the result.
+     No far transfer is ever executed by the translator.
+  4. Exceptions. A fault in 32-bit code arrives in the 32-bit context;
+     the kernel turns it into a return from `BTCpuSimulate` with an
+     `EXCEPTION_RECORD`/`I386_CONTEXT` so `wow64.dll` raises it on the
+     32-bit side (the existing `raiseSyncFault` plumbing supplies the
+     record).
 - `KMemory64` placement: 32-bit code needs its stack, heap and images below
   4 GiB. On iOS those addresses are served through the low alias
   (`include/guest_low_alias.h`, `K64_NATIVE_LOW_ALIAS_BASE`), which already
@@ -159,9 +194,10 @@ This is the risk that decides the schedule.
 
 Gate (host): a freestanding fixture through the pinned translator simulator
 (the same harness `scripts/test-fex-exit-dispatch-contract.py` and the
-`fex-translator-probe` job use) that executes a 64-to-32 far call, 32-bit
-code touching a low-alias page, and the return, with register truncation
-checked. Gate (device): a 32-bit console program prints through the 64-bit
+`fex-translator-probe` job use) in which a 32-bit context runs code that
+touches a low-alias page and reaches the transition address, the host
+reads the stopped 32-bit registers with truncation checked, and the 64-bit
+context resumes afterwards. Gate (device): a 32-bit console program prints through the 64-bit
 ntdll and exits 0.
 
 ### Phase 3: Windows and input for a 32-bit program
@@ -232,7 +268,7 @@ of each gate go in the table below.
 |---|---|---|
 | 0 | 2026-09-02 | see PROGRESS.md, "WoW64 phase 0" |
 | 1 | | |
-| 2 | | |
+| 2 | decision recorded 2026-09-02 (shape 2); gate open | see PROGRESS.md, "Phase 2 decision" |
 | 3 | | |
 | 4 | | |
 | 5 | | |

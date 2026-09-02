@@ -540,6 +540,7 @@ enum Session {
         runThroughWine: Bool,
         useFEX64: Bool = false,
         useDXMT: Bool = false,
+        winePrefixDriveC: URL? = nil,
         wineRenderer: BVNWineRenderer = BVNWineRendererAutomatic,
         gameDriveLetter: Character = "d",
         sharedDriveLetter: Character = "e",
@@ -553,7 +554,9 @@ enum Session {
         let argumentStorage = arguments.map { strdup($0) }
         let environmentStorage = environment.map { strdup($0) }
         let overlayStorage = rootFilesystemOverlays.map { strdup($0.path) }
+        let driveCStorage = winePrefixDriveC.map { strdup($0.path) }
         defer {
+            if let driveCStorage { free(driveCStorage) }
             argumentStorage.forEach { free($0) }
             environmentStorage.forEach { free($0) }
             overlayStorage.forEach { free($0) }
@@ -586,6 +589,8 @@ enum Session {
                                         request.compatibilityDirectoryHostPath =
                                             profilePath
                                         request.sharedDirectoryHostPath = sharedPath
+                                        request.winePrefixDriveCHostPath =
+                                            driveCStorage.map { UnsafePointer<CChar>($0) }
                                         request.gameDriveLetter = Int8(
                                             String(gameDriveLetter).lowercased()
                                                 .utf8.first ?? 100)

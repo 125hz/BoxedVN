@@ -587,6 +587,9 @@ final class AppModel: ObservableObject {
         let dxmt: URL
         let writableRoot: URL
         let files: URL
+        /// The 64-bit prefix's C: drive, kept beside the container's Files
+        /// folder so it shows in the Files app under the container.
+        let driveC: URL
         let diagnostics: URL
 
         /// The guest path D: resolves to for `diagnostics`. BoxedWine -w takes
@@ -630,11 +633,16 @@ final class AppModel: ObservableObject {
             writableRoot: prefixes.appendingPathComponent(
                 container.prefixName + "-x64", isDirectory: true),
             files: files,
+            driveC: files.deletingLastPathComponent()
+                .appendingPathComponent("Drive C (64-bit)", isDirectory: true),
             diagnostics: files.appendingPathComponent(
                 ".boxedvn-x64-diagnostics", isDirectory: true))
         do {
             try FileManager.default.createDirectory(
                 at: runtime.diagnostics, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: runtime.driveC, withIntermediateDirectories: true)
+            try migrateX64DriveC(from: runtime.writableRoot, to: runtime.driveC)
             for name in X64Runtime.dxmtModules {
                 let source = runtime.dxmt.appendingPathComponent(name)
                 let target = runtime.diagnostics.appendingPathComponent(name)
@@ -653,6 +661,33 @@ final class AppModel: ObservableObject {
             return nil
         }
         return runtime
+    }
+
+    /// Moves an existing prefix's drive_c out of the private writable root
+    /// into the Files-visible folder the first time that folder is mounted,
+    /// so Program Files and the user directories survive the move. Entries
+    /// already present in the visible folder are kept; the old directory is
+    /// removed only once it is empty.
+    private func migrateX64DriveC(from writableRoot: URL, to driveC: URL) throws {
+        let manager = FileManager.default
+        let legacy = writableRoot.appendingPathComponent(
+            "home/username/.wine64/drive_c", isDirectory: true)
+        guard manager.fileExists(atPath: legacy.path) else { return }
+        let present = Set(try manager.contentsOfDirectory(atPath: driveC.path))
+        var moved = 0
+        for name in try manager.contentsOfDirectory(atPath: legacy.path) {
+            guard !present.contains(name) else { continue }
+            try manager.moveItem(at: legacy.appendingPathComponent(name),
+                                 to: driveC.appendingPathComponent(name))
+            moved += 1
+        }
+        if try manager.contentsOfDirectory(atPath: legacy.path).isEmpty {
+            try manager.removeItem(at: legacy)
+        }
+        if moved > 0 {
+            Log.write("Moved \(moved) drive C entries of the 64-bit prefix into "
+                      + "the Files-visible folder", category: "container")
+        }
     }
 
     /// Runs the bundled AMD64 Direct3D 11 probe through Wine64 and the
@@ -698,6 +733,7 @@ final class AppModel: ObservableObject {
                 runThroughWine: true,
                 useFEX64: true,
                 useDXMT: true,
+                winePrefixDriveC: runtime.driveC,
                 wineRenderer: BVNWineRendererAutomatic,
                 sharedDriveLetter:
                     container.sharedDriveLetter.lowercased().first ?? "e",
@@ -741,6 +777,7 @@ final class AppModel: ObservableObject {
                 runThroughWine: true,
                 useFEX64: true,
                 useDXMT: true,
+                winePrefixDriveC: runtime.driveC,
                 wineRenderer: BVNWineRendererAutomatic,
                 sharedDriveLetter:
                     container.sharedDriveLetter.lowercased().first ?? "e",

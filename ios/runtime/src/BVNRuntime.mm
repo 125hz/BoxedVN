@@ -350,6 +350,15 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
             return false;
         }
     }
+    if (request->winePrefixDriveCHostPath != nullptr &&
+        request->winePrefixDriveCHostPath[0] != '\0') {
+        launch.winePrefixDriveCHostPath = request->winePrefixDriveCHostPath;
+        if (!directoryExists(launch.winePrefixDriveCHostPath)) {
+            error = std::string("The prefix drive C directory '") +
+                    launch.winePrefixDriveCHostPath + "' does not exist.";
+            return false;
+        }
+    }
 
     const auto normalizedDrive = [](char requested, char fallback) {
         if (requested >= 'A' && requested <= 'Z') {

@@ -28,6 +28,10 @@ struct BVNLaunchConfiguration {
     // independent prefixes for save/registry compatibility while documents
     // intentionally shared between games and the file browser live here.
     std::string sharedDirectoryHostPath;
+    // Host directory mounted over the lane's Wine prefix drive_c (the 64-bit
+    // prefix for a FEX launch, the default prefix otherwise). Empty keeps
+    // drive_c inside the writable root.
+    std::string winePrefixDriveCHostPath;
     char gameDriveLetter = 'd';
     char sharedDriveLetter = 'e';
     // Wine's documented compatibility version name (for example win10,

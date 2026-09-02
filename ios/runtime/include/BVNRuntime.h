@@ -301,6 +301,12 @@ typedef struct {
     // tool. May be NULL, although the app normally supplies Documents/Shared.
     const char* sharedDirectoryHostPath;
 
+    // Absolute host directory mounted over the Wine prefix's drive_c, so the
+    // prefix's C: is reachable from the Files app while the rest of the
+    // writable root stays private. NULL leaves drive_c inside the writable
+    // root. Applies to the prefix the launch's lane uses (.wine or .wine64).
+    const char* winePrefixDriveCHostPath;
+
     // Guest letters used for the two host mounts. Zero retains D: for the
     // game/container files and E: for shared files.
     char gameDriveLetter;

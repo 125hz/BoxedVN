@@ -413,6 +413,17 @@ std::vector<std::string> BVNBuildLaunchArguments(
         argv.push_back(launch.sharedDirectoryHostPath);
         argv.push_back(std::string(1, launch.sharedDriveLetter));
     }
+    if (!launch.winePrefixDriveCHostPath.empty()) {
+        // A plain -mount places a host directory at a guest path; Boxedwine
+        // creates the path inside the writable root first, so this works
+        // before wineboot has made the prefix. Wine then finds drive_c
+        // already present and builds the rest of the prefix around it.
+        argv.push_back("-mount");
+        argv.push_back(launch.winePrefixDriveCHostPath);
+        argv.push_back(std::string(launch.useFEX64 ? K_X64_GUEST_WINE_PREFIX
+                                                   : K_DEFAULT_GUEST_WINE_PREFIX) +
+                       "/" K_GUEST_WINE_DRIVE_C);
+    }
 
     if (launch.width > 0 && launch.height > 0) {
         argv.push_back("-resolution");

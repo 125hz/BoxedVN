@@ -612,6 +612,50 @@ BOXEDVN_TEST(a_plain_fex64_launch_projects_no_module_overlay) {
     CHECK(std::find(actual.begin(), actual.end(), "-x64modules") == actual.end());
 }
 
+BOXEDVN_TEST(a_fex64_launch_mounts_the_visible_drive_c_over_the_64bit_prefix) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.winePrefixDriveCHostPath = "/documents/Containers/vn/Drive C (64-bit)";
+    launch.executablePath = "explorer";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const auto option = std::find(actual.begin(), actual.end(), "-mount");
+    CHECK(option != actual.end());
+    if (option != actual.end() && option + 2 < actual.end()) {
+        CHECK_EQ(*(option + 1),
+                 std::string("/documents/Containers/vn/Drive C (64-bit)"));
+        CHECK_EQ(*(option + 2), std::string("/home/username/.wine64/drive_c"));
+    }
+}
+
+BOXEDVN_TEST(a_32bit_launch_mounts_the_visible_drive_c_over_the_default_prefix) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.writableRootPath = "/prefix";
+    launch.winePrefixDriveCHostPath = "/documents/Containers/vn/Drive C";
+    launch.executablePath = "explorer";
+    launch.runThroughWine = true;
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const auto option = std::find(actual.begin(), actual.end(), "-mount");
+    CHECK(option != actual.end());
+    if (option != actual.end() && option + 2 < actual.end()) {
+        CHECK_EQ(*(option + 2), std::string("/home/username/.wine/drive_c"));
+    }
+}
+
+BOXEDVN_TEST(no_drive_c_directory_means_no_prefix_mount) {
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.writableRootPath = "/prefix";
+    launch.executablePath = "explorer";
+    launch.runThroughWine = true;
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    CHECK(std::find(actual.begin(), actual.end(), "-mount") == actual.end());
+}
+
 BOXEDVN_TEST(a_32bit_launch_does_not_get_the_x64_library_path) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs.zip";
