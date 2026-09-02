@@ -267,6 +267,61 @@ struct LibraryView: View {
 
 // MARK: - Container detail
 
+/// The guest's presentation surface inside the container page. Registering
+/// the view with the runtime makes SDL's view, the DXMT layer and the touch
+/// overlay live here while a guest runs; the page stays on screen around it.
+struct GuestLiveView: UIViewRepresentable {
+    func makeUIView(context: Context) -> GuestLiveHostView {
+        let view = GuestLiveHostView()
+        view.backgroundColor = .black
+        view.clipsToBounds = true
+        BVNGuestPresentationSetHostView(Unmanaged.passUnretained(view).toOpaque())
+        return view
+    }
+
+    func updateUIView(_ uiView: GuestLiveHostView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: GuestLiveHostView, coordinator: ()) {
+        BVNGuestPresentationSetHostView(nil)
+    }
+}
+
+/// Keeps the list from scrolling when the finger is on the guest: the list's
+/// pan gesture is made to wait for this view's own recognizer, which never
+/// fails while a touch is inside, so drags reach the overlay as pointer
+/// motion instead of scrolling the page.
+final class GuestLiveHostView: UIView, UIGestureRecognizerDelegate {
+    private let blocker = UIPanGestureRecognizer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        blocker.cancelsTouchesInView = false
+        blocker.delaysTouchesBegan = false
+        blocker.delaysTouchesEnded = false
+        blocker.delegate = self
+        addGestureRecognizer(blocker)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        var ancestor = superview
+        while let view = ancestor {
+            if let scroll = view as? UIScrollView {
+                scroll.panGestureRecognizer.require(toFail: blocker)
+                break
+            }
+            ancestor = view.superview
+        }
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        true
+    }
+}
+
 struct ContainerDetailView: View {
     @EnvironmentObject private var model: AppModel
     @State private var container: WineContainer
@@ -287,6 +342,23 @@ struct ContainerDetailView: View {
 
     var body: some View {
         List {
+            Section("Live view") {
+                ZStack {
+                    GuestLiveView()
+                    if model.runtimeState != .running && model.runtimeState != .starting {
+                        Text("No guest is running. Open a desktop or a cube below and it appears here.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                    }
+                }
+                .aspectRatio(CGFloat(max(container.width, 1)) / CGFloat(max(container.height, 1)),
+                             contentMode: .fit)
+                .frame(maxWidth: .infinity)
+                .background(Color.black)
+                .listRowInsets(EdgeInsets())
+            }
             Section("Desktop") {
                 Button {
                     save()

@@ -316,7 +316,9 @@ static void BVNDXMTDisplayReportBlocked(const char* why, UIView* view,
 // confined to the same rectangle so the guest's picture sits where its
 // desktop does instead of covering the whole window. Falls back to the
 // window bounds when the mapping is unavailable.
-static CGRect BVNDXMTDesktopFrame(UIWindow* window) {
+extern UIView* BVNGuestPresentationHostView(void);
+
+static CGRect BVNDXMTDesktopFrame(UIView* window) {
     int width = 0, height = 0;
     float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     if (BVNGuestControlsScreenSize(&width, &height) && width > 0 && height > 0 &&
@@ -344,6 +346,9 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
         window = view.window;
     }
     UIView* root = window.rootViewController.view;
+    // With a live view host registered, the host plays the window's part:
+    // SDL's root view is its bottom subview and the layer goes above it.
+    UIView* container = BVNGuestPresentationHostView() ?: (UIView*)window;
     if (!gDisplayPollReported) {
         gDisplayPollReported = true;
         char message[320];
@@ -371,22 +376,22 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     // lives directly in the window, above whatever view SDL owns as the root
     // view controller's view, and below the overlay, which
     // BVNGuestOverlayInstall re-fronts.
-    const CGRect desktop = BVNDXMTDesktopFrame(window);
+    const CGRect desktop = BVNDXMTDesktopFrame(container);
     BOOL changed = NO;
     if (view.hidden) {
         view.hidden = NO;
         changed = YES;
     }
-    if (view.superview != window) {
+    if (view.superview != container) {
         [view removeFromSuperview];
         view.autoresizingMask = UIViewAutoresizingNone;
         view.frame = desktop;
-        [window addSubview:view];
+        [container addSubview:view];
         changed = YES;
     }
-    NSArray<UIView*>* subviews = window.subviews;
+    NSArray<UIView*>* subviews = container.subviews;
     const NSUInteger viewIndex = [subviews indexOfObjectIdenticalTo:view];
-    const NSUInteger rootIndex = (root != nil && root.superview == window)
+    const NSUInteger rootIndex = (root != nil && root.superview == container)
         ? [subviews indexOfObjectIdenticalTo:root]
         : NSNotFound;
     if (viewIndex == NSNotFound) {
@@ -396,13 +401,13 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     }
     if (rootIndex != NSNotFound) {
         if (viewIndex < rootIndex) {
-            [window insertSubview:view aboveSubview:root];
+            [container insertSubview:view aboveSubview:root];
             changed = YES;
         }
     } else if (viewIndex != subviews.count - 1) {
         // No root view to order against: sit on top of SDL's views and let
         // the overlay re-front itself below.
-        [window bringSubviewToFront:view];
+        [container bringSubviewToFront:view];
         changed = YES;
     }
     if (!CGRectEqualToRect(view.frame, desktop)) {

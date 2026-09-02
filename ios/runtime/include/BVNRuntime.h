@@ -431,6 +431,13 @@ void BVNRuntimeNotifyFrontendReady(void);
 // as a translated-code count: one allocation can contain many translations.
 void BVNGuestLoadingUpdateJITProgress(size_t allocationCount);
 
+// Live view. The container page registers a UIView (passed as an unretained
+// pointer) that hosts the guest's presentation: SDL's view, the DXMT layer
+// and the touch overlay move into it and SDL's own window hides, so the
+// library stays on screen around the running guest. NULL restores the
+// full-screen presentation. Main thread only.
+void BVNGuestPresentationSetHostView(void* uiView);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -5727,3 +5727,21 @@ with the panel, and the counter counts presented frames. A render rate
 above the panel's refresh needs a mailbox-style present path in DXMT
 (render off-screen, present the newest at each refresh); not started.
 
+## Live view: the guest inside the container page
+
+The container page now opens with a "Live view" section holding the
+guest's presentation at the container's aspect ratio, above the desktop
+buttons. The SwiftUI view registers itself with the runtime
+(`BVNGuestPresentationSetHostView`); while a host is registered, SDL's
+root view becomes the host's bottom subview, the DXMT layer and the touch
+overlay attach above it inside the host, SDL's own window hides and the
+library window stays key, so the page keeps scrolling around the running
+guest. SDL keeps its window and view controller; only the view hierarchy
+moves, which is what its touch delivery and size reporting key on. The
+overlay maps touches through the presentation view's bounds, so pointer
+mapping follows the host size. A pan recognizer on the host makes the
+list's scroll gesture wait for it, so drags inside the guest are pointer
+motion rather than page scrolling. The orientation lock, the preferred
+geometry wait and the keyboard's window fronting are skipped while a host
+is registered. Leaving the page returns the presentation to SDL's window.
+

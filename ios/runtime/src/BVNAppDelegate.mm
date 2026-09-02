@@ -73,6 +73,8 @@ extern "C" bool BVNLogStartSessionFile(void);
 @property (nonatomic, assign) BOOL guestOrientationLocked;
 - (void)createLibraryWindowForScene:(UIWindowScene*)scene;
 - (UIWindow*)superWindowForGuest;
+- (void)attachGuestPresentationToHost:(UIView*)host;
+- (void)detachGuestPresentationFromHost;
 @end
 
 @interface BVNSceneDelegate : NSObject <UIWindowSceneDelegate>
@@ -130,6 +132,10 @@ static BOOL BVNOrientationMatchesPreference(UIInterfaceOrientation orientation) 
     }
 }
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanSurfaceViews = nil;
+// The live view host (see BVNGuestPresentationSetHostView below). Declared
+// here because the class methods above the setter consult it.
+static __weak UIView* gGuestPresentationHost = nil;
+extern "C" void BVNGuestOverlayInstall(void);
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanWaitingOverlays = nil;
 
 // Defined at the bottom of this file, alongside the presentation geometry it
@@ -193,6 +199,68 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     return [super window];
 }
 
+- (void)attachGuestPresentationToHost:(UIView*)host {
+    NSAssert(NSThread.isMainThread, @"Guest presentation moves on main");
+    UIWindow* guestWindow = [super window];
+    UIView* root = guestWindow.rootViewController.view;
+    if (host == nil || guestWindow == nil || root == nil) {
+        return;
+    }
+    if (root.superview != host) {
+        [root removeFromSuperview];
+        root.frame = host.bounds;
+        root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                UIViewAutoresizingFlexibleHeight;
+        [host insertSubview:root atIndex:0];
+    }
+    guestWindow.hidden = YES;
+    self.libraryWindow.hidden = NO;
+    [self.libraryWindow makeKeyAndVisible];
+    BVNGuestOverlayInstall();
+    BVNDXMTDisplayAttach();
+    NSString* message = [NSString stringWithFormat:
+        @"Guest presentation attached to the live view host (%.0fx%.0f pt).",
+        host.bounds.size.width, host.bounds.size.height];
+    BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
+}
+
+- (void)detachGuestPresentationFromHost {
+    NSAssert(NSThread.isMainThread, @"Guest presentation moves on main");
+    UIWindow* guestWindow = [super window];
+    UIView* root = guestWindow.rootViewController.view;
+    if (guestWindow == nil || root == nil) {
+        return;
+    }
+    if (root.superview != guestWindow) {
+        [root removeFromSuperview];
+        root.frame = guestWindow.bounds;
+        root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                UIViewAutoresizingFlexibleHeight;
+        [guestWindow insertSubview:root atIndex:0];
+    }
+    guestWindow.hidden = NO;
+    [guestWindow makeKeyAndVisible];
+    BVNGuestOverlayInstall();
+    BVNDXMTDisplayAttach();
+    BVNLogWrite(BVNLogLevelInfo, "frontend",
+                "Guest presentation returned to SDL's window.");
+}
+
+- (void)guestWindowDidBecomeVisible:(NSNotification*)notification {
+    // SDL shows its window from inside boxedmain. When a live view host is
+    // registered the presentation belongs there, so the window is taken over
+    // as soon as it appears rather than covering the library.
+    if (gGuestPresentationHost == nil || notification.object != [super window]) {
+        return;
+    }
+    UIView* host = gGuestPresentationHost;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gGuestPresentationHost == host && host != nil) {
+            [self attachGuestPresentationToHost:host];
+        }
+    });
+}
+
 - (BOOL)application:(UIApplication*)application
     didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
     // First, unconditionally: everything below can fail in ways that leave
@@ -214,6 +282,11 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
         addObserver:self
            selector:@selector(guestKeyboardDidHide:)
                name:UIKeyboardDidHideNotification
+             object:nil];
+    [NSNotificationCenter.defaultCenter
+        addObserver:self
+           selector:@selector(guestWindowDidBecomeVisible:)
+               name:UIWindowDidBecomeVisibleNotification
              object:nil];
 
     // Let SDL install its lifecycle observers and schedule -postFinishLaunch,
@@ -392,6 +465,12 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 - (void)prepareGuestPresentationWithCompletion:(dispatch_block_t)completion {
     NSAssert(NSThread.isMainThread, @"Guest presentation must be prepared on main");
 
+    if (gGuestPresentationHost != nil) {
+        // Embedded in the library page: no orientation lock and no wait for
+        // the preferred geometry; the host's bounds are the geometry.
+        completion();
+        return;
+    }
     UIWindowScene* scene = self.libraryWindow.windowScene;
     self.guestOrientationLocked = YES;
     [self.libraryWindow.rootViewController
@@ -473,7 +552,9 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
             [textField removeFromSuperview];
             [guestController.view addSubview:textField];
         }
-        [guestWindow makeKeyAndVisible];
+        if (gGuestPresentationHost == nil) {
+            [guestWindow makeKeyAndVisible];
+        }
         [guestController.view layoutIfNeeded];
     }
 
@@ -702,6 +783,33 @@ extern "C" void BVNFinishGuestPresentation(void) {
 
 extern "C" UIWindow* BVNGuestUIWindow(void) {
     return [gAppDelegate superWindowForGuest];
+}
+
+// The live view host. While one is registered the guest's presentation
+// lives inside it: SDL's root view becomes its bottom subview, the DXMT
+// layer and the overlay attach above, and SDL's window hides so the library
+// window keeps the screen. SDL still owns its window and view controller;
+// only the view hierarchy moves, which is what its touch handling and layout
+// size reporting key on.
+
+extern "C" UIView* BVNGuestPresentationHostView(void) {
+    return NSThread.isMainThread ? gGuestPresentationHost : nil;
+}
+
+extern "C" void BVNGuestPresentationSetHostView(void* pointer) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BVNGuestPresentationSetHostView(pointer);
+        });
+        return;
+    }
+    UIView* host = (__bridge UIView*)pointer;
+    gGuestPresentationHost = host;
+    if (host != nil) {
+        [gAppDelegate attachGuestPresentationToHost:host];
+    } else {
+        [gAppDelegate detachGuestPresentationFromHost];
+    }
 }
 
 extern "C" const char* BVNGuestPreferredOrientationHint(void) {
@@ -1799,6 +1907,10 @@ extern "C" void BVNFrontendShowLibrary(void) {
 extern "C" void BVNFrontendHideLibrary(void) {
     BVNAppDelegate* delegate = gAppDelegate;
     if (delegate.libraryWindow == nil) {
+        return;
+    }
+    if (gGuestPresentationHost != nil) {
+        // The live view keeps the library on screen around the guest.
         return;
     }
     // Resigning key rather than hiding keeps the SwiftUI hierarchy alive, so

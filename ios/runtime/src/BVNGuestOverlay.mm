@@ -2738,6 +2738,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 // C entry points
 // ---------------------------------------------------------------------------
 
+extern "C" UIView* BVNGuestPresentationHostView(void);
+
 extern "C" void BVNGuestOverlayInstall(void) {
     if (!NSThread.isMainThread) {
         BVNLogWrite(BVNLogLevelWarning, "frontend",
@@ -2745,6 +2747,10 @@ extern "C" void BVNGuestOverlayInstall(void) {
         return;
     }
     UIWindow* window = BVNGuestUIWindow();
+    // The live view host, when the container page has registered one,
+    // replaces the window as the overlay's container: same z-order role,
+    // same pinned edges, only the parent differs.
+    UIView* container = BVNGuestPresentationHostView() ?: (UIView*)window;
     if (window == nil) {
         BVNLogWrite(BVNLogLevelWarning, "frontend",
                     "Guest overlay not installed: SDL has no guest window "
@@ -2752,10 +2758,10 @@ extern "C" void BVNGuestOverlayInstall(void) {
         return;
     }
     if (gOverlay == nil) {
-        gOverlay = [[BVNGuestOverlayView alloc] initWithFrame:window.bounds];
+        gOverlay = [[BVNGuestOverlayView alloc] initWithFrame:container.bounds];
     }
-    if (gOverlay.superview == window) {
-        [window bringSubviewToFront:gOverlay];
+    if (gOverlay.superview == container) {
+        [container bringSubviewToFront:gOverlay];
         return;
     }
     if (gOverlay.superview != nil) {
@@ -2776,14 +2782,14 @@ extern "C" void BVNGuestOverlayInstall(void) {
     // and hit-tested in another, which is indistinguishable from "the menu
     // does not respond".
     [gOverlay removeFromSuperview];
-    gOverlay.frame = window.bounds;
+    gOverlay.frame = container.bounds;
     gOverlay.translatesAutoresizingMaskIntoConstraints = NO;
-    [window addSubview:gOverlay];
+    [container addSubview:gOverlay];
     [NSLayoutConstraint activateConstraints:@[
-        [gOverlay.leadingAnchor constraintEqualToAnchor:window.leadingAnchor],
-        [gOverlay.trailingAnchor constraintEqualToAnchor:window.trailingAnchor],
-        [gOverlay.topAnchor constraintEqualToAnchor:window.topAnchor],
-        [gOverlay.bottomAnchor constraintEqualToAnchor:window.bottomAnchor],
+        [gOverlay.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [gOverlay.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [gOverlay.topAnchor constraintEqualToAnchor:container.topAnchor],
+        [gOverlay.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
     ]];
     [gOverlay setNeedsLayout];
 
