@@ -17,8 +17,8 @@ struct WineContainer: Codable, Identifiable, Hashable {
     var createdAt: Date
 
     init(id: String, name: String, windowsVersion: String = "win10",
-         renderer: String = "automatic", width: UInt32 = 800,
-         height: UInt32 = 600, sharedDriveLetter: String = "e",
+         renderer: String = "automatic", width: UInt32 = 1280,
+         height: UInt32 = 720, sharedDriveLetter: String = "e",
          showWindowsPrograms: Bool = false,
          createdAt: Date = Date()) {
         self.id = id
@@ -42,8 +42,8 @@ struct WineContainer: Codable, Identifiable, Hashable {
             String.self, forKey: .windowsVersion) ?? "win10"
         renderer = try values.decodeIfPresent(
             String.self, forKey: .renderer) ?? "automatic"
-        width = try values.decodeIfPresent(UInt32.self, forKey: .width) ?? 800
-        height = try values.decodeIfPresent(UInt32.self, forKey: .height) ?? 600
+        width = try values.decodeIfPresent(UInt32.self, forKey: .width) ?? 1280
+        height = try values.decodeIfPresent(UInt32.self, forKey: .height) ?? 720
         sharedDriveLetter = try values.decodeIfPresent(
             String.self, forKey: .sharedDriveLetter) ?? "e"
         showWindowsPrograms = try values.decodeIfPresent(

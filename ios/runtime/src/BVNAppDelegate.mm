@@ -154,6 +154,7 @@ static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanSurfaceViews = nil;
 // The live view host (see BVNGuestPresentationSetHostView below). Declared
 // here because the class methods above the setter consult it.
 static __weak UIView* gGuestPresentationHost = nil;
+extern std::atomic<bool> gLiveKeyboardVisible;
 extern "C" void BVNGuestOverlayInstall(void);
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanWaitingOverlays = nil;
 
@@ -968,6 +969,20 @@ extern "C" void BVNApplyPreferredOrientation(void) {
             : BVNPreferredOrientationValue() == 2 ? @"landscape flipped"
                                                    : @"landscape"];
     BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
+}
+
+extern "C" void BVNGuestControlsToggleKeyboard(void) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BVNGuestControlsToggleKeyboard();
+        });
+        return;
+    }
+    const bool wasVisible = gLiveKeyboardVisible.load(std::memory_order_relaxed);
+    const bool nowVisible = !wasVisible;
+    if ([gAppDelegate setGuestKeyboardVisible:nowVisible ? YES : NO] == YES) {
+        gLiveKeyboardVisible.store(nowVisible, std::memory_order_relaxed);
+    }
 }
 
 extern "C" bool BVNGuestKeyboardSetVisible(bool visible) {

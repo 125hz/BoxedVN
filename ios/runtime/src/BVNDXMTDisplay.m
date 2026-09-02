@@ -376,7 +376,12 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     // lives directly in the window, above whatever view SDL owns as the root
     // view controller's view, and below the overlay, which
     // BVNGuestOverlayInstall re-fronts.
-    const CGRect desktop = BVNDXMTDesktopFrame(container);
+    // In the live view the host already carries the container's aspect ratio,
+    // so the layer fills it; the window-space desktop rect placed the layer
+    // off the bottom of the smaller host and the picture was never on screen.
+    const CGRect desktop = BVNGuestPresentationHostView() != nil
+                               ? container.bounds
+                               : BVNDXMTDesktopFrame(container);
     BOOL changed = NO;
     if (view.hidden) {
         view.hidden = NO;

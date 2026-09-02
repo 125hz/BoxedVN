@@ -267,6 +267,92 @@ struct LibraryView: View {
 
 // MARK: - Container detail
 
+/// A plain-text performance line above the live view: frames per second,
+/// frame time and resident memory, refreshed on a timer while a guest runs.
+struct GuestPerformanceReadout: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var fps = 0.0
+    @State private var frameMs = 0.0
+    private let tick = Timer.publish(every: 0.5, on: .main, in: .common)
+        .autoconnect()
+
+    private var memoryText: String {
+        let used = model.memory.processResidentBytes
+        let total = min(model.memory.physicalMemoryBytes,
+                        model.memory.processResidentBytes + model.memory.availableBytes)
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .memory
+        formatter.allowedUnits = [.useMB, .useGB]
+        return "\(formatter.string(fromByteCount: Int64(used))) / "
+            + "\(formatter.string(fromByteCount: Int64(total)))"
+    }
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Text("FPS \(fps, specifier: "%.0f")")
+            Text("Frame \(frameMs, specifier: "%.1f") ms")
+            Spacer()
+            Text("RAM \(memoryText)")
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .onReceive(tick) { _ in
+            var f = 0.0
+            var ms = 0.0
+            BVNGuestPerformanceSnapshot(&f, &ms)
+            fps = f
+            frameMs = ms
+        }
+    }
+}
+
+/// The control bar below the live view. Plain glyph buttons that drive the
+/// running guest through the runtime's control API.
+struct GuestControlBar: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var pointerMode = Int(BVNGuestControlsPointerMode())
+
+    private var running: Bool {
+        model.runtimeState == .running || model.runtimeState == .starting
+    }
+
+    var body: some View {
+        HStack(spacing: 22) {
+            control("keyboard", "Keyboard") { BVNGuestControlsToggleKeyboard() }
+            control(pointerMode == 0 ? "hand.point.up.left" : "cursorarrow",
+                    "Pointer") {
+                pointerMode = pointerMode == 0 ? 1 : 0
+                BVNGuestControlsSetPointerMode(Int32(pointerMode))
+            }
+            control("return", "Enter") { BVNGuestControlsTapKeyNamed("Return") }
+            control("space", "Space") { BVNGuestControlsTapKeyNamed("Space") }
+            control("escape", "Esc") { BVNGuestControlsTapKeyNamed("Escape") }
+            control("arrow.right.to.line", "Tab") { BVNGuestControlsTapKeyNamed("Tab") }
+            control("stop.circle", "Stop", tint: .red) {
+                _ = BVNRuntimeRequestShutdown()
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .disabled(!running)
+        .opacity(running ? 1 : 0.4)
+    }
+
+    private func control(_ glyph: String, _ label: String,
+                         tint: Color = .accentColor,
+                         action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: glyph)
+                .font(.title3)
+                .frame(width: 34, height: 30)
+        }
+        .buttonStyle(.plain)
+        .tint(tint)
+        .foregroundStyle(tint)
+        .accessibilityLabel(label)
+    }
+}
+
 /// The guest's presentation surface inside the container page. Registering
 /// the view with the runtime makes SDL's view, the DXMT layer and the touch
 /// overlay live here while a guest runs; the page stays on screen around it.
@@ -331,6 +417,9 @@ struct ContainerDetailView: View {
     @State private var shortcutTitle = ""
     @State private var showingShortcutPrompt = false
     @State private var showingMonoImporter = false
+    // True from the moment a guest is launched from this page until it stops,
+    // so the "no guest" placeholder does not linger over a starting session.
+    @State private var launched = false
 
     private let resolutions = ["640x480", "800x600", "1024x768",
                                "1280x720", "1280x960", "1366x1024",
@@ -343,10 +432,13 @@ struct ContainerDetailView: View {
     var body: some View {
         List {
             Section("Live view") {
+                GuestPerformanceReadout()
                 ZStack {
                     GuestLiveView()
-                    if model.runtimeState != .running && model.runtimeState != .starting {
-                        Text("No guest is running. Open a desktop or a cube below and it appears here.")
+                    if !launched && model.runtimeState != .running
+                        && model.runtimeState != .starting {
+                        Text("No guest is running. Open a desktop or a cube "
+                             + "below and it appears here.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -358,45 +450,44 @@ struct ContainerDetailView: View {
                 .frame(maxWidth: .infinity)
                 .background(Color.black)
                 .listRowInsets(EdgeInsets())
+                GuestControlBar()
+            }
+            .onChange(of: model.runtimeState) { state in
+                if state == .stopped || state == .idle || state == .failed {
+                    launched = false
+                }
             }
             Section("Desktop") {
                 Button {
-                    save()
+                    save(); launched = true
                     model.launchDesktop(container)
                 } label: {
                     Label("Open 32-bit desktop", systemImage: "macwindow")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Button {
-                    save()
+                    save(); launched = true
                     model.launchX64Desktop(container)
                 } label: {
                     Label("Open 64-bit desktop", systemImage: "macwindow.on.rectangle")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Button {
-                    save()
-                    showingMonoImporter = true
-                } label: {
-                    Label("Install Wine Mono…", systemImage: "shippingbox")
-                }
-                .disabled(model.rootFilesystem == nil || sessionIsBusy)
-                Button {
-                    save()
+                    save(); launched = true
                     model.launchDirect3DTest(container)
                 } label: {
                     Label("Run Direct3D test", systemImage: "cube.transparent")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Button {
-                    save()
+                    save(); launched = true
                     model.launchGraphicsProbe(container)
                 } label: {
                     Label("Run 32-bit cube on 64-bit Wine", systemImage: "cube.fill")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Button {
-                    save()
+                    save(); launched = true
                     model.launchX64GraphicsProbe(container)
                 } label: {
                     Label("Run 64-bit DXMT cube", systemImage: "cube.fill")
@@ -409,12 +500,19 @@ struct ContainerDetailView: View {
                             .tag(resolutionBinding.wrappedValue)
                     }
                 }
+                .disabled(sessionIsBusy)
                 HStack {
                     TextField("Width", value: $container.width, format: .number)
                         .keyboardType(.numberPad)
                     Text("×").foregroundStyle(.secondary)
                     TextField("Height", value: $container.height, format: .number)
                         .keyboardType(.numberPad)
+                }
+                .disabled(sessionIsBusy)
+                if sessionIsBusy {
+                    Text("The resolution is fixed while a guest is running.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 Picker("Windows version", selection: $container.windowsVersion) {
                     Text("Windows 10").tag("win10")
@@ -490,7 +588,7 @@ struct ContainerDetailView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
-        .sheet(isPresented: $showingMonoImporter) {
+        .sheet(isPresented: .constant(false)) {
             DocumentImportPicker(
                 contentTypes: wineMonoContentTypes,
                 onResult: { result in

@@ -223,6 +223,9 @@ static NSString* const kBVNPerformanceBatteryKey =
 
 @interface BVNGuestOverlayView : UIView
 
+// Called from the live-view control bar's pointer toggle (extern C below).
+- (void)setPointerMode:(NSInteger)mode;
+
 @property (nonatomic, strong) UIButton* menuButton;
 @property (nonatomic, strong) UIView* scrim;
 @property (nonatomic, strong) UIView* menuPanel;
@@ -340,6 +343,10 @@ static NSString* const kBVNPerformanceBatteryKey =
 @end
 
 static BVNGuestOverlayView* gOverlay = nil;
+static std::atomic<double> gLivePerformanceFps {0.0};
+static std::atomic<double> gLivePerformanceFrameMs {0.0};
+std::atomic<bool> gLiveKeyboardVisible {false};
+extern "C" UIView* BVNGuestPresentationHostView(void);
 static std::atomic<uint64_t> gPerformancePresentedFrames{0};
 static std::atomic<uint64_t> gPerformanceLastUpdateNanoseconds{0};
 
@@ -812,6 +819,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     const double fps = (double)(frames - self.performanceLastFrameCount) / elapsed;
     self.performanceLastFrameCount = frames;
     self.performanceLastSampleTime = now;
+    // Published for the SwiftUI live-view readout, which shows these instead
+    // of the in-guest panel while a host is registered.
+    gLivePerformanceFps.store(fps, std::memory_order_relaxed);
+    gLivePerformanceFrameMs.store(fps > 0.01 ? 1000.0 / fps : 0.0,
+                                  std::memory_order_relaxed);
 
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
     NSMutableArray<NSString*>* lines = [NSMutableArray array];
@@ -2137,6 +2149,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         return;
     }
     self.layingOut = YES;
+    // The live view hosts its own controls and readout in the page, so the
+    // in-guest menu button and performance panel are hidden there. They come
+    // back for the full-screen presentation.
+    const BOOL hosted = BVNGuestPresentationHostView() != nil;
+    self.menuButton.hidden = hosted;
+    self.performanceView.hidden = hosted;
 
     const UIEdgeInsets safe = self.safeAreaInsets;
     const CGRect bounds = self.bounds;
@@ -2872,6 +2890,52 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
     UIView* parent = gOverlay.superview;
     if (parent != nil && parent.subviews.lastObject != gOverlay) {
         [parent bringSubviewToFront:gOverlay];
+    }
+}
+
+extern "C" void BVNGuestPerformanceSnapshot(double* framesPerSecond,
+                                           double* frameMilliseconds) {
+    if (framesPerSecond) {
+        *framesPerSecond = gLivePerformanceFps.load(std::memory_order_relaxed);
+    }
+    if (frameMilliseconds) {
+        *frameMilliseconds =
+            gLivePerformanceFrameMs.load(std::memory_order_relaxed);
+    }
+}
+
+extern "C" void BVNGuestControlsTapKeyNamed(const char* name) {
+    if (name == NULL) {
+        return;
+    }
+    const uint32_t scancode = BVNGuestControlsScancodeForName(name);
+    if (scancode == 0) {
+        return;
+    }
+    BVNGuestControlsSendKey(scancode, true);
+    BVNGuestControlsSendKey(scancode, false);
+}
+
+extern "C" int BVNGuestControlsPointerMode(void) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    const NSInteger mode =
+        [defaults objectForKey:@"BoxedVN.pointer.mode"]
+            ? [defaults integerForKey:@"BoxedVN.pointer.mode"] : 0;
+    return mode != 0 ? 1 : 0;
+}
+
+extern "C" void BVNGuestControlsSetPointerMode(int mode) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BVNGuestControlsSetPointerMode(mode);
+        });
+        return;
+    }
+    const NSInteger clamped = mode != 0 ? 1 : 0;
+    [[NSUserDefaults standardUserDefaults] setInteger:clamped
+                                               forKey:@"BoxedVN.pointer.mode"];
+    if (gOverlay != nil) {
+        [gOverlay setPointerMode:clamped];
     }
 }
 

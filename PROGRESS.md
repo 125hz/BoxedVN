@@ -5764,3 +5764,25 @@ behind the return slot, reads the slot it used back, logs it as
 pending IR capture target, so running the cube again in the same app
 session compiles that instruction with the capture armed.
 
+## Live view take 2: the cube fills the host, controls move to the page
+
+The cube rendered into the host but off screen: UIKit does not let SDL's
+root view leave its window (the presentation tree showed rootInHost=0,
+SDL's view stayed under its window's drop-shadow view), and the DXMT metal
+view, which does move into the host, was placed at the window-space
+letterbox rect (402x301@0,286) inside a 370x278 host, so the picture sat
+below the visible area. The DXMT layer now fills the host bounds when a
+host is registered, since the host already carries the container's aspect
+ratio.
+
+The in-guest menu button and performance panel are hidden while the live
+view hosts the guest. The page shows a plain-text FPS/frame-time/RAM line
+above the live view (BVNGuestPerformanceSnapshot) and a glyph control bar
+below it: keyboard, pointer mode, Enter, Space, Esc, Tab, and a red stop
+that requests shutdown. The "no guest" placeholder clears the moment a
+launch button is tapped and returns when the session stops. The Install
+Wine Mono button is gone, new containers default to 1280x720, and the
+resolution controls lock while a guest runs. The software desktop path
+still renders through SDL's own view, which cannot move into the host, so
+the 64-bit desktop's live view stays a separate task from the metal cube.
+

@@ -438,6 +438,19 @@ void BVNGuestLoadingUpdateJITProgress(size_t allocationCount);
 // full-screen presentation. Main thread only.
 void BVNGuestPresentationSetHostView(void* uiView);
 
+// Live-view readout: the presented frame rate and its frame time, sampled by
+// the same counter that fed the in-guest overlay. Either pointer may be NULL.
+void BVNGuestPerformanceSnapshot(double* framesPerSecond,
+                                 double* frameMilliseconds);
+
+// Live-view control bar. Toggle the on-screen keyboard, read and set the
+// pointer mode (0 = direct tap, 1 = Wine cursor), and tap a key by its SDL
+// scancode name ("Return", "Space", "Escape", "Tab", ...). Main thread only.
+void BVNGuestControlsToggleKeyboard(void);
+int BVNGuestControlsPointerMode(void);
+void BVNGuestControlsSetPointerMode(int mode);
+void BVNGuestControlsTapKeyNamed(const char* sdlScancodeName);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
