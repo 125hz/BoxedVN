@@ -522,13 +522,16 @@ final class AppModel: ObservableObject {
 
     /// Runs the app-bundled IA-32 D3D9 cube through the same persistent Wine
     /// prefix and Vulkan-backed WineD3D path used by classic 3D software.
+    /// Runs the bundled IA-32 Direct3D 9 probe through Wine64's WoW64 layer
+    /// on the translator lane: the same glibc, Wine64 and DXMT layers as the
+    /// 64-bit cube plus the 32-bit PE layer the user places in the container
+    /// folder. This is the phase 2 device probe: until the CPU backend hands
+    /// 32-bit code to a 32-bit translator context, the run is expected to
+    /// stop at the first mode switch, and the log of that stop is the input
+    /// for the next step.
     func launchGraphicsProbe(_ container: WineContainer) {
         guard let rootFilesystem else {
             alertMessage = "No root filesystem is installed."
-            return
-        }
-        guard let writableRoot = ContainerLibrary.prefixRoot(for: container) else {
-            alertMessage = "Could not create the container prefix."
             return
         }
         guard let source = Bundle.main.url(
@@ -536,39 +539,46 @@ final class AppModel: ObservableObject {
             alertMessage = "This build does not include the 32-bit graphics probe."
             return
         }
-
-        let files = ContainerLibrary.filesDirectory(for: container)
-        let diagnostics = files.appendingPathComponent(
-            ".boxedvn-diagnostics", isDirectory: true)
-        let target = diagnostics.appendingPathComponent(source.lastPathComponent)
+        guard let runtime = prepareX64Runtime(for: container) else { return }
+        guard runtime.pe32 != nil else {
+            alertMessage = "The 32-bit cube now runs through the 64-bit Wine, "
+                + "which needs the 32-bit PE layer. Download "
+                + "\(X64Runtime.pe32ArchiveName) from the build's release page and put "
+                + "it in this container's folder (next to Files) or in "
+                + "On My iPhone > BoxedVN, then try again."
+            return
+        }
+        let target = runtime.diagnostics.appendingPathComponent(source.lastPathComponent)
         do {
-            try FileManager.default.createDirectory(
-                at: diagnostics, withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: target.path) {
                 try FileManager.default.removeItem(at: target)
             }
             try FileManager.default.copyItem(at: source, to: target)
-            Log.write("Launching bundled IA-32 Direct3D 9 graphics probe",
-                      category: "container")
+            Log.write("Launching bundled IA-32 Direct3D 9 graphics probe through "
+                      + "Wine64 WoW64, BoxedWine FEX and DXMT", category: "container")
             try Session.launch(
                 rootFilesystem: rootFilesystem,
-                writableRoot: writableRoot,
-                gameDirectory: files,
+                rootFilesystemOverlays: runtime.overlays,
+                writableRoot: runtime.writableRoot,
+                gameDirectory: runtime.files,
                 sharedDirectory: Storage.sharedFiles,
                 executablePath:
-                    "d:\\.boxedvn-diagnostics\\boxedvn-d3d9-cube.exe",
+                    "d:\\.boxedvn-x64-diagnostics\\boxedvn-d3d9-cube.exe",
                 arguments: [],
-                environment: ["WINEDEBUG=warn+d3d_shader,-d3d"],
-                workingDirectory: "d:\\.boxedvn-diagnostics\\",
+                environment: X64Runtime.environment,
+                workingDirectory: runtime.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,
                 soundEnabled: false,
                 runThroughWine: true,
-                wineRenderer: BVNWineRendererWineD3D,
+                useFEX64: true,
+                useDXMT: true,
+                winePrefixDriveC: runtime.driveC,
+                wineRenderer: BVNWineRendererAutomatic,
                 sharedDriveLetter:
                     container.sharedDriveLetter.lowercased().first ?? "e",
                 windowsVersion: container.windowsVersion,
-                compatibilityDirectory: diagnostics)
+                compatibilityDirectory: runtime.diagnostics)
         } catch {
             alertMessage = "The 32-bit graphics probe could not start: "
                          + error.localizedDescription
@@ -591,6 +601,13 @@ final class AppModel: ObservableObject {
         /// folder so it shows in the Files app under the container.
         let driveC: URL
         let diagnostics: URL
+        /// The 32-bit PE layer (`wine64-pe32.zip`) when the user has placed
+        /// it in the container folder or in Documents. It is not bundled: the
+        /// IPA stays small for everyone who runs only 64-bit programs, and it
+        /// mounts as a third read-only layer when present.
+        let pe32: URL?
+        var overlays: [URL] { [glibc, wine64] + (pe32.map { [$0] } ?? []) }
+        static let pe32ArchiveName = "wine64-pe32.zip"
 
         /// The guest path D: resolves to for `diagnostics`. BoxedWine -w takes
         /// a guest Linux directory, not a Windows path: the Windows form left
@@ -626,6 +643,16 @@ final class AppModel: ObservableObject {
             return nil
         }
         let files = ContainerLibrary.filesDirectory(for: container)
+        let containerFolder = files.deletingLastPathComponent()
+        let pe32Candidates = [
+            containerFolder.appendingPathComponent(X64Runtime.pe32ArchiveName),
+            Storage.documents?.appendingPathComponent(X64Runtime.pe32ArchiveName),
+        ].compactMap { $0 }
+        let pe32 = pe32Candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+        Log.write(pe32.map { "32-bit PE layer found at \($0.path)" }
+                      ?? "No 32-bit PE layer: looked for \(X64Runtime.pe32ArchiveName) in "
+                         + pe32Candidates.map(\.path).joined(separator: ", "),
+                  category: "container")
         let runtime = X64Runtime(
             glibc: URL(fileURLWithPath: String(cString: glibcPointer)),
             wine64: URL(fileURLWithPath: String(cString: winePointer)),
@@ -633,10 +660,11 @@ final class AppModel: ObservableObject {
             writableRoot: prefixes.appendingPathComponent(
                 container.prefixName + "-x64", isDirectory: true),
             files: files,
-            driveC: files.deletingLastPathComponent()
+            driveC: containerFolder
                 .appendingPathComponent("Drive C (64-bit)", isDirectory: true),
             diagnostics: files.appendingPathComponent(
-                ".boxedvn-x64-diagnostics", isDirectory: true))
+                ".boxedvn-x64-diagnostics", isDirectory: true),
+            pe32: pe32)
         do {
             try FileManager.default.createDirectory(
                 at: runtime.diagnostics, withIntermediateDirectories: true)
@@ -716,7 +744,7 @@ final class AppModel: ObservableObject {
                       + "through BoxedWine FEX and DXMT", category: "container")
             try Session.launch(
                 rootFilesystem: rootFilesystem,
-                rootFilesystemOverlays: [runtime.glibc, runtime.wine64],
+                rootFilesystemOverlays: runtime.overlays,
                 writableRoot: runtime.writableRoot,
                 gameDirectory: runtime.files,
                 sharedDirectory: Storage.sharedFiles,
@@ -762,7 +790,7 @@ final class AppModel: ObservableObject {
                       category: "container")
             try Session.launch(
                 rootFilesystem: rootFilesystem,
-                rootFilesystemOverlays: [runtime.glibc, runtime.wine64],
+                rootFilesystemOverlays: runtime.overlays,
                 writableRoot: runtime.writableRoot,
                 gameDirectory: runtime.files,
                 sharedDirectory: Storage.sharedFiles,

@@ -320,7 +320,7 @@ struct ContainerDetailView: View {
                     save()
                     model.launchGraphicsProbe(container)
                 } label: {
-                    Label("Run 32-bit 3D cube", systemImage: "cube.fill")
+                    Label("Run 32-bit cube on 64-bit Wine", systemImage: "cube.fill")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Button {

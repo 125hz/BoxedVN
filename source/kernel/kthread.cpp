@@ -17,6 +17,8 @@
  */
 
 #include "boxedwine.h"
+#include <atomic>
+#include <cstring>
 
 #include "kscheduler.h"
 #include "ksignal.h"
@@ -628,6 +630,8 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
 
     if (command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET) {
         U32 expires = 0xffffffff;
+        const U32 waitStartedAtMillis = KSystem::getMilliesSinceStart();
+        const S64 waitResult = [&]() -> S64 {
         if (timeoutAddress) {
             const U64 seconds = guestMemory->readq(timeoutAddress);
             const U64 nanos = guestMemory->readq(timeoutAddress + 8);
@@ -700,6 +704,45 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
         }
         return K_FUTEX64_PARKED;
 #endif
+        }();
+        // A wait that keeps coming back at once is a thread spinning through
+        // the kernel: glibc's condvar and mutex loops re-enter futex until it
+        // blocks, so an immediate return the guest did not expect turns into
+        // a 100% CPU loop. Name the word and both views of it the first time
+        // a thread does this 256 times inside two seconds.
+        const U32 finishedAtMillis = KSystem::getMilliesSinceStart();
+        if (finishedAtMillis - waitStartedAtMillis <= 1) {
+            if (futexImmediateReturns == 0 ||
+                finishedAtMillis - futexImmediateWindowStart > 2000) {
+                futexImmediateWindowStart = finishedAtMillis;
+                futexImmediateReturns = 0;
+            }
+            if (++futexImmediateReturns == 256) {
+                static std::atomic<U32> reports {0};
+                if (reports.fetch_add(1) < 8) {
+                    U64 seconds = 0, nanos = 0;
+                    if (timeoutAddress) {
+                        seconds = guestMemory->readq(timeoutAddress);
+                        nanos = guestMemory->readq(timeoutAddress + 8);
+                    }
+                    U32 hostValue = 0;
+                    ::memcpy(&hostValue, ram, sizeof(hostValue));
+                    klog_fmt("BOXEDWINE_FUTEX_STORM pid=%d tid=%d addr=0x%llx op=0x%x val=0x%x "
+                             "actual=0x%x host=0x%llx host_value=0x%x rc=%lld "
+                             "timeout=%d sec=%llu nsec=%llu expires=%u now=%u repeats=%u",
+                             process ? process->id : -1, id,
+                             (unsigned long long)addr, op, value,
+                             guestMemory->readd(addr), (unsigned long long)ramAddress,
+                             hostValue, (long long)waitResult,
+                             timeoutAddress ? 1 : 0, (unsigned long long)seconds,
+                             (unsigned long long)nanos, expires, finishedAtMillis,
+                             futexImmediateReturns);
+                }
+            }
+        } else {
+            futexImmediateReturns = 0;
+        }
+        return waitResult;
     }
 
     if (command == FUTEX_WAKE || command == FUTEX_WAKE_BITSET) {

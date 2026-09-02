@@ -145,6 +145,10 @@ public:
     U32 clear_child_tid = 0;
 #ifdef BOXEDWINE_GUEST_X64
     U64 clear_child_tid64 = 0;
+    // Futex storm witness: how many times in a row the 64-bit wait path
+    // returned without blocking, and when that run started.
+    U32 futexImmediateReturns = 0;
+    U32 futexImmediateWindowStart = 0;
 #endif
     U32 debugRegs[8] = {};
     bool ptraceStopPending = false;

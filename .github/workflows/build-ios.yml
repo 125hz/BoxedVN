@@ -627,7 +627,10 @@ jobs:
           gh release upload "${release_tag}" \
             build/artifacts/BoxedVN.ipa \
             build/artifacts/BoxedVN.ipa.sha256 \
+            build/wine64-runtime/wine64-pe32.zip \
             --clobber
+          echo "- 32-bit PE layer (optional, place in the container folder): https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/wine64-pe32.zip" \
+            >> "${GITHUB_STEP_SUMMARY}"
 
           echo "- Direct IPA: https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/BoxedVN.ipa" \
             >> "${GITHUB_STEP_SUMMARY}"

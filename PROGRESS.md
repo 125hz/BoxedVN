@@ -5614,3 +5614,33 @@ that held the 959 projected modules. Plain directory mounts now attach
 before the prefix setup and the projection; zip mounts and drive letters
 keep their place after dosdevices exists.
 
+## fc0a0165: the cube renders and then parks; the 32-bit cube moves to WoW64
+
+Four runs on fc0a0165. The cube reached `complete ok` (368 presents in one
+run, 196 in another) and then every thread of the process parked in futex
+waits while one DXMT worker re-entered the futex syscall from the same
+libc instruction at 97% CPU (`BOXEDWINE_FEX64_BUSY_HOST` named the
+syscall entry and a recursive mutex). glibc's condvar and mutex loops only
+spin like that when the kernel's wait returns at once with a value the
+guest did not expect, so the 64-bit wait path now carries a witness:
+after 256 immediate returns inside two seconds a thread logs
+`BOXEDWINE_FUTEX_STORM` with the word, the value the guest passed, the
+kernel's read of it, the host pointer's own read, the timeout it was
+given and the return code. The freeze after the first seconds of the cube
+is what that line has to explain.
+
+The desktop's My Computer shows no drives because its double-click never
+opens it: the button witness shows press, release, press, release with
+the right timing, and then the same release peeked ten times, so the
+click stream is delivered and the handling on Wine's side is the open
+question. C: itself is present (the guest lists 961 modules under it).
+
+The 32-bit cube button now runs the IA-32 Direct3D 9 probe through
+Wine64's WoW64 on the translator lane with the 32-bit PE layer mounted as
+a third read-only layer. The layer stays out of the IPA: the rolling
+release now also carries `wine64-pe32.zip`, and the app mounts it when
+it finds the file in the container folder or in Documents, telling the
+user where to put it otherwise. Until phase 2's CPU backend exists the
+run is expected to stop at the first 64-to-32 mode switch; that log is
+the next input.
+
