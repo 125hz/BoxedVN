@@ -5324,3 +5324,12 @@ diagnostics; needs the iOS crash report), and one run raised an access
 violation (RIP=0 after a call from ntdll code) in a worker thread during
 D3D11 device creation before any frame; a third run faulted in ntdll only
 after the probe reported completion.
+
+Follow-up on 155eabf2: two device runs again presented 240 frames without
+`BOXEDVN_DXMT_LAYER_FRONT`. Every link is present in the source (present
+hook on the executed dispatcher path, poll in the threaded main loop, file
+compiled into the IPA), so the placement now also runs from a main-queue
+dispatch on the first present, remembers the attach window as a fallback,
+tolerates a root view that is not a direct window subview, re-fronts the
+overlay after moving, and logs `BOXEDVN_DXMT_LAYER_POLL` (state on the first
+pass) or `BOXEDVN_DXMT_LAYER_BLOCKED` (why it could not place the view).

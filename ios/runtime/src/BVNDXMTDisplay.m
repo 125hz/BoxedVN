@@ -21,6 +21,7 @@
 #include <stdlib.h>
 
 #include "BVNDXMTDisplay.h"
+#include "BVNGuestOverlay.h"
 #include "BVNRuntime.h"
 
 #if defined(BOXEDWINE_DXMT_NATIVE)
@@ -119,6 +120,9 @@ struct macdrv_functions_t {
 static pthread_mutex_t gDisplayLock = PTHREAD_MUTEX_INITIALIZER;
 static BVNDXMTMetalView* gDisplayView = nil;
 static CAMetalLayer* gDisplayLayer = nil;
+// The window the view was attached to; SDL's delegate can stop reporting a
+// window while the guest still presents into this one.
+static __weak UIWindow* gDisplayWindow = nil;
 
 static CAMetalLayer* BVNDXMTRegisteredLayer(void) {
     pthread_mutex_lock(&gDisplayLock);
@@ -163,10 +167,12 @@ void BVNDXMTDisplayAttach(void) {
         return;
     }
 
-    UIView* container = BVNGuestUIWindow().rootViewController.view;
+    UIWindow* window = BVNGuestUIWindow();
+    UIView* container = window.rootViewController.view;
     if (container == nil) {
         return;
     }
+    gDisplayWindow = window;
     if (view.superview != container) {
         [view removeFromSuperview];
         view.frame = container.bounds;
@@ -201,26 +207,89 @@ bool BVNDXMTDisplayHasLayer(void) {
 }
 
 // Set from the DXMT dispatcher's thread on the first present; consumed on the
-// main thread by the ordering poll below.
+// main thread by the placement below.
 static _Atomic(bool) gDisplayPresented = false;
+static _Atomic(bool) gDisplayPlacementQueued = false;
 static bool gDisplayFronted = false;
+static bool gDisplayPollReported = false;
+static bool gDisplayBlockedReported = false;
 
-void BVNDXMTDisplayNotePresented(void) {
-    atomic_store_explicit(&gDisplayPresented, true, memory_order_release);
+static void BVNDXMTDisplayPlaceOnMain(void);
+
+static void BVNDXMTDisplayQueuePlacement(void) {
+    if (atomic_exchange_explicit(&gDisplayPlacementQueued, true,
+                                 memory_order_acq_rel)) {
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BVNDXMTDisplayPlaceOnMain();
+    });
 }
 
-void BVNDXMTDisplaySyncOrdering(void) {
-    if (!NSThread.isMainThread) {
+void BVNDXMTDisplayNotePresented(void) {
+    if (atomic_exchange_explicit(&gDisplayPresented, true,
+                                 memory_order_acq_rel)) {
         return;
     }
-    if (!atomic_load_explicit(&gDisplayPresented, memory_order_acquire)) {
+    // Do not rely on the emulator loop alone to notice the first frame: place
+    // the view from the main queue as well. SDL's event pump services the run
+    // loop, so this runs even if the poll never reaches the placement.
+    BVNDXMTDisplayQueuePlacement();
+}
+
+static const char* BVNDXMTClassName(id object, const char* fallback) {
+    return object ? NSStringFromClass([object class]).UTF8String : fallback;
+}
+
+static void BVNDXMTDisplayReportBlocked(const char* why, UIView* view,
+                                        UIWindow* window, UIView* root) {
+    if (gDisplayBlockedReported) {
         return;
     }
+    gDisplayBlockedReported = true;
+    char message[320];
+    snprintf(message, sizeof(message),
+             "BOXEDVN_DXMT_LAYER_BLOCKED: %s (window=%s root=%s "
+             "root_in_window=%d view_superview=%s view_in_window=%d)",
+             why, BVNDXMTClassName(window, "nil"),
+             BVNDXMTClassName(root, "nil"),
+             root != nil && root.superview == window,
+             BVNDXMTClassName(view.superview, "nil"), view.window != nil);
+    BVNLogWrite(BVNLogLevelWarning, "dxmt", message);
+}
+
+static void BVNDXMTDisplayPlaceOnMain(void) {
     pthread_mutex_lock(&gDisplayLock);
     BVNDXMTMetalView* view = gDisplayView;
     pthread_mutex_unlock(&gDisplayLock);
+    if (view == nil) {
+        return;
+    }
     UIWindow* window = BVNGuestUIWindow();
-    if (view == nil || window == nil) {
+    if (window == nil) {
+        window = gDisplayWindow;
+    }
+    if (window == nil) {
+        window = view.window;
+    }
+    UIView* root = window.rootViewController.view;
+    if (!gDisplayPollReported) {
+        gDisplayPollReported = true;
+        char message[320];
+        snprintf(message, sizeof(message),
+                 "BOXEDVN_DXMT_LAYER_POLL: first placement pass after a "
+                 "presented frame (window=%s root=%s root_in_window=%d "
+                 "view_superview=%s view_in_window=%d window_subviews=%lu)",
+                 BVNDXMTClassName(window, "nil"),
+                 BVNDXMTClassName(root, "nil"),
+                 root != nil && root.superview == window,
+                 BVNDXMTClassName(view.superview, "nil"),
+                 view.window != nil,
+                 (unsigned long)window.subviews.count);
+        BVNLogWrite(BVNLogLevelInfo, "dxmt", message);
+    }
+    if (window == nil) {
+        BVNDXMTDisplayReportBlocked("no guest window", view, window, root);
         return;
     }
     // SDL 2.32 (SDL_uikitview setSDLWindow:) replaces the root view
@@ -228,13 +297,9 @@ void BVNDXMTDisplaySyncOrdering(void) {
     // previous one from the window. A DXMT view attached under that earlier
     // view left the window with it: a device run presented 240 frames into a
     // layer that was "frontmost" in a detached container. The view therefore
-    // lives directly in the window, immediately above whatever view SDL owns
-    // as the root view controller's view, and below the overlay that
-    // BVNGuestOverlayInstall keeps at the front.
-    UIView* root = window.rootViewController.view;
-    if (root == nil || root.superview != window) {
-        return;
-    }
+    // lives directly in the window, above whatever view SDL owns as the root
+    // view controller's view, and below the overlay, which
+    // BVNGuestOverlayInstall re-fronts.
     BOOL changed = NO;
     if (view.superview != window) {
         [view removeFromSuperview];
@@ -243,32 +308,69 @@ void BVNDXMTDisplaySyncOrdering(void) {
         changed = YES;
     }
     NSArray<UIView*>* subviews = window.subviews;
-    const NSUInteger rootIndex = [subviews indexOfObjectIdenticalTo:root];
     const NSUInteger viewIndex = [subviews indexOfObjectIdenticalTo:view];
-    if (rootIndex == NSNotFound || viewIndex == NSNotFound) {
+    const NSUInteger rootIndex = (root != nil && root.superview == window)
+        ? [subviews indexOfObjectIdenticalTo:root]
+        : NSNotFound;
+    if (viewIndex == NSNotFound) {
+        BVNDXMTDisplayReportBlocked("view not in window after add", view,
+                                    window, root);
         return;
     }
-    if (viewIndex != rootIndex + 1) {
-        [window insertSubview:view aboveSubview:root];
+    if (rootIndex != NSNotFound) {
+        if (viewIndex < rootIndex) {
+            [window insertSubview:view aboveSubview:root];
+            changed = YES;
+        }
+    } else if (viewIndex != subviews.count - 1) {
+        // No root view to order against: sit on top of SDL's views and let
+        // the overlay re-front itself below.
+        [window bringSubviewToFront:view];
         changed = YES;
     }
     if (!CGRectEqualToRect(view.frame, window.bounds)) {
         view.frame = window.bounds;
     }
+    if (changed) {
+        // Keeps the menu button, cursor, and notices above the frames.
+        BVNGuestOverlayInstall();
+    }
     if (changed && !gDisplayFronted) {
         gDisplayFronted = true;
         const CGSize drawable = view.metalLayer.drawableSize;
-        char message[256];
+        char message[320];
         snprintf(message, sizeof(message),
                  "BOXEDVN_DXMT_LAYER_FRONT: placed the DXMT layer in the guest "
                  "window above SDL's root view (%s) after the first presented "
-                 "frame; frame=%.0fx%.0f drawable=%.0fx%.0f window_subviews=%lu",
-                 NSStringFromClass(root.class).UTF8String,
+                 "frame; frame=%.0fx%.0f drawable=%.0fx%.0f index=%lu/%lu "
+                 "hidden=%d alpha=%.2f",
+                 BVNDXMTClassName(root, "none"),
                  view.bounds.size.width, view.bounds.size.height,
                  drawable.width, drawable.height,
-                 (unsigned long)window.subviews.count);
+                 (unsigned long)[window.subviews indexOfObjectIdenticalTo:view],
+                 (unsigned long)window.subviews.count,
+                 view.hidden || window.hidden, (double)window.alpha);
         BVNLogWrite(BVNLogLevelInfo, "dxmt", message);
     }
+}
+
+void BVNDXMTDisplaySyncOrdering(void) {
+    if (!atomic_load_explicit(&gDisplayPresented, memory_order_acquire)) {
+        return;
+    }
+    if (!NSThread.isMainThread) {
+        // The emulator loop is expected on the main thread; if it is not,
+        // say so once and still place the view from the main queue.
+        if (!gDisplayBlockedReported) {
+            gDisplayBlockedReported = true;
+            BVNLogWrite(BVNLogLevelWarning, "dxmt",
+                        "BOXEDVN_DXMT_LAYER_BLOCKED: ordering poll ran off "
+                        "the main thread; placing from the main queue.");
+        }
+        BVNDXMTDisplayQueuePlacement();
+        return;
+    }
+    BVNDXMTDisplayPlaceOnMain();
 }
 
 static struct macdrv_win_data* BVNDXMTGetWinData(HWND hwnd) {
