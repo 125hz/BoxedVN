@@ -15,8 +15,16 @@
 BOXEDVN_TEST(wine64_layout_keeps_loader_and_modules_under_one_root) {
     CHECK_EQ(std::string(K_X64_WINE_MODULE_ROOT),
              std::string("/usr/lib/x86_64-linux-gnu/wine"));
+    // The lane launches through the name upstream's WoW64 layout uses; the
+    // packaged wine64 and its preloader are aliased under it at startup.
     CHECK_EQ(std::string(K_X64_WINE_LOADER),
+             std::string(K_X64_WINE_MODULE_ROOT) + "/wine");
+    CHECK_EQ(std::string(K_X64_WINE_LOADER64),
              std::string(K_X64_WINE_MODULE_ROOT) + "/wine64");
+    CHECK_EQ(std::string(K_X64_WINE_PRELOADER),
+             std::string(K_X64_WINE_MODULE_ROOT) + "/wine-preloader");
+    CHECK_EQ(std::string(K_X64_WINE_LOADER64_NAME), std::string("wine64"));
+    CHECK_EQ(std::string(K_X64_WINE_PRELOADER64_NAME), std::string("wine64-preloader"));
     CHECK_EQ(std::string(K_X64_WINE_PE_DIR),
              std::string(K_X64_WINE_MODULE_ROOT) + "/x86_64-windows");
     CHECK_EQ(std::string(K_X64_WINE_BUILTIN_PROBE),
