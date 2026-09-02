@@ -249,10 +249,19 @@ void BVNDXMTDisplayNotePresented(uint32_t pid) {
 }
 
 void BVNDXMTDisplayNoteProcessExited(uint32_t pid) {
-    if (pid == 0 ||
-        atomic_load_explicit(&gDisplayPresenterPid, memory_order_acquire) !=
-            pid) {
+    const uint32_t presenter =
+        atomic_load_explicit(&gDisplayPresenterPid, memory_order_acquire);
+    if (pid == 0 || presenter != pid) {
         return;
+    }
+    {
+        // A device run exited cleanly and the layer stayed up with no hide
+        // marker; this line says whether the exit reached here at all.
+        char message[96];
+        snprintf(message, sizeof(message),
+                 "BOXEDVN_DXMT_LAYER_EXIT: presenting process %u exited",
+                 (unsigned)pid);
+        BVNLogWrite(BVNLogLevelInfo, "dxmt", message);
     }
     // The presenting process is gone: nothing will draw into the layer again
     // until another process presents. Hide it so SDL's view, with the desktop
@@ -428,6 +437,21 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
 
 void BVNDXMTDisplaySyncOrdering(void) {
     if (!atomic_load_explicit(&gDisplayPresented, memory_order_acquire)) {
+        // Presentation ended (the presenting process exited) but the view is
+        // still up: hide it from here as well, so the hide does not depend on
+        // the main queue draining while the emulator loop owns the thread.
+        if (gDisplayFronted && NSThread.isMainThread) {
+            pthread_mutex_lock(&gDisplayLock);
+            BVNDXMTMetalView* view = gDisplayView;
+            pthread_mutex_unlock(&gDisplayLock);
+            if (view != nil && !view.hidden) {
+                view.hidden = YES;
+                BVNLogWrite(BVNLogLevelInfo, "dxmt",
+                            "BOXEDVN_DXMT_LAYER_HIDDEN: hidden from the "
+                            "emulator loop after the presenter exited");
+            }
+            gDisplayFronted = false;
+        }
         return;
     }
     if (!NSThread.isMainThread) {

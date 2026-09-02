@@ -76,7 +76,9 @@ enum {
 
 static const char kStagePrefix[] = "BOXEDVN_X64_CUBE_STAGE ";
 
-enum { kProbeWidth = 640, kProbeHeight = 480, kProbeFrames = 240 };
+/* The acceptance run is the first 240 frames; after that the probe keeps
+ * drawing until its window is closed, so it can be watched and measured. */
+enum { kProbeWidth = 640, kProbeHeight = 480, kProbeAcceptanceFrames = 240 };
 
 /* Written through the Windows stderr handle rather than the CRT, so the bytes
  * reach the guest's fd 2 in one unbuffered write that cannot be lost if the
@@ -594,25 +596,34 @@ int main(void) {
     }
 
     /* ---------------------------------------------------------------- */
-    /* The presentation loop. It announces its FIRST present and nothing
-     * afterwards: a per-frame marker would be the largest thing in the log and
-     * would say no more than this one line does. */
+    /* The presentation loop. It announces its FIRST present, the end of the
+     * acceptance run, and nothing else per frame: a per-frame marker would be
+     * the largest thing in the log and would say no more than these do.
+     *
+     * The loop runs until the window is closed. The earlier 240-frame cut-off
+     * made the picture freeze on device after four seconds and looked like a
+     * hang. Present is asked for no vertical sync (interval 0) so the host's
+     * own frame limiter setting, not this program, decides the frame rate. */
     stage_begin("present");
-    for (frames = 0; frames < kProbeFrames; ++frames) {
+    for (frames = 0; ; ++frames) {
         MSG message;
         FLOAT colour[4];
         struct probe_matrix mvp;
+        int quit = 0;
         colour[0] = 0.10f;
         colour[1] = 0.20f + (FLOAT)(frames % 60) / 240.0f;
         colour[2] = 0.45f;
         colour[3] = 1.0f;
         while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) {
-                frames = kProbeFrames;
+                quit = 1;
                 break;
             }
             TranslateMessage(&message);
             DispatchMessageW(&message);
+        }
+        if (quit) {
+            break;
         }
         mvp = cube_transform(frames);
         ID3D11DeviceContext_UpdateSubresource(context,
@@ -623,7 +634,7 @@ int main(void) {
             context, (UINT)(sizeof(kCubeIndices) / sizeof(kCubeIndices[0])),
             0, 0);
         SetLastError(0);
-        hr = IDXGISwapChain_Present(swapchain, 1, 0);
+        hr = IDXGISwapChain_Present(swapchain, 0, 0);
         captured = GetLastError();
         if (FAILED(hr)) {
             snprintf(detail, sizeof(detail), "hr=0x%08lx frame=%d",
@@ -637,9 +648,13 @@ int main(void) {
                      (unsigned long)hr);
             stage_ok("present", detail);
         }
+        if (frames + 1 == kProbeAcceptanceFrames) {
+            stage_line("complete ok");
+        }
     }
 
-    stage_line("complete ok");
+    snprintf(detail, sizeof(detail), "exit ok frames=%d", frames);
+    stage_line(detail);
     if (constant_buffer != NULL) {
         ID3D11Buffer_Release(constant_buffer);
     }

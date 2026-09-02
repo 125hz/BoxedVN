@@ -941,7 +941,23 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             for (size_t i = 0; i < sizeof(bytes); ++i) {
                 snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02x", bytes[i]);
             }
+            // A jump to 0 says nothing about who jumped; the return slot at
+            // the top of the guest stack usually does (the desktop's explorer
+            // took one 16 s in, from unix-side code, and carried on).
+            uint64_t returnSlot[2] = {0, 0};
+            const uint64_t guestRsp = frame->State.gregs[4];
+            const uint64_t hostRsp =
+                adapter->process->memory64->nativeAliasForGuest(guestRsp);
+            if (hostRsp != 0 &&
+                adapter->cpu->memory->nativeRangeCoversForPlan(hostRsp, hostRsp + 16)) {
+                std::memcpy(returnSlot, reinterpret_cast<const void*>(hostRsp),
+                            sizeof(returnSlot));
+            }
             const auto& g = frame->State.gregs;
+            klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_STACK rsp=0x%llx slot0=0x%llx slot1=0x%llx",
+                     static_cast<unsigned long long>(guestRsp),
+                     static_cast<unsigned long long>(returnSlot[0]),
+                     static_cast<unsigned long long>(returnSlot[1]));
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT pid=%d tid=%d host_signal=%d "
                      "si_code=%d fault=0x%llx host_pc=0x%llx in_code=%d generated=%d "
                      "guest_signal=%u trap=%u guest_rip=0x%llx bytes=%s",

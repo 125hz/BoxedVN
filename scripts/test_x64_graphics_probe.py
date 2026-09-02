@@ -151,6 +151,17 @@ class CubeGeometryAndShaders(unittest.TestCase):
                         loop.find("DrawIndexed"))
         self.assertLess(loop.find("DrawIndexed"), loop.find("_Present("))
 
+    def test_the_loop_runs_until_the_window_closes_without_vsync(self) -> None:
+        # A 240-frame cut-off froze the picture on device after four seconds
+        # and looked like a hang; the acceptance marker still fires at 240.
+        loop = self.source[self.source.find('stage_begin("present")'):]
+        self.assertIn("for (frames = 0; ; ++frames) {", loop)
+        self.assertIn("if (message.message == WM_QUIT) {", loop)
+        self.assertIn("IDXGISwapChain_Present(swapchain, 0, 0)", loop)
+        self.assertIn("if (frames + 1 == kProbeAcceptanceFrames) {", loop)
+        self.assertIn('stage_line("complete ok");', loop)
+        self.assertIn('"exit ok frames=%d"', loop)
+
     def test_pipeline_state_is_complete(self) -> None:
         # Direct3D 11 has no default viewport; a missing one draws nothing
         # and reports nothing, which would look exactly like a DXMT defect.

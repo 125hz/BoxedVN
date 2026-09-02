@@ -5475,3 +5475,24 @@ fallbacks' store-exclusive status register and AtomicFetchNeg's saved value
 moved off TMP4 as well. The exit-dispatch contract now checks the patched
 AtomicOps.cpp for TMP4 reuse; the patch series was re-applied from the
 pristine pin locally to prove it still applies.
+
+## First clean 64-bit exits; desktop first run (ce7b2f4a)
+
+Two cube runs on ce7b2f4a: 240 presents, `complete ok`, then a clean
+`exit_group` with no Wine fault: the CASPair fix holds. The layer did not
+hide afterwards (no `BOXEDVN_DXMT_LAYER_HIDDEN`), so the hide now also
+runs from the emulator loop's poll and the exit hook logs
+`BOXEDVN_DXMT_LAYER_EXIT` on entry. The probe now runs until its window is
+closed, with Present interval 0 so the host frame limiter decides the rate;
+`complete ok` still marks frame 240 and `exit ok frames=N` the close.
+
+First 64-bit desktop run: explorer's desktop and winefile appeared. One
+guest fault at RIP 0 on explorer's main thread 16 s in, from unix-side code
+(rsp on the kernel stack), handled and survived; the fault log now records
+the two return slots at RSP. Unimplemented bridge ops seen: XShapeCombine*,
+XShmCreateImage, XcursorLibraryLoadCursor (all queried as absent; the calls
+are winex11's unconditional ones and the stubs are harmless). Reported by
+the user: the start menu flickers, double-clicking My Computer opens
+nothing (no process was spawned), and drives from the 32-bit desktop are
+not visible (expected: the 64-bit lane has its own prefix; only D: and the
+shared drive are mounted).
