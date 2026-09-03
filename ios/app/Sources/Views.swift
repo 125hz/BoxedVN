@@ -407,12 +407,24 @@ struct GuestLiveLog: View {
 /// running guest through the runtime's control API.
 struct GuestControlBar: View {
     let active: Bool
+    /// Whether the page is showing the mouse settings below this bar.
+    ///
+    /// The panel belongs to the page rather than to this bar because it is a
+    /// row of the page, not a presentation. A sheet, popover or alert started
+    /// while the guest owns the main thread never completes its transaction -
+    /// boxedmain runs the loop and only pumps UIKit through SDL's event
+    /// polling - and the whole page stops answering for the rest of the
+    /// session. Only the page's own hierarchy updates reliably, so that is
+    /// where these controls live.
+    @Binding var showingPointerSettings: Bool
     /// Stopping is the page's business, not just the runtime's: the page has
     /// to leave the running state at once, because the poll that publishes the
     /// runtime state cannot run while the guest still owns the main thread.
     let onStop: () -> Void
     @State private var pointerMode = Int(BVNGuestControlsPointerMode())
-    @State private var showingPointerSettings = false
+    /// Set by the long press, consumed by the touch-up that ends it, so the
+    /// release cannot be read as the tap that closes what the press opened.
+    @State private var pressOpenedSettings = false
 
     private var running: Bool { active }
 
@@ -435,26 +447,34 @@ struct GuestControlBar: View {
     /// press opens the mouse settings instead: they belong to the pointer, so
     /// they hang off the pointer button rather than adding an eighth glyph to
     /// a bar that is already full on a phone.
+    ///
+    /// The settings open in the page itself, immediately below this bar. A
+    /// tap on the button again closes them, as does the panel's own Done.
     private var pointerControl: some View {
         control(pointerMode == 0 ? "hand.point.up.left" : "cursorarrow",
                 "Pointer") {
-            // The long press has already opened the settings by the time the
-            // finger lifts; that release must not also change the mode.
-            guard !showingPointerSettings else { return }
+            // The long press has already opened the panel by the time the
+            // finger lifts; that release must neither change the mode nor
+            // close what the press just opened.
+            if pressOpenedSettings {
+                pressOpenedSettings = false
+                return
+            }
+            if showingPointerSettings {
+                showingPointerSettings = false
+                return
+            }
             pointerMode = pointerMode == 0 ? 1 : 0
             BVNGuestControlsSetPointerMode(Int32(pointerMode))
         }
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                pressOpenedSettings = true
                 showingPointerSettings = true
             }
         )
         .accessibilityHint("Double tap to switch pointer mode. "
                            + "Touch and hold for mouse settings.")
-        .popover(isPresented: $showingPointerSettings) {
-            GuestPointerSettingsPopover()
-                .presentationCompactAdaptation(.popover)
-        }
     }
 
     private func textControl(_ title: String, _ label: String,
@@ -487,18 +507,30 @@ struct GuestControlBar: View {
 
 /// The mouse settings behind the control bar's pointer button.
 ///
+/// A row of the container page, not a popover. The guest owns the main thread
+/// while it runs, so a UIKit presentation started from this page never
+/// finishes its transaction and leaves the page unresponsive; an inline panel
+/// is part of the hierarchy the page already updates.
+///
 /// Every control writes the runtime's own store through
 /// `BVNGuestPointerSettingsSet`, which is the same NSUserDefaults the in-guest
 /// pointer panel writes: the two are views of one set of values, not two
 /// copies, and the running overlay repaints its cursor while the slider is
 /// still under the finger.
-struct GuestPointerSettingsPopover: View {
+struct GuestPointerSettingsPanel: View {
+    let onDone: () -> Void
     @State private var settings = BVNGuestPointerSettingsGet()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Mouse")
-                .font(.headline)
+            HStack {
+                Text("Mouse")
+                    .font(.headline)
+                Spacer()
+                Button("Done", action: onDone)
+                    .font(.subheadline.weight(.semibold))
+                    .buttonStyle(.borderless)
+            }
             slider("Size", field(\.size), 12...64,
                    String(format: "%.0f pt", settings.size))
             slider("Thickness", field(\.thickness), 0.5...6,
@@ -524,9 +556,12 @@ struct GuestPointerSettingsPopover: View {
                 apply()
             }
             .font(.subheadline)
+            // Borderless, like Done above: a plain Button in a List row hands
+            // its tap target to the whole row, and this panel carries two.
+            .buttonStyle(.borderless)
         }
-        .padding(18)
-        .frame(width: 300)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Writes through on every change, so the value is applied live rather
@@ -623,9 +658,13 @@ struct ContainerDetailView: View {
     @State private var isScanning = false
     @State private var shortcutProgram: ContainerProgram?
     @State private var shortcutTitle = ""
-    @State private var showingShortcutPrompt = false
     @State private var showingMonoImporter = false
     @State private var showingProgramPicker = false
+    // The control bar's mouse settings, held here because they are drawn as a
+    // row of this page rather than presented over it. Nothing that runs while
+    // a guest owns the main thread may be a sheet, popover or alert: the
+    // presentation never completes and the page stops answering.
+    @State private var showingPointerSettings = false
     // True from the moment a guest is launched from this page until it stops,
     // so the "no guest" placeholder does not linger over a starting session.
     @State private var launched = false
@@ -682,16 +721,26 @@ struct ContainerDetailView: View {
                 .frame(maxWidth: .infinity)
                 .background(Color.black)
                 .listRowInsets(EdgeInsets())
-                GuestControlBar(active: launched, onStop: {
+                GuestControlBar(active: launched,
+                                showingPointerSettings: $showingPointerSettings,
+                                onStop: {
                     // The page returns to its idle state on the tap. The guest
                     // can take seconds to unwind on the main thread, and the
                     // runtime-state poll is stuck behind it, so waiting for
                     // the state to change left the whole page looking frozen.
                     launched = false
+                    showingPointerSettings = false
                     model.requestShutdown()
                 })
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 6, leading: 4, bottom: 6, trailing: 4))
+                if showingPointerSettings {
+                    GuestPointerSettingsPanel {
+                        showingPointerSettings = false
+                    }
+                    .listRowInsets(EdgeInsets(top: 2, leading: 16,
+                                              bottom: 8, trailing: 16))
+                }
                 if launched {
                     GuestLiveLog()
                         .listRowBackground(Color.clear)
@@ -827,7 +876,6 @@ struct ContainerDetailView: View {
                             shortcutTitle = URL(fileURLWithPath:
                                 program.executable.relativePath)
                                 .deletingPathExtension().lastPathComponent
-                            showingShortcutPrompt = true
                         } label: {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(program.executable.relativePath)
@@ -837,6 +885,35 @@ struct ContainerDetailView: View {
                             }
                         }
                     }
+                }
+                // The shortcut name is asked for here rather than in an alert.
+                // This list is not disabled while a guest runs, so a tap on a
+                // program mid-session used to start a presentation the guest's
+                // hold on the main thread never let finish.
+                if let program = shortcutProgram {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Add to Home")
+                            .font(.headline)
+                        Text(program.executable.relativePath)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("Title", text: $shortcutTitle)
+                            .textFieldStyle(.roundedBorder)
+                        HStack {
+                            Button("Cancel") { shortcutProgram = nil }
+                            Spacer()
+                            Button("Add to Home") {
+                                model.addShortcut(program, from: container,
+                                                  title: shortcutTitle)
+                                shortcutProgram = nil
+                            }
+                            .disabled(shortcutTitle.trimmingCharacters(
+                                in: .whitespacesAndNewlines).isEmpty)
+                        }
+                        .font(.subheadline)
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.vertical, 4)
                 }
                 Button("Scan again") { scan() }
                     .disabled(isScanning)
@@ -852,16 +929,6 @@ struct ContainerDetailView: View {
         }
         .navigationTitle(container.name)
         .task { scan() }
-        .alert("Add shortcut", isPresented: $showingShortcutPrompt) {
-            TextField("Title", text: $shortcutTitle)
-            Button("Add to Home") {
-                if let shortcutProgram {
-                    model.addShortcut(shortcutProgram, from: container,
-                                      title: shortcutTitle)
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        }
         .sheet(isPresented: .constant(false)) {
             DocumentImportPicker(
                 contentTypes: wineMonoContentTypes,
