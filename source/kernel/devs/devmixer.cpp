@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 
 #include "oss.h"
+#include "ossioctl.h"
 #include "../../io/fsvirtualopennode.h"
 
 class DevMixer : public FsVirtualOpenNode {
@@ -27,8 +28,18 @@ public:
 
     // From FsOpenNode
     U32 ioctl(KThread* thread, U32 request) override;
+#ifdef BOXEDWINE_GUEST_X64
+    U32 ioctl64(U32 request, U64 argAddress, KMemory64* memory) override;
+#endif
     U32 readNative(U8* buffer, U32 len) override {return 0;}
     U32 writeNative(U8* buffer, U32 len) override {return 0;}
+
+#ifdef BOXEDWINE_GUEST_X64
+private:
+    void logFirstCall64(U32 request, const char* op, U64 arg, U32 value, S32 result);
+    U32 loggedRequests64[16] = {};
+    U32 loggedRequestCount64 = 0;
+#endif
 };
 
 FsOpenNode* openDevMixer(const std::shared_ptr<FsNode>& node, U32 flags, U32 data) {
@@ -42,76 +53,102 @@ U32 DevMixer::ioctl(KThread* thread, U32 request) {
     //bool read = (request & 0x40000000) != 0;
     bool write = (request & 0x80000000) != 0;
 
+    OssIoctlArg32 arg(memory, IOCTL_ARG1);
+
     switch (request & 0xFFFF) {
     case 0x5801: // SNDCTL_SYSINFO
         if (write) {
-            U32 p = IOCTL_ARG1;
-            for (U32 i=0;i<len/4;i++)
-                memory->writed(p+i*4, 2000+i);
-            memory->strcpy(p, "OSS/Linux"); p+=32; // char product[32];		/* For example OSS/Free, OSS/Linux or OSS/Solaris */
-            memory->strcpy(p, "4.0.0a"); p+=32; // char version[32];		/* For example 4.0a */
-            memory->writed(p, 0x040000); p+=4; // int versionnum;		/* See OSS_GETVERSION */
-
-            for (U32 i=0;i<128;i++) {
-                memory->writeb(p, i+100); p+=1; // char options[128];		/* Reserved */
-            }
-
-            memory->writed(p, 1); p+=4; // offset 196 int numaudios;		/* # of audio/dsp devices */
-            for (U32 i=0;i<8;i++) {
-                memory->writed(p, 200+i); p+=4; // int openedaudio[8];		/* Bit mask telling which audio devices are busy */
-            }
-
-            memory->writed(p, 1); p+=4; // int numsynths;		/* # of availavle synth devices */
-            memory->writed(p, 1); p+=4; // int nummidis;			/* # of available MIDI ports */
-            memory->writed(p, 1); p+=4; // int numtimers;		/* # of available timer devices */
-            memory->writed(p, 1); p+=4; // offset 244 int nummixers;		/* # of mixer devices */
-
-            for (U32 i=0;i<8;i++) {
-                memory->writed(p, 0); p+=4; // int openedmidi[8];		/* Bit mask telling which midi devices are busy */
-            }
-            memory->writed(p, 1); p+=4; // offset 280 int numcards;			/* Number of sound cards in the system */
-            memory->writed(p, 1); p+=4; // offset 284 int numaudioengines;		/* Number of audio engines in the system */
-            memory->strcpy(p, "GPL"); // char license[16];		/* For example "GPL" or "CDDL" */
+            ossWriteSysInfo(arg, len);
             return 0;
         }
         break;
-    case 0x5807: // SNDCTL_AUDIOINFO	
+    case 0x5807: // SNDCTL_AUDIOINFO
         if (write) {
-            U32 p = IOCTL_ARG1;
-            p+=4; // int dev; /* Audio device number */
-            memory->strcpy(p, "BoxedWine mixer"); p+=64; // oss_devname_t name;
-            memory->writed(p, 0); p+=4; // int busy; /* 0, OPEN_READ, OPEN_WRITE or OPEN_READWRITE */
-            memory->writed(p, -1); p+=4; // int pid;
-            memory->writed(p, PCM_CAP_OUTPUT); p+=4; // int caps;			/* PCM_CAP_INPUT, PCM_CAP_OUTPUT */
-            memory->writed(p, 0); p+=4; // int iformats
-            memory->writed(p, AFMT_U8 | AFMT_S16_LE | AFMT_S16_BE | AFMT_S8 | AFMT_U16_BE); p+=4; // int oformats;
-            memory->writed(p, 0); p+=4; // int magic;			/* Reserved for internal use */
-            memory->strcpy(p, ""); p+=64; // oss_cmd_t cmd;		/* Command using the device (if known) */
-            memory->writed(p, 0); p+=4; // int card_number;
-            memory->writed(p, 0); p+=4; // int port_number;
-            memory->writed(p, 0); p+=4; // int mixer_dev;
-            memory->writed(p, 0); p+=4; // int legacy_device;		/* Obsolete field. Replaced by devnode */
-            memory->writed(p, 1); p+=4; // int enabled;			/* 1=enabled, 0=device not ready at this moment */
-            memory->writed(p, 0); p+=4; // int flags;			/* For internal use only - no practical meaning */
-            memory->writed(p, 0); p+=4; // int min_rate
-            memory->writed(p, 0); p+=4; // max_rate;	/* Sample rate limits */
-            memory->writed(p, 0); p+=4; // int min_channels
-            memory->writed(p, 0); p+=4; // max_channels;	/* Number of channels supported */
-            memory->writed(p, 0); p+=4; // int binding;			/* DSP_BIND_FRONT, etc. 0 means undefined */
-            memory->writed(p, 0); p+=4; // int rate_source;
-            memory->strcpy(p, ""); p+=64; // oss_handle_t handle;
-            memory->writed(p, 0); p+=4; // unsigned int nrates
-            for (U32 i=0;i<20;i++) {
-                memory->writed(p, 0); p+=4; // rates[20];	/* Please read the manual before using these */
-            }
-            memory->strcpy(p, ""); p+=32; // oss_longname_t song_name;	/* Song name (if given) */
-            memory->strcpy(p, ""); p+=16; // oss_label_t label;		/* Device label (if given) */
-            memory->writed(p, -1); p+=4; // int latency;			/* In usecs, -1=unknown */
-            memory->strcpy(p, "/dev/dsp"); p+=16; // oss_devnode_t devnode;	/* Device special file name (absolute path) */
-            memory->writed(p, 0); p+=4; // int next_play_engine;		/* Read the documentation for more info */
-            memory->writed(p, 0); // int next_rec_engine;		/* Read the documentation for more info */
+            // The device index the caller asked about is the first field and
+            // is echoed back. Only one audio device exists (numaudios == 1 in
+            // the sysinfo above), and it is /dev/dsp.
+            ossWriteAudioInfo(arg, (S32)arg.readd(0), "BoxedWine mixer",
+                              PCM_CAP_OUTPUT,
+                              AFMT_U8 | AFMT_S16_LE | AFMT_S16_BE | AFMT_S8 | AFMT_U16_BE,
+                              11025, 48000, 1, 2, "/dev/dsp");
             return 0;
-        }        
+        }
     }
     return -K_ENODEV;
 }
+
+#ifdef BOXEDWINE_GUEST_X64
+void DevMixer::logFirstCall64(U32 request, const char* op, U64 arg, U32 value,
+                              S32 result) {
+    const U32 code = request & 0xFFFF;
+    for (U32 i = 0; i < this->loggedRequestCount64; i++) {
+        if (this->loggedRequests64[i] == code) {
+            return;
+        }
+    }
+    if (this->loggedRequestCount64 >=
+        (U32)(sizeof(this->loggedRequests64) / sizeof(this->loggedRequests64[0]))) {
+        return;
+    }
+    this->loggedRequests64[this->loggedRequestCount64++] = code;
+    klog_fmt("BOXEDWINE_X64_MIXER op=%s request=0x%x arg=0x%llx value=%u result=%d",
+             op, request, (unsigned long long)arg, value, result);
+}
+
+// /dev/mixer is the node Wine's OSS driver opens first, and the only one it
+// opens before deciding whether the backend exists at all: oss_test_connect
+// opens it O_RDONLY and issues SNDCTL_SYSINFO, and a failure there is reported
+// as Priority_Unavailable, which makes mmdevapi skip the driver entirely.
+U32 DevMixer::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
+    if (!memory) {
+        return (U32)-K_ENOTTY;
+    }
+    const U32 code = request & 0xFFFF;
+    const U32 len = (request >> 16) & 0x3FFF;
+    const bool write = (request & 0x80000000) != 0;
+    OssIoctlArg64 arg(memory, argAddress);
+    const char* op = "unknown";
+    U32 value = 0;
+    S32 result = 0;
+
+    if (code == 0x5801) { // SNDCTL_SYSINFO
+        op = "SNDCTL_SYSINFO";
+        if (!write) {
+            return (U32)-K_ENOTTY;
+        }
+        ossWriteSysInfo(arg, len);
+    } else if (code == 0x5807) { // SNDCTL_AUDIOINFO
+        op = "SNDCTL_AUDIOINFO";
+        if (!write) {
+            return (U32)-K_ENOTTY;
+        }
+        value = arg.readd(0);
+        if ((S32)value > 0) {
+            // Only device 0 exists. Answering anything else with a copy of it
+            // would give Wine duplicate endpoints for the same devnode.
+            result = -K_EINVAL;
+        } else {
+            ossWriteAudioInfo(arg, (S32)value, "BoxedWine mixer", PCM_CAP_OUTPUT,
+                              AFMT_U8 | AFMT_S16_LE | AFMT_S16_BE | AFMT_S8 | AFMT_U16_BE,
+                              11025, 48000, 1, 2, "/dev/dsp");
+        }
+    } else if ((code & 0xFF00) == 0x4D00) {
+        // The SOUND_MIXER_READ_*/SOUND_MIXER_WRITE_* pair Wine's aux (winmm
+        // auxiliary) device uses. There is no hardware mixer behind /dev/dsp;
+        // report both channels at full scale and accept, but ignore, a write.
+        // Refusing would make Wine report the aux device as absent, which is
+        // a worse answer than a fixed volume.
+        // Both MIXER_READ (_SIOR) and MIXER_WRITE (_SIOWR) carry the READ
+        // direction bit, so both expect the resulting level written back.
+        op = "SOUND_MIXER";
+        value = 100 | (100 << 8);
+        if (write) {
+            arg.writed(0, value);
+        }
+    } else {
+        return (U32)-K_ENOTTY;
+    }
+    this->logFirstCall64(request, op, argAddress, value, result);
+    return (U32)result;
+}
+#endif

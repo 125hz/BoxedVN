@@ -365,6 +365,232 @@ static void projectX64WineDxvkD3d9(const BString& winePrefix) {
              syswow64.c_str(), (U32)modules.size(), projected);
 }
 
+// ---------------------------------------------------------------------------
+// Audio. See docs/PLAN_X64_AUDIO.md.
+//
+// The route is Wine's OSS driver over BoxedWine's own /dev/dsp, which is
+// already emulated for the IA-32 lane and already mixes through SDL on the
+// host. Two things have to be true before Wine will use it, and neither was
+// checked anywhere: the driver pair has to be in the packaged module tree,
+// and mmdevapi has to be pointed at it.
+//
+// The pair is a unit. wineoss.drv (PE) dlopens wineoss.so (ELF) across Wine's
+// private, unversioned __wine_unix_call boundary, so half a pair is not a
+// degraded driver, it is undefined behaviour -- which is why "packaged" here
+// means both halves or neither, and why a half-present tree is reported as a
+// packaging bug rather than quietly used.
+static bool x64WineOssDriverPackaged(bool& unixHalf, bool& peHalf) {
+    const BString unixPath = B(K_X64_WINE_UNIX_DIR) + "/wineoss.so";
+    const BString pePath = B(K_X64_WINE_PE_DIR) + "/wineoss.drv";
+    std::shared_ptr<FsNode> unixNode =
+        Fs::getNodeFromLocalPath(B(""), unixPath, true);
+    std::shared_ptr<FsNode> peNode =
+        Fs::getNodeFromLocalPath(B(""), pePath, true);
+    unixHalf = unixNode != nullptr && !unixNode->isDirectory();
+    peHalf = peNode != nullptr && !peNode->isDirectory();
+    return unixHalf && peHalf;
+}
+
+// Insert or correct one string value in a Wine user.reg, in the file's own
+// format: a section header line "[Software\\Wine\\Drivers] <seconds>", an
+// optional "#time=" line, then quoted "name"="value" lines until the next
+// section. Returns false when nothing had to change.
+//
+// This is deliberately the smallest possible editor rather than a registry
+// parser: it is inserting a single known value into a file Wine itself
+// rewrites, and anything it does not recognise it leaves alone.
+static bool setGuestWineRegistryValue(std::string& contents,
+                                      const std::string& section,
+                                      const std::string& name,
+                                      const std::string& quotedValue) {
+    const std::string header = "[" + section + "]";
+    const std::string assignment = "\"" + name + "\"=" + quotedValue;
+    const std::string namePrefix = "\"" + name + "\"=";
+
+    size_t sectionStart = contents.find(header);
+    while (sectionStart != std::string::npos && sectionStart != 0 &&
+           contents[sectionStart - 1] != '\n') {
+        // Only a header at the start of a line counts.
+        sectionStart = contents.find(header, sectionStart + 1);
+    }
+    if (sectionStart == std::string::npos) {
+        // Wine accepts a section with a zero timestamp; it rewrites the value
+        // with a real one the next time it touches the key.
+        if (!contents.empty() && contents.back() != '\n') {
+            contents += "\n";
+        }
+        contents += "\n" + header + " 0\n" + assignment + "\n";
+        return true;
+    }
+    size_t sectionEnd = contents.find("\n[", sectionStart);
+    if (sectionEnd == std::string::npos) {
+        sectionEnd = contents.length();
+    } else {
+        sectionEnd++;
+    }
+    // Look for the value inside this section only.
+    size_t cursor = contents.find('\n', sectionStart);
+    while (cursor != std::string::npos && cursor < sectionEnd) {
+        const size_t lineStart = cursor + 1;
+        size_t lineEnd = contents.find('\n', lineStart);
+        if (lineEnd == std::string::npos || lineEnd > sectionEnd) {
+            lineEnd = sectionEnd;
+        }
+        if (contents.compare(lineStart, namePrefix.length(), namePrefix) == 0) {
+            std::string existing =
+                contents.substr(lineStart, lineEnd - lineStart);
+            // A registry Wine wrote uses LF, but tolerate CRLF so a value
+            // that is already correct is not rewritten on every launch.
+            if (!existing.empty() && existing.back() == '\r') {
+                existing.pop_back();
+            }
+            if (existing == assignment) {
+                return false;
+            }
+            contents.replace(lineStart, lineEnd - lineStart, assignment);
+            return true;
+        }
+        if (lineEnd >= sectionEnd) {
+            break;
+        }
+        cursor = lineEnd;
+    }
+    // Not present: insert immediately after the header line, which is where
+    // Wine's own writer puts a new value.
+    size_t insertAt = contents.find('\n', sectionStart);
+    if (insertAt == std::string::npos) {
+        contents += "\n" + assignment + "\n";
+        return true;
+    }
+    insertAt++;
+    // Keep a "#time=" line directly under its header.
+    if (contents.compare(insertAt, 6, "#time=") == 0) {
+        const size_t afterTime = contents.find('\n', insertAt);
+        if (afterTime != std::string::npos && afterTime + 1 <= contents.length()) {
+            insertAt = afterTime + 1;
+        }
+    }
+    contents.insert(insertAt, assignment + "\n");
+    return true;
+}
+
+// mmdevapi picks its backend from HKCU\Software\Wine\Drivers value "Audio",
+// and with the value absent it tries its built-in order -- pulse, alsa, oss,
+// coreaudio -- so a guest with no PulseAudio daemon and no /dev/snd pays a
+// startup delay for two backends that cannot work before reaching the one
+// that can. Set it, but only when the driver is actually packaged: forcing a
+// driver that is not there leaves the process with no audio backend at all
+// rather than falling back.
+static void configureX64AudioDriver(const BString& winePrefix) {
+    bool unixHalf = false;
+    bool peHalf = false;
+    const bool packaged = x64WineOssDriverPackaged(unixHalf, peHalf);
+    const char* packagedStatus = packaged
+        ? "yes"
+        : (unixHalf || peHalf ? "half" : "no");
+    const char* registryStatus = "skipped";
+
+    if (packaged) {
+        const BString userRegistry = winePrefix + "/user.reg";
+        std::shared_ptr<FsNode> node =
+            Fs::getNodeFromLocalPath(B(""), userRegistry, true);
+        BString nativePath = node ? node->nativePath : B("");
+        if (!node || node->isDirectory() || nativePath.isEmpty()) {
+            registryStatus = "no-user-reg";
+        } else {
+            std::string contents;
+            bool readable = true;
+            {
+                std::ifstream in(nativePath.c_str(), std::ios::binary);
+                if (!in) {
+                    readable = false;
+                } else {
+                    in.seekg(0, std::ios::end);
+                    const std::streamoff size = in.tellg();
+                    in.seekg(0, std::ios::beg);
+                    if (size > 0) {
+                        contents.resize((size_t)size);
+                        in.read(&contents[0], (std::streamsize)contents.size());
+                        readable = in.good();
+                    }
+                }
+            }
+            if (!readable) {
+                registryStatus = "unreadable";
+            } else {
+                // The doubled backslashes are the registry file's own
+                // escaping, not C escaping twice over: user.reg spells this
+                // section "[Software\\Wine\\Drivers]" on disk. The host-side
+                // helper in ios/support/src/wine_prefix.cpp reaches the same
+                // bytes by escaping a single-backslash name itself.
+                if (!setGuestWineRegistryValue(contents, "Software\\\\Wine\\\\Drivers",
+                                               "Audio", "\"oss\"")) {
+                    registryStatus = "present";
+                } else {
+                    // Write through a sibling temp file and rename, so a
+                    // process killed mid-write cannot leave the prefix with a
+                    // truncated user.reg -- which Wine treats as an empty
+                    // registry and silently reinitialises.
+                    const BString tempPath = nativePath + ".boxedvn-audio";
+                    bool wrote = false;
+                    {
+                        std::ofstream out(tempPath.c_str(), std::ios::binary | std::ios::trunc);
+                        if (out) {
+                            out.write(contents.data(), (std::streamsize)contents.size());
+                            wrote = out.good();
+                        }
+                    }
+                    std::error_code ec;
+                    if (wrote) {
+                        std::filesystem::rename(tempPath.c_str(), nativePath.c_str(), ec);
+                    }
+                    if (!wrote || ec) {
+                        std::filesystem::remove(tempPath.c_str(), ec);
+                        registryStatus = "unwritable";
+                    } else {
+                        registryStatus = "oss";
+                    }
+                }
+            }
+        }
+    }
+
+    klog_fmt("BOXEDWINE_X64_AUDIO_DRIVER packaged=%s registry=%s unix=%d pe=%d "
+             "prefix=%s",
+             packagedStatus, registryStatus, unixHalf ? 1 : 0, peHalf ? 1 : 0,
+             winePrefix.c_str());
+    if (!packaged) {
+        klog(unixHalf || peHalf
+             ? "BOXEDWINE_X64_AUDIO_DRIVER status=half-packaged: wineoss.drv and "
+               "wineoss.so are one unit across Wine's private unix-call boundary; "
+               "ship both or neither"
+             : "BOXEDWINE_X64_AUDIO_DRIVER status=absent: no OSS driver in the "
+               "packaged Wine tree, so mmdevapi keeps its built-in backend order "
+               "and the 64-bit lane has no audio device");
+    }
+}
+
+// The two OSS nodes Wine's driver opens, taken through the guest filesystem
+// after every overlay is mounted. They are registered unconditionally in
+// buildVirtualFileSystem() and shared with the IA-32 lane, so the interesting
+// question is not whether the code ran but whether a 64-bit process can see
+// and open them.
+static void reportX64AudioDeviceNodes() {
+    // Presence and mode only. Opening /dev/dsp here would construct a DevDsp
+    // and with it a KDspAudio voice, which is a side effect a diagnostic has
+    // no business having; whether Wine's open succeeds is answered by
+    // BOXEDWINE_X64_DSP on the first ioctl anyway.
+    for (const char* path : {"/dev/dsp", "/dev/mixer"}) {
+        std::shared_ptr<FsNode> node =
+            Fs::getNodeFromLocalPath(B(""), BString::copy(path), true);
+        klog_fmt("BOXEDWINE_X64_AUDIO_DEVNODE path=%s present=%d mode=0%o "
+                 "sound=%d",
+                 path, node ? 1 : 0,
+                 node ? (unsigned)(node->getMode() & 0777) : 0u,
+                 KSystem::soundEnabled ? 1 : 0);
+    }
+}
+
 // Wine strips "64" from its own loader name to find the loader for a 32-bit
 // image and hands the image to start.exe when that yields a name; start.exe
 // then spawns that loader, which the layers do not ship. Upstream's WoW64
@@ -1103,6 +1329,10 @@ bool StartUpArgs::apply() {
                      "status=override-applied WINEDLLOVERRIDES=d3d9=n");
             }
         }
+        // Audio, after the module projections so the packaged-driver test sees
+        // the tree the guest will actually search. See docs/PLAN_X64_AUDIO.md.
+        reportX64AudioDeviceNodes();
+        configureX64AudioDriver(winePrefix);
     }
 
     if (!this->ddrawOverridePath.isEmpty()) {

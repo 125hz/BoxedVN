@@ -353,3 +353,100 @@ to satisfy them too.
   `/dev/sequencer` is out of scope here.
 - It does not address the fontconfig failure recorded in §1, which is a
   separate packaging defect in the same runtime.
+
+---
+
+## 8. Implementation status
+
+### Landed
+
+**§5.1, the guest kernel.** `DevDsp::ioctl64` and `DevMixer::ioctl64` exist and
+answer the OSS set `dlls/wineoss.drv/oss.c` actually issues, which reading the
+Wine 9.0 source narrowed to a much smaller list than the plan assumed: on
+`/dev/mixer` only `SNDCTL_SYSINFO` and `SNDCTL_AUDIOINFO` (plus the
+`SOUND_MIXER_READ_*`/`WRITE_*` pair the `aux` device uses), and on `/dev/dsp`
+only `SNDCTL_ENGINEINFO`, `SETFMT`, `SPEED`, `CHANNELS`, `GETOSPACE` and
+`GETISPACE`. The rest of the set (`RESET`, `SYNC`, `POST`, `GETBLKSIZE`,
+`GETFMTS`, `GETCAPS`, `SETTRIGGER`/`GETTRIGGER`, `GETOPTR`, `GETODELAY`,
+`SETFRAGMENT`, `NONBLOCK`) is implemented anyway, because an OSS client that
+gets `ENOTTY` from one of them has no way to tell a device that will not do it
+from a device that is not there.
+
+Three things came out of that reading that the plan did not have:
+
+- **`oss_test_connect` is the gate, not `oss_create_stream`.** It opens
+  `/dev/mixer`, issues `SNDCTL_SYSINFO`, and returns `Priority_Unavailable`
+  unless `sysinfo.version[0]` is in `'4'`..`'9'` and `versionnum` comes back
+  without its top bit. `mmdevapi` skips a driver at that priority, so the
+  mixer answering `SNDCTL_SYSINFO` correctly is what decides whether any of
+  the rest is ever reached. The emulation already answered `"4.0.0a"` and
+  `0x040000`, so it passes -- but nothing had ever checked, and it is now the
+  first thing `BOXEDWINE_X64_MIXER` reports.
+- **`GETOSPACE` has to be self-consistent, not just plausible.**
+  `oss_write_data` takes `oss_bufsize_bytes` as `fragstotal * fragsize` and
+  then computes `(oss_bufsize_bytes - bi.bytes)` as an *unsigned* frame count.
+  The IA-32 path reports `bytes` as the raw capacity while `fragstotal` is
+  the capacity divided by the fragment size, so `bytes` can exceed
+  `fragstotal * fragsize` and that subtraction underflows into a multi-gigabyte
+  write budget. `ioctl64` reports whole fragments, which keeps
+  `bytes <= fragstotal * fragsize` by construction.
+- **The host voice has to be open before `GETOSPACE` is answered.** BoxedWine
+  opens its SDL device lazily on the first `write`; wineoss asks for the
+  buffer geometry immediately after `SETFMT`/`SPEED`/`CHANNELS` and before any
+  write, so the lazy path would have described `KDspAudio`'s 11025/mono/U8
+  defaults rather than the format just negotiated. `ioctl64` opens the voice
+  first.
+
+The IA-32 `ioctl()` path keeps its own reads and writes through
+`thread->memory` at `IOCTL_ARG1`. The one behavioural change on that lane is
+the plan's §5.1 item 4: the four `kpanic`/`kpanic_fmt` calls on an unexpected
+length or value are now a logged `-EINVAL`. The `oss_audioinfo` and
+`oss_sysinfo` writers are shared between the two lanes
+(`source/kernel/devs/ossioctl.h`), which also fixed a field walk both devices
+had wrong in compensating ways -- `handle` written as 64 bytes and `song_name`
+as 32 in the mixer, `devnode` as 16 in both -- leaving `next_play_engine` and
+`next_rec_engine` landing inside `devnode`'s tail. Nothing Wine reads sat past
+the damage; the walk now follows `oss.h` field for field.
+
+**§5.2 scaffold.** `scripts/build-wine64-oss-driver.sh` builds the pair from
+the upstream Wine tarball matching the installed package's version, supplying
+the `<sys/soundcard.h>` Ubuntu lacks as the one-line wrapper over
+`<linux/soundcard.h>` that glibc used to ship -- and *checking*, by compiling a
+probe, that the kernel header still declares `oss_sysinfo`, `oss_audioinfo`,
+`SNDCTL_SYSINFO`, `SNDCTL_AUDIOINFO` and `SNDCTL_ENGINEINFO` before configuring
+anything. `--oss-driver-dir` stages the result;
+`.github/workflows/build-ios.yml` runs the driver build as a non-fatal step and
+passes the directory on only when both halves exist.
+
+**§5.0 inventory.** Both `scripts/build-wine64-runtime-ci.sh` and
+`scripts/validate-wine64-runtime.sh` report
+`WINE64_AUDIO_DRIVER name= unix= pe= status=` per driver and one
+`WINE64_AUDIO_INVENTORY` summary, and both fail on a half-present pair.
+
+**§5.3 registry.** `configureX64AudioDriver` in `source/sdl/startupArgs.cpp`
+sets `HKCU\Software\Wine\Drivers` `Audio` = `"oss"` in the prefix's `user.reg`,
+gated on both halves of the driver being present in the mounted module tree,
+and written through a temp file and a rename.
+
+**§5.4 host device.** `SDL_HINT_AUDIO_CATEGORY` is set to `playback` before
+`SDL_OpenAudioDevice`, so the ring/silent switch no longer mutes the guest, and
+`openAudio` now logs `BOXEDWINE_AUDIO_DEVICE` on success as well as failure.
+
+### Not landed
+
+**The CI driver build has never run.** It is written and syntax-checked but
+has not been executed on a runner, which is why the workflow step is
+`continue-on-error` and why the validator's hard requirement is behind
+`BOXEDVN_REQUIRE_WINE64_OSS=1` rather than always on. The next CI run answers
+three questions in its log: whether `linux-libc-dev`'s `<linux/soundcard.h>`
+satisfies the OSSv4 probe, whether Wine's `configure` accepts the shim
+(`HAVE_SYS_SOUNDCARD_H`), and whether `make dlls/wineoss.drv` produces a real
+PE `wineoss.drv` rather than the fake PE module Wine emits without a mingw
+cross compiler. Arm the gate once it has.
+
+**Capture is not implemented.** `SNDCTL_DSP_GETISPACE` answers an empty input
+buffer rather than `-ENODEV`, because refusing makes wineoss log an error every
+period, but there is no recording device behind it.
+
+**The fallback in §5 was not needed and was not built.** The ALSA shim over a
+new hostcall stays written down and unimplemented.

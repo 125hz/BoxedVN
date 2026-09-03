@@ -25,6 +25,27 @@
 
 #define DSP_BUFFER_SIZE (1024*32)
 
+// SDL's iOS backend picks the *ambient* AVAudioSession category by default,
+// which is silenced by the hardware ring/silent switch and ducked by whatever
+// else is playing. Nothing in ios/ configures AVAudioSession itself (a grep
+// for AVAudioSession, AVFAudio and setCategory over ios/ finds nothing), so
+// without this a user with the switch on hears no guest audio at all and has
+// no way to tell that from a broken driver.
+//
+// SDL_SetHint uses SDL_HINT_NORMAL priority, and SDL_GetHint prefers the
+// environment variable over a NORMAL-priority hint, so setting SDL_AUDIO_CATEGORY
+// in the environment still wins. The hint is read by coreaudio's
+// update_audio_session() when the device is opened, so it has to be in place
+// before SDL_OpenAudioDevice and not merely before SDL_Init.
+static void ensureAudioSessionCategory() {
+	static bool applied = false;
+	if (applied) {
+		return;
+	}
+	applied = true;
+	SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+}
+
 class KDspAudioSdl : public KDspAudio, public std::enable_shared_from_this<KDspAudioSdl> {
 public:
 	KDspAudioSdl() {
@@ -393,9 +414,14 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
         requested.freq = 44100;
     }
 #endif
+	ensureAudioSessionCategory();
 	SDL_AudioDeviceID newId = SDL_OpenAudioDevice(nullptr, 0, &requested, &this->got, SDL_AUDIO_ALLOW_ANY_CHANGE);
 	if (newId == 0) {
 		klog_fmt("Failed to open audio: %s", SDL_GetError());
+		klog_fmt("BOXEDWINE_AUDIO_DEVICE want=0x%x/%uHz/%uch got=none converted=0 "
+				 "status=failed error=%s",
+				 this->want.format, this->want.freq, this->want.channels,
+				 SDL_GetError());
 		return;
 	}
 	this->deviceId = newId;
@@ -414,9 +440,19 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
 		this->sameFormat = true;
 	}
 
-	this->open = true;	
+	this->open = true;
 	SDL_PauseAudioDevice(this->deviceId, 0);
 	klog_fmt("openAudio: freq=%d(got %d) format=%x(got %x) channels=%d(got %d)", this->want.freq, this->got.freq, this->want.format, this->got.format, this->want.channels, this->got.channels);
+	// One line that says whether a host device opened at all and whether the
+	// guest's format is being converted on the way to it. "Failed to open
+	// audio" above is the only thing this path used to say, and it said
+	// nothing on success -- so a silent run could not be told from a run with
+	// no device.
+	klog_fmt("BOXEDWINE_AUDIO_DEVICE want=0x%x/%uHz/%uch got=0x%x/%uHz/%uch "
+			 "converted=%d status=ok",
+			 this->want.format, this->want.freq, this->want.channels,
+			 this->got.format, this->got.freq, this->got.channels,
+			 this->sameFormat ? 0 : 1);
 }
 
 void KDspAudioSdl::closeAudio() {

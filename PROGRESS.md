@@ -7052,3 +7052,142 @@ fixed 10 MHz frequency on Linux.
 
 `0x06` is the program's own error number and says nothing further; nothing
 above is inferred from it.
+
+## The 64-bit lane can drive /dev/dsp, and Wine's own OSS driver is the client
+
+The 64-bit lane had no audio device and would have got none even if it asked.
+`/dev/dsp` and `/dev/mixer` were already there -- `startupArgs.cpp` registers
+them in the shared filesystem the 64-bit lane mounts, `sys_write64` already
+bounces the guest buffer into a host `std::vector<U8>` and calls
+`writeNative`, and `poll`/`ppoll` already drive the node's `waitForEvents`. The
+one gap was `ioctl`. `syscall64.cpp` has routed a device ioctl to
+`kf->openFile->ioctl64(cmd, a3, cpu->memory)` since the sound bridge went in,
+but no node overrode it: `fsopennode.h` returns `-ENOTTY` and every
+`SNDCTL_DSP_*` from a 64-bit guest was answered that way, which is where any
+OSS client gives up.
+
+So `DevDsp::ioctl64` and `DevMixer::ioctl64` now exist. Reading Wine 9.0's
+`dlls/wineoss.drv/oss.c` rather than guessing narrowed what they have to
+answer a long way, and moved where the risk is.
+
+**The gate is `oss_test_connect`, not the stream setup.** It opens
+`/dev/mixer` `O_RDONLY`, issues one `SNDCTL_SYSINFO`, and reports
+`Priority_Unavailable` if the open or the ioctl fails, `Priority_Low` unless
+`sysinfo.version[0]` is in `'4'`..`'9'` and `versionnum` comes back without
+its top bit, and `Priority_Preferred` otherwise. `mmdevapi` never loads a
+driver that reports Unavailable, so `/dev/mixer` answering that one request is
+what decides whether `/dev/dsp` is ever opened at all. The emulation already
+wrote `"OSS/Linux"`, `"4.0.0a"` and `0x040000`, so it passes -- but nothing had
+ever checked it, and `numaudios` has to be at least 1 or the enumeration loop
+that follows runs zero times and Wine reports no endpoints.
+
+**`SNDCTL_DSP_GETOSPACE` had an arithmetic trap in it.** `oss_write_data`
+takes `stream->oss_bufsize_bytes` as `bi.fragstotal * bi.fragsize` and then
+computes `(oss_bufsize_bytes - bi.bytes)` as an unsigned frame count. The
+IA-32 path fills `bytes` with the raw write capacity while `fragstotal` is
+that capacity divided by the fragment size, so for 48 kHz stereo 16-bit the
+numbers are `bytes=24000` against `fragstotal*fragsize=20480` -- the
+subtraction underflows and wineoss believes it has about four gigabytes of
+room. `ioctl64` reports whole fragments, so `bytes` is `fragments * fragsize`
+and cannot exceed `fragstotal * fragsize`. It also reports the space actually
+left (`getOutputSpaceAvailable(capacity, queued, true)`) rather than the full
+capacity every time, which is what makes the driver pace itself.
+
+**The host voice has to be open before the geometry is asked for.** BoxedWine
+opens its SDL device lazily on the first `write`, which is fine for a client
+that writes as soon as it has set a format. wineoss asks for `GETOSPACE`
+immediately after `SETFMT`/`SPEED`/`CHANNELS` and before writing anything, so
+the lazy path would have described `KDspAudio`'s 11025/mono/U8 defaults rather
+than the format just negotiated, and the driver would have sized its buffer
+from them. `ioctl64` opens the voice first.
+
+The IA-32 lane keeps its own reads and writes through `thread->memory` at
+`IOCTL_ARG1`; the 64-bit lane reads and writes through `KMemory64`, which is
+the whole reason `syscall64.cpp` was written to route through a separate entry
+point rather than call `ioctl()` with a truncated pointer. The one behaviour
+change on the IA-32 lane is deliberate: the four `kpanic`/`kpanic_fmt` calls on
+an unexpected length or value are now a logged `-EINVAL`. On this lane the
+caller is a sound driver, not a 1998 game, and taking the emulator down is
+never the right answer to a format it did not expect.
+
+The two `oss_audioinfo` writers and the `oss_sysinfo` writer are now shared
+between the devices in `source/kernel/devs/ossioctl.h`, behind a small
+width-agnostic accessor with a 32-bit and a 64-bit implementation. That also
+settled a field walk both devices had wrong in compensating ways -- the mixer
+wrote `handle` as 64 bytes and `song_name` as 32, both wrote `devnode` as 16 --
+which by luck left `latency` and `devnode` at the right offsets and
+`next_play_engine`/`next_rec_engine` inside `devnode`'s tail. Nothing Wine
+reads sat past the damage, which is why it never showed; the walk now follows
+`oss.h` field for field.
+
+## The driver Ubuntu does not build
+
+The route only works if the guest's Wine carries `wineoss`, and it does not.
+Wine's configure gates `dlls/wineoss.drv` on `<sys/soundcard.h>`, Ubuntu does
+not ship that header, and the amd64 package builds `winealsa` and `winepulse`
+instead -- neither of which can work here, because winepulse wants a
+PulseAudio daemon on a unix socket and winealsa wants `/dev/snd`, and the
+guest kernel emulates neither.
+
+`scripts/build-wine64-oss-driver.sh` builds the pair from the upstream tarball
+matching the installed package's version, which matters because Wine's
+PE/unix boundary (`__wine_unix_call`) is private and unversioned: a
+`wineoss.so` from a different Wine than the `mmdevapi.dll` beside it is
+undefined behaviour, not a degraded experience. The missing header is supplied
+as the one-line wrapper over `<linux/soundcard.h>` that glibc used to ship,
+and the script *checks* rather than assumes -- it compiles a probe that names
+`oss_sysinfo`, `oss_audioinfo`, `SNDCTL_SYSINFO`, `SNDCTL_AUDIOINFO` and
+`SNDCTL_ENGINEINFO` before configuring anything, so a kernel header that
+loses one of them fails by name instead of producing a driver that cannot
+enumerate a device.
+
+This has never run on a runner. That is why the workflow step is
+`continue-on-error`, why the runtime builder is handed `--oss-driver-dir` only
+when both halves exist, and why the validator's hard requirement sits behind
+`BOXEDVN_REQUIRE_WINE64_OSS=1` instead of being always on. A driver build that
+has never executed must not be able to stop a pipeline that ships four other
+lanes. What it cannot do is fail silently: the builder and the validator both
+now print `WINE64_AUDIO_DRIVER name= unix= pe= status=` for alsa, pulse and
+oss and one `WINE64_AUDIO_INVENTORY` summary, and both fail outright on a
+half-present pair, because the PE half loads the unix half by name and half a
+pair cannot load. Before this, an archive with no sound driver at all passed
+every check in the validator.
+
+## What the next device log says
+
+Before any process starts, on a 64-bit launch:
+
+- `BOXEDWINE_X64_AUDIO_DEVNODE path=/dev/dsp present=1 mode=0600 sound=1` and
+  the same for `/dev/mixer`.
+- `BOXEDWINE_X64_AUDIO_DRIVER packaged= registry= unix= pe= prefix=`.
+  `packaged=no` is the expected answer until a CI run builds the driver, and it
+  is followed by a line saying in words that mmdevapi will keep its built-in
+  backend order and the lane has no audio device. `packaged=yes registry=oss`
+  is the state to look for; `registry=present` means it was already set.
+- `packaged=half` is a packaging bug and says so.
+
+Then, if the driver is there and Wine reaches it:
+`BOXEDWINE_X64_MIXER op=SNDCTL_SYSINFO ... result=0` first -- that one line is
+`oss_test_connect` passing -- then `op=SNDCTL_AUDIOINFO`, then
+`BOXEDWINE_X64_DSP open pid= fmt= rate= channels= frag=` and one
+`BOXEDWINE_X64_DSP op= request= arg= value= result=` per distinct request code,
+budgeted at 24, so `SNDCTL_ENGINEINFO`, `SETFMT`, `SPEED` and `CHANNELS` appear
+once each and then the witness goes quiet. `BOXEDWINE_AUDIO_DEVICE want= got=
+converted= status=ok` says the host device opened and whether the guest's
+format is being converted, which nothing said before -- the path logged only
+`Failed to open audio` and said nothing at all on success. After that, one
+`BOXEDWINE_X64_DSP_STATS bytes/s= underruns= rate= channels= fmt= short=` every
+five seconds while audio is flowing.
+
+A run that gets that far and is still silent has one more thing to check that
+is not in the log: the iOS audio session. SDL's iOS backend picks the *ambient*
+category by default, which the hardware ring/silent switch mutes, and nothing
+in `ios/` configured `AVAudioSession` -- a grep for `AVAudioSession`,
+`AVFAudio` and `setCategory` over that tree found nothing. `kdspaudio.cpp` now
+sets `SDL_HINT_AUDIO_CATEGORY` to `playback` before `SDL_OpenAudioDevice`, at
+NORMAL priority so an `SDL_AUDIO_CATEGORY` in the environment still overrides
+it.
+
+A `result=-22` on any `BOXEDWINE_X64_DSP` line is the thing to chase: it means
+the emulation refused something wineoss asked for, and the line names the
+request and the value it was given.

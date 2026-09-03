@@ -90,8 +90,10 @@ jobs:
     runs-on: ubuntu-24.04
     # The i386 Wine package is 100 MB from the runner's Ubuntu mirror, which
     # served it at 110 kB/s on one run (15 minutes); the package is cached
-    # below, but an uncached run still has to fit.
-    timeout-minutes: 45
+    # below, but an uncached run still has to fit. The OSS driver step builds
+    # Wine's own configure and one dll from source and is bounded at 25
+    # minutes of that, so the job needs room for both worst cases at once.
+    timeout-minutes: 70
     steps:
       - name: Check out BoxedVN
         uses: actions/checkout@v6
@@ -103,7 +105,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             wine64 wine64-tools zip unzip gcc \
-            libx11-dev libxext-dev libxinerama-dev \
+            libx11-dev libxext-dev libxinerama-dev libxrandr-dev \
             libx11-6 libxext6 libxrender1 libxfixes3 libxcursor1 \
             libxcomposite1 libxi6 libxinerama1 libxxf86vm1 libxrandr2 \
             libx11-data \
@@ -183,6 +185,42 @@ jobs:
           fi
           echo "32-bit PE builtins: $(find "${pe32_dir}" -type f | wc -l)"
 
+      # Wine's OSS audio driver, which Ubuntu does not build: its configure
+      # gates dlls/wineoss.drv on <sys/soundcard.h>, so the package carries
+      # winealsa and winepulse instead -- and neither can work in BoxedWine,
+      # which emulates /dev/dsp and /dev/mixer but no PulseAudio socket and no
+      # /dev/snd. See docs/PLAN_X64_AUDIO.md.
+      #
+      # Non-fatal on purpose. This builds Wine from source against the same
+      # upstream version as the installed amd64 package, and that build has
+      # never run in this workflow before: a failure here must report itself
+      # and leave every other lane shippable, not stop the pipeline. The
+      # runtime builder is told about the driver only when both halves exist,
+      # and scripts/validate-wine64-runtime.sh names the absence either way.
+      # Arm the hard gate (BOXEDVN_REQUIRE_WINE64_OSS=1 on the validate step)
+      # once a run here has been seen to succeed.
+      - name: Build Wine's OSS audio driver
+        id: wineoss
+        continue-on-error: true
+        # Bounded so a Wine build that goes wrong cannot eat the job's budget
+        # and take the runtime layers down with it. A step timeout counts as a
+        # step failure, which continue-on-error absorbs; a job timeout would
+        # not be absorbed by anything.
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install --yes --no-install-recommends \
+            gcc-mingw-w64-x86-64 flex bison linux-libc-dev
+          # Ubuntu's package version carries an epoch and a packaging suffix;
+          # Wine's own release tarball is named for the upstream version
+          # alone. "1:9.0~repack-4build3" is upstream "9.0".
+          upstream="$(sed -E 's/^[0-9]+://; s/[~-].*$//' build/wine-i386/version.txt)"
+          echo "installed libwine upstream version: ${upstream}"
+          bash scripts/build-wine64-oss-driver.sh \
+            --output-dir build/wine64-oss \
+            --wine-version "${upstream}"
+
       - name: Build and validate Wine64 layers
         shell: bash
         env:
@@ -205,13 +243,25 @@ jobs:
           bash scripts/build-boxedwine-x64-vulkan.sh \
             --output-dir build/x64-vulkan \
             --winex11 "${winex11}"
+          # The OSS driver is passed only when both halves are there. Half a
+          # pair is a build failure in the runtime builder, by design: the PE
+          # half reaches the unix half through Wine's private
+          # __wine_unix_call boundary and cannot load without it.
+          oss_args=()
+          if [[ -s build/wine64-oss/wineoss.so && -s build/wine64-oss/wineoss.drv ]]; then
+            oss_args=(--oss-driver-dir build/wine64-oss)
+            echo "packaging Wine's OSS audio driver"
+          else
+            echo "no OSS audio driver was built; the runtime will carry no audio backend" >&2
+          fi
           bash scripts/build-wine64-runtime-ci.sh \
             --output-dir build/wine64-runtime \
             --dxmt-unixlib build/winemetal.so \
             --x11-shim-dir build/x64-x11 \
             --vulkan-shim build/x64-vulkan/libvulkan.so.1 \
             --dxvk-i386-dir ios/app/Dxvk \
-            --i386-pe-dir build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows
+            --i386-pe-dir build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows \
+            "${oss_args[@]+"${oss_args[@]}"}"
           bash scripts/validate-wine64-runtime.sh \
             --input build/wine64-runtime \
             --manifest build/wine64-runtime/wine64-runtime.manifest

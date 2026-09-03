@@ -500,6 +500,69 @@ done
 check_zip_path "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/libvulkan.so.1"
 check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/libvulkan.so.1"
 
+# ---------------------------------------------------------------------------
+# Audio inventory. See docs/PLAN_X64_AUDIO.md sections 5.0 and 5.2.
+#
+# This file had no audio assertion of any kind before: an archive that shipped
+# with no sound driver at all passed every check here, and the first anyone
+# knew of it was a guest with no audio endpoint. Report what is in the archive
+# by name, and fail on the two states that cannot work.
+#
+# Both halves or neither. wineoss.drv (PE) reaches wineoss.so (ELF) through
+# Wine's private, unversioned __wine_unix_call boundary, so a half-present
+# pair is undefined behaviour rather than a degraded driver -- and a driver
+# built against a different Wine version than the mmdevapi.dll beside it is
+# the same problem wearing a different hat.
+audio_drivers_ok=""
+for audio_driver in winealsa winepulse wineoss; do
+    audio_unix_state="absent"
+    audio_pe_state="absent"
+    zip_has "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-unix/${audio_driver}.so" \
+        && audio_unix_state="present"
+    zip_has "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-windows/${audio_driver}.drv" \
+        && audio_pe_state="present"
+    if [[ "${audio_unix_state}" == "present" && "${audio_pe_state}" == "present" ]]; then
+        audio_status="ok"
+        audio_drivers_ok="${audio_drivers_ok}${audio_drivers_ok:+,}${audio_driver#wine}"
+    elif [[ "${audio_unix_state}" == "absent" && "${audio_pe_state}" == "absent" ]]; then
+        audio_status="absent"
+    else
+        audio_status="half"
+    fi
+    ok "WINE64_AUDIO_DRIVER name=${audio_driver#wine} unix=${audio_unix_state} pe=${audio_pe_state} status=${audio_status}"
+    if [[ "${audio_status}" == "half" ]]; then
+        die "'$(basename "${WINE_ARCHIVE}")' carries only one half of ${audio_driver} (unix=${audio_unix_state}, pe=${audio_pe_state}).\nWine's PE user driver loads its unix half by name through __wine_unix_call; half a pair cannot load and must never ship."
+    fi
+done
+
+audio_pe_summary=""
+for audio_module in mmdevapi.dll dsound.dll xaudio2_9.dll winmm.dll; do
+    audio_module_state="absent"
+    zip_has "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-windows/${audio_module}" \
+        && audio_module_state="present"
+    audio_pe_summary="${audio_pe_summary}${audio_pe_summary:+ }${audio_module%.dll}=${audio_module_state}"
+done
+ok "WINE64_AUDIO_INVENTORY drivers=${audio_drivers_ok:-none} ${audio_pe_summary}"
+
+# The gate for the OSS route. It is armed by the caller rather than always on
+# because the driver has to be built from Wine source in CI (Ubuntu does not
+# package it), and an archive with no audio is still an archive that runs
+# every other lane. Set BOXEDVN_REQUIRE_WINE64_OSS=1 once the CI driver build
+# is proven, and a runtime that silently lost the pair stops being shippable.
+if [[ "${BOXEDVN_REQUIRE_WINE64_OSS:-0}" == "1" ]]; then
+    check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-unix/wineoss.so"
+    check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" \
+        "${WINE_MODULE_ROOT}/x86_64-unix/wineoss.so"
+    check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-windows/wineoss.drv"
+    check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" \
+        "${WINE_MODULE_ROOT}/x86_64-windows/wineoss.drv"
+elif [[ ",${audio_drivers_ok}," != *",oss,"* ]]; then
+    warn "wineoss.so + wineoss.drv are not in '$(basename "${WINE_ARCHIVE}")'. A 64-bit guest has no audio backend it can reach: winepulse needs a PulseAudio daemon and winealsa needs /dev/snd, and BoxedWine emulates neither. Build the pair with scripts/build-wine64-oss-driver.sh, pass it to the runtime builder with --oss-driver-dir, then set BOXEDVN_REQUIRE_WINE64_OSS=1 here."
+fi
+if [[ ! " ${audio_pe_summary} " == *"mmdevapi=present"* ]]; then
+    warn "'$(basename "${WINE_ARCHIVE}")' has no mmdevapi.dll. winmm, dsound and xaudio2 all reach a device through it, so the guest cannot enumerate an audio endpoint at all."
+fi
+
 # Wine's built-in bitmap fonts, at the data root and reachable through the
 # derived path the guest actually asks for. A device run showed every one of
 # these opens failing.

@@ -11,7 +11,7 @@
 #   scripts/build-wine64-runtime-ci.sh --output-dir DIR \
 #       [--dxmt-unixlib PATH] [--x11-shim-dir DIR] \
 #       [--vulkan-shim PATH] [--dxvk-i386-dir DIR] \
-#       [--i386-pe-dir DIR]
+#       [--i386-pe-dir DIR] [--oss-driver-dir DIR]
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
@@ -90,6 +90,31 @@ WOW64_LANE_PE32_MODULES=(
 # warning that answers the question on the next CI run rather than a failure
 # that could stop a build for a feature the launch has to opt into.
 WOW64_LANE_PE32_VULKAN_MODULES=(vulkan-1.dll winevulkan.dll)
+# Wine's OSS audio driver, built by scripts/build-wine64-oss-driver.sh from the
+# same Wine version the amd64 package provides. See docs/PLAN_X64_AUDIO.md.
+#
+# Ubuntu does not build this driver: Wine's configure needs <sys/soundcard.h>,
+# which Ubuntu does not ship, so the package carries winealsa and winepulse
+# instead. Neither of those can work here -- winepulse wants a PulseAudio
+# daemon on a unix socket, winealsa wants /dev/snd -- while wineoss talks to
+# /dev/dsp and /dev/mixer with raw ioctls, and BoxedWine already emulates
+# exactly those two devices for the IA-32 lane.
+#
+# The two halves are one unit. wineoss.drv (PE) reaches wineoss.so (ELF)
+# through __wine_unix_call, which is a private, unversioned interface: a .so
+# from a different Wine version paired with this mmdevapi.dll is undefined
+# behaviour, not a degraded experience. So both halves are checked, and a
+# half-present pair fails the build.
+OSS_DRIVER_DIR=""
+OSS_DRIVER_UNIX_NAME="wineoss.so"
+OSS_DRIVER_PE_NAME="wineoss.drv"
+# The audio modules the inventory reports on. The three unix drivers answer
+# "what could the guest possibly talk to", and the PE modules answer "can the
+# guest even ask" -- mmdevapi is what winmm, dsound and xaudio2 all reach
+# audio through, and a tree without it has no audio path at all regardless of
+# which driver is present.
+AUDIO_UNIX_DRIVERS=(winealsa winepulse wineoss)
+AUDIO_PE_MODULES=(mmdevapi.dll dsound.dll xaudio2_9.dll winmm.dll)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir needs a value"
@@ -104,6 +129,8 @@ while [[ $# -gt 0 ]]; do
                           DXVK_I386_DIR="$2"; shift 2 ;;
         --i386-pe-dir) [[ $# -ge 2 ]] || die "--i386-pe-dir needs a value"
                         I386_PE_DIR="$2"; shift 2 ;;
+        --oss-driver-dir) [[ $# -ge 2 ]] || die "--oss-driver-dir needs a value"
+                           OSS_DRIVER_DIR="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -629,6 +656,91 @@ is_elf64_x86_64 "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/winex11.so" \
 [[ "$(head -c 2 "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/winex11.drv")" == "MZ" ]] \
     || die "The packaged winex11.drv is not a PE image."
 log "X11 user driver packaged: winex11.drv + winex11.so"
+
+# ---------------------------------------------------------------------------
+# Audio. See docs/PLAN_X64_AUDIO.md sections 5.0 and 5.2.
+#
+# Step one is a fact-finding step, not an assumption: report what the archive
+# actually carries for every audio driver, by name, so "we think Ubuntu ships
+# winealsa" becomes a recorded fact in the build log. Nothing checked any of
+# this before -- the validator's required lists had no audio entry of any
+# kind, and the builder failed a missing font backend but said nothing about
+# a missing sound driver.
+if [[ -n "${OSS_DRIVER_DIR}" ]]; then
+    [[ -d "${OSS_DRIVER_DIR}" ]] \
+        || die "--oss-driver-dir '${OSS_DRIVER_DIR}' is not a directory."
+    oss_unix_src="${OSS_DRIVER_DIR}/${OSS_DRIVER_UNIX_NAME}"
+    oss_pe_src="${OSS_DRIVER_DIR}/${OSS_DRIVER_PE_NAME}"
+    # Named individually: a caller who built only one half has to be told
+    # which one is missing, not that "the directory is wrong".
+    [[ -s "${oss_unix_src}" ]] \
+        || die "--oss-driver-dir '${OSS_DRIVER_DIR}' has no ${OSS_DRIVER_UNIX_NAME}. Run scripts/build-wine64-oss-driver.sh first; it builds both halves from the pinned Wine sources."
+    [[ -s "${oss_pe_src}" ]] \
+        || die "--oss-driver-dir '${OSS_DRIVER_DIR}' has no ${OSS_DRIVER_PE_NAME}. Run scripts/build-wine64-oss-driver.sh first; it builds both halves from the pinned Wine sources."
+    is_elf64_x86_64 "${oss_unix_src}" \
+        || die "'${oss_unix_src}' is not an x86-64 ELF shared object. The unix half of a Wine driver is an ELF .so built for the host architecture of the guest, which on this lane is x86-64."
+    require_pe_machine "${oss_pe_src}" 34404 "64-bit Wine OSS user driver"
+    cp "${oss_unix_src}" "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/${OSS_DRIVER_UNIX_NAME}"
+    cp "${oss_pe_src}" "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${OSS_DRIVER_PE_NAME}"
+    log "Wine OSS audio driver packaged: ${OSS_DRIVER_PE_NAME} + ${OSS_DRIVER_UNIX_NAME}"
+else
+    warn "No --oss-driver-dir: the runtime carries no wineoss pair, so a 64-bit guest has no audio backend it can reach. See docs/PLAN_X64_AUDIO.md section 5.2."
+fi
+
+audio_drivers_present=0
+audio_driver_summary=""
+for audio_driver in "${AUDIO_UNIX_DRIVERS[@]}"; do
+    audio_unix_path="${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/${audio_driver}.so"
+    audio_pe_path="${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${audio_driver}.drv"
+    audio_unix_state="absent"
+    audio_pe_state="absent"
+    [[ -s "${audio_unix_path}" ]] && audio_unix_state="present"
+    [[ -s "${audio_pe_path}" ]] && audio_pe_state="present"
+    if [[ "${audio_unix_state}" == "present" && "${audio_pe_state}" == "present" ]]; then
+        audio_status="ok"
+        audio_drivers_present=$((audio_drivers_present + 1))
+        audio_driver_summary="${audio_driver_summary}${audio_driver_summary:+,}${audio_driver}"
+    elif [[ "${audio_unix_state}" == "absent" && "${audio_pe_state}" == "absent" ]]; then
+        audio_status="absent"
+    else
+        audio_status="half"
+    fi
+    log "WINE64_AUDIO_DRIVER name=${audio_driver#wine} unix=${audio_unix_state} pe=${audio_pe_state} status=${audio_status}"
+    if [[ "${audio_status}" == "half" ]]; then
+        # Half a driver is always a packaging bug, because the PE half loads
+        # the unix half by name through __wine_unix_call and gives up when it
+        # cannot. For our own driver that is a build failure; for the distro's
+        # it is a warning, because neither alsa nor pulse can work on this
+        # lane anyway and stopping the build for one would cost a runtime
+        # that is otherwise fine.
+        if [[ "${audio_driver}" == "wineoss" ]]; then
+            die "The staged tree has only one half of the OSS driver (unix=${audio_unix_state}, pe=${audio_pe_state}). wineoss.drv reaches wineoss.so through Wine's private __wine_unix_call boundary; half a pair is undefined behaviour, not a degraded driver."
+        fi
+        warn "The staged tree has only one half of ${audio_driver} (unix=${audio_unix_state}, pe=${audio_pe_state}). That driver cannot load."
+    fi
+done
+
+audio_pe_summary=""
+for audio_module in "${AUDIO_PE_MODULES[@]}"; do
+    audio_module_state="absent"
+    [[ -s "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${audio_module}" ]] \
+        && audio_module_state="present"
+    audio_pe_summary="${audio_pe_summary}${audio_pe_summary:+ }${audio_module%.dll}=${audio_module_state}"
+done
+log "WINE64_AUDIO_INVENTORY drivers=${audio_driver_summary:-none} count=${audio_drivers_present} ${audio_pe_summary}"
+
+# mmdevapi is the one PE module that is not optional: winmm, dsound and
+# xaudio2 all reach a device through CoCreateInstance(MMDeviceEnumerator),
+# so a tree without it has no audio path at all no matter which driver is
+# staged. A warning rather than a failure -- it is a core Wine builtin and
+# has never been observed missing, and a runtime with no audio is still a
+# runtime that runs.
+if [[ ! -s "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/mmdevapi.dll" ]]; then
+    warn "The staged Wine tree has no mmdevapi.dll. Nothing in the guest can enumerate an audio endpoint, so no audio driver can be reached."
+fi
+if [[ "${audio_drivers_present}" -eq 0 ]]; then
+    warn "The staged Wine tree carries no complete audio driver pair. A 64-bit guest will find no audio endpoint."
+fi
 
 # Fontconfig's default configuration. Without /etc/fonts/fonts.conf the library
 # loads and then reports "Cannot load default config file", which leaves Wine
