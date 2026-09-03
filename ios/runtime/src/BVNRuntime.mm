@@ -1229,17 +1229,25 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
 extern "C" bool BVNRuntimeRequestShutdown(void) {
     pthread_mutex_lock(&gMutex);
     const bool running = (gState == BVNRuntimeStateRunning);
+    // A guest that is already unwinding still accepts the request. The state
+    // moves to stopping on the first tap and boxedmain can hold the main
+    // thread for seconds afterwards, so treating the second tap as "no guest
+    // is running" put an error alert over a session that was stopping
+    // normally, and lost the repeat SDL_QUIT that a stuck guest needs.
+    const bool stopping = (gState == BVNRuntimeStateStopping);
     if (running) {
         gState = BVNRuntimeStateStopping;
         gShutdownRequested = true;
     }
     pthread_mutex_unlock(&gMutex);
 
-    if (!running) {
+    if (!running && !stopping) {
         return false;
     }
 
-    BVNLogWrite(BVNLogLevelInfo, "runtime", "shutdown requested; posting SDL_QUIT");
+    BVNLogWrite(BVNLogLevelInfo, "runtime",
+                running ? "shutdown requested; posting SDL_QUIT"
+                        : "shutdown requested again; posting SDL_QUIT");
 
     // SDL_PushEvent is documented as thread safe and is the supported way to
     // ask an SDL application to quit from another thread.  Boxedwine's event

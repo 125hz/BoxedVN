@@ -2053,11 +2053,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 - (void)positionCursor {
     CGFloat guestWidth = 0.0;
     CGFloat guestHeight = 0.0;
-    // In the live view Wine's own cursor is drawn into SDL's hidden window,
-    // so the overlay shows the guest's cursor bitmap itself, in direct-tap
-    // mode too. The ring remains a trackpad-only aid.
-    const BOOL hosted = BVNGuestPresentationHostView() != nil;
-    if ((!self.trackpadMode && !hosted) || !self.startupNotice.hidden ||
+    // Direct-tap mode shows no cursor at all, in the live view host as well.
+    // Showing the guest's bitmap there put a second, hotspot-shifted copy of
+    // the pointer next to the one Wine already draws, which on the desktop
+    // read as a black rectangle beside the cursor. The cursor belongs to
+    // trackpad mode, where the finger is not on the pointer.
+    if (!self.trackpadMode || !self.startupNotice.hidden ||
         ![self guestSizeWidth:&guestWidth height:&guestHeight]) {
         self.cursorView.hidden = YES;
         self.guestCursorView.hidden = YES;
@@ -2078,7 +2079,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     // cursor so a touch-only trackpad never loses position feedback. The
     // Wine-only mode is deliberately literal: no bitmap and a guest hide
     // request both produce no cursor.
-    self.guestCursorView.hidden = (!self.guestCursorMode && !hosted) ||
+    self.guestCursorView.hidden = !self.guestCursorMode ||
                                   self.guestCursorView.image == nil ||
         (self.wineCursorOnlyMode && !self.guestCursorVisible);
     if (!self.guestCursorView.hidden) {
@@ -2086,19 +2087,31 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         const CGFloat guestScale = self.guestCursorUsesFallback
             ? MAX(0.5, [defaults doubleForKey:kBVNPointerSizeKey] / 22.0)
             : 1.0;
-        const CGPoint topLeftGuest = CGPointMake(
-            self.cursorGuestPoint.x - self.guestCursorHotspot.x * guestScale,
-            self.cursorGuestPoint.y - self.guestCursorHotspot.y * guestScale);
-        const CGPoint bottomRightGuest = CGPointMake(
-            topLeftGuest.x + self.guestCursorPixelSize.width * guestScale,
-            topLeftGuest.y + self.guestCursorPixelSize.height * guestScale);
-        const CGPoint topLeft = [self overlayPointForGuestPoint:topLeftGuest];
-        const CGPoint bottomRight =
-            [self overlayPointForGuestPoint:bottomRightGuest];
+        // Anchored on the cursor point the ring already uses, with one scale
+        // taken from the picture's own mapping. Mapping the bitmap's two
+        // corners independently, as this did, let a corner that falls outside
+        // the picture take a different branch of overlayPointForGuestPoint
+        // from the other one: the frame then stretched away from the pointer
+        // and the cursor bitmap was drawn as a bar beside it.
+        const CGPoint pictureOrigin =
+            [self overlayPointForGuestPoint:CGPointZero];
+        const CGPoint pictureFar = [self overlayPointForGuestPoint:
+            CGPointMake(guestWidth, guestHeight)];
+        CGFloat scaleX = fabs(pictureFar.x - pictureOrigin.x) /
+                         MAX(1.0, guestWidth);
+        CGFloat scaleY = fabs(pictureFar.y - pictureOrigin.y) /
+                         MAX(1.0, guestHeight);
+        if (scaleX <= 0.0 || scaleY <= 0.0) {
+            scaleX = 1.0;
+            scaleY = 1.0;
+        }
+        const CGSize size = CGSizeMake(
+            MAX(1.0, self.guestCursorPixelSize.width * guestScale * scaleX),
+            MAX(1.0, self.guestCursorPixelSize.height * guestScale * scaleY));
         self.guestCursorView.frame = CGRectMake(
-            MIN(topLeft.x, bottomRight.x), MIN(topLeft.y, bottomRight.y),
-            MAX(1.0, fabs(bottomRight.x - topLeft.x)),
-            MAX(1.0, fabs(bottomRight.y - topLeft.y)));
+            cursorPoint.x - self.guestCursorHotspot.x * guestScale * scaleX,
+            cursorPoint.y - self.guestCursorHotspot.y * guestScale * scaleY,
+            size.width, size.height);
         [self bringSubviewToFront:self.guestCursorView];
     }
     [self bringSubviewToFront:self.cursorView];

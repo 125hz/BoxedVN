@@ -241,19 +241,19 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     }
     // The metal view and the overlay place into whatever this reports.
     gActivePresentationHost = host;
-    if (root.superview != host) {
-        [root removeFromSuperview];
-        root.frame = host.bounds;
-        root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
-                                UIViewAutoresizingFlexibleHeight;
-        [host insertSubview:root atIndex:0];
-    }
     // Not hidden: the platform layer shows and raises SDL's window again on
     // the first frame (KNativeScreenSDL::showWindow), which un-hid the
     // emptied window and painted the whole screen black on the first live
     // view run. A transparent, non-interactive window below the library
     // window stays out of sight whatever SDL does to it, while SDL still
     // sees a visible window and keeps drawing.
+    //
+    // The window state is set BEFORE the view moves. UIKit re-installs a
+    // window's rootViewController.view when the window becomes visible, so
+    // un-hiding it after the move undid the move in the same call: the first
+    // live view attach of the 64-bit desktop logged rootSuperview=
+    // UIDropShadowView, and the desktop stayed inside the invisible window
+    // for the whole portrait session.
     guestWindow.windowLevel = UIWindowLevelNormal - 1.0;
     guestWindow.alpha = 0.0;
     guestWindow.userInteractionEnabled = NO;
@@ -261,6 +261,13 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     self.libraryWindow.windowLevel = UIWindowLevelNormal;
     self.libraryWindow.hidden = NO;
     [self.libraryWindow makeKeyAndVisible];
+    if (root.superview != host) {
+        [root removeFromSuperview];
+        root.frame = host.bounds;
+        root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                UIViewAutoresizingFlexibleHeight;
+        [host insertSubview:root atIndex:0];
+    }
     BVNGuestOverlayInstall();
     BVNDXMTDisplayAttach();
     BVNSyncGuestX11PatchGeometry(root);
@@ -290,7 +297,10 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
             NSStringFromClass([window.rootViewController class]),
             (unsigned long)window.subviews.count];
     }
-    UIView* host = gGuestPresentationHost;
+    // The ACTIVE host, not the page's: during a landscape turn the guest lives
+    // in the full-screen host, and reporting the page host made every
+    // landscape line read rootInHost=0 as if the move had failed.
+    UIView* host = gActivePresentationHost ?: gGuestPresentationHost;
     UIView* root = [super window].rootViewController.view;
     [text appendFormat:@" | host=%@ hostWindow=%@ hostFrame=%.0fx%.0f rootSuperview=%@ rootFrame=%.0fx%.0f rootInHost=%d",
         host ? NSStringFromClass([host class]) : @"nil",
@@ -364,6 +374,28 @@ static UIDeviceOrientation gFullscreenOrientation = UIDeviceOrientationUnknown;
     }
     [self.libraryWindow bringSubviewToFront:gFullscreenPresentationHost];
     return gFullscreenPresentationHost;
+}
+
+// Full screen means full screen: the status bar and the home indicator sat on
+// top of the guest, with the clock, the battery and the navigation breadcrumb
+// across the picture. The interface itself stays portrait (the host is rotated
+// by transform), so UIKit has no reason to take them away by itself.
+//
+// The preference belongs to the library window's root view controller, which
+// is SwiftUI's hosting controller; the page expresses it with .statusBarHidden
+// and .persistentSystemOverlays on the notification posted here. The two
+// update requests are what make UIKit ask the controller again.
+- (void)setLiveViewFullscreen:(BOOL)fullscreen {
+    if (_liveViewFullscreen == fullscreen) {
+        return;
+    }
+    _liveViewFullscreen = fullscreen;
+    [NSNotificationCenter.defaultCenter
+        postNotificationName:@"BVNGuestLiveViewFullscreenDidChange"
+                      object:nil];
+    UIViewController* root = self.libraryWindow.rootViewController;
+    [root setNeedsStatusBarAppearanceUpdate];
+    [root setNeedsUpdateOfHomeIndicatorAutoHidden];
 }
 
 - (void)deviceOrientationDidChange:(NSNotification*)notification {
@@ -678,6 +710,15 @@ static UIDeviceOrientation gFullscreenOrientation = UIDeviceOrientationUnknown;
 - (void)finishGuestPresentation {
     NSAssert(NSThread.isMainThread, @"Guest presentation must finish on main");
     self.guestOrientationLocked = NO;
+    // A session that ended while the guest owned the whole screen has to give
+    // it back here: the black full-screen host outlives SDL's window, and
+    // nothing else drops it while the page keeps its own host registered.
+    // The setter restores the status bar and the home indicator.
+    self.liveViewFullscreen = NO;
+    gActivePresentationHost = nil;
+    [gFullscreenPresentationHost removeFromSuperview];
+    gFullscreenPresentationHost = nil;
+    gFullscreenOrientation = UIDeviceOrientationUnknown;
     [self.libraryWindow.rootViewController
         setNeedsUpdateOfSupportedInterfaceOrientations];
 }
@@ -1000,6 +1041,10 @@ extern "C" UIView* BVNGuestPresentationHostView(void) {
         return nil;
     }
     return gActivePresentationHost ?: gGuestPresentationHost;
+}
+
+extern "C" bool BVNGuestLiveViewIsFullscreen(void) {
+    return gAppDelegate.liveViewFullscreen == YES;
 }
 
 extern "C" void BVNGuestPresentationSetHostView(void* pointer) {
@@ -2012,6 +2057,54 @@ extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
     }
 }
 
+// SDL takes its root view back, and nothing noticed.
+//
+// -[SDL_uikitview setSDLWindow:] makes each view SDL creates the view
+// controller's view and then re-assigns uiwindow.rootViewController, which
+// re-adds that view to SDL's own window; UIKit does the same when a window
+// that lost its root view becomes visible. Either way the guest picture
+// silently leaves the live view host and lands in the transparent window
+// below the library, which is exactly the reported "the 64-bit desktop does
+// not appear in portrait": on device the desktop only came back when an
+// orientation change happened to re-run the attach.
+//
+// The deferred re-check that used to cover this never ran - the device log
+// has no "attach+3s" line at all, because boxedmain owns the main thread and
+// nothing drains the main queue while a guest runs. This runs from the
+// emulator's own 200 ms poll instead, the one loop that is guaranteed to
+// keep turning, and does nothing at all while the view is where it belongs.
+static void BVNReassertGuestPresentationHost(void) {
+    UIView* host = gActivePresentationHost ?: gGuestPresentationHost;
+    BVNAppDelegate* delegate = gAppDelegate;
+    if (host == nil || delegate == nil || host.window == nil) {
+        return;
+    }
+    UIView* root = [delegate superWindowForGuest].rootViewController.view;
+    if (root == nil || root.superview == host) {
+        return;
+    }
+    // At most one re-take a second. If UIKit ever refuses the move outright,
+    // this must not turn into an attach (and two log lines) every 200 ms.
+    static CFTimeInterval lastReattach = 0.0;
+    const CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastReattach < 1.0) {
+        return;
+    }
+    lastReattach = now;
+    static uint64_t driftCount = 0;
+    ++driftCount;
+    if (driftCount <= 8 || driftCount % 60 == 0) {
+        NSString* message = [NSString stringWithFormat:
+            @"BOXEDVN_PRESENTATION_DRIFT #%llu: SDL's view left the live view "
+             "host (now in %@); taking it back.",
+            (unsigned long long)driftCount,
+            root.superview ? NSStringFromClass([root.superview class])
+                           : @"nothing"];
+        BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
+    }
+    [delegate attachGuestPresentationToHost:host];
+}
+
 // Re-fits the guest picture when the window has changed shape, and reports
 // whether it did.
 //
@@ -2026,7 +2119,13 @@ extern "C" void BVNGuestPresentationNaturalDrawableSize(int* width,
 // Cheap by construction: two struct comparisons, and it only does work when
 // the answer has actually changed.
 extern "C" bool BVNSyncGuestPresentationGeometry(void) {
-    if (!NSThread.isMainThread || gGuestPresentationSurface == nullptr) {
+    if (!NSThread.isMainThread) {
+        return false;
+    }
+    // Before the Vulkan-surface check: the software-rendered desktop has no
+    // surface at all, and it is the path that loses its view.
+    BVNReassertGuestPresentationHost();
+    if (gGuestPresentationSurface == nullptr) {
         return false;
     }
     NSValue* key = [NSValue valueWithPointer:gGuestPresentationSurface];

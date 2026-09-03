@@ -118,11 +118,29 @@ enum DocumentImportError: LocalizedError {
 
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
+    /// True while a landscape turn has handed the guest the whole screen.
+    ///
+    /// The app delegate rotates a full-screen host over this window and keeps
+    /// the interface itself portrait, so UIKit has no reason to take the
+    /// status bar and the home indicator away - the clock, the battery and
+    /// the navigation breadcrumb were drawn across the guest. The preference
+    /// belongs to this window's root view controller, which is the hosting
+    /// controller for this view, so it is expressed here.
+    @State private var guestFullscreen = false
+
+    private let fullscreenChanges = NotificationCenter.default.publisher(
+        for: Notification.Name("BVNGuestLiveViewFullscreenDidChange"))
 
     var body: some View {
         NavigationStack {
             LibraryView()
                 .navigationTitle("BoxedVN")
+        }
+        .statusBarHidden(guestFullscreen)
+        .persistentSystemOverlays(guestFullscreen ? .hidden : .automatic)
+        .onAppear { guestFullscreen = BVNGuestLiveViewIsFullscreen() }
+        .onReceive(fullscreenChanges) { _ in
+            guestFullscreen = BVNGuestLiveViewIsFullscreen()
         }
         .alert("BoxedVN", isPresented: .constant(model.alertMessage != nil)) {
             Button("OK") { model.alertMessage = nil }
@@ -376,6 +394,10 @@ struct GuestLiveLog: View {
 /// running guest through the runtime's control API.
 struct GuestControlBar: View {
     let active: Bool
+    /// Stopping is the page's business, not just the runtime's: the page has
+    /// to leave the running state at once, because the poll that publishes the
+    /// runtime state cannot run while the guest still owns the main thread.
+    let onStop: () -> Void
     @State private var pointerMode = Int(BVNGuestControlsPointerMode())
 
     private var running: Bool { active }
@@ -392,9 +414,7 @@ struct GuestControlBar: View {
             control("space", "Space") { BVNGuestControlsTapKeyNamed("Space") }
             textControl("esc", "Esc") { BVNGuestControlsTapKeyNamed("Escape") }
             textControl("tab", "Tab") { BVNGuestControlsTapKeyNamed("Tab") }
-            control("stop.circle", "Stop", tint: .red) {
-                _ = BVNRuntimeRequestShutdown()
-            }
+            control("stop.circle", "Stop", tint: .red) { onStop() }
         }
         .frame(maxWidth: .infinity)
         .disabled(!running)
@@ -528,7 +548,14 @@ struct ContainerDetailView: View {
                 .frame(maxWidth: .infinity)
                 .background(Color.black)
                 .listRowInsets(EdgeInsets())
-                GuestControlBar(active: launched)
+                GuestControlBar(active: launched, onStop: {
+                    // The page returns to its idle state on the tap. The guest
+                    // can take seconds to unwind on the main thread, and the
+                    // runtime-state poll is stuck behind it, so waiting for
+                    // the state to change left the whole page looking frozen.
+                    launched = false
+                    model.requestShutdown()
+                })
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 6, leading: 4, bottom: 6, trailing: 4))
                 if launched {

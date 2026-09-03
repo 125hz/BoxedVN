@@ -905,8 +905,28 @@ final class AppModel: ObservableObject {
     }
 
     func requestShutdown() {
-        if !Session.requestShutdown() {
+        // Already on the way out: a second tap is not an error, and must not
+        // put an alert over a page that is waiting for the guest to unwind.
+        guard runtimeState != .stopping else {
+            Task.detached(priority: .userInitiated) {
+                Session.requestShutdown()
+            }
+            return
+        }
+        guard runtimeState == .running || runtimeState == .starting else {
             alertMessage = "No guest session is running."
+            return
+        }
+        // Published now rather than at the next poll. The poll timer is a main
+        // run-loop timer and the guest owns the main thread until it has
+        // finished unwinding, so on device the page kept saying "running" -
+        // and the whole UI looked frozen - for as long as that took.
+        runtimeState = .stopping
+        // SDL_PushEvent takes the event queue's lock, which the guest loop
+        // holds for stretches of its own, so the tap itself is answered off
+        // the main thread.
+        Task.detached(priority: .userInitiated) {
+            Session.requestShutdown()
         }
     }
 

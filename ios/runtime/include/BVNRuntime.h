@@ -438,6 +438,14 @@ void BVNGuestLoadingUpdateJITProgress(size_t allocationCount);
 // full-screen presentation. Main thread only.
 void BVNGuestPresentationSetHostView(void* uiView);
 
+// True while a landscape turn has given the guest the whole screen over the
+// library window. The page reads it to hide the status bar and the home
+// indicator, which would otherwise sit across the rotated picture: the
+// interface itself stays portrait, so UIKit keeps drawing them. It changes on
+// the main thread and posts "BVNGuestLiveViewFullscreenDidChange" (no object)
+// through NSNotificationCenter when it does.
+bool BVNGuestLiveViewIsFullscreen(void);
+
 // Live-view readout: the presented frame rate and its frame time, sampled by
 // the same counter that fed the in-guest overlay. Either pointer may be NULL.
 void BVNGuestPerformanceSnapshot(double* framesPerSecond,

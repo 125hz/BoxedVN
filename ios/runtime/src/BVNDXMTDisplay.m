@@ -128,6 +128,10 @@ static CAMetalLayer* gDisplayLayer = nil;
 // The window the view was attached to; SDL's delegate can stop reporting a
 // window while the guest still presents into this one.
 static __weak UIWindow* gDisplayWindow = nil;
+// Set from the DXMT dispatcher's thread on the first present; consumed on the
+// main thread by the placement below and by the attach, which must not put an
+// opaque black layer over a desktop that DXMT has never drawn into.
+static _Atomic(bool) gDisplayPresented = false;
 
 static CAMetalLayer* BVNDXMTRegisteredLayer(void) {
     pthread_mutex_lock(&gDisplayLock);
@@ -178,6 +182,15 @@ void BVNDXMTDisplayAttach(void) {
         return;
     }
     gDisplayWindow = window;
+    // The layer is opaque black until DXMT presents into it, and it is
+    // attached for every session that *might* use DXMT - including the plain
+    // Wine desktop, which never presents a single frame through it. Attaching
+    // it visible therefore covered the software desktop with a black
+    // rectangle the size of SDL's view. It stays hidden until a frame has
+    // been presented; BVNDXMTDisplayPlaceOnMain, reached from the emulator's
+    // ordering poll, unhides it on the first one (and
+    // BVNDXMTDisplayNoteProcessExited hides it again for the same reason).
+    view.hidden = !atomic_load_explicit(&gDisplayPresented, memory_order_acquire);
     if (view.superview != container) {
         [view removeFromSuperview];
         view.frame = container.bounds;
@@ -211,9 +224,6 @@ bool BVNDXMTDisplayHasLayer(void) {
     return BVNDXMTRegisteredLayer() != nil;
 }
 
-// Set from the DXMT dispatcher's thread on the first present; consumed on the
-// main thread by the placement below.
-static _Atomic(bool) gDisplayPresented = false;
 static _Atomic(bool) gDisplayPlacementQueued = false;
 static _Atomic(uint32_t) gDisplayPresenterPid = 0;
 static bool gDisplayFronted = false;
