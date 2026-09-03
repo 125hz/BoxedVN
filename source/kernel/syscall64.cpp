@@ -2878,10 +2878,17 @@ static U64 buildSignalFrame(CPU64* cpu, U64 framePtr) {
     cpu->memory->writeq(gregsPtr + 8 * X64_GREG_RSP, cpu->reg[X64_RSP].u64);
     cpu->memory->writeq(gregsPtr + 8 * X64_GREG_RIP, cpu->rip);
     cpu->memory->writeq(gregsPtr + 8 * X64_GREG_EFL, (U64)cpu->rflags);
-    // CSGSFS: low 16 = CS (we don't model segments → 0x33 USER_CS),
-    //         next 16 = GS, next 16 = FS, top 16 = ss. Approximate.
+    // CSGSFS: low 16 = CS, next 16 = GS, next 16 = FS, top 16 = SS.
+    //
+    // The interrupted CS and SS are real now, and the pair is what
+    // rt_sigreturn restores. Linux writes zero for GS and FS on x86-64
+    // (arch/x86/kernel/signal_64.c) and this matches it, so a handler that
+    // reads the frame sees the same shape it does on the host kernel --
+    // Wine's own save_context/restore_context on this architecture take
+    // SegCs from here, which is how a WoW64 exception returns to 32-bit
+    // code.
     cpu->memory->writeq(gregsPtr + 8 * X64_GREG_CSGSFS,
-                        (U64)0x33 | ((U64)0x2B << 48));
+                        (U64)cpu->seg.cs | ((U64)cpu->seg.ss << 48));
     // ERR/TRAPNO/CR2 = 0 (no fault triggered this delivery). A hardware-fault
     // delivery overwrites these afterwards via the fault-info it has.
     // OLDMASK = caller's sigmask before this delivery (we set it to current)
@@ -2892,6 +2899,76 @@ static U64 buildSignalFrame(CPU64* cpu, U64 framePtr) {
     // uc_sigmask
     cpu->memory->writeq(uctxPtr + X64_SIGMASK_OFF_IN_UCTX, cpu->sigMask);
     return uctxPtr;
+}
+
+// The code segment a signal handler runs in.
+//
+// On this architecture a signal handler always enters in the 64-bit code
+// segment: the processor takes CS from the descriptor the kernel names, and
+// Linux names __USER_CS unconditionally (arch/x86/kernel/signal_64.c). The
+// interrupted CS is what the frame carries, and rt_sigreturn puts it back.
+//
+// Under WoW64 that is not a formality. A thread executing 32-bit code has the
+// 32-bit code selector loaded, the translator takes each block's decode width
+// from the L bit of the descriptor that selector names, and a 64-bit handler
+// entered with it still loaded is decoded as 32-bit code. A device run showed
+// exactly that: after the far jump into 32-bit ntdll, a fault in 32-bit code
+// was delivered to Wine's 64-bit handler with cs=0x23 still set, the
+// handler's first byte `ab` decoded as `stosd`, it stored through a null EDI,
+// and the same fault repeated for the rest of the run.
+//
+// Inert for a thread that never leaves the 64-bit segment: its CS already is
+// the value this would set, and nothing is logged or changed.
+static std::atomic<U32> gSignalSegmentSwitchReports {0};
+static const U32 kSignalSegmentSwitchReports = 32;
+
+static void reportSignalSegmentSwitch(CPU64* cpu, const char* what, U16 fromCS,
+                                      U16 toCS) {
+    if (gSignalSegmentSwitchReports.fetch_add(1, std::memory_order_relaxed) >=
+        kSignalSegmentSwitchReports) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_SIGNAL_CS %s pid=%d tid=%d from_cs=0x%x to_cs=0x%x "
+             "rip=0x%llx",
+             what,
+             (int)(cpu->thread ? cpu->thread->process->id : -1),
+             (int)(cpu->thread ? cpu->thread->id : -1),
+             (unsigned)fromCS, (unsigned)toCS,
+             (unsigned long long)cpu->rip);
+}
+
+// Enter the handler in the 64-bit code segment. Call AFTER buildSignalFrame,
+// so the frame records the segments that were interrupted.
+static void enterSignalHandlerSegments(CPU64* cpu) {
+    if (cpu->seg.cs == K_WINE_X64_CODE_SELECTOR) {
+        return;
+    }
+    const U16 fromCS = cpu->seg.cs;
+    cpu->seg.cs = K_WINE_X64_CODE_SELECTOR;
+    cpu->seg.ss = K_WINE_X64_DATA_SELECTOR;
+    reportSignalSegmentSwitch(cpu, "deliver", fromCS, cpu->seg.cs);
+}
+
+// The reverse, from what the frame holds. Linux's restore_sigcontext takes CS
+// and SS out of the frame here (forcing CPL 3) and ignores the GS and FS
+// slots, which is why the FS base is not recomputed: it is owned by the
+// selector-write trap and by arch_prctl, and Wine's signal handlers reload it
+// themselves on this path. A frame with no CS recorded is left alone rather
+// than forced to a selector it never had.
+static void restoreSignalFrameSegments(CPU64* cpu, U64 csgsfs) {
+    const U16 savedCS = (U16)(csgsfs & 0xffffu);
+    const U16 savedSS = (U16)((csgsfs >> 48) & 0xffffu);
+    if (savedCS == 0) {
+        return;
+    }
+    const U16 fromCS = cpu->seg.cs;
+    cpu->seg.cs = (U16)(savedCS | 3u);
+    if (savedSS != 0) {
+        cpu->seg.ss = (U16)(savedSS | 3u);
+    }
+    if (cpu->seg.cs != fromCS) {
+        reportSignalSegmentSwitch(cpu, "sigreturn", fromCS, cpu->seg.cs);
+    }
 }
 
 // Restore cpu state from a signal frame whose ucontext_t lives at the
@@ -2926,6 +3003,13 @@ static U64 restoreSignalFrame(CPU64* cpu, U64 uctxPtr) {
     cpu->rip              = cpu->memory->readq(gregsPtr + 8 * X64_GREG_RIP);
     cpu->rflags           = (U32)cpu->memory->readq(gregsPtr + 8 * X64_GREG_EFL);
     cpu->sigMask          = cpu->memory->readq(uctxPtr   + X64_SIGMASK_OFF_IN_UCTX);
+    // Resume in the code segment the frame names. For a thread that never
+    // left the 64-bit segment this restores what it already had; for a WoW64
+    // thread it is how execution returns to 32-bit code, both after a fault
+    // taken there and after Wine's own handler rewrites the frame to continue
+    // somewhere else in 32-bit code.
+    restoreSignalFrameSegments(
+        cpu, cpu->memory->readq(gregsPtr + 8 * X64_GREG_CSGSFS));
     // RAX is restored last — the kernel returns RAX as the syscall return
     // value so the user-visible RAX is the *pre-signal* value, not whatever
     // rt_sigreturn would compute.
@@ -2978,6 +3062,7 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
     U64 frameBase = (baseSp - X64_SIGFRAME_SIZE) & ~(U64)15;
 
     U64 uctxPtr = buildSignalFrame(cpu, frameBase);
+    enterSignalHandlerSegments(cpu);
 
     // x86-64 signal-frame ABI: the kernel pushes the restorer address *below*
     // the ucontext so the handler's terminating `ret` pops it and jumps to
@@ -3059,6 +3144,7 @@ bool CPU64::raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr) {
     U64 frameBase = (baseSp - X64_SIGFRAME_SIZE) & ~(U64)15;
 
     U64 uctxPtr = buildSignalFrame(this, frameBase);
+    enterSignalHandlerSegments(this);
 
     // Fill the fault-specific mcontext slots the generic builder leaves zero.
     U64 gregsPtr = uctxPtr + X64_MCONTEXT_OFF_IN_UCTX;

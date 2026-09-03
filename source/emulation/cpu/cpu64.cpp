@@ -77,6 +77,12 @@ void CPU64::cloneRegistersFrom(const CPU64* from) {
     rflags = from->rflags;
     fsbase = from->fsbase;
     gsbase = from->gsbase;
+    // Selectors are architectural thread state and clone the way the rest of
+    // the register file does. A thread is always cloned from 64-bit code --
+    // Wine's WoW64 layer issues its system calls after the far transfer back
+    // -- so this carries the 64-bit pair in practice; carrying whatever the
+    // parent actually had is what the processor does.
+    seg = from->seg;
     for (int i = 0; i < 16; i++) {
         xmm[i] = from->xmm[i];
     }

@@ -1,0 +1,57 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -495,6 +495,30 @@
+   default: break; // Do nothing
+   }
+ 
++  // BoxedWine: `pop fs` and `pop gs` are selector writes, and reach the host
++  // the same way `mov fs, r/m16` already does whenever the descriptor table
++  // is host memory. Only the FS and GS bases are real; the load
++  // UpdatePrefixFromSegment would otherwise emit reads a host pointer through
++  // the guest's translation, in either decode mode.
++  //
++  // The pop itself has already happened -- the stack pointer is updated and
++  // the selector stored above -- so the host reads the descriptor the
++  // selector names, sets the base and resumes after the instruction, exactly
++  // as it does for the `mov` form. This is the second and last opcode that
++  // can write FS or GS: FEX leaves LFS and LGS unimplemented.
++  if ((SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX ||
++       SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX) &&
++      CTX->GetGuestLowAliasBase() != 0) {
++    _StoreContextGPR(GetGPROpSize(), GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
++    Break(FEXCore::IR::BreakDefinition {
++      .ErrorRegister = 0,
++      .Signal = Core::FAULT_SIGSEGV,
++      .TrapNumber = X86State::X86_TRAPNO_GP,
++      .si_code = 0x80,
++    });
++    return;
++  }
++
+   UpdatePrefixFromSegment(NewSegment, SegmentReg);
+ }
+ 
+@@ -4292,6 +4316,22 @@
+   // code and data descriptors Wine installs (0x23, 0x2b, 0x33) are flat, and
+   // FS and GS, the only segments with a base worth having, are still
+   // excluded and served by the host.
++  //
++  // BoxedWine, the other half of that exclusion: with the alias armed there
++  // is no caller left that may reach the descriptor load for FS or GS. Both
++  // opcodes that can write them -- `mov fs/gs, r/m16` and `pop fs/gs`; FEX
++  // leaves LFS and LGS unimplemented -- trap to the host, which reads the
++  // descriptor on the host side and writes fs_cached/gs_cached itself. So the
++  // cached base is already correct here and the load must not be emitted:
++  // emitting it would translate a host pointer as if it were a guest address,
++  // which is the fault this whole function exists to avoid. Returning leaves
++  // the base the host published intact, and it is the base a 32-bit block's
++  // FS-prefixed operand then reads out of fs_cached at GPR width.
++  if (CTX->GetGuestLowAliasBase() != 0 && (SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX ||
++                                           SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX)) {
++    return;
++  }
++
+   const bool HostSideDescriptorTable = CTX->GetGuestLowAliasBase() != 0 &&
+                                        SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX &&
+                                        SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX;

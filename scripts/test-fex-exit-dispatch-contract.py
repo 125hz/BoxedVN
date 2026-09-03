@@ -3868,9 +3868,92 @@ def main() -> None:
             "apply_patch fex-boxedwine-longmode-segment-selector-write.patch",
             "apply_patch fex-boxedwine-far-transfer-witness.patch",
             "apply_patch fex-boxedwine-per-block-decode-mode.patch",
+            "apply_patch fex-boxedwine-host-served-segment-base.patch",
         ],
         "per-block decode mode patch order",
     )
+
+    # FS and GS are the only segments with a base worth having, and the
+    # descriptor that names it is host memory. Two opcodes can write them --
+    # `mov fs/gs, r/m16` and `pop fs/gs`, since FEX leaves LFS and LGS
+    # unimplemented -- so both must reach the host, and the descriptor load
+    # must not be emitted for either register while the alias is armed.
+    host_served = read(
+        repository
+        / "scripts/fex64-patches/fex-boxedwine-host-served-segment-base.patch"
+    )
+    require_ordered(
+        host_served,
+        [
+            # `pop fs` / `pop gs` take the same host trap as the `mov` form.
+            "SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX",
+            "CTX->GetGuestLowAliasBase() != 0",
+            ".TrapNumber = X86State::X86_TRAPNO_GP,",
+            ".si_code = 0x80,",
+            # And nothing may reach the untranslatable descriptor load for
+            # FS or GS any more.
+            "UpdatePrefixFromSegment",
+            "return;",
+        ],
+        "host-served segment base contract",
+    )
+    if "FEXCore::Core::CPUState, rip" not in host_served:
+        raise SystemExit(
+            "the popped selector write must publish the faulting instruction's "
+            "own address, or the host cannot advance past it")
+    adapter = read(repository / "ios/runtime/src/BVNFEXCPU64Adapter.mm")
+    for required in ("bytes[i + 1] == 0xa1", "bytes[i + 1] == 0xa9"):
+        if required not in adapter:
+            raise SystemExit(
+                "the host must serve `pop fs` / `pop gs` as well as the `mov` "
+                "form of a selector write: " + required)
+
+    # A signal handler runs in the 64-bit code segment. The translator takes a
+    # block's decode width from the descriptor CS names, so a handler entered
+    # with the 32-bit code selector still loaded is decoded as 32-bit code.
+    require_ordered(
+        adapter,
+        [
+            "cpu->seg.cs = frame->State.cs_idx;",
+            "cpu->seg.valid = true;",
+            "if (cpu->seg.valid) {",
+            "frame->State.cs_idx = cpu->seg.cs;",
+        ],
+        "selector round-trip contract",
+    )
+    signals = read(repository / "source/kernel/syscall64.cpp")
+    require_ordered(
+        signals,
+        [
+            # The frame carries the interrupted pair, not a constant.
+            "(U64)cpu->seg.cs | ((U64)cpu->seg.ss << 48)",
+            # The witness the next device run is read for.
+            "BOXEDWINE_X64_SIGNAL_CS %s pid=%d tid=%d from_cs=0x%x to_cs=0x%x",
+            # Delivery switches to the 64-bit pair.
+            "static void enterSignalHandlerSegments(CPU64* cpu) {",
+            "cpu->seg.cs = K_WINE_X64_CODE_SELECTOR;",
+            "cpu->seg.ss = K_WINE_X64_DATA_SELECTOR;",
+            # And sigreturn puts back whatever the frame holds.
+            "static void restoreSignalFrameSegments(CPU64* cpu, U64 csgsfs) {",
+        ],
+        "signal code segment contract",
+    )
+    if ("restoreSignalFrameSegments(\n        cpu, cpu->memory->readq(gregsPtr "
+            "+ 8 * X64_GREG_CSGSFS));") not in signals:
+        raise SystemExit(
+            "rt_sigreturn must resume in the code segment the frame names, or "
+            "a WoW64 thread can never get back to 32-bit code")
+    # Order matters: the frame has to record the interrupted segments before
+    # the thread is switched to the handler's.
+    for builder, entry in (
+            ("U64 uctxPtr = buildSignalFrame(cpu, frameBase);\n"
+             "    enterSignalHandlerSegments(cpu);", "deliverSignalSync"),
+            ("U64 uctxPtr = buildSignalFrame(this, frameBase);\n"
+             "    enterSignalHandlerSegments(this);", "raiseSyncFault")):
+        if builder not in signals:
+            raise SystemExit(
+                "the signal frame must be built before the code segment is "
+                "switched, in " + entry)
     # The host half of the same switch: the one descriptor whose L bit decides
     # a decode, and the arming that lets the translator act on it.
     backend = read(repository / "ios/runtime/src/BVNFEXBackend.mm")

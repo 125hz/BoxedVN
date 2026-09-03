@@ -173,6 +173,15 @@ apply_patch fex-boxedwine-far-transfer-witness.patch
 # and lowered as 32-bit code inside a context created for 64-bit, which is what
 # Wine's WoW64 far jump needs; inert until the host arms it.
 apply_patch fex-boxedwine-per-block-decode-mode.patch
+# Depends on the per-block decode mode patch above, whose condition on the
+# alias it completes. Two opcodes can write FS or GS -- `mov fs/gs, r/m16` and
+# `pop fs/gs`; FEX leaves LFS and LGS unimplemented -- and only the first was
+# routed to the host trap. The second reached the descriptor load, which reads
+# a host pointer through the guest's translation. Both go to the host now, and
+# UpdatePrefixFromSegment refuses to emit that load for FS or GS at all while
+# the alias is armed, so the base a 32-bit block reads out of fs_cached is
+# always the one the host published.
+apply_patch fex-boxedwine-host-served-segment-base.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

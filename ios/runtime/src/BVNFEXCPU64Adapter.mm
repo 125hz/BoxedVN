@@ -310,6 +310,18 @@ extern "C" bool BVNFEXCPU64AdapterSyncFromFEX(BVNFEXCPU64Adapter* adapter,
         adapter->fexThread, false, nullptr, 0);
     cpu->fsbase = frame->State.fs_cached;
     cpu->gsbase = frame->State.gs_cached;
+    // The selectors travel with the registers. Nothing in the interpreter
+    // reads them; the signal path does, because the translator takes a
+    // block's decode width from the descriptor cs_idx names and a handler
+    // entered with the 32-bit code selector still loaded is decoded as
+    // 32-bit code.
+    cpu->seg.cs = frame->State.cs_idx;
+    cpu->seg.ss = frame->State.ss_idx;
+    cpu->seg.ds = frame->State.ds_idx;
+    cpu->seg.es = frame->State.es_idx;
+    cpu->seg.fs = frame->State.fs_idx;
+    cpu->seg.gs = frame->State.gs_idx;
+    cpu->seg.valid = true;
     std::array<__uint128_t, 16> xmmLow {};
     adapter->context->ReconstructXMMRegisters(
         adapter->fexThread, xmmLow.data(), nullptr);
@@ -335,6 +347,25 @@ extern "C" bool BVNFEXCPU64AdapterSyncToFEX(BVNFEXCPU64Adapter* adapter,
         adapter->fexThread, cpu->rflags);
     frame->State.fs_cached = cpu->fsbase;
     frame->State.gs_cached = cpu->gsbase;
+    // Only once this CPU64 has read a frame. The first entry into FEX copies
+    // this state into a frame publishGuestDescriptorTable has just written,
+    // and the defaults here must not overwrite the selectors it published --
+    // nor those of a fresh execution epoch after exec, which republishes them
+    // and is re-read before the next entry.
+    //
+    // The cached bases are deliberately not recomputed from the descriptors:
+    // every descriptor in this port's table is flat, so cs/ss/ds/es bases are
+    // zero either way, and fs_cached/gs_cached are owned by the host's
+    // selector-write trap and by arch_prctl, both of which have already
+    // written cpu->fsbase/gsbase above.
+    if (cpu->seg.valid) {
+        frame->State.cs_idx = cpu->seg.cs;
+        frame->State.ss_idx = cpu->seg.ss;
+        frame->State.ds_idx = cpu->seg.ds;
+        frame->State.es_idx = cpu->seg.es;
+        frame->State.fs_idx = cpu->seg.fs;
+        frame->State.gs_idx = cpu->seg.gs;
+    }
     std::array<__uint128_t, 16> xmmLow {};
     for (unsigned i = 0; i < 16; ++i) {
         std::memcpy(&xmmLow[i], &cpu->xmm[i], sizeof(cpu->xmm[i]));
@@ -677,12 +708,15 @@ static bool emulateLegacySyscall(BVNFEXCPU64Adapter* adapter,
     return true;
 }
 
-// `mov fs, r/m16` and `mov gs, r/m16` in long mode. The translator stores
-// the selector and traps (trap 13, si_code 0x80) at the instruction; the
-// segment base comes from the descriptor the selector names, which is what
-// a 64-bit Linux process gets when it reloads FS with an LDT/GDT selector.
-// Wine's WoW64 layer does exactly this after set_thread_area, then far-jumps
-// into 32-bit code that addresses its TEB through FS.
+// `mov fs, r/m16` / `mov gs, r/m16`, and `pop fs` / `pop gs`. In either
+// decode mode the translator stores the selector and traps (trap 13,
+// si_code 0x80) at the instruction; the segment base comes from the
+// descriptor the selector names, which is what a Linux process gets when it
+// reloads FS with an LDT/GDT selector. Wine's WoW64 layer writes FS with the
+// `mov` form after set_thread_area, then far-jumps into 32-bit code that
+// addresses its TEB through FS; the `pop` form is the only other opcode that
+// can write these two registers (FEX leaves LFS and LGS unimplemented), and
+// its stack update has already been performed by the translated block.
 static bool emulateSegmentSelectorWrite(BVNFEXCPU64Adapter* adapter,
                                         FEXCore::Core::CpuStateFrame* frame) {
     CPU64* cpu = adapter ? adapter->cpu : nullptr;
@@ -699,25 +733,37 @@ static bool emulateSegmentSelectorWrite(BVNFEXCPU64Adapter* adapter,
                      (bytes[i] & 0xf0) == 0x40)) {
         ++i;
     }
-    if (bytes[i] != 0x8e) return false;
-    const uint8_t modrm = bytes[i + 1];
-    const uint32_t reg = (modrm >> 3) & 7;
-    const uint32_t mod = modrm >> 6;
-    const uint32_t rm = modrm & 7;
-    if (reg != 4 && reg != 5) return false; // FS, GS
-    uint32_t length = i + 2;
-    if (mod != 3) {
-        if (rm == 4) {
-            const uint8_t sib = bytes[i + 2];
-            length += 1;
-            if (mod == 0 && (sib & 7) == 5) length += 4;
-        } else if (mod == 0 && rm == 5) {
-            length += 4;
+    bool fs = false;
+    uint32_t length = 0;
+    const char* form = "mov";
+    if (bytes[i] == 0x0f && (bytes[i + 1] == 0xa1 || bytes[i + 1] == 0xa9)) {
+        // `pop fs` (0f a1) and `pop gs` (0f a9). Nothing is popped here: the
+        // block already adjusted the stack pointer and stored the selector.
+        fs = bytes[i + 1] == 0xa1;
+        length = i + 2;
+        form = "pop";
+    } else if (bytes[i] == 0x8e) {
+        const uint8_t modrm = bytes[i + 1];
+        const uint32_t reg = (modrm >> 3) & 7;
+        const uint32_t mod = modrm >> 6;
+        const uint32_t rm = modrm & 7;
+        if (reg != 4 && reg != 5) return false; // FS, GS
+        fs = reg == 4;
+        length = i + 2;
+        if (mod != 3) {
+            if (rm == 4) {
+                const uint8_t sib = bytes[i + 2];
+                length += 1;
+                if (mod == 0 && (sib & 7) == 5) length += 4;
+            } else if (mod == 0 && rm == 5) {
+                length += 4;
+            }
+            if (mod == 1) length += 1;
+            if (mod == 2) length += 4;
         }
-        if (mod == 1) length += 1;
-        if (mod == 2) length += 4;
+    } else {
+        return false;
     }
-    const bool fs = reg == 4;
     const uint16_t selector = fs ? frame->State.fs_idx : frame->State.gs_idx;
     uint32_t base = 0;
     if ((selector & ~3u) != 0 && (selector >> 3) < K_GUEST_SEGMENT_TABLE_ENTRIES) {
@@ -733,11 +779,12 @@ static bool emulateSegmentSelectorWrite(BVNFEXCPU64Adapter* adapter,
     }
     static std::atomic<uint32_t> reports {0};
     if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
-        klog_fmt("BOXEDWINE_X64_SEGMENT_WRITE pid=%d tid=%d seg=%s selector=0x%x "
-                 "base=0x%x length=%u rip=0x%llx",
+        klog_fmt("BOXEDWINE_X64_SEGMENT_WRITE pid=%d tid=%d seg=%s form=%s "
+                 "selector=0x%x base=0x%x length=%u cs=0x%x rip=0x%llx",
                  adapter->process ? adapter->process->id : -1,
                  adapter->thread ? adapter->thread->id : -1, fs ? "fs" : "gs",
-                 selector, base, length,
+                 form, selector, base, length,
+                 static_cast<unsigned>(frame->State.cs_idx),
                  static_cast<unsigned long long>(cpu->rip));
     }
     cpu->rip += length;

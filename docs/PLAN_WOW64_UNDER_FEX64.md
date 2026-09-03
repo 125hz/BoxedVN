@@ -246,6 +246,25 @@ This is the risk that decides the schedule.
     the low alias.
   - Shape (2) is not deleted from this document: if the per-block mode proves
     unworkable it is still the fallback, and the notes below stand.
+- The mode switch is taken and 32-bit code runs (device run 2026-09-02 20:21):
+  `MODE_SWITCH rip=0x7bd65a00 cs=0x23 mode=32`, then several thousand bytes of
+  32-bit ntdll across a three-frame call chain before a fault. The fault is a
+  null-pointer read in 32-bit code (`mov eax,[ebx+0x14]` with EBX zero), not a
+  segment or width defect. What made it fatal is signal delivery: the guest
+  frame was built with CS still at the 32-bit code selector, so Wine's 64-bit
+  handler was decoded as 32-bit code and re-faulted forever. Delivery now
+  saves the interrupted CS/SS in the frame and enters the handler in the
+  64-bit code segment, and `rt_sigreturn` restores what the frame names --
+  which is also the mechanism Wine's `restore_context` uses to resume 32-bit
+  code after an exception, so the return path exists for free. Witness:
+  `BOXEDWINE_X64_SIGNAL_CS`.
+- FS and GS bases in 32-bit blocks need nothing beyond what the translator
+  already does: a 32-bit block loads `fs_cached`/`gs_cached` at GPR width and
+  adds it to the offset in a 32-bit add, so the address wraps at 4 GiB before
+  the low alias is applied. The host owns those two bases in both modes, and
+  both opcodes that can write the selectors -- `mov fs/gs, r/m16` and
+  `pop fs/gs`; FEX leaves LFS and LGS unimplemented -- now trap to it
+  (`fex-boxedwine-host-served-segment-base.patch`).
 - Shape (2) in BoxedVN terms (steps 2 and 3 superseded by the refinement):
   1. Context pair. `createFEXContext(FexGuestMode::X86_32, ...)` for the
      process, sharing `KMemory64` with its 64-bit context; the low-alias
@@ -292,6 +311,11 @@ This is the risk that decides the schedule.
 - Signals and exceptions: a fault in 32-bit code must be delivered with a
   32-bit context (`WOW64_CONTEXT`) through Wine's WoW64 exception path.
   Reuse the existing `raiseSyncFault` plumbing; add the context shape.
+  Done on the Unix side (2026-09-02): the guest signal frame carries the
+  interrupted CS and SS, delivery switches to the 64-bit code segment so the
+  handler is decoded as 64-bit code, and `rt_sigreturn` restores the frame's
+  pair. Wine builds the `WOW64_CONTEXT` itself from there; nothing on this
+  side has to know about it.
 
 Gate (host): a freestanding fixture through the pinned translator simulator
 (the same harness `scripts/test-fex-exit-dispatch-contract.py` and the

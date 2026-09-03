@@ -6102,3 +6102,74 @@ cube took a guest page fault reading 0x795e000130 (guest 0x15e000130, one word
 past rcx=0x15e000100) at guest RIP 0x140002d96, Wine started winedbg and
 showed 'Program Error', and pid 10 left through exit_group with 0xC0000005.
 That is the separate "pointer reads as garbage" class, not this one.
+## The 32-bit fault, and the signal that could not be delivered
+
+The per-block decode mode worked. The 20:21 device run reports
+`BOXEDWINE_FEX64_MODE_SWITCH rip=0x7bd65a00 cs=0x23 mode=32` at the far jump
+out of wow64cpu, and 32-bit ntdll then ran roughly 0x40fa bytes of code -- a
+call chain three frames deep, with a coherent 4-byte-slot stack at 0x22fc2c
+whose saved EBP and return address (0x7bd43236) both point back into the same
+32-bit image -- before it faulted. So the boundary is crossed and 32-bit code
+executes; the width, the stack width, the flat data segments and the FS base
+are all doing what they should.
+
+What faulted is now read rather than inferred, because the fault witness
+carries real guest bytes. At `guest_rip=0x7bd69afa` those bytes are
+`8b 43 14 85 c0 74 5f 89 1c 24 e8 ...`, which in 32-bit decode is
+`mov eax,[ebx+0x14]` / `test eax,eax` / `jz +0x5f` / `mov [esp],ebx` /
+`call rel32`. EBX is zero in the same report, so the load reads guest linear
+0x14 and takes a page fault -- `fault=0x7800000014` is that address through
+the low alias. It is not a TEB access: there is no segment prefix, and an
+FS-relative form would have used the base the run had already logged
+(`selector=0x63 base=0x7ffc2000`) and faulted at 0x7ffc2014. The RIP is
+byte-exact, which the next fault proves independently: at
+`guest_rip=0x7a4026431d` the first byte is `ab`, whose 32-bit decode is
+`stosd`, and the fault address is exactly 0 with EDI zero.
+
+That second fault is the real defect. 0x7a4026431d is 64-bit Wine ntdll.so --
+Wine's own signal handler -- being decoded as 32-bit code, because the guest
+signal frame was built while CS was still the 32-bit code selector and
+delivery never changed it. On this architecture a handler always enters in
+the 64-bit code segment: the kernel sets CS to `__USER_CS`, saves the
+interrupted CS and SS in the frame, and `rt_sigreturn` puts them back. That
+last half is not a detail -- it is how Wine returns to 32-bit code after an
+exception, since its `restore_context` writes `context->SegCs` into the
+frame's CSGSFS slot and sigreturns.
+
+So CPU64 now carries the six segment selectors, the adapter round-trips them
+through the translator's frame (only once a frame has been read, so the first
+entry cannot overwrite what `publishGuestDescriptorTable` published), the
+signal frame records the interrupted CS and SS instead of a constant pair,
+delivery switches the thread to 0x33/0x2b, and `rt_sigreturn` restores
+whatever the frame names, forcing CPL 3 the way `restore_sigcontext` does.
+GS and FS are written as zero in the frame, which is what Linux stores there,
+and the FS base is left alone: it belongs to the selector-write trap and to
+`arch_prctl`, and Wine's own `init_handler` reloads it when the 32-bit FS
+selector is in play. A thread whose CS never leaves 0x33 sees no change and
+logs nothing. The witness is `BOXEDWINE_X64_SIGNAL_CS deliver|sigreturn
+pid= tid= from_cs= to_cs= rip=`, on a budget of 32.
+
+Two opcodes can write FS or GS -- `mov fs/gs, r/m16` and `pop fs/gs`; FEX
+leaves LFS and LGS unimplemented -- and only the first reached the host trap.
+The second went to `UpdatePrefixFromSegment`, which for FS and GS still
+emitted the descriptor load, and that load reads a host pointer through the
+guest's address translation. Both go to the host now
+(`fex-boxedwine-host-served-segment-base.patch`), the host decodes `0f a1` and
+`0f a9` beside `8e /r`, and the function refuses to emit that load for FS or
+GS at all while the alias is armed. Nothing else was needed for 32-bit FS: a
+32-bit block already takes the base from `fs_cached` at GPR width and adds it
+to the offset in a 32-bit add, so the effective address wraps at 4 GiB the way
+hardware does, and the low alias is applied after that.
+
+What the next run has to show, in order: `MODE_SWITCH ... mode=32` as before,
+then a `GUEST_FAULT ... decode=32` for the 32-bit instruction that actually
+faults, then `BOXEDWINE_X64_SIGNAL_CS deliver ... from_cs=0x23 to_cs=0x33`
+and Wine's handler running as 64-bit code -- no more repeats of one RIP in
+ntdll.so with `decode=32`. A `MODE_PAGE_CONFLICT` naming the handler's page
+is expected exactly once per page, and is the invalidation working. If Wine
+turns the fault into a 32-bit exception and resumes, the return shows as
+`BOXEDWINE_X64_SIGNAL_CS sigreturn ... from_cs=0x33 to_cs=0x23`. Still open:
+why EBX is zero at 0x7bd69afa. It is the value Wine's WoW64 layer hands the
+first 32-bit entry in EBX, so the loader is dereferencing something it was
+never given; whether that is a missing register or a missing store is what
+the delivered exception will finally let Wine report.

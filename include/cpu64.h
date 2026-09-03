@@ -13,6 +13,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include "bounded_syscall_report.h"
+#include "guest_segment_table.h"
 #include "reg64.h"
 #include <memory>
 #include "../source/emulation/cpu/common/fpu.h"
@@ -60,6 +61,36 @@ public:
     U32   rflags = 0x202; // IF | reserved bit 1
     U64   fsbase = 0;     // x86-64: set via arch_prctl(ARCH_SET_FS)
     U64   gsbase = 0;
+
+    // Segment selectors, round-tripped through the translator's frame.
+    //
+    // The interpreter is flat and reads none of these. They exist because a
+    // WoW64 thread alternates between the 64-bit code segment and the 32-bit
+    // one, and the translator takes each block's decode width from the L bit
+    // of the descriptor CS names. A signal delivered while CS is the 32-bit
+    // selector would therefore have the 64-bit handler decoded as 32-bit
+    // code, which is what a device run showed: the handler's first byte,
+    // `ab`, became `stosd` and faulted on a null EDI, forever.
+    //
+    // So delivery saves the interrupted CS and SS in the signal frame and
+    // switches the thread to the 64-bit pair, and rt_sigreturn restores what
+    // the frame holds -- which is what the Linux kernel does on this
+    // architecture, and what Wine's own `restore_context` relies on to
+    // resume 32-bit code after an exception.
+    struct Segments {
+        U16 cs = K_WINE_X64_CODE_SELECTOR;
+        U16 ss = K_WINE_X64_DATA_SELECTOR;
+        U16 ds = 0;
+        U16 es = 0;
+        U16 fs = 0;
+        U16 gs = 0;
+        // False until a translator frame has been read into this CPU64. The
+        // first entry into the translator copies this state INTO a frame the
+        // backend has just initialised, and must not overwrite the selectors
+        // and descriptor table it published there.
+        bool valid = false;
+    };
+    Segments seg;
 
     // XMM register state. 16 × 128-bit slots, accessed as two U64 halves.
     // SSE2 is the minimum baseline for x86-64; glibc memcpy/memset, the
