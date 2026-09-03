@@ -618,16 +618,23 @@ final class AppModel: ObservableObject {
         ///
         /// The archive carries no version stamp of its own - the build writes
         /// its manifest beside the archive, not inside it - so this list *is*
-        /// the version check. A copy made before the packaging fix is exactly
-        /// a copy that does not carry all fourteen, and the device log of one
+        /// the version check. A copy made before a packaging fix is exactly a
+        /// copy that does not carry all fifteen, and the device log of one
         /// said so: `BOXEDWINE_X64_PE32_GAP tree=i386-windows required=14
         /// missing=1`, followed by a process that exited 0xC0000135 with no
         /// window and no message.
+        ///
+        /// libgcc_s_dw2-1.dll is the fifteenth and the newest. It is a mingw
+        /// runtime DLL that Wine's mingw-built i386 modules import and that
+        /// neither Wine tree builds; an archive predating that fix loses
+        /// whichever builtin imports it - Direct3D disappears while the
+        /// program keeps running - so the miss never reaches a status code
+        /// and this list is the only thing that can name it.
         static let pe32RequiredModules = [
             "ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll",
             "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll",
             "user32.dll", "win32u.dll", "opengl32.dll", "wined3d.dll",
-            "d3d9.dll", "zlib1.dll",
+            "d3d9.dll", "zlib1.dll", "libgcc_s_dw2-1.dll",
         ]
 
         /// The guest path D: resolves to for `diagnostics`. BoxedWine -w takes

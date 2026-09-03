@@ -183,6 +183,27 @@ jobs:
             cp "${mingw_zlib}" "${pe32_dir}/zlib1.dll"
             echo "i386-windows/zlib1.dll supplied from ${mingw_zlib}"
           fi
+          # The same gap, one module further along. Ubuntu builds Wine's i386
+          # PE modules with mingw-w64 and some of them import the shared i686
+          # libgcc; a device run resolved the whole 32-bit chain and then
+          # missed libgcc_s_dw2-1.dll in all four search directories, right
+          # after mapping opengl32.dll and again after uxtheme.dll. Neither
+          # Wine tree builds it, so it comes from the i686 mingw gcc runtime.
+          # The win32 and posix thread flavours ship the same unwinder DLL and
+          # either is fine here: nothing in the tree links libwinpthread.
+          if [[ ! -s "${pe32_dir}/libgcc_s_dw2-1.dll" ]]; then
+            mingw_libgcc="$(find /usr/lib/gcc/i686-w64-mingw32 -name libgcc_s_dw2-1.dll -print -quit 2>/dev/null || true)"
+            if [[ -z "${mingw_libgcc}" ]]; then
+              sudo apt-get install -y gcc-mingw-w64-i686
+              mingw_libgcc="$(find /usr/lib/gcc/i686-w64-mingw32 -name libgcc_s_dw2-1.dll -print -quit)"
+            fi
+            test -s "${mingw_libgcc}" || {
+              echo "i386-windows has no libgcc_s_dw2-1.dll and gcc-mingw-w64-i686 provides no i686 libgcc_s_dw2-1.dll" >&2
+              exit 1
+            }
+            cp "${mingw_libgcc}" "${pe32_dir}/libgcc_s_dw2-1.dll"
+            echo "i386-windows/libgcc_s_dw2-1.dll supplied from ${mingw_libgcc}"
+          fi
           echo "32-bit PE builtins: $(find "${pe32_dir}" -type f | wc -l)"
 
       # Wine's OSS audio driver, which Ubuntu does not build: its configure

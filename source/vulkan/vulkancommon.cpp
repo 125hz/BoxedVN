@@ -707,14 +707,51 @@ void vulkan_init() {
     // the way tools/x11-64 builds the X11 client shims. The file a 64-bit
     // guest would otherwise find under that name is the IA-32 shim in the
     // root filesystem, which its loader rejects for its ELF class and
-    // silently walks past, so `present` says which of the two a run has:
-    // the packaging step defines BOXEDWINE_X64_VULKAN_GUEST_SHIM when it
-    // stages the 64-bit file. See docs/PLAN_WOW64_D3D9.md.
-#if defined(BOXEDWINE_X64_VULKAN_GUEST_SHIM)
-    const int guestShimPresent = 1;
-#else
-    const int guestShimPresent = 0;
-#endif
+    // silently walks past, so `present` says which of the two a run has.
+    // See docs/PLAN_WOW64_D3D9.md.
+    //
+    // Asked of the guest filesystem, not of the build. This was a
+    // compile-time BOXEDWINE_X64_VULKAN_GUEST_SHIM define that no build ever
+    // set, so the witness read present=0 icd=none on every run -- including
+    // the ones whose wine64.zip did carry the file, which the packaging log
+    // said in the same session. A witness that cannot come out true reports
+    // nothing. vulkan_init() runs from startupArgs after the root filesystem
+    // and the overlays are mounted (the prefix witness a few lines earlier
+    // already resolves guest paths), and Fs::resolvePath answers -ENOENT
+    // rather than faulting if it is ever called before that.
+    //
+    // The ELF class is what separates the two files, so it is read rather
+    // than assumed: both are named libvulkan.so.1, and the IA-32 one is the
+    // failure this line exists to catch. Only the five identifying bytes are
+    // read, and only present=1 means a 64-bit guest can bind to it.
+    int guestShimPresent = 0;
+    const char* guestShimIcd = "none";
+    {
+        std::shared_ptr<FsNode> guestShim = Fs::getNodeFromLocalPath(
+            B(""), B(K_X64_GUEST_VULKAN_LIB_PATH), true);
+        if (guestShim && !guestShim->isDirectory()) {
+            guestShimIcd = "unreadable";
+            FsOpenNode* openShim = guestShim->open(K_O_RDONLY);
+            if (openShim) {
+                U8 ident[5] = {};
+                const U32 identRead =
+                    openShim->readNative(ident, (U32)sizeof(ident));
+                openShim->close();
+                if (identRead == (U32)sizeof(ident) && ident[0] == 0x7f &&
+                    ident[1] == 'E' && ident[2] == 'L' && ident[3] == 'F') {
+                    // EI_CLASS: 2 is ELFCLASS64, 1 is the IA-32 shim.
+                    if (ident[4] == 2) {
+                        guestShimPresent = 1;
+                        guestShimIcd = BOXEDWINE_X64_VK_GUEST_SONAME;
+                    } else {
+                        guestShimIcd = "elf32-lane32-shim";
+                    }
+                } else if (identRead > 0) {
+                    guestShimIcd = "not-elf";
+                }
+            }
+        }
+    }
 #define BOXEDWINE_X64_VK_COUNT_ONE(name, ordinal) + 1
     const unsigned bridgeOps =
         (unsigned)(0 BOXEDWINE_X64_VK_COMMANDS(BOXEDWINE_X64_VK_COUNT_ONE));
@@ -722,7 +759,7 @@ void vulkan_init() {
     klog_fmt("BOXEDWINE_X64_VULKAN_SHIM present=%d icd=%s hostcall=0x%llx "
              "abi=%u soname=%s path=%s bridge_ops=%u lane32_ops=%u",
              guestShimPresent,
-             guestShimPresent ? BOXEDWINE_X64_VK_GUEST_SONAME : "none",
+             guestShimIcd,
              (unsigned long long)BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE,
              (unsigned)BOXEDWINE_X64_VK_ABI_VERSION,
              BOXEDWINE_X64_VK_GUEST_SONAME,

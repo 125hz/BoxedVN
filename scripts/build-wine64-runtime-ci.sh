@@ -76,10 +76,20 @@ I386_PE_GUEST_DIR="${WINE_MODULE_ROOT}/i386-windows"
 # (0xc0000135) -- which on screen is a program that never appears, not an
 # error. Checked here so a tree that cannot run a 32-bit program fails the
 # build instead of shipping.
+#
+# libgcc_s_dw2-1.dll joined the list from a later run of the same probe, which
+# missed it in all four search directories right after mapping opengl32.dll and
+# again after uxtheme.dll: Ubuntu builds Wine's i386 PE modules with mingw-w64
+# and some of them import the shared i686 libgcc. That miss does not end the
+# process the way zlib1's did -- the importing builtin fails to load and its
+# caller carries on without Direct3D -- so nothing downstream reports it at
+# all, which is the argument for catching it here. The workflow supplies the
+# file from the i686 mingw gcc runtime when the i386 package lacks it, exactly
+# as it does for zlib1.dll.
 WOW64_LANE_PE32_MODULES=(
     ntdll.dll kernel32.dll kernelbase.dll advapi32.dll sechost.dll
     msvcrt.dll ucrtbase.dll gdi32.dll user32.dll win32u.dll
-    opengl32.dll wined3d.dll d3d9.dll zlib1.dll
+    opengl32.dll wined3d.dll d3d9.dll zlib1.dll libgcc_s_dw2-1.dll
 )
 # The two 32-bit builtins that carry a program from a Vulkan renderer to
 # Wine's WoW64 unix-call dispatch: DXVK's d3d9 links vulkan-1.dll, which is a
@@ -510,15 +520,25 @@ if [[ -n "${I386_PE_DIR}" ]]; then
     if (( ${#missing_pe32[@]} > 0 )); then
         # Whether the same name exists in the 64-bit tree says where to look:
         # a module Wine built for x86-64 and not for i386 is a gap in the i386
-        # package, not in this staging step.
+        # package, not in this staging step. The two names Wine does not build
+        # at all -- zlib1.dll and libgcc_s_dw2-1.dll, which its mingw-built PE
+        # modules import -- are in neither tree and come from their own i686
+        # mingw packages instead, so they are named apart from the rest.
         for absent_pe32 in "${missing_pe32[@]}"; do
-            if [[ -s "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${absent_pe32}" ]]; then
-                warn "i386-windows/${absent_pe32} is missing and x86_64-windows/${absent_pe32} is present: the i386 package did not carry it."
-            else
-                warn "i386-windows/${absent_pe32} is missing, and neither does the 64-bit tree carry it."
-            fi
+            case "${absent_pe32}" in
+                zlib1.dll|libgcc_s_dw2-1.dll)
+                    warn "i386-windows/${absent_pe32} is missing: it is a mingw runtime DLL Wine's i386 PE modules import and neither Wine tree builds. Install the i686 mingw package that carries it (libz-mingw-w64 for zlib1.dll, gcc-mingw-w64-i686 for libgcc_s_dw2-1.dll) and copy it into the tree before staging."
+                    ;;
+                *)
+                    if [[ -s "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${absent_pe32}" ]]; then
+                        warn "i386-windows/${absent_pe32} is missing and x86_64-windows/${absent_pe32} is present: the i386 package did not carry it."
+                    else
+                        warn "i386-windows/${absent_pe32} is missing, and neither does the 64-bit tree carry it."
+                    fi
+                    ;;
+            esac
         done
-        die "The staged i386-windows tree is missing ${#missing_pe32[@]} of the ${#WOW64_LANE_PE32_MODULES[@]} builtins a 32-bit Windows program loads before its own entry point (${missing_pe32[*]}). A 32-bit process that cannot resolve one of them exits STATUS_DLL_NOT_FOUND (0xc0000135) with no message and no window. Extract libwine:i386 of the same version as the installed amd64 libwine and stage its whole i386-windows tree."
+        die "The staged i386-windows tree is missing ${#missing_pe32[@]} of the ${#WOW64_LANE_PE32_MODULES[@]} modules a 32-bit Windows program's import chain reaches before its own Direct3D works (${missing_pe32[*]}). A 32-bit process that cannot resolve one of the builtins exits STATUS_DLL_NOT_FOUND (0xc0000135) with no message and no window; one that cannot resolve a mingw runtime DLL loses the builtin that imports it and runs on without Direct3D. Extract libwine:i386 of the same version as the installed amd64 libwine and stage its whole i386-windows tree, adding the mingw runtime DLLs named above."
     fi
     require_pe_machine "${PE32_STAGE}${I386_PE_GUEST_DIR}/ntdll.dll" 332 \
         "32-bit PE builtin"

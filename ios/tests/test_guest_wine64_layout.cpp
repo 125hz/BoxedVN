@@ -35,6 +35,88 @@ BOXEDVN_TEST(wine64_layout_keeps_loader_and_modules_under_one_root) {
              std::string("/usr/share/wine"));
 }
 
+BOXEDVN_TEST(wine64_layout_disables_the_vex_hwcaps_glibc_would_otherwise_use) {
+    // Only the launched process runs on FEX; every forked child runs on the
+    // SSE2-only interpreter. glibc picks its string routines once, per
+    // process, so the tunables have to name every feature that would select a
+    // VEX-encoded implementation -- and XSAVE/XSAVEC as well, because ld.so
+    // picks its lazy-binding trampoline from those and the interpreter has
+    // FXSAVE/FXRSTOR but no XSAVE/XSAVEC/XRSTOR.
+    const std::string hwcaps = K_X64_GUEST_GLIBC_HWCAPS;
+    for (const char* feature : {"-AVX", "-AVX2", "-AVX_Fast_Unaligned_Load",
+                                "-FMA", "-FMA4", "-XSAVE", "-XSAVEC"}) {
+        CHECK(hwcaps.find(feature) != std::string::npos);
+    }
+    // Every name is negated: an un-negated one would ENABLE the feature.
+    CHECK(hwcaps.find('+') == std::string::npos);
+    CHECK(hwcaps[0] == '-');
+    for (std::string::size_type at = hwcaps.find(','); at != std::string::npos;
+         at = hwcaps.find(',', at + 1)) {
+        CHECK(hwcaps[at + 1] == '-');
+    }
+    // glibc 2.39 (the Ubuntu 24.04 rootfs) has no F16C tunable; naming one
+    // would be silently ignored and would read as protection that is not there.
+    CHECK(hwcaps.find("F16C") == std::string::npos);
+    CHECK_EQ(std::string(K_X64_GUEST_GLIBC_HWCAPS_TUNABLE),
+             std::string("glibc.cpu.hwcaps=") + hwcaps);
+}
+
+BOXEDVN_TEST(wine64_layout_appends_its_hwcaps_to_a_callers_tunables) {
+    // Nothing set: the launch supplies the list on its own.
+    CHECK_EQ(boxedvn::guestGlibcTunablesValue(""),
+             std::string(K_X64_GUEST_GLIBC_HWCAPS_TUNABLE));
+    CHECK_EQ(boxedvn::guestGlibcTunablesAssignment(""),
+             std::string("GLIBC_TUNABLES=") + K_X64_GUEST_GLIBC_HWCAPS_TUNABLE);
+
+    // A caller tuning something else keeps it and gains ours; glibc separates
+    // tunables with ':'.
+    CHECK_EQ(boxedvn::guestGlibcTunablesValue("glibc.malloc.arena_max=1"),
+             std::string("glibc.malloc.arena_max=1:") +
+                 K_X64_GUEST_GLIBC_HWCAPS_TUNABLE);
+
+    // A caller that already chose an hwcaps list keeps it untouched: there is
+    // one list per process and merging two of them is a guess.
+    CHECK_EQ(boxedvn::guestGlibcTunablesValue("glibc.cpu.hwcaps=-AVX512F"),
+             std::string("glibc.cpu.hwcaps=-AVX512F"));
+    CHECK_EQ(boxedvn::guestGlibcTunablesValue(
+                 "glibc.malloc.arena_max=1:glibc.cpu.hwcaps=-AVX512F"),
+             std::string("glibc.malloc.arena_max=1:glibc.cpu.hwcaps=-AVX512F"));
+
+    // The name has to be a whole tunable, not the tail of a longer one.
+    CHECK(!boxedvn::glibcTunablesSetHwcaps("glibc.notglibc.cpu.hwcaps=-AVX"));
+    CHECK(boxedvn::glibcTunablesSetHwcaps("glibc.cpu.hwcaps=-AVX"));
+    CHECK(boxedvn::glibcTunablesSetHwcaps("glibc.malloc.arena_max=1:glibc.cpu.hwcaps=-AVX"));
+    CHECK(!boxedvn::glibcTunablesSetHwcaps("glibc.cpu.x86_shstk=permissive"));
+
+    CHECK(boxedvn::isGlibcTunablesAssignment("GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX"));
+    CHECK(!boxedvn::isGlibcTunablesAssignment("WINEPREFIX=/tmp/prefix"));
+}
+
+BOXEDVN_TEST(wine64_layout_merges_the_dxvk_d3d9_override_into_the_callers) {
+    // The app always sets WINEDLLOVERRIDES for the DXMT modules, so this is
+    // the case that runs. Declining left the projected DXVK image unused.
+    CHECK_EQ(boxedvn::wineDllOverridesWithDxvkD3d9(
+                 "d3d11,dxgi,d3d10core,winemetal=n,b"),
+             std::string("d3d11,dxgi,d3d10core,winemetal=n,b;d3d9=n"));
+    // Nothing set: unchanged from before, the launch supplies the whole value.
+    CHECK_EQ(boxedvn::wineDllOverridesWithDxvkD3d9(""), std::string("d3d9=n"));
+    // A caller that named d3d9 itself keeps its own load order.
+    CHECK_EQ(boxedvn::wineDllOverridesWithDxvkD3d9("d3d9=b"),
+             std::string("d3d9=b"));
+    CHECK_EQ(boxedvn::wineDllOverridesWithDxvkD3d9("dxgi=n,b;d3d9,d3d8=n"),
+             std::string("dxgi=n,b;d3d9,d3d8=n"));
+
+    // Whole module names only, case-insensitively, and never a fragment of a
+    // longer one -- d3dx9_43 is a different module from d3d9.
+    CHECK(boxedvn::wineDllOverridesNameModule("D3D9=n", "d3d9"));
+    CHECK(boxedvn::wineDllOverridesNameModule("dxgi,d3d9 = n,b", "d3d9"));
+    CHECK(!boxedvn::wineDllOverridesNameModule("d3dx9_43=n", "d3d9"));
+    CHECK(!boxedvn::wineDllOverridesNameModule("d3d9x=n", "d3d9"));
+    // The load order is not a module name: a value that happens to spell one
+    // must not count as an override of it.
+    CHECK(!boxedvn::wineDllOverridesNameModule("dxgi=d3d9", "d3d9"));
+}
+
 BOXEDVN_TEST(wine64_layout_supplies_only_a_missing_dll_path) {
     CHECK(!boxedvn::environmentSetsWineDllPath({"WINEPREFIX=/tmp/prefix"}));
     CHECK(boxedvn::environmentSetsWineDllPath(
@@ -94,6 +176,12 @@ BOXEDVN_TEST(wine64_layout_names_the_32_bit_import_chain_a_program_needs) {
     // it and the 32-bit tree did not, so the process ended
     // STATUS_DLL_NOT_FOUND before its own entry point -- a program that never
     // appears rather than an error anything reports.
+    //
+    // libgcc_s_dw2-1.dll came from a later run of the same probe and is the
+    // same kind of name: a mingw runtime DLL Wine's i386 PE modules import
+    // and neither Wine tree builds. Its absence is quieter still -- the
+    // importing builtin fails to load and the program runs on without
+    // Direct3D -- so the list is the only place it is named.
     const std::vector<std::string> names =
         boxedvn::x64Wow64LanePe32ModuleNames();
     CHECK_EQ(names.size(), (size_t)K_X64_WOW64_LANE_PE32_MODULE_COUNT);
@@ -101,7 +189,8 @@ BOXEDVN_TEST(wine64_layout_names_the_32_bit_import_chain_a_program_needs) {
                                  "advapi32.dll", "sechost.dll", "msvcrt.dll",
                                  "ucrtbase.dll", "gdi32.dll", "user32.dll",
                                  "win32u.dll", "opengl32.dll", "wined3d.dll",
-                                 "d3d9.dll", "zlib1.dll"}) {
+                                 "d3d9.dll", "zlib1.dll",
+                                 "libgcc_s_dw2-1.dll"}) {
         CHECK(std::find(names.begin(), names.end(), std::string(expected)) !=
               names.end());
     }

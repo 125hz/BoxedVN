@@ -66,6 +66,19 @@
 // / include / i386 - linux - gnu / bits / siginfo - consts.h:  FPE_INTDIV = 1,		/* Integer divide by zero.  */
 // / include / asm - generic / siginfo.h : #define FPE_INTDIV	1	/* integer divide by zero */
 
+// / include / asm - generic / siginfo.h : the SIGILL si_code values. An opcode
+// the interpreter cannot execute is ILL_ILLOPN -- the opcode itself is a real
+// instruction, it is its operand encoding (a VEX prefix) that is not
+// implemented -- so that is the code the guest handler sees.
+#define K_ILL_ILLOPC	1	/* illegal opcode */
+#define K_ILL_ILLOPN	2	/* illegal operand */
+#define K_ILL_ILLADR	3	/* illegal addressing mode */
+#define K_ILL_ILLTRP	4	/* illegal trap */
+#define K_ILL_PRVOPC	5	/* privileged opcode */
+#define K_ILL_PRVREG	6	/* privileged register */
+#define K_ILL_COPROC	7	/* coprocessor error */
+#define K_ILL_BADSTK	8	/* internal stack error */
+
 #define K_FPE_INTDIV	1	/* integer divide by zero */
 #define K_FPE_INTOVF	2	/* integer overflow */
 #define K_FPE_FLTDIV	3	/* floating point divide by zero */

@@ -137,6 +137,89 @@ static bool guestWantsWow64Dxvk(const std::vector<BString>& envValues) {
     return wanted;
 }
 
+// Make every process of an x86-64 session resolve glibc's IFUNC string and
+// memory routines to non-VEX implementations.
+//
+// See K_X64_GUEST_GLIBC_HWCAPS in guest_wine64_layout.h for why: only the
+// launched process runs on FEX, every forked child runs on the SSE2-only
+// interpreter, and glibc chose its routines once, from the FEX CPUID, before
+// the first fork. GLIBC_TUNABLES is read by ld.so in each process, so the
+// choice is remade -- the same way -- in the children as well.
+//
+// A caller-supplied GLIBC_TUNABLES is kept and appended to; a caller that
+// already named glibc.cpu.hwcaps keeps its own list untouched. Only the last
+// assignment is what the guest would see, so that is the one this reads and
+// the one it replaces.
+static void addGuestGlibcTunables(std::vector<BString>& envValues) {
+    const BString prefix = B(K_X64_GUEST_GLIBC_TUNABLES_NAME "=");
+    BString existing;
+    int replaceAt = -1;
+    for (int i = 0; i < (int)envValues.size(); i++) {
+        if (envValues[i].startsWith(prefix)) {
+            existing = envValues[i].substr(prefix.length());
+            replaceAt = i;
+        }
+    }
+    const std::string composed =
+        boxedvn::guestGlibcTunablesValue(std::string(existing.c_str()));
+    const bool callerSetHwcaps =
+        replaceAt >= 0 &&
+        boxedvn::glibcTunablesSetHwcaps(std::string(existing.c_str()));
+    const BString assignment = prefix + BString::copy(composed.c_str());
+    if (replaceAt >= 0) {
+        envValues[replaceAt] = assignment;
+    } else {
+        envValues.push_back(assignment);
+    }
+    // One line naming the value the guest will actually carry, so a log shows
+    // whether the children were launched with the tunables at all rather than
+    // leaving it to be inferred from which routines they died in.
+    klog_fmt("BOXEDWINE_X64_GLIBC_TUNABLES value=%s status=%s",
+             composed.c_str(),
+             callerSetHwcaps ? "caller-set-hwcaps"
+                             : (replaceAt >= 0 ? "appended" : "applied"));
+}
+
+// Give the projected DXVK d3d9 the WINEDLLOVERRIDES entry it needs, merged
+// into whatever the launch already set.
+//
+// Declining when the variable was already present is what used to happen, and
+// it was the branch that ran in practice: the app always sets
+// WINEDLLOVERRIDES for the DXMT modules, so the projected DXVK image sat in
+// syswow64 while the loader bound Wine's own i386-windows/d3d9.dll and the
+// device log said only "override-kept". Wine's separator between entries is
+// ';', so the caller's entry keeps everything it named and gains one more.
+//
+// Only the last assignment is what the guest would see, so that is the one
+// this reads and the one it rewrites.
+static void mergeWow64DxvkD3d9Override(std::vector<BString>& envValues) {
+    const BString prefix = B(K_WINE_DLL_OVERRIDES_NAME "=");
+    BString existing;
+    int replaceAt = -1;
+    for (int i = 0; i < (int)envValues.size(); i++) {
+        if (envValues[i].startsWith(prefix)) {
+            existing = envValues[i].substr(prefix.length());
+            replaceAt = i;
+        }
+    }
+    const std::string previous(existing.c_str());
+    const std::string merged = boxedvn::wineDllOverridesWithDxvkD3d9(previous);
+    const bool alreadyNamed =
+        replaceAt >= 0 && boxedvn::wineDllOverridesNameModule(previous, "d3d9");
+    const BString assignment = prefix + BString::copy(merged.c_str());
+    if (replaceAt >= 0) {
+        envValues[replaceAt] = assignment;
+    } else {
+        envValues.push_back(assignment);
+    }
+    klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 status=%s "
+             "WINEDLLOVERRIDES=%s",
+             alreadyNamed ? "override-kept"
+                          : (replaceAt >= 0 ? "override-merged"
+                                            : "override-applied"),
+             merged.c_str());
+}
+
 // Wine normally installs small builtin placeholders into a new prefix's
 // system32 directory. On the BoxedWine x64 path wineboot completes with status
 // 0 but leaves that directory empty, and the FEX-translated parent then cannot
@@ -1308,6 +1391,10 @@ bool StartUpArgs::apply() {
         // bridge rather than to a distro libX11 that opens an X socket. A
         // caller-supplied value is kept, as with every other default here.
         addDefaultEnvValue(envValues, K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT);
+        // Before anything below can fork: the value has to be in the
+        // environment the launched process starts with, because that is the
+        // environment every descendant inherits.
+        addGuestGlibcTunables(envValues);
         // The 32-bit Direct3D 9 renderer, when the launch asked for DXVK's.
         // This has to run after projectX64WinePe32Modules, which is what puts
         // Wine's own d3d9 into syswow64 in the first place.
@@ -1315,19 +1402,7 @@ bool StartUpArgs::apply() {
             projectX64WineDxvkD3d9(winePrefix);
             // Native, not builtin: the projected file is a real PE32 DXVK
             // image and Wine has to load it rather than fall back to its own.
-            // A caller that already set WINEDLLOVERRIDES keeps it -- adding a
-            // second assignment would leave the guest with two, and which one
-            // wins is not something to guess at -- but say so, because that
-            // caller has to spell d3d9=n itself.
-            if (hasEnvValue(envValues, "WINEDLLOVERRIDES")) {
-                klog("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 "
-                     "status=override-kept: the launch already set "
-                     "WINEDLLOVERRIDES; it must include d3d9=n for DXVK to load");
-            } else {
-                envValues.push_back(B("WINEDLLOVERRIDES=d3d9=n"));
-                klog("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 "
-                     "status=override-applied WINEDLLOVERRIDES=d3d9=n");
-            }
+            mergeWow64DxvkD3d9Override(envValues);
         }
         // Audio, after the module projections so the packaged-driver test sees
         // the tree the guest will actually search. See docs/PLAN_X64_AUDIO.md.

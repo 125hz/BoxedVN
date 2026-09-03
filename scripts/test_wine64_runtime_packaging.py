@@ -120,10 +120,16 @@ PE32PLUS_MACHINE = 0x8664
 # the staged 32-bit tree did not, and the process ended STATUS_DLL_NOT_FOUND
 # (0xc0000135) with no message and no window. The archive is checked against
 # this list precisely because the failure it prevents is silent.
+#
+# libgcc_s_dw2-1.dll is the same kind of name as zlib1.dll and came from a
+# later run of the same probe: a mingw runtime DLL that Ubuntu's mingw-built
+# i386 Wine modules import and that neither Wine tree builds. It is quieter
+# than zlib1's absence -- the importing builtin fails to load and the program
+# carries on without Direct3D -- so no status code ever names it.
 PE32_MODULES = ("ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll",
                 "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll",
                 "user32.dll", "win32u.dll", "opengl32.dll", "wined3d.dll",
-                "d3d9.dll", "zlib1.dll")
+                "d3d9.dll", "zlib1.dll", "libgcc_s_dw2-1.dll")
 # The prebuilt 32-bit DXVK, staged beside the i386 builtins rather than over
 # them: a launch that does not set BOXEDVN_WOW64_D3D9=dxvk gets Wine's own
 # d3d9 and cannot regress. Only d3d9.dll is required; the rest ride along.

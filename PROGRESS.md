@@ -7238,3 +7238,30 @@ resource list.
 The witnesses: `BOXEDWINE_X64_RANDR modes= current=WxH@Hz` once, at the first
 query, and one `mode-switch WxH -> WxH@Hz result=ok` per switch. A
 `refused=unlisted` names a size the mode list does not carry.
+
+## Helpers died on glibc's AVX2 routines once CPUID advertised AVX
+
+Advertising AVX did its job for the 64-bit lane (a Direct3D 11 title now
+reaches DXMT's dxgi attach), but glibc in the translated process resolved its
+string routines to AVX2 IFUNC variants, and every forked helper runs on the
+interpreter, which has no VEX decoding. Each grandchild of Wine's double fork
+died at the same libc address before it could exec, so no child process ever
+started: no explorer for the desktop, no window for either cube (the 32-bit
+probe's status 2 is its own return code for a failed CreateWindowExW), and the
+64-bit title exited after its window creation failed.
+
+The x86-64 launch environment now carries
+GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX,-AVX2,-AVX_Fast_Unaligned_Load,-FMA,-FMA4,-XSAVE,-XSAVEC
+(glibc 2.39 names; XSAVE/XSAVEC because the interpreter has FXSAVE only, so
+ld.so must pick the fxsave PLT trampoline), witnessed by
+BOXEDWINE_X64_GLIBC_TUNABLES. CPUID still advertises AVX to programs. The
+interpreter's unimplemented-opcode path now raises SIGILL (handler or
+signal death with BOXEDWINE_X64_PROC_EXIT) instead of parking the thread.
+
+Two 32-bit lane gaps found in the same logs: the DXVK d3d9 projection was
+declined whenever the app had already set WINEDLLOVERRIDES (it always does),
+so Wine's builtin d3d9 loaded; the override is now merged as `;d3d9=n`. And
+Wine's i386 uxtheme/opengl32 import libgcc_s_dw2-1.dll, which the 32-bit
+archive lacked; it is a required module now with a CI fallback from the mingw
+runtime. The Vulkan shim witness keyed on a define nothing set, so it always
+printed present=0; it now checks the staged file.

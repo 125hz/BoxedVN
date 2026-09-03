@@ -618,11 +618,14 @@ check_zip_path "${PE32_ARCHIVE}" "${PE32_DIR}"
 # ended STATUS_DLL_NOT_FOUND (0xc0000135) with no message. Presence is checked
 # for every name because the archive is what ships; the image class is checked
 # for the two the loader binds to first, which is where a tree built from the
-# wrong package announces itself.
+# wrong package announces itself. libgcc_s_dw2-1.dll is the same kind of name
+# as zlib1.dll -- a mingw runtime DLL Wine's i386 PE modules import and neither
+# Wine tree builds -- and a later run of the same probe missed it in all four
+# search directories, so it is required here too.
 for required_pe32 in ntdll.dll kernel32.dll kernelbase.dll advapi32.dll \
                      sechost.dll msvcrt.dll ucrtbase.dll gdi32.dll \
                      user32.dll win32u.dll opengl32.dll wined3d.dll \
-                     d3d9.dll zlib1.dll; do
+                     d3d9.dll zlib1.dll libgcc_s_dw2-1.dll; do
     check_zip_path "${PE32_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
 done
 for classed_pe32 in ntdll.dll kernel32.dll; do

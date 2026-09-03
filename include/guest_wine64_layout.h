@@ -73,6 +73,13 @@
 // the variable being unset, keeps Wine's own d3d9.
 #define K_X64_WOW64_D3D9_ENV "BOXEDVN_WOW64_D3D9"
 #define K_X64_WOW64_D3D9_DXVK "dxvk"
+// The override entry the projected DXVK d3d9 needs: native only, because the
+// projected file is a real PE32 DXVK image and Wine has to load it rather than
+// fall back to its own builtin. Wine separates WINEDLLOVERRIDES entries with
+// ';' and the modules of one entry with ','.
+#define K_X64_WOW64_D3D9_NATIVE_OVERRIDE "d3d9=n"
+#define K_WINE_DLL_OVERRIDES_NAME "WINEDLLOVERRIDES"
+#define K_WINE_DLL_OVERRIDES_SEPARATOR ";"
 // The lane launches through the name upstream's WoW64 layout uses. Wine
 // derives the loader for a 32-bit image by stripping "64" from its own name
 // and hands the image to start.exe whenever that yields a name
@@ -106,6 +113,48 @@
 #define K_X64_GUEST_X11_LIB_DIR "/usr/lib/boxedwine64-x11"
 #define K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT "LD_LIBRARY_PATH=" K_X64_GUEST_X11_LIB_DIR
 
+// The glibc CPU tunables every x86-64 guest process is launched with, and why
+// a launch has to set them at all.
+//
+// glibc picks its string and memory routines by IFUNC, once, while ld.so
+// relocates the process, from whatever CPUID reported. The process the session
+// launches runs on FEX, which advertises AVX/AVX2/FMA, so its libc resolves to
+// the AVX2 variants. Every process forked from it cannot run on FEX -- a
+// second identity mapping of the guest address space is impossible -- and
+// falls back to the x86-64 interpreter, which implements SSE2 only. Wine
+// double-forks before every exec, so the grandchild is already inside an AVX2
+// libc routine before it ever reaches execve; a device run stopped one at
+// "unimpl opcode ... c5 f9 6e c6", which is `vmovd xmm0, esi`, the prologue of
+// an AVX2 string routine.
+//
+// GLIBC_TUNABLES is read by ld.so before the first IFUNC resolves and is an
+// ordinary environment variable, so it is inherited by fork and carried across
+// execve -- the one switch that reaches the children as well as the process
+// that was launched. CPUID is deliberately left advertising AVX: a Windows
+// program does not go through glibc's IFUNC table and the 64-bit lane needs
+// the feature bits.
+//
+// XSAVE and XSAVEC are disabled for a second, independent reason. ld.so picks
+// its lazy-binding trampoline from them -- _dl_runtime_resolve_xsavec when
+// they are usable, _dl_runtime_resolve_fxsave otherwise -- and the interpreter
+// implements FXSAVE/FXRSTOR but neither XSAVE, XSAVEC nor XRSTOR. Without
+// this a helper would die the same way on the first lazily bound PLT entry,
+// whatever its string routines were.
+//
+// The spellings are the ones the packaged glibc accepts. glibc-rootfs64.zip is
+// assembled from an Ubuntu 24.04 runner (scripts/build-wine64-runtime-ci.sh
+// records source_image=ubuntu-24.04-apt and copies the runner's own
+// libraries), which is glibc 2.39, and 2.39's sysdeps/x86/cpu-tunables.c
+// matches exactly AVX, AVX2, FMA, FMA4, XSAVE, XSAVEC and
+// AVX_Fast_Unaligned_Load among these. F16C is deliberately absent: glibc has
+// no tunable of that name -- it would be ignored rather than honoured -- and
+// disabling AVX is what keeps the VEX-encoded routines out.
+#define K_X64_GUEST_GLIBC_HWCAPS \
+    "-AVX,-AVX2,-AVX_Fast_Unaligned_Load,-FMA,-FMA4,-XSAVE,-XSAVEC"
+#define K_X64_GUEST_GLIBC_TUNABLES_NAME "GLIBC_TUNABLES"
+#define K_X64_GUEST_GLIBC_HWCAPS_TUNABLE \
+    "glibc.cpu.hwcaps=" K_X64_GUEST_GLIBC_HWCAPS
+
 // Where a 64-bit guest Vulkan shim has to be staged, and why it is this
 // directory. Wine's winevulkan.so dlopens the bare soname, so the guest's own
 // ld-linux decides; the directory above is already at the head of
@@ -120,8 +169,13 @@
 //   searching, so wined3d gets no Vulkan adapter and no GL adapter and
 //   Direct3DCreate9 fails.
 //
-// Nothing builds this file yet. The name is fixed here so the builder, the
-// packaging and the startup witness cannot disagree about it.
+// scripts/build-boxedwine-x64-vulkan.sh builds the file, the runtime builder
+// stages it here and scripts/validate-wine64-runtime.sh requires it in
+// wine64.zip as an ELF64 x86-64 object. The name is fixed here so the builder,
+// the packaging and the startup witness cannot disagree about it -- and the
+// witness (BOXEDWINE_X64_VULKAN_SHIM in source/vulkan/vulkancommon.cpp) reads
+// this path out of the mounted guest filesystem and checks its ELF class,
+// because the IA-32 shim in the root filesystem answers to the same name.
 #define K_X64_GUEST_VULKAN_SONAME "libvulkan.so.1"
 #define K_X64_GUEST_VULKAN_LIB_PATH \
     K_X64_GUEST_X11_LIB_DIR "/" K_X64_GUEST_VULKAN_SONAME
@@ -162,11 +216,24 @@
 // screen is indistinguishable from a program that ran and drew nothing. The
 // names are therefore checked where the tree is built and reported again at
 // launch, so the gap is named rather than inferred.
-#define K_X64_WOW64_LANE_PE32_MODULE_COUNT 14
+//
+// libgcc_s_dw2-1.dll is the second name of the same kind, and it is here for
+// the same reason. Ubuntu builds Wine's PE modules with mingw-w64, and the
+// i386 ones reach for the shared i686 libgcc: a later device run resolved the
+// whole chain above and then missed libgcc_s_dw2-1.dll in all four search
+// directories, immediately after mapping opengl32.dll and again after
+// uxtheme.dll. That miss is quieter than zlib1's -- the importing builtin
+// fails to load and its caller carries on, so the program reaches its own
+// code and only Direct3D is gone -- which makes it exactly the kind of gap
+// that has to be caught where the tree is packaged. `dw2` is the i686 mingw
+// unwinder flavour, so the name is specific to the 32-bit tree; the 64-bit
+// one would want libgcc_s_seh-1.dll and does not import it.
+#define K_X64_WOW64_LANE_PE32_MODULE_COUNT 15
 #define K_X64_WOW64_LANE_PE32_MODULE_NAMES \
     {"ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll", \
      "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll", "user32.dll", \
-     "win32u.dll", "opengl32.dll", "wined3d.dll", "d3d9.dll", "zlib1.dll"}
+     "win32u.dll", "opengl32.dll", "wined3d.dll", "d3d9.dll", "zlib1.dll", \
+     "libgcc_s_dw2-1.dll"}
 
 // The builtin whose absence is the failure this layout exists to prevent. It
 // is the first PE module Wine loads after the server handshake, so a guest
@@ -275,6 +342,126 @@ inline bool looksLikePeImage(const unsigned char* bytes, unsigned long length) {
     return bytes != nullptr && length >= 2 &&
            bytes[0] == (unsigned char)K_PE_IMAGE_SIGNATURE_0 &&
            bytes[1] == (unsigned char)K_PE_IMAGE_SIGNATURE_1;
+}
+
+// True when this environment entry sets GLIBC_TUNABLES at all, whatever it
+// carries.
+inline bool isGlibcTunablesAssignment(const std::string& entry) {
+    return entry.rfind(K_X64_GUEST_GLIBC_TUNABLES_NAME "=", 0) == 0;
+}
+
+// True when a GLIBC_TUNABLES value already carries a glibc.cpu.hwcaps list.
+// glibc separates tunables with ':' and spells each one name=value, so the
+// list is set when the name starts the value or follows a separator -- a
+// substring test alone would also match a longer name that merely ends in it.
+inline bool glibcTunablesSetHwcaps(const std::string& value) {
+    const std::string name = "glibc.cpu.hwcaps=";
+    for (std::string::size_type at = value.find(name);
+         at != std::string::npos; at = value.find(name, at + 1)) {
+        if (at == 0 || value[at - 1] == ':') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The GLIBC_TUNABLES value an x86-64 launch runs with, given whatever the
+// caller already supplied (the empty string when the caller supplied nothing).
+//
+// A caller's tunables are kept and appended to, not replaced: a caller that
+// set one is tuning something else -- malloc arenas, say -- and dropping that
+// silently would trade one defect for another. A caller that already named
+// glibc.cpu.hwcaps keeps its list untouched: there is one hwcaps list per
+// process and merging two of them behind the caller's back is a guess.
+inline std::string guestGlibcTunablesValue(const std::string& existing) {
+    if (existing.empty()) {
+        return K_X64_GUEST_GLIBC_HWCAPS_TUNABLE;
+    }
+    if (glibcTunablesSetHwcaps(existing)) {
+        return existing;
+    }
+    return existing + ":" + K_X64_GUEST_GLIBC_HWCAPS_TUNABLE;
+}
+
+inline std::string guestGlibcTunablesAssignment(const std::string& existing) {
+    return std::string(K_X64_GUEST_GLIBC_TUNABLES_NAME "=") +
+           guestGlibcTunablesValue(existing);
+}
+
+// True when a WINEDLLOVERRIDES value already names this module, whatever load
+// order it gives it.
+//
+// Parsed rather than substring-matched: the value is a ';'-separated list of
+// entries, each "dll[,dll...]=order", so "d3d9" has to be matched as a whole
+// module name on the left of an '=' and not as a fragment of a longer one.
+// Wine compares module names case-insensitively, so this does too.
+inline bool wineDllOverridesNameModule(const std::string& value,
+                                       const std::string& module) {
+    std::string::size_type entryAt = 0;
+    while (entryAt <= value.size()) {
+        const std::string::size_type entryEnd = value.find(';', entryAt);
+        const std::string entry = value.substr(
+            entryAt, entryEnd == std::string::npos ? std::string::npos
+                                                   : entryEnd - entryAt);
+        const std::string names = entry.substr(0, entry.find('='));
+        std::string::size_type nameAt = 0;
+        while (nameAt <= names.size()) {
+            const std::string::size_type nameEnd = names.find(',', nameAt);
+            std::string name = names.substr(
+                nameAt, nameEnd == std::string::npos ? std::string::npos
+                                                     : nameEnd - nameAt);
+            // Trim the spaces a hand-written value may carry around a name.
+            while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) {
+                name.erase(name.begin());
+            }
+            while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) {
+                name.pop_back();
+            }
+            if (name.size() == module.size()) {
+                bool same = true;
+                for (std::string::size_type i = 0; i < name.size(); ++i) {
+                    const char a = name[i] >= 'A' && name[i] <= 'Z'
+                                       ? (char)(name[i] - 'A' + 'a') : name[i];
+                    const char b = module[i] >= 'A' && module[i] <= 'Z'
+                                       ? (char)(module[i] - 'A' + 'a') : module[i];
+                    if (a != b) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    return true;
+                }
+            }
+            if (nameEnd == std::string::npos) {
+                break;
+            }
+            nameAt = nameEnd + 1;
+        }
+        if (entryEnd == std::string::npos) {
+            break;
+        }
+        entryAt = entryEnd + 1;
+    }
+    return false;
+}
+
+// The WINEDLLOVERRIDES a launch that projects DXVK's 32-bit d3d9 runs with,
+// given whatever the caller already set.
+//
+// There is one WINEDLLOVERRIDES per process, so the entry is merged into the
+// caller's value rather than added beside it -- two assignments would leave
+// the guest with two and which one wins is not something to guess at. A caller
+// that already named d3d9 keeps its own load order: it said what it wanted.
+inline std::string wineDllOverridesWithDxvkD3d9(const std::string& existing) {
+    if (existing.empty()) {
+        return K_X64_WOW64_D3D9_NATIVE_OVERRIDE;
+    }
+    if (wineDllOverridesNameModule(existing, "d3d9")) {
+        return existing;
+    }
+    return existing + K_WINE_DLL_OVERRIDES_SEPARATOR +
+           K_X64_WOW64_D3D9_NATIVE_OVERRIDE;
 }
 
 } // namespace boxedvn

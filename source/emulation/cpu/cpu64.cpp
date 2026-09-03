@@ -5514,6 +5514,37 @@ unhandled:
         dumpMem("RBX ", reg[X64_RBX].u64);
         dumpMem("RBP ", reg[X64_RBP].u64);
     }
+    // An opcode this interpreter does not implement is, to the guest, an
+    // illegal instruction, and the guest has to be told so.
+    //
+    // What used to happen instead was nothing: `yield = true` breaks the
+    // dispatch loop in normalPlatformMultiThreaded.cpp, the platform thread
+    // returns, and the process stays alive with no exit status, no lifecycle
+    // marker and nobody to wake a parent blocked in waitpid. A device log
+    // therefore ended with the opcode line and no BOXEDWINE_X64_PROC_EXIT for
+    // that pid at all, which reads as "the helper vanished" rather than "the
+    // helper executed an instruction we do not have".
+    //
+    // rip is put back at the faulting instruction first: several of the ten
+    // paths that reach this label decode part of an instruction before giving
+    // up, and the ucontext RIP a handler reads has to be the fault site.
+    rip = ipStart;
+    if (this->raiseSyncFault(K_SIGILL, /*trapNo #UD*/6, K_ILL_ILLOPN, ipStart)) {
+        return 0; // rip now at the handler
+    }
+    // No handler: the kernel's default action for SIGILL is to terminate the
+    // process, and a waiter has to see that it died of a signal rather than
+    // exiting. The low 7 bits of the wait status are the terminating signal
+    // (KSystem's waitpid builds it from `signaled`), which is what makes
+    // WIFSIGNALED true and WTERMSIG report SIGILL in the parent.
+    if (thread && thread->process) {
+        thread->process->signaled = K_SIGILL;
+    }
+    // 128 + SIGILL, the shell's convention for a signal death, so a status
+    // printed anywhere still names the signal. kfatalProcessExit64 emits the
+    // same two markers a guest exit_group does, so this ending reads the same
+    // way to every consumer of the log.
+    kfatalProcessExit64(this, 128 + K_SIGILL, "cpu64-illegal-instruction");
     yield = true;
     return 0;
 }

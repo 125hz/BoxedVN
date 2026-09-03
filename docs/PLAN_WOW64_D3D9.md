@@ -20,6 +20,17 @@ then failed at device creation. `BOXEDWINE_X64_PE32_GAP tree=i386-windows
 required=14 missing=0` in the 02:12 run says the packaging gap that killed the
 previous attempt is closed.
 
+**Update.** The `libgcc` in that chain is `libgcc_s_dw2-1.dll`, and a later
+device run no longer resolved it: it missed in all four search directories,
+immediately after `opengl32.dll` was mapped and again after `uxtheme.dll`.
+Wine builds neither tree's copy -- it is the i686 mingw unwinder runtime that
+Ubuntu's mingw-built i386 PE modules import -- so it is now a required name
+alongside `zlib1.dll`, which raises `K_X64_WOW64_LANE_PE32_MODULE_COUNT` to 15
+and makes later logs read `required=15`. The workflow supplies it from
+`gcc-mingw-w64-i686` when the i386 package lacks it. Note the failure mode is
+softer than zlib1's: the importing builtin fails to load and its caller runs
+on without it, so the process reaches its own code and only Direct3D is gone.
+
 Three facts from that run decide the design.
 
 **1. Wine's own d3d9 is wined3d, and wined3d needs OpenGL or Vulkan.** There is
@@ -352,7 +363,13 @@ finds first on `LD_LIBRARY_PATH`.
   `static_assert`s that keep it from colliding with the DXMT unix call or the
   X11 bridge, and one forwarding case.
 - `source/vulkan/vulkancommon.cpp`. The `BOXEDWINE_X64_VULKAN_SHIM` startup
-  line, now also carrying `bridge_ops`.
+  line, now also carrying `bridge_ops`. `present` and `icd` are answered from
+  the mounted guest filesystem rather than from a compile-time define: the
+  define (`BOXEDWINE_X64_VULKAN_GUEST_SHIM`) was never set by any build, so
+  the line read `present=0 icd=none` even on runs whose `wine64.zip` carried
+  the file. `present=1` now means the path resolves to an ELF64 object;
+  `icd=elf32-lane32-shim` names the IA-32 shim the 64-bit loader walks past,
+  and `not-elf` / `unreadable` name the other two ways the file can be wrong.
 - `include/guest_wine64_layout.h`. `K_X64_WINE_DXVK_PE32_DIR`,
   `K_X64_DXVK_PE32_MODULE_NAMES`, `K_X64_WOW64_D3D9_ENV`.
 - `source/sdl/startupArgs.cpp`. `projectX64WineDxvkD3d9()` and the opt-in.
