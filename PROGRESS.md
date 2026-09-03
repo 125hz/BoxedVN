@@ -5901,3 +5901,31 @@ the faulting program's command line, so the desktop no longer consumes the
 cube's target. (cfe01cc5 carried all of this except the display-link
 thread and the counter readout, added in the following commit.)
 
+## The desktop's missing drives: system32 has no drivers directory
+
+Four device runs of the 64-bit desktop tell the same story. services.exe
+starts winedevice.exe for the mount manager, winedevice stats
+`system32/drivers` three times -- ENOENT each time, with Wine's
+case-insensitive retry re-reading all 961 system32 entries in between --
+then stats `system32/drivers/mountmgr.sys`, gets ENOENT, and exits 0;
+services.exe follows it out a moment later. Nothing else publishes the
+\DosDevices drive links that GetLogicalDrives enumerates, so My Computer
+lists no drives at all, not even C:. The `dosdevices/c:` link itself is
+fine: it resolves through the mounted host folder (the guest's opendir of
+`dosdevices/c:/windows/system32` reads `drive_c/windows/system32`), and
+the a-z drive scan at startup finds c:, d: and e:.
+
+The cause is the system32 projection, not the mount. Wine's packaged
+builtin tree is flat -- `x86_64-windows/mountmgr.sys` sits beside the
+DLLs -- but the services wine.inf registers name their binary as
+`%11%\drivers\<name>.sys`, one level below system32. The projection
+placed all 959 modules in system32 and created no drivers directory, and
+wineboot --init, which would have created it as part of its fake-dll
+install, is still reading wine.inf when services.exe starts winedevice.
+So the prefix now carries the directory before the first boot: every
+`.sys` builtin is projected a second time into
+`drive_c/windows/system32/drivers`, with the same non-destructive rule as
+system32 (a real prefix file always wins). The witness for the next log is
+`BOXEDWINE_X64_DRIVERS_OVERLAY destination=... projected=N mountmgr=1`;
+mountmgr=0 would mean the packaged runtime ships no mount manager at all,
+which is the only remaining way for the drives to stay missing.

@@ -40,6 +40,12 @@
 #define K_GUEST_WINE_C_LINK "c:"
 #define K_GUEST_WINE_WINDOWS "windows"
 #define K_GUEST_WINE_SYSTEM32 "system32"
+// Wine keeps its kernel drivers one level below system32, and the service
+// entries wine.inf writes name them there: the mount manager's is
+// ServiceBinary="%11%\drivers\mountmgr.sys". The packaged builtin tree is
+// flat, so a .sys module has to be projected into a drivers directory of its
+// own as well as beside the DLLs.
+#define K_GUEST_WINE_DRIVERS "drivers"
 // Relative on purpose: it is what Wine writes, and it keeps the prefix
 // relocatable. The guest filesystem resolves a relative link target against
 // the link's own directory.
@@ -165,6 +171,38 @@ inline std::string guestWineDriveCLinkPath(const std::string& prefix) {
 inline std::string guestWineSystem32Path(const std::string& prefix) {
     return guestWineDriveCPath(prefix) + "/" + K_GUEST_WINE_WINDOWS + "/" +
            K_GUEST_WINE_SYSTEM32;
+}
+
+inline std::string guestWineDriversPath(const std::string& prefix) {
+    return guestWineSystem32Path(prefix) + "/" + K_GUEST_WINE_DRIVERS;
+}
+
+// True for a packaged builtin that belongs in system32\drivers. Wine names a
+// driver by extension and nothing else -- ntoskrnl.exe and hal.dll stay in
+// system32 -- so the test is the ".sys" suffix, matched without regard to
+// case because the guest filesystem is case-insensitive for Windows paths.
+//
+// A prefix whose drivers directory does not exist makes winedevice.exe fail
+// to open mountmgr.sys and exit 0, and the mount manager is the only thing
+// that turns dosdevices/<letter>: into the \DosDevices links the shell
+// enumerates: the desktop then shows no drives at all, not even C:.
+inline bool isGuestWineKernelDriverModule(const char* name) noexcept {
+    if (name == nullptr) {
+        return false;
+    }
+    std::size_t end = 0;
+    while (name[end] != 0) {
+        ++end;
+    }
+    // At least one character of name before the four-character suffix.
+    if (end < 5) {
+        return false;
+    }
+    const char* suffix = name + (end - 4);
+    return suffix[0] == '.' &&
+           (suffix[1] == 's' || suffix[1] == 'S') &&
+           (suffix[2] == 'y' || suffix[2] == 'Y') &&
+           (suffix[3] == 's' || suffix[3] == 'S');
 }
 
 // The x64 prefix exposes packaged Wine builtins as an in-memory overlay. A

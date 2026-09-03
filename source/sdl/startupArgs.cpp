@@ -288,6 +288,61 @@ static void projectX64WineSystemModules(const BString& winePrefix) {
              "projected=%u preserved=%u skipped=%u status=ready",
              K_X64_WINE_PE_DIR, system32.c_str(), projected, preserved,
              skipped);
+
+    // The kernel drivers go one level down. Wine's packaged builtin tree
+    // is flat, but the services wine.inf registers name their binary as
+    // "%11%\drivers\<name>.sys", so a driver projected only beside the
+    // DLLs is not where winedevice.exe looks for it. Four device runs
+    // logged the consequence: stat 'system32/drivers' -> ENOENT (three
+    // times, Wine's case-insensitive retry re-reading all 961 system32
+    // entries), then 'system32/drivers/mountmgr.sys' -> ENOENT, and then
+    // winedevice.exe and services.exe both exiting 0 seconds after boot.
+    // Nothing else publishes the \DosDevices drive links the shell
+    // enumerates, which is why the desktop listed no drives at all, not
+    // even C:.
+    //
+    // wineboot --init would create the directory as part of its fake-dll
+    // install, but it is still reading wine.inf when services.exe starts
+    // winedevice.exe, so the prefix has to carry the directory before the
+    // first boot rather than during it.
+    const BString drivers = system32 + "/" K_GUEST_WINE_DRIVERS;
+    Fs::makeLocalDirs(drivers);
+    std::shared_ptr<FsNode> driversDirectory =
+        Fs::getNodeFromLocalPath(B(""), drivers, true);
+    if (!driversDirectory || !driversDirectory->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_DRIVERS_OVERLAY destination=%s projected=0 "
+                 "mountmgr=0 status=unavailable", drivers.c_str());
+        return;
+    }
+    U32 driversProjected = 0;
+    U32 mountManagerProjected = 0;
+    for (const std::shared_ptr<FsNode>& source : sourceModules) {
+        if (!source || source->name.isEmpty()) {
+            continue;
+        }
+        if (!boxedvn::isGuestWineKernelDriverModule(source->name.c_str())) {
+            continue;
+        }
+        const BString driverDestination = drivers + "/" + source->name;
+        const bool driverExists =
+            Fs::getNodeFromLocalPath(B(""), driverDestination, false) != nullptr;
+        if (!boxedvn::shouldProjectGuestWineSystemModule(
+                source != nullptr, source && source->isDirectory(),
+                driverExists)) {
+            continue;
+        }
+        Fs::addFileNode(driverDestination, source->path, B(""), false,
+                        driversDirectory);
+        ++driversProjected;
+        if (source->name.toLowerCase() == "mountmgr.sys") {
+            mountManagerProjected = 1;
+        }
+    }
+    // The witness for the next device log: mountmgr=1 says the mount
+    // manager has a binary to load, which is why the drives come back.
+    klog_fmt("BOXEDWINE_X64_DRIVERS_OVERLAY destination=%s projected=%u "
+             "mountmgr=%u status=ready",
+             drivers.c_str(), driversProjected, mountManagerProjected);
 }
 
 // WINEARCH, for the launch marker only. Empty means the caller left it to

@@ -189,3 +189,26 @@ BOXEDVN_TEST(guest_wine_prefix_c_link_target_is_relative_to_dosdevices) {
     CHECK(guestWineDosDevicesPath(prefix) + "/" + K_GUEST_WINE_C_LINK_TARGET ==
           "/home/username/.wine64/dosdevices/../drive_c");
 }
+
+BOXEDVN_TEST(guest_wine_kernel_drivers_live_below_system32) {
+    // winedevice.exe opens the mount manager as
+    // C:\windows\system32\drivers\mountmgr.sys, so the flat packaged builtin
+    // tree has to reach that path too. A prefix without the directory made
+    // winedevice exit 0 at boot and the desktop showed no drives at all.
+    CHECK(std::string(K_GUEST_WINE_DRIVERS) == "drivers");
+    CHECK(guestWineDriversPath("/home/username/.wine64") ==
+          "/home/username/.wine64/drive_c/windows/system32/drivers");
+
+    CHECK(isGuestWineKernelDriverModule("mountmgr.sys"));
+    CHECK(isGuestWineKernelDriverModule("MOUNTMGR.SYS"));
+    CHECK(isGuestWineKernelDriverModule("winebus.sys"));
+    // Everything else stays beside the DLLs, including the two modules whose
+    // names look like drivers but are loaded from system32 itself.
+    CHECK(!isGuestWineKernelDriverModule("ntoskrnl.exe"));
+    CHECK(!isGuestWineKernelDriverModule("hal.dll"));
+    CHECK(!isGuestWineKernelDriverModule("winex11.drv"));
+    CHECK(!isGuestWineKernelDriverModule(".sys"));
+    CHECK(!isGuestWineKernelDriverModule("sys"));
+    CHECK(!isGuestWineKernelDriverModule(""));
+    CHECK(!isGuestWineKernelDriverModule(nullptr));
+}
