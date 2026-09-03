@@ -3807,6 +3807,91 @@ def main() -> None:
         "long-mode segment base contract",
     )
 
+    # Per-block decode mode. Wine's WoW64 layer far-jumps a 64-bit thread into
+    # a 32-bit code segment and back, so the width a block is decoded in is a
+    # property of the block, not of the context. The translator already derived
+    # it that way -- from the L bit of the descriptor CS names -- and only two
+    # assertions tied it to the context's creation-time mode.
+    mode_patch = read(
+        repository
+        / "scripts/fex64-patches/fex-boxedwine-per-block-decode-mode.patch"
+    )
+    require_ordered(
+        mode_patch,
+        [
+            # The gate. Nothing may diverge unless the host armed it.
+            "void SetGuestPerBlockDecodeMode(bool Enabled) override {",
+            "bool GetGuestPerBlockDecodeMode() const {",
+            # The witness the next device run is read for.
+            "BOXEDWINE_FEX64_MODE_SWITCH rip={:#x} cs={:#x} mode={}",
+            # The block cache is keyed by RIP alone, so a page that changes
+            # bitness has to be invalidated before it is compiled again.
+            "bool ContextImpl::BoxedWineClaimDecodeModePage(",
+            "BOXEDWINE_FEX64_MODE_PAGE_CONFLICT",
+            "SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, Page, "
+            "FEXCore::Utils::FEX_PAGE_SIZE);",
+            # The frontend's assertion becomes conditional, not deleted: a
+            # divergence with the gate closed is still a hard error.
+            "BlockInfo.Is64BitMode = CSSegment->L == 1;",
+            "LOGMAN_THROW_A_FMT(CTX->GetGuestPerBlockDecodeMode(), "
+            "\"Expected operating mode to not change at runtime!\");",
+            "CTX->BoxedWineNoteDecodeMode(PC, "
+            "Thread->CurrentFrame->State.cs_idx, BlockInfo.Is64BitMode);",
+            # The same relaxation in the dispatcher, which is handed the
+            # decoder's per-block answer already.
+            "LOGMAN_THROW_A_FMT(CTX->GetGuestPerBlockDecodeMode(), "
+            "\"Expected operating mode to not change at runtime!\");",
+            # And the public arming hook the integration calls.
+            "virtual void SetGuestPerBlockDecodeMode(bool Enabled)",
+        ],
+        "per-block decode mode contract",
+    )
+    # The descriptor table is host memory in a 32-bit block exactly as it is in
+    # a 64-bit one, so the substituted base must no longer be conditional on
+    # the width -- and FS and GS must still be excluded from it and served by
+    # the host trap in both modes.
+    for required in (
+        "const bool HostSideDescriptorTable = CTX->GetGuestLowAliasBase() "
+        "!= 0 &&",
+        "if (!Is64BitMode && CTX->GetGuestLowAliasBase() == 0) {",
+    ):
+        if required not in mode_patch:
+            raise SystemExit(
+                "the per-block decode mode patch must keep the host-side "
+                "descriptor table decision on the address space rather than "
+                "the width: " + required)
+    require_ordered(
+        read(repository / "scripts/build-fex64-fex.sh"),
+        [
+            "apply_patch fex-boxedwine-low-address-alias.patch",
+            "apply_patch fex-boxedwine-longmode-segment-base.patch",
+            "apply_patch fex-boxedwine-longmode-segment-selector-write.patch",
+            "apply_patch fex-boxedwine-far-transfer-witness.patch",
+            "apply_patch fex-boxedwine-per-block-decode-mode.patch",
+        ],
+        "per-block decode mode patch order",
+    )
+    # The host half of the same switch: the one descriptor whose L bit decides
+    # a decode, and the arming that lets the translator act on it.
+    backend = read(repository / "ios/runtime/src/BVNFEXBackend.mm")
+    require_ordered(
+        backend,
+        [
+            "initialiseGuestDescriptorTable(",
+            "bool wow64ModeSwitch",
+            "table[wow64Code].L = 0;",
+            "table[wow64Code].D = 1;",
+            "guestWow64ModeSwitchEnabled()",
+            "SetGuestPerBlockDecodeMode(perBlockDecodeMode)",
+        ],
+        "WoW64 32-bit code descriptor contract",
+    )
+    if "K_WINE_X86_CODE_SELECTOR 0x23" not in read(
+            repository / "include/guest_segment_table.h"):
+        raise SystemExit(
+            "the 32-bit code selector a WoW64 thread enters compatibility "
+            "mode with must be named where the table arithmetic lives")
+
     # The dispatcher-return fixture runs through the real translator, with the
     # alias on as well as off, because the alias is the device's configuration.
     probe = read(repository / "scripts/run-fex64-vixl-probe.sh")

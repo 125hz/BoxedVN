@@ -254,8 +254,19 @@ std::unique_ptr<FEXContextBundle> gProbeContext;
 // a uniform table cannot change any program's meaning -- and it means a
 // selector this port did not anticipate keeps the decoder in 64-bit mode
 // instead of reading past the end of the array.
+//
+// One exception, and only when the WoW64 mode switch is armed: the 32-bit
+// code selector. The translator takes a block's decode width from the L bit
+// of the descriptor CS names, so with a uniformly long-mode table the first
+// block of 32-bit ntdll -- reached through wow64cpu's far jump, which changes
+// CS and nothing else -- was decoded as 64-bit code and faulted at an address
+// no 32-bit instruction can form. Giving that one descriptor L=0 and D=1 is
+// the whole of the mode switch on this side; the descriptor is flat and
+// present like every other, so it changes nothing for a process that never
+// loads it.
 inline void initialiseGuestDescriptorTable(
-    FEXCore::Core::CPUState::gdt_segment* table) {
+    FEXCore::Core::CPUState::gdt_segment* table,
+    bool wow64ModeSwitch) {
     for (unsigned entry = 0; entry < K_GUEST_SEGMENT_TABLE_ENTRIES; ++entry) {
         table[entry] = {};
         FEXCore::Core::CPUState::SetGDTBase(&table[entry], 0);
@@ -266,13 +277,35 @@ inline void initialiseGuestDescriptorTable(
         table[entry].L = 1;    // long mode
         table[entry].D = 0;    // reserved when L is set
     }
+    if (!wow64ModeSwitch) {
+        return;
+    }
+    const unsigned wow64Code =
+        boxedvn::decodeGuestSegmentSelector(K_WINE_X86_CODE_SELECTOR).index;
+    if (wow64Code < K_GUEST_SEGMENT_TABLE_ENTRIES) {
+        table[wow64Code].L = 0;  // compatibility mode
+        table[wow64Code].D = 1;  // 32-bit default operand and address size
+    }
+}
+
+// The WoW64 mode switch: the 32-bit code descriptor above, and the
+// translator's permission to decode a block for the descriptor its CS names
+// rather than for the mode the context was created with. One decision, so the
+// two halves cannot disagree. On by default because it is inert for a process
+// that never loads a 32-bit code selector -- which is every process the lane
+// has run so far -- and the environment variable is the off switch, so an A/B
+// on device needs no second build.
+inline bool guestWow64ModeSwitchEnabled() {
+    static const bool enabled =
+        getenv("BOXEDVN_FEX64_NO_MODE_SWITCH") == nullptr;
+    return enabled;
 }
 
 // Point both tables at one array, the way FEX's Linux thread manager does.
 inline void publishGuestDescriptorTable(
     FEXCore::Core::CPUState& state,
     FEXCore::Core::CPUState::gdt_segment* table) {
-    initialiseGuestDescriptorTable(table);
+    initialiseGuestDescriptorTable(table, guestWow64ModeSwitchEnabled());
     state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] =
         table;
     // The LDT was left null. A selector with its table indicator set would
@@ -1099,6 +1132,24 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     const bool callWitness = getenv("BW64_NO_CALL_WITNESS") == nullptr;
     bundle->context->SetBoxedWineCallWitness(callWitness);
     reportf("BOXEDWINE_FEX64_CALL_WITNESS armed=%d", callWitness ? 1 : 0);
+    // Wine's WoW64 layer far-jumps a 64-bit thread into a 32-bit code segment
+    // and back, so within one context and one thread the two decode modes
+    // alternate. The translator already derives each block's width from the L
+    // bit of the descriptor CS names; this lets that answer differ from the
+    // mode the context was created with, and makes the translator invalidate
+    // a guest code page that changes bitness, since its block cache is keyed
+    // by RIP alone.
+    //
+    // Only for the 64-bit context: a 32-bit context has no 64-bit descriptor
+    // to jump to, and its blocks are already decoded the one way it needs.
+    // Published before InitCore, beside the alias, for the same reason -- no
+    // guest code may be translated with the decision half made.
+    const bool perBlockDecodeMode =
+        mode == boxedvn::FexGuestMode::X86_64 && guestWow64ModeSwitchEnabled();
+    bundle->context->SetGuestPerBlockDecodeMode(perBlockDecodeMode);
+    reportf("BOXEDWINE_FEX64_MODE_SWITCH_ARMED armed=%d cs32=0x%x",
+            perBlockDecodeMode ? 1 : 0,
+            static_cast<unsigned>(K_WINE_X86_CODE_SELECTOR));
     if (!gLowAliasReported.exchange(true, std::memory_order_relaxed)) {
         reportf("BOXEDWINE_FEX64_LOW_ALIAS guest=[0x0,0x%llx) "
                 "host=[0x%llx,0x%llx) high_identity=[0x%llx,0x%llx)",

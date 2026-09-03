@@ -5929,3 +5929,121 @@ system32 (a real prefix file always wins). The witness for the next log is
 `BOXEDWINE_X64_DRIVERS_OVERLAY destination=... projected=N mountmgr=1`;
 mountmgr=0 would mean the packaged runtime ships no mount manager at all,
 which is the only remaining way for the drives to stay missing.
+
+## Futex value mismatch, and the cube probe becomes DXMT's own cube test
+
+Two 64-bit cube runs (unlocked/mailbox, and again with strict memory
+ordering) ended the same way: a call through a vtable slot that read as zero
+while the slot held a valid pointer when the fault handler read it back. In
+the unlocked run it was the probe's own per-frame
+`ID3D11DeviceContext::UpdateSubresource` (`call [rax+0x180]` at 0x1400029df,
+status 0xC0000005, winedbg's Program Error window after it); with strict
+ordering it was a `call [rax]` inside a Wine/DXMT module, which sent FEX into
+a block at RIP 0 and reported NoExec. So emulated TSO does not cover this
+class. What followed the strict-ordering fault is the freeze: the signal was
+delivered and unwound cleanly, and then every guest thread (11, 42, 43, 45,
+46, 47) sat in `__psynch_cvwait` under FUTEX_WAIT|PRIVATE for the rest of the
+run. Nobody was left to wake them.
+
+That is the shape of a lost wakeup, and the 64-bit futex had one. A futex is
+published to the shared table before its owner compares the word and parks,
+and FUTEX_WAKE claimed any entry at the address whether or not it had parked
+-- unlike the 32-bit path, which has always required `waiting`. A wake landing
+in that window is counted by the waker and then thrown away by the waiter,
+which finds the word changed and leaves through -EAGAIN taking the wake flag
+with it. FUTEX_WAKE now skips an entry that has not parked, and the compare
+and the enqueue both happen under the futex's own condition, so a mismatch can
+never consume a wakeup.
+
+The mismatch itself is now unambiguous: a word that does not hold the expected
+value returns -EAGAIN (-11) and never 0. 0 means "you were woken", and a
+caller whose predicate is still false treats it as "re-check and try again",
+which is how a private FUTEX_WAIT with val=0 against a word of 1 became 256
+immediate returns inside two seconds (`BOXEDWINE_FUTEX_STORM`). The witness
+now names which of the four exits happened (`reason=woken|value-mismatch|
+timeout|signal`) and whether the thread ever parked.
+
+"No timeout" is also said with a flag rather than with a sentinel: `expires`
+used to be 0xFFFFFFFF and "is there a deadline" was `expireTimeInMillies <
+0x7FFFFFFF`, which conflates no deadline with a distant one and silently makes
+a real deadline computed past that threshold infinite. Both futex paths now
+carry `hasDeadline`, and `expires` is meaningless without it.
+
+The graphics probe now renders DXMT's own `dx11_cube` test rather than a cube
+written here: the same demo the sibling iOS Wine/FEX/DXMT project builds and
+runs, so a difference between the two projects is a difference in the stack.
+Ported from willfaust/dxmt `b4b89f0a` (`tests/dx11/dx11_cube.cpp`,
+`3DMaths.h`, `shader_cube.hlsl`, MIT, (c) 2023 Feifan He; notice kept beside
+the code and in THIRD_PARTY_NOTICES.md): the eight position-only vertices and
+their counter-clockwise indices, the FrontCounterClockwise/cull-back
+rasterizer and the LESS depth state, the column-major matrices and the 84
+degree projection, the camera at (0, 0, 2), the clear colour, and the dynamic
+constant buffer written with Map/Unmap -- which also retires the
+UpdateSubresource call site the unlocked run faulted on. Not ported: its
+WinMain shell, keyboard camera, mouse trace, bitmap-font overlay, 1024x768
+hardcoding, and its D3DCompileFromFile call, since the DXBC is compiled ahead
+of time with fxc and embedded. The launcher contract is untouched: same
+executable name, same command line, same BOXEDVN_X64_CUBE_STAGE markers and
+per-stage exit codes, plus `render-target-depth` and `geometry-state`, both
+best-effort because a convex cube with back faces culled draws correctly
+without either.
+
+The spin is a function of elapsed wall-clock seconds from
+QueryPerformanceCounter, never of the frame counter, which is what the demo
+does and what unlocked mode needs: at a few thousand frames a second a
+per-frame angle was a blur, and the same program crawled at 30 Hz. The clear
+colour stopped drifting with the frame counter for the same reason.
+
+## Per-block decode mode: 32-bit code runs in the 64-bit context
+
+The 32-bit probe reached wow64cpu's far jump and then faulted at an address
+no 32-bit instruction can form, because the block the jump landed in was
+decoded as 64-bit code. The recorded plan for that was a second translator
+context per thread, on the reading that the translator fixes its machine mode
+per context. A second reading says otherwise: the decoder already takes each
+block's width from the L bit of the descriptor the thread's CS names, hands
+that answer to the dispatcher builder, and every width decision on the compile
+path reads it. Two assertions -- one in the decoder, one in `BeginFunction` --
+required the per-block answer to equal the context's creation-time mode, and
+this port's descriptor table gave every entry L=1, so the answer could never
+differ. That is the whole of what pinned the mode.
+
+So the mode is now per block. The 32-bit code selector's descriptor
+(`K_WINE_X86_CODE_SELECTOR`, 0x23, index 4) carries L=0 and D=1 while every
+other entry stays long-mode, so an unanticipated selector keeps the decoder
+where it is; the two assertions fire only when the host has not armed
+`SetGuestPerBlockDecodeMode`; and the block cache, which is keyed by guest RIP
+alone, records the mode of each guest code page at compile time and
+invalidates a page that changes bitness before compiling it again. Two things
+a 32-bit block would otherwise get wrong are fixed with it: the substituted
+zero segment base for CS, SS, DS and ES no longer depends on the width (the
+descriptor table is host memory in either mode, and a translated read of it
+lands in neither address space), and a 32-bit block's FS or GS selector write
+now traps to the host the way a long-mode one already does, so the base still
+comes from the descriptor the selector names.
+
+One decision, one switch: the descriptor and the translator's permission are
+both taken from `guestWow64ModeSwitchEnabled()`, on by default and off with
+`BOXEDVN_FEX64_NO_MODE_SWITCH`, so the A/B needs no second build. With it off,
+or for any process that never loads a 32-bit code selector, nothing changes.
+
+What the next device run has to show, in order: `BOXEDWINE_FEX64_MODE_SWITCH
+rip= cs= mode=32` at the far jump into 32-bit ntdll (the mode actually
+changed), the far-transfer witness reporting `decode=32` for the same landing
+block (the decoder and the frame agree), and then either a second
+`MODE_SWITCH ... mode=64` when the 32-bit side jumps back through
+`Wow64Transition` -- which is the boundary working -- or a
+`BOXEDWINE_FEX64_GUEST_FAULT ... decode=32` naming the first 32-bit
+instruction the lowering gets wrong. No `MODE_SWITCH` line at all means the
+far jump never loaded 0x23, and `decode=64` beside `cs=0x23` means the
+descriptor did not reach the thread whose block was compiled.
+`BOXEDWINE_FEX64_MODE_PAGE_CONFLICT` should not appear: under WoW64 the
+32-bit and 64-bit images occupy disjoint pages, and a line there means a page
+genuinely changed bitness and was invalidated.
+
+Known limits, recorded rather than discovered later: the zero segment base is
+exact for the flat WoW64 descriptors and would be wrong for a non-flat one;
+the x87 stack optimisation pass is still built with the context's GPR size, so
+a 32-bit x87 operand whose base plus displacement crossed 4 GiB would not wrap
+the way hardware does; and the AOT code cache, if it is ever enabled on this
+lane, keys cached blocks without the mode.

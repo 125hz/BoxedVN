@@ -1329,13 +1329,25 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      static_cast<unsigned long long>(returnSlot[0]),
                      static_cast<unsigned long long>(returnSlot[1]));
             // cs and ss say which code segment the faulting instruction was
-            // decoded for. A far transfer into the WoW64 32-bit selector
-            // changes cs and nothing else in this backend, so the pair is what
-            // separates a fault in 64-bit code from one taken past that
-            // boundary while the context still decodes 64-bit.
+            // decoded for, and `decode` says what the translator made of it:
+            // the L bit of the descriptor cs names, which is the same bit the
+            // decoder reads when it picks a block's width. decode=32 with a
+            // 32-bit cs means the mode switch took effect and the fault is a
+            // real one inside 32-bit code; decode=64 with cs=0x23 means the
+            // descriptor never got its L bit cleared, which is the failure
+            // this lane started from.
+            unsigned faultDecodeWidth = 64;
+            if (frame->State.segment_arrays[(frame->State.cs_idx >> 2) & 1] !=
+                nullptr) {
+                const auto* faultCS =
+                    FEXCore::Core::CPUState::GetSegmentFromIndex(
+                        frame->State, frame->State.cs_idx);
+                faultDecodeWidth = faultCS->L == 1 ? 64 : 32;
+            }
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT pid=%d tid=%d host_signal=%d "
                      "si_code=%d fault=0x%llx host_pc=0x%llx in_code=%d generated=%d "
-                     "guest_signal=%u trap=%u guest_rip=0x%llx cs=0x%x ss=0x%x bytes=%s",
+                     "guest_signal=%u trap=%u guest_rip=0x%llx cs=0x%x ss=0x%x "
+                     "decode=%u bytes=%s",
                      adapter->process->id, adapter->thread->id, signal,
                      static_cast<int>(siginfo->si_code),
                      static_cast<unsigned long long>(faultAddress),
@@ -1343,7 +1355,8 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      generatedException ? 1 : 0, guestSignal, guestTrapNumber,
                      static_cast<unsigned long long>(rip),
                      static_cast<unsigned>(frame->State.cs_idx),
-                     static_cast<unsigned>(frame->State.ss_idx), hex);
+                     static_cast<unsigned>(frame->State.ss_idx),
+                     faultDecodeWidth, hex);
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_GPRS rax=0x%llx rcx=0x%llx rdx=0x%llx "
                      "rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx "
                      "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx "

@@ -203,6 +203,49 @@ This is the risk that decides the schedule.
   adapter's fault witness now also reads guest bytes through the kernel's page
   table when the identity alias does not cover the address, which is every
   address below 4 GiB, and prints `cs`/`ss` with the fault.
+- **Decision reversed (2026-09-02, second reading of the pinned translator):
+  shape (1), per-block decode mode in one context.** The earlier decision
+  rested on a claim that reading the sources does not support: that the
+  translator "picks its machine mode from `Config.Is64BitMode` when a block is
+  compiled". It does not. `Decoder::DecodeInstructionsAtEntry` already reads
+  the L bit of the descriptor the thread's CS selector names and stores the
+  answer in `DecodedBlockInformation::Is64BitMode`; every width decision in
+  the frontend reads that field, `Core.cpp` hands the same field to
+  `OpDispatchBuilder::BeginFunction`, and every width decision in the
+  dispatcher reads the member it sets. The decode mode is already per block.
+  What made it look per context is two assertions -- one in the decoder, one
+  in `BeginFunction` -- that the per-block answer equals
+  `CTX->Config.Is64BitMode`, and the fact that this port's descriptor table
+  gives *every* entry L=1, so the per-block answer could never differ.
+  Nothing else consults the context's mode on the compile path: the JIT's
+  register allocation, the memory alias, the host ABI and the exit lowering
+  are all width-agnostic or take their width from the IR (`GetGPROpSize`),
+  and `_InlineEntrypointOffset` already masks a 32-bit RIP to 32 bits.
+  So shape (1) costs the two assertions, the one descriptor, and the
+  descriptor-table read that a 32-bit block would otherwise emit for
+  `mov seg, r/m` and for the far jump back -- against a second context, a
+  replacement `wow64cpu.dll` and a trap page for shape (2). Implemented:
+  `scripts/fex64-patches/fex-boxedwine-per-block-decode-mode.patch` plus the
+  32-bit code descriptor in `BVNFEXBackend.mm`.
+  Costs and limits recorded with the decision:
+  - The lookup cache stays keyed by guest RIP alone; widening the key would
+    reach into the dispatcher's emitted L1 probe. Instead the mode is
+    recorded per guest code page at compile time and a page that changes
+    bitness is invalidated before it is compiled again
+    (`BOXEDWINE_FEX64_MODE_PAGE_CONFLICT`). Under WoW64 the 32-bit and 64-bit
+    images occupy disjoint pages, so this is bookkeeping, not a hot path.
+  - Segment bases for CS, SS, DS and ES are substituted as zero in both
+    modes, because the descriptor table is host memory that a translated load
+    cannot reach. That is exact for the flat WoW64 descriptors (0x23, 0x2b,
+    0x33) and would be wrong for a non-flat one, which Wine does not create.
+    FS and GS keep real bases: their writes trap to the host in both modes
+    now, and the base comes from the descriptor the selector names.
+  - The x87 stack optimisation pass is still built with the context's GPR
+    size, so a 32-bit x87 memory operand whose base plus displacement crosses
+    4 GiB would not wrap the way hardware does. No such address exists under
+    the low alias.
+  - Shape (2) is not deleted from this document: if the per-block mode proves
+    unworkable it is still the fallback, and the notes below stand.
 - Shape (2) in BoxedVN terms (steps 2 and 3 superseded by the refinement):
   1. Context pair. `createFEXContext(FexGuestMode::X86_32, ...)` for the
      process, sharing `KMemory64` with its 64-bit context; the low-alias
@@ -296,11 +339,13 @@ Gate (device): the 32-bit cube renders its first frame through DXMT.
 
 ## Risks
 
-- **Mode switching under FEX inside BoxedWine (phase 2).** FEX supports
-  32-bit code, but BoxedVN's integration was built for a 64-bit-only
-  context per process. If honouring `CS` changes in one context proves
-  unworkable, the fallback is a second context per thread, which is
-  heavier and touches thread scheduling.
+- **Mode switching under FEX inside BoxedWine (phase 2).** Honouring `CS`
+  changes in one context is implemented and unproven on device. The residual
+  risks are named with the decision above: the RIP-only block cache (covered
+  by the per-page mode record), the substituted zero segment bases, and the
+  x87 pass's context-wide GPR size. If it proves unworkable the fallback is
+  still a second context per thread, which is heavier and touches thread
+  scheduling.
 - **Low-alias pressure.** All 32-bit allocations must live below 4 GiB and
   are aliased; large 32-bit games can exhaust that space faster than under
   the legacy lane. Measure early with a real title.
@@ -326,7 +371,7 @@ of each gate go in the table below.
 |---|---|---|
 | 0 | 2026-09-02 | see PROGRESS.md, "WoW64 phase 0" |
 | 1 | | |
-| 2 | decision recorded 2026-09-02 (shape 2); gate open | see PROGRESS.md, "Phase 2 decision" |
+| 2 | decision reversed 2026-09-02 to shape 1 (per-block decode mode implemented); gate open | see PROGRESS.md, "Per-block decode mode" |
 | 3 | | |
 | 4 | | |
 | 5 | | |

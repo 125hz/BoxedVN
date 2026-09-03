@@ -1,0 +1,308 @@
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index c69d831..216b1c5 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -166,6 +166,28 @@ public:
+     return (GuestAddress | GuestLowAliasBase) & ~GuestTopClearMask;
+   }
+ 
++  void SetGuestPerBlockDecodeMode(bool Enabled) override {
++    // Published once, before any guest code is translated. Read at block
++    // compilation time only, so it costs nothing at run time.
++    GuestPerBlockDecodeMode = Enabled;
++  }
++  bool GetGuestPerBlockDecodeMode() const {
++    return GuestPerBlockDecodeMode;
++  }
++
++  // Bounded witness for a decode-mode change. Called once per compiled block
++  // with the mode the decoder derived from the thread's CS descriptor; only a
++  // CHANGE is reported, because a WoW64 thread crosses the boundary twice per
++  // system call and a per-block line would be the whole log.
++  void BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, bool Is64BitMode);
++
++  // Records the decode mode a guest code page is being compiled in and
++  // reports whether that page had previously been compiled in the OTHER mode.
++  // The lookup cache is keyed by RIP alone, so a page that changed bitness
++  // would otherwise keep serving blocks decoded for the mode it no longer has.
++  // Returns true exactly when the caller must invalidate the page first.
++  bool BoxedWineClaimDecodeModePage(uint64_t GuestRIP, bool Is64BitMode);
++
+   void SetBoxedWineCallWitness(bool Enabled) override {
+     // Published once, before any guest code is translated, so the decision is
+     // made at block-compilation time and costs no runtime branch.
+@@ -408,6 +430,21 @@ public:
+   // When set, every CALL return-address push records what it stored and what an
+   // immediate read-back of the same host address returned.
+   bool BoxedWineCallWitness {};
++  // When set, a block whose CS descriptor disagrees with the context's
++  // creation-time mode is decoded and lowered for the descriptor's mode
++  // instead of tripping the "operating mode" assertion. Zero (the default)
++  // is the pinned translator's behaviour exactly.
++  bool GuestPerBlockDecodeMode {};
++  // 0 = nothing compiled yet, 1 = last block was 64-bit, 2 = 32-bit.
++  std::atomic<uint32_t> BoxedWineDecodeMode {0};
++  std::atomic<uint32_t> BoxedWineDecodeModeReports {0};
++  // Guest code page -> the mode it was last compiled in (1 = 64, 2 = 32).
++  // One entry per page of code the process executes, inserted at compile time
++  // only; a miss costs one hash lookup on a path that is already running the
++  // whole frontend.
++  std::mutex BoxedWineDecodeModePagesMutex;
++  fextl::unordered_map<uint64_t, uint8_t> BoxedWineDecodeModePages;
++  std::atomic<uint32_t> BoxedWineDecodeModeConflicts {0};
+ 
+   uint32_t StrictSplitLockMutex {};
+ 
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 05db343..859f830 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -885,7 +885,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+     const auto GPRSize = Thread->OpDispatcher->GetGPROpSize();
+ 
+ #ifdef ZYDIS_DISASSEMBLER
+-    const auto ZydisMachineMode = Config.Is64BitMode ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
++    // BoxedWine: the disassembly must agree with the decode, or a 32-bit block
++    // in a 64-bit context would be printed as something it is not.
++    const auto ZydisMachineMode = BlockInfo->Is64BitMode ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
+     if (FEXCore::Config::Get_X86DISASSEMBLE()) {
+       const uint64_t DecodedMin = Thread->FrontendDecoder->DecodedMinAddress;
+       const uint64_t DecodedMax = Thread->FrontendDecoder->DecodedMaxAddress;
+@@ -1607,11 +1609,92 @@ void ContextImpl::BoxedWineReportNullExitTarget(FEXCore::Core::CpuStateFrame* Fr
+   BoxedWineDumpCallRing(Frame, "null-exit-target");
+ }
+ 
++namespace {
++/* BoxedWine: the mode a block entered on this frame will be decoded in.
++ *
++ * Exactly what Decoder::DecodeInstructionsAtEntry reads -- the L bit of the
++ * descriptor the thread's CS selector names -- so a caller here and the
++ * frontend cannot disagree. Falls back to the caller's default when the
++ * thread has no descriptor table yet, which is the state a validation context
++ * is created in. */
++bool BoxedWineFrameIs64BitMode(FEXCore::Core::CpuStateFrame* Frame, bool Default) {
++  if (!Frame) {
++    return Default;
++  }
++  const uint16_t Selector = Frame->State.cs_idx;
++  if (!Frame->State.segment_arrays[(Selector >> 2) & 1]) {
++    return Default;
++  }
++  return FEXCore::Core::CPUState::GetSegmentFromIndex(Frame->State, Selector)->L == 1;
++}
++
++constexpr uint32_t BoxedWineDecodeModeReportLimit = 16;
++constexpr uint32_t BoxedWineDecodeModeConflictLimit = 8;
++} // namespace
++
++void ContextImpl::BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, bool Is64BitMode) {
++  const uint32_t Mode = Is64BitMode ? 1u : 2u;
++  const uint32_t Previous = BoxedWineDecodeMode.exchange(Mode, std::memory_order_acq_rel);
++  if (Previous == Mode || Previous == 0) {
++    // Unchanged, or the first block ever compiled, which is not a change.
++    return;
++  }
++  if (BoxedWineDecodeModeReports.fetch_add(1, std::memory_order_relaxed) >= BoxedWineDecodeModeReportLimit) {
++    return;
++  }
++  LogMan::Msg::IFmt("BOXEDWINE_FEX64_MODE_SWITCH rip={:#x} cs={:#x} mode={}", GuestRIP, CSIndex, Is64BitMode ? 64 : 32);
++}
++
++bool ContextImpl::BoxedWineClaimDecodeModePage(uint64_t GuestRIP, bool Is64BitMode) {
++  const uint64_t Page = GuestRIP & FEXCore::Utils::FEX_PAGE_MASK;
++  const uint8_t Mode = Is64BitMode ? 1 : 2;
++  std::scoped_lock lk {BoxedWineDecodeModePagesMutex};
++  auto Existing = BoxedWineDecodeModePages.find(Page);
++  if (Existing == BoxedWineDecodeModePages.end()) {
++    BoxedWineDecodeModePages.emplace(Page, Mode);
++    return false;
++  }
++  if (Existing->second == Mode) {
++    return false;
++  }
++  Existing->second = Mode;
++  return true;
++}
++
+ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+   /* First, before the frame is touched: the emitted L1 lookup refused a null
+    * host target and sent us here. Consumes and clears the witness slot. */
+   BoxedWineReportNullExitTarget(Frame, GuestRIP);
+ 
++  /* BoxedWine: the lookup cache is keyed by guest RIP alone, and with the
++   * per-block decode mode armed a RIP no longer determines the code that was
++   * compiled for it -- the CS descriptor's L bit does too. Rather than widen
++   * the key, which would reach into the dispatcher's emitted L1 probe, the
++   * mode is recorded per guest code page and a page that changes bitness is
++   * invalidated before it is compiled again.
++   *
++   * The cost is one hash lookup per compiled block and nothing at all per
++   * executed block. It is exact for the case that matters and cheap for the
++   * case that is normal: under WoW64 the 32-bit images and the 64-bit ones
++   * occupy disjoint pages, so this never fires and the map simply records
++   * which pages are which. It fires only if a page were genuinely re-used for
++   * the other bitness, which is the case that would otherwise execute a
++   * cached block decoded for the wrong width.
++   *
++   * Done here, at the top, deliberately: no FEX lock is held yet, so the
++   * frontend's invalidation may take the ones it needs. */
++  if (GuestPerBlockDecodeMode) {
++    const bool BlockIs64BitMode = BoxedWineFrameIs64BitMode(Frame, Config.Is64BitMode);
++    if (BoxedWineClaimDecodeModePage(GuestRIP, BlockIs64BitMode) && SyscallHandler && Frame && Frame->Thread) {
++      const uint64_t Page = GuestRIP & FEXCore::Utils::FEX_PAGE_MASK;
++      if (BoxedWineDecodeModeConflicts.fetch_add(1, std::memory_order_relaxed) < BoxedWineDecodeModeConflictLimit) {
++        LogMan::Msg::EFmt("BOXEDWINE_FEX64_MODE_PAGE_CONFLICT rip={:#x} page={:#x} cs={:#x} mode={}", GuestRIP, Page,
++                          Frame->State.cs_idx, BlockIs64BitMode ? 64 : 32);
++      }
++      SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
++    }
++  }
++
+   /* BoxedWine: where a far transfer landed, on its own budget.
+    *
+    * Wine's wow64cpu enters 32-bit code with `ljmp *(%r14)` through a page it
+@@ -1640,8 +1723,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+                       Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSP] : 0, Frame ? Frame->State.cs_idx : 0,
+                       Frame ? Frame->State.ss_idx : 0, Frame ? Frame->State.ds_idx : 0,
+                       Frame ? Frame->State.fs_cached : 0, Frame ? Frame->State.gs_cached : 0,
+-                      Config.Is64BitMode ? 64 : 32, reinterpret_cast<uint64_t>(FarBytes), BoxedWineFarCode1,
+-                      BoxedWineFarCode0);
++                      // The width this landing block is actually decoded in.
++                      // It used to be the context's creation-time mode, which
++                      // could only ever print 64 and so said nothing about the
++                      // transfer; it is now the CS descriptor's own answer,
++                      // the same one Decoder::DecodeInstructionsAtEntry takes.
++                      BoxedWineFrameIs64BitMode(Frame, Config.Is64BitMode) ? 64 : 32,
++                      reinterpret_cast<uint64_t>(FarBytes), BoxedWineFarCode1, BoxedWineFarCode0);
+   }
+ 
+   /* BoxedWine: the loader-to-Windows transition, and nothing else.
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 76e5d32..1358630 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -1409,7 +1409,29 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
+   const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);
+   BlockInfo.Is64BitMode = CSSegment->L == 1;
+   /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: CSSegment->L={}, Is64BitMode={}, Config.Is64BitMode={}", CSSegment->L, BlockInfo.Is64BitMode, (bool)CTX->Config.Is64BitMode);
+-  LOGMAN_THROW_A_FMT(BlockInfo.Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
++  /* BoxedWine: the decode mode is per block, not per context.
++   *
++   * This function already derived the mode the only way the processor does --
++   * from the L bit of the descriptor the thread's CS names -- and then
++   * asserted that the answer never differs from the mode the context was
++   * created with. That assertion is what a WoW64 process breaks: Wine's
++   * wow64cpu enters 32-bit code with an indirect far jump, the lowering of
++   * which changes cs_idx and the RIP, so the very next block genuinely is
++   * 32-bit code inside a context created for 64-bit.
++   *
++   * Nothing else in the frontend or the dispatcher needs the two to agree:
++   * every width decision below reads BlockInfo.Is64BitMode, and
++   * OpDispatchBuilder::BeginFunction is handed this same value per block. So
++   * when the host has armed the per-block mode the divergence is accepted and
++   * reported; otherwise the assertion stands exactly as before, which is what
++   * keeps a process whose CS never changes on today's path.
++   *
++   * The report is bounded and is emitted on a CHANGE, not per block: a
++   * WoW64 thread crosses this boundary twice per system call. */
++  if (BlockInfo.Is64BitMode != CTX->Config.Is64BitMode) {
++    LOGMAN_THROW_A_FMT(CTX->GetGuestPerBlockDecodeMode(), "Expected operating mode to not change at runtime!");
++  }
++  CTX->BoxedWineNoteDecodeMode(PC, Thread->CurrentFrame->State.cs_idx, BlockInfo.Is64BitMode);
+   /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Assertion passed OK");
+ 
+   EntryPoint = PC;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index e85b838..ddb82b6 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -1304,7 +1304,12 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+       break;
+     case FEXCore::X86State::REG_RBP: // GS
+     case FEXCore::X86State::REG_R13: // GS
+-      if (!Is64BitMode) {
++      // BoxedWine: the host serves this write whenever the descriptor table
++      // is host memory, in either decode mode. A 32-bit block cannot read the
++      // table any more than a 64-bit one can (the load would be translated as
++      // if the host pointer were a guest address), and the base a WoW64
++      // thread's FS names is real, so there is nothing to substitute.
++      if (!Is64BitMode && CTX->GetGuestLowAliasBase() == 0) {
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
+       } else {
+@@ -1328,7 +1333,10 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+       break;
+     case FEXCore::X86State::REG_RSP: // FS
+     case FEXCore::X86State::REG_R12: // FS
+-      if (!Is64BitMode) {
++      // BoxedWine: see the GS case above. Wine's WoW64 layer writes FS in
++      // long mode before the far jump, and the 32-bit side may write it again
++      // after; both reach the host through the same trap.
++      if (!Is64BitMode && CTX->GetGuestLowAliasBase() == 0) {
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
+       } else {
+@@ -4044,7 +4052,14 @@ void OpDispatchBuilder::BeginFunction(uint64_t RIP, const fextl::vector<FEXCore:
+                                       uint32_t NumInstructions, bool _Is64BitMode, bool MonoBackpatcherBlock) {
+   Entry = RIP;
+   Is64BitMode = _Is64BitMode;
+-  LOGMAN_THROW_A_FMT(Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
++  // BoxedWine: the builder's width already comes from the decoder's per-block
++  // answer, which is the L bit of the descriptor the thread's CS names. Only
++  // this assertion tied it to the context's creation-time mode. See
++  // Decoder::DecodeInstructionsAtEntry: with the per-block mode armed the two
++  // are allowed to differ, and with it disarmed the assertion is unchanged.
++  if (Is64BitMode != CTX->Config.Is64BitMode) {
++    LOGMAN_THROW_A_FMT(CTX->GetGuestPerBlockDecodeMode(), "Expected operating mode to not change at runtime!");
++  }
+   IsMonoBackpatcherBlock = MonoBackpatcherBlock;
+   auto IRHeader = _IRHeader(InvalidNode, RIP, 0, NumInstructions, 0, 0);
+   CreateJumpBlocks(Blocks);
+@@ -4267,7 +4282,17 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
+   // segment register would still reach the untranslatable load; Wine's
+   // x86-64 path does not, and leaving that visible is better than papering
+   // over it with a base this code cannot know.
+-  const bool HostSideDescriptorTable = Is64BitMode && CTX->GetGuestLowAliasBase() != 0 &&
++  //
++  // BoxedWine, per-block decode mode: the condition above used to require
++  // long mode, because long mode was the only mode a block could be in. It
++  // is not any more. The reason the load cannot be emitted is the address
++  // space, not the width -- segment_arrays[] holds a host pointer in a
++  // 32-bit block exactly as it does in a 64-bit one -- so the test is now on
++  // the alias alone. The base it substitutes is right for both: the WoW64
++  // code and data descriptors Wine installs (0x23, 0x2b, 0x33) are flat, and
++  // FS and GS, the only segments with a base worth having, are still
++  // excluded and served by the host.
++  const bool HostSideDescriptorTable = CTX->GetGuestLowAliasBase() != 0 &&
+                                        SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX &&
+                                        SegmentReg != FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX;
+ 
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index d2c6f37..2ea0192 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -107,6 +107,24 @@ public:
+     (void)Limit;
+   }
+ 
++  // BoxedWine: allow the decode mode to be taken per block from the L bit of
++  // the descriptor the thread's CS names, instead of being fixed at the mode
++  // the context was created with. Wine's WoW64 layer far-jumps a 64-bit
++  // thread into a 32-bit code segment and back, so within one context and one
++  // thread the two modes alternate.
++  //
++  // Everything the frontend and the dispatcher need is already per block: the
++  // decoder reads the CS descriptor itself and hands the answer to
++  // OpDispatchBuilder::BeginFunction, and the register allocation, the memory
++  // alias and the host ABI are unchanged by it. Only two assertions tied the
++  // two together, and this is what relaxes them.
++  //
++  // False (the default) is the pinned translator's behaviour exactly, and a
++  // process whose CS never changes bitness behaves identically either way.
++  FEX_DEFAULT_VISIBILITY virtual void SetGuestPerBlockDecodeMode(bool Enabled) {
++    (void)Enabled;
++  }
++
+   // BoxedWine: the guest's top-down arena is relocated by clearing one bit
+   // field of its address. Every address in the arena has the field set and
+   // every other hostable guest address has it clear, so this is exact and

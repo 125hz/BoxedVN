@@ -38,6 +38,18 @@
 #define K_WINE_X64_CODE_SELECTOR 0x33
 #define K_WINE_X64_DATA_SELECTOR 0x2b
 
+// The 32-bit code selector a WoW64 thread enters compatibility mode with.
+// Linux's __USER32_CS, and the value Wine's wow64cpu puts in the far-jump
+// target it builds below 4 GiB; a device run observed exactly this on the
+// far jump out of wow64cpu, with SS and DS at K_WINE_X64_DATA_SELECTOR.
+//
+// This is the one selector whose descriptor decides a decode: the translator
+// reads the L bit of the descriptor CS names and decodes the block as 32-bit
+// code when it is clear. Every other descriptor in the table stays long-mode,
+// so a selector this port did not anticipate keeps the decoder where it is
+// rather than guessing.
+#define K_WINE_X86_CODE_SELECTOR 0x23
+
 #if defined(__cplusplus)
 
 namespace boxedvn {

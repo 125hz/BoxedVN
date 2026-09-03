@@ -164,6 +164,15 @@ apply_patch fex-boxedwine-unaligned-backpatch-write-alias.patch
 # block is 32-bit code decoded as 64-bit. This names that boundary once, on a
 # budget of its own.
 apply_patch fex-boxedwine-far-transfer-witness.patch
+# Depends on the alias patch (it asks the context whether the guest is hosted
+# at an aliased address), on the long-mode segment-base patch (it widens that
+# patch's own condition to both decode modes) and on the selector-write patch
+# (it routes a 32-bit block's FS/GS write to the same host trap). Also extends
+# the far-transfer witness above, which now prints the width the landing block
+# is actually decoded in. Lets a block whose CS descriptor has L=0 be decoded
+# and lowered as 32-bit code inside a context created for 64-bit, which is what
+# Wine's WoW64 far jump needs; inert until the host arms it.
+apply_patch fex-boxedwine-per-block-decode-mode.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.
