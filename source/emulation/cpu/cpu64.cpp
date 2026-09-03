@@ -19,6 +19,7 @@
 #include "syscall64.h"
 #include "ksignal.h"   // K_SIGFPE
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -95,23 +96,64 @@ void CPU64::cloneRegistersFrom(const CPU64* from) {
 // a compare + two array indexes and call overhead dominates it.
 __attribute__((always_inline)) inline U8 CPU64::fetchByte(U64 addr) {
     if (!memory) return 0;
-    // Fast path: same code page as the last fetch -> read straight from the
-    // cached backing buffer, no lock, no map lookup. Code locality makes this
-    // hit on essentially every byte within an instruction and across a loop
-    // body, eliminating the per-byte pagesMutex + unordered_map cost that
-    // dominated interpreter throughput.
+    // Fast path: same code page as the last fetch AND the host-pointer cache
+    // generation this entry was filled at is still current -> read straight
+    // from the cached backing buffer, no lock, no map lookup. Code locality
+    // makes this hit on essentially every byte within an instruction and
+    // across a loop body, eliminating the per-byte pagesMutex + unordered_map
+    // cost that dominated interpreter throughput.
     U64 pageNum = addr >> K64_PAGE_SHIFT;
-    if (pageNum == fetchCachePage) {
-        return fetchCacheData[addr & K64_PAGE_MASK];
+    if (pageNum == fetchCachePage && fetchCacheGen == k64PageCacheGeneration()) {
+        U8* data = fetchCacheData;
+        // Belt and braces: a live entry can no longer hold NULL (only this
+        // thread fills it, and only with a non-null buffer), but the whole
+        // crash class this guards against was a NULL base indexed by an
+        // in-page offset, so never index without looking.
+        if (data) {
+            return data[addr & K64_PAGE_MASK];
+        }
     }
-    // Miss: resolve the page once under the lock and cache its buffer. An
-    // uncommitted/absent page returns nullptr -> fall back to readb (which
-    // zero-fills) and leave the cache empty so we don't memoize a hole.
+    return fetchByteMiss(addr, pageNum);
+}
+
+// Budgeted witness for a fetch whose page has no backing buffer. Eight lines,
+// then one per 4096, so a runaway guest cannot flood the log.
+static void cpu64ReportFetchNoBacking(int pid, U64 addr, U64 pageNum, bool mapped) {
+    static std::atomic<U64> reports {0};
+    const U64 n = reports.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8 || (n & 0xfff) == 0) {
+        klog_fmt("BOXEDWINE_X64_FETCH_NO_BACKING pid=%d addr=0x%llx page=0x%llx "
+                 "mapped=%d count=%llu",
+                 pid, (unsigned long long)addr, (unsigned long long)pageNum,
+                 mapped ? 1 : 0, (unsigned long long)(n + 1));
+    }
+}
+
+U8 CPU64::fetchByteMiss(U64 addr, U64 pageNum) {
+    // Read the generation BEFORE resolving the page: an invalidation that
+    // lands while we are looking the buffer up has to lose, or we would stamp
+    // the current generation onto a pointer it was meant to retire.
+    const U32 gen = k64PageCacheGeneration();
     U8* data = memory->getCommittedPagePtr(pageNum);
     if (data) {
         fetchCachePage = pageNum;
         fetchCacheData = data;
+        fetchCacheGen = gen;
         return data[addr & K64_PAGE_MASK];
+    }
+    // No backing buffer. Leave the cache empty so we never memoize a hole,
+    // and report it. A page the address space does not know at all is a guest
+    // execute fault: flag it so step() delivers SIGSEGV rather than decoding
+    // the zeros the sparse reader hands back and running off into garbage. A
+    // page that IS mapped but not yet committed legitimately reads as zero
+    // (lazy commit), so that case only reads.
+    invalidateFetchCache();
+    const bool mapped = memory->getPageFlags(pageNum) != 0;
+    cpu64ReportFetchNoBacking((int)(thread && thread->process ? (int)thread->process->id : -1),
+                              addr, pageNum, mapped);
+    if (!mapped && !fetchFault) {
+        fetchFault = true;
+        fetchFaultAddr = addr;
     }
     return memory->readb(addr);
 }
@@ -616,6 +658,7 @@ static void refWatchInit() {
 
 U32 CPU64::step() {
     U64 ipStart = rip;
+    fetchFault = false;
 
     // BW64_REFWATCH probe: catch wineserver's double-release at release_object
     // entry, one instruction before the assert. See the big comment above.
@@ -698,6 +741,35 @@ U32 CPU64::step() {
     U32 opSize = rexW ? 8u : (p.osize16 ? 2u : 4u);
 
     U8 op = fetchByte(rip + opOff);
+
+    // The prefix/opcode bytes came from a page this address space does not
+    // have. Hardware faults on the fetch; the sparse reader would hand back
+    // zeros and the decoder would happily execute them, so deliver the guest
+    // SIGSEGV here, before the instruction has any effect.
+    if (fetchFault) {
+        const U64 faultAddr = fetchFaultAddr;
+        fetchFault = false;
+        // Budgeted: a handler that returns to the faulting RIP re-faults, so
+        // this can repeat without bound.
+        {
+            static std::atomic<U64> faults {0};
+            const U64 n = faults.fetch_add(1, std::memory_order_relaxed);
+            if (n < 8 || (n & 0xfff) == 0) {
+                klog_fmt("BOXEDWINE_X64_FETCH_FAULT pid=%u rip=0x%llx addr=0x%llx "
+                         "count=%llu — instruction fetch from an unmapped page",
+                         (unsigned)(thread && thread->process ? thread->process->id : 0),
+                         (unsigned long long)ipStart, (unsigned long long)faultAddr,
+                         (unsigned long long)(n + 1));
+            }
+        }
+        if (this->raiseSyncFault(K_SIGSEGV, /*trapNo #PF*/14,
+                                 /*SEGV_MAPERR*/1, faultAddr)) {
+            return 0; // rip now at the handler
+        }
+        if (thread && thread->process) thread->process->signalProcess(K_SIGSEGV);
+        yield = true;
+        return 0;
+    }
 
     if (!g_opProfInit) {
         g_opProfInit = true;

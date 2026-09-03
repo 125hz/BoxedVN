@@ -6047,3 +6047,58 @@ the x87 stack optimisation pass is still built with the context's GPR size, so
 a 32-bit x87 operand whose base plus displacement crossed 4 GiB would not wrap
 the way hardware does; and the AOT code cache, if it is ever enabled on this
 lane, keys cached blocks without the mode.
+
+
+## The app-killing NULL: the fetch cache was invalidated across threads
+
+The host SIGSEGV that ends both the 64-bit desktop and the cube is one race,
+and the symbol map for the build that produced the logs (run 33702029899,
+host-symbols-Release) names it exactly: `CPU64::step` starts at image offset
+0x14b9ec, so the two faulting frames, +0x608 (address 0xbd8) and +0xa5c
+(0x3c5), are both inside the always-inlined `fetchByte` -- the one and only raw
+pointer dereference in cpu64.cpp. Every fault address is a bare page offset
+(0x3c5, 0x5a2, 0x944, 0xbd8), i.e. `fetchCacheData[addr & 0xfff]` with a NULL
+base.
+
+The base could be NULL because the invalidation reached across host threads.
+`k64InvalidateProcessFetchCaches` walked the process's threads and wrote
+`fetchCachePage = -1; fetchCacheData = nullptr;` into every sibling's CPU64 --
+while those siblings were running guest code. `fetchByte` compares the cached
+page number and then loads the cached pointer as two separate,
+non-synchronised loads, so a sibling could match the still-valid page an
+instant before the invalidator nulled the pointer, and then index NULL. It is
+a plain data race, so the compiler is also free to widen the window by holding
+either field in a register across a whole decode. The callers are
+mmap/mprotect/munmap, which is why both faults land in the middle of a mapping
+storm: the first while a helper dlopen'd libdbus/libsystemd/libgcrypt/liblz4/
+libzstd, the second the instant explorer opened a second X11 display
+connection.
+
+The fix removes cross-thread writes entirely. Both host-pointer caches -- this
+file's per-thread data TLB and CPU64's instruction-fetch page cache -- now
+validate against one shared generation (`k64PageCacheGeneration` in
+kmemory64.h). An entry records the generation it was filled at and is usable
+only while that still matches; invalidating is one atomic increment, and no
+thread ever writes into another thread's cache. The generation is read BEFORE
+a page is resolved at every insert, so an invalidation that lands during the
+lookup cannot be stamped as current. Because the fetch cache shares the
+counter, a KMemory64 destructor (execve, process exit) and a shared-page
+adopt/demote now retire fetch caches too, which they never did.
+
+Containment, so this class cannot reach a host fault again: `fetchByte` never
+indexes without checking the pointer, `k64DTlbInsert` refuses to memoize a
+NULL, and `KMemory64::writeb` -- the last write path that stored through
+`commitPageLocked`'s result unchecked -- drops and reports instead. A fetch
+whose page has no backing reports `BOXEDWINE_X64_FETCH_NO_BACKING pid= addr=
+page= mapped=` (eight lines, then one per 4096), and when the page is not in
+the address space at all the interpreter now raises a guest SIGSEGV through
+`raiseSyncFault` (`BOXEDWINE_X64_FETCH_FAULT`, SEGV_MAPERR at the fetch
+address) rather than decoding the zeros the sparse reader returns and running
+off into garbage. A mapped-but-uncommitted page still legitimately reads as
+zero.
+
+The third run in that batch (201953) did not host-fault at all: the translated
+cube took a guest page fault reading 0x795e000130 (guest 0x15e000130, one word
+past rcx=0x15e000100) at guest RIP 0x140002d96, Wine started winedbg and
+showed 'Program Error', and pid 10 left through exit_group with 0xC0000005.
+That is the separate "pointer reads as garbage" class, not this one.

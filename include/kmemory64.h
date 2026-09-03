@@ -256,6 +256,34 @@ static inline int k64IsLowAliasedGuestAddress(U64 guestAddress) {
     return guestAddress < K64_NATIVE_LOW_GUEST_LIMIT ? 1 : 0;
 }
 
+// ---- Host-pointer cache generation --------------------------------------
+//
+// Two caches hold a raw host pointer to a guest page's backing buffer: the
+// per-thread data TLB in kmemory64.cpp and CPU64's instruction-fetch page
+// cache. Both are keyed by page number, so an event that frees, moves or
+// withdraws a buffer has to retire them.
+//
+// This counter is the ONLY cross-thread signal for that. Nothing ever reaches
+// into another thread's cache to clear it: the old fetch-cache invalidation
+// did exactly that (`fetchCachePage = -1; fetchCacheData = nullptr;` written
+// into every sibling thread's CPU64 from whichever thread was mapping), and a
+// sibling running guest code could read the still-matching page number and
+// then the already-nulled data pointer — a NULL base indexed by an in-page
+// offset, which is the bare page-offset SIGSEGV inside CPU64::step. A cache
+// entry carries the generation it was filled at and is usable only while that
+// still matches, so an invalidation is one atomic increment and every reader
+// stays inside its own thread's memory.
+// Defined in kmemory64.cpp. Read through the inline accessors below so the
+// instruction-fetch fast path stays a load and a compare with no call.
+extern std::atomic<U32> g_k64PageCacheGeneration;
+
+inline U32 k64PageCacheGeneration() {
+    return g_k64PageCacheGeneration.load(std::memory_order_acquire);
+}
+inline void k64InvalidatePageCaches() {
+    g_k64PageCacheGeneration.fetch_add(1, std::memory_order_release);
+}
+
 // A guest page slot. `data` is allocated lazily: a freshly reserved page (mmap
 // of an address wine may never touch — its huge PROT_NONE reservations) carries
 // no backing buffer (data==nullptr) and reads as zero, so host RAM tracks pages

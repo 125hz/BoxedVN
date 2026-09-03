@@ -131,9 +131,28 @@ public:
     // events that replace the page map are fork (a fresh CPU64 with its own
     // cache) and exit. Invalidated explicitly via invalidateFetchCache() if the
     // backing store is ever decommitted under us. -1 page = empty.
+    //
+    // The entry also carries the host-pointer cache generation it was filled
+    // at (k64PageCacheGeneration, shared with kmemory64's data TLB) and is
+    // only usable while that still matches. That is what retires it when a
+    // buffer dies: the previous scheme had whichever thread was mapping clear
+    // every SIBLING thread's cache fields, and a sibling running guest code
+    // could read the still-matching page number and then the just-nulled
+    // pointer, indexing NULL by the in-page offset. Only this thread ever
+    // writes these three fields now.
     U64 fetchCachePage = (U64)-1;
     U8* fetchCacheData = nullptr;
-    void invalidateFetchCache() { fetchCachePage = (U64)-1; fetchCacheData = nullptr; }
+    U32 fetchCacheGen = 0;   // 0 never matches a live generation (starts at 1)
+    void invalidateFetchCache() {
+        fetchCachePage = (U64)-1; fetchCacheData = nullptr; fetchCacheGen = 0;
+    }
+
+    // Set by fetchByte when an instruction byte was taken from a page this
+    // address space does not have at all. step() turns it into a guest SIGSEGV
+    // at the faulting address instead of decoding the zeros the sparse reader
+    // returns. Cleared at the top of every step().
+    bool fetchFault = false;
+    U64  fetchFaultAddr = 0;
 
     // Standalone-runner heap pointer. The full kernel tracks the program
     // break on KProcess::brkEnd64; the --x64-run-elf path has no KProcess,
@@ -224,6 +243,10 @@ private:
     U32 step();
 
     U8  fetchByte(U64 addr);
+    // Cold half of fetchByte: resolve the page, refill the cache, and contain
+    // a page with no backing (witness + guest fault flag). Out of line so the
+    // hot path stays a compare and an index.
+    U8  fetchByteMiss(U64 addr, U64 pageNum);
     U32 fetchDword(U64 addr);
     U64 fetchQword(U64 addr);
 

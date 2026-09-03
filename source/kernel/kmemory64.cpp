@@ -277,7 +277,10 @@ static U8* k64KuserAliasFor(U64 guestAddress) {
 // destructor (execve reset, process exit — also covers heap-address reuse of
 // the KMemory64* tag), native logical unmap, and K64Page::adoptShared (the
 // shared-file mmap path).
-// Both bump the global generation; a TLB hit requires a generation match.
+// All of them bump the global generation; a TLB hit requires a generation
+// match. CPU64's instruction-fetch page cache validates against the SAME
+// counter (k64PageCacheGeneration), so one increment retires both caches on
+// every thread and no thread has to reach into another's.
 // Entries are tagged with the owning KMemory64* because kernel code on one
 // thread can touch another process's memory (fork ctid writes, ptrace-style
 // peeks), and one host thread serves exactly one running guest thread.
@@ -285,11 +288,15 @@ static U8* k64KuserAliasFor(U64 guestAddress) {
 bool bw64PageHoldsBlocks(U64 pageNum); // defined below, with the block tables
 #endif
 
+// The generation both host-pointer caches (this file's data TLB and CPU64's
+// instruction-fetch page cache) validate against. See kmemory64.h. Starts at
+// 1 so a zero-initialised cache entry can never look current.
+std::atomic<U32> g_k64PageCacheGeneration{1};
+
 namespace {
 struct K64DTlbEntry { const void* mem; U64 page; U8* data; U32 gen; };
 constexpr U32 K64_DTLB_SIZE = 64; // direct-mapped, per-thread (~2KB)
 thread_local K64DTlbEntry g_k64DTlb[K64_DTLB_SIZE];
-std::atomic<U32> g_k64DTlbGen{1};
 
 // A write whose page has no backing buffer (a failed or withdrawn commit)
 // is dropped and reported rather than written through NULL. Eight lines,
@@ -299,12 +306,20 @@ void k64ReportMissingBacking(int pid, U64 pageNum, const char* op);
 inline U8* k64DTlbLookup(const void* mem, U64 pageNum) {
     const K64DTlbEntry& e = g_k64DTlb[pageNum & (K64_DTLB_SIZE - 1)];
     if (e.mem == mem && e.page == pageNum &&
-        e.gen == g_k64DTlbGen.load(std::memory_order_acquire)) {
+        e.gen == k64PageCacheGeneration()) {
         return e.data;
     }
     return nullptr;
 }
-inline void k64DTlbInsert(const void* mem, U64 pageNum, U8* data) {
+// `gen` must be read BEFORE the page is resolved: an invalidation that lands
+// while we are looking the buffer up has to lose the race, or we would stamp
+// the new generation onto a pointer it was meant to retire.
+inline void k64DTlbInsert(const void* mem, U64 pageNum, U8* data, U32 gen) {
+    // Never memoize a hole. A null entry would be handed straight back by the
+    // next lookup and indexed by an in-page offset.
+    if (!data) {
+        return;
+    }
 #ifdef BOXEDWINE_BLOCK_CACHE_INFRA
     // Block-cache invalidation contract: a page registered as holding decoded
     // blocks is barred from the data TLB. All its accesses then take the slow
@@ -318,10 +333,10 @@ inline void k64DTlbInsert(const void* mem, U64 pageNum, U8* data) {
     e.mem = mem;
     e.page = pageNum;
     e.data = data;
-    e.gen = g_k64DTlbGen.load(std::memory_order_acquire);
+    e.gen = gen;
 }
 inline void k64DTlbInvalidateAll() {
-    g_k64DTlbGen.fetch_add(1, std::memory_order_release);
+    k64InvalidatePageCaches();
 }
 } // namespace
 
@@ -377,19 +392,18 @@ void KMemory64::noteGuestWriteRange(U64 addr, U64 len) {
 #endif // BOXEDWINE_BLOCK_CACHE_INFRA
 
 static void k64InvalidateProcessFetchCaches(KProcess* process) {
-    if (!process) return;
-    process->iterateThreads([](KThread* thread) {
-        if (thread && thread->cpu64) {
-            thread->cpu64->invalidateFetchCache();
-        }
-        return true;
-    });
-    // The initial thread normally aliases this object, but invalidate the
-    // process-owned CPU explicitly as well so early-loader mappings are safe
-    // before the thread has been bound to it.
-    if (process->cpu64) {
-        process->cpu64->invalidateFetchCache();
-    }
+    (void)process;
+    // Retire every instruction-fetch page cache by bumping the shared
+    // generation. This used to walk the process's threads and clear each
+    // sibling's CPU64 cache fields directly, which is a data race against a
+    // sibling that is running guest code: fetchByte compares the cached page
+    // number and then loads the cached pointer, so a thread could match the
+    // page an instant before the invalidator nulled the pointer and then index
+    // NULL by the in-page offset. That is the host SIGSEGV at a bare page
+    // offset (0x3c5, 0x5a2, 0x944, 0xbd8) inside CPU64::step. The generation
+    // is process-wide by construction — one extra miss for unrelated address
+    // spaces, and no thread ever writes into another thread's cache.
+    k64InvalidatePageCaches();
 }
 
 static void (*g_k64TranslatedCodeInvalidator)(KProcess*, U64, U64) = nullptr;
@@ -1847,9 +1861,10 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
         offsetInPage = dstGuest & K64_PAGE_MASK;
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
+        const U32 gen = k64PageCacheGeneration();
         U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
         if (data) {
-            k64DTlbInsert(this, pageNum, data);
+            k64DTlbInsert(this, pageNum, data, gen);
             ::memcpy(data + offsetInPage, s, (size_t)chunk); // commit-on-write (MT-safe)
         } else {
             k64ReportMissingBacking((int)(process ? process->id : -1), pageNum, "write");
@@ -1889,12 +1904,13 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
         offsetInPage = srcGuest & K64_PAGE_MASK;
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
+        const U32 gen = k64PageCacheGeneration();
         K64Page* page = getPage(pageNum);
         // Read the backing pointer once: committed() is the same load, and
         // a shared page's buffer can be withdrawn between the two.
         U8* host = page ? page->hostData() : nullptr;
         if (host) {
-            k64DTlbInsert(this, pageNum, host);
+            k64DTlbInsert(this, pageNum, host, gen);
             ::memcpy(d, host + offsetInPage, (size_t)chunk);
         } else {
             // Absent slot OR reserved-but-uncommitted page → reads as zero.
@@ -1929,10 +1945,11 @@ void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
 U8 KMemory64::readb(U64 addr) {
     U64 pageNum = addr >> K64_PAGE_SHIFT;
     if (U8* hit = k64DTlbLookup(this, pageNum)) return hit[addr & K64_PAGE_MASK];
+    const U32 gen = k64PageCacheGeneration();
     K64Page* p = getPage(pageNum);
     U8* host = p ? p->hostData() : nullptr;
     if (host) {
-        k64DTlbInsert(this, pageNum, host);
+        k64DTlbInsert(this, pageNum, host, gen);
         return host[addr & K64_PAGE_MASK];
     }
     return 0;
@@ -1961,8 +1978,16 @@ void KMemory64::writeb(U64 addr, U8 value) {
     strayWriteCheck(addr, 1);
     recordMemWrite(addr, 1, value);
     noteGuestWrite(pageNum); // slow path only — fast path is barred for block pages
+    const U32 gen = k64PageCacheGeneration();
     U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-    k64DTlbInsert(this, pageNum, data);
+    if (!data) {
+        // A page whose commit failed or was withdrawn (a shared slot the owner
+        // nulled) has nowhere to put this byte. Drop and report it, the way the
+        // bulk write paths do, rather than storing through NULL.
+        k64ReportMissingBacking((int)(process ? process->id : -1), pageNum, "writeb");
+        return;
+    }
+    k64DTlbInsert(this, pageNum, data, gen);
     data[addr & K64_PAGE_MASK] = value; // commit-on-write (MT-safe)
 }
 
