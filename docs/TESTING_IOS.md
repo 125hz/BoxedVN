@@ -300,6 +300,32 @@ From the same menu button:
 - **Quit to library.** It asks for confirmation inside the same panel. Confirm,
   and the library UI should return exactly as in section 3.7.
 
+### 3.6b Mouse settings and the hold-to-drag haptic
+
+The live view's control bar carries the pointer button. A **short tap** still
+toggles direct tap against the Wine cursor, and nothing about that changes. A
+**touch and hold** on the same button opens a small popover instead - cursor
+size, thickness, opacity, sensitivity and the outline switch - and the release
+that follows the hold must *not* also flip the mode.
+
+- Every control applies while the finger is still on it: drag the size slider
+  in trackpad mode and the drawn cursor must grow under the popover, not on
+  dismissal.
+- **Sensitivity is one scale for both axes**, 0.25x to 3.00x with 1.00x the
+  default. Set it to 3.00x, then move a finger diagonally across the live
+  view: the cursor must travel further but along the *same* line the finger
+  drew. A stroke that comes out flatter or steeper than the finger's is the
+  defect this control exists to rule out, and it is most visible in portrait,
+  where the guest occupies only a band of the window.
+- The popover and the in-guest pointer panel are one set of values. Change
+  sensitivity in the popover, open the in-guest menu's pointer settings, and
+  its slider must already be where the popover left it.
+- In trackpad mode, **hold a finger still** on the picture for about a third
+  of a second. The left button engages so the next movement drags, and a light
+  haptic fires at that instant - once. A quick tap, a plain move, a two-finger
+  right-click and every release must be silent. The log records
+  `BOXEDVN_POINTER_HOLD engaged=1` with the guest point, budgeted to 24 lines.
+
 ### 3.7 Exit
 
 Quit the guest.

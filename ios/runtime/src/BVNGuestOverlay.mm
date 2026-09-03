@@ -207,9 +207,6 @@ static const CGFloat kBVNKeyRowMaximumHeight = 46.0;
 // pass it.
 static const CGFloat kBVNKeyboardInlineMinimumHeight = 320.0;
 static const CGFloat kBVNKeyboardInlineMinimumWidth = 340.0;
-// Slightly faster than 1:1 so a small finger movement crosses a Wine dialog,
-// but not so fast that a title-bar button is unhittable - which is the whole
-// reason trackpad mode exists.
 static NSString* const kBVNTrackpadModeKey = @"BoxedVN.pointer.trackpad";
 static NSString* const kBVNPointerModeKey = @"BoxedVN.pointer.mode";
 static NSString* const kBVNPointerSensitivityKey =
@@ -225,6 +222,58 @@ static NSString* const kBVNPointerOuterCircleKey =
     @"BoxedVN.pointer.outerCircle";
 static NSString* const kBVNPointerInnerCircleKey =
     @"BoxedVN.pointer.innerCircle";
+
+// Trackpad motion is scaled by ONE number, never by a per-axis pair: the
+// horizontal and the vertical guest-pixel delta are multiplied by the same
+// factor, so a diagonal finger stroke stays diagonal whatever letterboxing or
+// rotation sits between the overlay and the guest picture. 1.0 is
+// finger-for-pixel, which is what the cursor is for - a Wine title-bar button
+// has to be reachable, and anything faster than the finger overshoots it.
+// Both writers (the in-guest panel and the live view's long-press popover)
+// clamp to these bounds, so a stale or hand-edited default cannot leave the
+// cursor unusable.
+static const double kBVNPointerSensitivityMinimum = 0.25;
+static const double kBVNPointerSensitivityMaximum = 3.0;
+static const double kBVNPointerSensitivityDefault = 1.0;
+// The remaining ranges the two panels share, so the popover's sliders and the
+// in-guest sliders cannot disagree about what a value means.
+static const double kBVNPointerSizeMinimum = 12.0;
+static const double kBVNPointerSizeMaximum = 64.0;
+static const double kBVNPointerThicknessMinimum = 0.5;
+static const double kBVNPointerThicknessMaximum = 6.0;
+static const double kBVNPointerOpacityMinimum = 0.1;
+static const double kBVNPointerOpacityMaximum = 1.0;
+
+static double BVNPointerClamp(double value, double minimum, double maximum) {
+    if (!(value > minimum)) {
+        // Also catches NaN, which a corrupted default can produce.
+        return minimum;
+    }
+    return value > maximum ? maximum : value;
+}
+
+// Reads a pointer default that -registerDefaults may not have supplied yet:
+// the live view can ask for these before any overlay exists, i.e. before a
+// guest has started. The fallbacks are the same values registerDefaults uses.
+static double BVNPointerDefaultDouble(NSString* key, double fallback,
+                                      double minimum, double maximum) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults objectForKey:key] == nil) {
+        return fallback;
+    }
+    return BVNPointerClamp([defaults doubleForKey:key], minimum, maximum);
+}
+
+// The one reader every motion path goes through. A default written before the
+// range narrowed - the shipped default used to be 1.4 - is clamped here rather
+// than rewritten, so nothing has to migrate the store.
+static double BVNPointerSensitivity(void) {
+    return BVNPointerDefaultDouble(kBVNPointerSensitivityKey,
+                                   kBVNPointerSensitivityDefault,
+                                   kBVNPointerSensitivityMinimum,
+                                   kBVNPointerSensitivityMaximum);
+}
+
 static NSString* const kBVNPerformanceEnabledKey =
     @"BoxedVN.performance.enabled";
 static NSString* const kBVNPerformanceFPSKey = @"BoxedVN.performance.fps";
@@ -327,6 +376,11 @@ static NSString* const kBVNPerformanceBatteryKey =
 @property (nonatomic, assign) CGPoint trackpadButtonGuestPoint;
 @property (nonatomic, strong) NSTimer* trackpadHoldTimer;
 @property (nonatomic, strong) NSTimer* trackpadTapReleaseTimer;
+// Fired once, at the moment a stationary hold turns into a held left button -
+// the instant a drag becomes possible and the only instant the finger has no
+// other way of knowing it. Kept alive and -prepare'd while the hold timer is
+// armed, because a generator built at the moment of the impact plays late.
+@property (nonatomic, strong) UIImpactFeedbackGenerator* trackpadHoldHaptic;
 // Where the finger was on the previous -touchesMoved, in the presenting
 // view's coordinates. UIKit's own -previousLocationInView: cannot be used for
 // this: UITouch objects are recycled between gestures, and on the first move
@@ -360,6 +414,11 @@ static NSString* const kBVNPerformanceBatteryKey =
 - (void)updateKeyboardPlacement;
 - (void)dismissKeyboardForTeardown;
 - (void)reportKeyboardVisibility;
+
+// Re-reads every pointer default into the in-guest panel's own controls and
+// applies it to the drawn cursor. Called when the live view's popover writes
+// the store from outside this panel.
+- (void)syncPointerSettingsControls;
 
 @end
 
@@ -477,7 +536,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.opaque = NO;
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         kBVNPointerOpacityKey: @1.0,
-        kBVNPointerSensitivityKey: @1.4,
+        kBVNPointerSensitivityKey: @(kBVNPointerSensitivityDefault),
         kBVNPointerSizeKey: @22.0,
         kBVNPointerOutlineOpacityKey: @1.0,
         kBVNPointerShadowOpacityKey: @0.85,
@@ -616,18 +675,26 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     }
     self.pointerSettingLabels = labels;
 
-    self.pointerSensitivitySlider = [self makePointerSliderFrom:0.5 to:3.0
-                                                             key:kBVNPointerSensitivityKey];
-    self.pointerOpacitySlider = [self makePointerSliderFrom:0.1 to:1.0
-                                                        key:kBVNPointerOpacityKey];
-    self.pointerSizeSlider = [self makePointerSliderFrom:12.0 to:64.0
-                                                     key:kBVNPointerSizeKey];
+    self.pointerSensitivitySlider = [self
+        makePointerSliderFrom:(float)kBVNPointerSensitivityMinimum
+                           to:(float)kBVNPointerSensitivityMaximum
+                          key:kBVNPointerSensitivityKey];
+    self.pointerOpacitySlider = [self
+        makePointerSliderFrom:(float)kBVNPointerOpacityMinimum
+                           to:(float)kBVNPointerOpacityMaximum
+                          key:kBVNPointerOpacityKey];
+    self.pointerSizeSlider = [self
+        makePointerSliderFrom:(float)kBVNPointerSizeMinimum
+                           to:(float)kBVNPointerSizeMaximum
+                          key:kBVNPointerSizeKey];
     self.pointerOutlineSlider = [self makePointerSliderFrom:0.0 to:1.0
                                                         key:kBVNPointerOutlineOpacityKey];
     self.pointerShadowSlider = [self makePointerSliderFrom:0.0 to:1.0
                                                        key:kBVNPointerShadowOpacityKey];
-    self.pointerThicknessSlider = [self makePointerSliderFrom:0.5 to:6.0
-                                                          key:kBVNPointerThicknessKey];
+    self.pointerThicknessSlider = [self
+        makePointerSliderFrom:(float)kBVNPointerThicknessMinimum
+                           to:(float)kBVNPointerThicknessMaximum
+                          key:kBVNPointerThicknessKey];
     for (UISlider* slider in @[self.pointerSensitivitySlider,
                               self.pointerOpacitySlider,
                               self.pointerSizeSlider,
@@ -738,6 +805,27 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         [defaults setBool:self.pointerInnerSwitch.on
                    forKey:kBVNPointerInnerCircleKey];
     }
+    [self applyPointerAppearance];
+    [self positionCursor];
+}
+
+// The live view's popover writes the same defaults these controls do, so the
+// in-guest panel has to be re-read after an outside write or it would show -
+// and on the next drag, re-write - the values from before it.
+- (void)syncPointerSettingsControls {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    self.pointerSensitivitySlider.value = (float)BVNPointerSensitivity();
+    self.pointerOpacitySlider.value =
+        [defaults floatForKey:kBVNPointerOpacityKey];
+    self.pointerSizeSlider.value = [defaults floatForKey:kBVNPointerSizeKey];
+    self.pointerOutlineSlider.value =
+        [defaults floatForKey:kBVNPointerOutlineOpacityKey];
+    self.pointerShadowSlider.value =
+        [defaults floatForKey:kBVNPointerShadowOpacityKey];
+    self.pointerThicknessSlider.value =
+        [defaults floatForKey:kBVNPointerThicknessKey];
+    self.pointerOuterSwitch.on = [defaults boolForKey:kBVNPointerOuterCircleKey];
+    self.pointerInnerSwitch.on = [defaults boolForKey:kBVNPointerInnerCircleKey];
     [self applyPointerAppearance];
     [self positionCursor];
 }
@@ -1596,6 +1684,35 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     return YES;
 }
 
+// A light impact, not a selection or a notification: the gesture being
+// reported is a button going down under the finger, and the heavier styles
+// read as an error beside a game's own audio.
+- (void)playTrackpadHoldFeedback {
+    if (self.trackpadHoldHaptic == nil) {
+        self.trackpadHoldHaptic = [[UIImpactFeedbackGenerator alloc]
+            initWithStyle:UIImpactFeedbackStyleLight];
+    }
+    [self.trackpadHoldHaptic impactOccurred];
+    // Re-arm for the next hold: the engine idles again after an impact.
+    [self.trackpadHoldHaptic prepare];
+    [self reportTrackpadHoldEngaged];
+}
+
+// One line per engagement, budgeted. A report of "the drag never started"
+// then reads as either a run with no line - the hold threshold was never
+// reached - or a line the guest did not act on, which is a different defect.
+- (void)reportTrackpadHoldEngaged {
+    static int budget = 24;
+    if (budget <= 0) {
+        return;
+    }
+    --budget;
+    NSString* line = [NSString stringWithFormat:
+        @"BOXEDVN_POINTER_HOLD engaged=1 guest=%.0f,%.0f",
+        self.cursorGuestPoint.x, self.cursorGuestPoint.y];
+    BVNLogWrite(BVNLogLevelInfo, "input", line.UTF8String);
+}
+
 - (void)trackpadHoldTimerFired:(NSTimer*)timer {
     if (timer != self.trackpadHoldTimer) {
         return;
@@ -1605,6 +1722,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         self.trackpadTouchMoved || self.trackpadButtonHeld) {
         return;
     }
+    // Only here. A tap, a move, the two-finger right-click and every release
+    // are silent: this is the one transition the finger cannot see, because
+    // the cursor does not move and the guest may not redraw, and the next
+    // movement will drag rather than hover.
+    [self playTrackpadHoldFeedback];
     BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
                                 (int)lround(self.cursorGuestPoint.y), 1);
     self.trackpadButtonGuestPoint = self.cursorGuestPoint;
@@ -1677,6 +1799,13 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         self.trackpadHasMotionBaseline = NO;
         self.trackpadButtonHeld = NO;
         [self cancelTrackpadHoldTimer];
+        // Warm the Taptic engine now, while the 0.35s threshold runs: an
+        // unprepared generator can take longer than the impact is worth.
+        if (self.trackpadHoldHaptic == nil) {
+            self.trackpadHoldHaptic = [[UIImpactFeedbackGenerator alloc]
+                initWithStyle:UIImpactFeedbackStyleLight];
+        }
+        [self.trackpadHoldHaptic prepare];
         self.trackpadHoldTimer = [NSTimer
             timerWithTimeInterval:0.35
                            target:self
@@ -1771,8 +1900,9 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
             [self cancelTrackpadHoldTimer];
         }
     }
-    const CGFloat sensitivity = [[NSUserDefaults standardUserDefaults]
-        doubleForKey:kBVNPointerSensitivityKey];
+    // One scale, both axes: dx and dy are multiplied by the identical factor,
+    // which is what keeps the cursor's motion 1:1 in aspect with the finger's.
+    const CGFloat sensitivity = BVNPointerSensitivity();
     [self moveCursorBy:CGPointMake(dx * sensitivity,
                                    dy * sensitivity)];
     BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
@@ -3148,6 +3278,65 @@ extern "C" void BVNGuestControlsSetPointerMode(int mode) {
                                                forKey:@"BoxedVN.pointer.mode"];
     if (gOverlay != nil) {
         [gOverlay setPointerMode:clamped];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mouse settings, shared by the in-guest pointer panel and the live view's
+// long-press popover
+//
+// Both write the same NSUserDefaults keys, so there is one store and no
+// synchronisation problem: the getter reads it, the setter clamps into it and
+// then makes the running overlay show the result at once. Neither side owns a
+// copy of the values.
+// ---------------------------------------------------------------------------
+
+extern "C" BVNPointerSettings BVNGuestPointerSettingsGet(void) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    BVNPointerSettings settings;
+    settings.size = (float)BVNPointerDefaultDouble(kBVNPointerSizeKey, 22.0,
+                                                   kBVNPointerSizeMinimum,
+                                                   kBVNPointerSizeMaximum);
+    settings.thickness = (float)BVNPointerDefaultDouble(
+        kBVNPointerThicknessKey, 2.0, kBVNPointerThicknessMinimum,
+        kBVNPointerThicknessMaximum);
+    settings.opacity = (float)BVNPointerDefaultDouble(
+        kBVNPointerOpacityKey, 1.0, kBVNPointerOpacityMinimum,
+        kBVNPointerOpacityMaximum);
+    settings.sensitivity = (float)BVNPointerSensitivity();
+    settings.outline = [defaults objectForKey:kBVNPointerOuterCircleKey] == nil
+        ? true
+        : [defaults boolForKey:kBVNPointerOuterCircleKey] != NO;
+    return settings;
+}
+
+extern "C" void BVNGuestPointerSettingsSet(BVNPointerSettings settings) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BVNGuestPointerSettingsSet(settings);
+        });
+        return;
+    }
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setDouble:BVNPointerClamp(settings.size, kBVNPointerSizeMinimum,
+                                        kBVNPointerSizeMaximum)
+                 forKey:kBVNPointerSizeKey];
+    [defaults setDouble:BVNPointerClamp(settings.thickness,
+                                        kBVNPointerThicknessMinimum,
+                                        kBVNPointerThicknessMaximum)
+                 forKey:kBVNPointerThicknessKey];
+    [defaults setDouble:BVNPointerClamp(settings.opacity,
+                                        kBVNPointerOpacityMinimum,
+                                        kBVNPointerOpacityMaximum)
+                 forKey:kBVNPointerOpacityKey];
+    [defaults setDouble:BVNPointerClamp(settings.sensitivity,
+                                        kBVNPointerSensitivityMinimum,
+                                        kBVNPointerSensitivityMaximum)
+                 forKey:kBVNPointerSensitivityKey];
+    [defaults setBool:settings.outline ? YES : NO
+               forKey:kBVNPointerOuterCircleKey];
+    if (gOverlay != nil) {
+        [gOverlay syncPointerSettingsControls];
     }
 }
 

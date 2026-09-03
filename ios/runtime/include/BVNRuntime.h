@@ -539,6 +539,33 @@ int BVNGuestControlsPointerMode(void);
 void BVNGuestControlsSetPointerMode(int mode);
 void BVNGuestControlsTapKeyNamed(const char* sdlScancodeName);
 
+// Mouse settings for the drawn trackpad cursor, reached from the control
+// bar's pointer button by a long press. This is the same store the in-guest
+// pointer panel writes - the defaults keys BoxedVN.pointer.{size,thickness,
+// outerCircle,opacity,sensitivity} - so the two never disagree, and a set
+// applies to the running overlay immediately.
+//
+// sensitivity is ONE isotropic scale on trackpad motion: the identical factor
+// multiplies the horizontal and the vertical guest-pixel delta, so the cursor
+// keeps a 1:1 aspect however the guest picture is letterboxed or rotated
+// inside the live view. 1.0 moves the cursor with the finger.
+typedef struct {
+    // Ring diameter in points; the fallback Wine cursor scales with it too.
+    float size;
+    // Ring line width in points.
+    float thickness;
+    // Cursor alpha, 0.1 (barely there) to 1.
+    float opacity;
+    // Motion scale, 0.25 to 3, applied to both axes alike.
+    float sensitivity;
+    // The dark contrast ring drawn just outside the white one, which is what
+    // keeps the cursor visible on white artwork.
+    bool outline;
+} BVNPointerSettings;
+
+BVNPointerSettings BVNGuestPointerSettingsGet(void);
+void BVNGuestPointerSettingsSet(BVNPointerSettings settings);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

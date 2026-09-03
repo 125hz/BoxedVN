@@ -412,17 +412,14 @@ struct GuestControlBar: View {
     /// runtime state cannot run while the guest still owns the main thread.
     let onStop: () -> Void
     @State private var pointerMode = Int(BVNGuestControlsPointerMode())
+    @State private var showingPointerSettings = false
 
     private var running: Bool { active }
 
     var body: some View {
         HStack(spacing: 22) {
             control("keyboard", "Keyboard") { BVNGuestControlsToggleKeyboard() }
-            control(pointerMode == 0 ? "hand.point.up.left" : "cursorarrow",
-                    "Pointer") {
-                pointerMode = pointerMode == 0 ? 1 : 0
-                BVNGuestControlsSetPointerMode(Int32(pointerMode))
-            }
+            pointerControl
             control("return", "Enter") { BVNGuestControlsTapKeyNamed("Return") }
             control("space", "Space") { BVNGuestControlsTapKeyNamed("Space") }
             textControl("esc", "Esc") { BVNGuestControlsTapKeyNamed("Escape") }
@@ -432,6 +429,32 @@ struct GuestControlBar: View {
         .frame(maxWidth: .infinity)
         .disabled(!running)
         .opacity(running ? 1 : 0.4)
+    }
+
+    /// A short tap keeps toggling direct tap against the Wine cursor. A long
+    /// press opens the mouse settings instead: they belong to the pointer, so
+    /// they hang off the pointer button rather than adding an eighth glyph to
+    /// a bar that is already full on a phone.
+    private var pointerControl: some View {
+        control(pointerMode == 0 ? "hand.point.up.left" : "cursorarrow",
+                "Pointer") {
+            // The long press has already opened the settings by the time the
+            // finger lifts; that release must not also change the mode.
+            guard !showingPointerSettings else { return }
+            pointerMode = pointerMode == 0 ? 1 : 0
+            BVNGuestControlsSetPointerMode(Int32(pointerMode))
+        }
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                showingPointerSettings = true
+            }
+        )
+        .accessibilityHint("Double tap to switch pointer mode. "
+                           + "Touch and hold for mouse settings.")
+        .popover(isPresented: $showingPointerSettings) {
+            GuestPointerSettingsPopover()
+                .presentationCompactAdaptation(.popover)
+        }
     }
 
     private func textControl(_ title: String, _ label: String,
@@ -459,6 +482,82 @@ struct GuestControlBar: View {
         .tint(tint)
         .foregroundStyle(tint)
         .accessibilityLabel(label)
+    }
+}
+
+/// The mouse settings behind the control bar's pointer button.
+///
+/// Every control writes the runtime's own store through
+/// `BVNGuestPointerSettingsSet`, which is the same NSUserDefaults the in-guest
+/// pointer panel writes: the two are views of one set of values, not two
+/// copies, and the running overlay repaints its cursor while the slider is
+/// still under the finger.
+struct GuestPointerSettingsPopover: View {
+    @State private var settings = BVNGuestPointerSettingsGet()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Mouse")
+                .font(.headline)
+            slider("Size", field(\.size), 12...64,
+                   String(format: "%.0f pt", settings.size))
+            slider("Thickness", field(\.thickness), 0.5...6,
+                   String(format: "%.1f pt", settings.thickness))
+            slider("Opacity", field(\.opacity), 0.1...1,
+                   String(format: "%.0f%%", settings.opacity * 100))
+            slider("Sensitivity", field(\.sensitivity), 0.25...3,
+                   String(format: "%.2f×", settings.sensitivity))
+            Toggle("Outline", isOn: Binding(
+                get: { settings.outline },
+                set: { settings.outline = $0; apply() }
+            ))
+            .font(.subheadline)
+            Text("Sensitivity scales sideways and up-and-down motion by the "
+                 + "same amount, so the cursor keeps the shape of the stroke. "
+                 + "1.00× moves it with the finger.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Reset") {
+                settings = BVNPointerSettings(size: 22, thickness: 2,
+                                              opacity: 1, sensitivity: 1,
+                                              outline: true)
+                apply()
+            }
+            .font(.subheadline)
+        }
+        .padding(18)
+        .frame(width: 300)
+    }
+
+    /// Writes through on every change, so the value is applied live rather
+    /// than on dismissal - a sensitivity that can only be judged by moving the
+    /// cursor is useless behind an OK button.
+    private func field(
+        _ keyPath: WritableKeyPath<BVNPointerSettings, Float>
+    ) -> Binding<Float> {
+        Binding(get: { settings[keyPath: keyPath] },
+                set: { settings[keyPath: keyPath] = $0; apply() })
+    }
+
+    private func apply() {
+        BVNGuestPointerSettingsSet(settings)
+    }
+
+    private func slider(_ title: String, _ value: Binding<Float>,
+                        _ range: ClosedRange<Float>,
+                        _ caption: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title)
+                    .font(.subheadline)
+                Spacer()
+                Text(caption)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range)
+                .accessibilityLabel(title)
+        }
     }
 }
 
