@@ -598,6 +598,66 @@ BOXEDVN_TEST(a_dxmt_launch_names_its_module_directory_for_the_module_root_overla
     CHECK(std::find(actual.begin(), actual.end(), "-w") != actual.end());
 }
 
+BOXEDVN_TEST(a_dxmt_launch_keeps_its_module_directory_when_the_program_runs_elsewhere) {
+    // Running a program of the user's own: its own folder is the working
+    // directory, so its DLLs and data resolve, while the DXMT modules are
+    // still projected from where the app staged them. Taking -x64modules
+    // from the working directory would have projected nothing at all.
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "D:\\Program\\program.exe";
+    launch.workingDirectory = "/mnt/drive_d/Program";
+    launch.dxmtModuleDirectory = "/mnt/drive_d/.boxedvn-x64-diagnostics";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    launch.useDXMT = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const auto modules = std::find(actual.begin(), actual.end(), "-x64modules");
+    CHECK(modules != actual.end());
+    if (modules != actual.end() && modules + 1 != actual.end()) {
+        CHECK_EQ(*(modules + 1),
+                 std::string("/mnt/drive_d/.boxedvn-x64-diagnostics"));
+    }
+    const auto working = std::find(actual.begin(), actual.end(), "-w");
+    CHECK(working != actual.end());
+    if (working != actual.end() && working + 1 != actual.end()) {
+        CHECK_EQ(*(working + 1), std::string("/mnt/drive_d/Program"));
+    }
+    CHECK_EQ(actual.back(), std::string("D:\\Program\\program.exe"));
+}
+
+BOXEDVN_TEST(a_program_on_the_prefix_drive_c_runs_from_its_own_folder) {
+    // The same launch for a program on C:. The guest path of that drive is
+    // the 64-bit prefix's drive_c, not /mnt/drive_d.
+    BVNLaunchConfiguration launch;
+    launch.rootFilesystemZipPath = "/rootfs.zip";
+    launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
+    launch.writableRootPath = "/prefixes/x64";
+    launch.executablePath = "C:\\Program Files\\Vendor\\program.exe";
+    launch.workingDirectory = "/home/username/.wine64/drive_c/Program Files/Vendor";
+    launch.dxmtModuleDirectory = "/mnt/drive_d/.boxedvn-x64-diagnostics";
+    launch.runThroughWine = true;
+    launch.useFEX64 = true;
+    launch.useDXMT = true;
+
+    const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
+    const auto working = std::find(actual.begin(), actual.end(), "-w");
+    CHECK(working != actual.end());
+    if (working != actual.end() && working + 1 != actual.end()) {
+        CHECK_EQ(*(working + 1),
+                 std::string("/home/username/.wine64/drive_c/Program Files/Vendor"));
+    }
+    const auto modules = std::find(actual.begin(), actual.end(), "-x64modules");
+    CHECK(modules != actual.end());
+    if (modules != actual.end() && modules + 1 != actual.end()) {
+        CHECK_EQ(*(modules + 1),
+                 std::string("/mnt/drive_d/.boxedvn-x64-diagnostics"));
+    }
+}
+
 BOXEDVN_TEST(a_plain_fex64_launch_projects_no_module_overlay) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs.zip";

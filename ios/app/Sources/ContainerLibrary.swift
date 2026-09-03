@@ -62,6 +62,60 @@ struct ContainerProgram: Identifiable, Hashable {
     var executable: ExecutableDescription
 }
 
+/// A program on one of a container's drives, with the two paths a 64-bit
+/// launch needs: the Windows path Wine reads, and the program's own folder as
+/// a guest Linux path, which is what BoxedWine's `-w` takes. The device log
+/// showed why the second one is not a Windows path: given one, the process
+/// started with no valid current directory at all (`open(".") -> -2`).
+struct ContainerX64Program: Identifiable, Hashable {
+    /// The guest drive letter the folder is mounted as: "d" for the
+    /// container's Files folder, "c" for its 64-bit prefix drive C.
+    var drive: String
+    /// Path below that drive's root, "/"-separated, as discovery reports it.
+    var relativePath: String
+    /// Host location, for the compatibility scan the launch does.
+    var root: URL
+    var executable: ExecutableDescription
+
+    var id: String { drive + ":" + relativePath }
+
+    /// Just the file name, for a row that has to fit on a phone.
+    var name: String {
+        relativePath.split(separator: "/").last.map { String($0) }
+            ?? relativePath
+    }
+
+    /// The folder the program sits in, as the user sees it: "D: · Folder".
+    var location: String {
+        let folder = relativePath.split(separator: "/").dropLast()
+            .joined(separator: "\\")
+        return drive.uppercased() + ":" + (folder.isEmpty ? "" : " · " + folder)
+    }
+
+    /// `D:\Folder\Program.exe` - Wine reads this one, so it stays a Windows
+    /// path.
+    var guestExecutablePath: String {
+        drive.uppercased() + ":\\"
+            + relativePath.replacingOccurrences(of: "/", with: "\\")
+    }
+
+    /// The program's own folder as a guest Linux directory, so a DLL beside
+    /// the program and the data it opens by relative path both resolve.
+    var guestWorkingDirectory: String {
+        let mount = drive == "c" ? ContainerLibrary.x64GuestDriveCPath
+                                 : ContainerLibrary.x64GuestDriveDPath
+        let folder = relativePath.split(separator: "/").dropLast()
+            .joined(separator: "/")
+        return folder.isEmpty ? mount : mount + "/" + folder
+    }
+
+    /// The host directory the program is in, which is what the launch scans
+    /// to pick a renderer and recognise an engine.
+    var hostDirectory: URL {
+        root.appendingPathComponent(relativePath).deletingLastPathComponent()
+    }
+}
+
 enum ContainerLibraryError: LocalizedError {
     case storageUnavailable
     case invalidName
@@ -187,6 +241,80 @@ enum ContainerLibrary {
             $0.executable.relativePath.localizedCaseInsensitiveCompare(
                 $1.executable.relativePath) == .orderedAscending
         }
+    }
+
+    /// Where the container's Files folder is mounted inside the guest. The
+    /// launch passes it as drive D:, and BoxedWine mounts a lettered drive at
+    /// `/mnt/drive_<letter>` (see startupArgs.cpp).
+    static let x64GuestDriveDPath = "/mnt/drive_d"
+
+    /// Where the 64-bit prefix's drive C is mounted: the prefix path from
+    /// guest_wine_prefix.h, which the launch mounts `x64DriveC` over.
+    static let x64GuestDriveCPath = "/home/username/.wine64/drive_c"
+
+    /// The 64-bit lane's C: drive. It sits beside the container's Files
+    /// folder rather than inside the private writable root so that Program
+    /// Files and the user directories are reachable from the Files app; the
+    /// 64-bit prefix is kept apart from the 32-bit one because the two Wine
+    /// builds cannot share a prefix.
+    static func x64DriveC(for container: WineContainer) -> URL {
+        filesDirectory(for: container).deletingLastPathComponent()
+            .appendingPathComponent("Drive C (64-bit)", isDirectory: true)
+    }
+
+    /// Every Windows program on the container's two 64-bit drives, newest
+    /// scan each time, for the "Run program…" picker.
+    ///
+    /// Only `.exe` files: the picker starts a process, and the loader is what
+    /// decides whether a given image runs. Both architectures are listed -
+    /// the 64-bit prefix has a 32-bit lane when the PE32 layer is present -
+    /// and the row says which one each is, so a program that cannot start
+    /// says so before it is picked rather than after.
+    ///
+    /// BoxedVN's own staging directory is hidden: the DXMT modules and the
+    /// bundled probes live there, and neither is a program the user put on
+    /// the drive.
+    static func x64Programs(in container: WineContainer) -> [ContainerX64Program] {
+        let files = filesDirectory(for: container)
+        var programs = discoverX64Programs(in: files, drive: "d")
+        let driveC = x64DriveC(for: container)
+        if FileManager.default.fileExists(atPath: driveC.path) {
+            programs += discoverX64Programs(in: driveC, drive: "c").filter {
+                if container.showWindowsPrograms { return true }
+                let path = $0.relativePath.lowercased()
+                return path != "windows" && !path.hasPrefix("windows/")
+            }
+        }
+        return programs.sorted {
+            // Anything that can start comes first; the rest stay visible,
+            // because "my program is not in the list" is worse than a row
+            // that explains itself.
+            if $0.executable.runnable != $1.executable.runnable {
+                return $0.executable.runnable
+            }
+            return $0.id.localizedCaseInsensitiveCompare($1.id)
+                == .orderedAscending
+        }
+    }
+
+    private static func discoverX64Programs(in root: URL, drive: String)
+        -> [ContainerX64Program] {
+        Executables.discover(in: root)
+            .filter { executable in
+                let path = executable.relativePath
+                    .replacingOccurrences(of: "\\", with: "/")
+                guard path.lowercased().hasSuffix(".exe") else { return false }
+                // A dot-directory is BoxedVN's own or the system's.
+                return !path.split(separator: "/").contains { $0.hasPrefix(".") }
+            }
+            .map { executable in
+                ContainerX64Program(
+                    drive: drive,
+                    relativePath: executable.relativePath
+                        .replacingOccurrences(of: "\\", with: "/"),
+                    root: root,
+                    executable: executable)
+            }
     }
 
     private static func containerDirectory(for container: WineContainer) throws

@@ -138,6 +138,77 @@ BOXEDVN_TEST(dll_search_trace_has_a_hard_per_process_budget) {
 
     CHECK(second.record("/usr/lib/wine/kernel32.dll") ==
           boxedvn::DllSearchTrace::Decision::Report);
-    CHECK(K_DLL_SEARCH_TRACE_BUDGET <= 128);
+    // Large enough for a program's whole import tree - 128 stopped forty
+    // operations short of the import that failed - and still bounded.
+    CHECK(K_DLL_SEARCH_TRACE_BUDGET >= 1024);
+    CHECK(K_DLL_SEARCH_TRACE_BUDGET <= 4096);
     boxedvn::setDllSearchTraceEnabled(false);
+}
+
+BOXEDVN_TEST(dll_search_module_name_reads_the_module_a_path_ends_in) {
+    char name[K_DLL_SEARCH_MODULE_NAME_MAX];
+
+    CHECK(boxedvn::dllSearchModuleName(
+        "/home/username/.wine64/dosdevices/c:/windows/system32/MSVCP140.dll",
+        name, sizeof(name)));
+    CHECK_EQ(std::string(name), std::string("msvcp140.dll"));
+
+    // Wine builds the same name with either separator, and the case it uses
+    // is the case the import table carries.
+    CHECK(boxedvn::dllSearchModuleName("D:\\Program\\Fmod64.DLL", name,
+                                       sizeof(name)));
+    CHECK_EQ(std::string(name), std::string("fmod64.dll"));
+
+    // A directory, the main image and the Unix half of a builtin are not
+    // imports.
+    CHECK(!boxedvn::dllSearchModuleName(
+        "/home/username/.wine64/dosdevices/c:/windows/system32", name,
+        sizeof(name)));
+    CHECK(!boxedvn::dllSearchModuleName("D:\\Program\\program.exe", name,
+                                        sizeof(name)));
+    CHECK(!boxedvn::dllSearchModuleName(
+        "/usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winemetal.dll.so", name,
+        sizeof(name)));
+    CHECK(!boxedvn::dllSearchModuleName(nullptr, name, sizeof(name)));
+}
+
+BOXEDVN_TEST(dll_search_trace_names_the_module_no_search_path_produced) {
+    boxedvn::setDllSearchTraceEnabled(true);
+    boxedvn::DllSearchTrace trace;
+    char module[K_DLL_SEARCH_MODULE_NAME_MAX];
+
+    // A module found on a later path is not missing, however many probes
+    // missed first - the loader stops at the first hit.
+    trace.noteResult("/home/username/.wine64/dosdevices/d:/game/dxgi.dll", -2);
+    trace.noteResult("/home/username/.wine64/dosdevices/c:/windows/system32/dxgi.dll", 0);
+    trace.lastUnresolvedModule(module, sizeof(module));
+    CHECK_EQ(std::string(module), std::string());
+
+    // An import searched for in the middle of its parent's search, and found
+    // at the module root, must not displace the one that is still missing.
+    trace.noteResult("/home/username/.wine64/dosdevices/d:/game/fmod64.dll", -2);
+    trace.noteResult("/home/username/.wine64/dosdevices/d:/game/winemetal.dll", -2);
+    trace.noteResult("/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/winemetal.dll", 7);
+    trace.lastUnresolvedModule(module, sizeof(module));
+    CHECK_EQ(std::string(module), std::string("fmod64.dll"));
+
+    // The name survives a spent budget: that is the case it exists for.
+    for (unsigned i = 0; i < K_DLL_SEARCH_TRACE_BUDGET + 8; ++i) {
+        trace.record("/usr/lib/wine/kernel32.dll");
+    }
+    trace.noteResult("/home/username/.wine64/dosdevices/d:/game/fmod64.dll", -2);
+    trace.lastUnresolvedModule(module, sizeof(module));
+    CHECK_EQ(std::string(module), std::string("fmod64.dll"));
+    CHECK(trace.probes() >= 5);
+    boxedvn::setDllSearchTraceEnabled(false);
+}
+
+BOXEDVN_TEST(dll_search_trace_records_nothing_when_it_is_not_armed) {
+    boxedvn::setDllSearchTraceEnabled(false);
+    boxedvn::DllSearchTrace trace;
+    char module[K_DLL_SEARCH_MODULE_NAME_MAX];
+    trace.noteResult("/home/username/.wine/dosdevices/d:/game/fmod64.dll", -2);
+    trace.lastUnresolvedModule(module, sizeof(module));
+    CHECK_EQ(std::string(module), std::string());
+    CHECK_EQ(trace.probes(), 0u);
 }

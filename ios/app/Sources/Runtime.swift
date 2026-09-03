@@ -569,7 +569,11 @@ enum Session {
         gameDriveLetter: Character = "d",
         sharedDriveLetter: Character = "e",
         windowsVersion: String? = nil,
-        compatibilityDirectory: URL? = nil
+        compatibilityDirectory: URL? = nil,
+        // Guest directory the DXMT modules are staged in. Nil takes them from
+        // workingDirectory, which is right only when the program being run is
+        // the one staged beside them.
+        dxmtModuleDirectory: String? = nil
     ) throws {
         var errorBuffer = [CChar](repeating: 0, count: 1024)
 
@@ -580,7 +584,12 @@ enum Session {
         let overlayStorage = rootFilesystemOverlays.map { strdup($0.path) }
         let driveCStorage: UnsafeMutablePointer<CChar>? =
             winePrefixDriveC.flatMap { strdup($0.path) }
+        // Held the same way as drive C rather than as another nested
+        // withCString: the closure nesting below is already at its limit.
+        let moduleDirectoryStorage: UnsafeMutablePointer<CChar>? =
+            dxmtModuleDirectory.flatMap { strdup($0) }
         defer {
+            if let moduleDirectoryStorage { free(moduleDirectoryStorage) }
             if let driveCStorage { free(driveCStorage) }
             argumentStorage.forEach { free($0) }
             environmentStorage.forEach { free($0) }
@@ -625,6 +634,10 @@ enum Session {
                                         request.windowsVersion = versionPath
                                         request.executablePath = exePath
                                         request.workingDirectory = workPath
+                                        request.dxmtModuleDirectory =
+                                            moduleDirectoryStorage.map {
+                                                UnsafePointer<CChar>($0)
+                                            }
                                         request.width = width
                                         request.height = height
                                         request.bitsPerPixel = 32

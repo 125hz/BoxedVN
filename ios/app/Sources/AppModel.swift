@@ -662,8 +662,7 @@ final class AppModel: ObservableObject {
             writableRoot: prefixes.appendingPathComponent(
                 container.prefixName + "-x64", isDirectory: true),
             files: files,
-            driveC: containerFolder
-                .appendingPathComponent("Drive C (64-bit)", isDirectory: true),
+            driveC: ContainerLibrary.x64DriveC(for: container),
             diagnostics: files.appendingPathComponent(
                 ".boxedvn-x64-diagnostics", isDirectory: true),
             pe32: pe32)
@@ -773,6 +772,84 @@ final class AppModel: ObservableObject {
             alertMessage = "The 64-bit graphics probe could not start: "
                          + error.localizedDescription
         }
+    }
+
+    /// Runs a program the user picked from the container's drives on exactly
+    /// the path the 64-bit cube takes: Wine64 through FEX, DXMT presenting
+    /// Direct3D, one translated process - the one launched here.
+    ///
+    /// Two things differ from the cube, and both matter. The program runs
+    /// from its own folder, so a DLL beside it and the data it opens by
+    /// relative path resolve (a device session's interpreter child, started
+    /// from the file manager, died with STATUS_DLL_NOT_FOUND while resolving
+    /// its imports). And because the working directory is no longer where
+    /// the DXMT modules are staged, the staging directory is named
+    /// separately: it is what Wine's module root is overlaid from, and taking
+    /// it from the working directory would have projected nothing.
+    ///
+    /// Starting the program here rather than double-clicking it in the file
+    /// manager is what gives it the translator. A process the guest creates
+    /// runs on the interpreter with no DXMT - exactly one process per session
+    /// is translated (docs/KNOWN_LIMITATIONS_IOS.md).
+    func launchX64Program(_ program: ContainerX64Program,
+                          in container: WineContainer) {
+        guard let rootFilesystem else {
+            alertMessage = "No root filesystem is installed."
+            return
+        }
+        guard let runtime = prepareX64Runtime(for: container) else { return }
+        rememberX64Program(program, for: container)
+        do {
+            Log.write("Launching \(program.guestExecutablePath) through "
+                      + "BoxedWine FEX and DXMT, working directory "
+                      + program.guestWorkingDirectory, category: "container")
+            try Session.launch(
+                rootFilesystem: rootFilesystem,
+                rootFilesystemOverlays: runtime.overlays,
+                writableRoot: runtime.writableRoot,
+                gameDirectory: runtime.files,
+                sharedDirectory: Storage.sharedFiles,
+                executablePath: program.guestExecutablePath,
+                arguments: [],
+                environment: X64Runtime.environment,
+                workingDirectory: program.guestWorkingDirectory,
+                width: container.width,
+                height: container.height,
+                soundEnabled: Preferences.soundEnabled,
+                runThroughWine: true,
+                useFEX64: true,
+                useDXMT: true,
+                winePrefixDriveC: runtime.driveC,
+                wineRenderer: BVNWineRendererAutomatic,
+                sharedDriveLetter:
+                    container.sharedDriveLetter.lowercased().first ?? "e",
+                windowsVersion: container.windowsVersion,
+                compatibilityDirectory: program.hostDirectory,
+                // Where prepareX64Runtime staged the DXMT modules, which is
+                // no longer the working directory.
+                dxmtModuleDirectory: runtime.guestWorkingDirectory)
+        } catch {
+            alertMessage = "\(program.name) could not start: "
+                         + error.localizedDescription
+        }
+    }
+
+    /// The program a container last ran, as `ContainerX64Program.id`. Kept so
+    /// the row can say what it would run again; the picker still lists
+    /// everything, because a remembered program can be deleted or renamed
+    /// between sessions.
+    func lastX64ProgramID(for container: WineContainer) -> String? {
+        UserDefaults.standard.string(forKey: Self.x64ProgramKey(container))
+    }
+
+    private func rememberX64Program(_ program: ContainerX64Program,
+                                    for container: WineContainer) {
+        UserDefaults.standard.set(program.id,
+                                  forKey: Self.x64ProgramKey(container))
+    }
+
+    private static func x64ProgramKey(_ container: WineContainer) -> String {
+        "BoxedVN.x64Program." + container.id
     }
 
     /// Wine's builtin explorer, named the way Wine's unix loader can resolve

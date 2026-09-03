@@ -48,6 +48,14 @@ struct BVNLaunchConfiguration {
     // Inclusive start, exclusive end in the 32-bit guest address space.
     std::vector<std::pair<uint32_t, uint32_t>> interpreterRanges;
     std::string workingDirectory;
+    // Guest directory holding the DXMT PE modules to project over Wine's
+    // module root (-x64modules). Empty keeps the old behaviour of taking them
+    // from the working directory, which is right only while the program being
+    // run is the bundled probe that lives beside them. A program of the
+    // user's own runs from its own folder - it needs that folder as its
+    // working directory so its own DLLs and data resolve - and the modules
+    // are still staged where the app put them.
+    std::string dxmtModuleDirectory;
     /// "ja" selects a CP932 prefix; empty leaves the root filesystem's own.
     std::string guestLocale;
     uint32_t width = 0;

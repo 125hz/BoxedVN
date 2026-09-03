@@ -417,10 +417,37 @@ static void dumpX64DescendantSnapshot(KProcess* parent) {
     }
 }
 
+// Wine's exit code when the loader could not resolve an import:
+// STATUS_DLL_NOT_FOUND, which the shell reports as 3221225781. It names the
+// module in an err:module:import_dll line on stderr -- but two device
+// sessions carried no Wine debug output at all, so that line is not something
+// this log can rely on. The module-search recorder saw the same search from
+// the syscall side and knows which name never resolved.
+#define K_X64_STATUS_DLL_NOT_FOUND 0xC0000135u
+
+// One line, once, at the exit that needs it: the module the loader searched
+// for and never found. Unbudgeted -- it is a single line per process, and the
+// process is already exiting.
+static void reportX64MissingImport(KProcess* process, U64 status) {
+    if (!process || (U32)status != K_X64_STATUS_DLL_NOT_FOUND) {
+        return;
+    }
+    char module[K_DLL_SEARCH_MODULE_NAME_MAX];
+    process->dllSearch.lastUnresolvedModule(module, sizeof(module));
+    klog_fmt("BOXEDWINE_X64_IMPORT_MISSING pid=%u module=%s status=0x%08x "
+             "probes=%u trace_budget_left=%u",
+             (unsigned)process->id,
+             module[0] ? module : "(none recorded)",
+             (unsigned)(U32)status, process->dllSearch.probes(),
+             process->dllSearch.remaining());
+}
+
 static void dumpX64ExitDiagnostics(CPU64* cpu, U64 status) {
     if (!cpu || !cpu->thread || !cpu->thread->process) return;
     KProcess* process = cpu->thread->process.get();
     if (!process->syscallTail.claimDump()) return;
+
+    reportX64MissingImport(process, status);
 
     klog_fmt("X64_EXIT_DIAG pid=%u status=%llu exe='%s' cmd='%s' "
              "rip=0x%llx syscall_rip=0x%llx rsp=0x%llx rax=0x%llx "
@@ -488,6 +515,10 @@ static void reportDllSearch(KProcess* process, const char* op, const char* path,
     if (!process) {
         return;
     }
+    // Before the budget is consulted: which module the search was for has to
+    // survive a spent budget, because that is exactly when the log stops
+    // saying it. See BOXEDWINE_X64_IMPORT_MISSING at exit.
+    process->dllSearch.noteResult(path, result);
     const boxedvn::DllSearchTrace::Decision decision =
         process->dllSearch.record(path);
     if (decision == boxedvn::DllSearchTrace::Decision::Silent) {

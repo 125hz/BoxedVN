@@ -586,9 +586,19 @@ std::vector<std::string> BVNBuildLaunchArguments(
         // of that name, which is how a device run ended up in wined3d with
         // DXGI_ERROR_UNSUPPORTED. Name the directory so the guest projects
         // those modules over the Wine module root before Wine starts.
-        if (launch.useDXMT && !launch.workingDirectory.empty()) {
-            argv.push_back("-x64modules");
-            argv.push_back(launch.workingDirectory);
+        //
+        // The modules stay where the app staged them even when the program
+        // runs from somewhere else, so the directory is named on its own and
+        // falls back to the working directory only for the callers that
+        // launch a program standing beside them.
+        if (launch.useDXMT) {
+            const std::string& modules = launch.dxmtModuleDirectory.empty()
+                                             ? launch.workingDirectory
+                                             : launch.dxmtModuleDirectory;
+            if (!modules.empty()) {
+                argv.push_back("-x64modules");
+                argv.push_back(modules);
+            }
         }
     }
     for (const std::string& entry : launch.environment) {

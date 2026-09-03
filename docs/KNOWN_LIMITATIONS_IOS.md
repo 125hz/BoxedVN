@@ -430,6 +430,41 @@ translator, which cannot happen while the parent's address space is still
 mapped. The supported way to run a Direct3D program is to launch it as the
 session's own process, which is what the cube entry does.
 
+**Run program…** on the container page is that entry for a program of the
+user's own. It lists the `.exe` files on the container's two 64-bit drives
+(D: is the container's Files folder, C: is `Drive C (64-bit)` beside it),
+remembers the last choice, and launches the selected program the way the cube
+is launched: `useFEX64` and `useDXMT`, the container's resolution, and the
+DXMT environment. Two details are specific to it. The working directory is
+the program's own folder, as a guest *Linux* path
+(`/mnt/drive_d/<folder>` or `/home/username/.wine64/drive_c/<folder>`), so a
+DLL beside the program and the data it opens by relative path both resolve -
+a Windows path there leaves the process with no valid current directory at
+all (`open(".") -> -2`). And because `-x64modules` used to be derived from
+the working directory, the staged DXMT module directory is now passed
+separately (`BVNLaunchConfiguration::dxmtModuleDirectory`); without that
+split, running a program from its own folder would have projected no DXMT
+modules over Wine's module root at all.
+
+### A failed import names itself in the log
+
+A guest that exits `3221225781` (`STATUS_DLL_NOT_FOUND`) could not resolve an
+import. Wine says which one in an `err:module:import_dll` line on stderr, but
+device sessions have carried no Wine debug channel output at all, so that
+line cannot be relied on. Instead the module-search recorder
+(`include/dll_search_trace.h`) remembers, per process and without spending
+any of its reporting budget, which module names the loader searched for and
+never found on any path, and the exit dump prints the most recent one:
+
+```
+BOXEDWINE_X64_IMPORT_MISSING pid=45 module=fmod64.dll status=0xc0000135 probes=812 trace_budget_left=0
+```
+
+The per-process budget for the full `BOXEDWINE_X64_DLL_SEARCH` trace is 1024
+operations (it was 128, which a real program's import tree spent on its first
+dozen imports, leaving the log naming every module that loaded and not the
+one that did not).
+
 The following remains unproven or deliberately constrained:
 
 - Whether `boxedmain()` can be called a **second time** in one process. The

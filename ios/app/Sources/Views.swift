@@ -526,6 +526,7 @@ struct ContainerDetailView: View {
     @State private var shortcutTitle = ""
     @State private var showingShortcutPrompt = false
     @State private var showingMonoImporter = false
+    @State private var showingProgramPicker = false
     // True from the moment a guest is launched from this page until it stops,
     // so the "no guest" placeholder does not linger over a starting session.
     @State private var launched = false
@@ -613,6 +614,38 @@ struct ContainerDetailView: View {
                     Label("Run 64-bit DXMT cube", systemImage: "cube.fill")
                 }
                 .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                // The same launch as the cube above, for a program of the
+                // user's own. Started here it is the session's one translated
+                // process, with DXMT; started by double-clicking it in the
+                // file manager it would be a guest-created child, which runs
+                // on the interpreter without DXMT.
+                Button {
+                    showingProgramPicker = true
+                } label: {
+                    HStack {
+                        Label("Run program…", systemImage: "play.rectangle")
+                        if let name = lastProgramName {
+                            Spacer()
+                            Text(name)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                        }
+                    }
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                .sheet(isPresented: $showingProgramPicker) {
+                    X64ProgramPicker(
+                        container: container,
+                        lastProgramID: model.lastX64ProgramID(for: container),
+                        onRun: { program in
+                            showingProgramPicker = false
+                            save(); launched = true
+                            model.launchX64Program(program, in: container)
+                        },
+                        onCancel: { showingProgramPicker = false })
+                }
                 Picker("Resolution", selection: resolutionBinding) {
                     ForEach(resolutions, id: \.self) { Text($0) }
                     if !resolutions.contains(resolutionBinding.wrappedValue) {
@@ -729,6 +762,15 @@ struct ContainerDetailView: View {
         model.runtimeState == .stopping
     }
 
+    /// The file name of the program this container ran last, for the row's
+    /// trailing label. Nil until one has been run.
+    private var lastProgramName: String? {
+        guard let id = model.lastX64ProgramID(for: container) else { return nil }
+        let path = id.drop(while: { $0 != ":" }).dropFirst()
+        guard let name = path.split(separator: "/").last else { return nil }
+        return String(name)
+    }
+
     private var resolutionBinding: Binding<String> {
         Binding(
             get: { "\(container.width)x\(container.height)" },
@@ -757,6 +799,72 @@ struct ContainerDetailView: View {
                 ContainerLibrary.programs(in: current)
             }.value
             isScanning = false
+        }
+    }
+}
+
+/// Picks one program from the container's two 64-bit drives. The scan is the
+/// same recursive discovery the Programs section uses, run once per opening
+/// of the sheet and off the main thread: a container's C: drive can hold
+/// thousands of files.
+private struct X64ProgramPicker: View {
+    let container: WineContainer
+    let lastProgramID: String?
+    let onRun: (ContainerX64Program) -> Void
+    let onCancel: () -> Void
+
+    @State private var programs: [ContainerX64Program] = []
+    @State private var isScanning = true
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if isScanning {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Scanning C: and D:…")
+                    }
+                } else if programs.isEmpty {
+                    Text("No programs on C: or D:. Copy a folder into the "
+                         + "container's Files folder - it is D: inside the "
+                         + "guest - and open this again.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(programs) { program in
+                    Button {
+                        onRun(program)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(program.name)
+                                Text(program.location + " · "
+                                     + program.executable.architecture)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if program.id == lastProgramID {
+                                Spacer()
+                                Image(systemName: "clock.arrow.circlepath")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Run program")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { onCancel() }
+                }
+            }
+            .task {
+                let current = container
+                programs = await Task.detached(priority: .userInitiated) {
+                    ContainerLibrary.x64Programs(in: current)
+                }.value
+                isScanning = false
+            }
         }
     }
 }

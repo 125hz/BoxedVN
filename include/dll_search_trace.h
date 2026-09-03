@@ -26,7 +26,26 @@
 // Enough operations to cover a full module search -- the loader probes a
 // handful of directories and stats a few names in each -- and few enough that
 // the whole trace is a readable block in a device log rather than its bulk.
-#define K_DLL_SEARCH_TRACE_BUDGET 128
+//
+// 128 was sized for one module. A real program's import tree is dozens: a
+// device session in which the user's 64-bit program exited
+// STATUS_DLL_NOT_FOUND spent the whole budget on the first twelve imports and
+// went quiet forty operations before the one that failed, so the log named
+// every module that loaded and not the one that did not. At roughly 130 bytes
+// a line this is still under 150KB for a process that spends all of it, and
+// only a 64-bit launch arms the trace at all.
+#define K_DLL_SEARCH_TRACE_BUDGET 1024
+
+// A module name as it appears at the end of a search path. Wine's longest
+// builtin is well under this; a name that does not fit is not recorded rather
+// than truncated into something that names a different module.
+#define K_DLL_SEARCH_MODULE_NAME_MAX 64
+
+// How many distinct module names one process remembers. The loader
+// interleaves searches -- an import of an import is looked for in the middle
+// of its parent's search -- so a single slot would report a module that was
+// found moments later. Eight covers the interleaving every device log shows.
+#define K_DLL_SEARCH_MODULE_SLOTS 8
 
 #if defined(__cplusplus)
 #include <atomic>
@@ -65,6 +84,50 @@ inline bool dllSearchPathIsInteresting(const char* path) {
         }
     }
     return false;
+}
+
+// The module name a search path ends in, lowercased, or false when the path
+// does not name one. Only ".dll" counts: an import failure is always a DLL,
+// and the main image's own .exe is not an import.
+inline bool dllSearchModuleName(const char* path, char* out, std::size_t capacity) {
+    if (path == nullptr || out == nullptr || capacity == 0) {
+        return false;
+    }
+    std::size_t length = 0;
+    while (path[length] != 0) {
+        ++length;
+    }
+    if (length < 4) {
+        return false;
+    }
+    const char* suffix = path + (length - 4);
+    const char* dot = ".dll";
+    for (int i = 0; i < 4; ++i) {
+        char left = suffix[i];
+        if (left >= 'A' && left <= 'Z') {
+            left = (char)(left - 'A' + 'a');
+        }
+        if (left != dot[i]) {
+            return false;
+        }
+    }
+    std::size_t start = length;
+    while (start > 0 && path[start - 1] != '/' && path[start - 1] != '\\') {
+        --start;
+    }
+    const std::size_t nameLength = length - start;
+    if (nameLength == 0 || nameLength + 1 > capacity) {
+        return false;
+    }
+    for (std::size_t i = 0; i < nameLength; ++i) {
+        char c = path[start + i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+        out[i] = c;
+    }
+    out[nameLength] = 0;
+    return true;
 }
 
 // Armed once, for the whole emulator, by a 64-bit Wine launch. A 32-bit
@@ -121,8 +184,131 @@ public:
         return Decision::Silent;
     }
 
+    // Remembers whether the module a path names has been found yet. Called
+    // for every module-search operation, budget or no budget: the budget
+    // bounds what is *printed*, and the one thing a spent budget must not
+    // cost is the name of the module the search was for.
+    //
+    // `result` is the operation's return: negative means the path was not
+    // there. A module is "unresolved" until some path for that name comes
+    // back non-negative, because the loader stops at the first hit -- so the
+    // misses that precede it say nothing on their own.
+    void noteResult(const char* path, long long result) {
+        if (!dllSearchTraceEnabled()) {
+            return;
+        }
+        char name[K_DLL_SEARCH_MODULE_NAME_MAX];
+        if (!dllSearchModuleName(path, name, sizeof(name))) {
+            return;
+        }
+        Guard guard(lock);
+        Slot* slot = nullptr;
+        Slot* oldest = &slots[0];
+        for (Slot& candidate : slots) {
+            if (candidate.sequence != 0 && sameName(candidate.name, name)) {
+                slot = &candidate;
+                break;
+            }
+            if (candidate.sequence < oldest->sequence) {
+                oldest = &candidate;
+            }
+        }
+        if (slot == nullptr) {
+            slot = oldest;
+            slot->resolved = false;
+            std::size_t i = 0;
+            for (; name[i] != 0 && i + 1 < sizeof(slot->name); ++i) {
+                slot->name[i] = name[i];
+            }
+            slot->name[i] = 0;
+        }
+        slot->sequence = ++sequenceCounter;
+        if (result >= 0) {
+            slot->resolved = true;
+        }
+        ++probeCount;
+    }
+
+    // The module searched for most recently that no search path has yet
+    // produced. Empty when every module the loader looked for was found --
+    // which, at an exit that says otherwise, is itself worth reporting.
+    //
+    // Copies into the caller's buffer: the slot can be rewritten by another
+    // thread, and a diagnostic must not hand out a pointer into it.
+    void lastUnresolvedModule(char* out, std::size_t capacity) const {
+        if (out == nullptr || capacity == 0) {
+            return;
+        }
+        out[0] = 0;
+        Guard guard(lock);
+        const Slot* newest = nullptr;
+        for (const Slot& candidate : slots) {
+            if (candidate.sequence == 0 || candidate.resolved) {
+                continue;
+            }
+            if (newest == nullptr || candidate.sequence > newest->sequence) {
+                newest = &candidate;
+            }
+        }
+        if (newest == nullptr) {
+            return;
+        }
+        std::size_t i = 0;
+        for (; newest->name[i] != 0 && i + 1 < capacity; ++i) {
+            out[i] = newest->name[i];
+        }
+        out[i] = 0;
+    }
+
+    // How many module-search operations this process performed, whether or
+    // not they were reported. Says how much of the search the budget covered.
+    unsigned probes() const {
+        return probeCount.load(std::memory_order_relaxed);
+    }
+
 private:
+    struct Slot {
+        char name[K_DLL_SEARCH_MODULE_NAME_MAX] = {0};
+        bool resolved = false;
+        // 0 means the slot was never used; otherwise the order it was last
+        // touched in, so the oldest slot is the one to reuse.
+        unsigned long long sequence = 0;
+    };
+
+    // The loader searches under its own lock, so this is uncontended in
+    // practice; it exists so that a second thread reading the table during an
+    // exit dump sees whole names rather than half-written ones.
+    class Guard {
+    public:
+        explicit Guard(std::atomic<bool>& held) : held(held) {
+            bool expected = false;
+            while (!held.compare_exchange_weak(expected, true,
+                                               std::memory_order_acquire,
+                                               std::memory_order_relaxed)) {
+                expected = false;
+            }
+        }
+        ~Guard() { held.store(false, std::memory_order_release); }
+    private:
+        std::atomic<bool>& held;
+    };
+
+    static bool sameName(const char* left, const char* right) {
+        for (std::size_t i = 0;; ++i) {
+            if (left[i] != right[i]) {
+                return false;
+            }
+            if (left[i] == 0) {
+                return true;
+            }
+        }
+    }
+
     std::atomic<unsigned> budget {K_DLL_SEARCH_TRACE_BUDGET};
+    std::atomic<unsigned> probeCount {0};
+    mutable std::atomic<bool> lock {false};
+    Slot slots[K_DLL_SEARCH_MODULE_SLOTS];
+    unsigned long long sequenceCounter = 0;
 };
 
 } // namespace boxedvn

@@ -385,6 +385,9 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     if (request->workingDirectory != nullptr) {
         launch.workingDirectory = request->workingDirectory;
     }
+    if (request->dxmtModuleDirectory != nullptr) {
+        launch.dxmtModuleDirectory = request->dxmtModuleDirectory;
+    }
     for (size_t i = 0; i < request->argumentCount; ++i) {
         if (request->arguments != nullptr && request->arguments[i] != nullptr) {
             launch.arguments.emplace_back(request->arguments[i]);

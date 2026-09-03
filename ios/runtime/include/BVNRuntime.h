@@ -349,6 +349,13 @@ typedef struct {
     // Guest working directory, as a guest path.  May be NULL for the default.
     const char* workingDirectory;
 
+    // Guest directory the DXMT PE modules are staged in, projected over
+    // Wine's module root when useDXMT is set.  NULL takes them from
+    // workingDirectory, which is right only when the program being run is the
+    // one staged beside them; a program of the user's own runs with its own
+    // folder as the working directory and still needs the staged modules.
+    const char* dxmtModuleDirectory;
+
     // Emulated screen size.  Zero means Boxedwine's default of 800x600.
     uint32_t width;
     uint32_t height;
