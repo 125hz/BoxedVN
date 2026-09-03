@@ -167,6 +167,20 @@ jobs:
               exit 1
             }
           done
+          # 32-bit wined3d imports zlib1.dll. The amd64 package carries it in
+          # its PE tree; the i386 package did not on the device (the 32-bit
+          # probe died with STATUS_DLL_NOT_FOUND on it), so it is taken from
+          # the i686 mingw zlib package when the tree lacks it.
+          if [[ ! -s "${pe32_dir}/zlib1.dll" ]]; then
+            sudo apt-get install -y libz-mingw-w64
+            mingw_zlib="$(find /usr/i686-w64-mingw32 -name zlib1.dll -print -quit)"
+            test -s "${mingw_zlib}" || {
+              echo "i386-windows has no zlib1.dll and libz-mingw-w64 provides no i686 zlib1.dll" >&2
+              exit 1
+            }
+            cp "${mingw_zlib}" "${pe32_dir}/zlib1.dll"
+            echo "i386-windows/zlib1.dll supplied from ${mingw_zlib}"
+          fi
           echo "32-bit PE builtins: $(find "${pe32_dir}" -type f | wc -l)"
 
       - name: Build and validate Wine64 layers
