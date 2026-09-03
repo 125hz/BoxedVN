@@ -7265,3 +7265,45 @@ Wine's i386 uxtheme/opengl32 import libgcc_s_dw2-1.dll, which the 32-bit
 archive lacked; it is a required module now with a CI fallback from the mingw
 runtime. The Vulkan shim witness keyed on a define nothing set, so it always
 printed present=0; it now checks the staged file.
+
+## The 32-bit access violation was FEX reading its own CPU state through the guest alias
+
+With helpers alive, a 32-bit program faulted at a `ret` in Wine's i386
+kernelbase reading 0x79524e09d0, an address no 32-bit block can form. It is
+the low-alias image of that thread's own x87 slot: FEX's x87 stack pass was
+the one place that formed a host address into CPUState with
+_FormContextAddress and then dereferenced it with the guest memory ops
+_LoadMemFPR/_StoreMemFPR. Every guest operand this port emits is or'ed with
+the alias base, so the host pointer was translated as if it were a guest one.
+The slow path is only reached when an x87 value lives across a block
+boundary, which 64-bit Wine never does because it uses SSE for floating
+point. fex-boxedwine-x87-context-slot-access.patch replaces both accesses
+with the indexed context ops OpcodeDispatcher already uses for those slots,
+and the adapter gained BOXEDWINE_FEX64_GUEST_FAULT_CONTEXT_ALIAS so the next
+instance of the class is a lookup rather than an afternoon of arithmetic.
+
+## The interpreter can run WoW64 threads now
+
+A 32-bit program started from the desktop died on `int 0x80`, which CPU64 did
+not decode at all: Wine's ntdll installs the 32-bit TEB descriptor through the
+i386 gate in every WoW64 process, and only the translated process had that
+served (in the FEX adapter). The gate moved to source/kernel/legacysyscall64.cpp
+(set_thread_area, get_thread_area, modify_ldt, one ENOSYS report per unknown
+number) and both backends call it. CPU64 also gained int3/int imm8 as guest
+traps, push/pop FS/GS, and a real `mov fs, r/m16`: it had been decoding that
+instruction and discarding the operand, so a 32-bit thread on the interpreter
+addressed its TEB through whatever base arch_prctl last set.
+
+## The 64-bit Vulkan bridge marshals guest pointers
+
+A 32-bit Direct3D 9 program reached vkCreateInstance for the first time and
+killed the host inside MoltenVK: the dispatcher passed the guest
+VkInstanceCreateInfo straight to the driver, and Wine's top-down arena, where
+every thread stack lives, is not identity-mapped. The bridge now shadow-copies
+every input structure through a Marshal object with a generic pNext walker over
+a 154-entry sType table, writes output chains back, and returns a Vulkan error
+with a bad-pointer witness instead of dereferencing what it cannot translate.
+Unknown sTypes are dropped rather than guessed, and nodes carrying guest
+callbacks (debug utils, debug report, memory report) are dropped by name.
+Thirteen commands were added for the Direct3D 9 bootstrap path; the ABI is
+version 3. Command-buffer recording is still absent, which is the next wall.

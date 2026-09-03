@@ -657,54 +657,27 @@ static bool emulateLegacySyscall(BVNFEXCPU64Adapter* adapter,
     uint8_t opcode[2] = {0, 0};
     memory->memcpyFromGuest(opcode, cpu->rip, sizeof(opcode));
     if (opcode[0] != 0xcd || opcode[1] != 0x80) return false;
-    static std::atomic<uint32_t> reports {0};
-    const bool report = reports.fetch_add(1, std::memory_order_relaxed) < 32;
-    const uint32_t number = static_cast<uint32_t>(cpu->reg[X64_RAX].u64);
-    int64_t result = -38; // ENOSYS
-    if (number == 243) { // set_thread_area
-        const uint64_t descriptor = static_cast<uint32_t>(cpu->reg[X64_RBX].u64);
-        int32_t entry = static_cast<int32_t>(memory->readd(descriptor));
-        const uint32_t base = memory->readd(descriptor + 4);
-        const uint32_t limit = memory->readd(descriptor + 8);
-        const uint32_t flags = memory->readd(descriptor + 12);
-        // GDT_ENTRY_TLS_MIN..MAX: the three slots Linux hands to user space.
-        if (entry == -1) entry = 12;
-        if (entry < 12 || entry > 14 || entry >= K_GUEST_SEGMENT_TABLE_ENTRIES) {
-            result = -22; // EINVAL
-        } else {
-            const uint16_t selector = static_cast<uint16_t>((entry << 3) | 3);
-            FEXCore::Core::CPUState::gdt_segment* segment =
-                FEXCore::Core::CPUState::GetSegmentFromIndex(frame->State, selector);
-            *segment = {};
-            FEXCore::Core::CPUState::SetGDTBase(segment, base);
-            // The descriptor's limit field is 20 bits; the flag chooses the
-            // page granularity, as the kernel's fill_ldt does.
-            FEXCore::Core::CPUState::SetGDTLimit(segment, limit & 0xfffff);
-            segment->G = (flags >> 4) & 1;
-            segment->D = flags & 1;
-            segment->P = ((flags >> 5) & 1) ? 0 : 1;
-            segment->S = 1;
-            segment->DPL = 3;
-            segment->Type = 0x3; // data, read/write, accessed
-            memory->writed(descriptor, static_cast<uint32_t>(entry));
-            result = 0;
-        }
-        if (report) {
-            klog_fmt("BOXEDWINE_X64_LEGACY_SYSCALL pid=%d tid=%d nr=set_thread_area "
-                     "entry=%d base=0x%x limit=0x%x flags=0x%x result=%lld rip=0x%llx",
-                     adapter->process ? adapter->process->id : -1,
-                     adapter->thread ? adapter->thread->id : -1, entry, base, limit,
-                     flags, static_cast<long long>(result),
-                     static_cast<unsigned long long>(cpu->rip));
-        }
-    } else if (report) {
-        klog_fmt("BOXEDWINE_X64_LEGACY_SYSCALL pid=%d tid=%d nr=%u result=ENOSYS rip=0x%llx",
-                 adapter->process ? adapter->process->id : -1,
-                 adapter->thread ? adapter->thread->id : -1, number,
-                 static_cast<unsigned long long>(cpu->rip));
+    // The gate's semantics, the descriptor bookkeeping and the diagnostics live
+    // in source/kernel/legacysyscall64.cpp so the interpreter, which decodes
+    // this opcode itself, cannot answer it differently. eax is written there;
+    // only the translator's own descriptor table is published from here.
+    const boxedvn::LegacySyscallResult legacy =
+        boxedvn::kernelLegacySyscall64(cpu);
+    if (legacy.descriptorInstalled) {
+        FEXCore::Core::CPUState::gdt_segment* segment =
+            FEXCore::Core::CPUState::GetSegmentFromIndex(
+                frame->State, legacy.descriptor.selector);
+        *segment = {};
+        FEXCore::Core::CPUState::SetGDTBase(segment, legacy.descriptor.base);
+        FEXCore::Core::CPUState::SetGDTLimit(segment, legacy.descriptor.limit);
+        segment->G = legacy.descriptor.granularity ? 1 : 0;
+        segment->D = legacy.descriptor.defaultBig ? 1 : 0;
+        segment->P = legacy.descriptor.present ? 1 : 0;
+        segment->S = 1;
+        segment->DPL = 3;
+        segment->Type = 0x3; // data, read/write, accessed
     }
-    cpu->reg[X64_RAX].u64 = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(result)));
-    cpu->rip += 2;
+    cpu->rip += legacy.instructionLength;
     return true;
 }
 
@@ -1415,6 +1388,33 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      static_cast<unsigned>(frame->State.cs_idx),
                      static_cast<unsigned>(frame->State.ss_idx),
                      faultDecodeWidth, hex);
+            // A fault whose address, taken back through the alias, lands
+            // inside FEX's own CPU state is not a guest fault at all: it is
+            // translated code dereferencing a HOST context address as if it
+            // were a guest one, which the alias then moves into the reserved
+            // window. That is a whole bug class -- an IR pass forming a
+            // context address and handing it to a guest memory op -- and it
+            // reads as an ordinary wild pointer otherwise. The x87 stack
+            // pass's &State.mm[top] cost a full device run to attribute by
+            // hand; this names the offset so the next one is a lookup in
+            // CoreState.h. Fault path only, inside the existing budget.
+            const uint64_t unaliased = k64HostToGuestAddress(faultAddress);
+            const int64_t stateDelta =
+                static_cast<int64_t>(unaliased) -
+                static_cast<int64_t>(reinterpret_cast<uint64_t>(frame));
+            if (stateDelta >= -4096 && stateDelta < 65536) {
+                klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_CONTEXT_ALIAS pid=%d tid=%d "
+                         "fault=0x%llx unaliased=0x%llx frame=0x%llx "
+                         "state_offset=%lld thread=0x%llx",
+                         adapter->process->id, adapter->thread->id,
+                         static_cast<unsigned long long>(faultAddress),
+                         static_cast<unsigned long long>(unaliased),
+                         static_cast<unsigned long long>(
+                             reinterpret_cast<uint64_t>(frame)),
+                         static_cast<long long>(stateDelta),
+                         static_cast<unsigned long long>(
+                             reinterpret_cast<uint64_t>(adapter->fexThread)));
+            }
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_GPRS rax=0x%llx rcx=0x%llx rdx=0x%llx "
                      "rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx "
                      "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx "

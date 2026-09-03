@@ -12,10 +12,12 @@
  * It marshals nothing. Every entry point packs its arguments into an array of
  * 64-bit words and traps through the reserved syscall in
  * include/boxedwine_x64_vulkan_bridge.h; the host casts those words to the
- * real Vulkan types and calls MoltenVK with them. That is sound because the
- * bridge is served only to the identity-mapped process, where a guest address
- * is the host address, and because every Vulkan structure has the same layout
- * on x86-64 System V as on arm64 AAPCS64.
+ * real Vulkan types, copies every structure they point at into host-side
+ * shadows with the nested pointers translated, and calls MoltenVK with those.
+ * Keeping the marshal entirely on the host side is what lets this file stay
+ * free of Vulkan headers: it never has to know the shape of anything it
+ * passes, only that every Vulkan structure has the same layout on x86-64
+ * System V as on arm64 AAPCS64, which is what makes a byte copy sufficient.
  *
  * No Vulkan headers are required to build this file. Only the widths of the
  * scalars matter, and they are fixed by the Vulkan ABI: dispatchable handles
@@ -222,6 +224,9 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const void* pAllocat
 VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue)
 { BW_V(GetDeviceQueue, U(device), (uint64_t)queueFamilyIndex, (uint64_t)queueIndex, U(pQueue)); }
 
+VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice device, const void* pQueueInfo, VkQueue* pQueue)
+{ BW_V(GetDeviceQueue2, U(device), U(pQueueInfo), U(pQueue)); }
+
 VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice device)
 { BW_R(DeviceWaitIdle, U(device)); }
 
@@ -254,14 +259,38 @@ VKAPI_ATTR VkResult VKAPI_CALL vkInvalidateMappedMemoryRanges(VkDevice device, u
 VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, void* pMemoryRequirements)
 { BW_V(GetBufferMemoryRequirements, U(device), (uint64_t)buffer, U(pMemoryRequirements)); }
 
+VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements2(VkDevice device, const void* pInfo, void* pMemoryRequirements)
+{ BW_V(GetBufferMemoryRequirements2, U(device), U(pInfo), U(pMemoryRequirements)); }
+
 VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset)
 { BW_R(BindBufferMemory, U(device), (uint64_t)buffer, (uint64_t)memory, (uint64_t)memoryOffset); }
+
+VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory2(VkDevice device, uint32_t bindInfoCount, const void* pBindInfos)
+{ BW_R(BindBufferMemory2, U(device), (uint64_t)bindInfoCount, U(pBindInfos)); }
 
 VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(VkDevice device, VkImage image, void* pMemoryRequirements)
 { BW_V(GetImageMemoryRequirements, U(device), (uint64_t)image, U(pMemoryRequirements)); }
 
+VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements2(VkDevice device, const void* pInfo, void* pMemoryRequirements)
+{ BW_V(GetImageMemoryRequirements2, U(device), U(pInfo), U(pMemoryRequirements)); }
+
 VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset)
 { BW_R(BindImageMemory, U(device), (uint64_t)image, (uint64_t)memory, (uint64_t)memoryOffset); }
+
+VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(VkDevice device, uint32_t bindInfoCount, const void* pBindInfos)
+{ BW_R(BindImageMemory2, U(device), (uint64_t)bindInfoCount, U(pBindInfos)); }
+
+/* The external-object capability queries. DXVK runs all three before it
+ * chooses a memory type or a sharing mode; a NULL answer for any of them is
+ * read as a device it cannot use. */
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice, const void* pExternalBufferInfo, void* pExternalBufferProperties)
+{ BW_V(GetPhysicalDeviceExternalBufferProperties, U(physicalDevice), U(pExternalBufferInfo), U(pExternalBufferProperties)); }
+
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice physicalDevice, const void* pExternalSemaphoreInfo, void* pExternalSemaphoreProperties)
+{ BW_V(GetPhysicalDeviceExternalSemaphoreProperties, U(physicalDevice), U(pExternalSemaphoreInfo), U(pExternalSemaphoreProperties)); }
+
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physicalDevice, const void* pExternalFenceInfo, void* pExternalFenceProperties)
+{ BW_V(GetPhysicalDeviceExternalFenceProperties, U(physicalDevice), U(pExternalFenceInfo), U(pExternalFenceProperties)); }
 
 /* The extension Wine's WoW64 layer needs before it can hand a 32-bit caller a
  * mapped pointer: wine_vkAllocateMemory places host memory below 4 GiB itself
@@ -284,6 +313,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice device, const void* pCreat
 
 VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice device, VkImage image, const void* pAllocator)
 { BW_V(DestroyImage, U(device), (uint64_t)image, U(pAllocator)); }
+
+VKAPI_ATTR void VKAPI_CALL vkGetImageSubresourceLayout(VkDevice device, VkImage image, const void* pSubresource, void* pLayout)
+{ BW_V(GetImageSubresourceLayout, U(device), (uint64_t)image, U(pSubresource), U(pLayout)); }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice device, const void* pCreateInfo, const void* pAllocator, VkImageView* pView)
 { BW_R(CreateImageView, U(device), U(pCreateInfo), U(pAllocator), U(pView)); }
@@ -313,6 +345,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice device, const void* pC
 
 VKAPI_ATTR void VKAPI_CALL vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const void* pAllocator)
 { BW_V(DestroySemaphore, U(device), (uint64_t)semaphore, U(pAllocator)); }
+
+VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore, uint64_t* pValue)
+{ BW_R(GetSemaphoreCounterValue, U(device), (uint64_t)semaphore, U(pValue)); }
+
+VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice device, const void* pWaitInfo, uint64_t timeout)
+{ BW_R(WaitSemaphores, U(device), U(pWaitInfo), timeout); }
+
+VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphore(VkDevice device, const void* pSignalInfo)
+{ BW_R(SignalSemaphore, U(device), U(pSignalInfo)); }
 
 /* -- Surface and swapchain ------------------------------------------------- */
 
@@ -354,6 +395,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice device, VkSwapch
 
 VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
 { BW_R(AcquireNextImageKHR, U(device), (uint64_t)swapchain, timeout, (uint64_t)semaphore, (uint64_t)fence, U(pImageIndex)); }
+
+VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImage2KHR(VkDevice device, const void* pAcquireInfo, uint32_t* pImageIndex)
+{ BW_R(AcquireNextImage2KHR, U(device), U(pAcquireInfo), U(pImageIndex)); }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const void* pPresentInfo)
 { BW_R(QueuePresentKHR, U(queue), U(pPresentInfo)); }

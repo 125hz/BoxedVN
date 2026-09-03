@@ -516,6 +516,14 @@ void DevDsp::logFirstCall64(U32 request, const char* op, U64 arg, U32 value,
         return;
     }
     this->loggedRequests64[this->loggedRequestCount64++] = code;
+    if (result == -K_ENOTTY) {
+        // The one line to grep for when a 64-bit guest's audio stops at a
+        // request this device does not model. -ENOTTY is the only result that
+        // means "not modelled": every other refusal here is a deliberate
+        // answer to a request that IS modelled.
+        klog_fmt("BOXEDWINE_X64_OSS_IOCTL node=/dev/dsp nr=0x%x status=unimplemented",
+                 request);
+    }
     klog_fmt("BOXEDWINE_X64_DSP op=%s request=0x%x arg=0x%llx value=%u result=%d",
              op, request, (unsigned long long)arg, value, result);
 }
@@ -563,6 +571,10 @@ U32 DevDsp::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
     }
     this->lane64 = true;
     OssIoctlArg64 arg(memory, argAddress);
+    // The size the guest encoded in the request, which is what a structure
+    // answer has to be zeroed across. The 0x80000000 direction bit is
+    // _IOC_READ: it means the driver writes the argument back.
+    const U32 len = (request >> 16) & 0x3FFF;
     const bool write = (request & 0x80000000) != 0;
     const char* op = "unknown";
     U32 value = 0;
@@ -751,14 +763,28 @@ U32 DevDsp::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
         value = DSP_CAP_TRIGGER;
         arg.writed(0, value);
         break;
-    case 0x5010: // SNDCTL_DSP_SETTRIGGER
-        op = "SNDCTL_DSP_SETTRIGGER";
-        value = arg.readd(0);
+    case 0x5010:
+        // OSSv4 gives SETTRIGGER and GETTRIGGER the same ('P', 16) number and
+        // separates them by direction alone: __SIOW for the set, __SIOR for
+        // the get. Keying on the code alone answered a get with nothing.
+        if (write) {
+            op = "SNDCTL_DSP_GETTRIGGER";
+            value = PCM_ENABLE_OUTPUT;
+            arg.writed(0, value);
+        } else {
+            op = "SNDCTL_DSP_SETTRIGGER";
+            value = arg.readd(0);
+        }
         break;
-    case 0x5011: // SNDCTL_DSP_GETTRIGGER
-        op = "SNDCTL_DSP_GETTRIGGER";
-        value = PCM_ENABLE_OUTPUT;
-        arg.writed(0, value);
+    case 0x5011: // SNDCTL_DSP_GETIPTR
+        // ('P', 17) is GETIPTR and answers a count_info, not the int a
+        // trigger mask was being written into here. No capture engine is
+        // emulated, so all three counters are zero -- which is still three
+        // words the caller does not have to read back off its own stack.
+        op = "SNDCTL_DSP_GETIPTR";
+        arg.writed(0, 0);   // unsigned int bytes
+        arg.writed(4, 0);   // int blocks
+        arg.writed(8, 0);   // int ptr
         break;
     case 0x5012: { // SNDCTL_DSP_GETOPTR
         op = "SNDCTL_DSP_GETOPTR";
@@ -782,6 +808,83 @@ U32 DevDsp::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
         value = this->audio->getBufferSize();
         arg.writed(0, value);
         break;
+    case 0x5018: // SNDCTL_DSP_GETPLAYVOL / SNDCTL_DSP_SETPLAYVOL
+        // ('P', 24), one number for the get and the set again. Nothing
+        // attenuates this stream before the host voice, so both channels read
+        // full scale and a set is accepted and ignored -- the same answer
+        // /dev/mixer gives, and for the same reason: refusing makes a client
+        // treat the device as broken rather than as unattenuated.
+        op = "SNDCTL_DSP_PLAYVOL";
+        value = 100 | (100 << 8);
+        if (write) {
+            arg.writed(0, value);
+        }
+        break;
+    case 0x5019: // SNDCTL_DSP_GETERROR
+        // audio_errinfo: ten counters and filler[16]. The underruns this
+        // device counts are a running total for BOXEDWINE_X64_DSP_STATS, not
+        // the since-you-last-asked delta OSS specifies here, so reporting
+        // them would be a wrong number rather than a missing one. All zero
+        // means "nothing to report", which is what a client acts on.
+        op = "SNDCTL_DSP_GETERROR";
+        for (U32 i = 0; i < len / 4; i++) {
+            arg.writed(i * 4, 0);
+        }
+        break;
+    case 0x501E: // SNDCTL_DSP_COOKEDMODE
+        // ('P', 30). Everything here is cooked: writeNative converts to
+        // whatever the host voice accepts. Accept the request and change
+        // nothing rather than fail a client asking for the mode it has.
+        op = "SNDCTL_DSP_COOKEDMODE";
+        value = arg.readd(0);
+        break;
+    case 0x5021: // SNDCTL_DSP_HALT_INPUT
+        // No capture engine exists, so there is nothing to halt.
+        op = "SNDCTL_DSP_HALT_INPUT";
+        break;
+    case 0x5022: // SNDCTL_DSP_HALT_OUTPUT
+        // The output half of ('P', 0) SNDCTL_DSP_HALT, which OSSv4 also
+        // spells SNDCTL_DSP_RESET and which is handled at the top.
+        op = "SNDCTL_DSP_HALT_OUTPUT";
+        this->audio->closeAudio();
+        break;
+    case 0x5023: // SNDCTL_DSP_CURRENT_IPTR
+        // oss_count_t: long long samples, int fifo_samples, int filler[32].
+        op = "SNDCTL_DSP_CURRENT_IPTR";
+        arg.writed(0, 0);   // samples, low half
+        arg.writed(4, 0);   // samples, high half
+        arg.writed(8, 0);   // fifo_samples
+        break;
+    case 0x5024: { // SNDCTL_DSP_CURRENT_OPTR
+        op = "SNDCTL_DSP_CURRENT_OPTR";
+        const U32 frameSize = this->bytesPerFrame();
+        const U64 samples = frameSize ? this->statsTotalBytes64 / frameSize : 0;
+        arg.writed(0, (U32)samples);          // samples, low half
+        arg.writed(4, (U32)(samples >> 32));  // samples, high half
+        arg.writed(8, frameSize
+                       ? this->audio->getBufferSize() / frameSize
+                       : 0);                  // fifo_samples
+        value = (U32)samples;
+        break;
+    }
+    case 0x502D: // SNDCTL_DSP_POLICY
+        // ('P', 45) is a hint about how eagerly the driver should refill.
+        // The fragment size is already whatever SETFRAGMENT and the host
+        // device settled on, so there is nothing a policy can tune here.
+        op = "SNDCTL_DSP_POLICY";
+        value = arg.readd(0);
+        break;
+    case 0x5801: // SNDCTL_SYSINFO
+        // OSSv4 answers this on any OSS node, not only on /dev/mixer. Wine
+        // asks /dev/mixer, but a client that asks the dsp node should not be
+        // told the system has no sound at all.
+        op = "SNDCTL_SYSINFO";
+        if (!write) {
+            result = -K_EINVAL;
+            break;
+        }
+        ossWriteSysInfo(arg, len);
+        break;
     case 0x580C: // SNDCTL_ENGINEINFO
         op = "SNDCTL_ENGINEINFO";
         if (!write) {
@@ -793,8 +896,10 @@ U32 DevDsp::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
                           1, 2, "/dev/dsp");
         break;
     default:
+        // -ENOTTY, not -ENODEV: syscall64.cpp falls through to its own
+        // FIONBIO/FIONREAD handling on -ENOTTY and gives up on anything else.
         result = -K_ENOTTY;
-        op = "unhandled";
+        op = "unimplemented";
         break;
     }
     this->logFirstCall64(request, op, argAddress, value, result);

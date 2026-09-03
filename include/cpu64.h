@@ -14,6 +14,7 @@
 
 #include "bounded_syscall_report.h"
 #include "guest_segment_table.h"
+#include "legacysyscall64.h"
 #include "reg64.h"
 #include <memory>
 #include "../source/emulation/cpu/common/fpu.h"
@@ -91,6 +92,20 @@ public:
         bool valid = false;
     };
     Segments seg;
+
+    // The descriptors this thread installed through the legacy i386 `int 0x80`
+    // gate (set_thread_area / modify_ldt), indexed the way a selector indexes a
+    // descriptor table: selector >> 3. One array for both tables, because the
+    // translator's own thread state mirrors the LDT onto the GDT array and
+    // indexes both the same way -- a WoW64 thread must find the same base
+    // whichever backend it is running on.
+    //
+    // This is where a `mov fs, r/m16` gets its base from. Wine's WoW64 setup
+    // installs the 32-bit TEB descriptor through the gate and then loads FS
+    // with the selector the gate handed back, so an empty table here means a
+    // 32-bit thread addressing its TEB through a zero base.
+    boxedvn::LegacyThreadAreaDescriptor
+        threadAreaDescriptors[K_GUEST_SEGMENT_TABLE_ENTRIES] = {};
 
     // XMM register state. 16 × 128-bit slots, accessed as two U64 halves.
     // SSE2 is the minimum baseline for x86-64; glibc memcpy/memset, the
@@ -273,6 +288,14 @@ public:
 
     void push64(U64 value);
     U64  pop64();
+
+    // Load FS or GS with a selector, the way `mov fs, r/m16` and `pop fs` do:
+    // the selector is recorded and the segment base is taken from the
+    // descriptor the selector indexes. Wine's WoW64 layer installs that
+    // descriptor through the legacy gate and then executes exactly these two
+    // instructions, so the base has to come from the descriptor rather than
+    // staying at whatever arch_prctl last set. `fs` false means GS.
+    void loadSegmentSelector(bool fs, U16 selector);
 
 private:
     U32 step();

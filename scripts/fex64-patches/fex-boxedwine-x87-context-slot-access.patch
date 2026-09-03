@@ -1,0 +1,129 @@
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -36,6 +36,12 @@
+   return static_cast<uint32_t>(offsetof(Core::CPUState, mm[0][0]));
+ }
+ 
++// Distance between two x87/MMX slots in the context, which is also the stride
++// the indexed context accesses to them are emitted with.
++inline uint32_t MMStride() {
++  return static_cast<uint32_t>(Core::CPUState::MM_REG_SIZE);
++}
++
+ // Similar helper to the one in OpcodeDispatcher.h except we do not
+ // need to handle flags, etc.
+ template<typename T>
+@@ -285,7 +291,6 @@
+   // Top Cache Management
+   Ref GetTopWithCache_Slow();
+   Ref GetOffsetTopWithCache_Slow(uint8_t Offset, bool Reverse = false);
+-  Ref GetOffsetTopAddressWithCache_Slow(uint8_t Offset);
+   void SetTopWithCache_Slow(Ref Value);
+   Ref GetX87ValidTag_Slow(uint8_t Offset);
+   // Resets fields to initial values
+@@ -346,7 +351,6 @@
+ 
+   Ref FTWCached {};
+   std::array<Ref, 8> TopOffsetCache {};
+-  std::array<Ref, 8> TopOffsetAddressCache {};
+   std::array<Ref, 8> TopValueCache {};
+   std::array<StackSlot, 8> TopValidCache {};
+ 
+@@ -373,7 +377,6 @@
+   FlushCachedRegs();
+   FTWCached = {};
+   TopOffsetCache.fill(nullptr);
+-  TopOffsetAddressCache.fill(nullptr);
+   TopValueCache.fill(nullptr);
+   TopValidCache.fill(StackSlot::UNUSED);
+ }
+@@ -432,17 +435,6 @@
+   return OffsetTop;
+ }
+ 
+-inline Ref X87StackOptimization::GetOffsetTopAddressWithCache_Slow(uint8_t Offset) {
+-  if (TopOffsetAddressCache[Offset]) {
+-    return TopOffsetAddressCache[Offset];
+-  }
+-
+-  Ref OffsetRef = GetOffsetTopWithCache_Slow(Offset);
+-  TopOffsetAddressCache[Offset] = IREmit->_FormContextAddress(OpSize::i64Bit, OffsetRef, 16);
+-
+-  return TopOffsetAddressCache[Offset];
+-}
+-
+ inline void X87StackOptimization::SetTopWithCache_Slow(Ref Value) {
+   InvalidateCachedRegs();
+   TopOffsetCache[0] = Value;
+@@ -471,10 +463,11 @@
+ }
+ 
+ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
+-  OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(Offset);
+   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+   if (!TopValueCache[Offset]) {
+-    TopValueCache[Offset] = IREmit->_LoadMemFPR(Size, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
++    // BoxedWine: an indexed CONTEXT load, not a guest memory load. The note on
++    // the matching store in FlushCachedRegs has the reasoning.
++    TopValueCache[Offset] = IREmit->_LoadContextFPRIndexed(GetOffsetTopWithCache_Slow(Offset), Size, MMBaseOffset(), MMStride());
+   }
+   return TopValueCache[Offset];
+ }
+@@ -579,7 +572,6 @@
+   // Pop the top of the x87 stack
+   GetOffsetTopWithCache_Slow(1);
+   std::rotate(TopOffsetCache.begin(), std::next(TopOffsetCache.begin()), TopOffsetCache.end());
+-  std::rotate(TopOffsetAddressCache.begin(), std::next(TopOffsetAddressCache.begin()), TopOffsetAddressCache.end());
+   std::rotate(TopValueCache.begin(), std::next(TopValueCache.begin()), TopValueCache.end());
+   std::rotate(FlushValuesPending.begin(), std::next(FlushValuesPending.begin()), FlushValuesPending.end());
+   std::rotate(TopValidCache.begin(), std::next(TopValidCache.begin()), TopValidCache.end());
+@@ -590,7 +582,6 @@
+   // Pop the top of the x87 stack
+   GetOffsetTopWithCache_Slow(1, true);
+   std::rotate(TopOffsetCache.begin(), std::prev(TopOffsetCache.end()), TopOffsetCache.end());
+-  std::rotate(TopOffsetAddressCache.begin(), std::prev(TopOffsetAddressCache.end()), TopOffsetAddressCache.end());
+   std::rotate(TopValueCache.begin(), std::prev(TopValueCache.end()), TopValueCache.end());
+   std::rotate(FlushValuesPending.begin(), std::prev(FlushValuesPending.end()), FlushValuesPending.end());
+   std::rotate(TopValidCache.begin(), std::prev(TopValidCache.end()), TopValidCache.end());
+@@ -606,9 +597,37 @@
+   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
+     if (FlushValuesPending[i]) {
+-      OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
+-      IREmit->_StoreMemFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
+-      // store
++      /* BoxedWine: the x87 register file is CONTEXT, so reach it with a
++       * context access.
++       *
++       * This pass was the one place in FEX that forms a host address into
++       * CPUState with _FormContextAddress and then dereferences it with the
++       * GUEST memory ops _LoadMemFPR/_StoreMemFPR. That is exactly what
++       * IR.json documents the op for, and it is right wherever the guest and
++       * the host share an address space -- but this port does not share one.
++       * Every guest memory operand the ARM64 backend emits is translated at
++       * the dereference boundary (`orr` with the low-alias base), so the host
++       * address of State.mm[] was translated as if it were a guest address
++       * and the access landed in the reserved alias window.
++       *
++       * Device evidence, revision e9b6924f: a 32-bit block faulted reading
++       * 0x79524e09d0, which is the alias of that thread's own
++       * &State.mm[7][0] -- InternalThreadState at 0x1524e0000, BaseFrameState
++       * at +0x540, offsetof(CPUState, mm) 0x420, slot 7 at +0x70 -- with a
++       * host PC inside translated code and no FEX-generated exception. The
++       * 64-bit side never reached it because Wine's x86-64 code uses SSE for
++       * floating point; 32-bit Windows code uses the x87 stack, and this slow
++       * path is what a stack value living across a block boundary takes.
++       *
++       * _LoadContextFPRIndexed/_StoreContextFPRIndexed name the same slot --
++       * base offsetof(CPUState, mm), stride 16, indexed by the same top
++       * offset -- and are what OpcodeDispatcher/X87.cpp already uses for it.
++       * The backend lowers them off the STATE register, which is a host
++       * pointer and is never translated. Same instructions on a host with no
++       * alias armed; the only thing given up is reuse of one formed address
++       * across two accesses at the same offset, which is why the address
++       * cache goes with it. */
++      IREmit->_StoreContextFPRIndexed(TopValueCache[i], GetOffsetTopWithCache_Slow(i), Size, MMBaseOffset(), MMStride());
+       FlushValuesPending[i] = false;
+     }
+   }

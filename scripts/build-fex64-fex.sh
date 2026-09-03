@@ -212,6 +212,15 @@ apply_patch fex-boxedwine-wow64-entry-witness.patch
 # null critical section. The store now takes its width from the same operand
 # size the push used.
 apply_patch fex-boxedwine-call-return-push-width.patch
+# Depends on the alias patch above, whose translation it keeps off a host
+# address. The x87 stack pass is the one place in FEX that forms a host
+# address into CPUState with _FormContextAddress and then dereferences it with
+# the GUEST memory ops, so the alias translated &State.mm[top] as if it were a
+# guest address: a 32-bit block reading its own x87 stack faulted at the alias
+# of that slot. It now reaches the slot with the indexed CONTEXT accesses the
+# rest of FEX already uses for it, which are lowered off the STATE register
+# and are never translated.
+apply_patch fex-boxedwine-x87-context-slot-access.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

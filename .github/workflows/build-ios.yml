@@ -207,10 +207,10 @@ jobs:
           echo "32-bit PE builtins: $(find "${pe32_dir}" -type f | wc -l)"
 
       # Wine's OSS audio driver, which Ubuntu does not build: its configure
-      # gates dlls/wineoss.drv on <sys/soundcard.h>, so the package carries
-      # winealsa and winepulse instead -- and neither can work in BoxedWine,
-      # which emulates /dev/dsp and /dev/mixer but no PulseAudio socket and no
-      # /dev/snd. See docs/PLAN_X64_AUDIO.md.
+      # gates dlls/wineoss.drv on an OSSv4 <sys/soundcard.h>, so the package
+      # carries winealsa and winepulse instead -- and neither can work in
+      # BoxedWine, which emulates /dev/dsp and /dev/mixer but no PulseAudio
+      # socket and no /dev/snd. See docs/PLAN_X64_AUDIO.md.
       #
       # Non-fatal on purpose. This builds Wine from source against the same
       # upstream version as the installed amd64 package, and that build has
@@ -219,7 +219,12 @@ jobs:
       # runtime builder is told about the driver only when both halves exist,
       # and scripts/validate-wine64-runtime.sh names the absence either way.
       # Arm the hard gate (BOXEDVN_REQUIRE_WINE64_OSS=1 on the validate step)
-      # once a run here has been seen to succeed.
+      # once a run here has been seen to succeed. It is still DISARMED: the
+      # two reasons the step could never have succeeded are fixed (the OSSv4
+      # header is now installed, and the post-configure check no longer greps
+      # for a HAVE_SYS_SOUNDCARD_H that Wine 9.0 never defines), but a Wine
+      # build from source has still never completed in this workflow, so the
+      # gate stays off until one has.
       - name: Build Wine's OSS audio driver
         id: wineoss
         continue-on-error: true
@@ -231,8 +236,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # oss4-dev is the OSSv4 header, and it is the whole reason this step
+          # used to fail on its first check. linux-libc-dev's
+          # <linux/soundcard.h> is OSSv3: it has the SNDCTL_DSP_* ioctls and
+          # none of oss_sysinfo, oss_audioinfo, SNDCTL_SYSINFO,
+          # SNDCTL_AUDIOINFO or SNDCTL_ENGINEINFO, which are exactly what
+          # dlls/wineoss.drv enumerates devices with. oss4-dev (universe)
+          # installs the real OSSv4 header AS /usr/include/linux/soundcard.h
+          # and dpkg-diverts the kernel's copy to soundcard.h.oss3 in its
+          # preinst, so the two packages coexist and no other build on this
+          # runner loses a header it was using.
           sudo apt-get install --yes --no-install-recommends \
-            gcc-mingw-w64-x86-64 flex bison linux-libc-dev
+            gcc-mingw-w64-x86-64 flex bison linux-libc-dev oss4-dev
           # Ubuntu's package version carries an epoch and a packaging suffix;
           # Wine's own release tarball is named for the upstream version
           # alone. "1:9.0~repack-4build3" is upstream "9.0".

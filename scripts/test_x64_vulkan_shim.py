@@ -13,6 +13,11 @@ A mismatch in any of them is either a command the guest can call and the host
 answers BADOP for, or a command the host carries and nothing can reach. None
 of that shows up until a device run, and it shows up as silence. These tests
 hold the four together without a compiler, a Vulkan SDK or a Wine install.
+
+A fifth file joins them for the marshal: source/vulkan/vk/vulkan_core.h, whose
+structures the dispatcher's extensible-structure table names. A typo there is a
+build failure rather than silence, but the table also has to keep covering the
+structures the D3D9 bootstrap actually carries, and nothing but a test says so.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ IMPORTS = SHIM_DIR / "winex11-vulkan-imports.txt"
 BRIDGE_HEADER = REPO / "include" / "boxedwine_x64_vulkan_bridge.h"
 VKDEF = REPO / "source" / "vulkan" / "vkdef.h"
 DISPATCHER = REPO / "source" / "vulkan" / "vulkanbridge64.cpp"
+VULKAN_CORE = REPO / "source" / "vulkan" / "vk" / "vulkan_core.h"
 BUILD_SCRIPT = REPO / "scripts" / "build-boxedwine-x64-vulkan.sh"
 
 _spec = importlib.util.spec_from_file_location(
@@ -45,6 +51,8 @@ SHIM_DEF_RE = re.compile(
     r"^VKAPI_ATTR\s+[\w\*\s]+?VKAPI_CALL\s+(vk\w+)\s*\(", re.MULTILINE)
 VKDEF_RE = re.compile(r"^#define\s+(\w+)\s+(\d+)\s*$", re.MULTILINE)
 CASE_RE = re.compile(r"^\s*case VKB_(\w+):", re.MULTILINE)
+CHAIN_RE = re.compile(
+    r"^\s*X\((VK_STRUCTURE_TYPE_\w+),\s*(\w+)\)\s*\\?\s*$", re.MULTILINE)
 
 
 def bridge_commands() -> dict[str, int]:
@@ -62,6 +70,29 @@ def shim_definitions() -> set[str]:
 
 def dispatcher_cases() -> set[str]:
     return set(CASE_RE.findall(DISPATCHER.read_text(encoding="utf-8")))
+
+
+def chain_structs() -> list[tuple[str, str]]:
+    """The dispatcher's extensible-structure table, as (sType, struct) pairs."""
+    text = DISPATCHER.read_text(encoding="utf-8")
+    start = text.index("#define BOXEDWINE_X64_VK_CHAIN_STRUCTS(X)")
+    end = text.index("struct ChainStructInfo", start)
+    return CHAIN_RE.findall(text[start:end])
+
+
+def vulkan_structure_types() -> set[str]:
+    return set(re.findall(r"\b(VK_STRUCTURE_TYPE_\w+)\s*=",
+                          VULKAN_CORE.read_text(encoding="utf-8")))
+
+
+def vulkan_struct_names() -> set[str]:
+    """Every structure name vulkan_core.h defines, including the alias
+    typedefs a promoted extension leaves behind (VkPhysicalDeviceXFeaturesEXT
+    for VkPhysicalDeviceXFeatures, which sizeof still resolves through)."""
+    text = VULKAN_CORE.read_text(encoding="utf-8")
+    names = set(re.findall(r"\}\s*(Vk\w+);", text))
+    names |= set(re.findall(r"^typedef\s+Vk\w+\s+(Vk\w+);", text, re.MULTILINE))
+    return names
 
 
 class CommandTableContract(unittest.TestCase):
@@ -187,6 +218,177 @@ class HostDispatcherContract(unittest.TestCase):
         self.assertIn("BOXEDWINE_X64_VK_ALIASES(VKB_ALIAS_FILL)", source)
         self.assertIn("commandIndexForAlias", source)
         self.assertIn("gCommandAlias[index]", source)
+
+
+class MarshalContract(unittest.TestCase):
+    """The dispatcher copies every structure that crosses the bridge instead of
+    handing MoltenVK the guest's own pointers.
+
+    The lane's native map is the identity only for the high lane: canonical low
+    addresses are served through an alias and Wine's top-down arena -- where
+    every thread stack lives, and where DXVK therefore builds its create-infos
+    -- is served from a relocated host block. An earlier revision passed the
+    guest pointers straight through and MoltenVK followed a
+    VkInstanceCreateInfo at a 0x7ffffe... stack address into unmapped host
+    memory. These tests hold the marshal in place.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+        self.pairs = chain_structs()
+
+    def test_no_guest_pointer_is_cast_straight_to_a_vulkan_structure(self) -> None:
+        # The shape of the bug: `(const VkInstanceCreateInfo*)CP(1)`, a guest
+        # address reinterpreted as a host one. Only Vulkan HANDLES, which are
+        # values the driver itself handed out, may come through untranslated,
+        # and the dispatcher spells that H(n).
+        for macro in ("#define P(n)", "#define CP(n)"):
+            with self.subTest(macro=macro):
+                self.assertNotIn(macro, self.source)
+        stray = re.findall(r"\(const Vk\w+\*\)\s*(?:CP|P)\(", self.source)
+        self.assertEqual(stray, [])
+
+    def test_a_pointer_that_cannot_be_translated_is_a_vulkan_error(self) -> None:
+        self.assertIn("status=bad-pointer", self.source)
+        self.assertIn("VK_ERROR_INITIALIZATION_FAILED", self.source)
+        self.assertIn("VK_ERROR_UNKNOWN", self.source)
+
+    def test_the_translation_uses_the_shared_alias_contract(self) -> None:
+        # The same arithmetic the ARM64 translator emits, not a second copy of
+        # it: include/guest_low_alias.h is the one definition both use.
+        self.assertIn('#include "guest_low_alias.h"', self.source)
+        self.assertIn("boxedvn::guestToHostAddress", self.source)
+        self.assertIn("boxedvn::guestRangeHostable", self.source)
+        # vkMapMemory hands a host address back; a guest can only hold the
+        # canonical form of it.
+        self.assertIn("boxedvn::hostToGuestAddress", self.source)
+
+    def test_every_chain_structure_is_a_real_vulkan_structure(self) -> None:
+        types = vulkan_structure_types()
+        structs = vulkan_struct_names()
+        for stype, struct in self.pairs:
+            with self.subTest(stype=stype):
+                self.assertIn(stype, types,
+                              f"{stype} is not an sType vulkan_core.h defines")
+                self.assertIn(struct, structs,
+                              f"{struct} is not a structure vulkan_core.h defines")
+
+    def test_no_structure_type_is_listed_twice(self) -> None:
+        seen = [stype for stype, _struct in self.pairs]
+        duplicates = sorted({name for name in seen if seen.count(name) > 1})
+        self.assertEqual(duplicates, [],
+                         f"listed more than once: {duplicates}")
+
+    def test_the_d3d9_bootstrap_structures_are_all_covered(self) -> None:
+        # A structure absent from the table is dropped from its chain, which
+        # for any of these means DXVK is told something it did not ask about.
+        listed = {stype for stype, _struct in self.pairs}
+        for stype in (
+                "VK_STRUCTURE_TYPE_APPLICATION_INFO",
+                "VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2",
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2",
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2",
+                "VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO",
+                "VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT",
+                "VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT",
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT",
+                "VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_SUBMIT_INFO",
+                "VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR",
+                "VK_STRUCTURE_TYPE_PRESENT_INFO_KHR",
+                "VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR",
+                "VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR",
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR"):
+            with self.subTest(stype=stype):
+                self.assertIn(stype, listed)
+
+    def test_a_node_carrying_a_guest_callback_is_dropped_not_forwarded(self) -> None:
+        # pfnUserCallback is x86-64 code; the host is arm64 and cannot call it.
+        # DXVK attaches this node to its VkInstanceCreateInfo whenever
+        # validation is on, so it is on the ordinary startup path.
+        listed = {stype for stype, _struct in self.pairs}
+        callbacks = (
+            "VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT",
+            "VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT",
+            "VK_STRUCTURE_TYPE_DEVICE_DEVICE_MEMORY_REPORT_CREATE_INFO_EXT")
+        callback_body = self.source[
+            self.source.index("bool nodeCarriesGuestCallback("):
+            self.source.index("// ---- The marshal ---")]
+        for stype in callbacks:
+            with self.subTest(stype=stype):
+                self.assertNotIn(stype, listed,
+                                 f"{stype} must not be copyable; it holds a "
+                                 "guest function pointer")
+                self.assertIn(stype, callback_body)
+
+    def test_an_unknown_chain_node_is_named_rather_than_followed(self) -> None:
+        self.assertIn("status=dropped-chain", self.source)
+        self.assertIn("unknown-stype", self.source)
+        self.assertIn("guest-callback", self.source)
+
+    def test_the_allocation_callbacks_rule_survived_the_rewrite(self) -> None:
+        # Same rule as before the marshal, restated against the new call
+        # sites: a VkAllocationCallbacks holds guest function pointers.
+        self.assertNotIn("VkAllocationCallbacks", self.source)
+
+
+class NewCommandContract(unittest.TestCase):
+    """The commands the marshal work added, and the ABI bump that names them."""
+
+    def setUp(self) -> None:
+        self.commands = bridge_commands()
+
+    def test_the_memory_and_sync_commands_dxvk_needs_are_present(self) -> None:
+        for name in ("GetBufferMemoryRequirements2", "GetImageMemoryRequirements2",
+                     "BindBufferMemory2", "BindImageMemory2",
+                     "GetPhysicalDeviceExternalBufferProperties",
+                     "GetPhysicalDeviceExternalSemaphoreProperties",
+                     "GetPhysicalDeviceExternalFenceProperties",
+                     "GetDeviceQueue2", "GetImageSubresourceLayout",
+                     "GetSemaphoreCounterValue", "WaitSemaphores",
+                     "SignalSemaphore", "AcquireNextImage2KHR"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_the_whole_swapchain_path_is_dispatchable(self) -> None:
+        for name in ("CreateSwapchainKHR", "GetSwapchainImagesKHR",
+                     "AcquireNextImageKHR", "QueuePresentKHR", "MapMemory",
+                     "UnmapMemory", "FlushMappedMemoryRanges",
+                     "InvalidateMappedMemoryRanges"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_every_promoted_command_carries_its_khr_spelling(self) -> None:
+        # A caller on a 1.0 instance asks for the KHR name; a NULL answer is
+        # how DXVK concludes the driver cannot do it at all.
+        aliases = validator.read_bridge_aliases(BRIDGE_HEADER)
+        for alias, core in (
+                ("GetBufferMemoryRequirements2KHR", "GetBufferMemoryRequirements2"),
+                ("GetImageMemoryRequirements2KHR", "GetImageMemoryRequirements2"),
+                ("BindBufferMemory2KHR", "BindBufferMemory2"),
+                ("BindImageMemory2KHR", "BindImageMemory2"),
+                ("GetPhysicalDeviceExternalBufferPropertiesKHR",
+                 "GetPhysicalDeviceExternalBufferProperties"),
+                ("GetSemaphoreCounterValueKHR", "GetSemaphoreCounterValue"),
+                ("WaitSemaphoresKHR", "WaitSemaphores"),
+                ("SignalSemaphoreKHR", "SignalSemaphore")):
+            with self.subTest(alias=alias):
+                self.assertEqual(aliases.get(alias), core)
+
+    def test_the_abi_version_was_bumped_for_the_marshal(self) -> None:
+        # A container holding a shim built against version 2 has no entry
+        # point for the commands version 3 added, and answering NULL for them
+        # reads as a driver limitation rather than a stale container. The
+        # shim's own check turns the mismatch into a named refusal.
+        text = BRIDGE_HEADER.read_text(encoding="utf-8")
+        version = int(re.search(
+            r"#define BOXEDWINE_X64_VK_ABI_VERSION\s+(\d+)U", text).group(1))
+        self.assertGreaterEqual(version, 3)
 
 
 class ImportContract(unittest.TestCase):

@@ -412,11 +412,87 @@ the damage; the walk now follows `oss.h` field for field.
 the upstream Wine tarball matching the installed package's version, supplying
 the `<sys/soundcard.h>` Ubuntu lacks as the one-line wrapper over
 `<linux/soundcard.h>` that glibc used to ship -- and *checking*, by compiling a
-probe, that the kernel header still declares `oss_sysinfo`, `oss_audioinfo`,
-`SNDCTL_SYSINFO`, `SNDCTL_AUDIOINFO` and `SNDCTL_ENGINEINFO` before configuring
-anything. `--oss-driver-dir` stages the result;
+probe, that the header behind it really declares `oss_sysinfo`,
+`oss_audioinfo`, `SNDCTL_SYSINFO`, `SNDCTL_AUDIOINFO` and `SNDCTL_ENGINEINFO`
+before configuring anything. `--oss-driver-dir` stages the result;
 `.github/workflows/build-ios.yml` runs the driver build as a non-fatal step and
 passes the directory on only when both halves exist.
+
+**§5.2, two bugs that made the step unbuildable.** The first CI run of that
+step (`33802614807`) stopped at the probe, and reading why turned up a second
+failure waiting behind it. Both are fixed.
+
+- **`<linux/soundcard.h>` is OSSv3, not OSSv4.** The script's premise was that
+  the kernel header `linux-libc-dev` installs *is* the OSSv4 header. It is
+  not. It carries the `SNDCTL_DSP_*` ioctls and nothing else: no
+  `oss_sysinfo`, no `oss_audioinfo`, no `SNDCTL_SYSINFO`, `SNDCTL_AUDIOINFO`
+  or `SNDCTL_ENGINEINFO`. Those come from the OSS4 project's own
+  `<sys/soundcard.h>`, and they are precisely the interface
+  `dlls/wineoss.drv/oss.c` enumerates devices with, so the probe was right to
+  fail -- it was the premise that was wrong. Ubuntu noble does package the
+  real header, as **`oss4-dev`** (universe, `4.2-build2020-1ubuntu3`). It
+  installs it *as* `/usr/include/linux/soundcard.h` and `dpkg-divert`s the
+  kernel's copy to `soundcard.h.oss3` in its `preinst`, so it coexists with
+  `linux-libc-dev` rather than conflicting with it, and the existing
+  `sys/soundcard.h` wrapper needs no change to find it. The workflow step now
+  installs it. `--oss-include-dir` covers a host that has a real
+  `<sys/soundcard.h>` somewhere else, such as an OSS4 install under
+  `/usr/lib/oss/include` -- which is, not coincidentally, the directory Wine's
+  own `configure` adds to `CPPFLAGS` while probing.
+- **The post-`configure` check grepped for a define Wine never emits.** It
+  looked for `HAVE_SYS_SOUNDCARD_H` in `include/config.h`. Wine 9.0's
+  `configure.ac` reaches the header through
+  `AC_CHECK_HEADER([sys/soundcard.h], [ACTION-IF-FOUND])`, and supplying an
+  action *replaces* autoconf's default action -- the one that would have
+  defined that name. `include/config.h.in` has no such entry at all, so the
+  grep would have failed on every tree, with or without a header, and killed
+  the step immediately after a `configure` that had actually succeeded. The
+  check now greps `HAVE_OSS_SYSINFO_NUMAUDIOENGINES`, which is what
+  `AC_CHECK_MEMBERS([oss_sysinfo.numaudioengines])` records and is the real
+  OSSv4 gate: `WINE_NOTICE_WITH` turns `enable_wineoss_drv` off when it fails.
+
+The probe was widened at the same time, from the five enumeration names to the
+whole set the driver compiles against -- `audio_buf_info`, `count_info`,
+`struct synth_info`, `struct midi_info` and `struct sbi_instrument` for
+`ossmidi.c` and `midipatch.c`, the `SNDCTL_SEQ_*`/`SNDCTL_SYNTH_INFO`/
+`SNDCTL_MIDI_INFO` requests, and `oss_sysinfo.numaudioengines` itself, so that
+anything that passes the probe and then fails `configure` is a Wine change
+rather than a header surprise.
+
+**§5.1, the OSSv4 numbering the guest had wrong or missing.** Reading the OSSv4
+header against `DevDsp::ioctl64` turned up one mis-decoded request and a set of
+unanswered ones:
+
+- `('P', 16)` is **both** `SNDCTL_DSP_SETTRIGGER` and `SNDCTL_DSP_GETTRIGGER`;
+  OSSv4 separates them by direction alone (`__SIOW` versus `__SIOR`), not by
+  number. The switch keyed on the code alone, so a get was answered with
+  nothing written back, and `('P', 17)` -- which is `SNDCTL_DSP_GETIPTR` and
+  wants a three-field `count_info` -- was being answered with a one-int
+  trigger mask. Both now decode on the direction bit and on the real number.
+- Added, all as the honest answer for a single output-only device:
+  `GETPLAYVOL`/`SETPLAYVOL` (`0x5018`), `GETERROR` (`0x5019`), `COOKEDMODE`
+  (`0x501E`), `HALT_INPUT`/`HALT_OUTPUT` (`0x5021`/`0x5022`),
+  `CURRENT_IPTR`/`CURRENT_OPTR` (`0x5023`/`0x5024`), `POLICY` (`0x502D`) and
+  `SNDCTL_SYSINFO` on the dsp node (`0x5801`, which OSSv4 answers on any OSS
+  node and not only on `/dev/mixer`).
+- `DevMixer::ioctl64` now answers `SNDCTL_ENGINEINFO` as well as
+  `SNDCTL_AUDIOINFO`, and stops answering the six `'M'`-group numbers that are
+  not channels with a channel level: `SOUND_MIXER_INFO` (101) gets a real
+  `mixer_info`, and `STEREODEVS`/`CAPS`/`RECMASK`/`DEVMASK`/`RECSRC`
+  (`0xfb`..`0xff`) get bit masks -- the six channels Wine's `aux` device
+  enumerates for the two device masks, zero for the rest.
+- Anything still unmodelled names itself once per request code, on both nodes:
+  `BOXEDWINE_X64_OSS_IOCTL node=/dev/dsp nr=0x… status=unimplemented`. It is
+  emitted only for `-ENOTTY`, which is the only result that means "not
+  modelled" -- every other refusal here is a deliberate answer to a request
+  that *is* modelled -- and on `/dev/mixer` only for the OSS request groups,
+  so `FIONBIO` and `FIONREAD` do not fill the log with witnesses for requests
+  that were never this device's to answer.
+
+None of this was needed by `wineoss` itself, which -- as §5.1 above records --
+issues a much shorter list. It is there for the same reason the rest of the set
+is: an OSS client that gets `ENOTTY` cannot tell a device that will not do
+something from a device that is not there.
 
 **§5.0 inventory.** Both `scripts/build-wine64-runtime-ci.sh` and
 `scripts/validate-wine64-runtime.sh` report
@@ -434,15 +510,16 @@ and written through a temp file and a rename.
 
 ### Not landed
 
-**The CI driver build has never run.** It is written and syntax-checked but
-has not been executed on a runner, which is why the workflow step is
-`continue-on-error` and why the validator's hard requirement is behind
-`BOXEDVN_REQUIRE_WINE64_OSS=1` rather than always on. The next CI run answers
-three questions in its log: whether `linux-libc-dev`'s `<linux/soundcard.h>`
-satisfies the OSSv4 probe, whether Wine's `configure` accepts the shim
-(`HAVE_SYS_SOUNDCARD_H`), and whether `make dlls/wineoss.drv` produces a real
-PE `wineoss.drv` rather than the fake PE module Wine emits without a mingw
-cross compiler. Arm the gate once it has.
+**The CI driver build has never completed.** It has now run once and failed at
+its first check, for the two reasons above; both are fixed, but a Wine build
+from source has still never finished in this workflow. That is why the step
+stays `continue-on-error` and why the validator's hard requirement stays behind
+`BOXEDVN_REQUIRE_WINE64_OSS=1` rather than always on. Two questions are left
+for the next run's log, and the fixes do not answer either of them: whether
+`configure` gets far enough to record `HAVE_OSS_SYSINFO_NUMAUDIOENGINES`, and
+whether `make dlls/wineoss.drv` produces a real PE `wineoss.drv` rather than
+the fake PE module Wine emits without a mingw cross compiler. Arm the gate once
+a run has produced both halves.
 
 **Capture is not implemented.** `SNDCTL_DSP_GETISPACE` answers an empty input
 buffer rather than `-ENODEV`, because refusing makes wineoss log an error every

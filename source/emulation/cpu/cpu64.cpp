@@ -83,6 +83,13 @@ void CPU64::cloneRegistersFrom(const CPU64* from) {
     // -- so this carries the 64-bit pair in practice; carrying whatever the
     // parent actually had is what the processor does.
     seg = from->seg;
+    // The TLS descriptors clone with the selectors that index them: Linux
+    // copies the parent's descriptor array into the child (CLONE_SETTLS then
+    // replaces one entry), and a child that inherited FS without inheriting
+    // the descriptor FS names would address its TEB through a zero base.
+    for (unsigned i = 0; i < K_GUEST_SEGMENT_TABLE_ENTRIES; i++) {
+        threadAreaDescriptors[i] = from->threadAreaDescriptors[i];
+    }
     for (int i = 0; i < 16; i++) {
         xmm[i] = from->xmm[i];
     }
@@ -195,6 +202,31 @@ U64 CPU64::pop64() {
     U64 v = memory ? memory->readq(reg[X64_RSP].u64) : 0;
     reg[X64_RSP].u64 += 8;
     return v;
+}
+
+// The base comes from the descriptor the selector indexes -- the same table the
+// legacy `int 0x80` gate wrote it into, and the same rule the translator
+// backend's fault handler applies when it serves one of these instructions.
+// A selector that names no installed descriptor leaves the base at zero, which
+// is what every flat descriptor this port publishes would give.
+void CPU64::loadSegmentSelector(bool fs, U16 selector) {
+    const U64 base = boxedvn::kernelLegacySegmentBase64(this, selector);
+    if (fs) {
+        seg.fs = selector;
+        fsbase = base;
+    } else {
+        seg.gs = selector;
+        gsbase = base;
+    }
+    static std::atomic<U32> reports {0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+        klog_fmt("BOXEDWINE_X64_SEGMENT_WRITE pid=%d tid=%d seg=%s selector=0x%x "
+                 "base=0x%llx rip=0x%llx",
+                 (thread && thread->process) ? (int)thread->process->id : -1,
+                 thread ? (int)thread->id : -1, fs ? "fs" : "gs",
+                 (unsigned)selector, (unsigned long long)base,
+                 (unsigned long long)rip);
+    }
 }
 
 // AH/CH/DH/BH addressing: only valid when there is no REX prefix at all.
@@ -891,7 +923,7 @@ U32 CPU64::step() {
         case 0x9d: goto dsp_46;
         case 0x9e: goto dsp_47;
         case 0x9f: goto dsp_48;
-        case 0xcc: goto dsp_49;
+        case 0xcc: case 0xcd: goto dsp_49;
         case 0xfc: goto dsp_50;
         case 0xfd: goto dsp_51;
         case 0xf5: goto dsp_52;
@@ -905,7 +937,7 @@ U32 CPU64::step() {
         case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f: case 0x60:
         case 0x61: case 0x62: case 0x64: case 0x65: case 0x66: case 0x67: case 0x6c: case 0x6d:
         case 0x6e: case 0x6f: case 0x82: case 0x9a: case 0xc2: case 0xc4:
-        case 0xc5: case 0xc8: case 0xca: case 0xcb: case 0xcd: case 0xce: case 0xd4: case 0xd5:
+        case 0xc5: case 0xc8: case 0xca: case 0xcb: case 0xce: case 0xd4: case 0xd5:
         case 0xd6: case 0xe0: case 0xe1: case 0xe2: case 0xe3: case 0xe4: case 0xe5: case 0xe6:
         case 0xe7: case 0xea: case 0xec: case 0xed: case 0xee: case 0xef: case 0xf0: case 0xf1:
         case 0xf2: case 0xf3: case 0xf4: case 0xfa: case 0xfb: goto unhandled;
@@ -1153,7 +1185,13 @@ dsp_11:
         static const U16 kSegSel[6] = { 0x2b, 0x33, 0x2b, 0x2b, 0x00, 0x00 };
         U8 segIdx = m.regField & 0x7;
         if (op == 0x8C) {
-            U16 sel = (segIdx < 6) ? kSegSel[segIdx] : 0;
+            // FS and GS answer with whatever selector was actually loaded into
+            // them (zero until something loads one, which is what a 64-bit
+            // thread that only ever used arch_prctl reads); the other four are
+            // the canonical Linux user-mode selectors.
+            U16 sel = (segIdx == 4) ? seg.fs
+                    : (segIdx == 5) ? seg.gs
+                    : (segIdx < 6) ? kSegSel[segIdx] : 0;
             // Destination width: for a memory operand it's 16-bit; for a register
             // operand the selector is zero-extended to the operand size.
             if (m.isReg) {
@@ -1163,10 +1201,19 @@ dsp_11:
             }
         } else {
             // MOV Sreg, r/m16 — loading a segment selector. In long mode this is
-            // effectively a no-op for CS/SS/DS/ES (the descriptor cache is flat);
-            // we read (and discard) the operand to advance correctly. Loading
-            // FS/GS selector doesn't change the base (that's arch_prctl's job).
-            (void)loadRM(m, 2, rexPresent);
+            // effectively a no-op for CS/SS/DS/ES (the descriptor cache is flat).
+            //
+            // FS and GS are the exception, and the reason this is not a discard
+            // any more: a selector loaded into either of them takes its base
+            // from the descriptor it indexes. Wine's WoW64 layer allocates that
+            // descriptor through the legacy `int 0x80` gate and then writes FS
+            // with this instruction before far-jumping into 32-bit code that
+            // addresses its TEB through FS, so discarding the write left the
+            // 32-bit thread reading its TEB at whatever arch_prctl had set.
+            const U16 selector = (U16)loadRM(m, 2, rexPresent);
+            if (segIdx == 4 || segIdx == 5) {
+                loadSegmentSelector(segIdx == 4, selector);
+            }
         }
         U32 used = opOff + 1 + m.length;
         rip += used;
@@ -1430,6 +1477,42 @@ dsp_23:
         ModRM m = decodeModRM(rip + opOff + 2, p, 0);
         if ((m.regField & 0x7) == 0) {
             U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+    }
+
+    // PUSH FS (0F A0) / POP FS (0F A1) / PUSH GS (0F A8) / POP GS (0F A9).
+    // The only other instructions that can write FS or GS -- LFS and LGS are
+    // not encodable in long mode -- and the pop form is what a context restore
+    // uses to put a WoW64 thread's 32-bit selector back. In long mode the stack
+    // slot is a qword unless 66h asks for a word; the selector itself is always
+    // the low 16 bits, and a load takes its base from the descriptor it names.
+    if (op == 0x0F) {
+        U8 segOp = fetchByte(rip + opOff + 1);
+        if (segOp == 0xA0 || segOp == 0xA1 || segOp == 0xA8 || segOp == 0xA9) {
+            bool isFs = (segOp == 0xA0 || segOp == 0xA1);
+            bool isPop = (segOp == 0xA1 || segOp == 0xA9);
+            U32 slot = p.osize16 ? 2u : 8u;
+            if (isPop) {
+                U16 selector;
+                if (slot == 2) {
+                    selector = memory ? memory->readw(reg[X64_RSP].u64) : 0;
+                    reg[X64_RSP].setU64(reg[X64_RSP].u64 + 2);
+                } else {
+                    selector = (U16)pop64();
+                }
+                loadSegmentSelector(isFs, selector);
+            } else {
+                U16 selector = isFs ? seg.fs : seg.gs;
+                if (slot == 2) {
+                    reg[X64_RSP].setU64(reg[X64_RSP].u64 - 2);
+                    if (memory) memory->writew(reg[X64_RSP].u64, selector);
+                } else {
+                    push64((U64)selector);
+                }
+            }
+            U32 used = opOff + 2;
             rip += used;
             return used;
         }
@@ -2611,17 +2694,74 @@ dsp_48:
         return opOff + 1;
     }
 
-    // INT3 (CC). Software-breakpoint. In user mode this raises SIGTRAP;
-    // without real signal delivery, klog the trap and yield so the guest
-    // exits cleanly instead of looping or corrupting host state. assert()
-    // failure paths and debugger-injected breakpoints emit this.
+    // Software interrupts: INT3 (CC) and INT imm8 (CD ib).
+    //
+    // Three different things share this encoding, and only one of them is an
+    // error:
+    //
+    //   - `int $0x80` is the legacy i386 syscall gate. A 64-bit process is not
+    //     supposed to need it, but Wine's unix ntdll allocates a WoW64 thread's
+    //     32-bit FS/GS selectors through it (there is no x86-64 syscall number
+    //     for set_thread_area), and that runs in every process that starts a
+    //     32-bit program. The interpreter serves it through the same kernel
+    //     helper the translator backend's fault handler uses, so the two
+    //     backends cannot answer the same instruction differently.
+    //   - INT3, and the two-byte `int $3`, are breakpoints. Wine's debugger
+    //     support plants them and expects EXCEPTION_BREAKPOINT, which is a
+    //     SIGTRAP with TRAP_BRKPT here. The processor reports the address AFTER
+    //     the trapping instruction, so rip is advanced before the frame is
+    //     built -- Wine's own handler subtracts the one byte back.
+    //   - Every other vector is not a user gate: the processor raises a general
+    //     protection fault and the kernel turns it into SIGSEGV/SI_KERNEL.
+    //
+    // None of the three is an unimplemented opcode, which is what all of them
+    // used to be (or, for INT3, a silent yield that left the process alive with
+    // no status at all).
 dsp_49:
-    if (op == 0xCC) {
-        klog_fmt("CPU64: INT3 at RIP=0x%llx — yielding (no SIGTRAP delivery yet)",
-                 (unsigned long long)rip);
+    if (op == 0xCC || op == 0xCD) {
+        const U8 vector = (op == 0xCC) ? 3 : fetchByte(rip + opOff + 1);
+        const U32 used = opOff + 1 + (op == 0xCD ? 1u : 0u);
+        if (op == 0xCD && vector == 0x80) {
+            // The helper reads the number and arguments out of the register
+            // file, performs the call, and writes the i386 answer into rax. It
+            // deliberately leaves rip alone: the gate resumes after its two
+            // bytes, which is what `used` already counts.
+            boxedvn::kernelLegacySyscall64(this);
+            rip += used;
+            return used;
+        }
+        // Both endings report the address AFTER the instruction, which is what
+        // the processor pushes for a software interrupt; a guest cannot
+        // usefully re-execute one, and Wine's breakpoint handler subtracts the
+        // byte back itself.
+        rip += used;
+        if (vector == 3) {
+            if (this->raiseSyncFault(K_SIGTRAP, /*trapNo #BP*/3, K_TRAP_BRKPT,
+                                     rip)) {
+                return 0; // rip now at the handler
+            }
+            klog_fmt("CPU64: INT3 at RIP=0x%llx with no SIGTRAP handler pid=%d",
+                     (unsigned long long)ipStart,
+                     (thread && thread->process) ? (int)thread->process->id : -1);
+            if (thread && thread->process) {
+                thread->process->signaled = K_SIGTRAP;
+            }
+            kfatalProcessExit64(this, 128 + K_SIGTRAP, "cpu64-breakpoint-trap");
+            yield = true;
+            return 0;
+        }
+        if (this->raiseSyncFault(K_SIGSEGV, /*trapNo #GP*/13, K_SI_KERNEL, 0)) {
+            return 0; // rip now at the handler
+        }
+        klog_fmt("CPU64: INT 0x%02x at RIP=0x%llx with no SIGSEGV handler pid=%d",
+                 (unsigned)vector, (unsigned long long)ipStart,
+                 (thread && thread->process) ? (int)thread->process->id : -1);
+        if (thread && thread->process) {
+            thread->process->signaled = K_SIGSEGV;
+        }
+        kfatalProcessExit64(this, 128 + K_SIGSEGV, "cpu64-software-interrupt");
         yield = true;
-        rip += opOff + 1;
-        return opOff + 1;
+        return 0;
     }
 
     // CLD (FC) / STD (FD). Direction flag for string ops.

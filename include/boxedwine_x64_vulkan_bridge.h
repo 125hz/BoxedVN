@@ -40,26 +40,44 @@
  * capacity slot and returns BOXEDWINE_X64_VK_E_BUFFER. The *array itself* is
  * always validated against the guest page table before a slot is touched.
  *
- * Why the arguments are guest pointers and nothing is marshalled
- * -------------------------------------------------------------
- * The IA-32 marshal exists because a 32-bit guest pointer is not a host
- * address and a 32-bit guest's Vulkan structures are not laid out the way the
- * host's are. Neither is true here:
+ * Why the arguments are raw guest pointers and the host marshals them
+ * -------------------------------------------------------------------
+ * The IA-32 marshal exists for two reasons: a 32-bit guest pointer is not a
+ * host address, and a 32-bit guest's Vulkan structures are not laid out the
+ * way the host's are. Only the second of those is gone here. Every Vulkan
+ * structure has the same layout on x86-64 System V as on arm64 AAPCS64: both
+ * are LP64, every Vulkan scalar has its natural alignment on both, and Vulkan
+ * defines no bitfields or packed members. So no field ever moves, and the
+ * argument words are the guest's own pointers, unwidened and unrepacked.
  *
- *   1. The bridge is served only to the one process per session that FEX
- *      translates, the process holding the identity map, where a guest
- *      address *is* the host address (BOXEDWINE_X64_VK_CAP_IDENTITY_MEMORY,
- *      the same rule the DXMT unix call enforces and
- *      docs/KNOWN_LIMITATIONS_IOS.md section 4 records).
- *   2. Every Vulkan structure has the same layout on x86-64 System V as on
- *      arm64 AAPCS64: both are LP64, every Vulkan scalar has its natural
- *      alignment on both, and Vulkan defines no bitfields or packed members.
+ * The first reason has NOT gone away, and an early device run proved it. The
+ * lane is served only to the process holding the native map
+ * (BOXEDWINE_X64_VK_CAP_IDENTITY_MEMORY, the same rule the DXMT unix call
+ * enforces), but that map is identity only for the high lane: canonical low
+ * addresses are served through an alias and Wine's top-down arena -- where
+ * every thread stack lives, and therefore where DXVK builds its create-infos
+ * -- is served from a relocated host block. A guest pointer handed straight
+ * to MoltenVK is a host address only by luck. It was not: MoltenVK followed
+ * a VkInstanceCreateInfo at a 0x7ffffe... stack address into unmapped host
+ * memory and the process died inside vkCreateInstance.
  *
- * So the host dispatcher casts the argument words to the real Vulkan types
- * and calls MoltenVK with them. What it must never do is call *through* a
- * guest pointer: `pAllocator` is forced to NULL (which is what the IA-32
- * marshal does too) and any command whose parameters include a guest
- * callback is refused rather than dispatched.
+ * So the host dispatcher marshals. Every structure a command names is copied
+ * into a host-side shadow through the guest page table, every pointer inside
+ * it (pNext chains, pApplicationInfo, ppEnabled*Names, pQueueCreateInfos,
+ * pEnabledFeatures, the arrays in VkSubmitInfo and VkPresentInfoKHR, ...) is
+ * marshalled the same way, and the results are copied back into guest memory
+ * afterwards. A pointer the page table cannot account for is a named
+ * VK_ERROR_INITIALIZATION_FAILED and a `status=bad-pointer` log line rather
+ * than a fault inside Metal. The guest ICD is unchanged by any of this: it
+ * still packs raw guest pointers, which is what keeps it free of Vulkan
+ * headers.
+ *
+ * What the host must never do is call *through* a guest pointer. `pAllocator`
+ * is forced to NULL (which is what the IA-32 marshal does too), a command
+ * whose parameters include a guest callback is not in the table, and a pNext
+ * node that carries one (VkDebugUtilsMessengerCreateInfoEXT, which DXVK
+ * attaches to its VkInstanceCreateInfo whenever validation is on) is dropped
+ * from the chain rather than forwarded.
  */
 #ifndef BOXEDWINE_X64_VULKAN_BRIDGE_H
 #define BOXEDWINE_X64_VULKAN_BRIDGE_H
@@ -78,7 +96,14 @@
  * block changes. The guest shim reads it through BOXEDWINE_X64_VK_OP_ABI and
  * refuses to run against a host it does not understand, so a stale shim in a
  * container is a named refusal rather than a crash inside Metal. */
-#define BOXEDWINE_X64_VK_ABI_VERSION 2U
+/* 3: the host marshals every structure that crosses the bridge instead of
+ *    handing the guest's own pointers to the driver, and the command table
+ *    grew the memory-requirements-2 / bind-memory-2 / external-object /
+ *    timeline-semaphore group. The wire format did not change -- a shim built
+ *    for 2 would still be understood -- but such a shim has no entry point for
+ *    the new commands and would answer NULL for them, which a caller reads as
+ *    "the driver cannot do this" rather than as a stale container. */
+#define BOXEDWINE_X64_VK_ABI_VERSION 3U
 
 /* Results below zero never collide with a VkResult (VK_SUCCESS is 0 and the
  * Vulkan error codes are negative but far from these), a count, or a handle.
@@ -130,7 +155,10 @@
  * winex11.drv binds by name out of the Vulkan library (its LOAD_FUNCPTR list
  * in dlls/winex11.drv/vulkan.c of Wine 9.0 -- sixteen required symbols and
  * four optional ones), plus the instance / physical-device / device / queue /
- * memory / image / sync calls DXVK walks before it records a command buffer.
+ * memory / image / sync calls DXVK walks before it records a command buffer:
+ * the "2" forms of the memory-requirements and bind-memory calls its
+ * allocator uses, the external-object capability queries it runs before it
+ * picks a memory type, and the timeline-semaphore trio.
  * The recording commands (vkCmd*, pipelines, descriptors, render passes,
  * command pools) are deliberately absent: a run that gets that far names each
  * one it wanted through BOXEDWINE_X64_VK_OP_PROC_ADDR, which is a cheaper way
@@ -168,6 +196,7 @@
     X(CreateDevice,                               12) \
     X(DestroyDevice,                              13) \
     X(GetDeviceQueue,                             19) \
+    X(GetDeviceQueue2,                           279) \
     X(DeviceWaitIdle,                             22) \
     X(QueueWaitIdle,                              21) \
     X(QueueSubmit,                                20) \
@@ -179,15 +208,25 @@
     X(FlushMappedMemoryRanges,                    27) \
     X(InvalidateMappedMemoryRanges,               28) \
     X(GetBufferMemoryRequirements,                30) \
+    X(GetBufferMemoryRequirements2,              263) \
     X(BindBufferMemory,                           31) \
+    X(BindBufferMemory2,                         230) \
     X(GetImageMemoryRequirements,                 32) \
+    X(GetImageMemoryRequirements2,               265) \
     X(BindImageMemory,                            33) \
+    X(BindImageMemory2,                          232) \
     X(GetMemoryHostPointerPropertiesEXT,         302) \
+    /* external object capabilities, which DXVK queries before it picks a
+     * memory type or a sharing mode */ \
+    X(GetPhysicalDeviceExternalBufferProperties, 214) \
+    X(GetPhysicalDeviceExternalSemaphoreProperties, 216) \
+    X(GetPhysicalDeviceExternalFenceProperties,  218) \
     /* buffers, images, views */ \
     X(CreateBuffer,                               54) \
     X(DestroyBuffer,                              55) \
     X(CreateImage,                                58) \
     X(DestroyImage,                               59) \
+    X(GetImageSubresourceLayout,                  60) \
     X(CreateImageView,                            61) \
     X(DestroyImageView,                           62) \
     /* synchronisation */ \
@@ -198,6 +237,9 @@
     X(WaitForFences,                              41) \
     X(CreateSemaphore,                            42) \
     X(DestroySemaphore,                           43) \
+    X(GetSemaphoreCounterValue,                  312) \
+    X(WaitSemaphores,                            314) \
+    X(SignalSemaphore,                           316) \
     /* surface and swapchain */ \
     X(DestroySurfaceKHR,                         161) \
     X(GetPhysicalDeviceSurfaceSupportKHR,        162) \
@@ -212,6 +254,7 @@
     X(DestroySwapchainKHR,                       167) \
     X(GetSwapchainImagesKHR,                     168) \
     X(AcquireNextImageKHR,                       169) \
+    X(AcquireNextImage2KHR,                      238) \
     X(QueuePresentKHR,                           170) \
     X(CreateXlibSurfaceKHR,                      171) \
     X(GetPhysicalDeviceXlibPresentationSupportKHR, 172)
@@ -241,7 +284,17 @@
     X(GetPhysicalDeviceFormatProperties2KHR,      GetPhysicalDeviceFormatProperties2) \
     X(GetPhysicalDeviceImageFormatProperties2KHR, GetPhysicalDeviceImageFormatProperties2) \
     X(GetPhysicalDeviceQueueFamilyProperties2KHR, GetPhysicalDeviceQueueFamilyProperties2) \
-    X(GetPhysicalDeviceMemoryProperties2KHR,      GetPhysicalDeviceMemoryProperties2)
+    X(GetPhysicalDeviceMemoryProperties2KHR,      GetPhysicalDeviceMemoryProperties2) \
+    X(GetBufferMemoryRequirements2KHR,            GetBufferMemoryRequirements2) \
+    X(GetImageMemoryRequirements2KHR,             GetImageMemoryRequirements2) \
+    X(BindBufferMemory2KHR,                       BindBufferMemory2) \
+    X(BindImageMemory2KHR,                        BindImageMemory2) \
+    X(GetPhysicalDeviceExternalBufferPropertiesKHR, GetPhysicalDeviceExternalBufferProperties) \
+    X(GetPhysicalDeviceExternalSemaphorePropertiesKHR, GetPhysicalDeviceExternalSemaphoreProperties) \
+    X(GetPhysicalDeviceExternalFencePropertiesKHR, GetPhysicalDeviceExternalFenceProperties) \
+    X(GetSemaphoreCounterValueKHR,                GetSemaphoreCounterValue) \
+    X(WaitSemaphoresKHR,                          WaitSemaphores) \
+    X(SignalSemaphoreKHR,                         SignalSemaphore)
 
 #define BOXEDWINE_X64_VK_OP_ENUM(name, ordinal) \
     BOXEDWINE_X64_VK_OP_##name = (BOXEDWINE_X64_VK_OP_VK_BASE + (ordinal)),

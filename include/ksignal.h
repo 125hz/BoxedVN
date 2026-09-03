@@ -87,6 +87,14 @@
 #define K_FPE_FLTRES	6	/* floating point inexact result */
 #define K_FPE_FLTINV	7	/* floating point invalid operation */
 
+// The SIGTRAP si_code values. INT3 (and the two-byte `int $3`) raises the
+// breakpoint trap, which is how a debugger's planted breakpoint reaches the
+// debuggee's handler; Wine's own exception dispatcher turns TRAP_BRKPT into
+// EXCEPTION_BREAKPOINT and reports it at the byte before the reported RIP,
+// because the processor reports the address after the trapping instruction.
+#define K_TRAP_BRKPT	1	/* process breakpoint */
+#define K_TRAP_TRACE	2	/* process trace trap */
+
 #define K_SS_ONSTACK 1
 #define K_SS_DISABLE 4
 
@@ -106,6 +114,11 @@
 #define K_SA_RESETHAND    0x80000000u
 
 #define K_SI_USER 0
+// SI_KERNEL: the kernel raised this signal itself rather than on behalf of a
+// sender or a specific fault. A software interrupt that is not a defined user
+// gate takes this route: the processor raises a general protection fault and
+// the kernel turns it into a SIGSEGV with no faulting address.
+#define K_SI_KERNEL 0x80
 
 #define K_POLL_IN         1   /* data input available */
 #define K_POLL_OUT        2   /* output buffers available */
