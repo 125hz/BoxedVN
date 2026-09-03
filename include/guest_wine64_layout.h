@@ -54,6 +54,25 @@
 // never be packaged.
 #define K_X64_WINE_PE32_DIR K_X64_WINE_MODULE_ROOT "/i386-windows"
 #define K_X64_WINE_UNIX_DIR K_X64_WINE_MODULE_ROOT "/x86_64-unix"
+// The prebuilt 32-bit DXVK, staged in the same 32-bit PE layer but in a
+// directory of its own rather than over i386-windows/d3d9.dll. Wine's own
+// d3d9 is wined3d, which needs OpenGL or Vulkan; DXVK's d3d9 needs Vulkan
+// only, and the binary the app already ships is the same one the IA-32 lane
+// uses for the same programs. Keeping it apart is what makes the override
+// opt-in: a launch that does not ask for it never sees these files, so a
+// broken Vulkan path cannot regress the lane's current behaviour.
+#define K_X64_WINE_DXVK_PE32_DIR K_X64_WINE_MODULE_ROOT "/dxvk-i386"
+// The one module the WoW64 Direct3D 9 lane needs, and the ones that ride
+// along when the layer carries them. d3d9 is projected on its own by default
+// because Direct3D 11 already has a route (DXMT) and mixing the two renderers
+// in one prefix has never been tried.
+#define K_X64_DXVK_PE32_MODULE_NAMES {"d3d9.dll"}
+// The launch environment variable that turns the projection on, read by
+// source/sdl/startupArgs.cpp and set by the iOS launcher for a 32-bit
+// program. "dxvk" is the only value that enables it; anything else, including
+// the variable being unset, keeps Wine's own d3d9.
+#define K_X64_WOW64_D3D9_ENV "BOXEDVN_WOW64_D3D9"
+#define K_X64_WOW64_D3D9_DXVK "dxvk"
 // The lane launches through the name upstream's WoW64 layout uses. Wine
 // derives the loader for a 32-bit image by stripping "64" from its own name
 // and hands the image to start.exe whenever that yields a name
@@ -223,6 +242,23 @@ inline std::vector<std::string> x64DxmtModuleNames() {
 // status no window ever shows.
 inline std::vector<std::string> x64Wow64LanePe32ModuleNames() {
     return K_X64_WOW64_LANE_PE32_MODULE_NAMES;
+}
+
+// The 32-bit DXVK modules a launch projects over syswow64 when it opts in.
+// Kept as a list for the same reason as the one above: the projection reports
+// each name it could not find, because a missing override shows on screen
+// only as a program that still cannot create a device.
+inline std::vector<std::string> x64DxvkPe32ModuleNames() {
+    return K_X64_DXVK_PE32_MODULE_NAMES;
+}
+
+// Whether a launch asked for DXVK's 32-bit d3d9 in place of Wine's own.
+// Exact-match on purpose: an unset variable, an empty one, or any other
+// spelling keeps Wine's d3d9, so a Vulkan path that does not work cannot
+// regress a lane that at least reaches its own error today.
+inline bool x64Wow64D3d9UsesDxvk(const char* value) {
+    return value != nullptr &&
+           std::string(value) == std::string(K_X64_WOW64_D3D9_DXVK);
 }
 
 // Only a real file is projected over a module-root builtin; a directory or a

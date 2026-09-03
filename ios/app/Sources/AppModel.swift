@@ -560,7 +560,7 @@ final class AppModel: ObservableObject {
                 executablePath:
                     "d:\\.boxedvn-x64-diagnostics\\boxedvn-d3d9-cube.exe",
                 arguments: [],
-                environment: X64Runtime.environment,
+                environment: X64Runtime.wow64Environment,
                 workingDirectory: runtime.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,
@@ -646,6 +646,20 @@ final class AppModel: ObservableObject {
             "WINEDEBUG=warn+module,warn+seh,+winedevice,+mountmgr",
             "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
         ]
+
+        /// The environment for a launch that will enter 32-bit code.
+        ///
+        /// Wine's own 32-bit d3d9 is wined3d, which needs OpenGL or Vulkan.
+        /// There is no OpenGL on iOS, and a device run showed both dlopens
+        /// failing and `Direct3DCreate9` returning E_FAIL into a message box.
+        /// DXVK's d3d9 needs Vulkan only, and the runtime now stages both the
+        /// 32-bit DXVK image and the 64-bit Vulkan client library the chain
+        /// ends at. This variable is what turns that projection on; the
+        /// emulator reads it in `source/sdl/startupArgs.cpp` and does nothing
+        /// unless the value is exactly "dxvk", so a 64-bit launch and a build
+        /// whose layer carries no DXVK are both unaffected.
+        static let wow64Environment =
+            environment + ["BOXEDVN_WOW64_D3D9=dxvk"]
     }
 
     /// Locates the bundled Wine64, glibc and DXMT resources for `container`
@@ -938,8 +952,9 @@ final class AppModel: ObservableObject {
         // is served entirely out of the 32-bit layer the user supplies. The
         // picker already read that header, so the launch knows which lane it
         // is on before it starts anything.
-        if program.executable.architecture == Self.x86_32ArchitectureName,
-           !allowWoW64Launch(with: runtime) {
+        let isWoW64Program =
+            program.executable.architecture == Self.x86_32ArchitectureName
+        if isWoW64Program, !allowWoW64Launch(with: runtime) {
             return
         }
         rememberX64Program(program, for: container)
@@ -955,7 +970,11 @@ final class AppModel: ObservableObject {
                 sharedDirectory: Storage.sharedFiles,
                 executablePath: program.guestExecutablePath,
                 arguments: [],
-                environment: X64Runtime.environment,
+                // Only a 32-bit program gets the DXVK d3d9 projection: it is
+                // the WoW64 lane's renderer and has nothing to do with the
+                // 64-bit lane, which reaches Direct3D 11 through DXMT.
+                environment: isWoW64Program ? X64Runtime.wow64Environment
+                                            : X64Runtime.environment,
                 workingDirectory: program.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,

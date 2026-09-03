@@ -65,6 +65,12 @@ X11_SHIM_LIBS = (
     "libXinerama.so.1", "libXi.so.6", "libXcursor.so.1", "libXfixes.so.3",
     "libXcomposite.so.1", "libXxf86vm.so.1",
 )
+# BoxedWine's x86-64 Vulkan ICD, in the same directory and for the same
+# reason: Wine's winex11.drv dlopens the bare soname and this directory is
+# first on the guest's library path. Without it the search reaches the IA-32
+# shim in the root filesystem, whose ELF class the 64-bit loader rejects, and
+# wined3d ends up with no Vulkan adapter and no GL adapter.
+VULKAN_SHIM_SONAME = "libvulkan.so.1"
 # Fontconfig loads without its configuration and then reports that it cannot
 # load a default config file, which leaves Wine with no usable font backend.
 FONTCONFIG_PATH = "etc/fonts/fonts.conf"
@@ -118,6 +124,11 @@ PE32_MODULES = ("ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll",
                 "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll",
                 "user32.dll", "win32u.dll", "opengl32.dll", "wined3d.dll",
                 "d3d9.dll", "zlib1.dll")
+# The prebuilt 32-bit DXVK, staged beside the i386 builtins rather than over
+# them: a launch that does not set BOXEDVN_WOW64_D3D9=dxvk gets Wine's own
+# d3d9 and cannot regress. Only d3d9.dll is required; the rest ride along.
+DXVK_PE32_DIR = ROOT + "/dxvk-i386"
+DXVK_PE32_MODULES = ("d3d9.dll", "dxgi.dll")
 # Wine's own WoW64 thunking layer, which lives in the 64-bit tree even though
 # it exists to serve 32-bit code: ntdll loads wow64.dll to build the 32-bit
 # process, wow64win.dll thunks user/GDI syscalls into the 64-bit win32u, and
@@ -290,6 +301,9 @@ class WineserverArchiveValidation(unittest.TestCase):
             archive.writestr("usr/lib/x86_64-linux-gnu/" + x11_lib, elf())
         for x11_shim in X11_SHIM_LIBS:
             archive.writestr(X11_SHIM_DIR + "/" + x11_shim, elf(body=b"shim"))
+        if getattr(self, "_vulkan_shim", True):
+            archive.writestr(X11_SHIM_DIR + "/" + VULKAN_SHIM_SONAME,
+                             elf(body=b"vulkan-icd"))
         if getattr(self, "_x11_driver", True):
             archive.writestr(PE_DIR + "/winex11.drv", pe(body=b"winex11"))
             archive.writestr(ROOT + "/x86_64-unix/winex11.so", elf())
@@ -319,6 +333,11 @@ class WineserverArchiveValidation(unittest.TestCase):
                 archive.writestr(PE32_DIR + "/" + pe32_module,
                                  pe(machine=pe32_machine,
                                     body=b"i386:" + pe32_module.encode()))
+            for dxvk_module in getattr(self, "_dxvk_modules", DXVK_PE32_MODULES):
+                archive.writestr(DXVK_PE32_DIR + "/" + dxvk_module,
+                                 pe(machine=getattr(self, "_dxvk_machine",
+                                                    PE32_MACHINE),
+                                    body=b"dxvk:" + dxvk_module.encode()))
             archive.writestr("usr/lib/wine/i386-windows.link",
                              guest_link("/" + PE32_DIR))
 

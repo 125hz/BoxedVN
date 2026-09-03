@@ -27,6 +27,7 @@
 #include "boxedwine_x64_x11_bridge.h"
 #include "boxedwine_x64_vulkan_bridge.h"
 #include "../x11/x11bridge64.h"
+#include "../vulkan/vulkanbridge64.h"
 #include "kevent.h"
 #include "ksocket.h"
 #include <cstring>
@@ -3823,29 +3824,26 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
 }
 
 /*
- * The 64-bit lane's Vulkan bridge -- plumbing only.
+ * The 64-bit lane's Vulkan bridge.
  *
  * The IA-32 lane hands the guest's `/lib/libvulkan.so.1` to the host through
  * `int 0x9A` and `callVulkan()`. CPU64 decodes no such trap and that shim is
- * an i386 ELF, so nothing in the 64-bit lane can reach MoltenVK: a device run
+ * an i386 ELF, so nothing in the 64-bit lane could reach MoltenVK: a device run
  * of a 32-bit Direct3D 9 program under WoW64 shows Wine's 64-bit loader
  * opening `/lib/libvulkan.so.1`, having it rejected for its ELF class, and
  * continuing its search (and the same again for `libGL.so.1`), after which
  * wined3d has no adapter of either kind and Direct3DCreate9 returns E_FAIL.
  *
- * This is the reserved entry point that a 64-bit guest `libvulkan.so.1` shim
- * will trap through, built the way tools/x11-64 builds the X11 shim. It
- * answers only the bootstrap operations today: the ABI version, a capability
- * probe, and an echo that proves the argument array was read and written back
- * through the guest page table. Every Vulkan entry point is still
- * BOXEDWINE_X64_VK_E_UNIMPL. docs/PLAN_WOW64_D3D9.md holds the order the rest
- * lands in and the marker each step has to print.
+ * This is the entry point the x86-64 guest `libvulkan.so.1` in tools/vulkan-64
+ * traps through. The dispatcher itself lives beside the rest of the Vulkan
+ * code, in source/vulkan/vulkanbridge64.cpp; only the syscall number, the
+ * three static assertions that keep it from colliding with the other two host
+ * bridges, and the forwarding case below belong here.
  *
- * The identity-map rule is the DXMT rule and is enforced here for the same
+ * The identity-map rule is the DXMT rule and is enforced there for the same
  * reason: host Vulkan handles are host pointers, so only the one process per
  * session that FEX translates can hold them (docs/KNOWN_LIMITATIONS_IOS.md
- * section 4). It is reported through the capability probe rather than
- * refusing the probe itself, so a shim can say why it declined.
+ * section 4).
  */
 static_assert(BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE !=
                   BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL,
@@ -3855,101 +3853,6 @@ static_assert(BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE !=
               "the Vulkan bridge must not shadow the X11 bridge");
 static_assert(BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE > 1024,
               "a host bridge number must sit above the Linux syscall table");
-
-static const char* vulkanBridge64OpName(U64 op) {
-#define BOXEDWINE_X64_VK_OP_NAME(name, value, text) \
-    if (op == (U64)(value)) return text;
-    BOXEDWINE_X64_VK_OPS(BOXEDWINE_X64_VK_OP_NAME)
-#undef BOXEDWINE_X64_VK_OP_NAME
-    return nullptr;
-}
-
-static U64 vulkanBridge64Capabilities(CPU64* cpu) {
-    U64 capabilities = 0;
-#ifdef BOXEDWINE_VULKAN
-    capabilities |= BOXEDWINE_X64_VK_CAP_HOST_MARSHAL;
-#endif
-    if (cpu && cpu->memory && cpu->memory->nativeIdentityMode()) {
-        capabilities |= BOXEDWINE_X64_VK_CAP_IDENTITY_MEMORY;
-    }
-    return capabilities;
-}
-
-static U64 boxedwineVulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress,
-                                   U64 count) {
-    if (!cpu || !cpu->memory || !cpu->thread || !cpu->thread->process) {
-        return (U64)(S64)BOXEDWINE_X64_VK_E_FAULT;
-    }
-    const U32 pid = (U32)cpu->thread->process->id;
-    const char* opName = vulkanBridge64OpName(op);
-    // One line the first time any process traps here. Until a guest shim
-    // exists this never fires, which is itself the answer to "does the
-    // 64-bit lane have a Vulkan path yet".
-    static std::atomic<U32> callCount{0};
-    const U32 ordinal = callCount.fetch_add(1, std::memory_order_relaxed);
-    if (ordinal < 16 || !opName) {
-        klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE ordinal=%u pid=%u op=%llu "
-                 "name=%s args=0x%llx count=%llu caps=0x%llx",
-                 ordinal, pid, (unsigned long long)op,
-                 opName ? opName : "?", (unsigned long long)argsAddress,
-                 (unsigned long long)count,
-                 (unsigned long long)vulkanBridge64Capabilities(cpu));
-    }
-    if (!opName) {
-        return (U64)(S64)BOXEDWINE_X64_VK_E_BADOP;
-    }
-    if (count > BOXEDWINE_X64_VK_MAX_ARGS) {
-        return (U64)(S64)BOXEDWINE_X64_VK_E_ARGS;
-    }
-    U64 args[BOXEDWINE_X64_VK_MAX_ARGS] = {};
-    if (count) {
-        // The array is IN/OUT, so it has to be writable as well as readable
-        // before a single slot is trusted; the host never dereferences a
-        // guest address directly.
-        if (argsAddress == 0) {
-            return (U64)(S64)BOXEDWINE_X64_VK_E_FAULT;
-        }
-        const U64 bytes = count * sizeof(U64);
-        const U64 firstPage = argsAddress >> K64_PAGE_SHIFT;
-        const U64 lastPage = (argsAddress + bytes - 1) >> K64_PAGE_SHIFT;
-        if (lastPage < firstPage) {
-            return (U64)(S64)BOXEDWINE_X64_VK_E_FAULT;
-        }
-        for (U64 page = firstPage; page <= lastPage; ++page) {
-            const U32 flags = cpu->memory->getPageFlags(page);
-            if (!(flags & K64_PAGE_MAPPED) || !(flags & K64_PAGE_READ) ||
-                !(flags & K64_PAGE_WRITE)) {
-                return (U64)(S64)BOXEDWINE_X64_VK_E_FAULT;
-            }
-        }
-        cpu->memory->memcpyFromGuest(args, argsAddress, bytes);
-    }
-
-    S64 result = BOXEDWINE_X64_VK_E_UNIMPL;
-    switch (op) {
-        case BOXEDWINE_X64_VK_OP_ABI:
-            result = (S64)BOXEDWINE_X64_VK_ABI_VERSION;
-            break;
-        case BOXEDWINE_X64_VK_OP_PROBE:
-            result = (S64)vulkanBridge64Capabilities(cpu);
-            break;
-        case BOXEDWINE_X64_VK_OP_ECHO:
-            if (count < 1) {
-                result = BOXEDWINE_X64_VK_E_ARGS;
-            } else {
-                args[0] = args[0] + 1;
-                result = 0;
-            }
-            break;
-        default:
-            result = BOXEDWINE_X64_VK_E_UNIMPL;
-            break;
-    }
-    if (count) {
-        cpu->memory->memcpyToGuest(argsAddress, args, count * sizeof(U64));
-    }
-    return (U64)result;
-}
 
 void ksyscall64(CPU64* cpu) {
     if (!cpu) return;
@@ -4022,10 +3925,11 @@ void ksyscall64(CPU64* cpu) {
             ret = x11Bridge64(cpu, a1, a2, a3);
             break;
         case BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE:
-            // The x86-64 guest libvulkan shim, when one exists. RDI =
+            // The x86-64 guest libvulkan shim (tools/vulkan-64). RDI =
             // operation, RSI = guest argument array, RDX = argument count.
-            // Plumbing only today; see docs/PLAN_WOW64_D3D9.md.
-            ret = boxedwineVulkanBridge64(cpu, a1, a2, a3);
+            // See source/vulkan/vulkanbridge64.cpp and
+            // docs/PLAN_WOW64_D3D9.md.
+            ret = vulkanBridge64(cpu, a1, a2, a3);
             break;
 #ifdef BOXEDWINE_OPENGL
         case GL64_SYSCALL_NR:

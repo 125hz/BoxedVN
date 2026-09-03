@@ -142,6 +142,10 @@ MANIFEST_I386_WINDOWS_NTDLL_SHA256=""
 MANIFEST_WOW64_DLL_SHA256=""
 MANIFEST_WOW64WIN_DLL_SHA256=""
 MANIFEST_WOW64CPU_DLL_SHA256=""
+# The Vulkan half: BoxedWine's x86-64 guest ICD, and how many 32-bit DXVK
+# modules rode along in the PE32 layer.
+MANIFEST_VULKAN_SHIM_SHA256=""
+MANIFEST_DXVK_I386_MODULES=""
 if [[ -n "${MANIFEST}" ]]; then
     require_file "${MANIFEST}" \
         "Copy scripts/wine64-runtime-manifest.example and fill in both layer SHA-256 values."
@@ -164,6 +168,8 @@ if [[ -n "${MANIFEST}" ]]; then
             wow64win_dll_sha256) MANIFEST_WOW64WIN_DLL_SHA256="${value}" ;;
             wow64cpu_dll_sha256) MANIFEST_WOW64CPU_DLL_SHA256="${value}" ;;
             x11_shim_libx11_sha256) MANIFEST_X11_SHIM_LIBX11_SHA256="${value}" ;;
+            vulkan_shim_sha256) MANIFEST_VULKAN_SHIM_SHA256="${value}" ;;
+            dxvk_i386_modules) MANIFEST_DXVK_I386_MODULES="${value}" ;;
             source)         MANIFEST_SOURCE="${value}" ;;
             source_image)   MANIFEST_SOURCE_IMAGE="${value}" ;;
             wine_address_contract) MANIFEST_WINE_ADDRESS_CONTRACT="${value}" ;;
@@ -484,6 +490,16 @@ for x11_shim in libX11.so.6 libXext.so.6 libXrender.so.1 libXrandr.so.2 \
     check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/${x11_shim}"
 done
 
+# BoxedWine's x86-64 Vulkan ICD, in the same directory for the same reason:
+# Wine's winex11.drv dlopens the bare soname "libvulkan.so.1" and this is the
+# first path the guest loader tries. If the archive does not carry it the
+# search falls through to the IA-32 shim in the root filesystem, whose ELF
+# class the 64-bit loader rejects, and wined3d gets no Vulkan adapter and no
+# GL adapter -- which is exactly the state a device run of a 32-bit Direct3D 9
+# program was in when Direct3DCreate9 returned E_FAIL.
+check_zip_path "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/libvulkan.so.1"
+check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/libvulkan.so.1"
+
 # Wine's built-in bitmap fonts, at the data root and reachable through the
 # derived path the guest actually asks for. A device run showed every one of
 # these opens failing.
@@ -561,6 +577,32 @@ for wow64_module in wow64.dll wow64win.dll wow64cpu.dll; do
 done
 check_zip_guest_link "${PE32_ARCHIVE}" usr/lib/wine/i386-windows \
     "/${PE32_DIR}"
+
+# The 32-bit DXVK override, staged beside the i386 builtins rather than over
+# them so a launch that does not ask for it is unchanged. d3d9.dll is the one
+# module the WoW64 Direct3D 9 lane needs; the rest ride along if the app
+# bundled them. Each has to be a PE32 i386 image: a 64-bit DXVK here would be
+# projected into syswow64 and silently refused by the 32-bit loader, which on
+# screen is a program that never draws.
+DXVK_PE32_DIR="${WINE_MODULE_ROOT}/dxvk-i386"
+check_zip_path "${PE32_ARCHIVE}" "${DXVK_PE32_DIR}/d3d9.dll"
+check_zip_entry_pe32_i386 "${PE32_ARCHIVE}" "${DXVK_PE32_DIR}/d3d9.dll"
+for dxvk_optional in dxgi.dll d3d11.dll d3d10core.dll; do
+    if unzip -Z1 "${PE32_ARCHIVE}" "${DXVK_PE32_DIR}/${dxvk_optional}" >/dev/null 2>&1; then
+        check_zip_entry_pe32_i386 "${PE32_ARCHIVE}" "${DXVK_PE32_DIR}/${dxvk_optional}"
+    fi
+done
+if [[ -n "${MANIFEST}" && -n "${MANIFEST_DXVK_I386_MODULES}" ]]; then
+    [[ "${MANIFEST_DXVK_I386_MODULES}" =~ ^[0-9]+$ ]] \
+        || die "Wine64 manifest dxvk_i386_modules is not a count."
+    dxvk_entry_count="$(unzip -Z1 "${PE32_ARCHIVE}" \
+        | sed 's#^\./##' \
+        | awk -v prefix="${DXVK_PE32_DIR}/" \
+            'index($0, prefix) == 1 && $0 != prefix && substr($0, length($0)) != "/" { count++ } END { print count + 0 }')"
+    (( dxvk_entry_count == MANIFEST_DXVK_I386_MODULES )) \
+        || die "The 32-bit PE archive holds ${dxvk_entry_count} DXVK modules under ${DXVK_PE32_DIR}; its manifest records ${MANIFEST_DXVK_I386_MODULES}."
+    ok "$(basename "${PE32_ARCHIVE}"): ${dxvk_entry_count} 32-bit DXVK modules"
+fi
 
 # The manifest pins the WoW64 half the same way it pins the layer archives: a
 # runtime that lost its 32-bit tree between build and packaging still has every
@@ -660,6 +702,10 @@ if [[ -n "${RECORD_MANIFEST}" ]]; then
         printf 'pe32_sha256=%s\n' "$(sha256_file "${PE32_ARCHIVE}")"
         # A recorded manifest has to be one this checker would accept on the
         # next run, so it carries the WoW64 pins the block above requires.
+        printf 'dxvk_i386_modules=%s\n' "$(unzip -Z1 "${PE32_ARCHIVE}" \
+            | sed 's#^\./##' \
+            | awk -v prefix="${WINE_MODULE_ROOT}/dxvk-i386/" \
+                'index($0, prefix) == 1 && $0 != prefix && substr($0, length($0)) != "/" { count++ } END { print count + 0 }')"
         printf 'i386_windows_module_count=%s\n' "$(unzip -Z1 "${PE32_ARCHIVE}" \
             | sed 's#^\./##' \
             | awk -v prefix="${PE32_DIR}/" \

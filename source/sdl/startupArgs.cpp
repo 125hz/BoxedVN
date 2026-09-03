@@ -116,6 +116,27 @@ static bool guestUsesFex64(const std::vector<BString>& envValues) {
     return false;
 }
 
+// Whether this launch asked for DXVK's 32-bit d3d9 over Wine's own.
+//
+// Wine's d3d9 is wined3d, and wined3d needs OpenGL or Vulkan: there is no
+// OpenGL on iOS, and the Vulkan route only exists once the 64-bit guest ICD
+// is staged and the bridge answers. DXVK's d3d9 needs Vulkan only, and the
+// binary is the one the app already ships and the IA-32 lane already uses.
+//
+// Opt-in, and only on the exact value: an unset variable, an empty one, or
+// any other spelling keeps Wine's own d3d9, so a Vulkan path that does not
+// work cannot regress a lane that currently reaches its own message box.
+static bool guestWantsWow64Dxvk(const std::vector<BString>& envValues) {
+    const BString prefix = B(K_X64_WOW64_D3D9_ENV "=");
+    bool wanted = false;
+    for (const BString& entry : envValues) {
+        if (entry.startsWith(prefix)) {
+            wanted = (entry == prefix + B(K_X64_WOW64_D3D9_DXVK));
+        }
+    }
+    return wanted;
+}
+
 // Wine normally installs small builtin placeholders into a new prefix's
 // system32 directory. On the BoxedWine x64 path wineboot completes with status
 // 0 but leaves that directory empty, and the FEX-translated parent then cannot
@@ -279,6 +300,69 @@ static void projectX64WinePe32Modules(const BString& winePrefix) {
     }
     klog_fmt("BOXEDWINE_X64_PE32_GAP tree=i386-windows required=%u missing=%u",
              (U32)lanePe32Modules.size(), pe32Missing);
+}
+
+// The 32-bit DXVK override, projected over the syswow64 entry the i386
+// projection just made.
+//
+// A 32-bit Direct3D 9 program on this lane resolves d3d9.dll out of syswow64
+// and gets Wine's own, which is wined3d over OpenGL or Vulkan. A device run
+// showed both dlopens failing -- there is no OpenGL on iOS and the 64-bit
+// lane had no Vulkan client library at all -- and Direct3DCreate9 returning
+// E_FAIL into a message box. DXVK's d3d9 needs Vulkan only, and now that the
+// lane has a Vulkan ICD it is the renderer worth trying.
+//
+// The files are staged apart, in K_X64_WINE_DXVK_PE32_DIR, and this runs only
+// when the launch set BOXEDVN_WOW64_D3D9=dxvk. Everything about the default
+// path is therefore unchanged: a runtime carrying DXVK and a launch that does
+// not ask for it behave identically to one that carries none.
+static void projectX64WineDxvkD3d9(const BString& winePrefix) {
+    const BString syswow64 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
+                             K_GUEST_WINE_WINDOWS "/syswow64";
+    std::shared_ptr<FsNode> dxvkDirectory =
+        Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_DXVK_PE32_DIR), true);
+    if (!dxvkDirectory || !dxvkDirectory->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 status=missing source=%s",
+                 K_X64_WINE_DXVK_PE32_DIR);
+        return;
+    }
+    std::shared_ptr<FsNode> destination =
+        Fs::getNodeFromLocalPath(B(""), syswow64, true);
+    if (!destination || !destination->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 status=missing destination=%s",
+                 syswow64.c_str());
+        return;
+    }
+    const std::vector<std::string> modules = boxedvn::x64DxvkPe32ModuleNames();
+    U32 projected = 0;
+    for (const std::string& name : modules) {
+        const BString sourcePath =
+            B(K_X64_WINE_DXVK_PE32_DIR) + "/" + name.c_str();
+        std::shared_ptr<FsNode> source =
+            Fs::getNodeFromLocalPath(B(""), sourcePath, true);
+        if (!source || source->isDirectory()) {
+            klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY name=%s source=%s status=missing",
+                     name.c_str(), sourcePath.c_str());
+            continue;
+        }
+        const BString overlay = syswow64 + "/" + name.c_str();
+        const bool replaced =
+            Fs::getNodeFromLocalPath(B(""), overlay, false) != nullptr;
+        // Destructive on purpose, unlike the i386 projection: the whole point
+        // is to replace Wine's d3d9 with DXVK's, and the entry already there
+        // is the one that projection made a moment ago. FsNode::addChild sets
+        // by name, so adding over it is the replacement.
+        Fs::addFileNode(overlay, sourcePath, source->nativePath, false,
+                        destination);
+        ++projected;
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY name=%s source=%s destination=%s "
+                 "status=projected tree=dxvk-i386 replaced=%d",
+                 name.c_str(), sourcePath.c_str(), overlay.c_str(),
+                 replaced ? 1 : 0);
+    }
+    klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 status=projected "
+             "destination=%s required=%u projected=%u",
+             syswow64.c_str(), (U32)modules.size(), projected);
 }
 
 // Wine strips "64" from its own loader name to find the loader for a 32-bit
@@ -998,6 +1082,27 @@ bool StartUpArgs::apply() {
         // bridge rather than to a distro libX11 that opens an X socket. A
         // caller-supplied value is kept, as with every other default here.
         addDefaultEnvValue(envValues, K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT);
+        // The 32-bit Direct3D 9 renderer, when the launch asked for DXVK's.
+        // This has to run after projectX64WinePe32Modules, which is what puts
+        // Wine's own d3d9 into syswow64 in the first place.
+        if (guestWantsWow64Dxvk(envValues)) {
+            projectX64WineDxvkD3d9(winePrefix);
+            // Native, not builtin: the projected file is a real PE32 DXVK
+            // image and Wine has to load it rather than fall back to its own.
+            // A caller that already set WINEDLLOVERRIDES keeps it -- adding a
+            // second assignment would leave the guest with two, and which one
+            // wins is not something to guess at -- but say so, because that
+            // caller has to spell d3d9=n itself.
+            if (hasEnvValue(envValues, "WINEDLLOVERRIDES")) {
+                klog("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 "
+                     "status=override-kept: the launch already set "
+                     "WINEDLLOVERRIDES; it must include d3d9=n for DXVK to load");
+            } else {
+                envValues.push_back(B("WINEDLLOVERRIDES=d3d9=n"));
+                klog("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 "
+                     "status=override-applied WINEDLLOVERRIDES=d3d9=n");
+            }
+        }
     }
 
     if (!this->ddrawOverridePath.isEmpty()) {

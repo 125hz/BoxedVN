@@ -700,29 +700,34 @@ U32 int9ACallbackSize;
 
 void vulkan_init() {
     // One startup line that answers "can a 64-bit guest reach the host's
-    // Vulkan at all", which today it cannot. The IA-32 lane traps through
-    // `int 0x9A` into the callback table built below; CPU64 decodes no such
-    // trap, so the 64-bit lane needs a guest `libvulkan.so.1` of its own that
+    // Vulkan at all". The IA-32 lane traps through `int 0x9A` into the
+    // callback table built below; CPU64 decodes no such trap, so the 64-bit
+    // lane has a guest `libvulkan.so.1` of its own (tools/vulkan-64) that
     // traps through BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE, built and staged
-    // the way tools/x11-64 builds the X11 client shims. Nothing in this tree
-    // builds one yet, and the file a 64-bit guest does find under that name
-    // is the IA-32 shim in the root filesystem, which its loader rejects for
-    // its ELF class and silently walks past. `present` flips when the
-    // packaging lands and defines BOXEDWINE_X64_VULKAN_GUEST_SHIM; see
-    // docs/PLAN_WOW64_D3D9.md.
+    // the way tools/x11-64 builds the X11 client shims. The file a 64-bit
+    // guest would otherwise find under that name is the IA-32 shim in the
+    // root filesystem, which its loader rejects for its ELF class and
+    // silently walks past, so `present` says which of the two a run has:
+    // the packaging step defines BOXEDWINE_X64_VULKAN_GUEST_SHIM when it
+    // stages the 64-bit file. See docs/PLAN_WOW64_D3D9.md.
 #if defined(BOXEDWINE_X64_VULKAN_GUEST_SHIM)
     const int guestShimPresent = 1;
 #else
     const int guestShimPresent = 0;
 #endif
+#define BOXEDWINE_X64_VK_COUNT_ONE(name, ordinal) + 1
+    const unsigned bridgeOps =
+        (unsigned)(0 BOXEDWINE_X64_VK_COMMANDS(BOXEDWINE_X64_VK_COUNT_ONE));
+#undef BOXEDWINE_X64_VK_COUNT_ONE
     klog_fmt("BOXEDWINE_X64_VULKAN_SHIM present=%d icd=%s hostcall=0x%llx "
-             "abi=%u soname=%s path=%s lane32_ops=%u",
+             "abi=%u soname=%s path=%s bridge_ops=%u lane32_ops=%u",
              guestShimPresent,
              guestShimPresent ? BOXEDWINE_X64_VK_GUEST_SONAME : "none",
              (unsigned long long)BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE,
              (unsigned)BOXEDWINE_X64_VK_ABI_VERSION,
              BOXEDWINE_X64_VK_GUEST_SONAME,
              K_X64_GUEST_VULKAN_LIB_PATH,
+             bridgeOps,
              (unsigned)(VK_LAST_VALUE + 1));
 
     int9ACallbackSize = VK_LAST_VALUE+1;

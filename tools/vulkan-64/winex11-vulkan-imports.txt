@@ -1,0 +1,40 @@
+# The symbols Wine's winex11.drv looks up in the Vulkan library it dlopens.
+#
+# Wine 9.0, dlls/winex11.drv/vulkan.c: the driver dlopens SONAME_LIBVULKAN and
+# resolves each of these with dlsym. A name in the "required" block that the
+# library does not export makes the driver's LOAD_FUNCPTR fail, it closes the
+# handle, and the whole Vulkan path is gone -- which is indistinguishable, in
+# a device log, from the library not being found at all. The "optional" block
+# is LOAD_OPTIONAL_FUNCPTR: absent is allowed and only costs the feature.
+#
+# Everything else Wine needs it obtains through vkGetInstanceProcAddr and
+# vkGetDeviceProcAddr, which is why the bridge's command table is much longer
+# than this file.
+#
+# scripts/validate-x64-vulkan-shim.py --winex11 PATH re-measures a given
+# winex11.so against this list by scanning its string table, so a Wine version
+# that added a required symbol fails the build rather than a device run.
+
+[required]
+vkCreateInstance
+vkCreateSwapchainKHR
+vkCreateXlibSurfaceKHR
+vkDestroyInstance
+vkDestroySurfaceKHR
+vkDestroySwapchainKHR
+vkEnumerateInstanceExtensionProperties
+vkGetDeviceProcAddr
+vkGetInstanceProcAddr
+vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+vkGetPhysicalDeviceSurfaceFormatsKHR
+vkGetPhysicalDeviceSurfacePresentModesKHR
+vkGetPhysicalDeviceSurfaceSupportKHR
+vkGetPhysicalDeviceXlibPresentationSupportKHR
+vkGetSwapchainImagesKHR
+vkQueuePresentKHR
+
+[optional]
+vkGetDeviceGroupSurfacePresentModesKHR
+vkGetPhysicalDevicePresentRectanglesKHR
+vkGetPhysicalDeviceSurfaceCapabilities2KHR
+vkGetPhysicalDeviceSurfaceFormats2KHR

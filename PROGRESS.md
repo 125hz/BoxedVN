@@ -6710,3 +6710,159 @@ Packaging note for the runtime build: `libwine:i386` has to supply
 not carry it, the build will now say so by name on the first run, and the
 module has to come from the same Wine version by another route -- the archive
 cannot ship without it and run a 32-bit program.
+
+## The 64-bit lane has a Vulkan client library, and it needs no marshal
+
+The 02:10 run's `Direct3DCreate9 failed (HRESULT 0x80004005)` has one cause:
+wined3d needs OpenGL or Vulkan, there is no OpenGL on iOS, and the 64-bit lane
+had no Vulkan either. The loader's search is in the log -- seven candidate
+paths for `libvulkan.so.1`, of which `/lib/libvulkan.so.1` *opens* and the
+search continues past it, because that file is the IA-32 lane's shim: an i386
+ELF that traps with `int 0x9A`, an opcode CPU64 does not decode. A 64-bit
+`ld-linux` rejects it for its ELF class and keeps looking, finds nothing, and
+wined3d has no adapter of either kind.
+
+So the lane now has its own `libvulkan.so.1`, an x86-64 ELF built from
+`tools/vulkan-64` and staged at `/usr/lib/boxedwine64-x11/libvulkan.so.1` --
+the first path that run was observed trying, and already first on the 64-bit
+launch's `LD_LIBRARY_PATH`.
+
+Two corrections to what the plan assumed.
+
+**It is not `winevulkan.so` that opens the library, and it is not six
+symbols.** Wine 9.0's `dlls/winex11.drv/vulkan.c` is what calls
+`dlopen(SONAME_LIBVULKAN, RTLD_NOW)`, and its `LOAD_FUNCPTR` list is sixteen
+required names -- the whole surface and swapchain set, plus
+`vkCreateXlibSurfaceKHR`, `vkGetPhysicalDeviceXlibPresentationSupportKHR` and
+the two `GetProcAddr` entry points. A library missing one of the sixteen makes
+the driver close the handle and give up, which in a device log looks exactly
+like the library not being found. winevulkan then takes its `vk_funcs` from
+`__wine_get_vulkan_driver` and reaches everything else through
+`vkGetInstanceProcAddr`. The list is recorded in
+`tools/vulkan-64/winex11-vulkan-imports.txt` and the validator re-measures it
+against the very `winex11.so` that gets packaged, so a Wine version that adds
+a seventeenth fails the build rather than a run.
+
+**The IA-32 marshal is not reused, and the reason it exists does not apply
+here.** `source/vulkan/vk_host*.cpp` is 2.7 MB of generated code that copies
+every Vulkan structure between guest and host, and it exists because a 32-bit
+guest pointer is not a host address and a 32-bit guest's structures are not
+laid out the way the host's are. Neither holds on this lane. The bridge is
+served only to the process holding the identity map -- the one process per
+session FEX translates, the same rule the DXMT unix call enforces -- where a
+guest address *is* the host address; and every Vulkan structure has an
+identical layout on x86-64 System V and arm64 AAPCS64, both being LP64 with
+natural alignment throughout and no bitfields or packed members anywhere in
+the API. So `source/vulkan/vulkanbridge64.cpp` casts the guest's argument
+words to the real Vulkan types and calls MoltenVK with them. One typed call
+per command, checked by the compiler, and no marshal at all.
+
+The two things it must never do are the two the IA-32 marshal also avoids:
+`pAllocator` is forced to NULL on every command that takes one, because a
+`VkAllocationCallbacks` holds guest x86-64 function pointers the arm64 host
+cannot call, and no command whose parameters include a guest callback is in
+the table. `vkCreateXlibSurfaceKHR` is the single command that is not
+forwarded: MoltenVK has no Xlib surface extension, so the bridge reads the
+window id out of the guest's `VkXlibSurfaceCreateInfoKHR` at offset 32 and
+builds the surface through `KNativeSystem::getVulkan()`, exactly as
+`BOXED_vkCreateXlibSurfaceKHR` does for the other lane -- including the
+`isPresentationSurface` test that decides whether a surface may take the
+fake-fullscreen target, so Wine's throwaway capability-probe surfaces do not.
+
+Operation numbers are the IA-32 lane's own ordinals from
+`source/vulkan/vkdef.h` plus `0x1000`. That was not for elegance: it means the
+two lanes can never drift, and a number in a diagnostic means the same command
+on both. `scripts/test_x64_vulkan_shim.py` asserts every one of the 66 against
+`vkdef.h`, and asserts that the ABI header, the guest ICD's definitions and
+the host dispatcher's cases are the same set -- 26 tests, no compiler, no
+Vulkan SDK, no Wine install.
+
+The command set is the bootstrap half: instance, physical device, device,
+queue, memory, buffers, images, image views, fences, semaphores, surface and
+swapchain. The recording half -- command pools and buffers, `vkCmd*`,
+pipelines, descriptors, render passes, samplers, query pools -- is absent on
+purpose rather than guessed at. Every name a caller asks for that the table
+does not carry is printed once as `BOXEDWINE_X64_VULKAN_BRIDGE
+call=vkGetProcAddr missing=<name>`, so one device run produces DXVK's real
+requirement list. Two traps for whoever adds them: a command with a `float`
+parameter passes it in a vector register, and a command with more than eight
+integer parameters passes the rest on the stack, where Apple's arm64 ABI packs
+sub-8-byte arguments to their natural size rather than to 8. Both are handled
+correctly by a typed call and incorrectly by any generic forwarder, which is
+why there is not one.
+
+## `vkMapMemory` under WoW64 is Wine's problem, and Wine already solves it
+
+The plan's deepest risk was that `vkMapMemory` has to return an address a
+32-bit caller can hold, and that the bridge would need the DXMT `CpuPlaced`
+discipline -- allocate mappable memory in the guest's low alias and hand
+Vulkan a pointer into it. Reading Wine 9.0's `dlls/winevulkan/vulkan.c`
+changes what that step is.
+
+`wine_vkAllocateMemory` checks `device->phys_dev->external_memory_align`,
+allocates the mapping itself with `NtAllocateVirtualMemory` and `zero_bits`
+set -- which on WoW64 forces it below 4 GiB -- and imports it with
+`VkImportMemoryHostPointerInfoEXT`. `wine_vkMapMemory2KHR` then tests
+`(UINT_PTR)*data >> 32` and, for a WoW64 caller handed a pointer above 4 GiB,
+unmaps it and returns `VK_ERROR_OUT_OF_HOST_MEMORY` with a FIXME saying the
+mapping does not fit a 32-bit pointer.
+
+So there is nothing for this bridge to place. The memory Wine imports is guest
+memory in the low alias, which under the identity map is a real host address
+below 4 GiB and page-aligned -- exactly what
+`VkImportMemoryHostPointerInfoEXT` wants -- and it passes through unchanged.
+What the path actually needs is `VK_EXT_external_memory_host` reaching the
+guest, which it does automatically because extension enumeration and
+`vkGetPhysicalDeviceProperties2` are pass-through, and
+`vkGetMemoryHostPointerPropertiesEXT` is in the command table for this reason
+alone.
+
+What is not known is whether the pinned MoltenVK 1.4.2 advertises that
+extension. One line answers it: `BOXEDWINE_X64_VULKAN_MAP memory= offset=
+size= address= low4g=`, printed for the first eight mappings. `low4g=1` and
+the 32-bit path works; `low4g=0` and Wine will refuse the mapping itself, and
+the `CpuPlaced` work becomes real.
+
+## The DXVK override is staged apart and opt-in
+
+`ios/app/Dxvk/d3d9.dll` is DXVK 2.5.2, PE32, already patched for MoltenVK's
+feature gaps, and already the renderer the IA-32 lane uses for the same
+programs. It now rides in the 32-bit PE layer at
+`.../wine/dxvk-i386/d3d9.dll` -- a directory of its own rather than over
+`i386-windows/d3d9.dll`, so nothing sees it unless a launch asks. The launcher
+sets `BOXEDVN_WOW64_D3D9=dxvk` for the two launches that enter 32-bit code
+(the bundled Direct3D 9 probe, and a program whose PE header says i386);
+`projectX64WineDxvkD3d9()` then projects it over the `syswow64` entry the i386
+projection made a moment earlier and adds `WINEDLLOVERRIDES=d3d9=n`. A launch
+that already carries its own `WINEDLLOVERRIDES` keeps it and is told, once,
+that it has to spell `d3d9=n` itself -- appending a second assignment and
+guessing which one Wine honours is not a thing to do quietly.
+
+A 64-bit launch is untouched, and a build whose layer carries no DXVK is
+untouched, so a Vulkan path that turns out not to work cannot regress a lane
+that at least reaches its own message box today.
+
+Two packaging gates came with it. The runtime validator now *requires*
+`usr/lib/boxedwine64-x11/libvulkan.so.1` in `wine64.zip` and a PE32 i386
+`dxvk-i386/d3d9.dll` in `wine64-pe32.zip`, so a runtime that lost either fails
+the build rather than a device run. And the builder now reports whether the
+staged `i386-windows` tree carries `vulkan-1.dll` and `winevulkan.dll` -- the
+two modules a 32-bit DXVK needs to reach the WoW64 unix-call dispatch, and the
+one link in the chain nobody has ever checked. That one warns rather than
+fails: Wine's own d3d9 does not need either, and a build should not stop for a
+feature the launch has to opt into.
+
+## What the next run says
+
+`BOXEDWINE_X64_VULKAN_SHIM present=1 ... abi=2 ... bridge_ops=66
+lane32_ops=645` at startup on every launch. Then, if the 32-bit lane gets that
+far: one `open('/usr/lib/boxedwine64-x11/libvulkan.so.1')` that succeeds with
+no further search after it; `BOXEDWINE_X64_VULKAN_BRIDGE ordinal=0 ...
+name=abi status=2` and `name=probe ... caps=0x7` (compiled in, driver loaded,
+identity map held); `BOXEDWINE_X64_MODULE_OVERLAY ... tree=dxvk-i386` naming
+the projected d3d9 and the applied override; then `call=vkCreateInstance
+status=0`, `call=vkEnumeratePhysicalDevices status=0`, `call=vkCreateDevice
+status=0`, and a run of `missing=<name>` lines that is the exact list of what
+to implement next. A `caps=` without bit 0x4 means the host loaded no driver;
+without 0x2, the caller is a forked child and the refusal is structural
+(`docs/KNOWN_LIMITATIONS_IOS.md` section 4).

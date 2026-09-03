@@ -10,6 +10,7 @@
 # Usage:
 #   scripts/build-wine64-runtime-ci.sh --output-dir DIR \
 #       [--dxmt-unixlib PATH] [--x11-shim-dir DIR] \
+#       [--vulkan-shim PATH] [--dxvk-i386-dir DIR] \
 #       [--i386-pe-dir DIR]
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
@@ -33,6 +34,25 @@ X11_SHIM_LIBRARIES=(
     libXcomposite.so.1
     libXxf86vm.so.1
 )
+# The x86-64 guest Vulkan ICD built by scripts/build-boxedwine-x64-vulkan.sh.
+# It rides in the same directory as the X11 shims because that directory is
+# already first on the 64-bit lane's LD_LIBRARY_PATH, and a device run of a
+# 32-bit Direct3D 9 program proves it is the first path Wine's loader tries
+# for this soname. Without it the loader falls through to /lib/libvulkan.so.1,
+# which is the IA-32 shim, is rejected for its ELF class, and leaves wined3d
+# with no adapter at all.
+VULKAN_SHIM=""
+VULKAN_SHIM_SONAME="libvulkan.so.1"
+# The prebuilt 32-bit DXVK the app already ships (ios/app/Dxvk). It is staged
+# under a directory of its own inside the 32-bit PE layer rather than over
+# i386-windows/d3d9.dll, so a launch that does not ask for it gets Wine's own
+# d3d9 and the lane's current behaviour cannot regress. The projection into
+# syswow64 is the launcher's job and is gated on BOXEDVN_WOW64_D3D9=dxvk; see
+# source/sdl/startupArgs.cpp.
+DXVK_I386_DIR=""
+DXVK_I386_GUEST_DIR="${WINE_MODULE_ROOT}/dxvk-i386"
+DXVK_I386_MODULES=(d3d9.dll)
+DXVK_I386_OPTIONAL_MODULES=(dxgi.dll d3d11.dll d3d10core.dll)
 # The guest module root everything real is packaged under. Kept the same
 # as K_X64_WINE_MODULE_ROOT in include/guest_wine64_layout.h, which is what
 # the launch and the device preflight use.
@@ -60,6 +80,15 @@ WOW64_LANE_PE32_MODULES=(
     msvcrt.dll ucrtbase.dll gdi32.dll user32.dll win32u.dll
     opengl32.dll wined3d.dll d3d9.dll zlib1.dll
 )
+# The two 32-bit builtins that carry a program from a Vulkan renderer to
+# Wine's WoW64 unix-call dispatch: DXVK's d3d9 links vulkan-1.dll, which is a
+# forwarder onto winevulkan.dll, which is what reaches x86_64-unix/winevulkan.so
+# and from there the guest libvulkan.so.1 this runtime now stages. Whether the
+# i386 package carries them has never been checked, and a missing one is not
+# fatal to the lane -- Wine's own d3d9 does not need either -- so this is a
+# warning that answers the question on the next CI run rather than a failure
+# that could stop a build for a feature the launch has to opt into.
+WOW64_LANE_PE32_VULKAN_MODULES=(vulkan-1.dll winevulkan.dll)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir needs a value"
@@ -68,10 +97,14 @@ while [[ $# -gt 0 ]]; do
                          DXMT_UNIXLIB="$2"; shift 2 ;;
         --x11-shim-dir) [[ $# -ge 2 ]] || die "--x11-shim-dir needs a value"
                          X11_SHIM_DIR="$2"; shift 2 ;;
+        --vulkan-shim) [[ $# -ge 2 ]] || die "--vulkan-shim needs a value"
+                        VULKAN_SHIM="$2"; shift 2 ;;
+        --dxvk-i386-dir) [[ $# -ge 2 ]] || die "--dxvk-i386-dir needs a value"
+                          DXVK_I386_DIR="$2"; shift 2 ;;
         --i386-pe-dir) [[ $# -ge 2 ]] || die "--i386-pe-dir needs a value"
                         I386_PE_DIR="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) die "Unknown argument '$1'. Run with --help." ;;
     esac
@@ -465,6 +498,47 @@ if [[ -n "${I386_PE_DIR}" ]]; then
     (( I386_PE_MODULE_COUNT > 0 )) \
         || die "The staged i386-windows tree is empty."
     log "32-bit PE builtins packaged: ${I386_PE_GUEST_DIR} (${I386_PE_MODULE_COUNT})"
+    # The Vulkan half of the 32-bit chain, reported and not enforced.
+    for vulkan_pe32 in "${WOW64_LANE_PE32_VULKAN_MODULES[@]}"; do
+        if [[ -s "${PE32_STAGE}${I386_PE_GUEST_DIR}/${vulkan_pe32}" ]]; then
+            log "i386-windows/${vulkan_pe32}: present (a 32-bit Vulkan renderer can bind)"
+        else
+            warn "i386-windows/${vulkan_pe32} is missing: a 32-bit DXVK d3d9 cannot reach winevulkan and BOXEDVN_WOW64_D3D9=dxvk will fail to load."
+        fi
+    done
+fi
+
+# The prebuilt 32-bit DXVK, staged beside the i386 builtins rather than over
+# them. Nothing projects it into a prefix unless the launch asks for it, so a
+# runtime carrying it behaves exactly as one that does not until
+# BOXEDVN_WOW64_D3D9=dxvk is set.
+DXVK_I386_MODULE_COUNT=0
+if [[ -n "${DXVK_I386_DIR}" ]]; then
+    [[ -d "${DXVK_I386_DIR}" ]] || die "--dxvk-i386-dir '${DXVK_I386_DIR}' is not a directory."
+    [[ -n "${I386_PE_DIR}" ]] \
+        || die "--dxvk-i386-dir needs --i386-pe-dir: the DXVK override rides in the 32-bit PE layer."
+    mkdir -p "${PE32_STAGE}${DXVK_I386_GUEST_DIR}"
+    for dxvk_module in "${DXVK_I386_MODULES[@]}"; do
+        [[ -s "${DXVK_I386_DIR}/${dxvk_module}" ]] \
+            || die "The DXVK directory has no ${dxvk_module}: ${DXVK_I386_DIR}"
+        cp "${DXVK_I386_DIR}/${dxvk_module}" "${PE32_STAGE}${DXVK_I386_GUEST_DIR}/${dxvk_module}"
+        # 0x14c is IMAGE_FILE_MACHINE_I386. A 64-bit DXVK here would be
+        # projected into syswow64 and silently refused by the 32-bit loader.
+        require_pe_machine "${PE32_STAGE}${DXVK_I386_GUEST_DIR}/${dxvk_module}" 332 \
+            "32-bit DXVK override"
+        DXVK_I386_MODULE_COUNT=$((DXVK_I386_MODULE_COUNT + 1))
+    done
+    for dxvk_module in "${DXVK_I386_OPTIONAL_MODULES[@]}"; do
+        if [[ -s "${DXVK_I386_DIR}/${dxvk_module}" ]]; then
+            cp "${DXVK_I386_DIR}/${dxvk_module}" "${PE32_STAGE}${DXVK_I386_GUEST_DIR}/${dxvk_module}"
+            require_pe_machine "${PE32_STAGE}${DXVK_I386_GUEST_DIR}/${dxvk_module}" 332 \
+                "32-bit DXVK override"
+            DXVK_I386_MODULE_COUNT=$((DXVK_I386_MODULE_COUNT + 1))
+        fi
+    done
+    log "32-bit DXVK override packaged: ${DXVK_I386_GUEST_DIR} (${DXVK_I386_MODULE_COUNT})"
+else
+    warn "No --dxvk-i386-dir: BOXEDVN_WOW64_D3D9=dxvk will find nothing to project and the 32-bit lane keeps Wine's own d3d9."
 fi
 
 # BoxedWine's own x86-64 X11 client libraries. winex11.so links the distro
@@ -488,6 +562,23 @@ if [[ -n "${X11_SHIM_DIR}" ]]; then
     log "BoxedWine x86-64 X11 client libraries packaged: ${X11_SHIM_GUEST_DIR} (${#X11_SHIM_LIBRARIES[@]})"
 else
     warn "No --x11-shim-dir: the 64-bit user driver will bind to the distro libX11 and fail to connect."
+fi
+
+# BoxedWine's own x86-64 Vulkan ICD. Wine's winex11.drv dlopens the bare
+# soname, so the guest's ld-linux decides; this directory is first on
+# LD_LIBRARY_PATH for a 64-bit launch and is the first path a device run was
+# observed trying. Without this file the search falls through to the IA-32
+# shim in the root filesystem, whose ELF class the 64-bit loader rejects.
+if [[ -n "${VULKAN_SHIM}" ]]; then
+    require_file "${VULKAN_SHIM}" \
+        "Build the x86-64 guest Vulkan ICD with scripts/build-boxedwine-x64-vulkan.sh first."
+    is_elf64_x86_64 "${VULKAN_SHIM}" \
+        || die "'${VULKAN_SHIM}' is not an x86-64 ELF shared object."
+    mkdir -p "${STAGE}${X11_SHIM_GUEST_DIR}"
+    cp "${VULKAN_SHIM}" "${STAGE}${X11_SHIM_GUEST_DIR}/${VULKAN_SHIM_SONAME}"
+    log "BoxedWine x86-64 Vulkan ICD packaged: ${X11_SHIM_GUEST_DIR}/${VULKAN_SHIM_SONAME}"
+else
+    warn "No --vulkan-shim: the 64-bit lane has no Vulkan client library and wined3d/DXVK get no adapter."
 fi
 
 # The builtin the loader reaches for first after the server handshake. If it is
@@ -765,6 +856,10 @@ sha256_file() {
     if [[ -n "${X11_SHIM_DIR}" ]]; then
         printf 'x11_shim_libx11_sha256=%s\n' "$(sha256_file "${X11_SHIM_DIR}/libX11.so.6")"
     fi
+    if [[ -n "${VULKAN_SHIM}" ]]; then
+        printf 'vulkan_shim_sha256=%s\n' "$(sha256_file "${VULKAN_SHIM}")"
+    fi
+    printf 'dxvk_i386_modules=%s\n' "${DXVK_I386_MODULE_COUNT}"
 } > "${OUTPUT_DIR}/wine64-runtime.manifest"
 
 ok "Wine64 runtime layers: ${OUTPUT_DIR}"

@@ -1,10 +1,11 @@
 /*
  * BoxedWine x86-64 guest Vulkan bridge ABI.
  *
- * C-compatible and free of BoxedWine types: it is meant to be included both
- * by the native dispatcher (source/kernel/syscall64.cpp) and, when it is
- * written, by the 64-bit guest `libvulkan.so.1` shim, exactly as
- * include/boxedwine_x64_x11_bridge.h is shared with tools/x11-64.
+ * C-compatible and free of BoxedWine types: it is included both by the native
+ * dispatcher (source/vulkan/vulkanbridge64.cpp, reached from
+ * source/kernel/syscall64.cpp) and by the 64-bit guest `libvulkan.so.1` shim
+ * in tools/vulkan-64, exactly as include/boxedwine_x64_x11_bridge.h is shared
+ * with tools/x11-64.
  *
  * Why this exists
  * ---------------
@@ -36,14 +37,29 @@
  *
  * The argument array is IN/OUT, as in the X11 bridge: an operation that
  * produces a variable-size result writes the size it needs back into the
- * capacity slot and returns BOXEDWINE_X64_VK_E_BUFFER. Every guest pointer
- * the host reads or writes through is validated against the guest page table
- * first; the host never dereferences a guest address directly.
+ * capacity slot and returns BOXEDWINE_X64_VK_E_BUFFER. The *array itself* is
+ * always validated against the guest page table before a slot is touched.
  *
- * Status: plumbing only. The operations below are the bootstrap set that
- * proves the trap reaches the host and reports what the host can do. No
- * Vulkan entry point is dispatched yet; see docs/PLAN_WOW64_D3D9.md for the
- * order the rest lands in and for what each step has to print.
+ * Why the arguments are guest pointers and nothing is marshalled
+ * -------------------------------------------------------------
+ * The IA-32 marshal exists because a 32-bit guest pointer is not a host
+ * address and a 32-bit guest's Vulkan structures are not laid out the way the
+ * host's are. Neither is true here:
+ *
+ *   1. The bridge is served only to the one process per session that FEX
+ *      translates, the process holding the identity map, where a guest
+ *      address *is* the host address (BOXEDWINE_X64_VK_CAP_IDENTITY_MEMORY,
+ *      the same rule the DXMT unix call enforces and
+ *      docs/KNOWN_LIMITATIONS_IOS.md section 4 records).
+ *   2. Every Vulkan structure has the same layout on x86-64 System V as on
+ *      arm64 AAPCS64: both are LP64, every Vulkan scalar has its natural
+ *      alignment on both, and Vulkan defines no bitfields or packed members.
+ *
+ * So the host dispatcher casts the argument words to the real Vulkan types
+ * and calls MoltenVK with them. What it must never do is call *through* a
+ * guest pointer: `pAllocator` is forced to NULL (which is what the IA-32
+ * marshal does too) and any command whose parameters include a guest
+ * callback is refused rather than dispatched.
  */
 #ifndef BOXEDWINE_X64_VULKAN_BRIDGE_H
 #define BOXEDWINE_X64_VULKAN_BRIDGE_H
@@ -62,7 +78,7 @@
  * block changes. The guest shim reads it through BOXEDWINE_X64_VK_OP_ABI and
  * refuses to run against a host it does not understand, so a stale shim in a
  * container is a named refusal rather than a crash inside Metal. */
-#define BOXEDWINE_X64_VK_ABI_VERSION 1U
+#define BOXEDWINE_X64_VK_ABI_VERSION 2U
 
 /* Results below zero never collide with a VkResult (VK_SUCCESS is 0 and the
  * Vulkan error codes are negative but far from these), a count, or a handle.
@@ -74,33 +90,137 @@
 #define BOXEDWINE_X64_VK_E_UNIMPL  (-5)  /* known operation, not implemented yet */
 #define BOXEDWINE_X64_VK_E_NOHOST  (-6)  /* the host has no Vulkan implementation */
 #define BOXEDWINE_X64_VK_E_MEMORY  (-7)  /* caller is not the identity-mapped process */
+#define BOXEDWINE_X64_VK_E_NOPROC  (-8)  /* the host driver does not expose the command */
 
-/* Operation table. The string is what diagnostics print; the index is ABI and
- * may only ever be appended to.
+/* Bootstrap operations.
  *
- * The three below are the bootstrap set:
- *   ABI     - no arguments; returns BOXEDWINE_X64_VK_ABI_VERSION.
- *   PROBE   - no arguments; returns a bitmask of BOXEDWINE_X64_VK_CAP_*, so a
- *             shim can decline cleanly on a build with no host Vulkan rather
- *             than failing at the first real call.
- *   ECHO    - args[0] in, args[0] out incremented; the smallest possible
- *             proof that the guest argument array was read and written back
- *             through the page table.
- * Everything a real ICD needs (instance creation, physical-device
- * enumeration, the per-instance and per-device procedure tables, the surface
- * and swapchain calls) is appended after these, in the order
- * docs/PLAN_WOW64_D3D9.md sets out.
+ *   ABI       - no arguments; returns BOXEDWINE_X64_VK_ABI_VERSION.
+ *   PROBE     - no arguments; returns a bitmask of BOXEDWINE_X64_VK_CAP_*, so
+ *               a shim can decline cleanly on a build with no host Vulkan
+ *               rather than failing at the first real call.
+ *   ECHO      - args[0] in, args[0] out incremented; the smallest possible
+ *               proof that the guest argument array was read and written back
+ *               through the page table.
+ *   PROC_ADDR - args[0] = VkInstance or VkDevice (0 for a global command),
+ *               args[1] = guest pointer to the NUL-terminated command name,
+ *               args[2] = 1 when the shim has a trampoline for that name and
+ *                         0 when it does not.
+ *               Returns 1 when the host driver exposes the command and the
+ *               shim can hand out its trampoline, 0 otherwise. The host names
+ *               every refusal in the log, which is how a run says what DXVK
+ *               asked for that this bridge does not carry.
  */
-#define BOXEDWINE_X64_VK_OPS(X) \
-    X(ABI,   0, "abi") \
-    X(PROBE, 1, "probe") \
-    X(ECHO,  2, "echo")
+#define BOXEDWINE_X64_VK_OP_ABI       0U
+#define BOXEDWINE_X64_VK_OP_PROBE     1U
+#define BOXEDWINE_X64_VK_OP_ECHO      2U
+#define BOXEDWINE_X64_VK_OP_PROC_ADDR 3U
+#define BOXEDWINE_X64_VK_OP_BOOTSTRAP_COUNT 4U
 
-#define BOXEDWINE_X64_VK_OP_ENUM(name, value, text) \
-    BOXEDWINE_X64_VK_OP_##name = (value),
+/* Vulkan commands start here. The index of a command is this base plus the
+ * ordinal the IA-32 lane already gave it in source/vulkan/vkdef.h, so the two
+ * lanes can never drift apart and a diagnostic that prints one number means
+ * the same command on both. scripts/test_x64_vulkan_shim.py asserts every
+ * ordinal below against vkdef.h. Append only. */
+#define BOXEDWINE_X64_VK_OP_VK_BASE 0x1000U
+
+/*
+ * The commands this bridge carries, as (name, IA-32 ordinal) pairs.
+ *
+ * The set is the bootstrap half of the D3D9 chain: everything Wine's
+ * winex11.drv binds by name out of the Vulkan library (its LOAD_FUNCPTR list
+ * in dlls/winex11.drv/vulkan.c of Wine 9.0 -- sixteen required symbols and
+ * four optional ones), plus the instance / physical-device / device / queue /
+ * memory / image / sync calls DXVK walks before it records a command buffer.
+ * The recording commands (vkCmd*, pipelines, descriptors, render passes,
+ * command pools) are deliberately absent: a run that gets that far names each
+ * one it wanted through BOXEDWINE_X64_VK_OP_PROC_ADDR, which is a cheaper way
+ * to learn the real list than guessing it. docs/PLAN_WOW64_D3D9.md holds the
+ * order they land in.
+ *
+ * Every command here takes only integers and pointers -- no float parameter,
+ * no by-value structure, no guest callback -- which is what makes a typed
+ * host-side call possible for each of them.
+ */
+#define BOXEDWINE_X64_VK_COMMANDS(X) \
+    /* global */ \
+    X(EnumerateInstanceVersion,                   14) \
+    X(EnumerateInstanceLayerProperties,           15) \
+    X(EnumerateInstanceExtensionProperties,       16) \
+    X(CreateInstance,                              1) \
+    X(DestroyInstance,                             2) \
+    X(EnumeratePhysicalDevices,                    3) \
+    /* physical device */ \
+    X(GetPhysicalDeviceProperties,                 6) \
+    X(GetPhysicalDeviceProperties2,              198) \
+    X(GetPhysicalDeviceFeatures,                   9) \
+    X(GetPhysicalDeviceFeatures2,                196) \
+    X(GetPhysicalDeviceFormatProperties,          10) \
+    X(GetPhysicalDeviceFormatProperties2,        200) \
+    X(GetPhysicalDeviceImageFormatProperties,     11) \
+    X(GetPhysicalDeviceImageFormatProperties2,   202) \
+    X(GetPhysicalDeviceQueueFamilyProperties,      7) \
+    X(GetPhysicalDeviceQueueFamilyProperties2,   204) \
+    X(GetPhysicalDeviceMemoryProperties,           8) \
+    X(GetPhysicalDeviceMemoryProperties2,        206) \
+    X(EnumerateDeviceLayerProperties,             17) \
+    X(EnumerateDeviceExtensionProperties,         18) \
+    /* device and queue */ \
+    X(CreateDevice,                               12) \
+    X(DestroyDevice,                              13) \
+    X(GetDeviceQueue,                             19) \
+    X(DeviceWaitIdle,                             22) \
+    X(QueueWaitIdle,                              21) \
+    X(QueueSubmit,                                20) \
+    /* memory */ \
+    X(AllocateMemory,                             23) \
+    X(FreeMemory,                                 24) \
+    X(MapMemory,                                  25) \
+    X(UnmapMemory,                                26) \
+    X(FlushMappedMemoryRanges,                    27) \
+    X(InvalidateMappedMemoryRanges,               28) \
+    X(GetBufferMemoryRequirements,                30) \
+    X(BindBufferMemory,                           31) \
+    X(GetImageMemoryRequirements,                 32) \
+    X(BindImageMemory,                            33) \
+    X(GetMemoryHostPointerPropertiesEXT,         302) \
+    /* buffers, images, views */ \
+    X(CreateBuffer,                               54) \
+    X(DestroyBuffer,                              55) \
+    X(CreateImage,                                58) \
+    X(DestroyImage,                               59) \
+    X(CreateImageView,                            61) \
+    X(DestroyImageView,                           62) \
+    /* synchronisation */ \
+    X(CreateFence,                                37) \
+    X(DestroyFence,                               38) \
+    X(ResetFences,                                39) \
+    X(GetFenceStatus,                             40) \
+    X(WaitForFences,                              41) \
+    X(CreateSemaphore,                            42) \
+    X(DestroySemaphore,                           43) \
+    /* surface and swapchain */ \
+    X(DestroySurfaceKHR,                         161) \
+    X(GetPhysicalDeviceSurfaceSupportKHR,        162) \
+    X(GetPhysicalDeviceSurfaceCapabilitiesKHR,   163) \
+    X(GetPhysicalDeviceSurfaceFormatsKHR,        164) \
+    X(GetPhysicalDeviceSurfacePresentModesKHR,   165) \
+    X(GetPhysicalDeviceSurfaceCapabilities2KHR,  257) \
+    X(GetPhysicalDeviceSurfaceFormats2KHR,       258) \
+    X(GetPhysicalDevicePresentRectanglesKHR,     241) \
+    X(GetDeviceGroupSurfacePresentModesKHR,      237) \
+    X(CreateSwapchainKHR,                        166) \
+    X(DestroySwapchainKHR,                       167) \
+    X(GetSwapchainImagesKHR,                     168) \
+    X(AcquireNextImageKHR,                       169) \
+    X(QueuePresentKHR,                           170) \
+    X(CreateXlibSurfaceKHR,                      171) \
+    X(GetPhysicalDeviceXlibPresentationSupportKHR, 172)
+
+#define BOXEDWINE_X64_VK_OP_ENUM(name, ordinal) \
+    BOXEDWINE_X64_VK_OP_##name = (BOXEDWINE_X64_VK_OP_VK_BASE + (ordinal)),
 enum {
-    BOXEDWINE_X64_VK_OPS(BOXEDWINE_X64_VK_OP_ENUM)
-    BOXEDWINE_X64_VK_OP_COUNT
+    BOXEDWINE_X64_VK_COMMANDS(BOXEDWINE_X64_VK_OP_ENUM)
+    BOXEDWINE_X64_VK_OP_SENTINEL
 };
 #undef BOXEDWINE_X64_VK_OP_ENUM
 
@@ -114,9 +234,12 @@ enum {
  * constraint the DXMT unix call already enforces and records in
  * docs/KNOWN_LIMITATIONS_IOS.md section 4. */
 #define BOXEDWINE_X64_VK_CAP_IDENTITY_MEMORY 0x2ULL
+/* The host loaded a real Vulkan driver and resolved vkGetInstanceProcAddr.
+ * Distinct from CAP_HOST_MARSHAL, which only says the code is compiled in. */
+#define BOXEDWINE_X64_VK_CAP_DRIVER 0x4ULL
 
 /* The soname the guest loader looks for, and the only name Wine's
- * winevulkan.so dlopens (SONAME_LIBVULKAN). Kept here so the shim, the
+ * winex11.drv dlopens (SONAME_LIBVULKAN). Kept here so the shim, the
  * packaging and the diagnostics cannot disagree about it. */
 #define BOXEDWINE_X64_VK_GUEST_SONAME "libvulkan.so.1"
 

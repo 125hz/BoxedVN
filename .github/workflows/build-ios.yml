@@ -198,10 +198,19 @@ jobs:
           bash scripts/build-boxedwine-x64-x11.sh \
             --output-dir build/x64-x11 \
             --winex11 "${winex11}"
+          # The guest Vulkan ICD, validated against the same winex11.so: that
+          # driver is what dlopens libvulkan.so.1 and binds sixteen symbols out
+          # of it by name, so a Wine update that adds a seventeenth fails here
+          # rather than as a silent "no Vulkan adapter" on a device.
+          bash scripts/build-boxedwine-x64-vulkan.sh \
+            --output-dir build/x64-vulkan \
+            --winex11 "${winex11}"
           bash scripts/build-wine64-runtime-ci.sh \
             --output-dir build/wine64-runtime \
             --dxmt-unixlib build/winemetal.so \
             --x11-shim-dir build/x64-x11 \
+            --vulkan-shim build/x64-vulkan/libvulkan.so.1 \
+            --dxvk-i386-dir ios/app/Dxvk \
             --i386-pe-dir build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows
           bash scripts/validate-wine64-runtime.sh \
             --input build/wine64-runtime \
@@ -454,7 +463,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: third_party
-          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/build-boxedwine-x64-x11.sh', 'scripts/validate-x64-x11-shim.py', 'tools/x11-64/**', 'include/boxedwine_x64_x11_bridge.h', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/rewrite-dxmt-guest-pointers.py', 'include/boxedwine_dxmt_guest_pointer.h', 'tools/dxmt/**', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/guest-probes/x64-d3d11-cube-shaders.h', 'scripts/guest-probes/x64-d3d11-cube.hlsl', 'scripts/wine64-runtime-manifest.example') }}
+          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/build-boxedwine-x64-x11.sh', 'scripts/validate-x64-x11-shim.py', 'tools/x11-64/**', 'include/boxedwine_x64_x11_bridge.h', 'scripts/build-boxedwine-x64-vulkan.sh', 'scripts/validate-x64-vulkan-shim.py', 'tools/vulkan-64/**', 'include/boxedwine_x64_vulkan_bridge.h', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/rewrite-dxmt-guest-pointers.py', 'include/boxedwine_dxmt_guest_pointer.h', 'tools/dxmt/**', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/guest-probes/x64-d3d11-cube-shaders.h', 'scripts/guest-probes/x64-d3d11-cube.hlsl', 'scripts/wine64-runtime-manifest.example') }}
 
       - name: Fetch pinned dependencies
         shell: bash
