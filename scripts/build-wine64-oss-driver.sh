@@ -251,17 +251,33 @@ grep -q '^#define HAVE_OSS_SYSINFO_NUMAUDIOENGINES 1' "${BUILD}/include/config.h
 ok "configure accepted the OSSv4 <sys/soundcard.h>"
 
 log "Building dlls/wineoss.drv"
-# Name the two output files, not the directory. "make dlls/wineoss.drv" asks
-# for a target that already exists as a directory in the build tree, so make
-# reports "Nothing to be done" and the step then fails on a missing library:
-# that is what happened on the first run where configure accepted OSSv4.
-if ! make -C "${BUILD}" -j"${JOBS}" dlls/wineoss.drv/wineoss.so dlls/wineoss.drv/wineoss.drv; then
+# Name the output files, not the directory: "make dlls/wineoss.drv" asks for a
+# target that already exists as a directory in the build tree, so make reports
+# "Nothing to be done" and the step then fails on a missing library.
+#
+# Where the PE half lands depends on the version's multi-arch layout: 9.0 with
+# --enable-archs builds it under <module>/<arch>-windows/, older trees put it
+# beside the unix half. Ask make which target it knows rather than guessing,
+# so a version bump reports an unknown layout instead of a missing file.
+unix_target="dlls/wineoss.drv/wineoss.so"
+pe_target=""
+for candidate in "dlls/wineoss.drv/x86_64-windows/wineoss.drv" "dlls/wineoss.drv/wineoss.drv"; do
+    if make -C "${BUILD}" -n "${candidate}" >/dev/null 2>&1; then
+        pe_target="${candidate}"
+        break
+    fi
+done
+if [[ -z "${pe_target}" ]]; then
+    die "Wine ${WINE_VERSION} builds no wineoss.drv at either layout this script knows. Check the module layout in ${BUILD}/Makefile."
+fi
+log "Building ${unix_target} and ${pe_target}"
+if ! make -C "${BUILD}" -j"${JOBS}" "${unix_target}" "${pe_target}"; then
     die "Building dlls/wineoss.drv failed."
 fi
 
 # --- verify and stage -------------------------------------------------------
-unix_half="${BUILD}/dlls/wineoss.drv/wineoss.so"
-pe_half="${BUILD}/dlls/wineoss.drv/wineoss.drv"
+unix_half="${BUILD}/${unix_target}"
+pe_half="${BUILD}/${pe_target}"
 [[ -s "${unix_half}" ]] \
     || die "The build produced no wineoss.so. Wine's unix half is what talks to /dev/dsp; without it the PE half has nothing to call."
 [[ -s "${pe_half}" ]] \
