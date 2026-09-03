@@ -87,6 +87,26 @@
 #define K_X64_GUEST_X11_LIB_DIR "/usr/lib/boxedwine64-x11"
 #define K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT "LD_LIBRARY_PATH=" K_X64_GUEST_X11_LIB_DIR
 
+// Where a 64-bit guest Vulkan shim has to be staged, and why it is this
+// directory. Wine's winevulkan.so dlopens the bare soname, so the guest's own
+// ld-linux decides; the directory above is already at the head of
+// LD_LIBRARY_PATH for a 64-bit launch, and a device run of a 32-bit Direct3D 9
+// program shows the loader trying exactly this path first:
+//
+//   open('/usr/lib/boxedwine64-x11/libvulkan.so.1') -> -2
+//   ... then /etc/ld.so.cache and six more paths, of which /lib/libvulkan.so.1
+//   opens and is walked past, because the file in the root filesystem is the
+//   IA-32 shim (an i386 ELF; it traps through `int 0x9A`, which CPU64 does not
+//   decode). The 64-bit loader rejects it for its ELF class and keeps
+//   searching, so wined3d gets no Vulkan adapter and no GL adapter and
+//   Direct3DCreate9 fails.
+//
+// Nothing builds this file yet. The name is fixed here so the builder, the
+// packaging and the startup witness cannot disagree about it.
+#define K_X64_GUEST_VULKAN_SONAME "libvulkan.so.1"
+#define K_X64_GUEST_VULKAN_LIB_PATH \
+    K_X64_GUEST_X11_LIB_DIR "/" K_X64_GUEST_VULKAN_SONAME
+
 // The DXMT modules are built as Wine builtins (their DOS stub carries Wine's
 // builtin marker so winemetal.dll can bind to winemetal.so through
 // __wine_unix_call). Wine treats a builtin-marked PE found outside its module

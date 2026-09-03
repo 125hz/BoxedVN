@@ -23,6 +23,8 @@
 #include "vk_host.h"
 #include "vkdef.h"
 #include "kvulkan.h"
+#include "boxedwine_x64_vulkan_bridge.h"
+#include "guest_wine64_layout.h"
 #include <SDL_vulkan.h>
 #ifdef BOXEDWINE_IOS
 #include "BVNFrameRate.h"
@@ -697,6 +699,32 @@ Int99Callback int9ACallback[VK_LAST_VALUE+1];
 U32 int9ACallbackSize;
 
 void vulkan_init() {
+    // One startup line that answers "can a 64-bit guest reach the host's
+    // Vulkan at all", which today it cannot. The IA-32 lane traps through
+    // `int 0x9A` into the callback table built below; CPU64 decodes no such
+    // trap, so the 64-bit lane needs a guest `libvulkan.so.1` of its own that
+    // traps through BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE, built and staged
+    // the way tools/x11-64 builds the X11 client shims. Nothing in this tree
+    // builds one yet, and the file a 64-bit guest does find under that name
+    // is the IA-32 shim in the root filesystem, which its loader rejects for
+    // its ELF class and silently walks past. `present` flips when the
+    // packaging lands and defines BOXEDWINE_X64_VULKAN_GUEST_SHIM; see
+    // docs/PLAN_WOW64_D3D9.md.
+#if defined(BOXEDWINE_X64_VULKAN_GUEST_SHIM)
+    const int guestShimPresent = 1;
+#else
+    const int guestShimPresent = 0;
+#endif
+    klog_fmt("BOXEDWINE_X64_VULKAN_SHIM present=%d icd=%s hostcall=0x%llx "
+             "abi=%u soname=%s path=%s lane32_ops=%u",
+             guestShimPresent,
+             guestShimPresent ? BOXEDWINE_X64_VK_GUEST_SONAME : "none",
+             (unsigned long long)BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE,
+             (unsigned)BOXEDWINE_X64_VK_ABI_VERSION,
+             BOXEDWINE_X64_VK_GUEST_SONAME,
+             K_X64_GUEST_VULKAN_LIB_PATH,
+             (unsigned)(VK_LAST_VALUE + 1));
+
     int9ACallbackSize = VK_LAST_VALUE+1;
 
 #undef VKFUNC
