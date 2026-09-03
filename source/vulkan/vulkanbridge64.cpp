@@ -139,6 +139,46 @@ int commandIndexForOp(U64 op) {
     return -1;
 }
 
+// The KHR spelling of each command promoted from an extension into Vulkan 1.1,
+// indexed by command, nullptr for a command that has only one name. A driver
+// may expose only one of the two depending on the API version the instance was
+// created with, so resolution tries the core name first and this second.
+//
+// Filled at first use rather than declared as an initialiser because
+// BOXEDWINE_X64_VK_ALIASES is keyed by command name, not by index. Every write
+// stores the same constant, so a race between two threads reaching this first
+// is harmless, and the critical section only keeps that honest.
+const char* gCommandAlias[VKB_COUNT] = {};
+bool gAliasesReady = false;
+
+void buildAliasTable() {
+    if (gAliasesReady) {
+        return;
+    }
+    BOXEDWINE_CRITICAL_SECTION;
+    if (gAliasesReady) {
+        return;
+    }
+#define VKB_ALIAS_FILL(alias, core) gCommandAlias[VKB_##core] = "vk" #alias;
+    BOXEDWINE_X64_VK_ALIASES(VKB_ALIAS_FILL)
+#undef VKB_ALIAS_FILL
+    gAliasesReady = true;
+}
+
+// The command an alias spelling resolves to, or -1. Separate from the exact
+// match so a caller asking for `vkGetPhysicalDeviceProperties2KHR` on a 1.0
+// instance is served rather than told the driver has no such command --
+// which is how DXVK concludes it cannot use a device at all.
+int commandIndexForAlias(const char* name) {
+    buildAliasTable();
+    for (int i = 0; i < VKB_COUNT; ++i) {
+        if (gCommandAlias[i] && !strcmp(gCommandAlias[i], name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 // ---- The host driver --------------------------------------------------------
 
 PFN_vkGetInstanceProcAddr gGetInstanceProcAddr = nullptr;
@@ -180,6 +220,17 @@ PFN_vkVoidFunction hostProc(int index) {
     PFN_vkVoidFunction fn = gipa(gInstance, kCommandName[index]);
     if (!fn && gInstance != VK_NULL_HANDLE) {
         fn = gipa(VK_NULL_HANDLE, kCommandName[index]);
+    }
+    if (!fn) {
+        // The KHR spelling, for a driver that exposes the extension form but
+        // not the core one because the instance is Vulkan 1.0.
+        buildAliasTable();
+        if (gCommandAlias[index]) {
+            fn = gipa(gInstance, gCommandAlias[index]);
+            if (!fn && gInstance != VK_NULL_HANDLE) {
+                fn = gipa(VK_NULL_HANDLE, gCommandAlias[index]);
+            }
+        }
     }
     gResolved[index] = fn;
     gResolvedFor[index] = gInstance;
@@ -590,6 +641,9 @@ S64 procAddr(KMemory64* memory, U64 handle, U64 nameAddress, U64 inShimTable) {
             index = i;
             break;
         }
+    }
+    if (index < 0) {
+        index = commandIndexForAlias(name);
     }
     if (index < 0) {
         // The point of the whole operation: a run says by name what the

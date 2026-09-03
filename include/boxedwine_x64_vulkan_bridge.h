@@ -216,6 +216,33 @@
     X(CreateXlibSurfaceKHR,                      171) \
     X(GetPhysicalDeviceXlibPresentationSupportKHR, 172)
 
+/*
+ * Alternate spellings that resolve to the same operation.
+ *
+ * Every command here was promoted from a KHR extension into Vulkan 1.1, and
+ * both spellings stayed valid. Which one a caller asks for depends on the API
+ * version it created the instance with, not on what it wants: DXVK queries
+ * `vkGetPhysicalDeviceProperties2KHR` and
+ * `vkGetPhysicalDeviceMemoryProperties2KHR` on a 1.0 instance, and Wine's
+ * winex11.drv names both as well. A lookup that only matched the core
+ * spelling would hand back NULL and the caller would conclude the driver has
+ * no `VK_KHR_get_physical_device_properties2` -- which is how DXVK decides it
+ * cannot use a device at all.
+ *
+ * So the guest ICD exports the alias under the core command's own entry point
+ * (the trap carries the operation number, not the name), and the host tries
+ * the core spelling against the driver first and the KHR spelling second,
+ * because MoltenVK may expose only one of the two depending on the instance
+ * version. First is (alias suffix name, core command name).
+ */
+#define BOXEDWINE_X64_VK_ALIASES(X) \
+    X(GetPhysicalDeviceFeatures2KHR,              GetPhysicalDeviceFeatures2) \
+    X(GetPhysicalDeviceProperties2KHR,            GetPhysicalDeviceProperties2) \
+    X(GetPhysicalDeviceFormatProperties2KHR,      GetPhysicalDeviceFormatProperties2) \
+    X(GetPhysicalDeviceImageFormatProperties2KHR, GetPhysicalDeviceImageFormatProperties2) \
+    X(GetPhysicalDeviceQueueFamilyProperties2KHR, GetPhysicalDeviceQueueFamilyProperties2) \
+    X(GetPhysicalDeviceMemoryProperties2KHR,      GetPhysicalDeviceMemoryProperties2)
+
 #define BOXEDWINE_X64_VK_OP_ENUM(name, ordinal) \
     BOXEDWINE_X64_VK_OP_##name = (BOXEDWINE_X64_VK_OP_VK_BASE + (ordinal)),
 enum {

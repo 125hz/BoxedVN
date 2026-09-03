@@ -117,10 +117,19 @@ class GuestShimContract(unittest.TestCase):
         self.assertEqual(stray, [], f"exported without an operation number: {stray}")
 
     def test_every_required_winex11_symbol_is_defined(self) -> None:
-        required, _optional = validator.read_import_contract(IMPORTS)
+        required, _optional, _not_imported = validator.read_import_contract(IMPORTS)
         missing = sorted(required - self.defined)
         self.assertEqual(missing, [],
                          f"winex11.drv binds {missing} by name and the shim lacks them")
+
+    def test_every_alias_maps_onto_a_command_the_shim_defines(self) -> None:
+        source = SHIM_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("BOXEDWINE_X64_VK_ALIASES(BW_ALIAS_ENTRY)", source,
+                      "the shim's lookup table must carry the alias spellings")
+        for alias, core in validator.read_bridge_aliases(BRIDGE_HEADER).items():
+            with self.subTest(alias=alias):
+                self.assertIn("vk" + core, self.defined)
+                self.assertIn(core, self.commands)
 
     def test_the_shim_traps_with_the_syscall_instruction(self) -> None:
         header = BRIDGE_HEADER.read_text(encoding="utf-8")
@@ -170,19 +179,50 @@ class HostDispatcherContract(unittest.TestCase):
         self.assertIn("BOXEDWINE_X64_VK_E_MEMORY", source)
         self.assertIn("nativeIdentityMode", source)
 
+    def test_alias_spellings_resolve_and_fall_back(self) -> None:
+        # A caller asking for the KHR spelling has to be served, and the host
+        # has to try that spelling against the driver when the core one is
+        # absent -- MoltenVK may expose only one of the two.
+        source = DISPATCHER.read_text(encoding="utf-8")
+        self.assertIn("BOXEDWINE_X64_VK_ALIASES(VKB_ALIAS_FILL)", source)
+        self.assertIn("commandIndexForAlias", source)
+        self.assertIn("gCommandAlias[index]", source)
+
 
 class ImportContract(unittest.TestCase):
-    def test_required_and_optional_lists_are_disjoint_and_sorted(self) -> None:
-        required, optional = validator.read_import_contract(IMPORTS)
+    def test_the_three_blocks_are_disjoint(self) -> None:
+        required, optional, not_imported = validator.read_import_contract(IMPORTS)
         self.assertEqual(required & optional, set())
-        for block in (required, optional):
-            self.assertEqual(sorted(block), sorted(block))
+        self.assertEqual(required & not_imported, set(),
+                         "a name cannot be both dlsym'd and not imported")
+        self.assertEqual(optional & not_imported, set())
 
     def test_every_required_symbol_is_dispatchable(self) -> None:
-        required, _optional = validator.read_import_contract(IMPORTS)
+        required, _optional, _not_imported = validator.read_import_contract(IMPORTS)
         dispatchable = {"vk" + name for name in bridge_commands()}
         dispatchable |= set(validator.ALWAYS_EXPORTED)
         self.assertEqual(sorted(required - dispatchable), [])
+
+    def test_the_not_imported_block_carries_the_names_ci_reported(self) -> None:
+        # The first CI run of this validator failed on exactly these strings.
+        # Each is in winex11.so and none is dlsym'd out of the Vulkan library;
+        # the reasons are recorded above the block in the contract file.
+        _required, _optional, not_imported = validator.read_import_contract(IMPORTS)
+        for name in ("vkCreateWin32SurfaceKHR",
+                     "vkGetPhysicalDeviceWin32PresentationSupportKHR",
+                     "vkGetPhysicalDeviceProperties2KHR",
+                     "vkGetPhysicalDeviceMemoryProperties2KHR",
+                     "vkGetRandROutputDisplayEXT"):
+            with self.subTest(name=name):
+                self.assertIn(name, not_imported)
+
+    def test_the_two_khr_names_dxvk_queries_are_still_served(self) -> None:
+        # Recorded as not-dlsym'd, but DXVK asks for both through
+        # vkGetInstanceProcAddr on a 1.0 instance. Being in [not-imported]
+        # must not mean the bridge cannot answer them.
+        aliases = {"vk" + name for name in validator.read_bridge_aliases(BRIDGE_HEADER)}
+        self.assertIn("vkGetPhysicalDeviceProperties2KHR", aliases)
+        self.assertIn("vkGetPhysicalDeviceMemoryProperties2KHR", aliases)
 
 
 # ---- A synthetic ELF, so the validator itself is tested -----------------------
@@ -261,7 +301,7 @@ def build_library(soname: str, exports: list[str],
 class ValidatorContract(unittest.TestCase):
     def setUp(self) -> None:
         self.commands = bridge_commands()
-        self.required, _ = validator.read_import_contract(IMPORTS)
+        self.required, _, _ = validator.read_import_contract(IMPORTS)
         self.exports = sorted({"vk" + name for name in self.commands}
                               | set(validator.ALWAYS_EXPORTED)
                               | self.required)
@@ -310,6 +350,17 @@ class ValidatorContract(unittest.TestCase):
         with self.assertRaises(validator.ValidationError):
             self.run_validator(path)
 
+    def driver_naming(self, *names: str) -> pathlib.Path:
+        """A stand-in winex11.so whose string table holds `names`, plus every
+        symbol the contract records as dlsym'd (absent one of those is its own
+        failure, which other tests cover)."""
+        required, _, _ = validator.read_import_contract(IMPORTS)
+        blob = b"\x00".join(
+            name.encode() for name in sorted(required) + list(names))
+        driver = self.dir / "winex11.so"
+        driver.write_bytes(b"\x00" + blob + b"\x00")
+        return driver
+
     def test_measures_command_strings_out_of_a_driver(self) -> None:
         driver = self.dir / "winex11.so"
         driver.write_bytes(b"\x00vkQueuePresentKHR\x00vkSomethingNewKHR\x00")
@@ -317,10 +368,45 @@ class ValidatorContract(unittest.TestCase):
         self.assertIn("vkQueuePresentKHR", measured)
         self.assertIn("vkSomethingNewKHR", measured)
 
-    def test_refuses_a_driver_naming_an_unrecorded_command(self) -> None:
-        path = self.write(build_library("libvulkan.so.1", self.exports))
+    def test_does_not_measure_a_name_inside_a_longer_identifier(self) -> None:
+        # The false positives that failed the first CI run: winex11's own
+        # exported X11DRV_* wrappers and its internal wine_vk_* helpers.
         driver = self.dir / "winex11.so"
-        driver.write_bytes(b"\x00vkSomethingNobodyRecorded\x00")
+        driver.write_bytes(
+            b"\x00X11DRV_vkCreateWin32SurfaceKHR\x00wine_vk_init\x00"
+            b"wine_vk_instance_convert_create_info\x00")
+        measured = validator.measure_winex11_vulkan_strings(driver)
+        self.assertEqual(measured, set())
+
+    def test_accepts_a_driver_naming_only_allow_listed_extras(self) -> None:
+        # The five names CI reported. All are recorded under [not-imported],
+        # so the build must pass.
+        path = self.write(build_library("libvulkan.so.1", self.exports))
+        driver = self.driver_naming(
+            "vkCreateWin32SurfaceKHR",
+            "vkGetPhysicalDeviceWin32PresentationSupportKHR",
+            "vkGetPhysicalDeviceProperties2KHR",
+            "vkGetPhysicalDeviceMemoryProperties2KHR",
+            "vkGetRandROutputDisplayEXT")
+        counts = validator.validate(path, IMPORTS, BRIDGE_HEADER, driver)
+        self.assertGreater(counts["driver_named"], 0)
+
+    def test_an_unrecorded_name_is_a_note_not_a_failure(self) -> None:
+        # Undecidable from the binary: a dlsym argument and any other literal
+        # are both just strings. It gets reported for a human to check, not
+        # turned into a build failure.
+        path = self.write(build_library("libvulkan.so.1", self.exports))
+        driver = self.driver_naming("vkSomethingNobodyRecorded")
+        validator.validate(path, IMPORTS, BRIDGE_HEADER, driver)
+
+    def test_refuses_a_driver_that_no_longer_names_a_required_symbol(self) -> None:
+        # The drift that *is* decidable, and the one that matters: Wine
+        # renamed or dropped a symbol the contract says it dlsyms.
+        path = self.write(build_library("libvulkan.so.1", self.exports))
+        required, _, _ = validator.read_import_contract(IMPORTS)
+        kept = sorted(required - {"vkQueuePresentKHR"})
+        driver = self.dir / "winex11.so"
+        driver.write_bytes(b"\x00" + b"\x00".join(n.encode() for n in kept) + b"\x00")
         with self.assertRaises(validator.ValidationError):
             validator.validate(path, IMPORTS, BRIDGE_HEADER, driver)
 

@@ -147,6 +147,40 @@ finds first on `LD_LIBRARY_PATH`.
    else through `vkGetInstanceProcAddr`. The list lives in
    `tools/vulkan-64/winex11-vulkan-imports.txt` and the validator re-measures
    it against the packaged `winex11.so`'s own string table.
+
+   **What that re-measurement can and cannot decide.** A `dlsym` argument is
+   an ordinary string literal, so a scan of the driver sees it -- but it sees
+   every other literal too, and the first CI run failed on five of them. So
+   the check is split. What is decidable, and is fatal, is the reverse
+   direction: a name the contract records as dlsym'd that the driver no longer
+   spells out, which means Wine renamed or dropped it. What is not decidable
+   -- a name the driver mentions that the contract does not list -- is printed
+   as a note telling the reader to go and read `vulkan.c`, and the answer is
+   written back into a `[not-imported]` block with the reason. That block
+   holds five names today: `vkCreateWin32SurfaceKHR` and
+   `vkGetPhysicalDeviceWin32PresentationSupportKHR` (literals in
+   `wine_vk_host_fn_name()`, which rewrites the Win32 spelling to the Xlib one
+   before anything is looked up, and also the driver's own `X11DRV_*`
+   exports), `vkGetPhysicalDeviceProperties2KHR` and
+   `vkGetPhysicalDeviceMemoryProperties2KHR` (requested through
+   `vkGetInstanceProcAddr`, never dlsym'd), and `vkGetRandROutputDisplayEXT`
+   (display enumeration, also absent from the `LOAD_FUNCPTR` list). The scan
+   itself is now anchored at a string boundary and requires `vk` followed by
+   an upper-case letter, which is what stops the driver's `X11DRV_vk*` exports
+   and its internal `wine_vk_init` /
+   `wine_vk_instance_convert_create_info` from matching at all.
+
+   **KHR aliases.** Un-dlsym'd does not mean unwanted. DXVK asks for
+   `vkGetPhysicalDeviceProperties2KHR` and
+   `vkGetPhysicalDeviceMemoryProperties2KHR` through `vkGetInstanceProcAddr`
+   on a Vulkan 1.0 instance, and a NULL answer is how it concludes the driver
+   has no `VK_KHR_get_physical_device_properties2` and cannot be used at all.
+   `BOXEDWINE_X64_VK_ALIASES` in the ABI header lists the six commands
+   promoted from KHR into Vulkan 1.1 that this bridge carries; the guest ICD
+   exports each alias under the core command's own entry point (the trap
+   carries the operation number, not the name), and the host tries the core
+   spelling against MoltenVK first and the KHR spelling second, because a
+   driver may expose only one of the two.
    *Done:* `tools/vulkan-64/vulkan.c`,
    `scripts/build-boxedwine-x64-vulkan.sh`,
    `scripts/validate-x64-vulkan-shim.py`.

@@ -38,3 +38,30 @@ vkGetDeviceGroupSurfacePresentModesKHR
 vkGetPhysicalDevicePresentRectanglesKHR
 vkGetPhysicalDeviceSurfaceCapabilities2KHR
 vkGetPhysicalDeviceSurfaceFormats2KHR
+
+# Names that appear as strings inside winex11.so but are NOT dlsym'd out of the
+# Vulkan library, so the shim owes them nothing. Each is recorded with the
+# reason, because a bare string scan cannot tell a dlsym argument from any other
+# literal and the first CI run of this validator failed on exactly these.
+#
+# vkCreateWin32SurfaceKHR
+#   A literal in wine_vk_host_fn_name(), which translates the Win32 spelling to
+#   "vkCreateXlibSurfaceKHR" before anything is looked up. It is also the
+#   driver's own exported X11DRV_vkCreateWin32SurfaceKHR. Never dlsym'd.
+# vkGetPhysicalDeviceWin32PresentationSupportKHR
+#   The same translation pair: mapped to
+#   "vkGetPhysicalDeviceXlibPresentationSupportKHR", which *is* in [required].
+# vkGetPhysicalDeviceProperties2KHR
+# vkGetPhysicalDeviceMemoryProperties2KHR
+#   Absent from the LOAD_FUNCPTR list. Wine and DXVK request these through
+#   vkGetInstanceProcAddr, which is why the bridge aliases them onto its core
+#   *2 commands rather than exporting them as separate entry points.
+# vkGetRandROutputDisplayEXT
+#   Part of winex11's display-enumeration handling, resolved through
+#   vkGetInstanceProcAddr if at all. Not in the LOAD_FUNCPTR list.
+[not-imported]
+vkCreateWin32SurfaceKHR
+vkGetPhysicalDeviceMemoryProperties2KHR
+vkGetPhysicalDeviceProperties2KHR
+vkGetPhysicalDeviceWin32PresentationSupportKHR
+vkGetRandROutputDisplayEXT

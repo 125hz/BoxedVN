@@ -377,11 +377,17 @@ struct bw_proc {
 /* Built from the same list the host dispatches, so the exported set and the
  * bridge's operation table can never disagree. */
 #define BW_PROC_ENTRY(name, ordinal) { "vk" #name, (PFN_vkVoidFunction)vk##name },
+/* An alias resolves to the core command's own entry point: the trap carries
+ * the operation number, not the name, so there is nothing for a separate
+ * function to do. */
+#define BW_ALIAS_ENTRY(alias, core) { "vk" #alias, (PFN_vkVoidFunction)vk##core },
 static const struct bw_proc bw_procs[] = {
     BOXEDWINE_X64_VK_COMMANDS(BW_PROC_ENTRY)
+    BOXEDWINE_X64_VK_ALIASES(BW_ALIAS_ENTRY)
     { "vkGetInstanceProcAddr", (PFN_vkVoidFunction)vkGetInstanceProcAddr },
     { "vkGetDeviceProcAddr", (PFN_vkVoidFunction)vkGetDeviceProcAddr },
 };
+#undef BW_ALIAS_ENTRY
 #undef BW_PROC_ENTRY
 
 static const struct bw_proc* bw_find(const char* name)

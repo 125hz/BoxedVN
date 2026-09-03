@@ -6866,3 +6866,81 @@ status=0`, and a run of `missing=<name>` lines that is the exact list of what
 to implement next. A `caps=` without bit 0x4 means the host loaded no driver;
 without 0x2, the caller is a forked child and the refusal is structural
 (`docs/KNOWN_LIMITATIONS_IOS.md` section 4).
+
+## The import check was reading strings and calling them imports
+
+CI run 33733945505 failed the runtime job in
+`scripts/build-boxedwine-x64-vulkan.sh`: the packaged `winex11.so` "names 7
+Vulkan command(s) neither recorded in winex11-vulkan-imports.txt nor carried
+by the bridge". None of the seven was an import. The check was wrong, not the
+shim.
+
+Two of them were not even whole names. `vk_init` and
+`vk_instance_convert_create_info` are the tails of winex11's own
+`wine_vk_init` and `wine_vk_instance_convert_create_info`, matched because the
+scan looked for `vk` followed by identifier characters and a NUL and never
+required the match to *start* at a string boundary. `vkCreateWin32SurfaceKHR`
+matched for the same reason inside `X11DRV_vkCreateWin32SurfaceKHR`, which is
+the driver's own exported function.
+
+The other three are real, whole strings that are still not imports.
+`vkCreateWin32SurfaceKHR` and `vkGetPhysicalDeviceWin32PresentationSupportKHR`
+are the two literals in `wine_vk_host_fn_name()`, which rewrites the Win32
+spelling into the Xlib one -- `vkCreateXlibSurfaceKHR` and
+`vkGetPhysicalDeviceXlibPresentationSupportKHR`, both of which *are* in the
+`LOAD_FUNCPTR` list and both of which the shim already exports.
+`vkGetRandROutputDisplayEXT`, `vkGetPhysicalDeviceProperties2KHR` and
+`vkGetPhysicalDeviceMemoryProperties2KHR` appear nowhere in that list at all;
+they are resolved, if ever, through `vkGetInstanceProcAddr`.
+
+The underlying mistake is that a `dlsym` argument and any other string literal
+are the same thing in a compiled binary. A scan cannot tell them apart, so it
+should not have been the thing that fails a build. The check is now split
+along what is actually decidable:
+
+- **Fatal, and new:** a name the contract records as dlsym'd that the driver
+  no longer spells out. That is Wine having renamed or dropped a symbol the
+  shim is built against, and its failure mode on device is the driver closing
+  the library handle with no diagnostic whatsoever -- exactly the silence this
+  validator exists to prevent. `vkQueuePresentKHR` disappearing from
+  `winex11.so` now fails the build by name.
+- **A note, not a failure:** a name the driver mentions that the contract does
+  not list. It prints, says to read the `LOAD_FUNCPTR` list in
+  `dlls/winex11.drv/vulkan.c`, and says which of the three blocks to record
+  the answer in.
+- **The string scan itself** is anchored at a string boundary and requires
+  `vk` plus an upper-case letter, which removes the `X11DRV_vk*` and
+  `wine_vk_*` matches outright rather than allow-listing them.
+- **`[not-imported]`**, a third block in `winex11-vulkan-imports.txt`, holds
+  the five genuine literals with a comment giving the reason for each. The
+  contract file is now the record of what was read in `vulkan.c`, which is
+  what it should have been from the start.
+
+## Two of those names were things DXVK actually needs
+
+`vkGetPhysicalDeviceProperties2KHR` and
+`vkGetPhysicalDeviceMemoryProperties2KHR` being un-dlsym'd says nothing about
+whether they are wanted. DXVK asks for both through `vkGetInstanceProcAddr` on
+a Vulkan 1.0 instance, and the ICD's lookup was an exact `strcmp` against the
+core spellings -- so it would have handed back NULL, and a NULL there is
+precisely how DXVK decides the driver has no
+`VK_KHR_get_physical_device_properties2` and refuses the device. The CI
+failure surfaced a real gap it was not looking for.
+
+`BOXEDWINE_X64_VK_ALIASES` in the ABI header now lists the six commands this
+bridge carries that were promoted from KHR into Vulkan 1.1 -- features,
+properties, format properties, image format properties, queue family
+properties and memory properties. The guest ICD exports each alias under the
+core command's own entry point, because the trap carries the operation number
+rather than the name and there is nothing for a second function to do. The
+host does the mirror of it: `procAddr` resolves an alias spelling onto the
+core command, and resolution against MoltenVK tries the core name first and
+the KHR name second, since a driver may expose only one of the two depending
+on the instance's API version.
+
+Seven new tests hold this: the alias list must name commands the table
+carries and the ICD defines, the five allow-listed names must stay in
+`[not-imported]`, the two DXVK asks for must stay aliased, a driver naming
+only allow-listed extras must pass, an unrecorded name must not fail, a
+driver missing a recorded required symbol must fail, and a name embedded in a
+longer identifier must not be measured at all. 33 tests in total.

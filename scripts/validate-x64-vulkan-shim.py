@@ -60,27 +60,57 @@ ALWAYS_EXPORTED = ("vkGetInstanceProcAddr", "vkGetDeviceProcAddr")
 COMMAND_RE = re.compile(r"^\s*X\((\w+),\s*(\d+)\)\s*\\?\s*$")
 
 
-def read_import_contract(path: pathlib.Path) -> tuple[set[str], set[str]]:
-    """Return (required, optional) symbol names."""
-    required: set[str] = set()
-    optional: set[str] = set()
+def read_import_contract(
+        path: pathlib.Path) -> tuple[set[str], set[str], set[str]]:
+    """Return (required, optional, not_imported) symbol names.
+
+    [required] and [optional] are the driver's LOAD_FUNCPTR and
+    LOAD_OPTIONAL_FUNCPTR lists. [not-imported] is the allow-list: names that
+    appear as strings in the driver but are never dlsym'd out of the Vulkan
+    library, each with the reason in a comment above the block.
+    """
+    blocks = {"[required]": set(), "[optional]": set(), "[not-imported]": set()}
     target = None
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if line == "[required]":
-            target = required
-            continue
-        if line == "[optional]":
-            target = optional
+        if line in blocks:
+            target = blocks[line]
             continue
         if target is None:
-            raise ValidationError(f"{path}: symbol {line!r} before a [required]/[optional] heading")
+            raise ValidationError(
+                f"{path}: symbol {line!r} before a [required]/[optional]/"
+                "[not-imported] heading")
         target.add(line)
+    required = blocks["[required]"]
     if not required:
         raise ValidationError(f"{path}: no required symbols recorded")
-    return required, optional
+    return required, blocks["[optional]"], blocks["[not-imported]"]
+
+
+ALIAS_RE = re.compile(r"^\s*X\((\w+),\s*(\w+)\)\s*\\?\s*$")
+
+
+def read_bridge_aliases(path: pathlib.Path) -> dict[str, str]:
+    """Parse BOXEDWINE_X64_VK_ALIASES out of the ABI header: the alternate
+    (KHR) spellings the guest ICD answers with a core command's entry point."""
+    text = path.read_text(encoding="utf-8")
+    start = text.find("#define BOXEDWINE_X64_VK_ALIASES(X)")
+    if start < 0:
+        raise ValidationError(f"{path}: no BOXEDWINE_X64_VK_ALIASES list")
+    aliases: dict[str, str] = {}
+    for raw in text[start:].splitlines()[1:]:
+        match = ALIAS_RE.match(raw)
+        if match:
+            aliases[match.group(1)] = match.group(2)
+            continue
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("/*") or stripped.startswith("*"):
+            continue
+        if not stripped.endswith("\\"):
+            break
+    return aliases
 
 
 def read_bridge_commands(path: pathlib.Path) -> dict[str, int]:
@@ -119,11 +149,28 @@ def exported_symbols(image: ELFImage) -> set[str]:
 
 
 def measure_winex11_vulkan_strings(path: pathlib.Path) -> set[str]:
-    """Every "vk*" string literal in a winex11.so, which is how its dlsym
-    names appear once the compiler is done with them."""
+    """Vulkan command names spelled out as whole strings inside a winex11.so.
+
+    A dlsym argument is an ordinary string literal, so this is the only way to
+    see one in a compiled driver -- but not every such literal is a dlsym
+    argument, and the match has to be narrowed twice or it reports nonsense:
+
+      * anchored at a string boundary, otherwise the driver's own exported
+        `X11DRV_vkCreateWin32SurfaceKHR` matches as a bare
+        `vkCreateWin32SurfaceKHR`, and its internal `wine_vk_init` matches as
+        `vk_init`;
+      * `vk` followed by an upper-case letter, which is how every Vulkan
+        command is spelled and how none of Wine's own `wine_vk_*` helpers are.
+
+    What survives is a name the driver mentions. Whether it *dlsyms* it cannot
+    be decided from the binary, which is what the [not-imported] block of the
+    contract file is for.
+    """
     data = path.read_bytes()
     found: set[str] = set()
-    for match in re.finditer(rb"vk[A-Za-z0-9_]{3,}\x00", data):
+    # (?<![A-Za-z0-9_]) keeps the match from starting in the middle of a
+    # longer identifier; the trailing NUL keeps it from ending in the middle.
+    for match in re.finditer(rb"(?<![A-Za-z0-9_])vk[A-Z][A-Za-z0-9]{2,}\x00", data):
         found.add(match.group(0)[:-1].decode("ascii"))
     return found
 
@@ -131,8 +178,15 @@ def measure_winex11_vulkan_strings(path: pathlib.Path) -> set[str]:
 def validate(shim: pathlib.Path, imports: pathlib.Path,
              bridge_header: pathlib.Path,
              winex11: pathlib.Path | None) -> dict[str, int]:
-    required, optional = read_import_contract(imports)
+    required, optional, not_imported = read_import_contract(imports)
     commands = read_bridge_commands(bridge_header)
+    aliases = read_bridge_aliases(bridge_header)
+    unknown_alias = sorted(
+        name for name, core in aliases.items() if core not in commands)
+    if unknown_alias:
+        raise ValidationError(
+            f"{bridge_header}: alias(es) {unknown_alias} name a command the "
+            "operation table does not carry")
 
     image = ELFImage(shim)
     if image.machine != EM_X86_64:
@@ -171,28 +225,57 @@ def validate(shim: pathlib.Path, imports: pathlib.Path,
     # would answer BOXEDWINE_X64_VK_E_BADOP on its first call, which is worse
     # than not exporting it.
     dispatchable = expected_commands | set(ALWAYS_EXPORTED)
+    dispatchable |= {"vk" + name for name in aliases}
     undispatchable = sorted(required - dispatchable)
     if undispatchable:
         raise ValidationError(
             f"{bridge_header}: winex11.drv requires {undispatchable}, which the bridge "
             "operation table does not carry")
 
+    named = 0
     if winex11 is not None:
         wanted = measure_winex11_vulkan_strings(winex11)
-        # Only names the driver could plausibly dlsym: the recorded contract
-        # plus anything else spelled like a Vulkan command.
-        unrecorded = sorted(wanted - required - optional - dispatchable)
-        if unrecorded:
+
+        # The check that matters, and the one the string scan can actually
+        # decide: a name this contract records as dlsym'd has to still be
+        # spelled out in the driver. If Wine renamed or dropped one, the shim
+        # is exporting a symbol nobody binds and, worse, is probably missing
+        # whatever replaced it -- and the failure on a device would be the
+        # driver closing the handle with no diagnostic at all.
+        vanished = sorted(name for name in required if name not in wanted)
+        if vanished:
             raise ValidationError(
-                f"{winex11}: names {len(unrecorded)} Vulkan command(s) neither recorded in "
-                f"{imports.name} nor carried by the bridge: " + ", ".join(unrecorded[:16])
-                + (" ..." if len(unrecorded) > 16 else ""))
+                f"{winex11}: does not name {len(vanished)} symbol(s) that "
+                f"{imports.name} records as dlsym'd: " + ", ".join(vanished)
+                + f". Re-read the LOAD_FUNCPTR list in Wine's "
+                  "dlls/winex11.drv/vulkan.c and update the [required] block.")
+
+        # Anything else the driver mentions. This cannot be decided from the
+        # binary -- a dlsym argument and any other literal are both just
+        # strings -- so an unrecorded name is a request for a human to read
+        # vulkan.c, not a build failure. The [not-imported] block is where the
+        # answer gets written down once someone has.
+        unrecorded = sorted(wanted - required - optional - not_imported - dispatchable)
+        if unrecorded:
+            print(
+                f"note: {winex11} names {len(unrecorded)} Vulkan command(s) not in "
+                f"{imports.name}: " + ", ".join(unrecorded[:16])
+                + (" ..." if len(unrecorded) > 16 else "")
+                + "\n      Check the LOAD_FUNCPTR list in Wine's "
+                  "dlls/winex11.drv/vulkan.c: if the driver dlsyms one of these, "
+                  "add it to [required] (and to the bridge's operation table); "
+                  "otherwise record it under [not-imported] with the reason.",
+                file=sys.stderr)
+        named = len(wanted)
 
     return {
         "required": len(required),
         "optional": len(optional),
+        "not_imported": len(not_imported),
+        "aliases": len(aliases),
         "commands": len(commands),
         "exported": len(exported),
+        "driver_named": named,
     }
 
 
@@ -216,8 +299,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(
         "x86-64 guest Vulkan ICD verified: {shim} soname={soname} "
-        "required={required} optional={optional} commands={commands} "
-        "exported={exported}".format(shim=args.shim, soname=SONAME, **counts)
+        "required={required} optional={optional} not_imported={not_imported} "
+        "aliases={aliases} commands={commands} exported={exported} "
+        "driver_named={driver_named}".format(
+            shim=args.shim, soname=SONAME, **counts)
     )
     return 0
 
