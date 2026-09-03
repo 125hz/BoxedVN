@@ -328,12 +328,82 @@ int XDrawable::fillRectangle(KThread* thread, const std::shared_ptr<XGC>& gc, S3
 		height = h - y;
 	}
 
+	// A stippled fill paints a pattern, not a colour. This port cannot hold
+	// the pattern: op_CREATE_PIXMAP builds every pixmap with the source
+	// drawable's visual and ignores the depth the client asked for, so a
+	// stipple is a 32-bit pixmap, and copyImageData above refuses a 1-bit
+	// XPutImage into it (bits_per_pixel != visual->bits_per_rgb -> BadMatch).
+	// The stipple therefore stays as setSize left it, all zeroes, and every
+	// bit of the pattern is unknown rather than clear. Painting the
+	// foreground over the whole rectangle - what this did - is a guess, and
+	// on the Wine desktop it is the guess that decides an 800x600 erase:
+	// explorer's WM_ERASEBKGND reaches X as XChangeGC(GCStipple|GCFillStyle|
+	// GCForeground|GCBackground) followed by XFillRectangle over the whole
+	// desktop window, so one flat colour replaced everything underneath.
+	// Leaving the pixels alone keeps whatever the surface already shows,
+	// which is the window's background rather than half of a pattern.
+	const S32 fillStyle = gc->values.fill_style;
+	const bool patterned = fillStyle != FillSolid;
+	if (patterned) {
+		bool patternReadable = false;
+		if (fillStyle == FillStippled || fillStyle == FillOpaqueStippled) {
+			XDrawablePtr stipple = gc->values.stipple ?
+				XServer::getServer()->getDrawable(gc->values.stipple) : nullptr;
+			if (stipple && stipple->getData() && stipple->width() &&
+				stipple->height() && stipple->getBitsPerPixel() == 32) {
+				const U8* bits = stipple->getData();
+				const U32 stipplePitch = stipple->getBytesPerLine();
+				for (U32 sy = 0; sy < stipple->height() && !patternReadable;
+					sy++) {
+					const U32* line = (const U32*)(bits + (U64)stipplePitch * sy);
+					for (U32 sx = 0; sx < stipple->width(); sx++) {
+						if (line[sx]) {
+							patternReadable = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+		static U32 reportedPatternFill = 0;
+		if (reportedPatternFill < 8) {
+			reportedPatternFill++;
+			klog_fmt("BOXEDWINE_X11_FILL_RECT drawable=0x%x style=%d "
+				"fg=0x%06x bg=0x%06x stipple=0x%x tile=0x%x rect=%d,%d %ux%u "
+				"painted=%d",
+				id, (int)fillStyle, gc->values.foreground,
+				gc->values.background, gc->values.stipple, gc->values.tile,
+				(int)x, (int)y, width, height, patternReadable ? 1 : 0);
+		}
+		if (!patternReadable) {
+			return Success;
+		}
+	}
+
 	if (visual->bits_per_rgb == 32) {
 		U32* p = (U32*)data;
-		U32 color = gc->values.foreground;
+		const U32 color = gc->values.foreground;
+		const U32 background = gc->values.background;
+		const XDrawablePtr stipple = patterned && gc->values.stipple ?
+			XServer::getServer()->getDrawable(gc->values.stipple) : nullptr;
 		p += bytes_per_line / 4 * y;
 		for (U32 dstY = 0; dstY < height; dstY++) {
 			for (U32 dstX = 0; dstX < width; dstX++) {
+				if (stipple) {
+					// The stipple repeats from the tile/stipple origin.
+					const U32 sx = (U32)(((S64)x + dstX - gc->values.ts_x_origin) %
+						(S64)stipple->width() + stipple->width()) % stipple->width();
+					const U32 sy = (U32)(((S64)y + dstY - gc->values.ts_y_origin) %
+						(S64)stipple->height() + stipple->height()) % stipple->height();
+					const U32* line = (const U32*)(stipple->getData() +
+						(U64)stipple->getBytesPerLine() * sy);
+					if (line[sx]) {
+						p[x + dstX] = color;
+					} else if (fillStyle == FillOpaqueStippled) {
+						p[x + dstX] = background;
+					}
+					continue;
+				}
 				p[x + dstX] = color;
 			}
 			p += bytes_per_line/4;

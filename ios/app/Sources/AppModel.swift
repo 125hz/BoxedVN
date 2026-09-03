@@ -964,7 +964,13 @@ final class AppModel: ObservableObject {
         // status and tap "Re-check" for the badge to ever catch up. The probe
         // itself only reads csops/CS_DEBUGGED: cheap and safe enough to keep
         // live rather than rely on the user noticing it's stale.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
+        // .common, not the default mode this timer would otherwise get: the
+        // guest runs on the main thread and the run loop spends its time in
+        // tracking and other modes, where a default-mode timer does not fire
+        // at all. This one still cannot outrun a blocked main actor - see
+        // GuestPerformanceReadout, which samples its own numbers for that
+        // reason - but it does keep the library screen's status live.
+        pollTimer = Timer(timeInterval: 0.5, repeats: true) {
             [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
@@ -985,6 +991,9 @@ final class AppModel: ObservableObject {
                     self.memory = .probe()
                 }
             }
+        }
+        if let pollTimer {
+            RunLoop.main.add(pollTimer, forMode: .common)
         }
     }
 

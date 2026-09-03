@@ -1057,6 +1057,29 @@ void XWindow::draw() {
 	// yet, or the window shows an uninitialised texture until it next changes.
 	const bool needsFirstUpload = !hasBeenPresented;
 	hasBeenPresented = true;
+	// Which window's pixels reach the screen first, and what colour they are
+	// where the desktop background would be. A blue top-left on the first
+	// line names a window whose background fill was presented; a black one
+	// says the fill never reached the buffer this call hands the native side.
+	// Budgeted, and it names the path so a run says whether the SDL blit or
+	// the Metal patch compositor consumed it.
+	{
+		static U32 reportedPresents = 0;
+		if (reportedPresents < 8) {
+			reportedPresents++;
+			U32 topLeft = 0;
+			if (data && visual && visual->bits_per_rgb == 32 &&
+				bytes_per_line >= 4) {
+				topLeft = *(U32*)data;
+			}
+			klog_fmt("BOXEDWINE_X11_PRESENT window=0x%x parent=0x%x at=%d,%d "
+				"size=%ux%u bpp=%d top_left=0x%08x dirty=%d first=%d blt=%d",
+				id, parent ? parent->id : 0, (int)screenX, (int)screenY,
+				width(), height(), visual ? visual->bits_per_rgb : 32,
+				topLeft, isDirty ? 1 : 0, needsFirstUpload ? 1 : 0,
+				KNativeSystem::getScreen()->canBltToScreen() ? 1 : 0);
+		}
+	}
 	KNativeSystem::getScreen()->putBitsOnWnd(id, data, visual?visual->bits_per_rgb:32, bytes_per_line, screenX, screenY, width(), height(), palette, isDirty || needsFirstUpload);
 	dirtyBoundsValid = false;
 	unlockData();

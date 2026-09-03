@@ -161,6 +161,9 @@ struct MemoryReport {
     var availableBytes: UInt64
     var physicalMemoryBytes: UInt64
     var processResidentBytes: UInt64
+    /// task_info(TASK_VM_INFO).phys_footprint - what the kernel bills against
+    /// the process limit, and what the live view's RAM readout shows.
+    var processFootprintBytes: UInt64
     var detail: String
 
     var statusText: String {
@@ -189,8 +192,29 @@ struct MemoryReport {
             availableBytes: report.availableBytes,
             physicalMemoryBytes: report.physicalMemoryBytes,
             processResidentBytes: report.processResidentBytes,
+            processFootprintBytes: report.processFootprintBytes,
             detail: report.detail.map(String.init(cString:)) ?? ""
         )
+    }
+}
+
+/// The memory numbers on their own, cheap enough to read twice a second while
+/// a guest is running: four kernel queries, no code-signature parsing.
+struct MemoryUsage {
+    var footprintBytes: UInt64
+    var residentBytes: UInt64
+    var availableBytes: UInt64
+    var physicalMemoryBytes: UInt64
+
+    static let zero = MemoryUsage(footprintBytes: 0, residentBytes: 0,
+                                  availableBytes: 0, physicalMemoryBytes: 0)
+
+    static func probe() -> MemoryUsage {
+        let usage = BVNMemoryUsageProbe()
+        return MemoryUsage(footprintBytes: usage.footprintBytes,
+                           residentBytes: usage.residentBytes,
+                           availableBytes: usage.availableBytes,
+                           physicalMemoryBytes: usage.physicalMemoryBytes)
     }
 }
 

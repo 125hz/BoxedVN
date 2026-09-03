@@ -129,6 +129,20 @@ static uint64_t processResidentBytes(void) {
     return static_cast<uint64_t>(info.resident_size);
 }
 
+// phys_footprint is the figure the kernel bills the process against its
+// memory limit - it is what Xcode's memory gauge and Jetsam use, and it
+// counts IOKit and compressed pages that resident_size leaves out. A guest
+// that has paged its translated code out still shows the memory it owns.
+static uint64_t processFootprintBytes(void) {
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return static_cast<uint64_t>(info.phys_footprint);
+}
+
 extern "C" BVNMemoryReport BVNMemoryProbe(void) {
     static thread_local std::string detail;
     BVNMemoryReport report{};
@@ -137,8 +151,25 @@ extern "C" BVNMemoryReport BVNMemoryProbe(void) {
     report.physicalMemoryBytes =
         static_cast<uint64_t>(NSProcessInfo.processInfo.physicalMemory);
     report.processResidentBytes = processResidentBytes();
+    report.processFootprintBytes = processFootprintBytes();
+    if (!report.processFootprintBytes) {
+        report.processFootprintBytes = report.processResidentBytes;
+    }
     report.detail = detail.c_str();
     return report;
+}
+
+extern "C" BVNMemoryUsage BVNMemoryUsageProbe(void) {
+    BVNMemoryUsage usage{};
+    usage.residentBytes = processResidentBytes();
+    usage.footprintBytes = processFootprintBytes();
+    if (!usage.footprintBytes) {
+        usage.footprintBytes = usage.residentBytes;
+    }
+    usage.availableBytes = static_cast<uint64_t>(os_proc_available_memory());
+    usage.physicalMemoryBytes =
+        static_cast<uint64_t>(NSProcessInfo.processInfo.physicalMemory);
+    return usage;
 }
 
 extern "C" BVNLowAddressProbeReport BVNLow4GiBIdentityProbe(void) {

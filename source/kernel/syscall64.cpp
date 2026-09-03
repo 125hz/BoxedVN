@@ -3692,8 +3692,17 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     }
     if (!cpu || !cpu->memory || !cpu->memory->nativeIdentityMode()) {
         if (logCall) {
-            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=native-memory",
-                     logOrdinal, -K_ENOSYS);
+            // Name the process, because this is not a DXMT fault: only the
+            // one process holding the identity map can reach Metal, and a
+            // CreateProcess from inside the desktop is a fork child, which
+            // KProcess::clone gives a sparse KMemory64 (fex=0). Such a
+            // process cannot present at all; D3D11CreateDevice reports "No
+            // default adapter available" and the program exits.
+            klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d "
+                     "reason=native-memory pid=%u fex=%d",
+                     logOrdinal, -K_ENOSYS, processId,
+                     cpu && cpu->thread && cpu->thread->process &&
+                         cpu->thread->process->useFEX64 ? 1 : 0);
         }
         return (U64)(S64)-K_ENOSYS;
     }

@@ -166,11 +166,29 @@ typedef struct {
     // in-game performance overlay; unlike availableBytes this is memory
     // already committed by the process.
     uint64_t processResidentBytes;
+    // task_info(TASK_VM_INFO).phys_footprint: the figure the kernel bills
+    // against the process memory limit. This is the one the live view shows;
+    // resident_size stays for the callers that already read it. Falls back to
+    // processResidentBytes if TASK_VM_INFO is unavailable.
+    uint64_t processFootprintBytes;
     const char* detail;
 } BVNMemoryReport;
 
 // Safe and side-effect free. Suitable for the library screen and its timer.
 BVNMemoryReport BVNMemoryProbe(void);
+
+typedef struct {
+    // task_info(TASK_VM_INFO).phys_footprint, falling back to resident_size.
+    uint64_t footprintBytes;
+    uint64_t residentBytes;
+    uint64_t availableBytes;
+    uint64_t physicalMemoryBytes;
+} BVNMemoryUsage;
+
+// The numbers only. BVNMemoryProbe re-reads the code signature on every call,
+// which is far too much for a twice-a-second readout beside a running guest;
+// this is four cheap kernel queries and no Security.framework work.
+BVNMemoryUsage BVNMemoryUsageProbe(void);
 
 // ---------------------------------------------------------------------------
 // Optional FEX32 low-address identity-map feasibility

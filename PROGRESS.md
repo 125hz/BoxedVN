@@ -6464,3 +6464,112 @@ those two reports are kept, along with the whole IR-capture machinery, because
 they are what would name a second, unrelated source of a zero target. A
 `NULL_CALL_SITE` that still appears with `x18_allocatable=0` in the same log
 would be a genuinely different defect and the capture is already armed for it.
+
+## The desktop is blue in the buffer and one flat fill lands on top of it
+
+`BOXEDWINE_X11_WINDOW_BACKGROUND window=0x1000c parent=0x10005 pixel=0x3a6ea5
+size=800x600` in the 22:31 run is Wine's desktop window, a direct child of the
+root, filled with COLOR_BACKGROUND and marked dirty. It is presented: the very
+next line is `iOS guest startup complete: first mapped X11 window 0x1000c`,
+which `KNativeScreenSDL::putBitsOnWnd` writes on its first call. So the blue
+reaches the native side, and the Metal patch compositor is not involved at all
+in a desktop session -- there is no Vulkan window, `additionalSDLWindowFlags`
+is zero, `canBltToScreen()` is true, and `XServer::draw` takes the
+clear/putBitsOnWnd/present arm rather than the `BVNGuestCompositeX11Patch`
+arm. The compositor's `memset` on an active-window change is correct where it
+does run: that buffer is a transparent overlay above the DXMT frame, and
+clearing it to anything opaque would cover the frame it is overlaying.
+
+What lands on top is one call: `change-gc a1=0x10068 a2=0x3b0d` followed by
+`fill-rectangle a1=0x1000c a2=0x10068` and `free-pixmap 0x10069`. The mask is
+GCFunction|GCForeground|GCBackground|GCFillStyle|GCFillRule|GCStipple|
+GCTileStipXOrigin|GCTileStipYOrigin -- a pattern brush, not a solid one, and
+the drawable is the desktop window. `XDrawable::fillRectangle` read none of
+that: it took `gc->values.foreground` and wrote it over every pixel of the
+rectangle regardless of `fill_style`, so an 800x600 pattern fill became an
+800x600 flat repaint of the whole desktop.
+
+It cannot do better with the pattern, and that is the second half. A stipple
+is a depth-1 pixmap, but `op_CREATE_PIXMAP` builds every pixmap with the
+source drawable's visual and ignores the depth the client asked for
+(source/x11/x11bridge64.cpp:2266), so the stipple is a 32-bit drawable, and
+`copyImageData` refuses a 1-bit `XPutImage` into it -- `bits_per_pixel !=
+visual->bits_per_rgb` returns BadMatch (source/x11/xdrawable.cpp:163). The
+stipple therefore stays as `setSize` left it: all zeroes. Every bit of the
+pattern is unknown rather than clear.
+
+So `fillRectangle` now honours `fill_style`. FillSolid is unchanged. A
+stippled fill paints foreground where the stipple has a set bit, and for
+FillOpaqueStippled paints background where it does not, repeating from the
+tile/stipple origin. When the pattern cannot be read at all -- no stipple, a
+stipple that is entirely zero, or a tiled fill with no tile -- the rectangle
+is left alone rather than flattened to a guessed colour: whatever the surface
+already shows is closer to the truth than half of a pattern, and on the
+desktop what it already shows is the background fill. The witness is
+`BOXEDWINE_X11_FILL_RECT drawable= style= fg= bg= stipple= tile= rect= painted=`,
+eight lines, which names the fill style and both colours the next time this
+happens.
+
+Beside it, what actually reaches the screen is now named:
+`BOXEDWINE_X11_PRESENT window= parent= at= size= bpp= top_left= dirty= first=
+blt=`, eight lines from `XWindow::draw` immediately before `putBitsOnWnd`.
+`top_left` is the first pixel of the buffer being handed over, so a run says
+in one line whether the window presented first is the desktop and whether its
+background pixel is Wine's blue or black, and `blt` says which of the two
+presentation paths consumed it.
+
+## The RAM readout was the probe taken before any guest existed
+
+23.9 MB is what a freshly launched SwiftUI app weighs, and that is exactly
+what the number was: `AppModel.memory` is initialised with `.probe()` in its
+property declaration (ios/app/Sources/AppModel.swift:22), and the poll that
+should replace it never ran. The poll timer's body is
+`Task { @MainActor in ... }`, and while a guest is running the main actor is
+the guest -- `BVNGuestMain` owns the main thread and only pumps the run loop,
+so run-loop timers still fire but nothing enqueued on the main actor's
+executor is ever serviced. The readout was reading a value frozen at launch,
+for the whole session. Two other things compounded it: the timer was created
+with `Timer.scheduledTimer`, which registers in the default run-loop mode
+only, and even when it did run it re-probed only every tenth tick, five
+seconds.
+
+`GuestPerformanceReadout` no longer reads `model` at all. It samples on its
+own `.common`-mode half-second tick, which is the one already driving the FPS
+line, through a new `BVNMemoryUsageProbe()` -- four kernel queries and no
+Security.framework work, unlike `BVNMemoryProbe`, which re-reads the process
+code signature on every call and had no business running twice a second. The
+used figure is `task_info(TASK_VM_INFO).phys_footprint`, the number the kernel
+bills against the process limit and the one Jetsam and Xcode's gauge show;
+`resident_size` is kept in the report for the callers that already read it and
+is the fallback when TASK_VM_INFO fails. AppModel's own timer is now added to
+the run loop in `.common` mode as well, so the library screen's status stays
+live during scrolling.
+
+## The cube launched from the desktop cannot present, and cannot be made to
+
+`BOXEDWINE_DXMT_CALL ordinal=1 pid=53 index=4` / `BOXEDWINE_DXMT_RETURN
+ordinal=1 status=-38 reason=native-memory`, then
+`err: D3D11CreateDevice: No default adapter available`, then `exit_group
+status=12`. The cube did start -- pid 53 created X window 0x1057f at 640x480
+and mapped it -- and it died at device creation, before any present.
+
+Presentation is not the constraint and no compositor change can help.
+`BVNDXMTDisplayNotePresented` accepts any pid and `gDisplayPresenterPid` just
+records the last one to present. The constraint is memory. A `CreateProcess`
+from winefile is a fork on the emulator, and `KProcess::clone` gives the child
+`useFEX64 = false` and `new KMemory64(child, false)`
+(source/kernel/kprocess.cpp:2926-2934) -- a sparse address space, because the
+identity map places guest pages at their own host addresses inside this one
+iOS process and the parent, which is waiting on the child, still holds every
+one of those addresses. `boxedwineDxmtUnixCall64` refuses every call from such
+a process at source/kernel/syscall64.cpp:3693, because the native DXMT table
+dereferences the unix-call parameter block at a host address that only exists
+under the identity map.
+
+That is a structural limitation of one-process-per-session translation, not a
+defect with a cheap fix, so it is written into
+docs/KNOWN_LIMITATIONS_IOS.md section 4 rather than worked around. The refusal
+line now names the process: `reason=native-memory pid= fex=`, so a log says
+which process was refused and that it was not the translated one. A Direct3D
+program has to be the session's own launched process, which is what the cube
+entry already does.

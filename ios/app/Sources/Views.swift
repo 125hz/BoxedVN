@@ -286,13 +286,25 @@ struct LibraryView: View {
 // MARK: - Container detail
 
 /// A plain-text performance line above the live view: frames per second,
-/// frame time and resident memory, refreshed on a timer while a guest runs.
+/// frame time and the process memory footprint, refreshed on a timer while a
+/// guest runs. It reads nothing from AppModel: everything it shows has to
+/// keep moving while the guest owns the main actor.
 struct GuestPerformanceReadout: View {
-    @EnvironmentObject private var model: AppModel
     @State private var fps = 0.0
     @State private var lastFrames: UInt64 = 0
     @State private var lastSample = Date()
     @State private var capMode = Int(BVNGuestFrameRateMode())
+    // Sampled here rather than read from model.memory. AppModel's poll timer
+    // refreshes that value from inside a `Task { @MainActor }`, and while a
+    // guest runs the main actor is the guest: BVNGuestMain owns the main
+    // thread and only pumps the run loop, so run-loop timers still fire but
+    // nothing enqueued on the main actor's executor ever gets to run. The
+    // readout was therefore showing the probe AppModel took in its own
+    // initialiser, before any guest existed - a freshly launched SwiftUI app,
+    // around 24 MB, for the whole session. This tick is a plain run-loop
+    // timer in .common mode and the probe is a synchronous task_info call, so
+    // it needs neither the main actor nor AppModel.
+    @State private var memory = MemoryUsage.probe()
 
     private var capLabel: String {
         switch capMode {
@@ -319,9 +331,9 @@ struct GuestPerformanceReadout: View {
         .autoconnect()
 
     private var memoryText: String {
-        let used = model.memory.processResidentBytes
-        let total = min(model.memory.physicalMemoryBytes,
-                        model.memory.processResidentBytes + model.memory.availableBytes)
+        let used = memory.footprintBytes
+        let total = min(memory.physicalMemoryBytes,
+                        used + memory.availableBytes)
         let formatter = ByteCountFormatter()
         formatter.countStyle = .memory
         formatter.allowedUnits = [.useMB, .useGB]
@@ -350,6 +362,7 @@ struct GuestPerformanceReadout: View {
             }
             lastFrames = frames
             lastSample = now
+            memory = .probe()
         }
     }
 }

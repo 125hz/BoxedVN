@@ -396,6 +396,40 @@ path, and `RoGetActivationFactory` failing for `windows.ui.dll`.
 
 ## 4. Runtime and display behaviour
 
+### Only the launched process can use Direct3D
+
+A 64-bit session translates exactly one process with FEX, and only that
+process can reach Metal. Starting a Direct3D program from inside the running
+desktop - double-clicking an `.exe` in winefile, or any other `CreateProcess`
+- produces a program that runs but cannot draw.
+
+The chain is short and each link is in the tree:
+
+- `CreateProcess` becomes a `fork` on the emulator, and `KProcess::clone`
+  (source/kernel/kprocess.cpp:2926-2934) gives the child `useFEX64 = false`
+  and `new KMemory64(child, false)`: a sparse address space, not the native
+  identity map. It has to. The identity map places guest pages at their own
+  host addresses inside this one iOS process, and the parent still holds
+  every one of those addresses - it is waiting on the child, so its
+  `KMemory64` is not torn down.
+- Every DXMT unix call is refused for such a process at
+  source/kernel/syscall64.cpp:3693: the native DXMT table dereferences the
+  unix-call parameter block at its host address, which only exists under the
+  identity map. The call returns `-ENOSYS` and the log carries
+  `BOXEDWINE_DXMT_RETURN ... reason=native-memory pid= fex=0`.
+- The child therefore never creates a device. Wine reports
+  `D3D11CreateDevice: No default adapter available` and the program exits;
+  the session log shows the X11 window being created and mapped first, so the
+  window really does appear briefly.
+
+Nothing about presentation is pid-filtered - `BVNDXMTDisplayNotePresented`
+accepts any pid and `gDisplayPresenterPid` simply records the last presenter
+- so this is not a compositor restriction and cannot be fixed there. Making
+it work means giving the child the identity map, which means handing over the
+translator, which cannot happen while the parent's address space is still
+mapped. The supported way to run a Direct3D program is to launch it as the
+session's own process, which is what the cube entry does.
+
 The following remains unproven or deliberately constrained:
 
 - Whether `boxedmain()` can be called a **second time** in one process. The
