@@ -6944,3 +6944,111 @@ carries and the ICD defines, the five allow-listed names must stay in
 only allow-listed extras must pass, an unrecorded name must not fail, a
 driver missing a recorded required symbol must fail, and a name embedded in a
 longer identifier must not be measured at all. 33 tests in total.
+
+## The 64-bit lane advertised a CPU from 2006
+
+The user's 64-bit program loads every module it needs, runs its DllMains --
+dxgi's attach is the single DXMT hostcall in the run -- and then, inside three
+seconds of its own code, having loaded no further module and opened no data
+file, puts up its own dialog and waits. It never calls `CreateDXGIFactory` or
+`D3D11CreateDevice`, never touches audio, input or networking. So the thing it
+read is a precondition, and there are only so many of those a program can read
+without opening anything.
+
+The first one was ours. `appleHostFeatures()` set `SupportsAVX = false`,
+apparently because the host has no SVE, and FEX's CPUID derives far more from
+that one flag than its name suggests: leaf 1 ECX loses AVX (bit 28), FMA3
+(12), F16C (29) and both XSAVE and OSXSAVE (26, 27); leaf 7 EBX loses AVX2
+(5), BMI1 (3) and BMI2 (8); leaf 7 ECX loses VPCLMULQDQ and VAES; XCR0 keeps
+only its x87 and SSE bits, and leaf 0xD reports no YMM save state. What the
+guest saw was a Skylake-branded part with none of the vector extensions any
+64-bit program built in the last decade assumes.
+
+**AVX does not need SVE.** FEX ships a second VEX decode table for precisely
+this host: `Decoder::Decoder` selects `VEXTableOps_AVX128` when `SupportsAVX`
+is set and `SupportsSVE256` is not, and `OpcodeDispatcher/AVX_128.cpp` lowers
+every 256-bit operation to two 128-bit halves -- including the VAES commands,
+each of which becomes two 128-bit AES operations. The JIT cannot emit a
+256-bit instruction in that configuration at all, because `HostSupportsAVX256`
+is `SupportsAVX && SupportsSVE256`. SVE appears in that file only to make a
+handful of gathers faster. Upstream's own host-feature probe sets
+`SupportsAVX` unconditionally after its SVE detection, for this reason.
+
+The one thing worth checking before flipping it was the CPU64 adapter, which
+exchanges register state with FEX at every syscall and every fault. It passes
+a null `YMM_High` to `ReconstructXMMRegisters` and
+`SetXMMRegistersFromState`, and the fault path restores 128-bit lanes out of
+the host `V` registers. All three stay correct: without SVE256 the high halves
+are not statically allocated -- `Arm64Emitter::SpillStaticRegs` and
+`FillStaticRegs` touch only `State.xmm.sse.data` unless SVE256 is present --
+so the high halves live in `State.avx_high` in the frame, which the adapter
+never reads and never writes, and which therefore survives the round trip
+untouched. `SupportsAES256` follows upstream's rule (`SupportsAVX &&
+SupportsAES`), and `XSAVE`/`XRSTOR`/`XSAVEOPT` are implemented in the
+dispatcher, so a caller that now sees OSXSAVE and executes one gets a real
+instruction.
+
+`BOXEDWINE_FEX64_CPUID` prints the answer once per context, read out of the
+emulator with `RunCPUIDFunction`/`RunXCRFunction` rather than recomputed, so
+the line cannot drift from what the guest reads: both raw leaves, XCR0, the
+core count, and the individual bits spelled out.
+
+## `sysinfo(2)` said the machine had no memory
+
+The 64-bit `sysinfo` handler zero-filled its 112 bytes and returned success.
+`totalram = 0`, `freeram = 0`, `mem_unit = 0`. A caller that divides by it
+faults; one that compares it against a minimum concludes the machine is
+unsupported, and does so having opened nothing -- which in a log is
+indistinguishable from every other precondition failure in this list. The
+32-bit lane has always answered with real numbers (`KSystem::sysinfo`), so the
+two lanes disagreed about the same machine.
+
+It now writes the x86-64 layout -- 64-bit longs everywhere except the `procs`
+pair and `mem_unit` -- from the same source `/proc/meminfo` uses, in units of
+`mem_unit` exactly as Linux reports them. `BOXEDWINE_X64_SYSINFO` prints the
+totals once per boot.
+
+Worth knowing when reading that line: `BVNGuestReportedTotalMemory` caps what
+it reports at 3 GB, and its comment gives the reason as "the guest is 32-bit".
+That reason does not hold on this lane, and the cap is what `/proc/meminfo`,
+`sysconf(_SC_PHYS_PAGES)` and therefore `GlobalMemoryStatusEx` will report to
+a 64-bit program on a 6 GB device.
+
+## The other four candidates, and what the run says about them
+
+**Processor count is fine.** `sched_getaffinity` here reports one CPU, but
+that is not what the guest counted: `/sys/devices/system/cpu/online` carries
+the real count, and the run proves the answer -- Wine walked
+`/sys/devices/system/cpu/cpu0..cpu5/cpufreq/cpuinfo_max_freq`, six iterations,
+which is `peb->NumberOfProcessors`. Six. (Those files answered `-2` despite
+`sysfs.cpp` registering them; that costs a frequency, not a core.)
+
+**The Windows version is Wine's own default.** `wineboot` ran in this session
+and nothing in this tree writes `CurrentVersion`, `CurrentBuildNumber`,
+`ProductName`, `ReleaseId` or `UBR`, so the prefix carries exactly what Wine
+9.0 seeds, which is win10. No evidence it is wrong. `UBR` is the one value
+Wine does not write at all, and a program that reads it gets nothing.
+
+**The display is the strongest remaining candidate, and it is not in this
+agent's files.** Two facts compound. The launch passes `-resolution 800x600`
+-- `BVNLaunchArguments.cpp` gives a larger virtual monitor only to the branch
+that has a game directory and is not this one -- and the run confirms it:
+`op=open-display ... screen=800x600`. And on the 64-bit lane
+`XRRQueryExtension` and `XineramaQueryExtension` are stubs that return 0
+(`tools/x11-64/extension_stub.c`), so `winex11.drv` takes its `nores` settings
+handler, whose mode list is a single entry: the current desktop size, at
+`screen_bpp`, at 60 Hz. A modern Windows 10 title enumerating display modes
+finds exactly one, 800x600, and no mode it can switch to. The 64-bit X11
+bridge serves no RandR operation at all -- `source/x11/xrandr.cpp` exists but
+is reached only through the 32-bit path, and its XRandR 1.1 size list would
+still be `1024x768 / 800x600 / 640x480` at an 800x600 root, with no 1280x720.
+The fix is one of two things, both owned elsewhere: a larger `-resolution` for
+the x86-64 launch, or an XRandR 1.1 path in the 64-bit bridge with a real size
+and rate list.
+
+**Timing is not implicated.** Nothing in the run touches
+`QueryPerformanceFrequency`'s inputs on a path that could fail; Wine returns a
+fixed 10 MHz frequency on Linux.
+
+`0x06` is the program's own error number and says nothing further; nothing
+above is inferred from it.

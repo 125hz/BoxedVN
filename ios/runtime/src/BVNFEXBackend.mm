@@ -512,9 +512,39 @@ FEXCore::HostFeatures appleHostFeatures() {
     features.SupportsFCMA = true;
     features.SupportsFlagM = true;
     features.SupportsFlagM2 = true;
-    features.SupportsAVX = false;
+    // AVX does not need SVE on this host, and saying otherwise made cpuid
+    // describe a CPU no modern program will run on.
+    //
+    // FEX carries a second VEX decode table for exactly this case:
+    // Decoder::Decoder picks VEXTableOps_AVX128 when SupportsAVX is set and
+    // SupportsSVE256 is not, and the AVX-128 dispatcher lowers every 256-bit
+    // operation to two 128-bit halves. The JIT then cannot emit a 256-bit
+    // instruction at all, because HostSupportsAVX256 is
+    // `SupportsAVX && SupportsSVE256`; SVE is used only to make a handful of
+    // gathers faster, never as a requirement. Upstream's own host-feature
+    // probe sets SupportsAVX unconditionally for that reason.
+    //
+    // With SupportsAVX false, FEX's CPUID reported no AVX (leaf 1 ECX bit
+    // 28), no FMA3 (bit 12), no F16C (bit 29), no XSAVE/OSXSAVE (bits 26/27),
+    // and no AVX2, BMI1 or BMI2 (leaf 7 EBX bits 5, 3 and 8), and XCR0 kept
+    // only its x87 and SSE bits. A program that gates on any of those decides
+    // the machine is unsupported before it opens a file.
+    //
+    // The 256-bit halves live in State.avx_high inside the frame rather than
+    // in a static host register -- Arm64Emitter spills and fills only
+    // State.xmm.sse.data unless SVE256 is present -- so the CPU64 adapter's
+    // register exchange stays correct unchanged: it passes a null YMM_High to
+    // ReconstructXMMRegisters/SetXMMRegistersFromState, which copies just the
+    // SSE halves and leaves avx_high alone across the round trip, and the
+    // signal path restores the same 128-bit lanes out of the host V
+    // registers that the emitter spilled them from.
+    features.SupportsAVX = true;
     features.SupportsSVE128 = false;
     features.SupportsSVE256 = false;
+    // Mirrors upstream: VAES (leaf 7 ECX bit 9) is the 256-bit spelling of
+    // the AES instructions, and the AVX-128 dispatcher implements each of
+    // them as two 128-bit AES operations.
+    features.SupportsAES256 = features.SupportsAVX && features.SupportsAES;
     int cores = 0;
     size_t length = sizeof(cores);
     if (sysctlbyname("hw.ncpu", &cores, &length, nullptr, 0) != 0 || cores < 1) {
@@ -1111,12 +1141,44 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     bundle->mode = mode;
     bundle->signals = std::make_unique<BoxedWineSignals>(mode);
     bundle->syscalls = std::make_unique<BoxedWineSyscalls>(mode);
-    bundle->context = FEXCore::Context::Context::CreateNewContext(
-        appleHostFeatures());
+    const FEXCore::HostFeatures hostFeatures = appleHostFeatures();
+    bundle->context = FEXCore::Context::Context::CreateNewContext(hostFeatures);
     if (!bundle->context) {
         reportf("FEX refused to create a %s translator context",
                 boxedvn::fexGuestModeName(mode));
         return nullptr;
+    }
+    // What the guest's own cpuid will answer, printed once per context and
+    // read straight out of the emulator rather than recomputed here, so the
+    // line cannot drift from what a program actually sees. CPUIDEmu is built
+    // by the context constructor from the very HostFeatures above, so these
+    // are valid before any guest code is translated.
+    //
+    // A program that shows a bare "unsupported system" message having opened
+    // no file and loaded no further module has read something like this and
+    // nothing else; leaf 1 ECX and leaf 7 EBX are where the whole
+    // AVX/AVX2/FMA/F16C/BMI question lands, and XCR0 is the second half of
+    // the answer for any caller that checks OSXSAVE and then xgetbv.
+    {
+        const FEXCore::CPUID::FunctionResults leaf1 =
+            bundle->context->RunCPUIDFunction(1, 0);
+        const FEXCore::CPUID::FunctionResults leaf7 =
+            bundle->context->RunCPUIDFunction(7, 0);
+        const FEXCore::CPUID::XCRResults xcr0 =
+            bundle->context->RunXCRFunction(0);
+        reportf("BOXEDWINE_FEX64_CPUID mode=%s leaf1_ecx=0x%08x "
+                "leaf1_edx=0x%08x leaf7_ebx=0x%08x leaf7_ecx=0x%08x "
+                "xcr0=0x%08x%08x cores=%zu avx=%u avx2=%u fma=%u f16c=%u "
+                "bmi1=%u bmi2=%u movbe=%u xsave=%u osxsave=%u sse42=%u",
+                boxedvn::fexGuestModeName(mode),
+                leaf1.ecx, leaf1.edx, leaf7.ebx, leaf7.ecx,
+                xcr0.edx, xcr0.eax,
+                hostFeatures.CPUMIDRs.size(),
+                (leaf1.ecx >> 28) & 1u, (leaf7.ebx >> 5) & 1u,
+                (leaf1.ecx >> 12) & 1u, (leaf1.ecx >> 29) & 1u,
+                (leaf7.ebx >> 3) & 1u, (leaf7.ebx >> 8) & 1u,
+                (leaf1.ecx >> 22) & 1u, (leaf1.ecx >> 26) & 1u,
+                (leaf1.ecx >> 27) & 1u, (leaf1.ecx >> 20) & 1u);
     }
     bundle->context->SetSignalDelegator(bundle->signals.get());
     bundle->context->SetSyscallHandler(bundle->syscalls.get());

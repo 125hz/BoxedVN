@@ -22,6 +22,12 @@
 #ifdef BOXEDWINE_FEX64_BACKEND
 #include "BVNFEXBackend.h"
 #endif
+#ifdef BOXEDWINE_IOS
+// BVNGuestReportedTotalMemory/FreeMemory: the same numbers /proc/meminfo and
+// the 32-bit lane's sysinfo(2) report, so sysinfo(2) here cannot disagree
+// with them.
+#include "BVNRuntime.h"
+#endif
 #include "krandom.h"
 #include "boxedwine_x64_hostcall.h"
 #include "boxedwine_x64_x11_bridge.h"
@@ -31,6 +37,7 @@
 #include "kevent.h"
 #include "ksocket.h"
 #include <cstring>
+#include <algorithm> // std::min for the sysinfo(2) totals
 #include <thread>   // std::this_thread::yield() for sched_yield
 #include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
 #include <atomic>   // bounded guest mmap placement counters
@@ -2877,6 +2884,62 @@ static U64 sys_sched_getaffinity64(CPU64* cpu, U64 pid, U64 cpusetsize, U64 mask
     return 8;
 }
 
+// sysinfo(2). The x86-64 struct is 112 bytes and every field but `procs`,
+// its padding and `mem_unit` is a 64-bit long:
+//    0 uptime      32 totalram   64 totalswap   80 procs (u16)
+//    8 loads[0]    40 freeram    72 freeswap    82 pad (u16)
+//   16 loads[1]    48 sharedram                 88 totalhigh
+//   24 loads[2]    56 bufferram                 96 freehigh
+//                                              104 mem_unit (u32)
+//
+// This used to zero all 112 bytes, which answers "this machine has no
+// memory at all". A caller that divides by totalram gets a fault; one that
+// compares it against a minimum decides the machine is unsupported, having
+// opened nothing and loaded nothing -- indistinguishable in a log from a
+// dozen other precondition failures. The 32-bit lane has always answered
+// with the real numbers (KSystem::sysinfo); this is the same answer in the
+// 64-bit layout, from the same source, so the two lanes cannot disagree.
+//
+// Sizes are in units of mem_unit, exactly as Linux reports them.
+static U64 sys_sysinfo64(CPU64* cpu, U64 address) {
+    if (!address) return (U64)-K_EFAULT;
+    if (!cpu->memory) return (U64)-K_EFAULT;
+
+#ifdef BOXEDWINE_IOS
+    const U64 totalPages = BVNGuestReportedTotalMemory() / K_PAGE_SIZE;
+    const U64 freePages =
+        std::min<U64>(BVNGuestReportedFreeMemory() / K_PAGE_SIZE, totalPages);
+#else
+    const U64 totalPages = 262144; // 1 GB
+    const U64 freePages = 196608;
+#endif
+    const U64 processCount = (U64)KSystem::processes.size();
+
+    KMemory* memory = cpu->memory;
+    memory->memsetGuest(address, 0, 112);
+    memory->writeq(address +  0, KSystem::getMilliesSinceStart() / 1000);
+    memory->writeq(address + 32, totalPages);
+    memory->writeq(address + 40, freePages);
+    memory->writew(address + 80, (U16)std::min<U64>(processCount, 0xffffull));
+    memory->writed(address + 104, K_PAGE_SIZE);
+
+    // Once per boot: the totals a program that never opens a file still gets
+    // to see. Everything else on this path is already zero by construction.
+    static std::atomic<bool> reported {false};
+    bool expected = false;
+    if (reported.compare_exchange_strong(expected, true)) {
+        klog_fmt("BOXEDWINE_X64_SYSINFO totalram_pages=%llu freeram_pages=%llu "
+                 "mem_unit=%u total_mb=%llu free_mb=%llu procs=%llu",
+                 (unsigned long long)totalPages,
+                 (unsigned long long)freePages,
+                 (U32)K_PAGE_SIZE,
+                 (unsigned long long)((totalPages * K_PAGE_SIZE) >> 20),
+                 (unsigned long long)((freePages * K_PAGE_SIZE) >> 20),
+                 (unsigned long long)processCount);
+    }
+    return 0;
+}
+
 // sched_setaffinity(2): silently accept any mask — we don't actually move
 // the thread anywhere, but reject obviously bogus calls.
 static U64 sys_sched_setaffinity64(CPU64* cpu, U64 pid, U64 cpusetsize, U64 maskPtr) {
@@ -5625,11 +5688,7 @@ void ksyscall64(CPU64* cpu) {
             ret = 0;
             break;
         case X64_SYS_sysinfo:
-            // struct sysinfo — zero-fill the standard 64-byte layout.
-            // ld-linux doesn't actually read these; some binaries call it
-            // anyway as part of /proc startup probes.
-            if (a1) cpu->memory->memsetGuest(a1, 0, 112);
-            ret = 0;
+            ret = sys_sysinfo64(cpu, a1);
             break;
         case X64_SYS_getppid:
             ret = cpu->thread && cpu->thread->process ? cpu->thread->process->parentId : 1;
