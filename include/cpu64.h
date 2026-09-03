@@ -178,11 +178,15 @@ public:
         fetchCachePage = (U64)-1; fetchCacheData = nullptr; fetchCacheGen = 0;
     }
 
-    // Set by fetchByte when an instruction byte was taken from a page this
-    // address space does not have at all. step() turns it into a guest SIGSEGV
-    // at the faulting address instead of decoding the zeros the sparse reader
-    // returns. Cleared at the top of every step().
+    // Set by fetchByte when an instruction byte came from a page with no
+    // backing buffer -- either absent from this address space or mapped as a
+    // reservation with nothing committed behind it. step() turns it into a
+    // guest SIGSEGV at the faulting address instead of decoding the zeros the
+    // sparse reader returns. fetchFaultMapped selects the si_code: false is
+    // SEGV_MAPERR (no translation), true is SEGV_ACCERR (a reservation the
+    // guest may not execute). Cleared at the top of every step().
     bool fetchFault = false;
+    bool fetchFaultMapped = false;
     U64  fetchFaultAddr = 0;
 
     // Standalone-runner heap pointer. The full kernel tracks the program

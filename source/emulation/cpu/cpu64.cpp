@@ -122,16 +122,23 @@ __attribute__((always_inline)) inline U8 CPU64::fetchByte(U64 addr) {
     return fetchByteMiss(addr, pageNum);
 }
 
-// Budgeted witness for a fetch whose page has no backing buffer. Eight lines,
-// then one per 4096, so a runaway guest cannot flood the log.
+// Hard-capped witness for a fetch whose page has no backing buffer. Every such
+// fetch now raises a guest SIGSEGV, so the interesting ones are the first few:
+// eight lines, then one line saying the rest are suppressed, and nothing after
+// that. The previous "one per 4096 forever" budget is what let a run print
+// hundreds of thousands of these while the interpreter executed zeros.
+#define CPU64_FETCH_NO_BACKING_REPORT_LIMIT 8u
 static void cpu64ReportFetchNoBacking(int pid, U64 addr, U64 pageNum, bool mapped) {
     static std::atomic<U64> reports {0};
     const U64 n = reports.fetch_add(1, std::memory_order_relaxed);
-    if (n < 8 || (n & 0xfff) == 0) {
+    if (n < CPU64_FETCH_NO_BACKING_REPORT_LIMIT) {
         klog_fmt("BOXEDWINE_X64_FETCH_NO_BACKING pid=%d addr=0x%llx page=0x%llx "
                  "mapped=%d count=%llu",
                  pid, (unsigned long long)addr, (unsigned long long)pageNum,
                  mapped ? 1 : 0, (unsigned long long)(n + 1));
+    } else if (n == CPU64_FETCH_NO_BACKING_REPORT_LIMIT) {
+        klog_fmt("BOXEDWINE_X64_FETCH_NO_BACKING pid=%d further reports suppressed "
+                 "after %u lines", pid, CPU64_FETCH_NO_BACKING_REPORT_LIMIT);
     }
 }
 
@@ -147,21 +154,28 @@ U8 CPU64::fetchByteMiss(U64 addr, U64 pageNum) {
         fetchCacheGen = gen;
         return data[addr & K64_PAGE_MASK];
     }
-    // No backing buffer. Leave the cache empty so we never memoize a hole,
-    // and report it. A page the address space does not know at all is a guest
-    // execute fault: flag it so step() delivers SIGSEGV rather than decoding
-    // the zeros the sparse reader hands back and running off into garbage. A
-    // page that IS mapped but not yet committed legitimately reads as zero
-    // (lazy commit), so that case only reads.
+    // No backing buffer. Leave the cache empty so we never memoize a hole, and
+    // fault. There is no instruction here to execute: a page the address space
+    // does not know at all is an absent translation (SEGV_MAPERR), and a page
+    // that IS mapped but has nothing committed behind it is a reservation the
+    // guest never wrote (SEGV_ACCERR) -- hardware faults on the fetch in both
+    // cases. Returning zero for the mapped case is what let the interpreter
+    // decode `add [rax],al` out of a reservation and repeat it hundreds of
+    // millions of times instead of reporting the wild jump that got there.
+    //
+    // Data reads of an uncommitted page still read zero, which is correct for
+    // reserved-but-untouched memory; that path is KMemory64::readb and is not
+    // touched here. This is the instruction-fetch path only.
     invalidateFetchCache();
     const bool mapped = memory->getPageFlags(pageNum) != 0;
     cpu64ReportFetchNoBacking((int)(thread && thread->process ? (int)thread->process->id : -1),
                               addr, pageNum, mapped);
-    if (!mapped && !fetchFault) {
+    if (!fetchFault) {
         fetchFault = true;
         fetchFaultAddr = addr;
+        fetchFaultMapped = mapped;
     }
-    return memory->readb(addr);
+    return 0;
 }
 
 U32 CPU64::fetchDword(U64 addr) {
@@ -665,6 +679,7 @@ static void refWatchInit() {
 U32 CPU64::step() {
     U64 ipStart = rip;
     fetchFault = false;
+    fetchFaultMapped = false;
 
     // BW64_REFWATCH probe: catch wineserver's double-release at release_object
     // entry, one instruction before the assert. See the big comment above.
@@ -748,28 +763,42 @@ U32 CPU64::step() {
 
     U8 op = fetchByte(rip + opOff);
 
-    // The prefix/opcode bytes came from a page this address space does not
-    // have. Hardware faults on the fetch; the sparse reader would hand back
-    // zeros and the decoder would happily execute them, so deliver the guest
-    // SIGSEGV here, before the instruction has any effect.
+    // The prefix/opcode bytes came from a page with no backing buffer, either
+    // absent from this address space or present only as a reservation.
+    // Hardware faults on the fetch; the sparse reader would hand back zeros and
+    // the decoder would happily execute them, so deliver the guest SIGSEGV
+    // here, before the instruction has any effect. No zeros are ever executed.
     if (fetchFault) {
         const U64 faultAddr = fetchFaultAddr;
+        const bool faultMapped = fetchFaultMapped;
         fetchFault = false;
-        // Budgeted: a handler that returns to the faulting RIP re-faults, so
-        // this can repeat without bound.
+        fetchFaultMapped = false;
+        // Hard-capped: a handler that returns to the faulting RIP re-faults, so
+        // this repeats for as long as the guest keeps trying. The first few
+        // lines name the RIP that jumped into nothing, which is the whole
+        // diagnostic value; after that the report is silent rather than
+        // printing forever at a fixed interval.
         {
             static std::atomic<U64> faults {0};
             const U64 n = faults.fetch_add(1, std::memory_order_relaxed);
-            if (n < 8 || (n & 0xfff) == 0) {
+            if (n < CPU64_FETCH_NO_BACKING_REPORT_LIMIT) {
                 klog_fmt("BOXEDWINE_X64_FETCH_FAULT pid=%u rip=0x%llx addr=0x%llx "
-                         "count=%llu — instruction fetch from an unmapped page",
+                         "mapped=%d count=%llu — instruction fetch from a page "
+                         "with no backing",
                          (unsigned)(thread && thread->process ? thread->process->id : 0),
                          (unsigned long long)ipStart, (unsigned long long)faultAddr,
-                         (unsigned long long)(n + 1));
+                         faultMapped ? 1 : 0, (unsigned long long)(n + 1));
+            } else if (n == CPU64_FETCH_NO_BACKING_REPORT_LIMIT) {
+                klog_fmt("BOXEDWINE_X64_FETCH_FAULT pid=%u further reports "
+                         "suppressed after %u lines",
+                         (unsigned)(thread && thread->process ? thread->process->id : 0),
+                         CPU64_FETCH_NO_BACKING_REPORT_LIMIT);
             }
         }
-        if (this->raiseSyncFault(K_SIGSEGV, /*trapNo #PF*/14,
-                                 /*SEGV_MAPERR*/1, faultAddr)) {
+        // A reservation the guest may not execute is an access error; a page
+        // with no translation at all is a mapping error.
+        const S32 siCode = faultMapped ? /*SEGV_ACCERR*/2 : /*SEGV_MAPERR*/1;
+        if (this->raiseSyncFault(K_SIGSEGV, /*trapNo #PF*/14, siCode, faultAddr)) {
             return 0; // rip now at the handler
         }
         if (thread && thread->process) thread->process->signalProcess(K_SIGSEGV);
