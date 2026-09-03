@@ -1,0 +1,97 @@
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index a913e0b..0ab5968 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -20,6 +20,7 @@
+ #endif
+ 
+ #include <array>
++#include <atomic>
+ #include <tuple>
+ #include <utility>
+ 
+@@ -73,7 +74,39 @@ namespace x64 {
+     ARMEmitter::Reg::r8, ARMEmitter::Reg::r16, ARMEmitter::Reg::r17,
+   };
+ 
+-#ifdef FEX_IOS_HOST
++/* BoxedWine: x18 is not allocatable on an Apple host, and the guard that said
++ * so compiled nowhere.
++ *
++ * Apple reserves x18 for the platform. A user value in it does not survive a
++ * return to EL0, and an ObjC/mach/Metal call on the same thread scribbles on
++ * it as well; this port already documents both facts and refuses to trust x18
++ * at every TEB read (below in this file, in Dispatcher.cpp, in MiscOps.cpp and
++ * in the ARM64EC module). A register whose contents can vanish asynchronously
++ * cannot carry an SSA value across even one instruction.
++ *
++ * FEX_IOS_HOST alone never excluded it. That define is set only by the ARM64EC
++ * module build, which also defines ARCHITECTURE_arm64ec and therefore takes the
++ * other arm of the enclosing #ifndef -- so this arm was compiled by nothing at
++ * all, and the iOS host library (built from the iphoneos SDK without
++ * FEX_IOS_HOST, see scripts/build-fex64-fex.sh) kept r18 in the allocatable set
++ * as index 6.
++ *
++ * What that cost is the long-standing "a load returns zero" misread. Two
++ * targeted IR captures of the faulting blocks -- guest 0x140002d9b
++ * `call qword ptr [rax+0x180]` and guest 0x7a41141485 `call qword ptr
++ * [rdi+0x60]` -- both allocate the call target to RA index 6 and emit
++ * `ldr x18, [x3, #disp]`, then read it back some thirty instructions later
++ * with `mov x2, x18` for the indirect exit. When the kernel wipes x18 inside
++ * that window the exit branches to guest RIP 0 while the memory slot still
++ * holds the pointer the fault handler re-reads. Nothing about the load, the
++ * address translation, the return-address push or the call-return witness is
++ * wrong: the register does not survive.
++ *
++ * Excluding it costs one allocatable GPR and no register pairs. PairRegisters
++ * is a count of leading array entries masked to even indices, so 3 and 4 both
++ * select index 0 and index 2 -- the same two pairs, (r20, r21) and (r22, r23).
++ */
++#if defined(FEX_IOS_HOST) || defined(__APPLE__)
+   // On Apple platforms, x18 is reserved for platform TLS. Do not use it.
+   constexpr std::array<ARMEmitter::Register, 6> RA = {
+     // All these callee saved
+@@ -107,6 +140,21 @@ namespace x64 {
+   constexpr std::array<ARMEmitter::Register, 2> NotPreserved_Dynamic = PreserveAll_Dynamic;
+ #endif
+ 
++#ifdef __APPLE__
++  // Fail the build rather than let a later edit put it back.
++  static_assert(
++    []() constexpr {
++      for (auto Reg : RA) {
++        if (Reg.Idx() == 18) {
++          return false;
++        }
++      }
++      return true;
++    }(),
++    "x18 is reserved by the Apple platform ABI and is not preserved across a return to user mode; it must "
++    "never be in the allocatable register set");
++#endif
++
+   // All are caller saved
+   constexpr std::array<ARMEmitter::VRegister, 16> SRAFPR = {
+     ARMEmitter::VReg::v16, ARMEmitter::VReg::v17, ARMEmitter::VReg::v18, ARMEmitter::VReg::v19,
+@@ -409,6 +457,21 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
+     StaticFPRegisters = x64::SRAFPR;
+     GeneralFPRegisters = x64::RAFPR;
+     PairRegisters = x64::RAPairs;
++
++    /* BoxedWine: name the allocatable set once per process, so a log says which
++     * host registers this build can park a guest value in without anyone having
++     * to disassemble a block. x18_allocatable=1 means the Apple platform
++     * register is back in the set and every value held in it is liable to be
++     * wiped by the kernel; it must always read 0 on this host. */
++    static std::atomic<bool> BoxedWineReportedGPRSet {false};
++    if (!BoxedWineReportedGPRSet.exchange(true, std::memory_order_relaxed)) {
++      uint32_t Mask {};
++      for (auto Reg : GeneralRegisters) {
++        Mask |= 1U << Reg.Idx();
++      }
++      LogMan::Msg::IFmt("BOXEDWINE_FEX64_JIT_GPR_SET count={} mask={:#x} pairs={} x18_allocatable={}",
++                        GeneralRegisters.size(), Mask, PairRegisters, (Mask >> 18) & 1);
++    }
+   } else {
+     PairRegisters = x32::RAPairs;
+ 

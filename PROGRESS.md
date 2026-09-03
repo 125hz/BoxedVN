@@ -6383,3 +6383,84 @@ is the regression check: its pid 10 already runs the probe itself
 (`cmd='...boxedvn-d3d11-cube-x64.exe'`), and its 10 -> 37 -> 39 is win32u
 starting `C:\windows\system32\explorer.exe /desktop` for the default
 desktop, which is a helper and belongs on the interpreter.
+
+## The load that returned zero was a register the kernel wipes: x18
+
+The targeted IR capture answered it in one pass, and the two runs agree
+instruction for instruction. Both faulting blocks lower their indirect call
+exactly the way they should. The cube's `call qword ptr [rax+0x180]` at guest
+0x140002d9b becomes, in the post-RA IR,
+
+    %52(r3) i64 = Constant #0x180
+    %54(r6) i64 = LoadMem GPR, R0, %53, i64, SXTX, #0x1
+    %55(r0) i64 = EntrypointOffset #0x32
+    %57(R4) i64 = Push i64, r0, R4
+    (%60 i64) ExitFunction r6, Call, %59, %Invalid
+
+and the emitted host words, from the capture's own guest+0x2c -> host+0x7c
+map, are
+
+    +0x0080  b25d0c83   orr  x3, x4, #0x7800000000
+    +0x0084  9251dc63   and  x3, x3, #0xffff807fffffffff
+    +0x0088  f940c072   ldr  x18, [x3, #0x180]
+    ...      (return address built in x20, pushed, the bounded call-return
+              witness, all of which touch only x0-x3)
+    +0x0140  aa1203e2   mov  x2, x18
+    +0x0148  8a021021   and  x1, x1, x2, lsl #4
+    +0x0154  cb020000   sub  x0, x0, x2
+
+The desktop's `call qword ptr [rdi+0x60]` at 0x7a41141485 is the same shape
+with the same register: `%39(r6) = LoadMem GPR, R7, ...` and
+`+0x0060  f9403072   ldr x18, [x3, #0x60]`.
+
+So the address translation is right (the OR of the alias base and the mask of
+the top window, in that order, before the load), the size is right, the load
+happens before the return-address push and is not reloaded after it, no
+instruction between the load and the branch writes the register -- the witness
+block confines itself to x0 through x3 -- and the exit reads the same register
+the load wrote. There is no spill and no second copy. Every hypothesis about
+the lowering is refuted by the capture.
+
+What is wrong is the register itself. r6 is index 6 of `x64::RA`, and index 6
+of that array is `ARMEmitter::Reg::r18`. x18 is the Apple platform register: a
+user value in it does not survive a return to EL0, and an ObjC/mach/Metal call
+on the same thread scribbles on it too. This port already knows that and
+refuses to trust x18 at every TEB read it emits. So the load reads the vtable
+slot correctly into x18, the kernel wipes x18 somewhere in the thirty-odd
+instructions before the exit reads it back, and the indirect exit branches to
+guest RIP 0 while the slot still holds the pointer the fault handler re-reads
+(`slot_readable=1 slot_value=0x7ffffee52d50`, and `0x7a41143b40` for the
+desktop). It is intermittent, it favours busy moments -- the cube's fault
+followed a DXMT present-mode change, i.e. more threads and more Metal calls --
+and it is not memory ordering: the value was published, read, and then lost
+after the read. The `Strict memory ordering` toggle keeps its meaning
+unchanged and is not the lever here.
+
+FEX had a guard for exactly this and it compiled nowhere. `x64::RA` picks a
+six-register array without r18 under `#ifdef FEX_IOS_HOST`, but FEX_IOS_HOST is
+set only by the ARM64EC module build, which also defines
+`ARCHITECTURE_arm64ec` and therefore takes the other arm of the enclosing
+`#ifndef` -- so that arm was dead code, and the iOS host library, built from
+the iphoneos SDK without FEX_IOS_HOST (scripts/build-fex64-fex.sh says why it
+cannot be set), kept r18 allocatable. The condition is now
+`defined(FEX_IOS_HOST) || defined(__APPLE__)`, which is true for both builds,
+and a `static_assert` under `__APPLE__` walks the array and fails the build if
+r18 ever returns. Nothing else changes: `PairRegisters` is a count of leading
+array entries masked to even indices, so 3 and 4 select the same two pairs,
+(r20, r21) and (r22, r23); the cost is one allocatable GPR and the spills that
+follow from it.
+
+This is not confined to indirect calls. Any SSA value the allocator parked in
+r18 could read back as zero -- or as whatever the platform left there, which is
+the garbage-pointer variant of the same fault seen earlier at other sites.
+
+The witness is `BOXEDWINE_FEX64_JIT_GPR_SET count= mask= pairs=
+x18_allocatable=`, written once per process when the emitter selects the
+64-bit register set. The next run has to show `count=6`, `mask=0x41f00000` and
+`x18_allocatable=0`; anything else means the define did not reach the
+translation unit and the fix is inert. After that, no `NULL_CALL_SITE` at
+0x140002d9b or 0x7a41141485, and no `NULL_EXIT_TARGET` from a call site --
+those two reports are kept, along with the whole IR-capture machinery, because
+they are what would name a second, unrelated source of a zero target. A
+`NULL_CALL_SITE` that still appears with `x18_allocatable=0` in the same log
+would be a genuinely different defect and the capture is already armed for it.

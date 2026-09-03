@@ -126,6 +126,15 @@ fi
 
 apply_patch fex-ios-host-diagnostics-guard.patch
 apply_patch fex-ios-caspal-diagnostic-host.patch
+# Independent of every other patch here; it touches only the register-set
+# tables. x18 is the Apple platform register, and a value the JIT parks in it
+# does not survive a return to user mode. The existing FEX_IOS_HOST guard that
+# excluded it was compiled by nothing -- that define is set only by the ARM64EC
+# module build, which takes the arm64ec arm of the same #ifndef -- so this host
+# build kept x18 allocatable and every SSA value the allocator put there could
+# read back as zero. Applied early because everything downstream is emitted
+# into the register set it selects.
+apply_patch fex-apple-reserved-x18-not-allocatable.patch
 apply_patch fex-boxedwine-block-diagnostics.patch
 apply_patch fex-apple-dual-map-cache-publish.patch
 apply_patch fex-arm64-pair-immediate-mask.patch
