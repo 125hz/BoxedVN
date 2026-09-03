@@ -38,14 +38,42 @@
  *
  * What is ported: the eight position-only vertices and their 36 indices, the
  * rasterizer and depth-stencil state, the column-major matrix helpers and the
- * projection, the camera at (0, 0, 2), the clear colour, the dynamic constant
- * buffer written through Map/Unmap, and the wall-clock spin. What is NOT
- * ported: the demo's WinMain shell, its keyboard camera, its mouse trace and
- * its bitmap-font overlay, its 1024x768 hardcoding, and its
+ * projection, the camera at (0, 0, 2), the clear colour, the per-frame
+ * constant buffer upload, and the wall-clock spin. What is NOT ported: the
+ * demo's WinMain shell, its keyboard camera, its mouse trace and its
+ * bitmap-font overlay, its 1024x768 hardcoding, and its
  * D3DCompileFromFile call -- the shaders are compiled ahead of time
  * (x64-d3d11-cube.hlsl, embedded via x64-d3d11-cube-shaders.h) so no HLSL
  * compiler runs inside the guest, which is what Madeira's own build does with
  * its test_shim.h.
+ *
+ * ONE DELIBERATE DEVIATION FROM THE DEMO: THE CONSTANT BUFFER IS NOT MAPPED
+ *
+ * The demo declares its constant buffer D3D11_USAGE_DYNAMIC and writes it
+ * through Map(D3D11_MAP_WRITE_DISCARD)/Unmap. Ported literally, that killed
+ * every run the moment the first frame was drawn: the process took an access
+ * violation writing the pointer Map returned, exactly 0x30 into the 64-byte
+ * matrix copy, and Wine went off to start a debugger
+ * (`guest_rip=0x140002d96 ... si_code=2`, `rcx=0x158798100`,
+ * `fault=0x7958798130`, i.e. the probe's own memcpy at the mapped address).
+ *
+ * The reason is in DXMT: a dynamic buffer's storage is a Metal buffer, and
+ * `Map` hands back `BufferAllocation::mappedMemory_`, which is that Metal
+ * buffer's `contents()` -- a HOST address. DXMT only makes that address CPU
+ * side memory the guest itself owns under `#ifdef __i386__`
+ * (BufferAllocationFlag::CpuPlaced in d3d11_buffer.cpp and dxmt_staging.cpp);
+ * in a 64-bit guest the raw host pointer is returned as-is, because upstream
+ * DXMT runs in a Wine process that shares the host's address space. Under
+ * BoxedVN it does not: the emulated guest cannot address host memory, so the
+ * store lands in the reserved alias window and faults.
+ *
+ * A D3D11_USAGE_DEFAULT buffer written with UpdateSubresource has no such
+ * problem. That path stays inside DXMT, which copies through its own
+ * `MTLBuffer_updateContents` thunk -- a host call -- so the guest never
+ * dereferences a host pointer. It is also the path that has actually run on
+ * device: thousands of frames of this cube, with `complete ok`, before the
+ * port replaced it. The rule this file encodes for anything written later:
+ * NEVER dereference a pointer Direct3D hands back through Map in this stack.
  *
  * In its place this file keeps the launcher contract: a console image, the
  * stage markers below, the per-stage exit codes, and the window creation the
@@ -95,7 +123,9 @@ enum {
     BOXEDVN_EXIT_RENDER_TARGET = 15,
     BOXEDVN_EXIT_PRESENT = 16,
     BOXEDVN_EXIT_SHADERS = 17,
-    BOXEDVN_EXIT_GEOMETRY = 18
+    BOXEDVN_EXIT_GEOMETRY = 18,
+    /* Not a stage: a fault nothing else handled. See fatal_exception_filter. */
+    BOXEDVN_EXIT_FAULT = 19
 };
 
 static const char kStagePrefix[] = "BOXEDVN_X64_CUBE_STAGE ";
@@ -154,6 +184,44 @@ static void stage_fail(const char* stage, DWORD win32, const char* extra) {
                  (unsigned long)win32);
     }
     stage_line(body);
+}
+
+/* A fault this program does not survive is still evidence, and it should read
+ * like every other line it writes.
+ *
+ * Left alone, an access violation here ends the run the worst possible way:
+ * Wine prints one page-fault line and starts winedbg, which on device could
+ * not attach, so two runs said nothing beyond an address. This filter runs
+ * only for an exception nothing else handled -- it is the top-level filter,
+ * not a vectored handler, so Direct3D and Wine keep any exception they use
+ * internally -- and it turns that case into a marker naming the code, the
+ * faulting address and the RIP, then ends the process on a code of its own.
+ *
+ * TerminateProcess rather than a return: it cannot be unwound through, and
+ * the status is then this program's, not 0xC0000005 from the exception. */
+static LONG WINAPI fatal_exception_filter(EXCEPTION_POINTERS* info) {
+    static LONG entered = 0;
+    char body[256];
+    if (InterlockedCompareExchange(&entered, 1, 0) == 0 && info != NULL &&
+        info->ExceptionRecord != NULL) {
+        const EXCEPTION_RECORD* record = info->ExceptionRecord;
+        unsigned long long address = 0;
+        if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+            record->NumberParameters >= 2) {
+            address = (unsigned long long)record->ExceptionInformation[1];
+        }
+        snprintf(body, sizeof(body),
+                 "fault code=0x%08lx rip=0x%llx address=0x%llx access=%llu",
+                 (unsigned long)record->ExceptionCode,
+                 (unsigned long long)(ULONG_PTR)record->ExceptionAddress,
+                 address,
+                 (unsigned long long)(record->NumberParameters >= 1
+                                          ? record->ExceptionInformation[0]
+                                          : 0));
+        stage_line(body);
+    }
+    TerminateProcess(GetCurrentProcess(), BOXEDVN_EXIT_FAULT);
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
@@ -359,10 +427,14 @@ int main(void) {
     LARGE_INTEGER counter_frequency;
     LARGE_INTEGER counter_start;
     HRESULT hr;
+    HRESULT rtv_hr = S_OK;
     char detail[320];
     int frames;
     int presented = 0;
-    int mapped_failed = 0;
+
+    /* Armed before anything else, so even a fault in device creation is
+     * reported as a marker instead of as a debugger Wine cannot start. */
+    SetUnhandledExceptionFilter(fatal_exception_filter);
 
     /* ---------------------------------------------------------------- */
     stage_begin("register-class");
@@ -529,6 +601,7 @@ int main(void) {
         stage_fail("render-target", captured, detail);
         return BOXEDVN_EXIT_RENDER_TARGET;
     }
+    rtv_hr = hr;
     /* The ported demo draws with a depth buffer. Failing to build one is
      * reported and survived: the cube is convex and back faces are culled, so
      * the picture is the same, and a depth-buffer defect should not end a run
@@ -563,13 +636,18 @@ int main(void) {
                          (unsigned long)hr);
                 stage_fail("render-target-depth", captured, detail);
             } else {
-                stage_ok("render-target-depth", "format=D24S8");
+                snprintf(detail, sizeof(detail), "hr=0x%08lx format=D24S8",
+                         (unsigned long)hr);
+                stage_ok("render-target-depth", detail);
             }
         }
     }
     ID3D11DeviceContext_OMSetRenderTargets(context, 1, &rtv, depth_view);
-    snprintf(detail, sizeof(detail), "depth=%s",
-             depth_view != NULL ? "yes" : "none");
+    /* The render target's own HRESULT, kept from CreateRenderTargetView: the
+     * depth buffer is best-effort and reports its own, so a failed one must
+     * not be the number printed beside `render-target ok`. */
+    snprintf(detail, sizeof(detail), "hr=0x%08lx depth=%s",
+             (unsigned long)rtv_hr, depth_view != NULL ? "yes" : "none");
     stage_ok("render-target", detail);
 
     /* ---------------------------------------------------------------- */
@@ -664,18 +742,28 @@ int main(void) {
             return BOXEDVN_EXIT_GEOMETRY;
         }
 
-        /* DYNAMIC and written with Map/Unmap every frame, the way the ported
-         * demo does it. (The probe used to write this buffer with
-         * UpdateSubresource; a device run took an access violation reading
-         * that method's vtable slot, so following the demo here also removes
-         * that call site.) A constant buffer's size must be a multiple of 16,
-         * which a 4x4 float matrix already is. */
+        /* DEFAULT and written with UpdateSubresource every frame, which is
+         * the one place this probe deliberately does not follow the demo.
+         *
+         * The demo's D3D11_USAGE_DYNAMIC buffer would be written through
+         * Map(D3D11_MAP_WRITE_DISCARD), and the pointer DXMT returns from
+         * Map is the Metal buffer's host `contents()` address -- memory this
+         * emulated guest cannot write. Every ported run died on the first
+         * frame's copy into it. The file header records the fault and the
+         * DXMT code that produces the pointer.
+         *
+         * UpdateSubresource keeps the copy inside DXMT, which reaches the
+         * Metal buffer through its own host call. NO CPU access flag is
+         * asked for: this buffer is never mapped.
+         *
+         * A constant buffer's size must be a multiple of 16, which a 4x4
+         * float matrix already is. */
         ZeroMemory(&desc, sizeof(desc));
         desc.ByteWidth =
             (UINT)((sizeof(struct probe_matrix) + 15u) & ~(size_t)15u);
-        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        desc.CPUAccessFlags = 0;
         SetLastError(0);
         hr = ID3D11Device_CreateBuffer(device, &desc, NULL, &constant_buffer);
         captured = GetLastError();
@@ -786,7 +874,6 @@ int main(void) {
         MSG message;
         FLOAT colour[4];
         struct probe_matrix mvp;
-        D3D11_MAPPED_SUBRESOURCE mapped;
         LARGE_INTEGER counter_now;
         double seconds;
         int quit = 0;
@@ -809,19 +896,11 @@ int main(void) {
         seconds = (double)(counter_now.QuadPart - counter_start.QuadPart) /
                   (double)counter_frequency.QuadPart;
         mvp = cube_transform(seconds);
-        ZeroMemory(&mapped, sizeof(mapped));
-        hr = ID3D11DeviceContext_Map(context, (ID3D11Resource*)constant_buffer,
-                                     0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr) && mapped.pData != NULL) {
-            CopyMemory(mapped.pData, &mvp, sizeof(mvp));
-            ID3D11DeviceContext_Unmap(context,
-                                      (ID3D11Resource*)constant_buffer, 0);
-        } else if (!mapped_failed) {
-            mapped_failed = 1;
-            snprintf(detail, sizeof(detail), "hr=0x%08lx stage=map-constants",
-                     (unsigned long)hr);
-            stage_fail("present", GetLastError(), detail);
-        }
+        /* The whole buffer, no destination box: DXMT reads the source in the
+         * guest and copies it host-side, so nothing here dereferences a
+         * pointer that came back from Direct3D. */
+        ID3D11DeviceContext_UpdateSubresource(
+            context, (ID3D11Resource*)constant_buffer, 0, NULL, &mvp, 0, 0);
         ID3D11DeviceContext_ClearRenderTargetView(context, rtv, colour);
         if (depth_view != NULL) {
             ID3D11DeviceContext_ClearDepthStencilView(context, depth_view,

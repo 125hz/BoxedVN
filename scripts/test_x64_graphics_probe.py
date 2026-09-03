@@ -98,9 +98,15 @@ class ProbeMarkers(unittest.TestCase):
         self.assertEqual(len(values), len(set(values)),
                          "two stages share an exit code, so the status cannot "
                          "name the stage")
-        # Every failure path returns its own stage's code.
+        # Every failure path returns its own stage's code. The fault code is
+        # the exception: nothing returns from a fault, so the top-level
+        # filter delivers it with TerminateProcess.
         for name in codes:
             if name == "BOXEDVN_EXIT_OK":
+                continue
+            if name == "BOXEDVN_EXIT_FAULT":
+                self.assertIn(f"TerminateProcess(GetCurrentProcess(), {name});",
+                              self.source)
                 continue
             self.assertIn(f"return {name};", self.source)
 
@@ -146,21 +152,55 @@ class CubeGeometryAndShaders(unittest.TestCase):
     def test_the_probe_draws_an_indexed_cube_every_frame(self) -> None:
         loop_at = self.source.find('stage_begin("present")')
         loop = self.source[loop_at:]
-        # The constant buffer is DYNAMIC and written through Map/Unmap, which
-        # is what the ported demo does -- and which also removes the
-        # UpdateSubresource call site a device run faulted on.
-        for call in ("ID3D11DeviceContext_Map(",
-                     "ID3D11DeviceContext_Unmap(",
+        for call in ("ID3D11DeviceContext_UpdateSubresource(",
                      "ID3D11DeviceContext_ClearRenderTargetView(",
                      "ID3D11DeviceContext_DrawIndexed(",
                      "IDXGISwapChain_Present("):
             self.assertIn(call, loop)
-        self.assertIn("D3D11_MAP_WRITE_DISCARD", loop)
-        self.assertNotIn("ID3D11DeviceContext_UpdateSubresource(", loop)
         # The clear precedes the draw, the draw precedes the present.
         self.assertLess(loop.find("ClearRenderTargetView"),
                         loop.find("DrawIndexed"))
         self.assertLess(loop.find("DrawIndexed"), loop.find("_Present("))
+
+    def test_nothing_is_written_through_a_mapped_pointer(self) -> None:
+        # The one place the port deliberately does not follow the demo.
+        #
+        # The demo's constant buffer is D3D11_USAGE_DYNAMIC and is written
+        # through Map(D3D11_MAP_WRITE_DISCARD). DXMT returns the Metal
+        # buffer's host contents() address from Map -- it only allocates CPU
+        # side memory the guest owns under `#ifdef __i386__` -- and this
+        # emulated 64-bit guest cannot write host memory. Every run of the
+        # literal port died on the first frame, in the probe's own copy into
+        # that pointer, with Wine trying to start a debugger.
+        #
+        # UpdateSubresource on a DEFAULT buffer keeps the copy inside DXMT,
+        # which reaches the Metal buffer through its own host call.
+        banned = ("ID3D11DeviceContext_Map(", "ID3D11DeviceContext_Unmap(",
+                  "D3D11_MAP_WRITE_DISCARD", "D3D11_USAGE_DYNAMIC",
+                  "D3D11_CPU_ACCESS_WRITE")
+        for line in self.source.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("*") or stripped.startswith("/*"):
+                continue  # the comment that explains why they are banned
+            for name in banned:
+                self.assertNotIn(name, stripped,
+                                 f"{name} is code again, not a comment")
+        self.assertIn("desc.Usage = D3D11_USAGE_DEFAULT;", self.source)
+
+    def test_an_unhandled_fault_is_a_marker_and_not_a_debugger(self) -> None:
+        # Wine answers an unhandled exception by starting winedbg, which on
+        # device could not attach: two runs said nothing but an address. The
+        # top-level filter turns that into a marker and a status of its own.
+        self.assertIn("SetUnhandledExceptionFilter(fatal_exception_filter);",
+                      self.source)
+        self.assertIn('"fault code=0x%08lx rip=0x%llx address=0x%llx',
+                      self.source)
+        self.assertIn(
+            "TerminateProcess(GetCurrentProcess(), BOXEDVN_EXIT_FAULT);",
+            self.source)
+        # A vectored handler would also see exceptions Direct3D and Wine
+        # handle themselves; this must stay the last-resort filter.
+        self.assertNotIn("AddVectoredExceptionHandler", self.source)
 
     def test_the_spin_comes_from_the_clock_not_the_frame_counter(self) -> None:
         # With the host frame limiter unlocked the guest presents as fast as
@@ -194,6 +234,13 @@ class CubeGeometryAndShaders(unittest.TestCase):
         self.assertIn("ID3D11Device_CreateDepthStencilView(", self.source)
         self.assertIn('stage_fail("render-target-depth"', self.source)
         self.assertIn("if (depth_view != NULL) {", self.source)
+        # Both outcomes of this stage carry an HRESULT, and the render
+        # target's own marker carries the one from CreateRenderTargetView --
+        # never the depth buffer's, which is allowed to fail.
+        self.assertIn('stage_ok("render-target-depth", detail);', self.source)
+        self.assertIn('"hr=0x%08lx format=D24S8"', self.source)
+        self.assertIn("rtv_hr = hr;", self.source)
+        self.assertIn('"hr=0x%08lx depth=%s"', self.source)
         # ...and the failure is not fatal: no exit code is returned from it.
         depth_at = self.source.find('stage_fail("render-target-depth"')
         tail = self.source[depth_at:depth_at + 400]

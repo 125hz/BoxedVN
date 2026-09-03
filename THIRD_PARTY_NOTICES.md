@@ -186,6 +186,13 @@ carried over (the shaders are compiled ahead of time with `fxc` and embedded,
 which is what Madeira's own `test_shim.h` arranges differently for the same
 reason).
 
+One behavioural deviation is deliberate and is documented at its call site:
+the demo's constant buffer is `D3D11_USAGE_DYNAMIC` and is written through
+`Map`/`Unmap`, while the probe's is `D3D11_USAGE_DEFAULT` and is written with
+`UpdateSubresource`. DXMT returns the Metal buffer's host `contents()`
+address from `Map`, which an emulated 64-bit guest cannot write; the values
+uploaded each frame are identical.
+
 The DXMT Direct3D 11 / DXGI PE modules and the native Metal backend staged
 beside the probe come from the same MIT-licensed project and are built from
 source by `scripts/build-dxmt-x64-pe.sh` and
