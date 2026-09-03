@@ -50,13 +50,14 @@ VULKAN_SHIM_SONAME="libvulkan.so.1"
 # syswow64 is the launcher's job and is gated on BOXEDVN_WOW64_D3D9=dxvk; see
 # source/sdl/startupArgs.cpp.
 DXVK_I386_DIR=""
-DXVK_I386_GUEST_DIR="${WINE_MODULE_ROOT}/dxvk-i386"
 DXVK_I386_MODULES=(d3d9.dll)
 DXVK_I386_OPTIONAL_MODULES=(dxgi.dll d3d11.dll d3d10core.dll)
 # The guest module root everything real is packaged under. Kept the same
 # as K_X64_WINE_MODULE_ROOT in include/guest_wine64_layout.h, which is what
 # the launch and the device preflight use.
 WINE_MODULE_ROOT="/usr/lib/x86_64-linux-gnu/wine"
+# Defined after the root it hangs off: the i386 DXVK staging directory.
+DXVK_I386_GUEST_DIR="${WINE_MODULE_ROOT}/dxvk-i386"
 # The 32-bit PE builtin tree for new WoW64, extracted from the SAME libwine
 # version's i386 package by the caller. Ubuntu's wine64 package ships only the
 # 64-bit trees; the i386 package's i386-unix tree is the OLD WoW64 (it needs
@@ -647,13 +648,17 @@ fi
     || die "The staged fontconfig tree has no fonts.conf."
 # Every configuration file has to be XML, not the text of a link target.
 #
-# A device run reported "out of memory" from fontconfig at the two <include>
-# lines of fonts.conf and then "Cannot load config file". Fontconfig reports a
-# parse failure that way, so the interesting question is what those includes
-# actually resolve to inside the guest. /etc/fonts/conf.d is a directory of
-# symlinks on the runner; if any of them reached the archive as a small file
-# containing its target path rather than the file it names, fontconfig would
-# read that text, fail to parse it, and say exactly this.
+# A device run reported "out of memory" from fontconfig at lines 86 and 91 of
+# fonts.conf and then "Cannot load config file". That particular failure was
+# not a packaging fault -- it was the 64-bit kernel's getcwd returning the
+# buffer pointer instead of the length, which made fontconfig's <glob>
+# canonicalisation fail; see docs/HANDOFF_X64_FONTCONFIG_GETCWD.md.
+#
+# The checks below stay because they cover a different, equally silent way to
+# produce the same message: /etc/fonts/conf.d is a directory of symlinks on the
+# runner, and if any of them reached the archive as a small file containing its
+# target path rather than the file it names, fontconfig would read that text,
+# fail to parse it, and say exactly this.
 #
 # Checked here rather than assumed: a .conf that does not parse fails the
 # build, and the count is logged so an empty conf.d is visible too.
