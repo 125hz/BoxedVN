@@ -411,7 +411,7 @@ enum ContainerLibrary {
         found: (ContainerX64Program, Int) -> Void
     ) -> Int {
         let manager = FileManager.default
-        let keys: [URLResourceKey] = [.isDirectoryKey]
+        let keys: Set<URLResourceKey> = [.isDirectoryKey]
         var queue: [(URL, String, Int)] = [(root, "", 0)]
         // A Wine drive_c is full of symbolic links, several of which point
         // back up the tree. Entering a folder once is both the loop guard and
