@@ -540,14 +540,9 @@ final class AppModel: ObservableObject {
             return
         }
         guard let runtime = prepareX64Runtime(for: container) else { return }
-        guard runtime.pe32 != nil else {
-            alertMessage = "The 32-bit cube now runs through the 64-bit Wine, "
-                + "which needs the 32-bit PE layer. Download "
-                + "\(X64Runtime.pe32ArchiveName) from the build's release page and put "
-                + "it in this container's folder (next to Files) or in "
-                + "On My iPhone > BoxedVN, then try again."
-            return
-        }
+        // The cube is a 32-bit PE, so it takes the WoW64 lane and needs a
+        // complete 32-bit layer, not merely a present one.
+        guard allowWoW64Launch(with: runtime) else { return }
         let target = runtime.diagnostics.appendingPathComponent(source.lastPathComponent)
         do {
             if FileManager.default.fileExists(atPath: target.path) {
@@ -608,6 +603,32 @@ final class AppModel: ObservableObject {
         let pe32: URL?
         var overlays: [URL] { [glibc, wine64] + (pe32.map { [$0] } ?? []) }
         static let pe32ArchiveName = "wine64-pe32.zip"
+
+        /// Where inside the archive the 32-bit builtins live. The build
+        /// script archives the staged tree from its root, so the entries are
+        /// `usr/lib/x86_64-linux-gnu/wine/i386-windows/<module>` - the guest
+        /// path K_X64_WINE_PE32_DIR names, with no leading slash.
+        static let pe32ModuleDirectory = "/i386-windows/"
+
+        /// The 32-bit builtins the WoW64 lane's own import chain reaches
+        /// before a Windows program runs an instruction of its own. Kept in
+        /// step with K_X64_WOW64_LANE_PE32_MODULE_NAMES in
+        /// include/guest_wine64_layout.h, which is where the list came from:
+        /// every name was observed being resolved by a device run.
+        ///
+        /// The archive carries no version stamp of its own - the build writes
+        /// its manifest beside the archive, not inside it - so this list *is*
+        /// the version check. A copy made before the packaging fix is exactly
+        /// a copy that does not carry all fourteen, and the device log of one
+        /// said so: `BOXEDWINE_X64_PE32_GAP tree=i386-windows required=14
+        /// missing=1`, followed by a process that exited 0xC0000135 with no
+        /// window and no message.
+        static let pe32RequiredModules = [
+            "ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll",
+            "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll",
+            "user32.dll", "win32u.dll", "opengl32.dll", "wined3d.dll",
+            "d3d9.dll", "zlib1.dll",
+        ]
 
         /// The guest path D: resolves to for `diagnostics`. BoxedWine -w takes
         /// a guest Linux directory, not a Windows path: the Windows form left
@@ -690,6 +711,121 @@ final class AppModel: ObservableObject {
             return nil
         }
         return runtime
+    }
+
+    // MARK: - The 32-bit runtime layer
+
+    /// What one reading of a `wine64-pe32.zip` found, remembered so the same
+    /// archive is not re-read on every launch.
+    private struct Pe32Inspection {
+        /// Path, size and modification date. A replaced archive gets a new
+        /// one and is read again; the same file never is.
+        var identity: String
+        /// Required modules the archive's central directory does not list, or
+        /// lists as an empty entry.
+        var missingModules: [String]
+        /// False when the file could not be read as a ZIP at all.
+        var readable: Bool
+    }
+
+    private var pe32Inspections: [String: Pe32Inspection] = [:]
+
+    /// Checks the 32-bit runtime layer a WoW64 launch is about to mount, and
+    /// returns the message to show when it cannot carry one.
+    ///
+    /// The archive is not opened or inflated: only its central directory is
+    /// read, which is the last few tens of kilobytes of the file whatever its
+    /// size, so this costs the same on a 500 MB layer as on a small one.
+    ///
+    /// Why it exists: the layer is a file the user downloads and copies into
+    /// the container folder by hand, so the copy on a device can predate any
+    /// packaging fix, and nothing on either side notices. One did, and the
+    /// only symptom was a program that never opened a window - the loader
+    /// searched for a builtin the archive did not carry and ended the process
+    /// with STATUS_DLL_NOT_FOUND before its entry point. Naming the gap and
+    /// the fix here turns that into a sentence the user can act on.
+    private func pe32LayerProblem(at archive: URL) -> String? {
+        let attributes = try? FileManager.default.attributesOfItem(
+            atPath: archive.path)
+        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? -1
+        let modified = (attributes?[.modificationDate] as? Date)?
+            .timeIntervalSince1970 ?? -1
+        let identity = "\(archive.path)|\(size)|\(modified)"
+
+        var inspection = pe32Inspections[archive.path]
+        if inspection?.identity != identity {
+            inspection = inspect(pe32Archive: archive, identity: identity)
+            pe32Inspections[archive.path] = inspection
+        }
+        guard let inspection else { return nil }
+
+        let replace = "Download \(X64Runtime.pe32ArchiveName) again from the "
+            + "build's release page and replace the copy in this container's "
+            + "folder (next to Files), or in On My iPhone > BoxedVN."
+        if !inspection.readable {
+            return "The 32-bit runtime layer at \(archive.path) could not be "
+                + "read as a ZIP archive, so a 32-bit program cannot be "
+                + "started. " + replace
+        }
+        guard !inspection.missingModules.isEmpty else { return nil }
+        let names = inspection.missingModules.joined(separator: ", ")
+        return "The 32-bit runtime layer in this container is out of date: "
+            + "\(X64Runtime.pe32ArchiveName) is missing "
+            + "\(inspection.missingModules.count) of the "
+            + "\(X64Runtime.pe32RequiredModules.count) modules a 32-bit "
+            + "Windows program loads before it runs - \(names). A program "
+            + "started with this layer exits with status 0xC0000135 and no "
+            + "window. " + replace
+    }
+
+    private func inspect(pe32Archive archive: URL, identity: String)
+        -> Pe32Inspection {
+        guard let entries = ZipArchive.listEntries(at: archive) else {
+            Log.write("The 32-bit PE layer at \(archive.path) has no readable "
+                      + "ZIP central directory", category: "container",
+                      level: BVNLogLevelError)
+            return Pe32Inspection(identity: identity, missingModules: [],
+                                  readable: false)
+        }
+        var present: Set<String> = []
+        for entry in entries where entry.uncompressedSize > 0 {
+            let name = entry.name.lowercased()
+            guard name.contains(X64Runtime.pe32ModuleDirectory) else { continue }
+            present.insert(entry.fileName.lowercased())
+        }
+        let missing = X64Runtime.pe32RequiredModules.filter {
+            !present.contains($0)
+        }
+        Log.write("32-bit PE layer \(archive.lastPathComponent): "
+                  + "\(entries.count) entries, "
+                  + "\(present.count) i386-windows modules, "
+                  + (missing.isEmpty
+                        ? "all \(X64Runtime.pe32RequiredModules.count) "
+                          + "required modules present"
+                        : "missing " + missing.joined(separator: ", ")),
+                  category: "container",
+                  level: missing.isEmpty ? BVNLogLevelInfo
+                                         : BVNLogLevelWarning)
+        return Pe32Inspection(identity: identity, missingModules: missing,
+                              readable: true)
+    }
+
+    /// The guard both WoW64 launches share: the layer has to be there, and it
+    /// has to be complete. Returns false after setting the alert.
+    private func allowWoW64Launch(with runtime: X64Runtime) -> Bool {
+        guard let pe32 = runtime.pe32 else {
+            alertMessage = "A 32-bit program runs through the 64-bit Wine, "
+                + "which needs the 32-bit PE layer. Download "
+                + "\(X64Runtime.pe32ArchiveName) from the build's release page "
+                + "and put it in this container's folder (next to Files) or in "
+                + "On My iPhone > BoxedVN, then try again."
+            return false
+        }
+        if let problem = pe32LayerProblem(at: pe32) {
+            alertMessage = problem
+            return false
+        }
+        return true
     }
 
     /// Moves an existing prefix's drive_c out of the private writable root
@@ -798,6 +934,14 @@ final class AppModel: ObservableObject {
             return
         }
         guard let runtime = prepareX64Runtime(for: container) else { return }
+        // A program whose PE header says i386 takes Wine's WoW64 lane, which
+        // is served entirely out of the 32-bit layer the user supplies. The
+        // picker already read that header, so the launch knows which lane it
+        // is on before it starts anything.
+        if program.executable.architecture == Self.x86_32ArchitectureName,
+           !allowWoW64Launch(with: runtime) {
+            return
+        }
         rememberX64Program(program, for: container)
         do {
             Log.write("Launching \(program.guestExecutablePath) through "
@@ -851,6 +995,10 @@ final class AppModel: ObservableObject {
     private static func x64ProgramKey(_ container: WineContainer) -> String {
         "BoxedVN.x64Program." + container.id
     }
+
+    /// What `architectureName` in Runtime.swift calls an i386 PE. Matched
+    /// rather than re-derived so the two never drift apart silently.
+    private static let x86_32ArchitectureName = "x86 32-bit"
 
     /// Wine's builtin explorer, named the way Wine's unix loader can resolve
     /// it without falling back to `start.exe`. See `launchX64Desktop`.
@@ -1001,23 +1149,30 @@ final class AppModel: ObservableObject {
     }
 
     func requestShutdown() {
-        // Already on the way out: a second tap is not an error, and must not
-        // put an alert over a page that is waiting for the guest to unwind.
-        guard runtimeState != .stopping else {
-            Task.detached(priority: .userInitiated) {
-                Session.requestShutdown()
-            }
-            return
+        // The runtime's own state, read straight out of C, not the published
+        // copy. The published copy is refreshed from inside a
+        // `Task { @MainActor }`, and while a guest runs the main actor is the
+        // guest, so that copy is frozen at whatever it held when the launch
+        // button was tapped - `idle`. Deciding anything from it meant the stop
+        // button answering "No guest session is running" to the user of a
+        // session that was very much running, over a page still showing it.
+        //
+        // BVNRuntimeGetState is a mutex read with no actor hop, so it is the
+        // truth at the moment of the tap whatever the main actor is doing.
+        let live = RuntimeState.current
+        // Published now rather than at the next poll: the poll cannot run
+        // until the guest has finished unwinding, so on device the page kept
+        // saying "running" - and the whole UI looked frozen - for as long as
+        // that took.
+        if live == .running || live == .starting {
+            runtimeState = .stopping
+        } else {
+            runtimeState = live
         }
-        guard runtimeState == .running || runtimeState == .starting else {
-            alertMessage = "No guest session is running."
-            return
-        }
-        // Published now rather than at the next poll. The poll timer is a main
-        // run-loop timer and the guest owns the main thread until it has
-        // finished unwinding, so on device the page kept saying "running" -
-        // and the whole UI looked frozen - for as long as that took.
-        runtimeState = .stopping
+        // Never an alert. A stop tap on a page that shows a session is always
+        // meant, and the runtime answers a request it cannot serve by doing
+        // nothing, which is the right answer here too.
+        //
         // SDL_PushEvent takes the event queue's lock, which the guest loop
         // holds for stretches of its own, so the tap itself is answered off
         // the main thread.

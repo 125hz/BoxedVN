@@ -82,6 +82,10 @@ std::string gLastError;
 bool gFrontendReady = false;
 bool gShutdownRequested = false;
 
+// How the session's launched program ended, and whether that ending has
+// already been acted on.  Both live under gMutex with the state they explain.
+BVNGuestExitReport gLastGuestExit = {};
+
 // Set for the lifetime of an outstanding call to BVNJITProbeExecute() and
 // never cleared if that call never returns.  See probeJitWithTimeout() below
 // for why a hang, not just a crash, has to be planned for.
@@ -541,6 +545,10 @@ bool acceptLaunchLocked(const BVNLaunchRequest* request, std::string& error) {
     gPendingLaunch = std::move(launch);
     gHasPendingLaunch = true;
     gState = BVNRuntimeStateStarting;
+    // The previous session's ending belongs to the previous session. Clearing
+    // it here rather than when a session ends means a page that shows the
+    // message keeps showing it for as long as the guest stays stopped.
+    gLastGuestExit = BVNGuestExitReport();
     return true;
 }
 
@@ -1260,6 +1268,79 @@ extern "C" bool BVNRuntimeRequestShutdown(void) {
     quit.type = SDL_QUIT;
     SDL_PushEvent(&quit);
     return true;
+}
+
+extern "C" BVNGuestExitReport BVNRuntimeLastGuestExit(void) {
+    pthread_mutex_lock(&gMutex);
+    const BVNGuestExitReport report = gLastGuestExit;
+    pthread_mutex_unlock(&gMutex);
+    return report;
+}
+
+extern "C" void BVNRuntimeNoteLaunchedProcessExited(uint32_t pid,
+                                                    uint32_t status,
+                                                    const char* missingModule) {
+    BVNGuestExitReport report = BVNGuestExitReport();
+    report.valid = true;
+    report.status = status;
+    report.pid = pid;
+    copyString(report.missingModule, sizeof(report.missingModule),
+               missingModule != nullptr ? missingModule : "");
+
+    pthread_mutex_lock(&gMutex);
+    // A process is retired once, but several of its threads can each be the
+    // one that observes it, so this arrives more than once. The first report
+    // is the one that describes the ending; the rest say nothing new and must
+    // not queue a second shutdown.
+    const bool alreadyRecorded = gLastGuestExit.valid;
+    const bool sessionLive = (gState == BVNRuntimeStateRunning ||
+                              gState == BVNRuntimeStateStarting);
+    if (!alreadyRecorded) {
+        gLastGuestExit = report;
+    }
+    pthread_mutex_unlock(&gMutex);
+
+    if (alreadyRecorded) {
+        return;
+    }
+
+    char line[256];
+    snprintf(line, sizeof(line),
+             "BOXEDWINE_SESSION_PROGRAM_EXIT pid=%u status=0x%08x module=%s "
+             "live=%d",
+             (unsigned)pid, (unsigned)status,
+             report.missingModule[0] != '\0' ? report.missingModule : "(none)",
+             sessionLive ? 1 : 0);
+    BVNLogWrite(status == 0 ? BVNLogLevelInfo : BVNLogLevelWarning, "runtime",
+                line);
+
+    if (!sessionLive) {
+        return;
+    }
+
+    // Off this thread, and off any lock the emulator holds while it retires a
+    // process: this runs on a guest CPU thread inside the translator's unwind,
+    // and SDL_PushEvent takes the event queue's own lock.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BVNLogWrite(BVNLogLevelInfo, "runtime",
+                    "the launched program has ended; stopping the session");
+        BVNRuntimeRequestShutdown();
+        // The launched program's helpers - wineserver, services.exe,
+        // winedevice - are what keep boxedmain from returning, and they are
+        // torn down by the same SDL_QUIT the stop button posts. Repeat it a
+        // bounded number of times for a guest that is slow to notice the
+        // first one, exactly as a second tap on the stop button would.
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW,
+                              (int64_t)attempt * (int64_t)NSEC_PER_SEC),
+                dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    if (BVNRuntimeGetState() == BVNRuntimeStateStopping) {
+                        BVNRuntimeRequestShutdown();
+                    }
+                });
+        }
+    });
 }
 
 extern "C" int BVNGuestMain(int argc, char* argv[]) {

@@ -446,6 +446,19 @@ separately (`BVNLaunchConfiguration::dxmtModuleDirectory`); without that
 split, running a program from its own folder would have projected no DXMT
 modules over Wine's module root at all.
 
+The picker's scan is bounded and incremental. It walks the two drives on a
+detached task eight folders deep, skipping Windows' own tree (unless "Show
+Windows system programs" is on), `Program Files/Common Files`, and the
+installer and component caches - `winsxs`, `Installer`, `assembly`, package
+caches - which is where a scan of a real C: drive spent the minutes the user
+waited through. Programs appear as they are inspected rather than all at once
+at the end, the row above them counts folders read, and the result is
+remembered against the modification date of every folder the walk entered: a
+second opening of the sheet is instant until a file is added, removed or
+renamed anywhere in that tree, at which point the folder holding it has a new
+date and the scan runs again. **Rescan** in the sheet discards the
+remembered result explicitly.
+
 ### A failed import names itself in the log
 
 A guest that exits `3221225781` (`STATUS_DLL_NOT_FOUND`) could not resolve an
@@ -464,6 +477,78 @@ The per-process budget for the full `BOXEDWINE_X64_DLL_SEARCH` trace is 1024
 operations (it was 128, which a real program's import tree spent on its first
 dozen imports, leaving the log naming every module that loaded and not the
 one that did not).
+
+### The launched program's exit ends the session; nothing else does
+
+`boxedmain()` returns when the emulator's platform thread count reaches zero,
+and the launched program is not the only thing holding it above zero. A Wine
+session also has wineserver, `services.exe` and `winedevice`, and none of them
+notices that the program which started them is gone. A device session shows
+the whole consequence: the launched process exited `0xC0000135` about
+fourteen seconds in, the log's last line was the translator retiring it, and
+after that nothing - no `state -> stopped`, no `guest exited with code`, the
+main thread inside `boxedmain()` for good, and the app frozen with a live view
+of an empty screen.
+
+So the frontend is told. `BVNFEXCPU64Run` reports the retirement of the
+session's translated process - `parentId <= 1`, which is the launched program
+and never a helper - through
+`BVNRuntimeNoteLaunchedProcessExited(pid, status, missingModule)`
+(ios/runtime/include/BVNRuntime.h). The runtime records the status, logs
+`BOXEDWINE_SESSION_PROGRAM_EXIT`, and posts the same `SDL_QUIT` the stop
+button posts, repeating it up to three times a second apart while the state is
+still `stopping`. The helpers are then torn down exactly as a user-requested
+stop tears them down.
+
+The status survives the shutdown, because the exit is the only thing the user
+ever sees of a program that never opened a window. `BVNRuntimeLastGuestExit()`
+returns it until the next launch is accepted, and the container page shows it
+where the live view was:
+
+> The program exited with status 0xC0000135 (a required DLL was not found:
+> ws2_32.dll).
+
+The module name comes from the loader's own search recorder, which is the only
+place it exists when Wine's debug channels are quiet.
+
+### Page state is read from the runtime, not from AppModel
+
+`AppModel.runtimeState` is refreshed from inside a `Task { @MainActor }`, and
+while a guest runs the main actor *is* the guest: `BVNGuestMain` owns the main
+thread and only pumps the run loop, so run-loop timers still fire but nothing
+enqueued on the main actor's executor is ever serviced. The published copy
+therefore stays at whatever it held when Launch was tapped - `idle` - for the
+whole session.
+
+That is what made the stop button answer "No guest session is running" over a
+page that was showing one. Anything on the container page that has to stay
+true during a session reads `BVNRuntimeGetState()` directly, on a `.common`
+mode run-loop timer, the way `GuestPerformanceReadout` already samples its own
+numbers; and `AppModel.requestShutdown()` decides from that live state and
+never raises an alert of its own.
+
+### The 32-bit runtime layer is checked before a WoW64 launch
+
+`wine64-pe32.zip` is not bundled: the user downloads it and copies it into the
+container folder, so the copy on a device can predate a packaging fix with
+nothing on either side noticing. One did, and the only symptom was a program
+that never opened a window.
+
+Before a launch that takes the WoW64 lane - the 32-bit cube, or a program
+whose PE header says i386, which the picker has already read - BoxedVN reads
+the archive's ZIP *central directory* (the last few tens of kilobytes of the
+file, whatever its size; nothing is inflated) and checks that the fourteen
+names in `K_X64_WOW64_LANE_PE32_MODULE_NAMES` are all present under
+`i386-windows/` as non-empty entries. The archive carries no version stamp of
+its own - the build writes `wine64-runtime.manifest` beside it, not inside it
+- so that list is the version check: a copy made before the fix is exactly a
+copy that does not carry all fourteen.
+
+A layer that fails names the missing modules and the fix (download
+`wine64-pe32.zip` again and replace the copy in the container folder) instead
+of starting a program that would exit `0xC0000135` in silence. The reading is
+cached against the archive's path, size and modification date, so replacing
+the file re-reads it and nothing else does.
 
 The following remains unproven or deliberately constrained:
 

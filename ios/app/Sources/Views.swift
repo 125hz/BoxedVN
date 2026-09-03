@@ -530,6 +530,25 @@ struct ContainerDetailView: View {
     // True from the moment a guest is launched from this page until it stops,
     // so the "no guest" placeholder does not linger over a starting session.
     @State private var launched = false
+    // The runtime's own state, sampled here rather than read from
+    // model.runtimeState.
+    //
+    // AppModel refreshes its copy from inside a `Task { @MainActor }`, and
+    // while a guest runs the main actor is the guest: BVNGuestMain owns the
+    // main thread and only pumps the run loop, so run-loop timers still fire
+    // but nothing enqueued on the main actor's executor is ever serviced. The
+    // published copy therefore stays at whatever it held when Launch was
+    // tapped - `idle` - for the whole session, which is how this page came to
+    // show a running guest while the stop button answered that none was
+    // running. The tick below is a plain run-loop timer in .common mode and
+    // BVNRuntimeGetState is a mutex read, so neither needs the main actor.
+    @State private var liveState: RuntimeState = .idle
+    // How the launched program ended, when it ended badly. Shown where the
+    // live view was, because a program that exits before it opens a window
+    // otherwise leaves nothing at all behind.
+    @State private var exitNote: String?
+    private let sessionTick = Timer.publish(every: 0.5, on: .main, in: .common)
+        .autoconnect()
 
     private let resolutions = ["640x480", "800x600", "1024x768",
                                "1280x720", "1280x960", "1366x1024",
@@ -547,12 +566,14 @@ struct ContainerDetailView: View {
                     .listRowInsets(EdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4))
                 ZStack {
                     GuestLiveView()
-                    if !launched && model.runtimeState != .running
-                        && model.runtimeState != .starting {
-                        Text("No guest is running. Open a desktop or a cube "
-                             + "below and it appears here.")
+                    if !launched && liveState != .running
+                        && liveState != .starting {
+                        Text(exitNote
+                             ?? ("No guest is running. Open a desktop or a "
+                                 + "cube below and it appears here."))
                             .font(.footnote)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(exitNote == nil ? Color.secondary
+                                                             : Color.primary)
                             .multilineTextAlignment(.center)
                             .padding()
                     }
@@ -585,6 +606,7 @@ struct ContainerDetailView: View {
                     launched = false
                 }
             }
+            .onReceive(sessionTick) { _ in refreshSession() }
             Section("Desktop") {
                 Button {
                     save(); launched = true
@@ -758,8 +780,29 @@ struct ContainerDetailView: View {
     }
 
     private var sessionIsBusy: Bool {
-        model.runtimeState == .starting || model.runtimeState == .running ||
-        model.runtimeState == .stopping
+        liveState == .starting || liveState == .running ||
+        liveState == .stopping
+    }
+
+    /// Half a second of session bookkeeping, off the main actor's queue.
+    ///
+    /// Leaving the launched state is this page's own business. The guest can
+    /// end without the page having asked - a program that cannot resolve an
+    /// import exits in its first seconds - and when it does, the runtime stops
+    /// the session and the page has to come back to idle by itself rather than
+    /// wait for a publish that cannot arrive while the guest holds the main
+    /// thread.
+    private func refreshSession() {
+        let state = RuntimeState.current
+        if state != liveState { liveState = state }
+        if state == .stopped || state == .idle || state == .failed {
+            if launched { launched = false }
+        }
+        // Only an ending worth reading. A program that exited normally leaves
+        // the ordinary placeholder in place.
+        let ending = Session.lastGuestExit
+        let note = ending?.isError == true ? ending?.message : nil
+        if note != exitNote { exitNote = note }
     }
 
     /// The file name of the program this container ran last, for the row's
@@ -803,10 +846,16 @@ struct ContainerDetailView: View {
     }
 }
 
-/// Picks one program from the container's two 64-bit drives. The scan is the
-/// same recursive discovery the Programs section uses, run once per opening
-/// of the sheet and off the main thread: a container's C: drive can hold
-/// thousands of files.
+/// Picks one program from the container's two 64-bit drives.
+///
+/// The scan runs on a detached task and its results arrive as they are found,
+/// so the first programs are pickable while the rest of the tree is still
+/// being read. It is bounded, too: eight folders deep, past neither Windows'
+/// own trees nor the installer caches, which is where a scan of a real C:
+/// drive spent the minutes the user waited through. What it finds is
+/// remembered against the modification dates of every folder it entered, so
+/// opening this sheet a second time is instant until something on the drives
+/// actually changes.
 private struct X64ProgramPicker: View {
     let container: WineContainer
     let lastProgramID: String?
@@ -815,6 +864,9 @@ private struct X64ProgramPicker: View {
 
     @State private var programs: [ContainerX64Program] = []
     @State private var isScanning = true
+    @State private var foldersScanned = 0
+    /// Bumped to start a fresh scan; `.task(id:)` cancels the one in flight.
+    @State private var scanGeneration = 0
 
     var body: some View {
         NavigationStack {
@@ -822,7 +874,14 @@ private struct X64ProgramPicker: View {
                 if isScanning {
                     HStack(spacing: 8) {
                         ProgressView()
-                        Text("Scanning C: and D:…")
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Scanning C: and D:…")
+                            Text("\(foldersScanned) folders · "
+                                 + "\(programs.count) programs")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
                     }
                 } else if programs.isEmpty {
                     Text("No programs on C: or D:. Copy a folder into the "
@@ -857,12 +916,23 @@ private struct X64ProgramPicker: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { onCancel() }
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Rescan") {
+                        ContainerLibrary.forgetX64ProgramCache(for: container)
+                        scanGeneration += 1
+                    }
+                    .disabled(isScanning)
+                }
             }
-            .task {
-                let current = container
-                programs = await Task.detached(priority: .userInitiated) {
-                    ContainerLibrary.x64Programs(in: current)
-                }.value
+            .task(id: scanGeneration) {
+                isScanning = true
+                foldersScanned = 0
+                programs = []
+                let scan = ContainerLibrary.x64ProgramScan(for: container)
+                for await update in scan {
+                    programs = update.programs
+                    foldersScanned = update.foldersScanned
+                }
                 isScanning = false
             }
         }

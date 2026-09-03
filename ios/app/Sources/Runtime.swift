@@ -386,9 +386,134 @@ enum Storage {
     }
 }
 
+// MARK: - ZIP central directory
+
+struct ZipEntry {
+    var name: String
+    var uncompressedSize: UInt64
+
+    /// The last path component, which is what a module name is.
+    var fileName: String {
+        name.split(separator: "/").last.map(String.init) ?? name
+    }
+}
+
+/// Reads what is *in* a ZIP archive without inflating any of it.
+///
+/// The runtime layers the user drops into a container are hundreds of
+/// megabytes and BoxedVN needs one fact about them before a launch: whether
+/// the modules a WoW64 program loads are actually in there. The central
+/// directory at the end of the file answers that in two reads, so the check
+/// costs the same on a 500 MB archive as on a 5 MB one.
+enum ZipArchive {
+    private static let endOfCentralDirectory: UInt32 = 0x0605_4b50
+    private static let zip64Locator: UInt32 = 0x0706_4b50
+    private static let zip64EndOfCentralDirectory: UInt32 = 0x0606_4b50
+    private static let centralFileHeader: UInt32 = 0x0201_4b50
+
+    /// Every entry the archive's central directory lists, or nil when the file
+    /// cannot be read or is not a ZIP at all. Directory entries are included;
+    /// they are the ones with a trailing "/".
+    static func listEntries(at url: URL) -> [ZipEntry]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd(), size > 22 else { return nil }
+
+        // The end record is last but for a comment of up to 64 KiB.
+        let tailLength = UInt64(min(size, 66 * 1024))
+        guard let tail = readBytes(handle, at: size - tailLength,
+                                   count: Int(tailLength)),
+              let endOffset = lastIndex(of: endOfCentralDirectory, in: tail,
+                                        minimumTrailingBytes: 22) else {
+            return nil
+        }
+
+        var directoryOffset = UInt64(uint32(tail, endOffset + 16))
+        var directorySize = UInt64(uint32(tail, endOffset + 12))
+        if directoryOffset == 0xFFFF_FFFF || directorySize == 0xFFFF_FFFF {
+            guard endOffset >= 20,
+                  uint32(tail, endOffset - 20) == zip64Locator else {
+                return nil
+            }
+            let recordOffset = uint64(tail, endOffset - 20 + 8)
+            guard let record = readBytes(handle, at: recordOffset,
+                                         count: 56),
+                  uint32(record, 0) == zip64EndOfCentralDirectory else {
+                return nil
+            }
+            directorySize = uint64(record, 40)
+            directoryOffset = uint64(record, 48)
+        }
+        guard directorySize > 0, directoryOffset + directorySize <= size,
+              directorySize < 64 * 1024 * 1024,
+              let directory = readBytes(handle, at: directoryOffset,
+                                        count: Int(directorySize)) else {
+            return nil
+        }
+
+        var entries: [ZipEntry] = []
+        var cursor = 0
+        while cursor + 46 <= directory.count,
+              uint32(directory, cursor) == centralFileHeader {
+            let nameLength = Int(uint16(directory, cursor + 28))
+            let extraLength = Int(uint16(directory, cursor + 30))
+            let commentLength = Int(uint16(directory, cursor + 32))
+            let uncompressed = UInt64(uint32(directory, cursor + 24))
+            let nameStart = cursor + 46
+            guard nameStart + nameLength <= directory.count else { break }
+            let name = String(
+                decoding: directory[nameStart..<(nameStart + nameLength)],
+                as: UTF8.self)
+            entries.append(ZipEntry(name: name, uncompressedSize: uncompressed))
+            cursor = nameStart + nameLength + extraLength + commentLength
+        }
+        return entries
+    }
+
+    private static func readBytes(_ handle: FileHandle, at offset: UInt64,
+                                  count: Int) -> [UInt8]? {
+        guard (try? handle.seek(toOffset: offset)) != nil,
+              let data = try? handle.read(upToCount: count),
+              data.count == count else {
+            return nil
+        }
+        return [UInt8](data)
+    }
+
+    private static func lastIndex(of signature: UInt32, in bytes: [UInt8],
+                                  minimumTrailingBytes: Int) -> Int? {
+        guard bytes.count >= minimumTrailingBytes else { return nil }
+        var index = bytes.count - minimumTrailingBytes
+        while index >= 0 {
+            if uint32(bytes, index) == signature { return index }
+            index -= 1
+        }
+        return nil
+    }
+
+    private static func uint16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
+        guard offset >= 0, offset + 2 <= bytes.count else { return 0 }
+        return UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+    }
+
+    private static func uint32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+        guard offset >= 0, offset + 4 <= bytes.count else { return 0 }
+        return UInt32(uint16(bytes, offset))
+            | (UInt32(uint16(bytes, offset + 2)) << 16)
+    }
+
+    private static func uint64(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
+        guard offset >= 0, offset + 8 <= bytes.count else { return 0 }
+        return UInt64(uint32(bytes, offset))
+            | (UInt64(uint32(bytes, offset + 4)) << 32)
+    }
+}
+
 // MARK: - Executable inspection
 
-struct ExecutableDescription: Identifiable, Hashable {
+struct ExecutableDescription: Identifiable, Hashable, Sendable {
     var id: String { relativePath }
     var relativePath: String
     var architecture: String
@@ -448,9 +573,18 @@ private func describe(_ info: BVNExecutableInfo, relativePath: String)
 enum Executables {
     /// Inspects a single file.
     static func inspect(at url: URL) -> ExecutableDescription {
+        inspect(at: url, relativePath: url.lastPathComponent)
+    }
+
+    /// Inspects a single file and labels it with a path of the caller's
+    /// choosing, so a scan that walks the tree itself can report where the
+    /// file sits rather than only what it is called. Reads the PE header
+    /// only; blocking, so call it off the main thread.
+    static func inspect(at url: URL, relativePath: String)
+        -> ExecutableDescription {
         var info = BVNExecutableInfo()
         BVNInspectExecutable(url.path, &info)
-        return describe(info, relativePath: url.lastPathComponent)
+        return describe(info, relativePath: relativePath)
     }
 
     /// Scans a directory recursively.  Blocking; call off the main thread.
@@ -543,6 +677,65 @@ enum RuntimeState: String {
 struct LaunchFailure: LocalizedError {
     var message: String
     var errorDescription: String? { message }
+}
+
+/// How the program a session launched ended.
+///
+/// A Windows program under Wine exits with an NTSTATUS, and the ones that
+/// matter here are the loader's: a program that cannot resolve an import never
+/// reaches its own entry point, so it draws nothing, says nothing and leaves a
+/// number behind. `missingModule` is the name the guest's own module search
+/// recorded, which is the only place that name exists when Wine's debug
+/// channels are quiet.
+struct GuestExit {
+    var status: UInt32
+    var pid: UInt32
+    /// The module the loader searched for and never found. Empty when the
+    /// status was about something else, or when the search trace had already
+    /// spent its budget by the time the program gave up.
+    var missingModule: String
+
+    var isError: Bool { status != 0 }
+
+    static let dllNotFound: UInt32 = 0xC000_0135
+
+    /// Statuses a launch can plausibly end with, each in one clause a reader
+    /// who has never seen an NTSTATUS can act on. Anything not here is
+    /// reported as its number alone rather than guessed at.
+    private static let explanations: [UInt32: String] = [
+        0xC000_0005: "the program stopped at an invalid memory access",
+        0xC000_0135: "a required DLL was not found",
+        0xC000_0139: "a DLL was missing an entry point the program needed",
+        0xC000_0142: "a DLL failed to initialise",
+        0xC000_007B: "a DLL was the wrong architecture for the program",
+        0xC000_0409: "the program detected a corrupted stack and stopped",
+        0xC000_00FD: "the program ran out of stack",
+        0xC000_0017: "the program ran out of memory",
+    ]
+
+    /// One plain sentence for the live view, e.g. "The program exited with
+    /// status 0xC0000135 (a required DLL was not found: ws2_32.dll)."
+    ///
+    /// The number is always there: it is what a log or a search can be matched
+    /// against, and a message that only says "something went wrong" has told
+    /// the reader nothing they did not already see on screen.
+    var message: String {
+        guard isError else { return "The program exited normally." }
+        // A Windows status is a bit field and only reads as one in hex; a
+        // Linux exit status is a small number and only reads as one in
+        // decimal.
+        let printed = status >= 0x8000_0000
+            ? String(format: "0x%08X", status)
+            : String(status)
+        var reason = Self.explanations[status]
+        if status == Self.dllNotFound, !missingModule.isEmpty {
+            reason = "a required DLL was not found: " + missingModule
+        }
+        guard let reason else {
+            return "The program exited with status \(printed)."
+        }
+        return "The program exited with status \(printed) (\(reason))."
+    }
 }
 
 enum Session {
@@ -695,6 +888,21 @@ enum Session {
     static var lastExitCode: Int32? {
         let code = BVNRuntimeLastExitCode()
         return code == Int32.min ? nil : code
+    }
+
+    /// How the program this session launched ended, or nil when no launched
+    /// program has ended since the last launch was accepted.
+    static var lastGuestExit: GuestExit? {
+        var report = BVNRuntimeLastGuestExit()
+        guard report.valid else { return nil }
+        let module = withUnsafePointer(to: &report.missingModule) {
+            $0.withMemoryRebound(to: CChar.self,
+                                 capacity: Int(BVN_MAX_MODULE_NAME)) {
+                String(cString: $0)
+            }
+        }
+        return GuestExit(status: report.status, pid: report.pid,
+                         missingModule: module)
     }
 
     static var boxedwineVersion: String {

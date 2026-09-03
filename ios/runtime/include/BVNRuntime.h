@@ -410,6 +410,53 @@ const char* BVNRuntimeLastError(void);
 const char* BVNRuntimeBoxedwineVersion(void);
 
 // ---------------------------------------------------------------------------
+// How the launched program ended
+//
+// boxedmain() does not return when the launched program exits: wineserver,
+// services.exe and winedevice are still alive, so the emulator's thread count
+// stays above zero and the session runs on with nothing to present.  A device
+// run showed the whole consequence - the launched process exited
+// STATUS_DLL_NOT_FOUND twenty seconds in, the log's last line was the
+// translator retiring it, and the app then held the main thread forever.
+//
+// The CPU backend reports that retirement here, the runtime ends the session
+// the way the stop button does, and the exit status survives the shutdown so
+// the page can say what happened instead of returning silently to an empty
+// live view.
+// ---------------------------------------------------------------------------
+
+// Longest module name the loader's search trace records, with its terminator.
+#define BVN_MAX_MODULE_NAME 64
+
+typedef struct {
+    // False until a launched program has ended.  Cleared when a new launch is
+    // accepted, so one session never shows the previous one's ending.
+    bool valid;
+    // The status the program itself exited with: an NTSTATUS for a Windows
+    // program under Wine (0xC0000135 is STATUS_DLL_NOT_FOUND), a small integer
+    // for a Linux one.  Zero means it ended normally.
+    uint32_t status;
+    uint32_t pid;
+    // The module the loader searched for and never resolved, when one was
+    // recorded.  Empty otherwise - including when the status says a module was
+    // missing but the search trace had already spent its budget.
+    char missingModule[BVN_MAX_MODULE_NAME];
+} BVNGuestExitReport;
+
+// The launched program's ending, or a report with valid == false.  Safe to
+// call from any thread at any time.
+BVNGuestExitReport BVNRuntimeLastGuestExit(void);
+
+// Called by the CPU backend when the session's launched process retires -
+// exactly one process per session is translated, and it is that one.  Records
+// the ending and asks the emulator to stop, which terminates the surviving
+// helper processes exactly as the stop button does.  Idempotent within a
+// session: only the first call is recorded and only the first one stops the
+// emulator.  Any thread.
+void BVNRuntimeNoteLaunchedProcessExited(uint32_t pid, uint32_t status,
+                                         const char* missingModule);
+
+// ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
 

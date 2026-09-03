@@ -2427,6 +2427,33 @@ extern "C" void BVNFEXBackendDisarmHandoffTrace(unsigned processId) {
     }
 }
 
+// The session's launched program is the translated process whose parent is the
+// boot process: exactly one process per session is translated, and it is that
+// one. Its ending is what ends the session; a helper's is not.
+//
+// The frontend has no other way to learn it. boxedmain() keeps the main thread
+// while wineserver, services.exe and winedevice are alive, so a program that
+// died in its first seconds left the app presenting a live view of nothing,
+// with the runtime still reporting a running session - see BVNRuntime.h.
+// Reported here rather than at the guest's exit_group because this is where
+// the process has both a terminal status and the loader's search trace, which
+// is what names the module a STATUS_DLL_NOT_FOUND was about.
+static void reportLaunchedProcessRetired(void* process) {
+    KProcess* guest = static_cast<KProcess*>(process);
+    // `terminated` is what makes exitCode real. A run that retires the process
+    // because the host side failed has not been through exitgroup yet, and the
+    // fatal path ends the session on its own with its own report.
+    if (guest == nullptr || !guest->terminated || guest->parentId > 1) {
+        return;
+    }
+    char module[BVN_MAX_MODULE_NAME];
+    module[0] = '\0';
+    guest->dllSearch.lastUnresolvedModule(module, sizeof(module));
+    BVNRuntimeNoteLaunchedProcessExited(static_cast<uint32_t>(guest->id),
+                                        static_cast<uint32_t>(guest->exitCode),
+                                        module);
+}
+
 extern "C" bool BVNFEXCPU64Run(void* process, void* thread,
                                BVNFEXCPU64RunOutcome* outcome) {
     // Written on every return path below. A caller that cannot tell a fatal
@@ -2648,6 +2675,9 @@ extern "C" bool BVNFEXCPU64Run(void* process, void* thread,
                      threadState->fexThread->CurrentFrame)
                         ? threadState->fexThread->CurrentFrame->State.rip
                         : 0));
+    }
+    if (retireProcess) {
+        reportLaunchedProcessRetired(process);
     }
     finish(retireThread, retireProcess);
     return cleanReturn;
