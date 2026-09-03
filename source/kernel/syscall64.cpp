@@ -534,6 +534,93 @@ static void reportDllSearch(KProcess* process, const char* op, const char* path,
                  : "");
 }
 
+namespace {
+
+// One line per process, the first time it asks where it is. getcwd's raw
+// return value is a length, not the buffer -- a distinction that is invisible
+// until a caller lands on a buffer whose low 32 bits look negative -- so the
+// buffer address and the length are both in the line. See the X64_SYS_getcwd
+// case for what depended on it.
+std::mutex guestGetcwdMutex;
+std::vector<U32> guestGetcwdReported;
+
+void reportGuestGetcwd(KProcess* process, const char* cwd, U64 buf, U64 size,
+                       long long result) {
+    const U32 pid = process ? process->id : 0;
+    {
+        std::lock_guard<std::mutex> guard(guestGetcwdMutex);
+        for (U32 seen : guestGetcwdReported) {
+            if (seen == pid) {
+                return;
+            }
+        }
+        guestGetcwdReported.push_back(pid);
+    }
+    klog_fmt("BOXEDWINE_X64_GETCWD pid=%u cwd='%s' buf=0x%llx size=%llu "
+             "ret=%lld low32=0x%08x",
+             (unsigned)pid, cwd ? cwd : "(null)",
+             (unsigned long long)buf, (unsigned long long)size, result,
+             (unsigned)(buf & 0xffffffffULL));
+}
+
+// Fontconfig's configuration load, one line per process.
+//
+// The guest says so itself: a failed parse writes "Fontconfig error" to fd 2
+// and then gives up on /etc/fonts/fonts.conf, and a successful FcInit goes
+// straight on to probe its per-directory caches. So the first of those two
+// events that a process produces is the verdict, and only the first is
+// reported.
+std::mutex fontconfigWitnessMutex;
+std::vector<U32> fontconfigWitnessReported;
+
+bool claimFontconfigWitness(U32 pid) {
+    std::lock_guard<std::mutex> guard(fontconfigWitnessMutex);
+    for (U32 seen : fontconfigWitnessReported) {
+        if (seen == pid) {
+            return false;
+        }
+    }
+    fontconfigWitnessReported.push_back(pid);
+    return true;
+}
+
+void reportFontconfigFailure(KProcess* process, const char* message) {
+    const U32 pid = process ? process->id : 0;
+    if (!claimFontconfigWitness(pid)) {
+        return;
+    }
+    // The guest writes the message in pieces and with embedded newlines. Take
+    // the first line only, so the witness stays one line.
+    char detail[160];
+    size_t out = 0;
+    for (const char* cursor = message; cursor && *cursor && out + 1 < sizeof(detail);
+         ++cursor) {
+        if (*cursor == '\n' || *cursor == '\r') {
+            if (out) {
+                break;
+            }
+            continue;
+        }
+        detail[out++] = *cursor;
+    }
+    detail[out] = 0;
+    klog_fmt("BOXEDWINE_X64_FONTCONFIG pid=%u config='/etc/fonts/fonts.conf' "
+             "status=failed detail='%s'",
+             (unsigned)pid, detail);
+}
+
+void reportFontconfigLoaded(KProcess* process, const char* cachePath) {
+    const U32 pid = process ? process->id : 0;
+    if (!claimFontconfigWitness(pid)) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_FONTCONFIG pid=%u config='/etc/fonts/fonts.conf' "
+             "status=loaded first_cache='%s'",
+             (unsigned)pid, cachePath ? cachePath : "(null)");
+}
+
+}  // namespace
+
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (count == 0) return 0;
     // Ceiling only (was a 1MB cap that silently truncated large writes for any
@@ -562,6 +649,12 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         U32 wpid = (cpu->thread && cpu->thread->process) ? cpu->thread->process->id : 0;
         const char* wexe = (cpu->thread && cpu->thread->process) ? cpu->thread->process->name.c_str() : "?";
         klog_fmt("[guest fd=%llu pid=%u %s] %s", (unsigned long long)fd, (unsigned)wpid, wexe, (const char*)buffer.data());
+        if (fd == 2 && strstr((const char*)buffer.data(), "Fontconfig error")) {
+            reportFontconfigFailure(
+                (cpu->thread && cpu->thread->process) ? cpu->thread->process.get()
+                                                      : nullptr,
+                (const char*)buffer.data());
+        }
         // On a guest abort, dump the request ring so we can see the wineserver
         // request sequence that triggered the double-release.
         if (fd == 2 && (strstr((const char*)buffer.data(), "release_object") ||
@@ -1631,6 +1724,14 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode
                          (unsigned long long)chain.occurrences);
             }
         }
+    }
+    /* Fontconfig got a configuration, and this is the proof: a per-directory
+     * cache probe is the first thing FcInit does once it holds a config, and a
+     * process that failed the parse has already written its error to fd 2 and
+     * claimed the witness. The name is fontconfig's own hashed cache file
+     * (".../fontconfig/<md5>-le64.cache-<N>"), whether or not it exists yet. */
+    if (strstr(path, "fontconfig") && strstr(path, ".cache-")) {
+        reportFontconfigLoaded(process, path);
     }
     if ((S32)rc < 0) {
         if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
@@ -3677,22 +3778,188 @@ static const char* x64SyscallName(U64 nr) {
  * the syscall reserved but return ENOSYS, preserving the optional-backend
  * property of the core.
  */
+// Every entry of DXMT's winemetal unix-call table, in its own order: the
+// index a guest passes is a position in __wine_unix_call_funcs
+// (src/winemetal/unix/winemetal_unix.c of the pinned checkout), so a name
+// here is that array's entry at the same subscript and nothing else. The
+// table used to name six of them, and a device log that showed a program
+// making exactly one call before giving up said only "index=119", which cost
+// a checkout read to learn was WMTSetMetalShaderCachePath - dxgi.dll's
+// DllMain, so the program had loaded the module and asked it for nothing.
+// The one hole is index 83, which upstream leaves NULL.
+//
+// Kept in the table's order rather than sorted, so it can be re-derived from
+// the checkout by reading the array top to bottom, and the static_assert
+// against the hostcall count catches a pin that adds or removes a call.
+static const char* const kDxmtUnixCallNames64[] = {
+    /*   0 */ "NSObject_retain",
+    /*   1 */ "NSObject_release",
+    /*   2 */ "NSArray_object",
+    /*   3 */ "NSArray_count",
+    /*   4 */ "MTLCopyAllDevices",
+    /*   5 */ "MTLDevice_recommendedMaxWorkingSetSize",
+    /*   6 */ "MTLDevice_currentAllocatedSize",
+    /*   7 */ "MTLDevice_name",
+    /*   8 */ "NSString_getCString",
+    /*   9 */ "MTLDevice_newCommandQueue",
+    /*  10 */ "NSAutoreleasePool_alloc_init",
+    /*  11 */ "MTLCommandQueue_commandBuffer",
+    /*  12 */ "MTLCommandBuffer_commit",
+    /*  13 */ "MTLCommandBuffer_waitUntilCompleted",
+    /*  14 */ "MTLCommandBuffer_status",
+    /*  15 */ "MTLDevice_newSharedEvent",
+    /*  16 */ "MTLSharedEvent_signaledValue",
+    /*  17 */ "MTLCommandBuffer_encodeSignalEvent",
+    /*  18 */ "MTLDevice_newBuffer",
+    /*  19 */ "MTLDevice_newSamplerState",
+    /*  20 */ "MTLDevice_newDepthStencilState",
+    /*  21 */ "MTLDevice_newTexture",
+    /*  22 */ "MTLBuffer_newTexture",
+    /*  23 */ "MTLTexture_newTextureView",
+    /*  24 */ "MTLDevice_minimumLinearTextureAlignmentForPixelFormat",
+    /*  25 */ "MTLDevice_newLibrary",
+    /*  26 */ "MTLLibrary_newFunction",
+    /*  27 */ "NSString_lengthOfBytesUsingEncoding",
+    /*  28 */ "NSObject_description",
+    /*  29 */ "MTLDevice_newComputePipelineState",
+    /*  30 */ "MTLCommandBuffer_blitCommandEncoder",
+    /*  31 */ "MTLCommandBuffer_computeCommandEncoder",
+    /*  32 */ "MTLCommandBuffer_renderCommandEncoder",
+    /*  33 */ "MTLCommandEncoder_endEncoding",
+    /*  34 */ "MTLDevice_newRenderPipelineState",
+    /*  35 */ "MTLDevice_newMeshRenderPipelineState",
+    /*  36 */ "MTLBlitCommandEncoder_encodeCommands",
+    /*  37 */ "MTLComputeCommandEncoder_encodeCommands",
+    /*  38 */ "MTLRenderCommandEncoder_encodeCommands",
+    /*  39 */ "MTLTexture_pixelFormat",
+    /*  40 */ "MTLTexture_width",
+    /*  41 */ "MTLTexture_height",
+    /*  42 */ "MTLTexture_depth",
+    /*  43 */ "MTLTexture_arrayLength",
+    /*  44 */ "MTLTexture_mipmapLevelCount",
+    /*  45 */ "MTLTexture_replaceRegion",
+    /*  46 */ "MTLBuffer_didModifyRange",
+    /*  47 */ "MTLCommandBuffer_presentDrawable",
+    /*  48 */ "MTLCommandBuffer_presentDrawableAfterMinimumDuration",
+    /*  49 */ "MTLDevice_supportsFamily",
+    /*  50 */ "MTLDevice_supportsBCTextureCompression",
+    /*  51 */ "MTLDevice_supportsTextureSampleCount",
+    /*  52 */ "MTLDevice_hasUnifiedMemory",
+    /*  53 */ "MTLCaptureManager_sharedCaptureManager",
+    /*  54 */ "MTLCaptureManager_startCapture",
+    /*  55 */ "MTLCaptureManager_stopCapture",
+    /*  56 */ "MTLDevice_newTemporalScaler",
+    /*  57 */ "MTLDevice_newSpatialScaler",
+    /*  58 */ "MTLCommandBuffer_encodeTemporalScale",
+    /*  59 */ "MTLCommandBuffer_encodeSpatialScale",
+    /*  60 */ "NSString_string",
+    /*  61 */ "NSString_alloc_init",
+    /*  62 */ "DeveloperHUDProperties_instance",
+    /*  63 */ "DeveloperHUDProperties_addLabel",
+    /*  64 */ "DeveloperHUDProperties_updateLabel",
+    /*  65 */ "DeveloperHUDProperties_remove",
+    /*  66 */ "MetalDrawable_texture",
+    /*  67 */ "MetalLayer_nextDrawable",
+    /*  68 */ "MTLDevice_supportsFXSpatialScaler",
+    /*  69 */ "MTLDevice_supportsFXTemporalScaler",
+    /*  70 */ "MetalLayer_setProps",
+    /*  71 */ "MetalLayer_getProps",
+    /*  72 */ "CreateMetalViewFromHWND",
+    /*  73 */ "ReleaseMetalView",
+    /*  74 */ "SM50Initialize",
+    /*  75 */ "SM50Destroy",
+    /*  76 */ "SM50Compile",
+    /*  77 */ "SM50GetCompiledBitcode",
+    /*  78 */ "SM50DestroyBitcode",
+    /*  79 */ "SM50GetErrorMessage",
+    /*  80 */ "SM50FreeError",
+    /*  81 */ "SM50CompileGeometryPipelineVertex",
+    /*  82 */ "SM50CompileGeometryPipelineGeometry",
+    /*  83 */ "(reserved)",
+    /*  84 */ "SM50CompileTessellationPipelineHull",
+    /*  85 */ "SM50CompileTessellationPipelineDomain",
+    /*  86 */ "MTLCommandEncoder_setLabel",
+    /*  87 */ "MTLDevice_setShouldMaximizeConcurrentCompilation",
+    /*  88 */ "SM50GetArgumentsInfo",
+    /*  89 */ "MTLCommandBuffer_error",
+    /*  90 */ "MTLCommandBuffer_logs",
+    /*  91 */ "MTLLogContainer_enumerate",
+    /*  92 */ "CGColorSpace_checkColorSpaceSupported",
+    /*  93 */ "MetalLayer_setColorSpace",
+    /*  94 */ "WMTGetPrimaryDisplayId",
+    /*  95 */ "WMTGetSecondaryDisplayId",
+    /*  96 */ "WMTGetDisplayDescription",
+    /*  97 */ "MetalLayer_getEDRValue",
+    /*  98 */ "MTLLibrary_newFunctionWithConstants",
+    /*  99 */ "WMTQueryDisplaySetting",
+    /* 100 */ "WMTUpdateDisplaySetting",
+    /* 101 */ "WMTQueryDisplaySettingForLayer",
+    /* 102 */ "MTLCommandBuffer_encodeWaitForEvent",
+    /* 103 */ "MTLSharedEvent_signalValue",
+    /* 104 */ "MTLSharedEvent_setWin32EventAtValue",
+    /* 105 */ "MTLDevice_newFence",
+    /* 106 */ "MTLDevice_newEvent",
+    /* 107 */ "MTLBuffer_updateContents",
+    /* 108 */ "SharedEventListener_create",
+    /* 109 */ "SharedEventListener_start",
+    /* 110 */ "SharedEventListener_destroy",
+    /* 111 */ "WMTGetOSVersion",
+    /* 112 */ "MTLDevice_newBinaryArchive",
+    /* 113 */ "MTLBinaryArchive_serialize",
+    /* 114 */ "DispatchData_alloc_init",
+    /* 115 */ "CacheReader_alloc_init",
+    /* 116 */ "CacheReader_get",
+    /* 117 */ "CacheWriter_alloc_init",
+    /* 118 */ "CacheWriter_set",
+    /* 119 */ "WMTSetMetalShaderCachePath",
+    /* 120 */ "MTLDevice_newSharedTexture",
+    /* 121 */ "WMTBootstrapRegister",
+    /* 122 */ "WMTBootstrapLookUp",
+    /* 123 */ "MTLSharedEvent_createMachPort",
+    /* 124 */ "MTLDevice_newSharedEventWithMachPort",
+    /* 125 */ "MTLDevice_registryID",
+    /* 126 */ "MTLSharedEvent_waitUntilSignaledValue",
+};
+
+static_assert(sizeof(kDxmtUnixCallNames64) / sizeof(kDxmtUnixCallNames64[0])
+                  == BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT,
+              "The DXMT unix-call name table and the hostcall count disagree; "
+              "regenerate the names from the pinned checkout's "
+              "__wine_unix_call_funcs.");
+
 static const char* dxmtUnixCallName64(U64 callIndex) {
+    if (callIndex >= BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT) {
+        return nullptr;
+    }
+    return kDxmtUnixCallNames64[callIndex];
+}
+
+// The calls worth a line every time they happen, whatever the ordinal: the
+// per-frame boundary of the presentation path. Naming every index is for
+// reading a log; logging every index would bury it, because a running frame
+// makes tens of thousands of encoder calls a second (a working probe session
+// made 277603 of them). Kept apart from the name table for exactly that
+// reason - the two questions are "what is this index" and "is it worth a
+// line", and they used to be the same answer.
+static bool dxmtUnixCallAlwaysLogged64(U64 callIndex) {
     switch (callIndex) {
-        case 47: return "present";
-        case 48: return "present-after-delay";
-        case 67: return "next-drawable";
-        case 70: return "set-layer-properties";
-        case 71: return "get-layer-properties";
-        case 72: return "create-view";
-        default: return nullptr;
+        case 47: // MTLCommandBuffer_presentDrawable
+        case 48: // MTLCommandBuffer_presentDrawableAfterMinimumDuration
+        case 67: // MetalLayer_nextDrawable
+        case 70: // MetalLayer_setProps
+        case 71: // MetalLayer_getProps
+        case 72: // CreateMetalViewFromHWND
+            return true;
+        default:
+            return false;
     }
 }
 
 // The last DXMT unix calls, for a host fault the FEX handler declines. Only
-// the first 32 calls and the named ones are logged, so without this ring a
-// fault in native code during an unnamed call names nothing. Written racily
-// on purpose: it is a diagnostic, and a torn entry is still a hint.
+// the opening budget and the always-logged calls reach the log, so without
+// this ring a fault in native code during a steady-state call names nothing.
+// Written racily on purpose: it is a diagnostic, and a torn entry is still a
+// hint.
 struct DxmtRecentCall {
     U32 index;
     U32 tid;
@@ -3712,17 +3979,29 @@ extern "C" void boxedwineDxmtReportRecentCalls(void) {
     }
 }
 
+// How many calls are logged unconditionally from the start of a session.
+// This is the device bring-up window, and it was 32, which stopped inside
+// D3D11CreateDevice: the working 64-bit probe reached CreateMetalViewFromHWND
+// - the swap chain's Metal view - only at ordinal 118, and its layer
+// properties at 119, so the two calls that say a swap chain exists both fell
+// outside the budget and were seen only because they happen to be named. 128
+// covers device creation and the first swap chain, and then stops: the ring
+// above carries the steady state.
+static const U32 kDxmtOpeningCallLogBudget = 128;
+
 static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     static std::atomic<U32> callLogCount{0};
     const U32 logOrdinal = callLogCount.fetch_add(1, std::memory_order_relaxed);
     const char* callName = dxmtUnixCallName64(callIndex);
-    const bool logCall = logOrdinal < 32 || callName != nullptr;
+    const bool logCall = logOrdinal < kDxmtOpeningCallLogBudget
+                         || dxmtUnixCallAlwaysLogged64(callIndex);
     const U32 processId = cpu && cpu->thread && cpu->thread->process
         ? cpu->thread->process->id : 0;
     if (logCall) {
         klog_fmt("BOXEDWINE_DXMT_CALL ordinal=%u pid=%u index=%llu name=%s args=0x%llx",
                  logOrdinal, processId, (unsigned long long)callIndex,
-                 callName ? callName : "other", (unsigned long long)args);
+                 callName ? callName : "out-of-range",
+                 (unsigned long long)args);
     }
     if (!cpu || !cpu->memory || !cpu->memory->nativeIdentityMode()) {
         if (logCall) {
@@ -4119,17 +4398,45 @@ void ksyscall64(CPU64* cpu) {
             }
             break;
         case X64_SYS_getcwd: {
-            // getcwd(buf, size) — copy current directory string out. Returns
-            // a pointer to buf on success, -ERANGE if size is too small.
-            if (!a1 || a2 == 0) { ret = (U64)-K_EFAULT; break; }
+            // getcwd(buf, size) — copy the current directory string out.
+            //
+            // The RAW system call returns the LENGTH of what it wrote,
+            // including the terminating NUL. It does not return the buffer
+            // pointer; that is what the libc wrapper hands back to its own
+            // caller. Returning `buf` here was wrong in a way that only shows
+            // up for some addresses: glibc's Linux getcwd assigns the result
+            // to an `int` and treats `retval > 0 && path[0] == '/'` as success
+            // (sysdeps/unix/sysv/linux/getcwd.c), so a buffer whose low 32
+            // bits have bit 31 set -- every thread stack in this lane sits
+            // around 0x7fff_fexx_xxxx -- truncated to a negative int, glibc
+            // fell through its "syscall failed" path and returned NULL. A
+            // heap buffer usually truncated positive, which is why most
+            // callers never noticed.
+            //
+            // What noticed was fontconfig. FcConfigGlobAdd() canonicalises a
+            // <glob> through FcStrCopyFilename -> FcStrCanonFilename, and a
+            // relative pattern takes the getcwd branch; NULL there is reported
+            // as "out of memory" and sets parse->error, which is exactly the
+            // pair of errors every 64-bit session printed at the two
+            // </rejectfont> lines of Ubuntu's /etc/fonts/fonts.conf followed by
+            // "Cannot load config file".
+            //
+            // KProcess::getcwd (kprocess.cpp), the 32-bit lane's
+            // implementation, has always returned the length. This is the same
+            // contract.
+            if (!a1) { ret = (U64)-K_EFAULT; break; }
             // No-process standalone runner: default cwd to "/".
             BString cwd = (cpu->thread && cpu->thread->process)
                               ? cpu->thread->process->currentDirectory : B("/");
             if (!cwd.length()) cwd = B("/");
             U64 need = (U64)cwd.length() + 1;
-            if (need > a2) { ret = (U64)-34; /* -ERANGE */ break; }
+            // size 0 (or any size below the string) is -ERANGE, the way the
+            // kernel reports a buffer that cannot hold the path.
+            if (need > a2) { ret = (U64)-K_ERANGE; break; }
             cpu->memory->memcpyToGuest(a1, cwd.c_str(), need);
-            ret = a1;
+            ret = need;
+            reportGuestGetcwd(cpu->thread ? cpu->thread->process.get() : nullptr,
+                              cwd.c_str(), a1, a2, (long long)need);
             break;
         }
         case X64_SYS_fcntl: {

@@ -645,6 +645,22 @@ final class AppModel: ObservableObject {
             // desktop's drive links never appear; both are quiet at boot.
             "WINEDEBUG=warn+module,warn+seh,+winedevice,+mountmgr",
             "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
+            // DXMT's own logging. It is not wined3d, so no WINEDEBUG channel
+            // reaches it: `+d3d11` and `+dxgi` name Wine's implementations,
+            // which these overrides replace. DXMT reads DXMT_LOG_LEVEL
+            // instead and defaults to info, which is why a device run carried
+            // one line ("Failed to set Metal cache path") and nothing else -
+            // everything below info was discarded before it was written.
+            // trace is affordable here: the pinned source has eleven TRACE
+            // and three DEBUG call sites in total, so this adds lines at the
+            // rate of a program's D3D entry points, not its frames.
+            "DXMT_LOG_LEVEL=trace",
+            // Send it to Wine's debug output only. DXMT writes to a file as
+            // well unless told otherwise, and the file it picks is relative
+            // to the working directory - which on this lane is a read-only
+            // projection. The capture already carries the guest's stderr as
+            // `[guest fd=2 pid=...]`, so the file has no reader anyway.
+            "DXMT_LOG_PATH=none",
         ]
 
         /// The environment for a launch that will enter 32-bit code.

@@ -491,6 +491,44 @@ actual signature plus `os_proc_available_memory()`, not a claim based on the
 project entitlement file. A changed entitlement without changed headroom (or
 vice versa) is still useful evidence and should be reported with the log.
 
+### 3.11 Reading a 64-bit program's Direct3D trace
+
+A 64-bit program that shows its own error dialog instead of a picture has
+usually stopped somewhere in Direct3D startup, and the log says where without
+any extra instrumentation. Two kinds of line carry it.
+
+**`BOXEDWINE_DXMT_CALL ordinal=N pid=P index=I name=X`** is one guest-to-host
+winemetal call. `index` is a position in DXMT's `__wine_unix_call_funcs`
+(`src/winemetal/unix/winemetal_unix.c` of the pinned checkout) and `name` is
+that entry, from the table in `source/kernel/syscall64.cpp`. The first 128
+calls of a session are logged whatever they are, and the six presentation
+calls (`MetalLayer_nextDrawable`, `MTLCommandBuffer_presentDrawable`,
+`CreateMetalViewFromHWND` and their neighbours) are logged for the whole
+session. Anything after that is in the `BOXEDWINE_DXMT_RECENT` ring, printed
+when a host fault is declined.
+
+Two ordinals decide most questions:
+
+- `ordinal=0 index=119 name=WMTSetMetalShaderCachePath` is `dxgi.dll`'s
+  `DllMain`. It means the module was **loaded**, nothing more - a program can
+  reach it having never called a Direct3D function.
+- `index=4 name=MTLCopyAllDevices` is `IDXGIFactory::EnumAdapters1`, the first
+  call that needs a GPU. A trace that never reaches it never asked for an
+  adapter, and the failure is before Direct3D, not inside it.
+
+**`[guest fd=2 pid=P wine64] info: ...`** lines are DXMT's own logger.
+`DXMT_LOG_LEVEL=trace` and `DXMT_LOG_PATH=none` are set for every 64-bit
+launch, so `CreateDXGIFactory2`, `D3D11CreateDeviceAndSwapChain`,
+`EnumAdapters1`, `EnumOutputs` and `GetDisplayModeList1` each name themselves
+and their arguments as they are entered, and a refusal names the reason. Wine
+debug channels do not reach DXMT: `+d3d11` and `+dxgi` name Wine's own
+implementations, which the launch's `WINEDLLOVERRIDES` replaces.
+
+So a program that stops with no `CreateDXGIFactory2` line at all failed before
+Direct3D - check what it loaded and what it opened. One that logs the factory
+but no `D3D11CreateDeviceAndSwapChain` stopped between them, most often on an
+adapter, output or display-mode query, each of which now names its own result.
+
 ---
 
 ## 4. Reporting a failure

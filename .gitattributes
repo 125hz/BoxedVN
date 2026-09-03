@@ -11,6 +11,7 @@ scripts/*.sh text eol=lf
 # git apply rejects a CRLF patch: an empty context line becomes a lone
 # carriage return and reads as a corrupt fragment.
 scripts/fex64-patches/*.patch text eol=lf
+scripts/dxmt-patches/*.patch text eol=lf
 .github/workflows/*.yml text eol=lf
 
 ###############################################################################
