@@ -173,15 +173,31 @@ if [[ -z "${WINE_SOURCE}" ]]; then
     WINE_SOURCE="${WORK}/wine-${WINE_VERSION}"
     if [[ ! -d "${WINE_SOURCE}" ]]; then
         tarball="${WORK}/wine-${WINE_VERSION}.tar.xz"
-        # The major series directory upstream files releases under: 9.0 and
-        # 9.0.1 both live under 9.x.
-        series="${WINE_VERSION%%.*}.x"
+        # Upstream files a stable series under its own directory and the
+        # development releases that follow it under <major>.x: wine-9.0.tar.xz
+        # and wine-9.0.1.tar.xz are under source/9.0/, while wine-9.1.tar.xz is
+        # under source/9.x/. Which one is right cannot be decided from the
+        # version string alone, so try both before giving up. Asking only for
+        # <major>.x is what this step failed on once the OSSv4 header check
+        # started passing: a 404, and no driver.
+        major="${WINE_VERSION%%.*}"
+        minor="${WINE_VERSION#*.}"
+        minor="${minor%%.*}"
+        series_candidates=("${major}.${minor}" "${major}.x")
         if [[ ! -s "${tarball}" ]]; then
             log "Downloading Wine ${WINE_VERSION} sources"
-            curl --fail --location --show-error --silent \
-                --output "${tarball}.partial" \
-                "https://dl.winehq.org/wine/source/${series}/wine-${WINE_VERSION}.tar.xz" \
-                || die "Could not download Wine ${WINE_VERSION} from dl.winehq.org. The driver has to be built from the same version as the installed amd64 libwine; pass --wine-source if the tarball must come from elsewhere."
+            downloaded=0
+            for series in "${series_candidates[@]}"; do
+                url="https://dl.winehq.org/wine/source/${series}/wine-${WINE_VERSION}.tar.xz"
+                if curl --fail --location --show-error --silent --output "${tarball}.partial" "${url}"; then
+                    log "fetched ${url}"
+                    downloaded=1
+                    break
+                fi
+            done
+            if [[ "${downloaded}" -ne 1 ]]; then
+                die "Could not download Wine ${WINE_VERSION} from dl.winehq.org (tried ${series_candidates[*]}). The driver has to be built from the same version as the installed amd64 libwine; pass --wine-source if the tarball must come from elsewhere."
+            fi
             mv "${tarball}.partial" "${tarball}"
         fi
         log "Unpacking Wine ${WINE_VERSION}"
