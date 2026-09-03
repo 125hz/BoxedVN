@@ -258,6 +258,28 @@ This is the risk that decides the schedule.
   which is also the mechanism Wine's `restore_context` uses to resume 32-bit
   code after an exception, so the return path exists for free. Witness:
   `BOXEDWINE_X64_SIGNAL_CS`.
+- **Correction (2026-09-02, from the 21:19 run): the transfer into 32-bit
+  code is `iretq`, not a far jump.** Every note above that names an indirect
+  far jump as the boundary describes only one of wow64cpu's two arms.
+  `syscall_32to64_return` (Wine 9.0 `dlls/wow64cpu/cpu.c`) far-jumps
+  `ljmp *(%r14)` only when `WOW64_CPURESERVED_FLAG_RESET_STATE` is clear;
+  when it is set the arm below it loads EDX, ECX, DS, ES and FS from the
+  32-bit context, pushes SegSs/Esp/EFlags/SegCs/Eip and `iretq`s. `wow64.dll`
+  `thread_init` sets that flag through `BTCpuSetContext` immediately before
+  the first `BTCpuSimulate`, so the entry is always the iretq and the far
+  jump is only ever the syscall fast path. The far-transfer witness spent
+  none of its budget on a run whose decode mode changed, which is how this
+  was found. Nothing about the per-block decode mode changes: `iretq` sets
+  `cs_idx` from its frame exactly as the far jump does.
+- The selectors a thread starts with are part of the WoW64 contract, not a
+  formality. Wine's `signal_init_threading` reads `%cs` and `%ss` into
+  `cs64_sel` and `ds64_sel`, and `call_init_thunk` writes `ds64_sel` into
+  `SegSs`, `SegDs`, `SegEs` and `SegGs` of every 32-bit context while
+  wow64cpu's bop thunk far-jumps back through `cs64_sel`. This port
+  published CS alone, as FEX's `DEFAULT_USER_CS << 3` (0x30), and left SS,
+  DS and ES null, so a WoW64 thread ran with a null SS in compatibility
+  mode. `publishGuestDescriptorTable` now publishes 0x33 for CS and 0x2b for
+  SS, DS and ES with their descriptor bases.
 - FS and GS bases in 32-bit blocks need nothing beyond what the translator
   already does: a 32-bit block loads `fs_cached`/`gs_cached` at GPR width and
   adds it to the offset in a 32-bit add, so the address wraps at 4 GiB before

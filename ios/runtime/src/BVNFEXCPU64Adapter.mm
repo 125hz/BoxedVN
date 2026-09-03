@@ -1416,6 +1416,33 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      (unsigned long long)g[10], (unsigned long long)g[11],
                      (unsigned long long)g[12], (unsigned long long)g[13],
                      (unsigned long long)g[14], (unsigned long long)g[15]);
+            if (faultDecodeWidth == 32) {
+                // The segmented half of a 32-bit fault, which the line above
+                // carries only two selectors of. A 32-bit block adds
+                // fs_cached or gs_cached at GPR width to an FS- or
+                // GS-prefixed address and nothing at all to an unprefixed
+                // one, so these six values decide whether a faulting address
+                // is a real null in guest code or a base that never arrived.
+                // Same marker the translator prints at the mode change, so a
+                // log can be read as entry-then-fault.
+                klog_fmt("BOXEDWINE_FEX64_SEG32 rip=0x%llx mode=32 cs=0x%x "
+                         "ss=0x%x ds=0x%x es=0x%x fs=0x%x gs=0x%x "
+                         "cs_base=0x%llx ss_base=0x%llx ds_base=0x%llx "
+                         "es_base=0x%llx fs_base=0x%llx gs_base=0x%llx",
+                         static_cast<unsigned long long>(rip),
+                         static_cast<unsigned>(frame->State.cs_idx),
+                         static_cast<unsigned>(frame->State.ss_idx),
+                         static_cast<unsigned>(frame->State.ds_idx),
+                         static_cast<unsigned>(frame->State.es_idx),
+                         static_cast<unsigned>(frame->State.fs_idx),
+                         static_cast<unsigned>(frame->State.gs_idx),
+                         static_cast<unsigned long long>(frame->State.cs_cached),
+                         static_cast<unsigned long long>(frame->State.ss_cached),
+                         static_cast<unsigned long long>(frame->State.ds_cached),
+                         static_cast<unsigned long long>(frame->State.es_cached),
+                         static_cast<unsigned long long>(frame->State.fs_cached),
+                         static_cast<unsigned long long>(frame->State.gs_cached));
+            }
             if (rip == 0) {
                 // A jump to zero out of a memory-indirect call: the slot the
                 // call read is the memory that matters. Every device case so

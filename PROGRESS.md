@@ -6173,3 +6173,83 @@ why EBX is zero at 0x7bd69afa. It is the value Wine's WoW64 layer hands the
 first 32-bit entry in EBX, so the loader is dereferencing something it was
 never given; whether that is a missing register or a missing store is what
 the delivered exception will finally let Wine report.
+
+## The WoW64 entry is an iretq, and the selectors it copies were never published
+
+Two things the 21:19 device run says that were read as one. The first is
+mechanical: the transfer into 32-bit code is `iretq`, not a far jump. The
+far-transfer witness has a budget of eight and spent none of it, while the
+decode mode changed to 32 -- so no far jump, far call or far return was ever
+translated. Wine 9.0's `dlls/wow64cpu/cpu.c` explains why. `BTCpuSimulate`
+falls straight into `syscall_32to64_return`, which reloads EDI, ESI, EBX and
+EBP from the thread's `I386_CONTEXT` at `0x9c/0xa0/0xa4/0xb4(%r13)`, then does
+`btrl $0,-4(%r13)` on `cpu->Flags` and takes the far jump `ljmp *(%r14)` only
+when `WOW64_CPURESERVED_FLAG_RESET_STATE` was clear. `wow64.dll`'s
+`thread_init` calls `BTCpuSetContext` immediately before the first
+`BTCpuSimulate`, which sets that flag, so the first entry always takes the
+other arm: it loads EDX, ECX, DS, ES and FS from the context, pushes SegSs,
+Esp, EFlags, SegCs and Eip, loads EAX, and `iretq`s. The iretq witness was
+gated on the block trace's credit, which is armed at the loader handoff and
+spent within a hundred blocks, so it said nothing. It has its own budget now
+and reports DS and ES and the landing block's decode width beside what it
+already printed.
+
+The frame is readable from that. `thread_init` copies the `I386_CONTEXT` onto
+the 32-bit stack at `Esp - 0x2cc`, pushes `0`, `0`, `0`, `ctx_ptr`,
+`0xdeadbabe` under it and enters `LdrInitializeThunk(context, 0, 0, 0)`; the
+32-bit `LdrInitializeThunk` calls `loader_init(context, &context->Eax)`. In
+the fault report `rax=0x22fdd4`, the stack slot at `0x22fc30` is `0x22fd24`,
+and `0x22fd24 + 0xb0` -- `I386_CONTEXT.Eax` -- is `0x22fdd4` exactly. So
+`ctx_ptr = 0x22fd24`, the thread's original `Esp` was `0x22fff0`
+(`StackBase - 16`), and the fault at `0x7bd69afa` is two frames below
+`LdrInitializeThunk`, inside a callee of `loader_init` whose first argument is
+the EBX that is zero -- `mov eax,[ebx+0x14] / test eax,eax / jz +0x5f /
+mov [esp],ebx / call`, which is `RtlEnterCriticalSection`'s
+`if (crit->SpinCount) { if (RtlTryEnterCriticalSection(crit)) ... }` with a
+null critical section. EBX at the 32-bit entry is `context->Ebx`, and
+`call_init_thunk` in Wine's `dlls/ntdll/unix/signal_x86_64.c` sets that to the
+32-bit PEB. Whether the zero is that PEB or a value the 32-bit loader
+computed later is the one thing the log cannot say, so the boundary now
+reports it: `BOXEDWINE_FEX64_SEG32` and `BOXEDWINE_FEX64_SEG32_GPRS` at every
+decode-mode change, and `BOXEDWINE_FEX64_SEG32` again from the adapter at a
+fault whose block was decoded 32-bit.
+
+The second thing is a defect, and the run named it twice without it being
+read: `IRET_POST ... cs=0x30 ss=0x0` and `GUEST_FAULT ... cs=0x23 ss=0x0`.
+`publishGuestDescriptorTable` published one selector, CS, as FEX's own
+`DEFAULT_USER_CS` shifted into place -- `6 << 3` = 0x30, which is `__USER_CS`
+without its RPL -- and left SS, DS and ES null. Nothing in a 64-bit thread
+notices, because every descriptor in this port's table is flat and the bases
+are zero either way. Wine notices, because it reads the values rather than
+assuming them: `signal_init_threading` does `movw %cs,cs64_sel` and
+`movw %ss,ds64_sel`, and those two variables are what the WoW64 layer writes
+into every 32-bit context it builds. `call_init_thunk` sets `SegSs`, `SegDs`,
+`SegEs` and `SegGs` to `ds64_sel` and `set_thread_wow64_context` sets `SegSs`
+to it again, so a null `%ss` on this side becomes a null SS, DS, ES and GS in
+compatibility mode; `cs64_sel` is the selector wow64cpu's bop thunk far-jumps
+back through. Wine's own dispatcher return proves the round trip: it saves
+`%cs` and `%ss` into its frame and `iretq`s them back, which is why the frame
+carried 0x30 and 0 rather than 0x33 and 0x2b. The table is now published with
+the pair Wine expects to read back -- `K_WINE_X64_CODE_SELECTOR` for CS and
+`K_WINE_X64_DATA_SELECTOR` for SS, DS and ES, with their bases computed from
+the same descriptors -- which is the pair the table was widened to hold in the
+first place.
+
+What the next run has to show, in order: `IRET_PRE`/`IRET_POST` for wow64cpu's
+own iretq, with `cs=0x23 ss=0x2b decode=32` (the entry, correctly named for
+the first time); `MODE_SWITCH ... mode=32` and beside it `SEG32
+... ss=0x2b ds=0x2b es=0x2b fs=0x63 fs_base=0x7ffc2000` and `SEG32_GPRS ...
+rbx=` with the value the 32-bit loader is actually handed. A non-zero `rbx`
+there means the null is computed inside 32-bit ntdll and the next question is
+which pointer it read; a zero `rbx` means the 32-bit PEB never reached the
+context and the question moves back to the 64-bit side.
+
+Not done, and deliberately: the FS write trap still fires on every WoW64
+system-call return (`mov 0x90(%r13),%fs` reloading the selector it already
+holds). Skipping it needs an IR compare and a conditional branch around the
+`Break`, and the pinned JIT lowers `CondJump` only as `cbz`/`cbnz`/`tbz`/`tbnz`
+against an inline constant, so the shape has to be an XOR against zero with a
+three-block split around a non-terminating `Break` -- on the path every WoW64
+syscall return takes, with no way to compile or run it here. It would confound
+the run that has to answer the EBX question. The shape is recorded; the change
+is not.

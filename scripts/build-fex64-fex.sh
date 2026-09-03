@@ -182,6 +182,17 @@ apply_patch fex-boxedwine-per-block-decode-mode.patch
 # the alias is armed, so the base a 32-bit block reads out of fs_cached is
 # always the one the host published.
 apply_patch fex-boxedwine-host-served-segment-base.patch
+# Depends on the per-block decode mode patch above, whose decode-mode witness
+# it extends, and on the block-diagnostics patch, whose iretq witness it takes
+# off the block trace's credit. Wine's wow64cpu enters 32-bit code with
+# `iretq`, not with a far jump -- `syscall_32to64_return` far-jumps only when
+# the reset-state flag is clear, and `thread_init` sets that flag through
+# BTCpuSetContext right before the first BTCpuSimulate -- so the far-transfer
+# witness stayed silent while the mode changed. This reports the boundary
+# itself: the six selectors with their bases, and the integer registers the
+# 32-bit context was restored with, which is what names the value the 32-bit
+# loader is handed in EBX.
+apply_patch fex-boxedwine-wow64-entry-witness.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

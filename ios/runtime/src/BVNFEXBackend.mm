@@ -312,10 +312,38 @@ inline void publishGuestDescriptorTable(
     // have dereferenced it; mirroring is what FEX does for the same reason.
     state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] =
         table;
-    state.cs_idx =
-        (uint16_t)(FEXCore::Core::CPUState::DEFAULT_USER_CS << 3);
+    // The selectors a thread starts with, and all of them.
+    //
+    // This published CS alone, as FEX's own DEFAULT_USER_CS shifted into a
+    // selector (0x30), and left SS, DS and ES at zero -- the null selector.
+    // That is not what a Linux x86-64 thread starts with, and Wine reads the
+    // difference rather than assuming it: `signal_init_threading` in
+    // dlls/ntdll/unix/signal_x86_64.c does `movw %cs,cs64_sel` and
+    // `movw %ss,ds64_sel`, and those two variables are what the WoW64 layer
+    // then writes into every 32-bit context it builds --
+    // `call_init_thunk` sets SegSs, SegDs, SegEs and SegGs to ds64_sel and
+    // wow64cpu's bop thunk far-jumps back to cs64_sel. A device run shows the
+    // consequence exactly: `IRET_POST ... cs=0x30 ss=0x0` for Wine's own
+    // dispatcher return, because Wine saved and restored the pair this side
+    // handed it, and `GUEST_FAULT ... cs=0x23 ss=0x0` for the fault in 32-bit
+    // code, whose SS came from a 32-bit context built out of a null ds64_sel.
+    //
+    // So publish the pair Wine's unix side expects to read back: __USER_CS
+    // and __USER_DS, the two selectors this port's table was widened for in
+    // the first place. Every descriptor is flat and long-mode, so the bases
+    // are zero either way and nothing about a 64-bit thread's addressing
+    // changes; what changes is that `mov %ss,...` and `push %ss` now yield a
+    // selector the WoW64 layer can propagate instead of a null one.
+    state.cs_idx = K_WINE_X64_CODE_SELECTOR;
+    state.ss_idx = K_WINE_X64_DATA_SELECTOR;
+    state.ds_idx = K_WINE_X64_DATA_SELECTOR;
+    state.es_idx = K_WINE_X64_DATA_SELECTOR;
     state.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(
         *FEXCore::Core::CPUState::GetSegmentFromIndex(state, state.cs_idx));
+    state.ss_cached = FEXCore::Core::CPUState::CalculateGDTBase(
+        *FEXCore::Core::CPUState::GetSegmentFromIndex(state, state.ss_idx));
+    state.ds_cached = state.ss_cached;
+    state.es_cached = state.ss_cached;
 }
 
 struct LiveThreadState {

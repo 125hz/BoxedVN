@@ -1,0 +1,197 @@
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 216b1c538..384b5b97c 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -179,7 +179,13 @@ public:
+   // with the mode the decoder derived from the thread's CS descriptor; only a
+   // CHANGE is reported, because a WoW64 thread crosses the boundary twice per
+   // system call and a per-block line would be the whole log.
+-  void BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, bool Is64BitMode);
++  //
++  // The frame is the state the boundary is crossed with. On a change it also
++  // reports BOXEDWINE_FEX64_SEG32 and BOXEDWINE_FEX64_SEG32_GPRS: the six
++  // selectors with their cached bases, and the integer registers Wine's WoW64
++  // layer has just loaded out of the thread's 32-bit context. Null is
++  // accepted and suppresses only that second half.
++  void BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, bool Is64BitMode, FEXCore::Core::CpuStateFrame* Frame);
+
+   // Records the decode mode a guest code page is being compiled in and
+   // reports whether that page had previously been compiled in the OTHER mode.
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 859f8304b..c01b6084f 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1377,6 +1377,17 @@ namespace {
+ std::atomic<uint32_t> BoxedWineBlockTraceBudget {0};
+ std::atomic<uint32_t> BoxedWineBlockTraceProcess {0};
+ std::atomic<uint64_t> BoxedWineIRETRip {0};
++/* BoxedWine: how many iretq reports are left, on a budget of the witness's
++ * own. It used to ride on the block trace's budget, which is armed at the
++ * loader handoff and spent within a hundred blocks -- so the one iretq worth
++ * seeing was silent. Wine's wow64cpu enters 32-bit code with `iretq`, not with
++ * the far jump this port expected: `syscall_32to64_return` takes the far jump
++ * only when the reset-state flag is clear, and `thread_init` sets that flag
++ * through BTCpuSetContext immediately before the first BTCpuSimulate. A device
++ * run confirms it -- the far-transfer witness, whose budget was untouched,
++ * printed nothing while the decode mode changed to 32. */
++std::atomic<uint32_t> BoxedWineIRETReports {0};
++constexpr uint32_t BoxedWineIRETReportLimit = 8;
+ /* BoxedWine: the pending far transfer, and how many of them may still be
+  * reported. Deliberately not on the block trace's budget: that budget is armed
+  * at the loader handoff and spent within a hundred blocks, and the transfer
+@@ -1402,7 +1413,7 @@ bool BoxedWineDisarmBlockTrace(uint32_t ProcessId) {
+ }
+
+ void BoxedWineNoteGuestIRET(uint64_t GuestRIP) {
+-  if (BoxedWineBlockTraceBudget.load(std::memory_order_acquire) == 0) {
++  if (BoxedWineIRETReports.load(std::memory_order_acquire) >= BoxedWineIRETReportLimit) {
+     return;
+   }
+   BoxedWineIRETRip.store(GuestRIP, std::memory_order_release);
+@@ -1410,7 +1421,12 @@ void BoxedWineNoteGuestIRET(uint64_t GuestRIP) {
+ }
+
+ uint64_t BoxedWineTakeGuestIRETNote() {
+-  return BoxedWineIRETRip.exchange(0, std::memory_order_acq_rel);
++  const uint64_t From = BoxedWineIRETRip.exchange(0, std::memory_order_acq_rel);
++  if (From == 0) {
++    return 0;
++  }
++  BoxedWineIRETReports.fetch_add(1, std::memory_order_acq_rel);
++  return From;
+ }
+
+ void BoxedWineNoteGuestFarTransfer(uint64_t GuestRIP, const char* Kind) {
+@@ -1632,7 +1648,8 @@ constexpr uint32_t BoxedWineDecodeModeReportLimit = 16;
+ constexpr uint32_t BoxedWineDecodeModeConflictLimit = 8;
+ } // namespace
+
+-void ContextImpl::BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, bool Is64BitMode) {
++void ContextImpl::BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, bool Is64BitMode,
++                                          FEXCore::Core::CpuStateFrame* Frame) {
+   const uint32_t Mode = Is64BitMode ? 1u : 2u;
+   const uint32_t Previous = BoxedWineDecodeMode.exchange(Mode, std::memory_order_acq_rel);
+   if (Previous == Mode || Previous == 0) {
+@@ -1643,6 +1660,44 @@ void ContextImpl::BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, b
+     return;
+   }
+   LogMan::Msg::IFmt("BOXEDWINE_FEX64_MODE_SWITCH rip={:#x} cs={:#x} mode={}", GuestRIP, CSIndex, Is64BitMode ? 64 : 32);
++
++  /* BoxedWine: the whole segmented and integer state at the boundary.
++   *
++   * The mode change is the one instant where "what did the other side hand
++   * us" is answerable, and reading it after the fact is guesswork: a device
++   * run reported a null-pointer fault several thousand bytes into 32-bit
++   * ntdll with EBX zero, and nothing in the log said whether EBX had been
++   * zero at the first 32-bit instruction or was cleared inside it. Wine's
++   * WoW64 layer loads EDI, ESI, EBX, EBP, EDX, ECX and EAX out of the
++   * thread's I386_CONTEXT immediately before the transfer
++   * (wow64cpu's syscall_32to64_return), so the values here are that
++   * context's, and EBX in particular is the 32-bit PEB that
++   * call_init_thunk stored.
++   *
++   * The selectors are printed beside them because the same transfer sets
++   * CS, SS, DS, ES and FS, and a null one is invisible in every other
++   * report. The bases are the cached values a translated access actually
++   * adds -- for CS, SS, DS and ES the substituted zero, for FS and GS the
++   * base the host published for the descriptor the selector names.
++   *
++   * On the decode-mode report's own budget, so it costs a WoW64 thread
++   * nothing after the first few crossings and a thread that never changes
++   * mode nothing at all. */
++  if (!Frame) {
++    return;
++  }
++  const auto& State = Frame->State;
++  LogMan::Msg::IFmt("BOXEDWINE_FEX64_SEG32 rip={:#x} mode={} cs={:#x} ss={:#x} ds={:#x} es={:#x} fs={:#x} gs={:#x} "
++                    "cs_base={:#x} ss_base={:#x} ds_base={:#x} es_base={:#x} fs_base={:#x} gs_base={:#x}",
++                    GuestRIP, Is64BitMode ? 64 : 32, State.cs_idx, State.ss_idx, State.ds_idx, State.es_idx, State.fs_idx,
++                    State.gs_idx, State.cs_cached, State.ss_cached, State.ds_cached, State.es_cached, State.fs_cached,
++                    State.gs_cached);
++  LogMan::Msg::IFmt("BOXEDWINE_FEX64_SEG32_GPRS rip={:#x} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} "
++                    "rsi={:#x} rdi={:#x}",
++                    GuestRIP, State.gregs[FEXCore::X86State::REG_RAX], State.gregs[FEXCore::X86State::REG_RCX],
++                    State.gregs[FEXCore::X86State::REG_RDX], State.gregs[FEXCore::X86State::REG_RBX],
++                    State.gregs[FEXCore::X86State::REG_RSP], State.gregs[FEXCore::X86State::REG_RBP],
++                    State.gregs[FEXCore::X86State::REG_RSI], State.gregs[FEXCore::X86State::REG_RDI]);
+ }
+
+ bool ContextImpl::BoxedWineClaimDecodeModePage(uint64_t GuestRIP, bool Is64BitMode) {
+@@ -1740,30 +1795,42 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+    * now, so the per-block half is gone and only the two markers around the
+    * iretq remain. Restoring the firehose is a deliberate act, not the
+    * default. */
++  /* The credit is still spent, so an armed block-trace budget expires exactly
++   * as it did before. The iretq report below no longer depends on it. */
+   const bool BoxedWinePhase = FEXCore::Context::BoxedWineTakeBlockTraceCredit();
+-  if (BoxedWinePhase) {
+-    /* An iretq was translated and this is the first block compiled after it,
+-     * so this is where it landed: the selectors it loaded, the stack it
+-     * switched to and the first bytes of the code it reached. A target block
+-     * already in the cache would not be recompiled and so would not appear
+-     * here -- which is not a limitation for the transition this watches,
+-     * because Windows code has never been reached before.
+-     *
+-     * The instruction bytes are read through the same translation the
+-     * translator itself uses, so a canonical low address resolves. */
+-    if (const uint64_t BoxedWineIRETFrom = FEXCore::Context::BoxedWineTakeGuestIRETNote()) {
+-      uint64_t BoxedWineCode0 = 0, BoxedWineCode1 = 0;
+-      const uint8_t* Bytes = reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP));
+-      if (Bytes) {
+-        memcpy(&BoxedWineCode0, Bytes, sizeof(BoxedWineCode0));
+-        memcpy(&BoxedWineCode1, Bytes + sizeof(BoxedWineCode0), sizeof(BoxedWineCode1));
+-      }
+-      LogMan::Msg::IFmt(
+-        "BOXEDWINE_FEX64_IRET_POST from={:#x} rip={:#x} rsp={:#x} cs={:#x} ss={:#x} fs={:#x} gs={:#x} code={:#018x}{:016x}",
+-        BoxedWineIRETFrom, GuestRIP, Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSP] : 0,
+-        Frame ? Frame->State.cs_idx : 0, Frame ? Frame->State.ss_idx : 0, Frame ? Frame->State.fs_cached : 0,
+-        Frame ? Frame->State.gs_cached : 0, BoxedWineCode1, BoxedWineCode0);
++  (void)BoxedWinePhase;
++
++  /* An iretq was translated and this is the first block compiled after it,
++   * so this is where it landed: the selectors it loaded, the stack it
++   * switched to and the first bytes of the code it reached. A target block
++   * already in the cache would not be recompiled and so would not appear
++   * here -- which is not a limitation for the transition this watches,
++   * because Windows code has never been reached before.
++   *
++   * No longer inside the block trace's credit. That credit is armed at the
++   * loader handoff and spent within a hundred blocks, and the iretq that
++   * matters -- the one wow64cpu's `syscall_32to64_return` uses to enter a
++   * 32-bit code segment, taken whenever the reset-state flag is set, which
++   * `thread_init` sets through BTCpuSetContext before the first
++   * BTCpuSimulate -- happens a second later. The note slot carries its own
++   * budget, so this stays bounded.
++   *
++   * The instruction bytes are read through the same translation the
++   * translator itself uses, so a canonical low address resolves. */
++  if (const uint64_t BoxedWineIRETFrom = FEXCore::Context::BoxedWineTakeGuestIRETNote()) {
++    uint64_t BoxedWineCode0 = 0, BoxedWineCode1 = 0;
++    const uint8_t* Bytes = reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP));
++    if (Bytes) {
++      memcpy(&BoxedWineCode0, Bytes, sizeof(BoxedWineCode0));
++      memcpy(&BoxedWineCode1, Bytes + sizeof(BoxedWineCode0), sizeof(BoxedWineCode1));
+     }
++    LogMan::Msg::IFmt("BOXEDWINE_FEX64_IRET_POST from={:#x} rip={:#x} rsp={:#x} cs={:#x} ss={:#x} ds={:#x} es={:#x} "
++                      "fs={:#x} gs={:#x} decode={} code={:#018x}{:016x}",
++                      BoxedWineIRETFrom, GuestRIP, Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSP] : 0,
++                      Frame ? Frame->State.cs_idx : 0, Frame ? Frame->State.ss_idx : 0, Frame ? Frame->State.ds_idx : 0,
++                      Frame ? Frame->State.es_idx : 0, Frame ? Frame->State.fs_cached : 0,
++                      Frame ? Frame->State.gs_cached : 0, BoxedWineFrameIs64BitMode(Frame, Config.Is64BitMode) ? 64 : 32,
++                      BoxedWineCode1, BoxedWineCode0);
+   }
+
+   if constexpr (BLOCK_DEBUGGING) {
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 13586301b..a8257eab9 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -1431,7 +1431,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
+   if (BlockInfo.Is64BitMode != CTX->Config.Is64BitMode) {
+     LOGMAN_THROW_A_FMT(CTX->GetGuestPerBlockDecodeMode(), "Expected operating mode to not change at runtime!");
+   }
+-  CTX->BoxedWineNoteDecodeMode(PC, Thread->CurrentFrame->State.cs_idx, BlockInfo.Is64BitMode);
++  CTX->BoxedWineNoteDecodeMode(PC, Thread->CurrentFrame->State.cs_idx, BlockInfo.Is64BitMode, Thread->CurrentFrame);
+   /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Assertion passed OK");
+
+   EntryPoint = PC;
