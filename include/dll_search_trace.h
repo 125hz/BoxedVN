@@ -44,8 +44,15 @@
 // How many distinct module names one process remembers. The loader
 // interleaves searches -- an import of an import is looked for in the middle
 // of its parent's search -- so a single slot would report a module that was
-// found moments later. Eight covers the interleaving every device log shows.
-#define K_DLL_SEARCH_MODULE_SLOTS 8
+// found moments later.
+//
+// Eight covered the interleaving but not the distance: a device run probed
+// fifteen further names between the module that never resolved and the exit
+// that had to name it, so the slot had been reused long before the report. An
+// import tree is dozens deep, and the eviction rule now gives up a resolved
+// slot before an unresolved one, so this only has to hold the misses that are
+// live at once.
+#define K_DLL_SEARCH_MODULE_SLOTS 32
 
 #if defined(__cplusplus)
 #include <atomic>
@@ -130,6 +137,92 @@ inline bool dllSearchModuleName(const char* path, char* out, std::size_t capacit
     return true;
 }
 
+// Which module names some process in this session has already opened.
+//
+// The loader that searches for a module is not always the process that opens
+// it. Wine's NtCreateFile hands the Unix path to wineserver, which performs
+// the open and passes the descriptor back, so a client's own trace sees only
+// the stats it made while resolving the name -- and for a name whose case
+// differs from the file's, every one of those stats misses and the resolution
+// happens through a directory scan. A per-process "resolved" flag therefore
+// reports as missing every module whose only successful open was wineserver's.
+// A device session did exactly that: it named ws2_32.dll, which wineserver had
+// opened twice (once in the prefix, once in the module root), and never named
+// winemetal.dll, which no path in the whole run ever produced.
+//
+// Whether a module was found is a property of the file set, not of the process
+// that asked, so it is recorded once for the session. The budget stays per
+// process: that bounds what is printed, which is a different question.
+#define K_DLL_SEARCH_RESOLVED_SLOTS 256
+
+inline std::atomic<bool> gDllSearchResolvedLock {false};
+inline char gDllSearchResolvedNames[K_DLL_SEARCH_RESOLVED_SLOTS]
+                                   [K_DLL_SEARCH_MODULE_NAME_MAX] = {};
+inline unsigned gDllSearchResolvedCount = 0;
+
+inline bool dllSearchSameModuleName(const char* left, const char* right) {
+    for (std::size_t i = 0;; ++i) {
+        if (left[i] != right[i]) {
+            return false;
+        }
+        if (left[i] == 0) {
+            return true;
+        }
+    }
+}
+
+// Held for a handful of byte comparisons over a table that only ever grows,
+// and only while the module-search trace is armed.
+class DllSearchResolvedGuard final {
+public:
+    DllSearchResolvedGuard() {
+        bool expected = false;
+        while (!gDllSearchResolvedLock.compare_exchange_weak(
+                   expected, true, std::memory_order_acquire,
+                   std::memory_order_relaxed)) {
+            expected = false;
+        }
+    }
+    ~DllSearchResolvedGuard() {
+        gDllSearchResolvedLock.store(false, std::memory_order_release);
+    }
+    DllSearchResolvedGuard(const DllSearchResolvedGuard&) = delete;
+    DllSearchResolvedGuard& operator=(const DllSearchResolvedGuard&) = delete;
+};
+
+// `name` is already lowercased by dllSearchModuleName, so the comparison is
+// exact. A full table stops recording rather than evicting: an evicted name
+// would come back as unresolved, which is the wrong answer in the one
+// direction that matters.
+inline void dllSearchNoteResolved(const char* name) {
+    DllSearchResolvedGuard guard;
+    for (unsigned i = 0; i < gDllSearchResolvedCount; ++i) {
+        if (dllSearchSameModuleName(gDllSearchResolvedNames[i], name)) {
+            return;
+        }
+    }
+    if (gDllSearchResolvedCount >= K_DLL_SEARCH_RESOLVED_SLOTS) {
+        return;
+    }
+    char* slot = gDllSearchResolvedNames[gDllSearchResolvedCount];
+    std::size_t i = 0;
+    for (; name[i] != 0 && i + 1 < K_DLL_SEARCH_MODULE_NAME_MAX; ++i) {
+        slot[i] = name[i];
+    }
+    slot[i] = 0;
+    ++gDllSearchResolvedCount;
+}
+
+inline bool dllSearchWasResolved(const char* name) {
+    DllSearchResolvedGuard guard;
+    for (unsigned i = 0; i < gDllSearchResolvedCount; ++i) {
+        if (dllSearchSameModuleName(gDllSearchResolvedNames[i], name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Armed once, for the whole emulator, by a 64-bit Wine launch. A 32-bit
 // launch never sets it, so the IA-32 path is untouched -- and because it is
 // consulted rather than copied, every process the launch goes on to create,
@@ -203,18 +296,37 @@ public:
         }
         Guard guard(lock);
         Slot* slot = nullptr;
-        Slot* oldest = &slots[0];
         for (Slot& candidate : slots) {
             if (candidate.sequence != 0 && sameName(candidate.name, name)) {
                 slot = &candidate;
                 break;
             }
-            if (candidate.sequence < oldest->sequence) {
-                oldest = &candidate;
-            }
         }
         if (slot == nullptr) {
-            slot = oldest;
+            // What the table is for is naming the module that never resolved,
+            // so a slot whose module was found is the one to give up. Only
+            // when every slot is still unresolved does age decide -- an import
+            // tree is dozens of names deep and the failing one is not
+            // necessarily the last, so evicting a live miss to make room for a
+            // hit is how a real gap goes unnamed.
+            Slot* victim = &slots[0];
+            bool victimResolved = false;
+            for (Slot& candidate : slots) {
+                const bool candidateResolved =
+                    candidate.sequence == 0 || candidate.resolved ||
+                    dllSearchWasResolved(candidate.name);
+                if (candidateResolved != victimResolved) {
+                    if (candidateResolved) {
+                        victim = &candidate;
+                        victimResolved = true;
+                    }
+                    continue;
+                }
+                if (candidate.sequence < victim->sequence) {
+                    victim = &candidate;
+                }
+            }
+            slot = victim;
             slot->resolved = false;
             std::size_t i = 0;
             for (; name[i] != 0 && i + 1 < sizeof(slot->name); ++i) {
@@ -225,6 +337,9 @@ public:
         slot->sequence = ++sequenceCounter;
         if (result >= 0) {
             slot->resolved = true;
+            // Session-wide, because the process that opens a module is not
+            // always the one that searched for it.
+            dllSearchNoteResolved(name);
         }
         ++probeCount;
     }
@@ -244,6 +359,12 @@ public:
         const Slot* newest = nullptr;
         for (const Slot& candidate : slots) {
             if (candidate.sequence == 0 || candidate.resolved) {
+                continue;
+            }
+            // A name this process only ever missed on may still have been
+            // opened -- by wineserver, on this process's behalf. Nothing that
+            // any process in the session opened is a missing module.
+            if (dllSearchWasResolved(candidate.name)) {
                 continue;
             }
             if (newest == nullptr || candidate.sequence > newest->sequence) {

@@ -797,6 +797,11 @@ U32 CPU64::step() {
     // large slice of that. Ops no block can match go straight to `unhandled`.
     // REGENERATE (do not hand-edit) after adding/reordering opcode blocks:
     //   python3 tools/gen_dispatch64.py
+    // That generator is not in this tree. Until it is, an added block is
+    // entered by hand under the same rule: its opcodes are removed from the
+    // `unhandled` list and given a case naming the FIRST block that could
+    // match them, and the block itself is placed so that the ops which used
+    // to fall through to its successor still reach that successor.
     switch (op) {
         case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
         goto dsp_0;
@@ -851,6 +856,7 @@ U32 CPU64::step() {
         case 0x69: case 0x6b: goto dsp_41;
         case 0xa4: case 0xa5: case 0xaa: case 0xab: goto dsp_42;
         case 0xa6: case 0xa7: case 0xae: case 0xaf: goto dsp_43;
+        case 0xac: case 0xad: goto dsp_43b;
         case 0xc9: goto dsp_44;
         case 0x9c: goto dsp_45;
         case 0x9d: goto dsp_46;
@@ -869,7 +875,7 @@ U32 CPU64::step() {
         case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: case 0x48:
         case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f: case 0x60:
         case 0x61: case 0x62: case 0x64: case 0x65: case 0x66: case 0x67: case 0x6c: case 0x6d:
-        case 0x6e: case 0x6f: case 0x82: case 0x9a: case 0xac: case 0xad: case 0xc2: case 0xc4:
+        case 0x6e: case 0x6f: case 0x82: case 0x9a: case 0xc2: case 0xc4:
         case 0xc5: case 0xc8: case 0xca: case 0xcb: case 0xcd: case 0xce: case 0xd4: case 0xd5:
         case 0xd6: case 0xe0: case 0xe1: case 0xe2: case 0xe3: case 0xe4: case 0xe5: case 0xe6:
         case 0xe7: case 0xea: case 0xec: case 0xed: case 0xee: case 0xef: case 0xf0: case 0xf1:
@@ -2481,6 +2487,45 @@ dsp_43:
             }
         }
         if (p.rep != 0) reg[X64_RCX].setU64(count);
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // LODS — load string. AL/AX/EAX/RAX = [RSI], then RSI steps by ±size.
+    //   LODSB — AC (byte)
+    //   LODSW/LODSD/LODSQ — AD (opSize)
+    //
+    // The one member of the string family the interpreter did not decode. A
+    // device run stopped a helper at "unimpl opcode ... bytes=ac eb df 5b 5e",
+    // which is `lodsb; jmp short -0x21` -- the read half of a hand-written
+    // byte loop, the same shape as the STOS/SCAS loops already here.
+    //
+    // REP is architecturally permitted and useless: every iteration but the
+    // last is overwritten, so the visible result is the final element and
+    // RCX=0. It is implemented the way MOVS/STOS above implement it rather
+    // than special-cased, so a guest that emits it behaves the same as on
+    // hardware. Flags are untouched: LODS is a move, not an arithmetic op.
+dsp_43b:
+    if (op == 0xAC || op == 0xAD) {
+        U32 size = (op == 0xAC) ? 1 : opSize;
+        S64 step = (rflags & X64_DF) ? -(S64)size : (S64)size;
+        U64 count = (p.rep != 0) ? reg[X64_RCX].u64 : 1;
+        if (p.asize32) count &= 0xFFFFFFFFULL;
+        while (count--) {
+            U64 src = reg[X64_RSI].u64;
+            if (p.asize32) src &= 0xFFFFFFFFULL;
+            switch (size) {
+                // Each width writes the register the way the rest of the
+                // interpreter does: a byte or word load leaves the upper bits
+                // of RAX alone, a dword load zero-extends to 64.
+                case 1: reg[X64_RAX].setU8(memory->readb(src)); break;
+                case 2: reg[X64_RAX].setU16(memory->readw(src)); break;
+                case 4: reg[X64_RAX].setU32(memory->readd(src)); break;
+                default: reg[X64_RAX].setU64(memory->readq(src)); break;
+            }
+            reg[X64_RSI].setU64(reg[X64_RSI].u64 + (U64)step);
+        }
+        if (p.rep != 0) reg[X64_RCX].setU64(0);
         rip += opOff + 1;
         return opOff + 1;
     }
@@ -5382,7 +5427,13 @@ dsp_58:
 unhandled:
     // Unimplemented. Print enough leading bytes to identify the opcode
     // in the Intel SDM tables and bail out so we don't silently loop.
-    klog_fmt("CPU64: unimpl opcode at RIP=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x (rex=0x%02x osz=%d asz=%d seg=%02x rep=%02x)",
+    //
+    // The process is named here rather than only under BW64_UNIMPLDUMP: a
+    // session runs a dozen helpers on this interpreter at once, and a report
+    // that says only RIP leaves the reader inferring which one hit it from
+    // whichever pid happened to log a line just above. That inference was
+    // wrong once already.
+    klog_fmt("CPU64: unimpl opcode at RIP=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x (rex=0x%02x osz=%d asz=%d seg=%02x rep=%02x) pid=%d exe='%s' cmd='%s'",
              (unsigned long long)ipStart,
              fetchByte(ipStart),
              fetchByte(ipStart + 1),
@@ -5391,7 +5442,10 @@ unhandled:
              fetchByte(ipStart + 4),
              fetchByte(ipStart + 5),
              fetchByte(ipStart + 6),
-             p.rex, (int)p.osize16, (int)p.asize32, p.seg, p.rep);
+             p.rex, (int)p.osize16, (int)p.asize32, p.seg, p.rep,
+             (thread && thread->process) ? (int)thread->process->id : -1,
+             (thread && thread->process) ? thread->process->exe.c_str() : "",
+             (thread && thread->process) ? thread->process->commandLine.c_str() : "");
     // BW64_UNIMPLDUMP: when a thread decodes a bogus opcode it has almost always
     // jumped to a garbage address (corruption / bad control transfer). Dump the
     // pid + GPRs + the top of the stack so we can see WHO called into here and

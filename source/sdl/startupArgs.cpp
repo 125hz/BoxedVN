@@ -136,7 +136,22 @@ static bool guestUsesFex64(const std::vector<BString>& envValues) {
 // archive is untouched: this is the same in-memory union the system32
 // projection uses, applied after it so the system32 links, which name the
 // module-root guest paths, resolve to the DXMT copies as well.
-static void overlayX64WineModules(const BString& overlayDir) {
+//
+// That last sentence only holds for a name the packaged tree already carried.
+// The system32 projection runs first and links what it finds; a module DXMT
+// adds afterwards -- winemetal.dll, which Wine does not ship -- is in the
+// module root and nowhere in the prefix. Wine's loader never looks in the
+// module root by itself: it searches the DOS directories, finds the prefix's
+// entry for a builtin name, and only then follows it to the module tree. With
+// no prefix entry the search ends at the four DOS directories, and a device
+// run showed exactly that -- 'system32/winemetal.dll' ENOENT after a scan of
+// all 962 system32 entries, no probe of the module root at any point, and
+// dxgi.dll (which imports it) failing with STATUS_DLL_NOT_FOUND, which
+// LdrInitializeThunk then returned for the whole process. So each projected
+// module is linked into the prefix as well, under the same non-destructive
+// rule the system32 projection uses: a real prefix file always wins.
+static void overlayX64WineModules(const BString& overlayDir,
+                                  const BString& winePrefix) {
     std::shared_ptr<FsNode> peDir =
         Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_PE_DIR), true);
     if (!peDir || !peDir->isDirectory()) {
@@ -144,6 +159,12 @@ static void overlayX64WineModules(const BString& overlayDir) {
                  overlayDir.c_str());
         return;
     }
+    const BString system32 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
+                             K_GUEST_WINE_WINDOWS "/" K_GUEST_WINE_SYSTEM32;
+    std::shared_ptr<FsNode> system32Directory =
+        Fs::getNodeFromLocalPath(B(""), system32, true);
+    const bool system32Ready =
+        system32Directory != nullptr && system32Directory->isDirectory();
     for (const std::string& name : boxedvn::x64DxmtModuleNames()) {
         const BString sourcePath = overlayDir + "/" + name.c_str();
         std::shared_ptr<FsNode> source =
@@ -156,8 +177,29 @@ static void overlayX64WineModules(const BString& overlayDir) {
         }
         const BString destination = B(K_X64_WINE_PE_DIR) + "/" + name.c_str();
         Fs::addFileNode(destination, B(""), source->nativePath, false, peDir);
-        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY name=%s source=%s destination=%s status=projected",
-                 name.c_str(), sourcePath.c_str(), destination.c_str());
+        // The prefix half. "present" is the ordinary case for a name the
+        // packaged tree already had -- the system32 projection linked it, and
+        // that link names the module-root path this loop just rewrote, so it
+        // already resolves to the DXMT copy. "linked" is the name that had no
+        // prefix entry at all and is the one this exists for.
+        const char* system32Status = "unavailable";
+        if (system32Ready) {
+            const BString prefixPath = system32 + "/" + name.c_str();
+            const bool prefixExists =
+                Fs::getNodeFromLocalPath(B(""), prefixPath, false) != nullptr;
+            if (boxedvn::shouldProjectGuestWineSystemModule(true, false,
+                                                            prefixExists)) {
+                Fs::addFileNode(prefixPath, destination, B(""), false,
+                                system32Directory);
+                system32Status = "linked";
+            } else {
+                system32Status = "present";
+            }
+        }
+        klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY name=%s source=%s destination=%s "
+                 "status=projected system32=%s",
+                 name.c_str(), sourcePath.c_str(), destination.c_str(),
+                 system32Status);
     }
 }
 
@@ -1065,7 +1107,7 @@ bool StartUpArgs::apply() {
     // has to run after them. A device run that projected before the mounts
     // reported every module missing and Wine fell back to wined3d.
     if (requestedFEX64 && !this->x64ModuleOverlayPath.isEmpty()) {
-        overlayX64WineModules(this->x64ModuleOverlayPath);
+        overlayX64WineModules(this->x64ModuleOverlayPath, winePrefix);
     }
 
     if (this->args.size()==0) {
