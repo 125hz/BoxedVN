@@ -220,6 +220,21 @@ public:
 	void setDirtyRect(S32 x, S32 y, U32 width, U32 height) override;
 	XWindowPtr getWindowFromPoint(S32 screenX, S32 screenY);
 
+	// X11 gives a window that declares no background of its own - background
+	// None, which is the default - no pixels at all. What shows through it is
+	// whatever the server already had in that area, which for a window
+	// parented to the root is the root's background. Boxedwine gives every
+	// window a private backing store and zero-fills it, so "no background of
+	// my own" became an opaque black rectangle. Wine's virtual desktop window
+	// is exactly that case: winex11.drv creates it with only
+	// CWEventMask | CWCursor | CWColormap (the mask the bridge logs as
+	// 0x6800), so nothing but explorer's own painting ever colours it, and
+	// anything explorer leaves alone reached the screen black. The backing
+	// store of the root, and of a background-less window parented to it, is
+	// therefore seeded with the root background instead of with zero.
+	U32 backgroundFillPixel();
+	void fillWithBackground();
+
 	void focusOut();
 	void focusIn();
 
@@ -240,8 +255,22 @@ private:
 	S32 top;	
 	U32 border_width;
 	XSetWindowAttributes attributes;
-	bool isMapped = false;	
+	bool isMapped = false;
 	bool isFullScreen = false;
+	// Whether the client named a background pixel of its own (CWBackPixel).
+	// XSetWindowAttributes has a fixed emulated layout, so the answer lives
+	// here rather than as a second field inside that structure.
+	bool hasBackgroundPixel = false;
+	// The background seed above is applied once, when the window is first
+	// mapped and its attributes are settled. A later remap keeps whatever the
+	// client has drawn since.
+	bool backgroundFilled = false;
+	// A freshly created native texture holds nothing until something is
+	// copied into it, and XServer::draw presents every mapped window whether
+	// or not it is dirty. Without this the first present of a window that
+	// happens to be clean shows undefined contents until the client next
+	// draws into it.
+	bool hasBeenPresented = false;
 	bool dirtyBoundsValid = false;
 	S32 dirtyLeft = 0;
 	S32 dirtyTop = 0;

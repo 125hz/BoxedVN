@@ -280,6 +280,11 @@ const XWindowPtr& XServer::getRoot() {
 		U32 atom = server->internAtom(B("_GTK_WORKAREAS_D0"), false);
 		root->setProperty(atom, XA_CARDINAL, 32, sizeof(U32) * 4, (U8*)&rect, false);
 		root->isMapped = true; // so that grab works
+		// The root is never mapped through mapWindow, so its background is
+		// applied here. Nothing presents the root itself - a full-screen
+		// desktop window covers it - but it is what a background-less child
+		// of the root inherits, and what XGetImage on the root reports.
+		root->fillWithBackground();
 		root->colorMap = getDefaultColorMap();
 		root->attributes.colormap = root->colorMap->id;
 		root->cursor = std::make_shared<XCursor>(132); // XC_top_left_arrow

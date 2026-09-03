@@ -43,6 +43,7 @@
 #include <dispatch/dispatch.h>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "BVNDXMTDisplay.h"
 #include "BVNRuntime.h"
@@ -1376,7 +1377,17 @@ static CGRect gGuestPresentationContentRect = CGRectZero;
 @interface BVNX11PatchView : UIView
 - (BOOL)configureForPixelWidth:(uint32_t)width
                         height:(uint32_t)height;
-- (BOOL)presentPixelData:(NSData*)pixelData;
+// Copies one rectangle of the guest buffer into the shared texture. The
+// buffer is the whole guest surface, so the rectangle is addressed inside it
+// rather than uploaded from its own start.
+- (NSUInteger)uploadPixelData:(NSData*)pixelData
+                         left:(uint32_t)left
+                          top:(uint32_t)top
+                        width:(uint32_t)width
+                       height:(uint32_t)height;
+// Blits the whole texture into a drawable and presents it. Separate from the
+// upload so a draw pass that touched several windows presents once.
+- (BOOL)presentTexture;
 @end
 
 @implementation BVNX11PatchView
@@ -1424,11 +1435,20 @@ static CGRect gGuestPresentationContentRect = CGRectZero;
     return YES;
 }
 
-- (BOOL)presentPixelData:(NSData*)pixelData {
-    if (_patchTexture == nil || pixelData == nil ||
+- (NSUInteger)uploadPixelData:(NSData*)pixelData
+                         left:(uint32_t)left
+                          top:(uint32_t)top
+                        width:(uint32_t)width
+                       height:(uint32_t)height {
+    if (_patchTexture == nil || pixelData == nil || width == 0 || height == 0 ||
         pixelData.length < _patchTexture.width * _patchTexture.height * 4) {
-        return NO;
+        return 0;
     }
+    if (left >= _patchTexture.width || top >= _patchTexture.height) {
+        return 0;
+    }
+    width = (uint32_t)MIN((NSUInteger)width, _patchTexture.width - left);
+    height = (uint32_t)MIN((NSUInteger)height, _patchTexture.height - top);
 
     // Keep one shared Metal texture for the lifetime of the guest surface.
     // Core Animation's UIView backing-store path retained a small amount of
@@ -1437,12 +1457,26 @@ static CGRect gGuestPresentationContentRect = CGRectZero;
     // roughly 220 MB in three minutes, then presentation stopped near the
     // device limit. Uploading into this fixed allocation gives CA only its
     // normal bounded drawable pool, independent of the number of patches.
-    const MTLRegion fullRegion = MTLRegionMake2D(
-        0, 0, _patchTexture.width, _patchTexture.height);
-    [_patchTexture replaceRegion:fullRegion
+    //
+    // Only the rectangle the guest changed is copied. The source rows stay in
+    // the full guest buffer, so the row stride is the buffer's and the first
+    // byte is the rectangle's own top-left pixel; a 1280x720 caret repaint
+    // costs its own few hundred bytes instead of 3.5 MB.
+    const NSUInteger bytesPerRow = _patchTexture.width * 4;
+    const NSUInteger offset = (NSUInteger)top * bytesPerRow +
+                              (NSUInteger)left * 4;
+    const MTLRegion region = MTLRegionMake2D(left, top, width, height);
+    [_patchTexture replaceRegion:region
                      mipmapLevel:0
-                       withBytes:pixelData.bytes
-                     bytesPerRow:_patchTexture.width * 4];
+                       withBytes:(const uint8_t*)pixelData.bytes + offset
+                     bytesPerRow:bytesPerRow];
+    return (NSUInteger)width * height * 4;
+}
+
+- (BOOL)presentTexture {
+    if (_patchTexture == nil) {
+        return NO;
+    }
 
     CAMetalLayer* layer = (CAMetalLayer*)self.layer;
     id<CAMetalDrawable> drawable = [layer nextDrawable];
@@ -1476,6 +1510,86 @@ static uint32_t gGuestX11PatchHeight = 0;
 static uint32_t gGuestX11ActiveWindow = 0;
 static std::atomic<bool> gGuestX11PatchVisible{false};
 static std::atomic<uint64_t> gGuestX11PatchCount{0};
+// The whole texture has to be re-uploaded after it is created and after the
+// guest buffer is cleared; every other patch uploads only its own rectangle.
+static bool gGuestX11PatchNeedsFullUpload = true;
+// One present per main-thread turn. XServer::draw walks the whole mapped
+// window tree inside a single runOnUiThread block, so a pass that touched
+// four windows used to call nextDrawable four times, and nextDrawable blocks
+// the main thread once the drawable pool is in flight - up to a display
+// refresh each. The deferred block below runs after that whole pass.
+static bool gGuestX11PresentScheduled = false;
+// Patches composed since the deferred present was queued. If the main run
+// loop has not serviced it after this many, the present happens inline: the
+// picture is never allowed to go stale because a block did not get to run.
+static uint32_t gGuestX11PendingPatches = 0;
+static const uint32_t kGuestX11MaxPendingPatches = 32;
+// Five-second compositor witness. Counters are only touched on the main
+// thread, next to the work they measure.
+static uint64_t gGuestX11StatPatches = 0;
+static uint64_t gGuestX11StatSkipped = 0;
+static uint64_t gGuestX11StatPresents = 0;
+static uint64_t gGuestX11StatUploadedBytes = 0;
+static uint64_t gGuestX11StatBlitPixels = 0;
+static CFAbsoluteTime gGuestX11StatWindowStart = 0;
+
+static void BVNReportGuestX11CompositorStats(void) {
+    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gGuestX11StatWindowStart == 0) {
+        gGuestX11StatWindowStart = now;
+        return;
+    }
+    const double elapsed = now - gGuestX11StatWindowStart;
+    if (elapsed < 5.0) {
+        return;
+    }
+    gGuestX11StatWindowStart = now;
+    const uint64_t patches = gGuestX11StatPatches;
+    const uint64_t skipped = gGuestX11StatSkipped;
+    const uint64_t presents = gGuestX11StatPresents;
+    const uint64_t uploaded = gGuestX11StatUploadedBytes;
+    const uint64_t blitted = gGuestX11StatBlitPixels;
+    gGuestX11StatPatches = 0;
+    gGuestX11StatSkipped = 0;
+    gGuestX11StatPresents = 0;
+    gGuestX11StatUploadedBytes = 0;
+    gGuestX11StatBlitPixels = 0;
+    if (patches == 0 && presents == 0 && skipped == 0) {
+        return;
+    }
+    NSString* message = [NSString stringWithFormat:
+        @"BOXEDVN_X11_COMPOSITOR window=%ux%u seconds=%.1f patches/s=%.1f "
+         "presents/s=%.1f uploaded_kb/s=%.1f blit_mpixels/s=%.2f "
+         "skipped/s=%.1f",
+        gGuestX11PatchWidth, gGuestX11PatchHeight, elapsed,
+        (double)patches / elapsed, (double)presents / elapsed,
+        (double)uploaded / 1024.0 / elapsed,
+        (double)blitted / 1000000.0 / elapsed,
+        (double)skipped / elapsed];
+    BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
+}
+
+static void BVNPresentGuestX11PatchesNow(void) {
+    gGuestX11PendingPatches = 0;
+    if (gGuestX11PatchView == nil) {
+        return;
+    }
+    if (![gGuestX11PatchView presentTexture]) {
+        static bool loggedMetalPresentFailure = false;
+        if (!loggedMetalPresentFailure) {
+            loggedMetalPresentFailure = true;
+            BVNLogWrite(BVNLogLevelWarning, "graphics",
+                        "The bounded Metal X11 compositor could not obtain "
+                        "a drawable; later patches will retry.");
+        }
+        // The texture still holds everything composed so far, so the next
+        // patch presents it; nothing has to be uploaded again.
+        return;
+    }
+    gGuestX11StatPresents++;
+    BVNGuestPerformanceFramePresented();
+    BVNReportGuestX11CompositorStats();
+}
 
 extern "C" uint64_t BVNGuestX11PatchCount(void) {
     return gGuestX11PatchCount.load(std::memory_order_relaxed);
@@ -1488,6 +1602,7 @@ static void BVNRemoveGuestX11PatchView(void) {
     gGuestX11PatchWidth = 0;
     gGuestX11PatchHeight = 0;
     gGuestX11ActiveWindow = 0;
+    gGuestX11PatchNeedsFullUpload = true;
     gGuestX11PatchVisible.store(false, std::memory_order_release);
 }
 
@@ -1583,6 +1698,7 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
             BVNRemoveGuestX11PatchView();
             return;
         }
+        gGuestX11PatchNeedsFullUpload = true;
     }
 
     const bool activeWindowChanged =
@@ -1591,6 +1707,7 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         gGuestX11ActiveWindow = activeWindowId;
         memset(gGuestX11PatchPixels.mutableBytes, 0,
                gGuestX11PatchPixels.length);
+        gGuestX11PatchNeedsFullUpload = true;
     }
 
     const int32_t sourceLeft = MAX(0, dirtyX);
@@ -1638,6 +1755,7 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
     if (truncatedFullHeightUpdate) {
         static uint64_t skippedTruncatedCount = 0;
         ++skippedTruncatedCount;
+        gGuestX11StatSkipped++;
         if (skippedTruncatedCount <= 12 ||
             skippedTruncatedCount % 120 == 0) {
             NSString* message = [NSString stringWithFormat:
@@ -1666,23 +1784,51 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
         reinterpret_cast<uint32_t*>(gGuestX11PatchPixels.mutableBytes);
     const int32_t clientOffsetX = activeScreenX - screenX;
     const int32_t clientOffsetY = activeScreenY - screenY;
-    for (int32_t destinationY = clippedTop;
-         destinationY < clippedBottom; ++destinationY) {
-        const int32_t clientY = MIN(clientBottom - 1,
-            (int32_t)((int64_t)destinationY * activeHeight / guestHeight));
-        const uint32_t* sourceRow = reinterpret_cast<const uint32_t*>(
-            pixels + (clientOffsetY + clientY) * pitch);
-        uint32_t* destinationRow = destination +
-            destinationY * guestWidth;
-        for (int32_t destinationX = clippedLeft;
-             destinationX < clippedRight; ++destinationX) {
-            const int32_t clientX = MIN(clientRight - 1,
+    // Boxedwine's X11 visual is BGRX in little-endian memory. Core Graphics
+    // consumes BGRA here, so make only the updated rectangle opaque and leave
+    // the rest transparent over the Vulkan frame.
+    //
+    // The general case maps the active client's size onto the presentation
+    // size. It used to do that with a 64-bit multiply and divide per
+    // destination pixel - close to a million divisions for a full-screen
+    // patch, on the main thread, where the guest also lives. The usual case
+    // is the identity mapping, which needs neither; and when the sizes do
+    // differ, the column each destination column reads is the same for every
+    // row, so it is computed once per patch instead of once per pixel.
+    const bool identityMapping =
+        activeWidth == guestWidth && activeHeight == guestHeight;
+    if (identityMapping) {
+        for (int32_t destinationY = clippedTop;
+             destinationY < clippedBottom; ++destinationY) {
+            const uint32_t* sourceRow = reinterpret_cast<const uint32_t*>(
+                pixels + (clientOffsetY + destinationY) * pitch) +
+                clientOffsetX;
+            uint32_t* destinationRow = destination +
+                (int64_t)destinationY * guestWidth;
+            for (int32_t x = clippedLeft; x < clippedRight; ++x) {
+                destinationRow[x] = sourceRow[x] | 0xff000000u;
+            }
+        }
+    } else {
+        const int32_t columns = clippedRight - clippedLeft;
+        std::vector<int32_t> sourceColumn((size_t)MAX(0, columns));
+        for (int32_t index = 0; index < columns; ++index) {
+            const int32_t destinationX = clippedLeft + index;
+            sourceColumn[(size_t)index] = clientOffsetX + MIN(clientRight - 1,
                 (int32_t)((int64_t)destinationX * activeWidth / guestWidth));
-            // Boxedwine's X11 visual is BGRX in little-endian memory. Core
-            // Graphics consumes BGRA here, so make only the updated rectangle
-            // opaque and leave the rest transparent over the Vulkan frame.
-            destinationRow[destinationX] =
-                sourceRow[clientOffsetX + clientX] | 0xff000000u;
+        }
+        for (int32_t destinationY = clippedTop;
+             destinationY < clippedBottom; ++destinationY) {
+            const int32_t clientY = MIN(clientBottom - 1,
+                (int32_t)((int64_t)destinationY * activeHeight / guestHeight));
+            const uint32_t* sourceRow = reinterpret_cast<const uint32_t*>(
+                pixels + (clientOffsetY + clientY) * pitch);
+            uint32_t* destinationRow = destination +
+                (int64_t)destinationY * guestWidth;
+            for (int32_t index = 0; index < columns; ++index) {
+                destinationRow[clippedLeft + index] =
+                    sourceRow[sourceColumn[(size_t)index]] | 0xff000000u;
+            }
         }
     }
 
@@ -1690,18 +1836,46 @@ extern "C" void BVNGuestCompositeX11Patch(const uint8_t* pixels,
     gGuestX11PatchView.hidden = NO;
     gGuestX11PatchVisible.store(true, std::memory_order_release);
 
-    if (![gGuestX11PatchView presentPixelData:gGuestX11PatchPixels]) {
-        static bool loggedMetalPresentFailure = false;
-        if (!loggedMetalPresentFailure) {
-            loggedMetalPresentFailure = true;
-            BVNLogWrite(BVNLogLevelWarning, "graphics",
-                        "The bounded Metal X11 compositor could not obtain "
-                        "a drawable; later patches will retry.");
-        }
-        return;
-    }
+    const bool fullUpload = gGuestX11PatchNeedsFullUpload;
+    gGuestX11PatchNeedsFullUpload = false;
+    const NSUInteger uploaded = fullUpload
+        ? [gGuestX11PatchView uploadPixelData:gGuestX11PatchPixels
+                                         left:0
+                                          top:0
+                                        width:guestWidth
+                                       height:guestHeight]
+        : [gGuestX11PatchView uploadPixelData:gGuestX11PatchPixels
+                                         left:(uint32_t)clippedLeft
+                                          top:(uint32_t)clippedTop
+                                        width:(uint32_t)(clippedRight -
+                                                         clippedLeft)
+                                       height:(uint32_t)(clippedBottom -
+                                                         clippedTop)];
+    gGuestX11StatPatches++;
+    gGuestX11StatUploadedBytes += (uint64_t)uploaded;
+    gGuestX11StatBlitPixels += (uint64_t)(clippedRight - clippedLeft) *
+                               (uint64_t)(clippedBottom - clippedTop);
     gGuestX11PatchCount.fetch_add(1, std::memory_order_relaxed);
-    BVNGuestPerformanceFramePresented();
+
+    // One present for the whole draw pass. XServer::draw walks the mapped
+    // window tree inside a single runOnUiThread block, so a pass that touched
+    // four windows used to call nextDrawable four times, and nextDrawable
+    // blocks the main thread - the thread the guest runs on - for up to a
+    // display refresh once the drawable pool is in flight. The deferred block
+    // is queued on the main queue that this pass is occupying, so it runs
+    // once the pass has composed every window it is going to.
+    gGuestX11PendingPatches++;
+    if (gGuestX11PresentScheduled) {
+        if (gGuestX11PendingPatches >= kGuestX11MaxPendingPatches) {
+            BVNPresentGuestX11PatchesNow();
+        }
+    } else {
+        gGuestX11PresentScheduled = true;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gGuestX11PresentScheduled = false;
+            BVNPresentGuestX11PatchesNow();
+        });
+    }
 
     static uint64_t patchCount = 0;
     ++patchCount;
@@ -1734,6 +1908,9 @@ extern "C" void BVNGuestClearX11Patches(void) {
     if (gGuestX11PatchPixels != nil) {
         memset(gGuestX11PatchPixels.mutableBytes, 0,
                gGuestX11PatchPixels.length);
+        // The texture still holds the old picture; the next patch has to
+        // re-upload the whole cleared buffer rather than only its rectangle.
+        gGuestX11PatchNeedsFullUpload = true;
     }
     gGuestX11PatchView.hidden = YES;
 }

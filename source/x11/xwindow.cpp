@@ -323,8 +323,70 @@ int XWindow::setAttributes(const DisplayDataPtr& data, XSetWindowAttributes* att
 	if (valueMask & CWColormap) {
 		colorMap = XServer::getServer()->getColorMap(attributes->colormap);
 	}
+	if (valueMask & CWBackPixel) {
+		hasBackgroundPixel = true;
+	}
 	this->attributes.copyWithMask(attributes, valueMask);
 	return Success;
+}
+
+// Wine's own default for COLOR_BACKGROUND, the colour its desktop window
+// class paints with (dlls/win32u/class.c gives the desktop class the
+// COLOR_BACKGROUND + 1 brush, and dlls/win32u/sysparams.c defines that colour
+// as RGB(58, 110, 165)). wine.inf writes no Control Panel\Colors values at
+// all, so this compiled-in colour is what a prefix uses and no registry seed
+// can change what a background-less window shows.
+#define X11_ROOT_BACKGROUND_PIXEL 0x003A6EA5
+
+U32 XWindow::backgroundFillPixel() {
+	if (hasBackgroundPixel) {
+		return attributes.background_pixel;
+	}
+	if (!parent) {
+		return X11_ROOT_BACKGROUND_PIXEL;
+	}
+	// Only a window sitting directly on the root inherits. A nested child
+	// that paints nothing is a client-area defect of its own program and
+	// keeping it black leaves that visible rather than tinting it.
+	if (!parent->parent) {
+		return parent->backgroundFillPixel();
+	}
+	return 0;
+}
+
+void XWindow::fillWithBackground() {
+	if (backgroundFilled || c_class != InputOutput) {
+		return;
+	}
+	backgroundFilled = true;
+	const U32 pixel = backgroundFillPixel();
+	if (!pixel) {
+		return;
+	}
+	lockData();
+	const bool filled = data && visual && visual->bits_per_rgb == 32;
+	if (filled) {
+		for (U32 y = 0; y < height(); y++) {
+			U32* line = (U32*)(data + (U64)bytes_per_line * y);
+			for (U32 x = 0; x < width(); x++) {
+				line[x] = pixel;
+			}
+		}
+	}
+	unlockData();
+	if (!filled) {
+		return;
+	}
+	setDirty();
+
+	static U32 reported = 0;
+	if (reported < 4) {
+		reported++;
+		klog_fmt("BOXEDWINE_X11_WINDOW_BACKGROUND window=0x%x parent=0x%x "
+			"pixel=0x%06x size=%dx%d declared=%d",
+			id, parent ? parent->id : 0, pixel, (int)width(), (int)height(),
+			hasBackgroundPixel ? 1 : 0);
+	}
 }
 
 void XWindow::iterateAllMappedDescendants(std::function<void(const XWindowPtr& child)> callback) {
@@ -741,10 +803,14 @@ int XWindow::mapWindow() {
 	if (attributes.backing_store != NotUseful) {
 		kwarn("XWindow::mapWindow backing_store was expected to be NotUseful");
 	}
+	// The background belongs to the map, before the Expose that tells the
+	// client to draw over it: by then the attributes XCreateWindow carried are
+	// settled, which they are not yet when the window is constructed.
+	fillWithBackground();
 	if (c_class == InputOutput) {
 		XServer::getServer()->iterateEventMask(id, ExposureMask, [this](const DisplayDataPtr& data) {
 			exposeNofity(data, 0, 0, width(), height(), 0);
-			});		
+			});
 	}
 	if (isThisAndAncestorsMapped()) {
 		KNativeSystem::showWindow(shared_from_this(), isThisAndAncestorsMapped());
@@ -984,7 +1050,14 @@ void XWindow::draw() {
 		}
 	}
 #endif
-	KNativeSystem::getScreen()->putBitsOnWnd(id, data, visual?visual->bits_per_rgb:32, bytes_per_line, screenX, screenY, width(), height(), palette, isDirty);
+	// XServer::draw presents every mapped window on a pass that any one window
+	// made dirty, and the native side only copies this buffer into its texture
+	// when it is told the window changed. The very first present of a window
+	// therefore has to claim the change whether or not the client has drawn
+	// yet, or the window shows an uninitialised texture until it next changes.
+	const bool needsFirstUpload = !hasBeenPresented;
+	hasBeenPresented = true;
+	KNativeSystem::getScreen()->putBitsOnWnd(id, data, visual?visual->bits_per_rgb:32, bytes_per_line, screenX, screenY, width(), height(), palette, isDirty || needsFirstUpload);
 	dirtyBoundsValid = false;
 	unlockData();
 	isDirty = false;
@@ -1083,6 +1156,11 @@ int XWindow::moveResize(S32 x, S32 y, U32 width, U32 height) {
 	}
 	if (width != this->width() || height != this->height()) {
 		setSize(width, height);
+		// setSize hands back a new zero-filled backing store, so a window that
+		// was showing its background is showing black again until the client
+		// repaints. Wine resizes its desktop window right after creating it.
+		backgroundFilled = false;
+		fillWithBackground();
 	}
 
 	KNativeSystem::moveWindow(shared_from_this());
@@ -1133,6 +1211,8 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 	if (sizeChanged) {
 		if (width != this->width() || height != this->height()) {
 			setSize(width, height);
+			backgroundFilled = false;
+			fillWithBackground();
 		}
 		KNativeSystem::moveWindow(shared_from_this());
 	}
