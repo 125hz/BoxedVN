@@ -194,6 +194,19 @@ static const CGFloat kBVNMenuButtonSize = 46.0;
 static const CGFloat kBVNMenuRowHeight = 46.0;
 static const CGFloat kBVNMenuWidth = 268.0;
 static const CGFloat kBVNKeyGap = 4.0;
+// A row below this is not a key any more, it is a target a fingertip misses;
+// above the upper bound the six rows start eating a landscape screen.
+static const CGFloat kBVNKeyRowMinimumHeight = 28.0;
+static const CGFloat kBVNKeyRowMaximumHeight = 46.0;
+// What a container has to measure before the keyboard is drawn *inside* it
+// rather than as a sheet over the page. Six rows at the minimum row height
+// plus the gaps come to just under 200pt, so a container has to be well past
+// that or the keyboard is the whole of it and the guest picture is gone. The
+// live view's portrait host on a phone is about 350x260pt and fails this; the
+// rotated full-screen landscape host (~390pt tall) and an iPad's live view
+// pass it.
+static const CGFloat kBVNKeyboardInlineMinimumHeight = 320.0;
+static const CGFloat kBVNKeyboardInlineMinimumWidth = 340.0;
 // Slightly faster than 1:1 so a small finger movement crosses a Wine dialog,
 // but not so fast that a title-bar button is unhittable - which is the whole
 // reason trackpad mode exists.
@@ -339,6 +352,14 @@ static NSString* const kBVNPerformanceBatteryKey =
 // key is held down with no way to release it.
 - (void)releaseHeldKeys;
 - (void)cancelTrackpadGesture;
+
+// The on-screen keyboard. -setKeyboardVisible: is the one place its state
+// changes: it moves the panel to whichever container can show it, publishes
+// gLiveKeyboardVisible and writes the witness.
+- (void)setKeyboardVisible:(BOOL)visible;
+- (void)updateKeyboardPlacement;
+- (void)dismissKeyboardForTeardown;
+- (void)reportKeyboardVisibility;
 
 @end
 
@@ -2268,10 +2289,89 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.menuPanel.frame = CGRectMake(x, y, width, cursor);
 }
 
+// Where the on-screen keyboard belongs.
+//
+// Inside the overlay whenever the overlay is big enough to carry it: the
+// full-screen session, the rotated landscape live-view host, an iPad's live
+// view. The live view's portrait host on a phone is not - it is about
+// 350x260pt, and six tappable rows are 200 of those points, so the keyboard
+// there would *be* the live view. In that case the panel is anchored to the
+// library window instead and comes up as a bottom sheet over the page, at the
+// full width of the screen and covering none of the guest picture.
+//
+// It is the same panel, the same buttons and the same key routing either way;
+// only the parent differs, and -layoutKeyboardPanelWithSafeArea: lays it out
+// in whichever parent it currently has.
+- (UIView*)keyboardContainer {
+    const CGSize size = self.bounds.size;
+    if (size.width <= 0.0 || size.height <= 0.0) {
+        // No geometry yet - the overlay has been created but its constraints
+        // have not resolved. Nothing to decide on, and moving the panel now
+        // would only be undone by the first real layout pass.
+        UIView* current = self.keyboardPanel.superview;
+        if (current != nil) {
+            return current;
+        }
+        return self;
+    }
+    if (size.height >= kBVNKeyboardInlineMinimumHeight &&
+        size.width >= kBVNKeyboardInlineMinimumWidth) {
+        return self;
+    }
+    // The host's window, not the overlay's: they are the same library window
+    // today, but the host is what the page registered and is the thing that
+    // is guaranteed to be in the window hierarchy.
+    UIView* host = BVNGuestPresentationHostView();
+    UIWindow* window = host.window;
+    if (window == nil) {
+        window = self.window;
+    }
+    if (window != nil) {
+        return window;
+    }
+    // Not in a window yet - during construction, or after the overlay has
+    // been detached. Keep it where it was built.
+    return self;
+}
+
+- (void)updateKeyboardPlacement {
+    if (self.keyboardPanel == nil) {
+        return;
+    }
+    UIView* container = [self keyboardContainer];
+    if (container == nil) {
+        container = self;
+    }
+    if (self.keyboardPanel.superview != container) {
+        [self.keyboardPanel removeFromSuperview];
+        [container addSubview:self.keyboardPanel];
+    }
+    // A sheet has to stay above the page, and above the rotated full-screen
+    // host if one is still parked on the same window. Only when it is not
+    // already there: this runs from every layout pass, and an unconditional
+    // reorder dirties the window's layout on each one.
+    if (container != self && !self.keyboardPanel.hidden &&
+        container.subviews.lastObject != self.keyboardPanel) {
+        [container bringSubviewToFront:self.keyboardPanel];
+    }
+}
+
 - (void)layoutKeyboardPanelWithSafeArea:(UIEdgeInsets)safe {
-    const CGFloat width = self.bounds.size.width;
+    [self updateKeyboardPlacement];
+    UIView* container = self.keyboardPanel.superview;
     const NSUInteger rowCount = self.keyRows.count;
-    if (rowCount == 0 || width <= 0.0) {
+    if (container == nil || rowCount == 0) {
+        return;
+    }
+    // As a sheet the panel is laid out in the window's coordinates and against
+    // the window's safe area. The overlay's own insets are all zero there - it
+    // is a small view in the middle of a page - so using them would put the
+    // bottom row under the home indicator.
+    const BOOL sheet = container != self;
+    const CGRect area = container.bounds;
+    const UIEdgeInsets insets = sheet ? container.safeAreaInsets : safe;
+    const CGFloat width = area.size.width;
+    if (width <= 0.0) {
         return;
     }
 
@@ -2279,19 +2379,25 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     // whole screen - at this fraction they take about 63% of it, and the
     // keyboard is summoned deliberately and dismissed again - while still
     // being tappable on a 402pt-wide portrait one, where the clamp takes over.
-    const CGFloat usableHeight = self.bounds.size.height - safe.top;
+    const CGFloat usableHeight = area.size.height - insets.top;
     CGFloat rowHeight = floor(usableHeight * 0.085);
-    rowHeight = MAX(28.0, MIN(46.0, rowHeight));
+    rowHeight = MAX(kBVNKeyRowMinimumHeight,
+                    MIN(kBVNKeyRowMaximumHeight, rowHeight));
 
     const CGFloat contentHeight =
         rowCount * rowHeight + (rowCount - 1) * kBVNKeyGap;
-    const CGFloat panelHeight = contentHeight + kBVNKeyGap * 2.0 + safe.bottom;
+    const CGFloat panelHeight = contentHeight + kBVNKeyGap * 2.0 + insets.bottom;
     self.keyboardPanel.frame = CGRectMake(0.0,
-                                          self.bounds.size.height - panelHeight,
+                                          area.size.height - panelHeight,
                                           width, panelHeight);
+    // Rounded at the top only when it is a sheet, so it reads as something
+    // that came up over the page rather than as a slab of the page itself.
+    self.keyboardPanel.layer.cornerRadius = sheet ? 16.0 : 0.0;
+    self.keyboardPanel.layer.maskedCorners =
+        kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
 
-    const CGFloat left = safe.left + kBVNKeyGap;
-    const CGFloat right = width - safe.right - kBVNKeyGap;
+    const CGFloat left = insets.left + kBVNKeyGap;
+    const CGFloat right = width - insets.right - kBVNKeyGap;
     CGFloat rowY = kBVNKeyGap;
     for (NSArray<BVNOverlayKey*>* row in self.keyRows) {
         CGFloat totalWeight = 0.0;
@@ -2614,15 +2720,69 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
 }
 
 - (void)toggleKeyboard {
-    const BOOL show = self.keyboardPanel.hidden;
-    if (!show) {
+    [self setKeyboardVisible:self.keyboardPanel.hidden];
+    [self closeMenu];
+}
+
+// The single place the keyboard's visibility changes, whichever control asked
+// for it: the in-guest menu row, the keyboard's own "close" key, or the live
+// view's control bar through BVNGuestOverlayToggleKeyboard.
+- (void)setKeyboardVisible:(BOOL)visible {
+    if (!visible) {
+        // A latched Ctrl must not survive the keyboard that latched it.
         [self releaseHeldKeys];
     }
-    self.keyboardPanel.hidden = !show;
-    [self closeMenu];
-    BVNLogWrite(BVNLogLevelInfo, "input",
-                show ? "Guest overlay keyboard shown."
-                     : "Guest overlay keyboard hidden.");
+    [self updateKeyboardPlacement];
+    self.keyboardPanel.hidden = !visible;
+    if (visible) {
+        [self.keyboardPanel.superview bringSubviewToFront:self.keyboardPanel];
+    }
+    // The panel is framed by -layoutSubviews wherever it lives, so a sheet
+    // that has just been parented to the window still needs this pass before
+    // it can be seen; without it the first toggle shows a zero-sized view.
+    [self setNeedsLayout];
+    [self layoutIfNeeded];
+    gLiveKeyboardVisible.store(visible ? true : false,
+                               std::memory_order_relaxed);
+    [self reportKeyboardVisibility];
+}
+
+// Called when the overlay itself is going away. Hiding is not enough: a sheet
+// lives on the library window, which outlives both the overlay and the guest,
+// and an abandoned one would sit over the page for the rest of the app's life.
+- (void)dismissKeyboardForTeardown {
+    [self releaseHeldKeys];
+    self.keyboardPanel.hidden = YES;
+    if (self.keyboardPanel.superview != self) {
+        [self.keyboardPanel removeFromSuperview];
+        [self addSubview:self.keyboardPanel];
+    }
+    gLiveKeyboardVisible.store(false, std::memory_order_relaxed);
+    [self reportKeyboardVisibility];
+}
+
+// One line per change, budgeted: which container the keyboard went into and
+// the rectangle it occupies there. A toggle that changes nothing visible is
+// then a line with an empty or off-screen frame rather than a silence.
+- (void)reportKeyboardVisibility {
+    static int budget = 32;
+    if (budget <= 0) {
+        return;
+    }
+    --budget;
+    UIView* container = self.keyboardPanel.superview;
+    const CGRect frame = self.keyboardPanel.frame;
+    NSString* host = container == nil
+        ? @"none"
+        : container == self
+            ? @"overlay"
+            : [container isKindOfClass:UIWindow.class] ? @"window" : @"other";
+    NSString* line = [NSString stringWithFormat:
+        @"BOXEDVN_GUEST_KEYBOARD visible=%d host=%@ frame=%.0f,%.0f,%.0fx%.0f",
+        self.keyboardPanel.hidden ? 0 : 1, host,
+        frame.origin.x, frame.origin.y,
+        frame.size.width, frame.size.height];
+    BVNLogWrite(BVNLogLevelInfo, "input", line.UTF8String);
 }
 
 - (void)togglePointerMode {
@@ -2805,6 +2965,10 @@ extern "C" void BVNGuestOverlayInstall(void) {
     }
     if (gOverlay.superview == container) {
         [container bringSubviewToFront:gOverlay];
+        // The container can be the same object and still have changed size -
+        // a rotation of the page, say - which is what decides whether the
+        // keyboard belongs inside the overlay or over the page.
+        [gOverlay updateKeyboardPlacement];
         return;
     }
     if (gOverlay.superview != nil) {
@@ -2916,6 +3080,15 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
     if (parent != nil && parent.subviews.lastObject != gOverlay) {
         [parent bringSubviewToFront:gOverlay];
     }
+    // A keyboard sheet lives on the library window, outside the overlay's
+    // subtree, so being on top has to be re-asserted for it separately -
+    // anything the page presents lands on the same window.
+    UIView* keyboardParent = gOverlay.keyboardPanel.superview;
+    if (!gOverlay.keyboardPanel.hidden && keyboardParent != nil &&
+        keyboardParent != gOverlay &&
+        keyboardParent.subviews.lastObject != gOverlay.keyboardPanel) {
+        [keyboardParent bringSubviewToFront:gOverlay.keyboardPanel];
+    }
 }
 
 extern "C" uint64_t mythic_get_present_count(void) __attribute__((weak));
@@ -3010,8 +3183,12 @@ extern "C" void BVNGuestOverlayGeometryDidChange(void) {
     const CGPoint menuFraction = oldOverlay.menuButtonFraction;
     const CGPoint performanceFraction = oldOverlay.performanceFraction;
     const BOOL startupVisible = !oldOverlay.startupNotice.hidden;
+    const BOOL keyboardVisible = !oldOverlay.keyboardPanel.hidden;
     [oldOverlay.performanceTimer invalidate];
     oldOverlay.performanceTimer = nil;
+    // Takes the keyboard off the library window if it was a sheet there; the
+    // rebuilt overlay puts its own back up below.
+    [oldOverlay dismissKeyboardForTeardown];
     [oldOverlay releaseHeldKeys];
     [oldOverlay removeFromSuperview];
     gOverlay = nil;
@@ -3026,6 +3203,12 @@ extern "C" void BVNGuestOverlayGeometryDidChange(void) {
             [gOverlay refreshStartupActivity];
         }
         [gOverlay setNeedsLayout];
+        // A rotation is exactly when the keyboard is most likely to change
+        // container, so it is re-shown through the same path a button press
+        // takes rather than by restoring the old frame.
+        if (keyboardVisible) {
+            [gOverlay setKeyboardVisible:YES];
+        }
     }
     BVNLogWrite(BVNLogLevelInfo, "input",
                 "Rebuilt guest overlay after geometry change; the new scene "
@@ -3045,8 +3228,36 @@ extern "C" void BVNGuestOverlayRemove(void) {
     }
     [gOverlay.performanceTimer invalidate];
     gOverlay.performanceTimer = nil;
+    [gOverlay dismissKeyboardForTeardown];
     [gOverlay releaseHeldKeys];
     [gOverlay removeFromSuperview];
     gOverlay = nil;
     BVNLogWrite(BVNLogLevelInfo, "frontend", "Guest overlay removed.");
+}
+
+// ---------------------------------------------------------------------------
+// The live view's keyboard button
+//
+// The control bar drives the overlay's own drawn keyboard, not SDL's system
+// one: see BVNGuestControlsToggleKeyboard in BVNAppDelegate.mm for why the
+// system keyboard cannot appear while the guest is hosted in the page.
+//
+// Returns false when there is no overlay to show, which is the same thing as
+// "no guest is running"; the caller then has nothing to toggle.
+// ---------------------------------------------------------------------------
+
+extern "C" bool BVNGuestOverlayToggleKeyboard(void) {
+    if (!NSThread.isMainThread || gOverlay == nil) {
+        return false;
+    }
+    [gOverlay setKeyboardVisible:gOverlay.keyboardPanel.hidden];
+    [gOverlay closeMenu];
+    return true;
+}
+
+extern "C" void BVNGuestOverlayDismissKeyboard(void) {
+    if (!NSThread.isMainThread || gOverlay == nil) {
+        return;
+    }
+    [gOverlay dismissKeyboardForTeardown];
 }

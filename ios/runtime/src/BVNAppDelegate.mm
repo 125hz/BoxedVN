@@ -170,6 +170,12 @@ static __weak UIView* gActivePresentationHost = nil;
 static UIView* gFullscreenPresentationHost = nil;
 extern std::atomic<bool> gLiveKeyboardVisible;
 extern "C" void BVNGuestOverlayInstall(void);
+// The overlay's own drawn keyboard, which is the one the live view's control
+// bar drives. Declared here rather than in BVNGuestOverlay.h for the same
+// reason BVNGuestOverlayInstall is: this file is the runtime's UIKit side and
+// the overlay header is private to the overlay's own callers.
+extern "C" bool BVNGuestOverlayToggleKeyboard(void);
+extern "C" void BVNGuestOverlayDismissKeyboard(void);
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanWaitingOverlays = nil;
 
 // Defined at the bottom of this file, alongside the presentation geometry it
@@ -315,6 +321,9 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
 
 - (void)detachGuestPresentationFromHost {
     NSAssert(NSThread.isMainThread, @"Guest presentation moves on main");
+    // The keyboard may be a sheet on the library window, which is not going
+    // anywhere; take it down with the presentation that summoned it.
+    BVNGuestOverlayDismissKeyboard();
     gActivePresentationHost = nil;
     [gFullscreenPresentationHost removeFromSuperview];
     gFullscreenPresentationHost = nil;
@@ -710,6 +719,9 @@ static UIDeviceOrientation gFullscreenOrientation = UIDeviceOrientationUnknown;
 
 - (void)finishGuestPresentation {
     NSAssert(NSThread.isMainThread, @"Guest presentation must finish on main");
+    // BVNGuestOverlayRemove has usually taken the keyboard down already; this
+    // covers the paths that end a session without removing the overlay first.
+    BVNGuestOverlayDismissKeyboard();
     self.guestOrientationLocked = NO;
     // A session that ended while the guest owned the whole screen has to give
     // it back here: the black full-screen host outlives SDL's window, and
@@ -1127,6 +1139,31 @@ extern "C" void BVNGuestControlsToggleKeyboard(void) {
         });
         return;
     }
+    // The overlay's keyboard, not SDL's system one.
+    //
+    // -setGuestKeyboardVisible: makes SDL's hidden UITextField first
+    // responder inside SDL's own UIWindow, and that window is exactly what
+    // the live view takes away: -attachGuestPresentationToHost: leaves it at
+    // alpha 0, non-interactive, one level below the library window, which is
+    // the window it makes key. iOS presents the software keyboard for the
+    // first responder of the KEY window, so the field took first-responder
+    // status and no keyboard scene was ever created - the 00:35 device log
+    // says so in one line, "SDL keyboard show: keyWindow=no ...
+    // firstResponder=yes", with no UIKeyboardDidShow after it. Making SDL's
+    // window key instead would hand the screen back to a full-screen window
+    // the live view has deliberately emptied, which is what the
+    // gGuestPresentationHost gate around -setGuestKeyboardVisible:'s
+    // makeKeyAndVisible exists to prevent.
+    //
+    // The overlay's own drawn keyboard has none of that problem: it lives in
+    // the same host as the guest picture, or comes up as a sheet on the
+    // library window when the host is too small to carry it, and its keys go
+    // through the unchanged ScancodeForName/SendKey path.
+    if (BVNGuestOverlayToggleKeyboard()) {
+        return;
+    }
+    // No overlay means no guest session. Fall back to SDL's keyboard so the
+    // old full-screen path keeps whatever behaviour it had.
     const bool wasVisible = gLiveKeyboardVisible.load(std::memory_order_relaxed);
     const bool nowVisible = !wasVisible;
     if ([gAppDelegate setGuestKeyboardVisible:nowVisible ? YES : NO] == YES) {
