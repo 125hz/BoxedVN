@@ -2479,9 +2479,12 @@ static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
 
 // Futex with real per-address waiter bookkeeping.
 //
-// We still cannot truly block (no KThread64 yet), so WAIT returns -EAGAIN
-// even when the word matches. But we DO count would-block events per
-// address in cpu->futexWaiters, and WAKE drains up to `val` of them and
+// A futex on a scheduled thread is handled by KThread::futex64, which parks
+// and wakes for real; everything from here down is the THREADLESS fallback
+// (--x64-run-elf and the selftests), where nothing can block, so WAIT returns
+// -EAGAIN even when the word matches. That fallback DOES count would-block
+// events per address in cpu->futexWaiters, and WAKE drains up to `val` of
+// them and
 // returns the count actually drained — matching the kernel's "number
 // woken" semantics. The difference from the old stub:
 //

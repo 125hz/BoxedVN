@@ -124,7 +124,7 @@ class ProbeMarkers(unittest.TestCase):
 
 
 class CubeGeometryAndShaders(unittest.TestCase):
-    """The probe draws a cube through embedded DXBC.
+    """The probe draws DXMT's own cube test through embedded DXBC.
 
     The first device runs only cleared the render target, which proved
     presentation and nothing about shaders: a clear is a render pass load
@@ -132,6 +132,11 @@ class CubeGeometryAndShaders(unittest.TestCase):
     an input layout, three buffers, a viewport, and an indexed draw. The DXBC
     is compiled ahead of time with fxc, which exists only in the Windows SDK,
     so the generated header is committed and pinned to the HLSL it came from.
+
+    The renderer is no longer this repository's own: it is a port of DXMT's
+    tests/dx11/dx11_cube.cpp, the demo the sibling iOS Wine/FEX/DXMT project
+    builds and runs on device, so that a difference between the two projects
+    is a difference in the stack and not in the program.
     """
 
     def setUp(self) -> None:
@@ -141,15 +146,69 @@ class CubeGeometryAndShaders(unittest.TestCase):
     def test_the_probe_draws_an_indexed_cube_every_frame(self) -> None:
         loop_at = self.source.find('stage_begin("present")')
         loop = self.source[loop_at:]
-        for call in ("ID3D11DeviceContext_UpdateSubresource(",
+        # The constant buffer is DYNAMIC and written through Map/Unmap, which
+        # is what the ported demo does -- and which also removes the
+        # UpdateSubresource call site a device run faulted on.
+        for call in ("ID3D11DeviceContext_Map(",
+                     "ID3D11DeviceContext_Unmap(",
                      "ID3D11DeviceContext_ClearRenderTargetView(",
                      "ID3D11DeviceContext_DrawIndexed(",
                      "IDXGISwapChain_Present("):
             self.assertIn(call, loop)
+        self.assertIn("D3D11_MAP_WRITE_DISCARD", loop)
+        self.assertNotIn("ID3D11DeviceContext_UpdateSubresource(", loop)
         # The clear precedes the draw, the draw precedes the present.
         self.assertLess(loop.find("ClearRenderTargetView"),
                         loop.find("DrawIndexed"))
         self.assertLess(loop.find("DrawIndexed"), loop.find("_Present("))
+
+    def test_the_spin_comes_from_the_clock_not_the_frame_counter(self) -> None:
+        # With the host frame limiter unlocked the guest presents as fast as
+        # it can; an angle taken from the frame number made the cube a blur at
+        # a few thousand frames a second and crawl at 30.
+        self.assertIn("QueryPerformanceFrequency(", self.source)
+        self.assertIn("QueryPerformanceCounter(", self.source)
+        self.assertIn("cube_transform(double seconds)", self.source)
+        self.assertIn("mvp = cube_transform(seconds);", self.source)
+        self.assertNotIn("cube_transform(frames)", self.source)
+        # Nothing else in the frame may key off the frame counter either.
+        loop = self.source[self.source.find('stage_begin("present")'):]
+        self.assertNotIn("frames %", loop)
+
+    def test_the_port_records_where_it_came_from(self) -> None:
+        # Licence discipline: the MIT notice travels with the ported code and
+        # the exact commit is named, so the port can be diffed against it.
+        hlsl = SHADER_HLSL.read_text(encoding="utf-8")
+        commit = "b4b89f0a5a1752da3982a7b6c5575506024bf253"
+        for text in (self.source, hlsl):
+            self.assertIn("MIT License", text)
+            self.assertIn("Copyright (c) 2023 Feifan He", text)
+            self.assertIn(commit, text)
+            self.assertIn("tests/dx11", text)
+
+    def test_the_depth_buffer_is_best_effort(self) -> None:
+        # The demo draws with a depth buffer, but the cube is convex and back
+        # faces are culled, so a depth buffer this stack cannot build must not
+        # end a run that could still say something about the draw.
+        self.assertIn("DXGI_FORMAT_D24_UNORM_S8_UINT", self.source)
+        self.assertIn("ID3D11Device_CreateDepthStencilView(", self.source)
+        self.assertIn('stage_fail("render-target-depth"', self.source)
+        self.assertIn("if (depth_view != NULL) {", self.source)
+        # ...and the failure is not fatal: no exit code is returned from it.
+        depth_at = self.source.find('stage_fail("render-target-depth"')
+        tail = self.source[depth_at:depth_at + 400]
+        self.assertNotIn("return BOXEDVN_EXIT_", tail)
+
+    def test_the_demo_rasterizer_and_depth_state_are_bound(self) -> None:
+        self.assertIn("rasterizer_desc.FrontCounterClockwise = TRUE;",
+                      self.source)
+        self.assertIn("rasterizer_desc.CullMode = D3D11_CULL_BACK;",
+                      self.source)
+        self.assertIn("depth_stencil_desc.DepthFunc = D3D11_COMPARISON_LESS;",
+                      self.source)
+        self.assertIn("ID3D11DeviceContext_RSSetState(", self.source)
+        self.assertIn("ID3D11DeviceContext_OMSetDepthStencilState(",
+                      self.source)
 
     def test_the_loop_runs_until_the_window_closes_without_vsync(self) -> None:
         # A 240-frame cut-off froze the picture on device after four seconds
@@ -176,12 +235,13 @@ class CubeGeometryAndShaders(unittest.TestCase):
             self.assertIn(f"stage={step}", self.source,
                           f"a failed {step} would not be named")
 
-    def test_the_cube_is_wound_clockwise_from_outside(self) -> None:
-        # Direct3D's default rasterizer culls counter-clockwise triangles in
-        # its left-handed convention. Without a depth buffer the cube only
-        # renders correctly if every triangle is clockwise seen from outside,
-        # which for these coordinates means the right-hand-rule normal points
-        # away from the centre.
+    def test_the_cube_is_wound_counter_clockwise_from_outside(self) -> None:
+        # The ported demo asks the rasterizer to treat COUNTER-clockwise
+        # triangles as front faces and culls the rest, so every triangle has
+        # to be counter-clockwise seen from outside -- which for these
+        # coordinates means the right-hand-rule normal points away from the
+        # centre. A triangle wound the other way disappears, and with the
+        # depth buffer best-effort the hole would look like a draw defect.
         vertex_block = re.search(r"kCubeVertices\[8\] = \{(.*?)\};",
                                  self.source, re.S).group(1)
         vertices = [tuple(float(v) for v in m)
@@ -204,14 +264,20 @@ class CubeGeometryAndShaders(unittest.TestCase):
                                f"triangle {indices[t:t + 3]} faces inward")
 
     def test_the_matrix_layout_matches_the_hlsl(self) -> None:
-        # The C side uploads a row-major array applied as M * v; the HLSL
-        # declares the matrix row_major and multiplies mul(mvp, v). Either
-        # side changing alone would silently render nothing recognisable.
+        # Both sides are the demo's: the C array stores column j at m[j][*],
+        # which is one constant register per column, and the HLSL leaves the
+        # matrix at its default (column-major) packing and multiplies
+        # mul(v, M) with v a row vector. Either side changing alone would
+        # silently render nothing recognisable.
         hlsl = SHADER_HLSL.read_text(encoding="utf-8")
-        self.assertIn("row_major float4x4 mvp", hlsl)
-        self.assertIn("mul(mvp, float4(input.position, 1.0))", hlsl)
+        self.assertNotIn("row_major", hlsl)
+        self.assertIn("mul(float4(input.pos, 1.0f), modelViewProj)", hlsl)
+        self.assertIn("float3 pos : POS;", hlsl)
         self.assertIn("m[4][4]", self.source)
-        self.assertIn("r.m[0][3] = x;", self.source)
+        self.assertIn('layout[0].SemanticName = "POS";', self.source)
+        # The translation lives in the last row, which in this layout is the
+        # fourth component of each of the first three columns.
+        self.assertIn("{1.0f, 0.0f, 0.0f, x},", self.source)
 
     def test_the_embedded_dxbc_is_pinned_to_the_hlsl(self) -> None:
         import hashlib

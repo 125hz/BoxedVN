@@ -155,6 +155,44 @@ warning when used.
 
 ---
 
+## Ported source: DXMT's Direct3D 11 cube test
+
+The x86-64 Direct3D 11 acceptance probe staged as
+`boxedvn-d3d11-cube-x64.exe` renders **DXMT's own `dx11_cube` test**, ported
+into this repository's instrumentation. It is the same demo the sibling iOS
+Wine/FEX/DXMT project (Madeira) builds and runs on device, so a difference
+between the two projects is a difference in the stack rather than in the
+program.
+
+| | |
+|---|---|
+| Upstream | https://github.com/willfaust/dxmt (fork of https://github.com/3Shain/dxmt) |
+| Commit | `b4b89f0a5a1752da3982a7b6c5575506024bf253` (branch `ios-port`) |
+| Files ported | `tests/dx11/dx11_cube.cpp`, `tests/dx11/3DMaths.h`, `tests/dx11/shader_cube.hlsl` |
+| Ported into | `scripts/guest-probes/x64-d3d11-cube.c`, `scripts/guest-probes/x64-d3d11-cube.hlsl` |
+| Consumer that pins it | https://github.com/willfaust/Madeira `build/dxmt-tests/build-x64.sh` |
+| Licence | MIT, Copyright © 2023 Feifan He |
+| In the iOS build | **yes** — as the staged guest probe executable |
+
+The MIT notice is reproduced in full beside the ported code in both files.
+DXMT's cube test in turn follows Kevin Moran's *BeginnerDirect3D11* tutorial
+series ("08. Drawing a Cube"), which is where the matrix helpers and the
+camera come from.
+
+Ported, not copied verbatim: the C++ was rewritten in C11 with the same
+values and the same arithmetic; the demo's `WinMain` shell, keyboard camera,
+mouse trace, bitmap-font overlay and `D3DCompileFromFile` call were not
+carried over (the shaders are compiled ahead of time with `fxc` and embedded,
+which is what Madeira's own `test_shim.h` arranges differently for the same
+reason).
+
+The DXMT Direct3D 11 / DXGI PE modules and the native Metal backend staged
+beside the probe come from the same MIT-licensed project and are built from
+source by `scripts/build-dxmt-x64-pe.sh` and
+`scripts/build-dxmt-ios-native.sh`.
+
+---
+
 ## Not used
 
 For the avoidance of doubt, BoxedVN contains no code from, and no dependency

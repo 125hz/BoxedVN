@@ -348,7 +348,13 @@ public:
     U32 expectedValue = 0;
     U32 operation = 0;
     U32 waitStartedAt = 0;
-    U32 expireTimeInMillies = 0;    
+    U32 expireTimeInMillies = 0;
+    // Whether expireTimeInMillies means anything. A wait with no timeout used
+    // to be encoded as the 0xFFFFFFFF sentinel and recognised by comparing it
+    // against 0x7FFFFFFF, which conflates "no deadline" with "a deadline far
+    // enough away" -- and a real deadline computed past that threshold would
+    // silently become infinite. The flag says which of the two it is.
+    bool hasDeadline = false;
     bool wake = false;
     bool waiting = false;
 
@@ -371,7 +377,7 @@ public:
 
 static void initFutex(struct futex* f, KThread* thread, U64 address,
                       U32 guestAddress, U32 expectedValue, U32 operation,
-                      U32 millies) {
+                      U32 millies, bool hasDeadline) {
     f->thread = thread;
     f->address = address;
     f->guestAddress = guestAddress;
@@ -379,6 +385,7 @@ static void initFutex(struct futex* f, KThread* thread, U64 address,
     f->operation = operation;
     f->waitStartedAt = KSystem::getMilliesSinceStart();
     f->expireTimeInMillies = millies;
+    f->hasDeadline = hasDeadline;
     f->wake = false;
     f->mask = 0;
     f->waiting = false;
@@ -398,7 +405,8 @@ struct futex* getFutex(KThread* thread, U64 address) {
 }
 
 struct futex* allocFutex(KThread* thread, U64 address, U32 guestAddress,
-                         U32 expectedValue, U32 operation, U32 millies) {
+                         U32 expectedValue, U32 operation, U32 millies,
+                         bool hasDeadline) {
     SystemFutexesLock futexesLock;
 
     for (auto& entry : systemFutexes) {
@@ -408,7 +416,7 @@ struct futex* allocFutex(KThread* thread, U64 address, U32 guestAddress,
             continue;
         }
         initFutex(f, thread, address, guestAddress, expectedValue, operation,
-                  millies);
+                  millies, hasDeadline);
         return f;
     }
 
@@ -418,7 +426,7 @@ struct futex* allocFutex(KThread* thread, U64 address, U32 guestAddress,
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(f->cond);
         initFutex(f, thread, address, guestAddress, expectedValue, operation,
-                  millies);
+                  millies, hasDeadline);
     }
     return f;
 }
@@ -430,6 +438,11 @@ void freeFutex(struct futex* f) {
     f->expectedValue = 0;
     f->operation = 0;
     f->waitStartedAt = 0;
+    // A released entry is no longer a waiter: leaving `waiting` set would let
+    // a WAKE hand its wakeup to a slot nobody is parked on, and the entry is
+    // reused by allocFutex, which does reset the rest.
+    f->waiting = false;
+    f->hasDeadline = false;
 }
 
 void KThread::logFutexSnapshot() {
@@ -445,12 +458,13 @@ void KThread::logFutexSnapshot() {
         ++active;
         klog_fmt("  futex pid=%04X tid=%04X guest=%08X host=%llX "
                  "op=%u expected=%08X waiting=%u wake=%u mask=%08X "
-                 "age=%ums expires=%08X",
+                 "age=%ums deadline=%s expires=%08X",
                  f->thread->process ? f->thread->process->id : 0,
                  f->thread->id, f->guestAddress,
                  (unsigned long long)f->address, f->operation,
                  f->expectedValue, f->waiting ? 1 : 0, f->wake ? 1 : 0,
                  f->mask, now - f->waitStartedAt,
+                 f->hasDeadline ? "yes" : "none",
                  f->expireTimeInMillies);
     }
     klog_fmt("Guest futex snapshot complete: %u active waiter(s)", active);
@@ -491,6 +505,7 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
         //klog_fmt("%x/%x futux WAIT addr=%x op=%x val=%x ram=%x", id, process->id, addr, op, value, (U32)ramAddress);
         struct futex* f;
         U32 expireTime = 0xFFFFFFFF;
+        const bool hasDeadline = (pTime != 0);
 
         if (pTime != 0) {
             if (time64) {
@@ -519,8 +534,9 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
 
         f = getFutex(this, ramAddress);
 
-        if (!f) {            
-            f = allocFutex(this, ramAddress, addr, value, cmd, expireTime);
+        if (!f) {
+            f = allocFutex(this, ramAddress, addr, value, cmd, expireTime,
+                           hasDeadline);
             if (cmd == FUTEX_WAIT_BITSET) {
                 f->mask = val3;
             }
@@ -536,7 +552,9 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
         if (currentValue != value) {
             //klog_fmt("   %x/%x futux addr=%x op=%x val=%x ram=%x NEW VALUE 2nd try %x", id, process->id, addr, op, value, (U32)ramAddress, currentValue);
             freeFutex(f);
-            return -K_EWOULDBLOCK;
+            // Linux returns -EAGAIN (== -EWOULDBLOCK) for a word that does not
+            // hold the expected value, and never 0: 0 means "you were woken".
+            return -K_EAGAIN;
         }
         f->waiting = true;
         while (true) {                        
@@ -552,7 +570,7 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
                 freeFutex(f);
                 return 0;
             }            
-            if (f->expireTimeInMillies<0x7FFFFFFF) {
+            if (f->hasDeadline) {
                 S32 diff = f->expireTimeInMillies - KSystem::getMilliesSinceStart();
                 if (diff<=0) {
                     freeFutex(f);
@@ -629,7 +647,14 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
     const U32 command = op & FUTEX_CMD_MASK;
 
     if (command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET) {
-        U32 expires = 0xffffffff;
+        // No timeout means no deadline, and that is now said with a flag
+        // rather than with a 32-bit sentinel: `expires` is only meaningful
+        // when hasDeadline is set, so it can never be mistaken for a
+        // deadline that happens to be far away (or, once the tick counter has
+        // run for long enough, for one that has already passed).
+        U32 expires = 0;
+        bool hasDeadline = false;
+        bool parked = false;
         const U32 waitStartedAtMillis = KSystem::getMilliesSinceStart();
         const S64 waitResult = [&]() -> S64 {
         if (timeoutAddress) {
@@ -647,28 +672,53 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
                 const U64 nowMillis = KSystem::getSystemTimeAsMicroSeconds() / 1000;
                 millis = millis > nowMillis ? millis - nowMillis : 0;
             }
-            // A deadline beyond the 32-bit tick range is no deadline at all.
+            // The tick counter is 32 bits, so a deadline further out than it
+            // can express is clamped rather than wrapped. It stays a deadline.
             if (millis > 0x7ffffffeULL) millis = 0x7ffffffeULL;
             expires = static_cast<U32>(millis) +
                       KSystem::getMilliesSinceStart();
+            hasDeadline = true;
         }
 
         struct futex* wait = getFutex(this, ramAddress);
         if (!wait) {
             if (guestMemory->readd(addr) != value) {
-                return -K_EWOULDBLOCK;
+                return -K_EAGAIN;
             }
             wait = allocFutex(this, ramAddress, static_cast<U32>(addr), value,
-                              command, expires);
+                              command, expires, hasDeadline);
             if (command == FUTEX_WAIT_BITSET) {
                 wait->mask = val3;
+            }
+        } else {
+            // An entry left over from an earlier wait on the same word by this
+            // same thread (the cooperative park below returns without freeing
+            // it and the syscall is re-executed). Its deadline is this call's.
+            {
+                BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(wait->cond);
+                wait->expireTimeInMillies = expires;
+                wait->hasDeadline = hasDeadline;
+                wait->operation = command;
+                if (command == FUTEX_WAIT_BITSET) {
+                    wait->mask = val3;
+                }
             }
         }
 
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(wait->cond);
+        // The kernel compares the word with the caller's expected value and
+        // returns -EAGAIN when they differ; it never reports that as a wakeup.
+        // Returning 0 here is what makes glibc's and Wine's wait loops spin:
+        // 0 means "somebody woke you, re-check the predicate", so a caller
+        // whose predicate is still false comes straight back into the kernel.
+        //
+        // The comparison and the enqueue both happen under this futex's own
+        // condition, and FUTEX_WAKE below only ever claims a futex that is
+        // already parked, so a wakeup can never be handed to a waiter that is
+        // about to leave through this branch and then be lost.
         if (guestMemory->readd(addr) != value) {
             freeFutex(wait);
-            return -K_EWOULDBLOCK;
+            return -K_EAGAIN;
         }
         wait->waiting = true;
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -685,16 +735,18 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
                 freeFutex(wait);
                 return 0;
             }
-            if (wait->expireTimeInMillies < 0x7fffffff) {
+            if (wait->hasDeadline) {
                 S32 remaining = wait->expireTimeInMillies -
                                 KSystem::getMilliesSinceStart();
                 if (remaining <= 0) {
                     freeFutex(wait);
                     return -K_ETIMEDOUT;
                 }
+                parked = true;
                 BOXEDWINE_CONDITION_WAIT_TIMEOUT(wait->cond,
                                                   static_cast<U32>(remaining));
             } else {
+                parked = true;
                 BOXEDWINE_CONDITION_WAIT(wait->cond);
             }
             if (terminating) {
@@ -703,11 +755,13 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
             }
         }
 #else
-        if (wait->expireTimeInMillies < 0x7fffffff) {
+        if (wait->hasDeadline) {
             U32 remaining = wait->expireTimeInMillies -
                             KSystem::getMilliesSinceStart();
+            parked = true;
             (void)wait->cond->waitWithTimeout(remaining);
         } else {
+            parked = true;
             (void)wait->cond->wait();
         }
         return K_FUTEX64_PARKED;
@@ -735,15 +789,27 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
                     }
                     U32 hostValue = 0;
                     ::memcpy(&hostValue, ram, sizeof(hostValue));
+                    // Which of the four ways out this was. Both a value
+                    // mismatch and a wakeup used to be invisible here, and
+                    // they mean opposite things to the caller's loop.
+                    const char* reason =
+                        waitResult == 0 ? "woken" :
+                        waitResult == -K_EAGAIN ? "value-mismatch" :
+                        waitResult == -K_ETIMEDOUT ? "timeout" :
+                        waitResult == -K_EINTR ? "signal" : "other";
                     klog_fmt("BOXEDWINE_FUTEX_STORM pid=%d tid=%d addr=0x%llx op=0x%x val=0x%x "
-                             "actual=0x%x host=0x%llx host_value=0x%x rc=%lld "
-                             "timeout=%d sec=%llu nsec=%llu expires=%u now=%u repeats=%u",
+                             "actual=0x%x host=0x%llx host_value=0x%x rc=%lld reason=%s "
+                             "parked=%d timeout=%d sec=%llu nsec=%llu deadline=%s "
+                             "expires=%u now=%u repeats=%u",
                              process ? process->id : -1, id,
                              (unsigned long long)addr, op, value,
                              guestMemory->readd(addr), (unsigned long long)ramAddress,
-                             hostValue, (long long)waitResult,
+                             hostValue, (long long)waitResult, reason,
+                             parked ? 1 : 0,
                              timeoutAddress ? 1 : 0, (unsigned long long)seconds,
-                             (unsigned long long)nanos, expires, finishedAtMillis,
+                             (unsigned long long)nanos,
+                             hasDeadline ? "yes" : "none",
+                             expires, finishedAtMillis,
                              futexImmediateReturns);
                 }
             }
@@ -763,6 +829,18 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
             struct futex* wait = entry.get();
             BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(wait->cond);
             if (!wait->thread || wait->address != ramAddress || wait->wake) {
+                continue;
+            }
+            // Only a waiter that has actually parked can be woken, which is
+            // what the 32-bit path has always done. A futex is published to
+            // this list before its owner compares the word and parks; claiming
+            // one in that window both inflates the count this call returns and
+            // loses the wakeup outright, because the owner then finds the word
+            // changed and leaves through -EAGAIN, taking the wake flag with
+            // it. The waker believes it woke somebody, and nobody was woken --
+            // which is exactly the shape of a run where every guest thread
+            // ends up parked in FUTEX_WAIT and the picture stops.
+            if (!wait->waiting) {
                 continue;
             }
             if (command == FUTEX_WAKE_BITSET && !(wait->mask & val3)) {

@@ -20,18 +20,42 @@
  *
  * WHAT IT DRAWS
  *
- * A spinning cube with a different colour per face, over a slowly changing
- * clear colour. The first device runs of this probe only cleared, which
- * proved presentation but exercised no shader: a clear is a Metal render
- * pass load action, not a pipeline. The cube adds the rest of the path a
- * game needs -- DXBC vertex and pixel shaders translated by DXMT, an input
- * layout, vertex/index/constant buffers, a viewport, and an indexed draw.
- * The shaders are compiled ahead of time (x64-d3d11-cube.hlsl, embedded via
- * x64-d3d11-cube-shaders.h) so no HLSL compiler runs inside the guest.
+ * DXMT's own Direct3D 11 cube test -- the demo the sibling iOS
+ * Wine/FEX/DXMT project (Madeira) builds and runs on device -- ported into
+ * this probe's instrumentation:
  *
- * No depth buffer on purpose: the cube is convex and back faces are culled
- * by the default rasterizer state, so it renders correctly without one, and
- * that keeps a depth-buffer defect from masquerading as a draw defect.
+ *   renderer:  https://github.com/willfaust/dxmt/blob/b4b89f0a5a1752da3982a7b6c5575506024bf253/tests/dx11/dx11_cube.cpp
+ *   maths:     https://github.com/willfaust/dxmt/blob/b4b89f0a5a1752da3982a7b6c5575506024bf253/tests/dx11/3DMaths.h
+ *   shader:    https://github.com/willfaust/dxmt/blob/b4b89f0a5a1752da3982a7b6c5575506024bf253/tests/dx11/shader_cube.hlsl
+ *   commit:    b4b89f0a5a1752da3982a7b6c5575506024bf253 (branch ios-port)
+ *   consumer:  https://github.com/willfaust/Madeira/blob/main/build/dxmt-tests/build-x64.sh
+ *
+ * DXMT is MIT licensed, Copyright (c) 2023 Feifan He; the notice is kept in
+ * full beside the ported geometry and matrices below and in
+ * THIRD_PARTY_NOTICES.md. Its cube test in turn follows Kevin Moran's
+ * BeginnerDirect3D11 tutorial ("08. Drawing a Cube"), which is where the
+ * matrix helpers and the camera come from.
+ *
+ * What is ported: the eight position-only vertices and their 36 indices, the
+ * rasterizer and depth-stencil state, the column-major matrix helpers and the
+ * projection, the camera at (0, 0, 2), the clear colour, the dynamic constant
+ * buffer written through Map/Unmap, and the wall-clock spin. What is NOT
+ * ported: the demo's WinMain shell, its keyboard camera, its mouse trace and
+ * its bitmap-font overlay, its 1024x768 hardcoding, and its
+ * D3DCompileFromFile call -- the shaders are compiled ahead of time
+ * (x64-d3d11-cube.hlsl, embedded via x64-d3d11-cube-shaders.h) so no HLSL
+ * compiler runs inside the guest, which is what Madeira's own build does with
+ * its test_shim.h.
+ *
+ * In its place this file keeps the launcher contract: a console image, the
+ * stage markers below, the per-stage exit codes, and the window creation the
+ * device logs are read against.
+ *
+ * The demo draws with a depth buffer, so this does too; if the depth
+ * resources cannot be created the loop reports it and carries on without
+ * them, because the cube is convex and back-face culling alone renders it
+ * correctly. That keeps a depth-buffer defect from ending a run that would
+ * otherwise say something about the draw.
  *
  * DIAGNOSTIC DISCIPLINE
  *
@@ -142,125 +166,169 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
 }
 
 /* ------------------------------------------------------------------------ */
-/* Geometry: a unit cube, one colour per face, indexed as 12 triangles.
+/* Geometry, matrices and camera, PORTED from DXMT's Direct3D 11 cube test
+ * and its 3DMaths.h (see the file header for the URLs and the commit).
  *
- * Direct3D's default rasterizer state treats CLOCKWISE triangles as front
- * faces in its left-handed convention and culls the rest. Every triangle
- * below is wound clockwise as seen from outside the cube, so the convex cube
- * renders correctly with no depth buffer. */
+ *   MIT License
+ *   Copyright (c) 2023 Feifan He
+ *
+ *   Permission is hereby granted, free of charge, to any person obtaining a
+ *   copy of this software and associated documentation files (the
+ *   "Software"), to deal in the Software without restriction, including
+ *   without limitation the rights to use, copy, modify, merge, publish,
+ *   distribute, sublicense, and/or sell copies of the Software, and to
+ *   permit persons to whom the Software is furnished to do so, subject to
+ *   the following conditions:
+ *
+ *   The above copyright notice and this permission notice shall be included
+ *   in all copies or substantial portions of the Software.
+ *
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ *   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ *   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ *   IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ *   CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ *   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ *   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * The C++ original uses operator overloads on a float4x4 union; this is the
+ * same arithmetic written out in C11. Nothing about the values changed.
+ *
+ * The cube is position only: the pixel colour is derived from the position
+ * in the vertex shader. Its 12 triangles are wound COUNTER-clockwise as seen
+ * from outside, which is why the rasterizer state below sets
+ * FrontCounterClockwise and culls back faces -- the demo's own state. */
 struct probe_vertex {
     float position[3];
-    float colour[3];
 };
 
 static const struct probe_vertex kCubeVertices[8] = {
-    {{-1.0f, -1.0f, -1.0f}, {0.95f, 0.30f, 0.25f}},
-    {{-1.0f,  1.0f, -1.0f}, {0.95f, 0.75f, 0.20f}},
-    {{ 1.0f,  1.0f, -1.0f}, {0.30f, 0.85f, 0.35f}},
-    {{ 1.0f, -1.0f, -1.0f}, {0.25f, 0.55f, 0.95f}},
-    {{-1.0f, -1.0f,  1.0f}, {0.80f, 0.35f, 0.90f}},
-    {{-1.0f,  1.0f,  1.0f}, {0.95f, 0.95f, 0.95f}},
-    {{ 1.0f,  1.0f,  1.0f}, {0.20f, 0.90f, 0.90f}},
-    {{ 1.0f, -1.0f,  1.0f}, {0.95f, 0.55f, 0.65f}},
+    {{-0.5f, -0.5f, -0.5f}},
+    {{-0.5f, -0.5f,  0.5f}},
+    {{-0.5f,  0.5f, -0.5f}},
+    {{-0.5f,  0.5f,  0.5f}},
+    {{ 0.5f, -0.5f, -0.5f}},
+    {{ 0.5f, -0.5f,  0.5f}},
+    {{ 0.5f,  0.5f, -0.5f}},
+    {{ 0.5f,  0.5f,  0.5f}},
 };
 
 static const WORD kCubeIndices[36] = {
-    0, 1, 2,  0, 2, 3,  /* -z */
-    4, 6, 5,  4, 7, 6,  /* +z */
-    4, 5, 1,  4, 1, 0,  /* -x */
-    3, 2, 6,  3, 6, 7,  /* +x */
-    1, 5, 6,  1, 6, 2,  /* +y */
-    4, 0, 3,  4, 3, 7,  /* -y */
+    0, 6, 4,
+    0, 2, 6,
+    0, 3, 2,
+    0, 1, 3,
+    2, 7, 6,
+    2, 3, 7,
+    4, 6, 7,
+    4, 7, 5,
+    0, 4, 5,
+    0, 5, 1,
+    1, 5, 7,
+    1, 7, 3,
 };
 
-/* Row-major 4x4 matrices, m[row][column], applied as M * v. The HLSL side
- * declares its matrix row_major so this exact layout is uploaded unchanged. */
+/* 4x4 matrices stored the way the ported 3DMaths.h stores them: m[column]
+ * is one constant register, so m[j][i] is the element in column j, row i.
+ * Vectors are rows and are applied as v * M, which is what the HLSL does
+ * with mul(float4(pos, 1), modelViewProj) at the default (column-major)
+ * packing. The array is uploaded to the constant buffer unchanged. */
 struct probe_matrix {
     float m[4][4];
 };
 
-static struct probe_matrix matrix_identity(void) {
-    struct probe_matrix r;
-    int i, j;
-    for (i = 0; i < 4; ++i) {
-        for (j = 0; j < 4; ++j) {
-            r.m[i][j] = (i == j) ? 1.0f : 0.0f;
-        }
-    }
-    return r;
-}
-
+/* dot(a.row(i), b.cols[j]) written out: the original's
+ * `float4x4 operator*` in the same order. */
 static struct probe_matrix matrix_multiply(const struct probe_matrix* a,
                                            const struct probe_matrix* b) {
     struct probe_matrix r;
     int i, j, k;
-    for (i = 0; i < 4; ++i) {
-        for (j = 0; j < 4; ++j) {
+    for (j = 0; j < 4; ++j) {
+        for (i = 0; i < 4; ++i) {
             float sum = 0.0f;
             for (k = 0; k < 4; ++k) {
-                sum += a->m[i][k] * b->m[k][j];
+                sum += a->m[k][i] * b->m[j][k];
             }
-            r.m[i][j] = sum;
+            r.m[j][i] = sum;
         }
     }
     return r;
 }
 
-static struct probe_matrix matrix_rotation_x(float angle) {
-    struct probe_matrix r = matrix_identity();
-    float c = cosf(angle), s = sinf(angle);
-    r.m[1][1] = c;  r.m[1][2] = -s;
-    r.m[2][1] = s;  r.m[2][2] = c;
+static struct probe_matrix matrix_rotation_x(float rad) {
+    const float s = sinf(rad), c = cosf(rad);
+    struct probe_matrix r = {{
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, c,   -s,    0.0f},
+        {0.0f, s,    c,    0.0f},
+        {0.0f, 0.0f, 0.0f, 1.0f},
+    }};
     return r;
 }
 
-static struct probe_matrix matrix_rotation_y(float angle) {
-    struct probe_matrix r = matrix_identity();
-    float c = cosf(angle), s = sinf(angle);
-    r.m[0][0] = c;  r.m[0][2] = s;
-    r.m[2][0] = -s; r.m[2][2] = c;
+static struct probe_matrix matrix_rotation_y(float rad) {
+    const float s = sinf(rad), c = cosf(rad);
+    struct probe_matrix r = {{
+        {c,    0.0f, s,    0.0f},
+        {0.0f, 1.0f, 0.0f, 0.0f},
+        {-s,   0.0f, c,    0.0f},
+        {0.0f, 0.0f, 0.0f, 1.0f},
+    }};
     return r;
 }
 
 static struct probe_matrix matrix_translation(float x, float y, float z) {
-    struct probe_matrix r = matrix_identity();
-    r.m[0][3] = x;
-    r.m[1][3] = y;
-    r.m[2][3] = z;
+    struct probe_matrix r = {{
+        {1.0f, 0.0f, 0.0f, x},
+        {0.0f, 1.0f, 0.0f, y},
+        {0.0f, 0.0f, 1.0f, z},
+        {0.0f, 0.0f, 0.0f, 1.0f},
+    }};
     return r;
 }
 
-/* Left-handed perspective projection, depth mapped to [0, 1]. */
-static struct probe_matrix matrix_perspective(float fov_y, float aspect,
+/* makePerspectiveMat: right-handed, looking down -Z, depth in [0, 1].
+ * 1/tan(x) == tan(90deg - x), which is why there is no divide. */
+static struct probe_matrix matrix_perspective(float aspect, float fov_y_rad,
                                               float near_z, float far_z) {
-    struct probe_matrix r;
-    float y_scale = 1.0f / tanf(fov_y * 0.5f);
-    float x_scale = y_scale / aspect;
-    int i, j;
-    for (i = 0; i < 4; ++i) {
-        for (j = 0; j < 4; ++j) {
-            r.m[i][j] = 0.0f;
-        }
-    }
-    r.m[0][0] = x_scale;
-    r.m[1][1] = y_scale;
-    r.m[2][2] = far_z / (far_z - near_z);
-    r.m[2][3] = -near_z * far_z / (far_z - near_z);
-    r.m[3][2] = 1.0f;
+    const float y_scale = tanf(0.5f * (3.14159265358979323846f - fov_y_rad));
+    const float x_scale = y_scale / aspect;
+    const float z_range_inverse = 1.0f / (near_z - far_z);
+    const float z_scale = far_z * z_range_inverse;
+    const float z_translation = far_z * near_z * z_range_inverse;
+    struct probe_matrix r = {{
+        {x_scale, 0.0f,    0.0f,     0.0f},
+        {0.0f,    y_scale, 0.0f,     0.0f},
+        {0.0f,    0.0f,    z_scale,  z_translation},
+        {0.0f,    0.0f,   -1.0f,     0.0f},
+    }};
     return r;
 }
 
-static struct probe_matrix cube_transform(int frame) {
-    const float angle = (float)frame * 0.035f;
-    struct probe_matrix rotate_y = matrix_rotation_y(angle);
-    struct probe_matrix rotate_x = matrix_rotation_x(angle * 0.6f);
-    struct probe_matrix model = matrix_multiply(&rotate_y, &rotate_x);
-    struct probe_matrix view = matrix_translation(0.0f, 0.0f, 4.5f);
+static float degrees_to_radians(float degrees) {
+    return degrees * (3.14159265358979323846f / 180.0f);
+}
+
+/* The spin is a function of ELAPSED WALL-CLOCK SECONDS, never of the frame
+ * counter. With the host frame limiter unlocked the guest presents as fast as
+ * it can -- a per-frame angle turned the cube into a blur at a few thousand
+ * frames a second, and the same program looked slow at 30. These are the
+ * demo's own rates: -0.2*pi rad/s about X, 0.1*pi rad/s about Y. */
+static struct probe_matrix cube_transform(double seconds) {
+    const float t = (float)seconds;
+    struct probe_matrix rotate_x =
+        matrix_rotation_x(-0.2f * 3.14159265358979323846f * t);
+    struct probe_matrix rotate_y =
+        matrix_rotation_y(0.1f * 3.14159265358979323846f * t);
+    struct probe_matrix model = matrix_multiply(&rotate_x, &rotate_y);
+    /* The demo's camera sits at (0, 0, 2) with no pitch or yaw, so its
+     * view matrix reduces to a translation by -cameraPos. */
+    struct probe_matrix view = matrix_translation(0.0f, 0.0f, -2.0f);
     struct probe_matrix projection = matrix_perspective(
-        1.0471976f /* 60 degrees */, (float)kProbeWidth / (float)kProbeHeight,
-        0.5f, 20.0f);
-    struct probe_matrix model_view = matrix_multiply(&view, &model);
-    return matrix_multiply(&projection, &model_view);
+        (float)kProbeWidth / (float)kProbeHeight, degrees_to_radians(84.0f),
+        0.1f, 1000.0f);
+    struct probe_matrix model_view = matrix_multiply(&model, &view);
+    return matrix_multiply(&model_view, &projection);
 }
 
 int main(void) {
@@ -277,17 +345,24 @@ int main(void) {
     ID3D11DeviceContext* context = NULL;
     ID3D11Texture2D* backbuffer = NULL;
     ID3D11RenderTargetView* rtv = NULL;
+    ID3D11Texture2D* depth_texture = NULL;
+    ID3D11DepthStencilView* depth_view = NULL;
     ID3D11VertexShader* vertex_shader = NULL;
     ID3D11PixelShader* pixel_shader = NULL;
     ID3D11InputLayout* input_layout = NULL;
     ID3D11Buffer* vertex_buffer = NULL;
     ID3D11Buffer* index_buffer = NULL;
     ID3D11Buffer* constant_buffer = NULL;
+    ID3D11RasterizerState* rasterizer_state = NULL;
+    ID3D11DepthStencilState* depth_state = NULL;
     D3D_FEATURE_LEVEL level = (D3D_FEATURE_LEVEL)0;
+    LARGE_INTEGER counter_frequency;
+    LARGE_INTEGER counter_start;
     HRESULT hr;
     char detail[320];
     int frames;
     int presented = 0;
+    int mapped_failed = 0;
 
     /* ---------------------------------------------------------------- */
     stage_begin("register-class");
@@ -454,8 +529,48 @@ int main(void) {
         stage_fail("render-target", captured, detail);
         return BOXEDVN_EXIT_RENDER_TARGET;
     }
-    ID3D11DeviceContext_OMSetRenderTargets(context, 1, &rtv, NULL);
-    stage_ok("render-target", NULL);
+    /* The ported demo draws with a depth buffer. Failing to build one is
+     * reported and survived: the cube is convex and back faces are culled, so
+     * the picture is the same, and a depth-buffer defect should not end a run
+     * that could still say something about the draw. */
+    {
+        D3D11_TEXTURE2D_DESC depth_desc;
+        ID3D11Texture2D_GetDesc(backbuffer, &depth_desc);
+        depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        depth_desc.Usage = D3D11_USAGE_DEFAULT;
+        depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        depth_desc.CPUAccessFlags = 0;
+        depth_desc.MiscFlags = 0;
+        depth_desc.MipLevels = 1;
+        depth_desc.ArraySize = 1;
+        SetLastError(0);
+        hr = ID3D11Device_CreateTexture2D(device, &depth_desc, NULL,
+                                          &depth_texture);
+        captured = GetLastError();
+        if (FAILED(hr) || depth_texture == NULL) {
+            depth_texture = NULL;
+            snprintf(detail, sizeof(detail), "hr=0x%08lx stage=depth-texture",
+                     (unsigned long)hr);
+            stage_fail("render-target-depth", captured, detail);
+        } else {
+            SetLastError(0);
+            hr = ID3D11Device_CreateDepthStencilView(
+                device, (ID3D11Resource*)depth_texture, NULL, &depth_view);
+            captured = GetLastError();
+            if (FAILED(hr) || depth_view == NULL) {
+                depth_view = NULL;
+                snprintf(detail, sizeof(detail), "hr=0x%08lx stage=depth-view",
+                         (unsigned long)hr);
+                stage_fail("render-target-depth", captured, detail);
+            } else {
+                stage_ok("render-target-depth", "format=D24S8");
+            }
+        }
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(context, 1, &rtv, depth_view);
+    snprintf(detail, sizeof(detail), "depth=%s",
+             depth_view != NULL ? "yes" : "none");
+    stage_ok("render-target", detail);
 
     /* ---------------------------------------------------------------- */
     /* Shaders and the input layout. The DXBC was compiled ahead of time; the
@@ -486,18 +601,16 @@ int main(void) {
         return BOXEDVN_EXIT_SHADERS;
     }
     {
-        D3D11_INPUT_ELEMENT_DESC layout[2];
+        /* One element, "POS": the ported shader derives the colour from the
+         * position, so the vertex buffer carries nothing else. */
+        D3D11_INPUT_ELEMENT_DESC layout[1];
         ZeroMemory(layout, sizeof(layout));
-        layout[0].SemanticName = "POSITION";
+        layout[0].SemanticName = "POS";
         layout[0].Format = DXGI_FORMAT_R32G32B32_FLOAT;
         layout[0].AlignedByteOffset = 0;
         layout[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
-        layout[1].SemanticName = "COLOR";
-        layout[1].Format = DXGI_FORMAT_R32G32B32_FLOAT;
-        layout[1].AlignedByteOffset = 12;
-        layout[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
         SetLastError(0);
-        hr = ID3D11Device_CreateInputLayout(device, layout, 2,
+        hr = ID3D11Device_CreateInputLayout(device, layout, 1,
                                             kProbeVertexShader,
                                             sizeof(kProbeVertexShader),
                                             &input_layout);
@@ -551,10 +664,18 @@ int main(void) {
             return BOXEDVN_EXIT_GEOMETRY;
         }
 
+        /* DYNAMIC and written with Map/Unmap every frame, the way the ported
+         * demo does it. (The probe used to write this buffer with
+         * UpdateSubresource; a device run took an access violation reading
+         * that method's vtable slot, so following the demo here also removes
+         * that call site.) A constant buffer's size must be a multiple of 16,
+         * which a 4x4 float matrix already is. */
         ZeroMemory(&desc, sizeof(desc));
-        desc.ByteWidth = sizeof(struct probe_matrix);
-        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.ByteWidth =
+            (UINT)((sizeof(struct probe_matrix) + 15u) & ~(size_t)15u);
+        desc.Usage = D3D11_USAGE_DYNAMIC;
         desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         SetLastError(0);
         hr = ID3D11Device_CreateBuffer(device, &desc, NULL, &constant_buffer);
         captured = GetLastError();
@@ -564,6 +685,51 @@ int main(void) {
             stage_fail("geometry", captured, detail);
             return BOXEDVN_EXIT_GEOMETRY;
         }
+    }
+    /* The demo's own rasterizer and depth-stencil state: counter-clockwise
+     * front faces (its cube is wound that way), back faces culled, depth
+     * tested and written with LESS. Both are best-effort in the same sense as
+     * the depth buffer: a NULL state is Direct3D's default state, which still
+     * draws the cube. */
+    stage_begin("geometry-state");
+    {
+        D3D11_RASTERIZER_DESC rasterizer_desc;
+        D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
+
+        ZeroMemory(&rasterizer_desc, sizeof(rasterizer_desc));
+        rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+        rasterizer_desc.CullMode = D3D11_CULL_BACK;
+        rasterizer_desc.FrontCounterClockwise = TRUE;
+        rasterizer_desc.DepthClipEnable = TRUE;
+        SetLastError(0);
+        hr = ID3D11Device_CreateRasterizerState(device, &rasterizer_desc,
+                                                &rasterizer_state);
+        captured = GetLastError();
+        if (FAILED(hr) || rasterizer_state == NULL) {
+            rasterizer_state = NULL;
+            snprintf(detail, sizeof(detail), "hr=0x%08lx stage=rasterizer-state",
+                     (unsigned long)hr);
+            stage_fail("geometry-state", captured, detail);
+        }
+
+        ZeroMemory(&depth_stencil_desc, sizeof(depth_stencil_desc));
+        depth_stencil_desc.DepthEnable = TRUE;
+        depth_stencil_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        depth_stencil_desc.DepthFunc = D3D11_COMPARISON_LESS;
+        SetLastError(0);
+        hr = ID3D11Device_CreateDepthStencilState(device, &depth_stencil_desc,
+                                                  &depth_state);
+        captured = GetLastError();
+        if (FAILED(hr) || depth_state == NULL) {
+            depth_state = NULL;
+            snprintf(detail, sizeof(detail),
+                     "hr=0x%08lx stage=depth-stencil-state", (unsigned long)hr);
+            stage_fail("geometry-state", captured, detail);
+        }
+        snprintf(detail, sizeof(detail), "rasterizer=%s depth_stencil=%s",
+                 rasterizer_state != NULL ? "yes" : "default",
+                 depth_state != NULL ? "yes" : "default");
+        stage_ok("geometry-state", detail);
     }
     snprintf(detail, sizeof(detail), "vertices=%u indices=%u",
              (unsigned)(sizeof(kCubeVertices) / sizeof(kCubeVertices[0])),
@@ -582,6 +748,8 @@ int main(void) {
         viewport.MinDepth = 0.0f;
         viewport.MaxDepth = 1.0f;
         ID3D11DeviceContext_RSSetViewports(context, 1, &viewport);
+        ID3D11DeviceContext_RSSetState(context, rasterizer_state);
+        ID3D11DeviceContext_OMSetDepthStencilState(context, depth_state, 0);
         ID3D11DeviceContext_IASetInputLayout(context, input_layout);
         ID3D11DeviceContext_IASetVertexBuffers(context, 0, 1, &vertex_buffer,
                                                &stride, &offset);
@@ -603,16 +771,28 @@ int main(void) {
      * The loop runs until the window is closed. The earlier 240-frame cut-off
      * made the picture freeze on device after four seconds and looked like a
      * hang. Present is asked for no vertical sync (interval 0) so the host's
-     * own frame limiter setting, not this program, decides the frame rate. */
+     * own frame limiter setting, not this program, decides the frame rate --
+     * which is exactly why the cube's angle comes from the performance
+     * counter and not from the frame number. The demo's clear colour is a
+     * constant for the same reason: it used to drift with the frame counter,
+     * which strobed once the guest ran unthrottled. */
     stage_begin("present");
+    QueryPerformanceFrequency(&counter_frequency);
+    QueryPerformanceCounter(&counter_start);
+    if (counter_frequency.QuadPart <= 0) {
+        counter_frequency.QuadPart = 1;
+    }
     for (frames = 0; ; ++frames) {
         MSG message;
         FLOAT colour[4];
         struct probe_matrix mvp;
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        LARGE_INTEGER counter_now;
+        double seconds;
         int quit = 0;
         colour[0] = 0.10f;
-        colour[1] = 0.20f + (FLOAT)(frames % 60) / 240.0f;
-        colour[2] = 0.45f;
+        colour[1] = 0.20f;
+        colour[2] = 0.60f;
         colour[3] = 1.0f;
         while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) {
@@ -625,11 +805,29 @@ int main(void) {
         if (quit) {
             break;
         }
-        mvp = cube_transform(frames);
-        ID3D11DeviceContext_UpdateSubresource(context,
-                                              (ID3D11Resource*)constant_buffer,
-                                              0, NULL, &mvp, 0, 0);
+        QueryPerformanceCounter(&counter_now);
+        seconds = (double)(counter_now.QuadPart - counter_start.QuadPart) /
+                  (double)counter_frequency.QuadPart;
+        mvp = cube_transform(seconds);
+        ZeroMemory(&mapped, sizeof(mapped));
+        hr = ID3D11DeviceContext_Map(context, (ID3D11Resource*)constant_buffer,
+                                     0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (SUCCEEDED(hr) && mapped.pData != NULL) {
+            CopyMemory(mapped.pData, &mvp, sizeof(mvp));
+            ID3D11DeviceContext_Unmap(context,
+                                      (ID3D11Resource*)constant_buffer, 0);
+        } else if (!mapped_failed) {
+            mapped_failed = 1;
+            snprintf(detail, sizeof(detail), "hr=0x%08lx stage=map-constants",
+                     (unsigned long)hr);
+            stage_fail("present", GetLastError(), detail);
+        }
         ID3D11DeviceContext_ClearRenderTargetView(context, rtv, colour);
+        if (depth_view != NULL) {
+            ID3D11DeviceContext_ClearDepthStencilView(context, depth_view,
+                                                      D3D11_CLEAR_DEPTH, 1.0f,
+                                                      0);
+        }
         ID3D11DeviceContext_DrawIndexed(
             context, (UINT)(sizeof(kCubeIndices) / sizeof(kCubeIndices[0])),
             0, 0);
@@ -655,6 +853,18 @@ int main(void) {
 
     snprintf(detail, sizeof(detail), "exit ok frames=%d", frames);
     stage_line(detail);
+    if (depth_state != NULL) {
+        ID3D11DepthStencilState_Release(depth_state);
+    }
+    if (rasterizer_state != NULL) {
+        ID3D11RasterizerState_Release(rasterizer_state);
+    }
+    if (depth_view != NULL) {
+        ID3D11DepthStencilView_Release(depth_view);
+    }
+    if (depth_texture != NULL) {
+        ID3D11Texture2D_Release(depth_texture);
+    }
     if (constant_buffer != NULL) {
         ID3D11Buffer_Release(constant_buffer);
     }

@@ -14,6 +14,13 @@
 # probe from source in this repository is what makes the failing stage
 # recoverable from a device log.
 #
+# What it renders is DXMT's own Direct3D 11 cube test (MIT, Copyright (c) 2023
+# Feifan He), ported into that instrumentation -- the same demo the sibling
+# iOS Wine/FEX/DXMT project runs on device, so a difference between the two
+# projects is a difference in the stack rather than in the program. The source
+# URLs and the pinned commit are in the probe's own header and in
+# THIRD_PARTY_NOTICES.md.
+#
 # Usage:
 #   scripts/build-x64-graphics-probe.sh --toolchain DIR --output PATH
 
