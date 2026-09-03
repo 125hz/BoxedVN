@@ -522,6 +522,23 @@ static std::atomic<uint64_t> gPendingIRCapTarget {0};
 static std::atomic<uint32_t> gExactRIPReports {0};
 static constexpr uint32_t kExactRIPReportLimit = 8;
 
+// A command line reduced to the program image it names: everything after the
+// last separator of either kind. The stored command line is read from the
+// process that faulted and carries the loader path and the guest path it was
+// given ("<loader>d:\\...\\program.exe"); the launching one is read while the
+// process is still being built, so the prefix, the separators and the argument
+// tail can all differ between two launches of the same program. The image name
+// is the part that makes a fixed instruction address meaningful across runs.
+static NSString* ircapProgramImageName(NSString* command) {
+    if (command.length == 0) return @"";
+    NSCharacterSet* const separators =
+        [NSCharacterSet characterSetWithCharactersInString:@"\\/"];
+    const NSRange separator = [command rangeOfCharacterFromSet:separators
+                                                      options:NSBackwardsSearch];
+    if (separator.location == NSNotFound) return command;
+    return [command substringFromIndex:NSMaxRange(separator)];
+}
+
 extern "C" void BVNFEXBackendPublishPendingIRCapTarget(uint64_t guestRIP) {
     if (guestRIP == 0) return;
     gPendingIRCapTarget.store(guestRIP, std::memory_order_relaxed);
@@ -549,13 +566,31 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char* commandLine)
         if ([stored respondsToSelector:@selector(unsignedLongLongValue)]) {
             target = [stored unsignedLongLongValue];
         }
-        NSString* storedCommand = [defaults stringForKey:commandKey];
-        if (target != 0 && storedCommand.length > 0 && commandLine != nullptr &&
-            ![storedCommand isEqualToString:@(commandLine)]) {
+        NSString* storedCommand = [defaults stringForKey:commandKey] ?: @"";
+        NSString* currentCommand = @"";
+        if (commandLine != nullptr) {
+            currentCommand = [NSString stringWithUTF8String:commandLine] ?: @"";
+        }
+        NSString* const storedImage = ircapProgramImageName(storedCommand);
+        NSString* const currentImage = ircapProgramImageName(currentCommand);
+        // Only a *named* other program defers the target. An empty current
+        // command line is not evidence of one: the take happens on the first
+        // live process, before the launching command line is necessarily set,
+        // and refusing on that alone deferred the target forever. Comparing
+        // the image names rather than the whole strings survives a differing
+        // loader path or argument tail between the faulting run and this one.
+        const bool otherProgram = currentImage.length > 0 &&
+                                  storedImage.length > 0 &&
+                                  ![storedImage isEqualToString:currentImage];
+        if (target != 0 && otherProgram) {
             // Another program is launching; the target stays for its own.
-            klog_fmt("BOXEDWINE_FEX64_IRCAP_TARGET_DEFERRED rip=0x%llx for='%s'",
+            klog_fmt("BOXEDWINE_FEX64_IRCAP_TARGET_DEFERRED rip=0x%llx "
+                     "for='%s' current='%s' stored_image='%s' current_image='%s'",
                      static_cast<unsigned long long>(target),
-                     storedCommand.UTF8String);
+                     storedCommand.UTF8String ?: "",
+                     currentCommand.UTF8String ?: "",
+                     storedImage.UTF8String ?: "",
+                     currentImage.UTF8String ?: "");
             return 0;
         }
     }
@@ -1235,12 +1270,33 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         static std::atomic<uint32_t> reported {0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
             const uint64_t rip = frame->State.rip;
+            // The alias reader answers for the identity window only. A guest
+            // address below 4 GiB -- where the WoW64 layer maps the 32-bit
+            // modules and their stack -- is not in that window, so the first
+            // fault taken in 32-bit code printed sixteen zero bytes and an
+            // empty return slot: no instruction, no caller. The kernel's own
+            // page table covers every mapped guest page and is the fallback.
+            KMemory64* const faultMemory = adapter->cpu->memory;
+            auto readGuestBytes = [&](uint64_t address, uint8_t* out,
+                                      size_t length) -> bool {
+                if (faultMemory == nullptr) return false;
+                bool any = false;
+                for (size_t i = 0; i < length; ++i) {
+                    const uint64_t at = address + i;
+                    if (!faultMemory->isPageMapped(at >> 12)) break;
+                    out[i] = faultMemory->readb(at);
+                    any = true;
+                }
+                return any;
+            };
             uint8_t bytes[16] = {0};
             const uint64_t hostRip =
                 adapter->process->memory64->nativeAliasForGuest(rip);
             if (hostRip != 0 &&
                 adapter->cpu->memory->nativeRangeCoversForPlan(hostRip, hostRip + 16)) {
                 std::memcpy(bytes, reinterpret_cast<const void*>(hostRip), sizeof(bytes));
+            } else {
+                readGuestBytes(rip, bytes, sizeof(bytes));
             }
             char hex[40];
             for (size_t i = 0; i < sizeof(bytes); ++i) {
@@ -1261,21 +1317,33 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                 adapter->cpu->memory->nativeRangeCoversForPlan(hostRsp, hostRsp + 16)) {
                 std::memcpy(returnSlot, reinterpret_cast<const void*>(hostRsp),
                             sizeof(returnSlot));
+            } else {
+                uint8_t slotBytes[16] = {0};
+                if (readGuestBytes(guestRsp, slotBytes, sizeof(slotBytes))) {
+                    std::memcpy(returnSlot, slotBytes, sizeof(returnSlot));
+                }
             }
             const auto& g = frame->State.gregs;
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_STACK rsp=0x%llx slot0=0x%llx slot1=0x%llx",
                      static_cast<unsigned long long>(guestRsp),
                      static_cast<unsigned long long>(returnSlot[0]),
                      static_cast<unsigned long long>(returnSlot[1]));
+            // cs and ss say which code segment the faulting instruction was
+            // decoded for. A far transfer into the WoW64 32-bit selector
+            // changes cs and nothing else in this backend, so the pair is what
+            // separates a fault in 64-bit code from one taken past that
+            // boundary while the context still decodes 64-bit.
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT pid=%d tid=%d host_signal=%d "
                      "si_code=%d fault=0x%llx host_pc=0x%llx in_code=%d generated=%d "
-                     "guest_signal=%u trap=%u guest_rip=0x%llx bytes=%s",
+                     "guest_signal=%u trap=%u guest_rip=0x%llx cs=0x%x ss=0x%x bytes=%s",
                      adapter->process->id, adapter->thread->id, signal,
                      static_cast<int>(siginfo->si_code),
                      static_cast<unsigned long long>(faultAddress),
                      static_cast<unsigned long long>(hostPC), inCodeBuffer ? 1 : 0,
                      generatedException ? 1 : 0, guestSignal, guestTrapNumber,
-                     static_cast<unsigned long long>(rip), hex);
+                     static_cast<unsigned long long>(rip),
+                     static_cast<unsigned>(frame->State.cs_idx),
+                     static_cast<unsigned>(frame->State.ss_idx), hex);
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_GPRS rax=0x%llx rcx=0x%llx rdx=0x%llx "
                      "rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx "
                      "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx "

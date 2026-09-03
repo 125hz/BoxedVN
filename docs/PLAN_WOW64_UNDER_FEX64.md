@@ -178,6 +178,31 @@ This is the risk that decides the schedule.
   `BTCpuProcessInit` also refuses to run when `wow64cpu.dll` is mapped
   above 4 GiB, so the loader's low-address mapping of WoW64 modules must
   succeed inside `KMemory64`'s low window.
+- The far transfer is reached (device run 2026-09-02 19:08). After
+  `set_thread_area` and the FS selector write, the 64-bit loader opened
+  `i386-windows/ntdll.dll`, then `wow64.dll`, `wow64cpu.dll`, `wow64win.dll`
+  and `win32u`; `wow64.dll`'s `init_image_mapping` protected a page of the
+  32-bit ntdll back to `PAGE_EXECUTE_READ` (`mprotect(0x7bce8000, 0x1000, r-x)`
+  from Wine's `NtProtectVirtualMemory`), which is the last 64-bit step before
+  `BTCpuSimulate`. The next event is a page fault whose guest state is
+  unambiguously 32-bit: `rip=0x7bd4321c` (32-bit ntdll's image range, below
+  4 GiB), `rsp=0x22fc20` / `rbp=0x22fcd8` (the WoW64 32-bit stack), against a
+  fault address of `0x78f7aed7ce` that no 32-bit instruction can form. Wine
+  turned it into an access violation and the process left with
+  `exit_group(0xC0000005)`. So the far jump is taken, the translator keeps
+  decoding for the context's fixed 64-bit mode, and the first block of 32-bit
+  code is misdecoded -- exactly the risk the phase names, now observed rather
+  than predicted, and the gate it has to clear.
+  Instrumentation added with this finding, because the run above named the
+  boundary only by inference: every far jump, far call and far return notes
+  itself while a small budget lasts, and the block compiled straight after one
+  reports `BOXEDWINE_FEX64_FAR_TRANSFER_POST` with the target RIP, `cs`, `ss`,
+  `ds`, `rsp`, the segment bases, the context's decode width and the first
+  sixteen bytes at the target
+  (`scripts/fex64-patches/fex-boxedwine-far-transfer-witness.patch`). The
+  adapter's fault witness now also reads guest bytes through the kernel's page
+  table when the identity alias does not cover the address, which is every
+  address below 4 GiB, and prints `cs`/`ss` with the fault.
 - Shape (2) in BoxedVN terms (steps 2 and 3 superseded by the refinement):
   1. Context pair. `createFEXContext(FexGuestMode::X86_32, ...)` for the
      process, sharing `KMemory64` with its 64-bit context; the low-alias

@@ -1,0 +1,151 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1375,6 +1375,16 @@
+ std::atomic<uint32_t> BoxedWineBlockTraceBudget {0};
+ std::atomic<uint32_t> BoxedWineBlockTraceProcess {0};
+ std::atomic<uint64_t> BoxedWineIRETRip {0};
++/* BoxedWine: the pending far transfer, and how many of them may still be
++ * reported. Deliberately not on the block trace's budget: that budget is armed
++ * at the loader handoff and spent within a hundred blocks, and the transfer
++ * this watches -- the one Wine's WoW64 layer uses to enter a 32-bit code
++ * segment -- happens a second later, with the whole of wow64.dll's setup in
++ * between. The kind is a string literal, stored by pointer. */
++std::atomic<uint64_t> BoxedWineFarTransferRip {0};
++std::atomic<const char*> BoxedWineFarTransferKind {nullptr};
++std::atomic<uint32_t> BoxedWineFarTransferReports {0};
++constexpr uint32_t BoxedWineFarTransferReportLimit = 8;
+ } // namespace
+ 
+ void BoxedWineArmBlockTrace(uint32_t ProcessId, uint32_t Budget) {
+@@ -1401,6 +1411,30 @@
+   return BoxedWineIRETRip.exchange(0, std::memory_order_acq_rel);
+ }
+ 
++void BoxedWineNoteGuestFarTransfer(uint64_t GuestRIP, const char* Kind) {
++  if (BoxedWineFarTransferReports.load(std::memory_order_acquire) >= BoxedWineFarTransferReportLimit) {
++    return;
++  }
++  BoxedWineFarTransferKind.store(Kind, std::memory_order_relaxed);
++  BoxedWineFarTransferRip.store(GuestRIP, std::memory_order_release);
++  LogMan::Msg::IFmt("BOXEDWINE_FEX64_FAR_TRANSFER_PRE kind={} rip={:#x}", Kind ? Kind : "far", GuestRIP);
++}
++
++uint64_t BoxedWineTakeGuestFarTransferNote(const char** Kind) {
++  const uint64_t From = BoxedWineFarTransferRip.exchange(0, std::memory_order_acq_rel);
++  if (From == 0) {
++    return 0;
++  }
++  BoxedWineFarTransferReports.fetch_add(1, std::memory_order_acq_rel);
++  if (Kind != nullptr) {
++    const char* const Stored = BoxedWineFarTransferKind.load(std::memory_order_acquire);
++    if (Stored != nullptr) {
++      *Kind = Stored;
++    }
++  }
++  return From;
++}
++
+ bool BoxedWineTakeBlockTraceCredit() {
+   uint32_t Remaining = BoxedWineBlockTraceBudget.load(std::memory_order_acquire);
+   while (Remaining != 0) {
+@@ -1578,6 +1612,38 @@
+    * host target and sent us here. Consumes and clears the witness slot. */
+   BoxedWineReportNullExitTarget(Frame, GuestRIP);
+ 
++  /* BoxedWine: where a far transfer landed, on its own budget.
++   *
++   * Wine's wow64cpu enters 32-bit code with `ljmp *(%r14)` through a page it
++   * maps below 4 GiB, and the 32-bit ntdll comes back through a second far
++   * jump written into the same page. The translator lowers every far transfer
++   * as a RIP change plus a stored cs_idx and keeps decoding for the mode the
++   * context was created with, so the block compiled straight after one is the
++   * exact boundary: the CS it loaded, the stack it switched to, and the first
++   * sixteen bytes at the target. A device run reaches 32-bit code and page
++   * faults inside it with nothing in the log naming the transfer, which is
++   * what this answers.
++   *
++   * The bytes are read through the same translation the translator itself
++   * uses, so an address in the low alias resolves. */
++  const char* BoxedWineFarKind = "far";
++  if (const uint64_t BoxedWineFarFrom = FEXCore::Context::BoxedWineTakeGuestFarTransferNote(&BoxedWineFarKind)) {
++    uint64_t BoxedWineFarCode0 = 0, BoxedWineFarCode1 = 0;
++    const uint8_t* FarBytes = reinterpret_cast<const uint8_t*>(GuestToHostAddress(GuestRIP));
++    if (FarBytes) {
++      memcpy(&BoxedWineFarCode0, FarBytes, sizeof(BoxedWineFarCode0));
++      memcpy(&BoxedWineFarCode1, FarBytes + sizeof(BoxedWineFarCode0), sizeof(BoxedWineFarCode1));
++    }
++    LogMan::Msg::IFmt("BOXEDWINE_FEX64_FAR_TRANSFER_POST kind={} from={:#x} rip={:#x} rsp={:#x} cs={:#x} ss={:#x} "
++                      "ds={:#x} fs={:#x} gs={:#x} decode={} host={:#x} code={:#018x}{:016x}",
++                      BoxedWineFarKind, BoxedWineFarFrom, GuestRIP,
++                      Frame ? Frame->State.gregs[FEXCore::X86State::REG_RSP] : 0, Frame ? Frame->State.cs_idx : 0,
++                      Frame ? Frame->State.ss_idx : 0, Frame ? Frame->State.ds_idx : 0,
++                      Frame ? Frame->State.fs_cached : 0, Frame ? Frame->State.gs_cached : 0,
++                      Config.Is64BitMode ? 64 : 32, reinterpret_cast<uint64_t>(FarBytes), BoxedWineFarCode1,
++                      BoxedWineFarCode0);
++  }
++
+   /* BoxedWine: the loader-to-Windows transition, and nothing else.
+    *
+    * This was a per-block enter/leave trace, which is what proved that
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -938,6 +938,13 @@
+   // Calculate flags early.
+   CalculateDeferredFlags();
+ 
++  // BoxedWine: note the transfer on its own bounded budget. This is the
++  // instruction Wine's wow64cpu uses to enter 32-bit code (`ljmp *(%r14)`)
++  // and the one the 32-bit ntdll uses to come back; the lowering below
++  // changes cs_idx and the RIP without changing the decode mode, so the block
++  // compiled next is where 32-bit code starts being decoded as 64-bit.
++  FEXCore::Context::BoxedWineNoteGuestFarTransfer(Op->PC, "jmpf");
++
+   BlockSetRIP = true;
+   // This is just an unconditional jump
+   // This uses ModRM to determine its location
+@@ -961,6 +968,9 @@
+   // Calculate flags early.
+   CalculateDeferredFlags();
+ 
++  // BoxedWine: see JUMPFARIndirectOp. A far call crosses the same boundary.
++  FEXCore::Context::BoxedWineNoteGuestFarTransfer(Op->PC, "callf");
++
+   BlockSetRIP = true;
+ 
+   Ref Src = MakeSegmentAddress(Op, Op->Dest);
+@@ -989,6 +999,9 @@
+   const auto GPRSize = GetGPROpSize();
+   const auto SrcSize = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_REX_WIDENING ? OpSize::i64Bit : OpSize::i32Bit;
+ 
++  // BoxedWine: see JUMPFARIndirectOp. A far return crosses the same boundary.
++  FEXCore::Context::BoxedWineNoteGuestFarTransfer(Op->PC, "retf");
++
+   Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+   Ref NewRIP = Pop(SrcSize, SP);
+   Ref NewSegmentCS = Pop(SrcSize, SP);
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -49,6 +49,20 @@
+ FEX_DEFAULT_VISIBILITY void BoxedWineNoteGuestIRET(uint64_t GuestRIP);
+ // Returns and clears the address a pending iretq was translated at, or zero.
+ FEX_DEFAULT_VISIBILITY uint64_t BoxedWineTakeGuestIRETNote();
++// Records that a far transfer -- a far jump, far call or far return -- was
++// translated at this guest address. `Kind` must be a string literal; it is
++// stored by pointer and printed with the block that the transfer landed in.
++// Wine's WoW64 layer enters 32-bit code through an indirect far jump and
++// returns through another, and the translator lowers both as a RIP change plus
++// a stored cs_idx with no change of decode mode, so the block compiled after
++// one is the exact boundary where 32-bit code starts being decoded as 64-bit.
++// Bounded on its own budget: the block trace's budget is spent during startup,
++// long before the transfer worth watching.
++FEX_DEFAULT_VISIBILITY void BoxedWineNoteGuestFarTransfer(uint64_t GuestRIP, const char* Kind);
++// Returns and clears the address a pending far transfer was translated at, or
++// zero, writing its kind through `Kind` when one is pending. Counts the report
++// against the far-transfer budget.
++FEX_DEFAULT_VISIBILITY uint64_t BoxedWineTakeGuestFarTransferNote(const char** Kind);
+ 
+ enum OperatingMode {
+   MODE_32BIT,
