@@ -108,6 +108,27 @@
 #define K_X64_WOW64_MODULE_COUNT 3
 #define K_X64_WOW64_MODULE_NAMES {"wow64.dll", "wow64win.dll", "wow64cpu.dll"}
 
+// The 32-bit builtins the lane's own import chain reaches before a Windows
+// program runs a single instruction of its own code. Every name here was
+// observed being resolved by a device run of a 32-bit Direct3D 9 probe: the
+// loader entered 32-bit mode at ntdll's WoW64 entry, mapped kernel32,
+// kernelbase, advapi32, sechost, msvcrt, ucrtbase, gdi32, user32, win32u,
+// opengl32, wined3d and d3d9 out of the projected i386-windows tree, then
+// searched the whole module path for zlib1.dll -- which 32-bit wined3d
+// imports -- found nothing, and exited STATUS_DLL_NOT_FOUND (0xc0000135)
+// before reaching the program's entry point.
+//
+// The 64-bit tree carries zlib1.dll; the packaged 32-bit tree did not. Wine
+// reports that difference only as a process that never started, which on
+// screen is indistinguishable from a program that ran and drew nothing. The
+// names are therefore checked where the tree is built and reported again at
+// launch, so the gap is named rather than inferred.
+#define K_X64_WOW64_LANE_PE32_MODULE_COUNT 14
+#define K_X64_WOW64_LANE_PE32_MODULE_NAMES \
+    {"ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll", \
+     "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll", "user32.dll", \
+     "win32u.dll", "opengl32.dll", "wined3d.dll", "d3d9.dll", "zlib1.dll"}
+
 // The builtin whose absence is the failure this layout exists to prevent. It
 // is the first PE module Wine loads after the server handshake, so a guest
 // that cannot see this file gets as far as Windows code and no further.
@@ -174,6 +195,14 @@ inline std::string guestLibraryPathAssignment() {
 // winemetal.so once it is a module-root builtin.
 inline std::vector<std::string> x64DxmtModuleNames() {
     return K_X64_DXMT_MODULE_NAMES;
+}
+
+// The 32-bit builtins a Windows program binds to before its own entry point
+// runs. Returned as a list rather than searched for on demand so the launch
+// can report the whole gap at once: one missing name ends the process with a
+// status no window ever shows.
+inline std::vector<std::string> x64Wow64LanePe32ModuleNames() {
+    return K_X64_WOW64_LANE_PE32_MODULE_NAMES;
 }
 
 // Only a real file is projected over a module-root builtin; a directory or a

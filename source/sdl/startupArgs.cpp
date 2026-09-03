@@ -211,6 +211,32 @@ static void projectX64WinePe32Modules(const BString& winePrefix) {
     }
     klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=i386-windows status=projected destination=%s projected=%u",
              syswow64.c_str(), pe32Projected);
+
+    // What the projection produced, checked against the import chain every
+    // 32-bit Windows program walks before its own entry point runs. A device
+    // run projected 784 modules and still had no zlib1.dll, which 32-bit
+    // wined3d imports: the loader searched syswow64, system, windows and the
+    // program's own directory, found nothing, and ended the process with
+    // STATUS_DLL_NOT_FOUND. Nothing in that sequence names the missing module
+    // -- the search trace is hundreds of stat lines and the program simply
+    // never appears -- so name it here, once, before any process starts.
+    //
+    // The list is the budget: at most one line per required module and one
+    // summary, whatever the state of the tree.
+    const std::vector<std::string> lanePe32Modules =
+        boxedvn::x64Wow64LanePe32ModuleNames();
+    U32 pe32Missing = 0;
+    for (const std::string& name : lanePe32Modules) {
+        const BString probe = syswow64 + "/" + name.c_str();
+        if (Fs::getNodeFromLocalPath(B(""), probe, false) != nullptr) {
+            continue;
+        }
+        ++pe32Missing;
+        klog_fmt("BOXEDWINE_X64_PE32_GAP name=%s destination=%s status=missing",
+                 name.c_str(), probe.c_str());
+    }
+    klog_fmt("BOXEDWINE_X64_PE32_GAP tree=i386-windows required=%u missing=%u",
+             (U32)lanePe32Modules.size(), pe32Missing);
 }
 
 // Wine strips "64" from its own loader name to find the loader for a 32-bit

@@ -532,9 +532,22 @@ if zip_has "${WINE_ARCHIVE}" "${PE32_DIR}"; then
     die "'$(basename "${WINE_ARCHIVE}")' carries an i386-windows tree; the 32-bit builtins belong in wine64-pe32.zip until the app mounts them."
 fi
 check_zip_path "${PE32_ARCHIVE}" "${PE32_DIR}"
-for required_pe32 in ntdll.dll kernel32.dll; do
+# The whole import chain a 32-bit Windows program walks before its own entry
+# point runs, taken from a device run of a 32-bit Direct3D 9 probe. The run
+# resolved all of these but zlib1.dll, which 32-bit wined3d imports and which
+# the amd64 package carries and the staged i386 tree did not; the process
+# ended STATUS_DLL_NOT_FOUND (0xc0000135) with no message. Presence is checked
+# for every name because the archive is what ships; the image class is checked
+# for the two the loader binds to first, which is where a tree built from the
+# wrong package announces itself.
+for required_pe32 in ntdll.dll kernel32.dll kernelbase.dll advapi32.dll \
+                     sechost.dll msvcrt.dll ucrtbase.dll gdi32.dll \
+                     user32.dll win32u.dll opengl32.dll wined3d.dll \
+                     d3d9.dll zlib1.dll; do
     check_zip_path "${PE32_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
-    check_zip_entry_pe32_i386 "${PE32_ARCHIVE}" "${PE32_DIR}/${required_pe32}"
+done
+for classed_pe32 in ntdll.dll kernel32.dll; do
+    check_zip_entry_pe32_i386 "${PE32_ARCHIVE}" "${PE32_DIR}/${classed_pe32}"
 done
 # The 64-bit tree staying 64-bit is what the loop above already proves for
 # ntdll, kernel32 and kernelbase; the thunk modules are held to the same class,

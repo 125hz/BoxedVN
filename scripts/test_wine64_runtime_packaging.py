@@ -107,7 +107,17 @@ PE32_DIR = ROOT + "/i386-windows"
 # cannot be mapped by the guest at all.
 PE32_MACHINE = 0x014C
 PE32PLUS_MACHINE = 0x8664
-PE32_MODULES = ("ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll")
+# The 32-bit builtins a Windows program's import chain reaches before its own
+# entry point runs, taken from a device run of a 32-bit Direct3D 9 probe. That
+# run resolved every one of these out of the projected i386-windows tree
+# except zlib1.dll, which 32-bit wined3d imports: the 64-bit tree carried it,
+# the staged 32-bit tree did not, and the process ended STATUS_DLL_NOT_FOUND
+# (0xc0000135) with no message and no window. The archive is checked against
+# this list precisely because the failure it prevents is silent.
+PE32_MODULES = ("ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll",
+                "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll",
+                "user32.dll", "win32u.dll", "opengl32.dll", "wined3d.dll",
+                "d3d9.dll", "zlib1.dll")
 # Wine's own WoW64 thunking layer, which lives in the 64-bit tree even though
 # it exists to serve 32-bit code: ntdll loads wow64.dll to build the 32-bit
 # process, wow64win.dll thunks user/GDI syscalls into the 64-bit win32u, and
@@ -980,6 +990,23 @@ class Wow64ArchiveValidation(WineserverArchiveValidation):
                 self.assertIn(wow64_module, output)
             self.assertIn("i386-windows -> /" + PE32_DIR, output)
 
+    def test_a_32_bit_tree_missing_one_import_chain_module_is_rejected(self) -> None:
+        # The failure this reproduces: a tree carrying ntdll, kernel32 and
+        # every other builtin the loader binds to, and not zlib1.dll, which
+        # 32-bit wined3d imports. The old check passed such a tree, and the
+        # 32-bit process then exited STATUS_DLL_NOT_FOUND before its entry
+        # point with nothing on screen to say why.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(
+                directory, server,
+                pe32_modules=tuple(name for name in PE32_MODULES
+                                   if name != "zlib1.dll"))
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("zlib1.dll", output)
+
     def test_a_runtime_without_the_32_bit_tree_is_rejected(self) -> None:
         # A 64-bit-only runtime satisfies every path the checker required
         # before this lane existed, which is exactly why it is checked.
@@ -1186,3 +1213,33 @@ class Wow64LayoutHeaderContract(unittest.TestCase):
         self.assertIn('"${WINE_MODULE_ROOT}/i386-windows"', builder)
         self.assertIn('PE32_DIR="${WINE_MODULE_ROOT}/i386-windows"', validator)
         self.assertEqual(PE32_DIR, "usr/lib/x86_64-linux-gnu/wine/i386-windows")
+
+    def test_every_layer_names_the_same_32_bit_import_chain(self) -> None:
+        # Three places decide whether a 32-bit program can start: the builder
+        # stages the tree, the validator gates the archive, and the launch
+        # reports what the projection actually produced. A name present in one
+        # and missing from another is how zlib1.dll shipped absent in the
+        # first place.
+        header = (REPO / "include" / "guest_wine64_layout.h").read_text(
+            encoding="utf-8")
+        builder = BUILDER.read_text(encoding="utf-8")
+        validator = VALIDATOR.read_text(encoding="utf-8")
+        self.assertIn(
+            "#define K_X64_WOW64_LANE_PE32_MODULE_COUNT "
+            + str(len(PE32_MODULES)),
+            header)
+        self.assertIn("WOW64_LANE_PE32_MODULES=(", builder)
+        for lane_module in PE32_MODULES:
+            self.assertIn('"' + lane_module + '"', header, lane_module)
+            self.assertIn(lane_module, builder, lane_module)
+            self.assertIn(lane_module, validator, lane_module)
+
+    def test_the_launch_reports_the_32_bit_modules_the_projection_lacks(self) -> None:
+        # A device run that ends before the program's entry point leaves only
+        # the search trace to read, and that trace is hundreds of stat lines
+        # that never name what was not found. The projection reports the gap
+        # itself, bounded by the size of the list.
+        startup = (REPO / "source" / "sdl" / "startupArgs.cpp").read_text(
+            encoding="utf-8")
+        self.assertIn("x64Wow64LanePe32ModuleNames", startup)
+        self.assertIn("BOXEDWINE_X64_PE32_GAP", startup)

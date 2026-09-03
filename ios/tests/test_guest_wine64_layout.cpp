@@ -87,6 +87,34 @@ BOXEDVN_TEST(wine64_layout_places_the_32_bit_pe_tree_beside_the_64_bit_one) {
              std::string(K_X64_WINE_MODULE_ROOT) + "/x86_64-unix");
 }
 
+BOXEDVN_TEST(wine64_layout_names_the_32_bit_import_chain_a_program_needs) {
+    // A device run of a 32-bit Direct3D 9 probe entered 32-bit mode at ntdll's
+    // WoW64 entry and resolved every one of these out of the projected tree
+    // except zlib1.dll, which 32-bit wined3d imports. The 64-bit tree carried
+    // it and the 32-bit tree did not, so the process ended
+    // STATUS_DLL_NOT_FOUND before its own entry point -- a program that never
+    // appears rather than an error anything reports.
+    const std::vector<std::string> names =
+        boxedvn::x64Wow64LanePe32ModuleNames();
+    CHECK_EQ(names.size(), (size_t)K_X64_WOW64_LANE_PE32_MODULE_COUNT);
+    for (const char* expected : {"ntdll.dll", "kernel32.dll", "kernelbase.dll",
+                                 "advapi32.dll", "sechost.dll", "msvcrt.dll",
+                                 "ucrtbase.dll", "gdi32.dll", "user32.dll",
+                                 "win32u.dll", "opengl32.dll", "wined3d.dll",
+                                 "d3d9.dll", "zlib1.dll"}) {
+        CHECK(std::find(names.begin(), names.end(), std::string(expected)) !=
+              names.end());
+    }
+    // These are 32-bit builtins, not Wine's 64-bit WoW64 thunking layer: the
+    // thunk modules live in the x86_64-windows tree and serve the lane from
+    // the other side of the transition.
+    for (const std::string& thunk : {std::string("wow64.dll"),
+                                     std::string("wow64win.dll"),
+                                     std::string("wow64cpu.dll")}) {
+        CHECK(std::find(names.begin(), names.end(), thunk) == names.end());
+    }
+}
+
 BOXEDVN_TEST(wine64_layout_names_wines_own_wow64_thunk_modules) {
     const char* const names[] = K_X64_WOW64_MODULE_NAMES;
     CHECK_EQ(sizeof(names) / sizeof(names[0]),

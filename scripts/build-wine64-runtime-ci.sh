@@ -45,6 +45,21 @@ WINE_MODULE_ROOT="/usr/lib/x86_64-linux-gnu/wine"
 # the 64-bit Unix process.
 I386_PE_DIR=""
 I386_PE_GUEST_DIR="${WINE_MODULE_ROOT}/i386-windows"
+# The 32-bit builtins a Windows program's import chain reaches before its own
+# entry point runs, taken from a device run of a 32-bit Direct3D 9 probe: the
+# loader switched to 32-bit mode at ntdll's WoW64 entry and resolved every one
+# of these except zlib1.dll, which 32-bit wined3d imports. That one was in the
+# amd64 package's x86_64-windows tree and not in the staged i386-windows tree,
+# so the loader searched syswow64, system, windows and the program's own
+# directory, found nothing, and ended the process with STATUS_DLL_NOT_FOUND
+# (0xc0000135) -- which on screen is a program that never appears, not an
+# error. Checked here so a tree that cannot run a 32-bit program fails the
+# build instead of shipping.
+WOW64_LANE_PE32_MODULES=(
+    ntdll.dll kernel32.dll kernelbase.dll advapi32.dll sechost.dll
+    msvcrt.dll ucrtbase.dll gdi32.dll user32.dll win32u.dll
+    opengl32.dll wined3d.dll d3d9.dll zlib1.dll
+)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir needs a value"
@@ -422,11 +437,28 @@ I386_PE_MODULE_COUNT=0
 if [[ -n "${I386_PE_DIR}" ]]; then
     mkdir -p "${PE32_STAGE}${I386_PE_GUEST_DIR}"
     cp -aL "${I386_PE_DIR}/." "${PE32_STAGE}${I386_PE_GUEST_DIR}/"
-    for required_pe32 in ntdll.dll kernel32.dll; do
+    # Every module the lane binds to, reported together. One name at a time
+    # would hide the shape of the gap: a tree missing only zlib1.dll came from
+    # the right package and lost one module, while a tree missing ten of these
+    # came from the wrong place entirely, and the fix is different.
+    missing_pe32=()
+    for required_pe32 in "${WOW64_LANE_PE32_MODULES[@]}"; do
         pe32_path="${PE32_STAGE}${I386_PE_GUEST_DIR}/${required_pe32}"
-        [[ -s "${pe32_path}" ]] \
-            || die "The i386 PE tree has no ${required_pe32}: ${pe32_path}. Extract libwine:i386 of the same version as the installed amd64 libwine."
+        [[ -s "${pe32_path}" ]] || missing_pe32+=("${required_pe32}")
     done
+    if (( ${#missing_pe32[@]} > 0 )); then
+        # Whether the same name exists in the 64-bit tree says where to look:
+        # a module Wine built for x86-64 and not for i386 is a gap in the i386
+        # package, not in this staging step.
+        for absent_pe32 in "${missing_pe32[@]}"; do
+            if [[ -s "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${absent_pe32}" ]]; then
+                warn "i386-windows/${absent_pe32} is missing and x86_64-windows/${absent_pe32} is present: the i386 package did not carry it."
+            else
+                warn "i386-windows/${absent_pe32} is missing, and neither does the 64-bit tree carry it."
+            fi
+        done
+        die "The staged i386-windows tree is missing ${#missing_pe32[@]} of the ${#WOW64_LANE_PE32_MODULES[@]} builtins a 32-bit Windows program loads before its own entry point (${missing_pe32[*]}). A 32-bit process that cannot resolve one of them exits STATUS_DLL_NOT_FOUND (0xc0000135) with no message and no window. Extract libwine:i386 of the same version as the installed amd64 libwine and stage its whole i386-windows tree."
+    fi
     require_pe_machine "${PE32_STAGE}${I386_PE_GUEST_DIR}/ntdll.dll" 332 \
         "32-bit PE builtin"
     I386_PE_MODULE_COUNT="$(find "${PE32_STAGE}${I386_PE_GUEST_DIR}" -type f | wc -l | tr -d ' ')"

@@ -6637,3 +6637,76 @@ than zero, then the 32-bit loader continuing past `loader_init` into
 `init_wow64` and the first WoW64 system call, which shows as a return to
 `mode=64`. A fault that still lands in the first 32-bit frames should now name
 an argument the stack dump can be read against.
+
+## The 32-bit lane reached the loader and died on one missing DLL
+
+The return-slot width fix worked. The run at 00:38 gets the whole way through
+the mode transition and into 32-bit Wine, and the trace reads cleanly for the
+first time.
+
+`IRET_POST from=0x7bce1204 rip=0x7bd65a00 ... cs=0x23 ... decode=32` puts the
+thread at `LdrInitializeThunk` in 32-bit mode with `rsp=0x22fd10`, and
+`SEG32_GPRS` then marches through 32-bit ntdll exactly as the last run asked
+it to: `loader_init` at 0x7bd43210, `RtlEnterCriticalSection` at 0x7bd69af0
+with `rbx=0x7bd7a2c0` rather than zero, and out the other side. `init_wow64`
+follows, and from 0x7bd63580 onward the lane makes seven WoW64 system calls --
+each one a `MODE_SWITCH ... cs=0x33 mode=64` into a 64-bit thunk at
+0x7fffff8e____, then a `MODE_SWITCH ... cs=0x23 mode=32` back to the
+instruction after the call. Every one of them was served. No
+`unimplemented syscall`, no ENOSYS, no hostcall refusal, and no fault with
+`decode=32` or `cs=0x23` anywhere in the run.
+
+The loader mapped its modules too. `DLL_SEARCH` shows kernel32, kernelbase,
+advapi32, sechost, msvcrt, ucrtbase, gdi32, user32, win32u, opengl32, wined3d
+and d3d9 all resolving out of `c:/windows/syswow64` with `result=0`. So the
+32-bit Direct3D 9 lane binds Wine's own wined3d over opengl32, not DXVK and
+not a stub; DXMT is the D3D11 path and is not in this chain at all.
+
+One name never resolved. `zlib1.dll`, which 32-bit wined3d imports, missed
+`syswow64`, then `c:/windows/system`, then `c:/windows`, then the program's
+own directory, and the loader gave up: `exit_group syscall,
+status=3221225781` -- 0xC0000135, STATUS_DLL_NOT_FOUND -- with the tail ring
+recording `nr=231 (exit_group) a=(0xc0000135,...)`. The 32-bit program never
+reached its entry point, which is why the screen stayed on "Starting Wine".
+The stop was ours, not the user's.
+
+The gap is packaging, and it is one-sided. `MODULE_OVERLAY tree=i386-windows
+status=projected ... projected=784` says the 32-bit tree was mounted and
+projected; `system32/zlib1.dll` resolves for the 64-bit lane in the same
+session. The amd64 package carried the module and the staged i386 tree did
+not, and nothing between the two noticed: the builder required only ntdll and
+kernel32 of the 32-bit tree, and the validator checked the same two.
+
+So the check now covers the whole chain a 32-bit Windows program walks before
+its own entry point -- the fourteen names above, taken from what this run
+actually resolved. `K_X64_WOW64_LANE_PE32_MODULE_NAMES` holds them;
+`scripts/build-wine64-runtime-ci.sh` fails the build naming every one the
+staged tree lacks and saying, per name, whether the 64-bit tree has it (the
+i386 package dropped it) or neither does (the extraction is wrong);
+`scripts/validate-wine64-runtime.sh` gates the shipped archive on the same
+list. A tree that cannot run a 32-bit program is now a build failure instead
+of a silent 0xC0000135 on device.
+
+The witness for the next run is `BOXEDWINE_X64_PE32_GAP`, emitted by the
+projection itself: one line per required module the projection did not
+produce, plus `tree=i386-windows required=N missing=N`. Fourteen lines at
+worst, before any process starts. The search trace that had to be read this
+time was 497 `DLL_SEARCH` lines that never name what was not found, and it ran
+out of budget four lines before the exit.
+
+On the FS-selector trap, the arithmetic does not support doing the IR work
+yet. Every `X64_SEGMENT_WRITE` in the run -- 25 logged plus 8 suppressed -- is
+the same instruction at `rip=0x7a4025fa73` (`65 8e 24 25 38 03 00 00`,
+`mov fs, [gs:0x338]`), writing selector 0x63 over selector 0x63 with the base
+already loaded (`fs=0x7ffc2000` in the surrounding IRET reports). They cost
+about 1.1 s of wall clock, and every one of them lands before the transition
+at 08.353. Across the seven WoW64 system calls the 32-bit lane then made,
+there is not one. The trap is a one-time cost in the 64-bit setup path, not a
+per-syscall tax on the 32-bit lane; the compare-and-branch skip would recover
+that second and nothing that is blocking.
+
+Packaging note for the runtime build: `libwine:i386` has to supply
+`i386-windows/zlib1.dll`. If the version the workflow downloads genuinely does
+not carry it, the build will now say so by name on the first run, and the
+module has to come from the same Wine version by another route -- the archive
+cannot ship without it and run a 32-bit program.
