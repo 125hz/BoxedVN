@@ -6253,3 +6253,133 @@ three-block split around a non-terminating `Break` -- on the path every WoW64
 syscall return takes, with no way to compile or run it here. It would confound
 the run that has to answer the EBX question. The shape is recorded; the change
 is not.
+
+## Map returned a pointer the guest had no mapping for
+
+`ID3D11DeviceContext::Map` on a `D3D11_USAGE_DYNAMIC` buffer handed the
+application the address Metal reports for its own allocation. That address is
+an allocation of the host process. The guest's translated writes go through
+one address rule -- `(guest | 0x7800000000) & ~0x7F8000000000`, the identity
+for the high lane, an alias for everything below 8 GiB, a relocation for
+Wine's top arena (include/guest_low_alias.h) -- so a host heap pointer like
+0x158798130 is not a host pointer at all when the guest writes through it: it
+is read as a canonical low guest address and aliased to 0x7958798130, where
+nothing is mapped. That is exactly the reported fault: guest RIP
+0x140002d96, address 0x7958798130, ACCERR. Every real Direct3D 11 program
+maps a dynamic constant or vertex buffer per frame, so this was the whole
+graphics path, not one probe.
+
+What memory the guest can reach is settled by the address space, not by the
+kernel's page table: in native identity mode `KMemory64::nativeMapAnonymous`
+issues a real host `MAP_FIXED` at the translated address for the whole range
+(source/kernel/kmemory64.cpp), and the translator dereferences it with the OR
+and the mask and nothing else. So guest-reachable means "mapped at a host
+address inside one of the three lanes", and the only party that can guarantee
+that for a Metal buffer is the guest itself.
+
+DXMT already knows how to do that. `BufferAllocationFlag::CpuPlaced` makes the
+caller allocate the storage and the unix side wrap it with
+`newBufferWithBytesNoCopy`, and upstream sets it under `#ifdef __i386__` --
+for the same reason, one word narrower. The port now takes that path too. The
+condition is the build rather than the word size (the guest PE half is the
+x86-64 target that also defines `DXMT_IOS`; the native half defines
+`DXMT_NATIVE` and is arm64), and it is applied in `BufferAllocation`'s
+constructor to every allocation that is not GPU-private rather than at the
+call sites that upstream annotated: an allocation reached through a path that
+forgot the flag would hand out a host address again, and the result is a wild
+write inside the application rather than a diagnosable failure. Placement
+alignment moves from `DXMT_PAGE_SIZE` (4096) to the 16 KiB iOS device page,
+and the request is rounded up to it, because `newBufferWithBytesNoCopy` wants
+a page-aligned pointer and wires whole pages; the translation only sets high
+bits, so aligning the guest pointer aligns the host address the bytes live
+at. The page a suballocating allocation carves up follows the same size, so a
+dynamic buffer is one host page rather than a 4 KiB page rounded up to one
+with three quarters of it wasted, and it now holds four times as many
+suballocations between renames.
+
+Two things fall out of the same change. A linear texture's mapped image and
+an occlusion query's visibility-result heap took the identical
+Metal-owned-pointer path and would have faulted the same way the moment
+either was read; both are placed now. And `dummy_cbuffer_host_`, which was
+always allocated by the caller, was aligned to 4 KiB, which is not a page on
+this device -- it now follows the placement alignment like the rest.
+
+The other half closes the hole permanently. `_MTLDevice_newBuffer` used to
+write `[buffer contents]` back into the caller's `WMTBufferInfo` whenever
+Metal owned the storage -- that assignment is the one place a host address
+entered guest-visible memory, and the guest-pointer rewrite cannot catch it
+because it is a write, not a read. It now reports no mapping instead, and
+DXMT falls back to copying through `MTLBuffer_updateContents`, which runs on
+the host side. Nothing that is expected to be mapped takes that branch any
+more.
+
+Both changes are unified diffs in scripts/dxmt-patches, applied by
+build-dxmt-ios-native.sh and build-dxmt-x64-pe.sh with the reverse-check
+idempotency the FEX patches use, and applied by both because the two halves
+are compiled from separate trees and have to agree about where a mapped
+buffer's memory lives. The native patch is ordered before the guest-pointer
+rewrite, which reads the same file and counts its dereference sites; it adds
+none.
+
+The witness is `BOXEDVN_DXMT_BUFFER_MEMORY path=caller-placed|metal-owned
+host= len= buffer= guest_visible=`, eight lines. What the next device run has
+to show is `path=caller-placed guest_visible=1` for the buffers created
+around the first draw, and a `host=` in one of the two alias windows rather
+than in the host heap. A `path=metal-owned` line for anything the application
+then maps would name the allocation whose flag is still wrong.
+
+## The translator was asleep: start.exe owned the desktop launch
+
+Exactly one process per session is translated, and in the 64-bit desktop it
+was the wrong one. In the 21:23:27 run pid 10 -- the only process with
+`parent_fex=1` -- sat at `state=waiting cpu=0.0%` from 21:23:48 to the end of
+the log, while explorer (pid 39) and winefile (pid 45) did every bit of the
+desktop's work on the sparse interpreter. That is the sluggishness.
+
+The tree, read from the fork/exec markers: pid 10 is the launched loader
+(`wine explorer /desktop=shell,800x600 winefile D:\`), which execs
+wine-preloader and then wine in place and keeps FEX
+(`BOXEDWINE_X64_EXEC pid=10 ... fex=1 native=1`). It forks the wineserver
+(12 -> 14, `wineserver -p`), then wineboot (16 -> 18, `--init`), which starts
+services.exe (20 -> 22), which starts winedevice.exe (25 -> 27) -- the mount
+manager that exits 0 for want of a drivers directory. wineboot exits at
+21:23:47, and pid 10 then maps a PE the wineserver had just opened:
+`start.exe`. Its manifest lookup names it outright
+(`pid=10 op=stat path='.../system32/start.exe.manifest'`). start.exe
+CreateProcesses the desktop -- 10 -> 37 -> 39, the double fork every Wine
+`NtCreateUserProcess` does -- with argv identical to pid 10's, and explorer
+in turn spawns winefile (39 -> 43 -> 45) and its helpers (47, 49, 51...).
+
+Why start.exe at all: Wine's unix loader resolves argv[1] as a path before
+anything else, and the bare word `explorer` is not one. Not finding an image,
+it loads `start.exe` as the main image and prepends `/exec`, which is how
+`wine notepad` works on any host. start.exe resolves the name through the
+Windows path, launches it, and -- because of `/exec` -- waits. Upstream that
+costs one idle process; here it costs the translator, because the process
+holding it is the one that waits.
+
+So the launch names the image the loader can resolve:
+`C:\windows\system32\explorer.exe` (present in this prefix -- the cube run
+logs `op=stat ... explorer.exe result=0` when win32u starts the default
+desktop). The launched process then *is* explorer, and the desktop's windows,
+GDI and DXMT presentation are what FEX runs. If the path ever went missing the
+loader would fall back to start.exe again, i.e. to today's behaviour, so the
+change cannot fail worse than it already is. The 32-bit lane keeps the bare
+name; it has no per-process translator to place.
+
+Handing the translator to an exec'ing fork child instead was considered and
+cannot work: the parent's KMemory64 is torn down only by its own execve or its
+exit, so while start.exe waits every one of its pages is still mapped at the
+identity address the child would need. Keeping FEX across a *process's own*
+exec is already the rule and is what carries pid 10 from the loader to
+wine-preloader to wine -- exec replaces the address space, so the mapping is
+reused rather than duplicated.
+
+The witness is `BOXEDWINE_X64_FEX_PROCESS pid= cmd=`, written wherever a
+process takes or keeps the translator: once at launch and once per exec that
+keeps it. The next desktop log should carry it for pid 10 naming
+explorer.exe, and no `start.exe` line anywhere. The cube lane is unchanged and
+is the regression check: its pid 10 already runs the probe itself
+(`cmd='...boxedvn-d3d11-cube-x64.exe'`), and its 10 -> 37 -> 39 is win32u
+starting `C:\windows\system32\explorer.exe /desktop` for the default
+desktop, which is a helper and belongs on the interpreter.

@@ -54,6 +54,38 @@ for tool in x86_64-w64-mingw32-clang x86_64-w64-mingw32-clang++ \
     [[ -x "${MINGW_BIN}/${tool}" ]] || die "Missing llvm-mingw tool '${MINGW_BIN}/${tool}'."
 done
 
+# --- pinned-source patches --------------------------------------------------
+#
+# DXMT is built from a pinned commit, and the changes this port needs to that
+# source live as unified diffs in scripts/dxmt-patches rather than as commits
+# in the checkout: the pin stays readable, and a patch the pin outgrows fails
+# the build instead of rotting silently. Both DXMT builds apply the whole
+# directory. They compile different halves from separate trees - this one the
+# guest PE DLLs, build-dxmt-ios-native.sh the native Metal side - and the two
+# halves agree on where a mapped buffer's memory lives, so they must not be
+# patched differently.
+#
+# Idempotent: a tree that already carries a patch reverses it cleanly, which
+# is what a restored CI cache looks like.
+apply_dxmt_patches() {
+    local tree="$1" patch name
+    require_command git
+    for patch in "${BOXEDVN_ROOT}"/scripts/dxmt-patches/*.patch; do
+        [[ -f "${patch}" ]] || die "No DXMT patches found in scripts/dxmt-patches."
+        name="$(basename "${patch}")"
+        if git -C "${tree}" apply --reverse --check "${patch}" 2>/dev/null; then
+            ok "dxmt patch already applied: ${name}"
+            continue
+        fi
+        git -C "${tree}" apply --check "${patch}" \
+            || die "DXMT patch ${name} no longer applies to the pinned source in
+${tree}. The pin moved or upstream fixed this. Re-cut the patch deliberately."
+        git -C "${tree}" apply "${patch}" || die "Could not apply ${name}."
+        ok "dxmt patch applied: ${name}"
+    done
+}
+apply_dxmt_patches "${DXMT_SOURCE}"
+
 TOOLCHAIN_ROOT="$(dirname "${MINGW_ROOT}")"
  # DXMT's airconv Meson file includes ../../toolchains/llvm/include from the
  # source tree, so the Windows LLVM install must live at this exact path.

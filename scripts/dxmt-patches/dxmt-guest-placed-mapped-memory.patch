@@ -1,0 +1,209 @@
+diff --git a/src/dxmt/dxmt_buffer.cpp b/src/dxmt/dxmt_buffer.cpp
+index 7c56159..42a4c7b 100644
+--- a/src/dxmt/dxmt_buffer.cpp
++++ b/src/dxmt/dxmt_buffer.cpp
+@@ -1,5 +1,6 @@
+ #include "dxmt_buffer.hpp"
+ #include "dxmt_format.hpp"
++#include "dxmt_guest_placed.hpp"
+ #include "thread.hpp"
+ #include "util_likely.hpp"
+ #include "util_math.hpp"
+@@ -18,13 +19,25 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
+   // (sub)allocate a minimum of 256B buffer so that texture can be created
+   info_.length = std::max(info_.length, 256ull);
+   suballocation_size_ = info_.length;
+-  if (flags_.test(BufferAllocationFlag::SuballocateFromOnePage) && suballocation_size_ <= DXMT_PAGE_SIZE) {
++  if (flags_.test(BufferAllocationFlag::SuballocateFromOnePage) &&
++      suballocation_size_ <= DXMT_SUBALLOCATION_PAGE_SIZE) {
+     suballocation_size_ = align(info_.length, 16);
+-    suballocation_count_ = DXMT_PAGE_SIZE / suballocation_size_;
+-    info_.length = DXMT_PAGE_SIZE;
++    suballocation_count_ = (uint32_t)(DXMT_SUBALLOCATION_PAGE_SIZE / suballocation_size_);
++    info_.length = DXMT_SUBALLOCATION_PAGE_SIZE;
+   }
++#ifdef DXMT_GUEST_PLACED_MEMORY
++  // BoxedVN: the mapped pointer of any allocation the CPU can see is handed to
++  // the application, which runs in the guest address space. Place all of them,
++  // not only the ones whose call sites were annotated: an allocation reached
++  // through a path that forgot the flag would hand out a host address, and the
++  // fault it causes is a wild write inside the application rather than a
++  // diagnosable failure here. A GPU-private allocation has no CPU mapping at
++  // all and is left to Metal.
++  if (!flags_.test(BufferAllocationFlag::CpuInvisible))
++    flags_.set(BufferAllocationFlag::CpuPlaced);
++#endif
+   if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
+-    placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
++    placed_buffer = wsi::aligned_malloc(guest_placed_size(info_.length), DXMT_GUEST_PLACED_ALIGNMENT);
+     info_.memory.set(placed_buffer);
+   }
+   obj_ = device.newBuffer(info_);
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 2f0b176..f47ed46 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -2,6 +2,7 @@
+ #include "Metal.hpp"
+ #include "dxmt_command_queue.hpp"
+ #include "dxmt_format.hpp"
++#include "dxmt_guest_placed.hpp"
+ #include "dxmt_occlusion_query.hpp"
+ #include "dxmt_presenter.hpp"
+ #include "wsi_platform.hpp"
+@@ -34,7 +35,9 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
+   dummy_sampler_info_.max_anisotroy = 1;
+   dummy_sampler_info_.lod_average = false;
+   dummy_sampler_ = device.newSamplerState(dummy_sampler_info_);
+-  dummy_cbuffer_host_ = wsi::aligned_malloc(65536, DXMT_PAGE_SIZE);
++  // BoxedVN: this one was always placed in caller memory; only its alignment
++  // needed to follow the host page size (see dxmt_guest_placed.hpp).
++  dummy_cbuffer_host_ = wsi::aligned_malloc(guest_placed_size(65536), DXMT_GUEST_PLACED_ALIGNMENT);
+   dummy_cbuffer_info_.length = 65536;
+   dummy_cbuffer_info_.memory.set(dummy_cbuffer_host_);
+   dummy_cbuffer_info_.options = WMTResourceOptionCPUCacheModeWriteCombined | WMTResourceStorageModeShared |
+diff --git a/src/dxmt/dxmt_guest_placed.hpp b/src/dxmt/dxmt_guest_placed.hpp
+new file mode 100644
+index 0000000..e85b70c
+--- /dev/null
++++ b/src/dxmt/dxmt_guest_placed.hpp
+@@ -0,0 +1,73 @@
++#pragma once
++
++/*
++ * BoxedVN: memory a mapped resource hands to the application must be memory
++ * the guest can address.
++ *
++ * DXMT normally lets Metal own the storage of a CPU-visible buffer and hands
++ * the pointer Metal reports (MTLBuffer.contents) straight back to the caller
++ * of ID3D11DeviceContext::Map. That is correct when the caller and Metal share
++ * one address space. It is not correct when the caller is emulated: the
++ * pointer is a host allocation of the emulator process, and the guest has no
++ * mapping for it, so the first write through a mapped D3D11_USAGE_DYNAMIC
++ * buffer faults.
++ *
++ * Upstream already solves this for the 32-bit guest, where a host pointer may
++ * simply not be representable: BufferAllocationFlag::CpuPlaced makes the guest
++ * allocate the storage itself and Metal wrap it with newBufferWithBytesNoCopy.
++ * The same is required, for the same reason, of a 64-bit guest whose address
++ * space is not the host's. This header decides when that applies and with what
++ * alignment; nothing about the mechanism changes.
++ *
++ * The condition is the build, not the word size: the guest PE build for this
++ * port is the x86-64 target that also defines DXMT_IOS (the native half of the
++ * same port defines DXMT_NATIVE and is compiled for arm64). Define
++ * DXMT_GUEST_PLACED_MEMORY on the command line to force it on elsewhere.
++ */
++
++#include <cstddef>
++
++#ifndef DXMT_PAGE_SIZE
++#define DXMT_PAGE_SIZE 4096
++#endif
++
++#if defined(__i386__)
++/* Upstream's own case; keep its alignment exactly as it was. */
++#define DXMT_GUEST_PLACED_MEMORY 1
++#define DXMT_GUEST_PLACED_ALIGNMENT ((size_t)DXMT_PAGE_SIZE)
++#elif defined(DXMT_IOS) && defined(__x86_64__) && !defined(DXMT_NATIVE)
++#define DXMT_GUEST_PLACED_MEMORY 1
++/*
++ * newBufferWithBytesNoCopy requires a host-page-aligned pointer, and an iOS
++ * device page is 16 KiB while DXMT_PAGE_SIZE is 4 KiB. The emulator's guest
++ * to host translation only sets high bits, so aligning the guest pointer
++ * aligns the host address the bytes actually live at.
++ */
++#define DXMT_GUEST_PLACED_ALIGNMENT ((size_t)16384)
++#else
++#define DXMT_GUEST_PLACED_ALIGNMENT ((size_t)DXMT_PAGE_SIZE)
++#endif
++
++/*
++ * The page a suballocating allocation carves up. Tied to the placement
++ * alignment so one placed page is exactly one host page: leaving it at 4 KiB
++ * and rounding the allocation up to 16 KiB would throw away the difference on
++ * every dynamic buffer, and these are allocated per frame. Identical to
++ * DXMT_PAGE_SIZE wherever placement is not in play.
++ */
++#define DXMT_SUBALLOCATION_PAGE_SIZE DXMT_GUEST_PLACED_ALIGNMENT
++
++namespace dxmt {
++
++/*
++ * Metal wires whole pages of a no-copy buffer, so a placed allocation owns
++ * every page it starts. Rounding the request up keeps those pages ours
++ * instead of borrowing whatever the allocator put next.
++ */
++inline size_t
++guest_placed_size(size_t length) {
++  const size_t alignment = DXMT_GUEST_PLACED_ALIGNMENT;
++  return (length + alignment - 1) & ~(alignment - 1);
++}
++
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_occlusion_query.hpp b/src/dxmt/dxmt_occlusion_query.hpp
+index 115ed35..af8e15b 100644
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "Metal.hpp"
++#include "dxmt_guest_placed.hpp"
+ #include "rc/util_rc_ptr.hpp"
+ #include "wsi_platform.hpp"
+ #include <atomic>
+@@ -165,8 +166,10 @@ public:
+       queries(queries) {
+         visibility_result_heap_info.options = WMTResourceHazardTrackingModeUntracked;
+         visibility_result_heap_info.memory.set(nullptr);
+-#ifdef __i386__
+-        visibility_result_heap_info.memory.set(wsi::aligned_malloc(num_results * sizeof(uint64_t), DXMT_PAGE_SIZE));
++#ifdef DXMT_GUEST_PLACED_MEMORY
++        visibility_result_heap_info.memory.set(wsi::aligned_malloc(
++            guest_placed_size(num_results * sizeof(uint64_t)), DXMT_GUEST_PLACED_ALIGNMENT
++        ));
+ #endif
+         visibility_result_heap_info.length = num_results * sizeof(uint64_t);
+         visibility_result_heap = device.newBuffer(visibility_result_heap_info);
+@@ -175,7 +178,7 @@ public:
+     for (auto query : queries) {
+       query->issue(seq_id, (uint64_t *)visibility_result_heap_info.memory.get(), num_results);
+     }
+-#ifdef __i386__
++#ifdef DXMT_GUEST_PLACED_MEMORY
+     wsi::aligned_free(visibility_result_heap_info.memory.get());
+ #endif
+   }
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 6bc945d..b29f109 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -1,4 +1,5 @@
+ #include "dxmt_texture.hpp"
++#include "dxmt_guest_placed.hpp"
+ #include "dxmt_residency.hpp"
+ #include "wsi_platform.hpp"
+ #include <atomic>
+@@ -69,7 +70,7 @@ TextureAllocation::TextureAllocation(
+ 
+ TextureAllocation::~TextureAllocation(){
+   mem_census_sub((MemOwner)census_owner_, census_bytes_);   /* ml677 */
+-#ifdef __i386__
++#ifdef DXMT_GUEST_PLACED_MEMORY
+   wsi::aligned_free(mappedMemory);
+ #endif
+ };
+@@ -182,8 +183,10 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
+     buffer_info.length = bytes_per_image_;
+     buffer_info.options = options;
+     buffer_info.memory.set(nullptr);
+-#ifdef __i386__
+-    buffer_info.memory.set(wsi::aligned_malloc(bytes_per_image_, DXMT_PAGE_SIZE));
++#ifdef DXMT_GUEST_PLACED_MEMORY
++    buffer_info.memory.set(
++        wsi::aligned_malloc(guest_placed_size(bytes_per_image_), DXMT_GUEST_PLACED_ALIGNMENT)
++    );
+ #endif
+     auto buffer = device_.newBuffer(buffer_info);
+     auto *ta = new TextureAllocation(this, std::move(buffer), buffer_info.memory.get(), info, bytes_per_row_, flags);

@@ -1,0 +1,53 @@
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 30cb25d..f188e11 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -181,6 +181,26 @@ _MTLCommandBuffer_encodeSignalEvent(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++/*
++ * BoxedVN: a witness for where a mapped buffer's memory came from.
++ *
++ * "caller-placed" means the caller allocated the storage and Metal wrapped it,
++ * so the address the caller later maps is one it can dereference. "metal-owned"
++ * means Metal allocated it, and the address is only meaningful in this process
++ * - which is why nothing is handed back for it below. Bounded: buffers are
++ * created continuously, and this is a statement about the path, not a trace.
++ */
++static void
++boxedvn_note_buffer_memory(int caller_placed, const void *host_memory, uint64_t length, id buffer) {
++  static _Atomic unsigned reported;
++  if (atomic_fetch_add(&reported, 1) >= 8)
++    return;
++  dprintf(STDERR_FILENO,
++          "BOXEDVN_DXMT_BUFFER_MEMORY path=%s host=%p len=%llu buffer=%p guest_visible=%d\n",
++          caller_placed ? "caller-placed" : "metal-owned", host_memory,
++          (unsigned long long)length, buffer, caller_placed);
++}
++
+ static NTSTATUS
+ _MTLDevice_newBuffer(void *obj) {
+   struct unixcall_mtldevice_newbuffer *params = obj;
+@@ -192,9 +212,20 @@ _MTLDevice_newBuffer(void *obj) {
+                                        length:info->length
+                                       options:(enum MTLResourceOptions)info->options
+                                   deallocator:NULL];
++    boxedvn_note_buffer_memory(1, [buffer contents], info->length, buffer);
+   } else {
+     buffer = [device newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
+-    info->memory.ptr = [buffer storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
++    /*
++     * BoxedVN: [buffer contents] is an address in this process only. Handing it
++     * back put a host heap pointer in the caller's WMTBufferInfo, from where it
++     * reached ID3D11DeviceContext::Map and the application wrote through it -
++     * the fault this port saw on the first mapped dynamic buffer. Report no
++     * mapping instead: DXMT then copies through MTLBuffer_updateContents, which
++     * runs on this side. Allocations the caller is expected to map place their
++     * own memory and take the branch above.
++     */
++    boxedvn_note_buffer_memory(0, [buffer contents], info->length, buffer);
++    info->memory.ptr = NULL;
+   }
+   params->ret = (obj_handle_t)buffer;
+   info->gpu_address = [buffer gpuAddress];
