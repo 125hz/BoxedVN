@@ -2913,9 +2913,9 @@ static U64 sys_sysinfo64(CPU64* cpu, U64 address) {
     const U64 totalPages = 262144; // 1 GB
     const U64 freePages = 196608;
 #endif
-    const U64 processCount = (U64)KSystem::processes.size();
+    const U64 processCount = (U64)KSystem::getProcessCount();
 
-    KMemory* memory = cpu->memory;
+    KMemory64* memory = cpu->memory;
     memory->memsetGuest(address, 0, 112);
     memory->writeq(address +  0, KSystem::getMilliesSinceStart() / 1000);
     memory->writeq(address + 32, totalPages);
