@@ -251,8 +251,13 @@ grep -q '^#define HAVE_OSS_SYSINFO_NUMAUDIOENGINES 1' "${BUILD}/include/config.h
 ok "configure accepted the OSSv4 <sys/soundcard.h>"
 
 log "Building dlls/wineoss.drv"
-make -C "${BUILD}" -j"${JOBS}" dlls/wineoss.drv \
-    || die "Building dlls/wineoss.drv failed."
+# Name the two output files, not the directory. "make dlls/wineoss.drv" asks
+# for a target that already exists as a directory in the build tree, so make
+# reports "Nothing to be done" and the step then fails on a missing library:
+# that is what happened on the first run where configure accepted OSSv4.
+if ! make -C "${BUILD}" -j"${JOBS}" dlls/wineoss.drv/wineoss.so dlls/wineoss.drv/wineoss.drv; then
+    die "Building dlls/wineoss.drv failed."
+fi
 
 # --- verify and stage -------------------------------------------------------
 unix_half="${BUILD}/dlls/wineoss.drv/wineoss.so"
