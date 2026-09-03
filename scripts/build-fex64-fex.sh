@@ -202,6 +202,16 @@ apply_patch fex-boxedwine-host-served-segment-base.patch
 # 32-bit context was restored with, which is what names the value the 32-bit
 # loader is handed in EBX.
 apply_patch fex-boxedwine-wow64-entry-witness.patch
+# Depends on the inline call/return patch above, whose exit-slot repair it
+# gives a width, and on the wow64 entry witness above, whose SEG32_GPRS line
+# it re-uses per block. The repair stored the architectural return address as
+# a qword unconditionally, which is right only while every block is 64-bit: in
+# a 32-bit block the push is four bytes, so the extra four zeroed the dword
+# above the return slot -- the outgoing argument an i386 caller stores at
+# [esp] immediately before the call. That is what handed the 32-bit loader a
+# null critical section. The store now takes its width from the same operand
+# size the push used.
+apply_patch fex-boxedwine-call-return-push-width.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

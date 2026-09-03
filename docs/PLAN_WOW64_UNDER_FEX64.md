@@ -244,6 +244,14 @@ This is the risk that decides the schedule.
     size, so a 32-bit x87 memory operand whose base plus displacement crosses
     4 GiB would not wrap the way hardware does. No such address exists under
     the low alias.
+  - This port's own additions to the translator are the ones that assumed a
+    single width, not the translator's. The CALL exit-slot repair stored the
+    architectural return address as a qword unconditionally and so zeroed the
+    dword above a 32-bit return slot -- the outgoing stdcall argument -- which
+    is what handed the 32-bit loader a null critical section
+    (`fex-boxedwine-call-return-push-width.patch`). Every BoxedWine hunk that
+    emits a guest store or a guest-width computation has to take its width
+    from the block, not from `Config.Is64BitMode`.
   - Shape (2) is not deleted from this document: if the per-block mode proves
     unworkable it is still the fallback, and the notes below stand.
 - The mode switch is taken and 32-bit code runs (device run 2026-09-02 20:21):

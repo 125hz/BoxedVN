@@ -1,0 +1,79 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1646,10 +1646,34 @@
+ 
+ constexpr uint32_t BoxedWineDecodeModeReportLimit = 16;
+ constexpr uint32_t BoxedWineDecodeModeConflictLimit = 8;
++/* BoxedWine: how many 32-bit blocks may still print their entry registers.
++ *
++ * The mode-change report names the boundary and nothing after it, so a value
++ * that is right at the first 32-bit instruction and wrong a few blocks later
++ * -- which is exactly what a device run showed for EBX -- leaves no trace of
++ * where it changed. This is the missing middle: the first 32-bit blocks a
++ * process compiles, each with its entry RIP and the eight integer registers,
++ * which brackets the defect to a single block before anything is disassembled.
++ *
++ * Newly compiled blocks only. A block served from the lookup cache does not
++ * reach the decoder, so a loop prints once rather than forever, and the budget
++ * bounds the rest. A process that never enters 32-bit code prints nothing. */
++constexpr uint32_t BoxedWineBlock32ReportLimit = 64;
++std::atomic<uint32_t> BoxedWineBlock32Reports {0};
+ } // namespace
+ 
+ void ContextImpl::BoxedWineNoteDecodeMode(uint64_t GuestRIP, uint16_t CSIndex, bool Is64BitMode,
+                                           FEXCore::Core::CpuStateFrame* Frame) {
++  if (!Is64BitMode && Frame && BoxedWineBlock32Reports.fetch_add(1, std::memory_order_relaxed) < BoxedWineBlock32ReportLimit) {
++    const auto& BlockState = Frame->State;
++    LogMan::Msg::IFmt("BOXEDWINE_FEX64_SEG32_GPRS rip={:#x} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} "
++                      "rsi={:#x} rdi={:#x}",
++                      GuestRIP, BlockState.gregs[FEXCore::X86State::REG_RAX], BlockState.gregs[FEXCore::X86State::REG_RCX],
++                      BlockState.gregs[FEXCore::X86State::REG_RDX], BlockState.gregs[FEXCore::X86State::REG_RBX],
++                      BlockState.gregs[FEXCore::X86State::REG_RSP], BlockState.gregs[FEXCore::X86State::REG_RBP],
++                      BlockState.gregs[FEXCore::X86State::REG_RSI], BlockState.gregs[FEXCore::X86State::REG_RDI]);
++  }
++
+   const uint32_t Mode = Is64BitMode ? 1u : 2u;
+   const uint32_t Previous = BoxedWineDecodeMode.exchange(Mode, std::memory_order_acq_rel);
+   if (Previous == Mode || Previous == 0) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -81,9 +81,34 @@
+     }
+     const auto GuestStack = StaticRegisters[X86State::REG_RSP];
+     const auto HostStack = AliasGuestAddress(GuestStack);
+-    stur(TMP1, HostStack, 0);
+-    if (CTX->GetBoxedWineCallWitness()) {
+-      EmitCallReturnWitness(TMP1, GuestStack, HostStack, TMP1, GuestStack);
++    /* The slot is exactly as wide as CALL's own Push made it, which is the
++     * BLOCK's GPR size and not the context's.
++     *
++     * Written as an unconditional 64-bit store, this repair was correct for
++     * every block until a block could be 32-bit. Then it wrote eight bytes
++     * over a four-byte return slot and zeroed the dword above it -- which,
++     * in the i386 calling convention, is the argument the caller had just
++     * stored at [esp] before the call. Device evidence, exact to the byte:
++     * Wine's 32-bit ntdll called RtlEnterCriticalSection(&loader_section)
++     * from loader_init with `mov dword ptr [esp], imm32` at guest 0x7bd4322a
++     * and `call` at 0x7bd43231; the callee's `mov ebx,[ebp+8]` read zero and
++     * `mov eax,[ebx+0x14]` faulted at guest linear 0x14. The stack dump at
++     * the fault shows the return address intact one slot below the argument
++     * that had become zero, which is this store and nothing else.
++     *
++     * ExitFunction's own Size is the size of the RIP operand the two CALL
++     * forms build -- _InlineEntrypointOffset(GPRSize) for the relative call
++     * and the loaded target for the absolute one -- and both forms push at
++     * that same size, so it is the push width by construction. A 16-bit
++     * operand-size call is left alone entirely: the repair only duplicates
++     * a store the Push lowering already made correctly. */
++    if (IROp->Size == IR::OpSize::i64Bit) {
++      stur(TMP1, HostStack, 0);
++      if (CTX->GetBoxedWineCallWitness()) {
++        EmitCallReturnWitness(TMP1, GuestStack, HostStack, TMP1, GuestStack);
++      }
++    } else if (IROp->Size == IR::OpSize::i32Bit) {
++      stur(TMP1.W(), HostStack, 0);
+     }
+   }
+ 

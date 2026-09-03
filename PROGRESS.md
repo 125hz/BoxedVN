@@ -6573,3 +6573,67 @@ line now names the process: `reason=native-memory pid= fex=`, so a log says
 which process was refused and that it was not the translated one. A Direct3D
 program has to be the session's own launched process, which is what the cube
 entry already does.
+## The null EBX was our own store: a 64-bit return slot in a 32-bit frame
+
+EBX is the 32-bit PEB at the WoW64 entry and zero four instructions later, and
+the 22:29 device log now says exactly where it changed, because the whole path
+is readable byte for byte. `SEG32_GPRS rip=0x7bd65a00 ... rbx=0x7ffd1000` at
+the entry; `GUEST_FAULT ... guest_rip=0x7bd69afa ... rbx=0x0` at the fault.
+Extracting the Wine 9.0 i386 ntdll.dll from the packaged runtime and matching
+the sixteen fault bytes (`8b 43 14 85 c0 74 5f 89 1c 24 e8 b7 f8 ff ff 83`)
+pins its RVA at 0x59afa, so the image is based at 0x7bd10000 and every address
+in the log resolves:
+
+- 0x7bd65a00 = `LdrInitializeThunk`: `push ebp / mov ebp,esp / push ebx /
+  sub esp,0x18 / mov ebx,[ebp+8] / lea eax,[ebx+0xb0] / mov [esp],ebx /
+  mov [esp+4],eax / call 0x7bd43210`. The `lea` result is `rax=0x22fdd4` in
+  the fault report, so the context pointer and the frame are both right.
+- 0x7bd43210 = `loader_init`, whose `mov [esp],0x7bc6a2c0` (`&loader_section`)
+  at 0x7bd4322a and `call 0x7bd69af0` at 0x7bd43231 leave the return address
+  0x7bd43236 -- the value the fault's stack dump shows at 0x22fc38.
+- 0x7bd69af0 = `RtlEnterCriticalSection`: `push ebp / mov ebp,esp / push ebx /
+  sub esp,4 / mov ebx,[ebp+8] / mov eax,[ebx+0x14]`. Every slot of that frame
+  matches the log to the byte: ebp 0x22fc34, saved ebx 0x22fd24, esp 0x22fc2c.
+
+So the argument at 0x22fc3c was written by `mov [esp],imm32` and read back as
+zero, and the slot immediately below it holds the return address the CALL
+pushed. That is one store, and it is ours. The exit-slot repair added with the
+inline call/return work re-stores a CALL's return address at the post-push RSP
+to close a class of lost pushes, and it did so as `stur(TMP1, ...)` -- an
+unconditional 64-bit store. Correct while every block is 64-bit. In a 32-bit
+block the push is four bytes, so the repair wrote eight over a four-byte slot
+and zeroed the dword above it, which in the i386 convention is the outgoing
+argument the caller stored at `[esp]` immediately before the call. Every
+stdcall argument in the first 32-bit frame was being destroyed by the call
+that consumed it; `RtlEnterCriticalSection(NULL)` is just the first one to
+dereference what it was handed.
+
+The repair now takes its width from `ExitFunction`'s own operand size, which
+is the size both CALL forms build their RIP and push their return address at
+(`fex-boxedwine-call-return-push-width.patch`). A 16-bit operand-size call is
+left alone: the repair only duplicates a store the ordinary Push lowering
+already made correctly.
+
+Nothing else in the translator keys the width off the context. `Is64BitMode`
+outside the frontend and the dispatcher was read through: the x87 pass's GPR
+size (recorded already), the register count in `ReconstructXMMRegisters` and
+`SetXMMRegistersFromState`, the AOT cache validation, the thunk-callback
+stack adjust and
+the thunk trampoline IR -- none reachable on this lane or none width-sensitive
+for it. The frontend and the dispatcher already read the block's mode
+everywhere, which is what the per-block decode mode rests on.
+
+Two markers for the next run. `BOXEDWINE_FEX64_SEG32_GPRS` is now emitted for
+every newly compiled 32-bit block, not only at a mode change, on a budget of
+64: entry RIP and the eight integer registers, which brackets any future
+value-goes-wrong to one block without a disassembler. And
+`BOXEDWINE_FEX64_GUEST_FAULT_STACK` prints four slots instead of two, so a
+32-bit callee's `[ebp+8]` and `[ebp+0xc]` -- the arguments, which sit above the
+return address -- are in the report that names the fault.
+
+What the run has to show: `SEG32_GPRS` marching through 32-bit ntdll with
+`rbx` holding a plausible pointer at `RtlEnterCriticalSection`'s entry rather
+than zero, then the 32-bit loader continuing past `loader_init` into
+`init_wow64` and the first WoW64 system call, which shows as a return to
+`mode=64`. A fault that still lands in the first 32-bit frames should now name
+an argument the stack dump can be read against.

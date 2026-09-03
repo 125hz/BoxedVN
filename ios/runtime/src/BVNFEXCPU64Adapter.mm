@@ -1352,7 +1352,14 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             // A jump to 0 says nothing about who jumped; the return slot at
             // the top of the guest stack usually does (the desktop's explorer
             // took one 16 s in, from unix-side code, and carried on).
-            uint64_t returnSlot[2] = {0, 0};
+            // Four slots, not two. In 32-bit code the interesting words sit
+            // ABOVE the return address: an i386 caller stores its outgoing
+            // arguments at [esp] before the call, so the callee's [ebp+8]
+            // and [ebp+0xc] land two and three slots up from the faulting
+            // frame's stack pointer. A run that ended on a null first
+            // argument printed only as far as the return address and could
+            // not show the argument itself.
+            uint64_t returnSlot[4] = {0, 0, 0, 0};
             const uint64_t guestRsp = frame->State.gregs[4];
             // The translator dereferences guest addresses through the
             // deterministic alias; the kuser alias helper answers zero for a
@@ -1361,20 +1368,24 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                 adapter->cpu->memory->nativeIdentityMode()
                     ? k64GuestToHostAddress(guestRsp) : 0;
             if (hostRsp != 0 &&
-                adapter->cpu->memory->nativeRangeCoversForPlan(hostRsp, hostRsp + 16)) {
+                adapter->cpu->memory->nativeRangeCoversForPlan(hostRsp,
+                                                              hostRsp + sizeof(returnSlot))) {
                 std::memcpy(returnSlot, reinterpret_cast<const void*>(hostRsp),
                             sizeof(returnSlot));
             } else {
-                uint8_t slotBytes[16] = {0};
+                uint8_t slotBytes[sizeof(returnSlot)] = {0};
                 if (readGuestBytes(guestRsp, slotBytes, sizeof(slotBytes))) {
                     std::memcpy(returnSlot, slotBytes, sizeof(returnSlot));
                 }
             }
             const auto& g = frame->State.gregs;
-            klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_STACK rsp=0x%llx slot0=0x%llx slot1=0x%llx",
+            klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_STACK rsp=0x%llx slot0=0x%llx slot1=0x%llx "
+                     "slot2=0x%llx slot3=0x%llx",
                      static_cast<unsigned long long>(guestRsp),
                      static_cast<unsigned long long>(returnSlot[0]),
-                     static_cast<unsigned long long>(returnSlot[1]));
+                     static_cast<unsigned long long>(returnSlot[1]),
+                     static_cast<unsigned long long>(returnSlot[2]),
+                     static_cast<unsigned long long>(returnSlot[3]));
             // cs and ss say which code segment the faulting instruction was
             // decoded for, and `decode` says what the translator made of it:
             // the L bit of the descriptor cs names, which is the same bit the
