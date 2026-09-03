@@ -2579,6 +2579,191 @@ S64 op_TRACE(Call& call) {
     return Success;
 }
 
+// ---- RandR 1.2+ -------------------------------------------------------------
+//
+// The 32-bit lane answers XRandR 1.1 only: a size list and one rate
+// (source/x11/xrandr.cpp), and its 1.2 entry points in x11common.cpp are
+// kpanics. Wine 9.0's winex11 reads its mode list through RRGetScreenResources,
+// RRGetOutputInfo and RRGetCrtcInfo instead, so the modes live here, built
+// once by XrrStandardModeList and served to the shim, which turns them into
+// the Xrandr structures Wine's driver reads.
+
+std::mutex& randrMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+struct RandrModeList {
+    XrrModeEntry entries[BOXEDWINE_X64_X11_RANDR_MAX_MODES];
+    U32 count = 0;
+    bool built = false;
+};
+
+// Built once, from the desktop size the launch asked for, and fixed after
+// that: a program that enumerates modes, switches, and enumerates again has
+// to be shown the same list both times. Only the current mode moves.
+U32 randrModeList(const XrrModeEntry** entries) {
+    static RandrModeList modes;
+    std::lock_guard<std::mutex> lock(randrMutex());
+    if (!modes.built) {
+        KNativeScreenPtr screen = KNativeSystem::getScreen();
+        const U32 width = screen ? screen->screenWidth() : 0;
+        const U32 height = screen ? screen->screenHeight() : 0;
+        const U32 rate = screen ? screen->screenRate() : 0;
+        modes.count = XrrStandardModeList(width, height, rate, modes.entries,
+                                          BOXEDWINE_X64_X11_RANDR_MAX_MODES);
+        modes.built = true;
+    }
+    *entries = modes.entries;
+    return modes.count;
+}
+
+// The rate the last accepted switch asked for, and the size it asked for.
+// The host panel keeps its own refresh rate whatever a guest selects, so
+// reporting that rate back would tell a caller that asked for 120 and got
+// RRSetConfigSuccess that it is running at 60. It is told what it chose, for
+// as long as the mode it chose is the one on screen.
+struct RandrRequest {
+    U32 width = 0;
+    U32 height = 0;
+    U32 rate = 0;
+};
+
+RandrRequest& randrRequest() {
+    static RandrRequest request;
+    return request;
+}
+
+U32 randrCurrentRate(U32 width, U32 height) {
+    {
+        std::lock_guard<std::mutex> lock(randrMutex());
+        const RandrRequest& request = randrRequest();
+        if (request.rate && request.width == width && request.height == height) {
+            return request.rate;
+        }
+    }
+    KNativeScreenPtr screen = KNativeSystem::getScreen();
+    const U32 rate = screen ? screen->screenRate() : 0;
+    return rate ? rate : (U32)XRR_MODE_RATE_PRIMARY;
+}
+
+// The index of the mode the root window is showing. Wine fails
+// xrandr14_get_current_mode outright when the CRTC names a mode the resource
+// list does not carry, so this never answers "none": an exact match first,
+// then the same size at any rate, then the first mode.
+U32 randrCurrentModeIndex(const XrrModeEntry* entries, U32 count, U32 width, U32 height, U32 rate) {
+    if (!count) {
+        return BOXEDWINE_X64_X11_RANDR_NO_MODE;
+    }
+    for (U32 i = 0; i < count; i++) {
+        if (entries[i].width == width && entries[i].height == height && entries[i].rate == rate) {
+            return i;
+        }
+    }
+    for (U32 i = 0; i < count; i++) {
+        if (entries[i].width == width && entries[i].height == height) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+// { display, buffer, capacity } -> mode count
+S64 op_RANDR_GET_STATE(Call& call) {
+    REQUIRE_ARGS(3);
+    REQUIRE_DISPLAY(data, 0);
+    const XrrModeEntry* entries = nullptr;
+    const U32 count = randrModeList(&entries);
+    KNativeScreenPtr screen = KNativeSystem::getScreen();
+    const U32 width = screen ? screen->screenWidth() : 0;
+    const U32 height = screen ? screen->screenHeight() : 0;
+    const U32 rate = randrCurrentRate(width, height);
+    const U32 current = randrCurrentModeIndex(entries, count, width, height, rate);
+
+    boxedwine_x64_x11_randr_state state = {};
+    state.version = BOXEDWINE_X64_X11_RANDR_STATE_VERSION;
+    state.modeCount = count;
+    state.currentWidth = width;
+    state.currentHeight = height;
+    state.currentRate = rate;
+    state.currentMode = current;
+    state.mmWidth = (U32)(width * 0.2646);
+    state.mmHeight = (U32)(height * 0.2646);
+    state.minWidth = 320;
+    state.minHeight = 200;
+    state.maxWidth = 8192;
+    state.maxHeight = 8192;
+
+    std::vector<U8> bytes(sizeof(state) + (size_t)count * sizeof(boxedwine_x64_x11_randr_mode), 0);
+    memcpy(bytes.data(), &state, sizeof(state));
+    for (U32 i = 0; i < count; i++) {
+        boxedwine_x64_x11_randr_mode mode = {};
+        mode.width = entries[i].width;
+        mode.height = entries[i].height;
+        mode.rate = entries[i].rate;
+        if (i == current) {
+            mode.flags |= BOXEDWINE_X64_X11_RANDR_MODE_CURRENT;
+        }
+        if (entries[i].width == width && entries[i].height == height &&
+            entries[i].rate == (U32)XRR_MODE_RATE_PRIMARY) {
+            mode.flags |= BOXEDWINE_X64_X11_RANDR_MODE_PREFERRED;
+        }
+        memcpy(bytes.data() + sizeof(state) + (size_t)i * sizeof(mode), &mode, sizeof(mode));
+    }
+    S64 status = 0;
+    if (!call.sizedResult(1, bytes.data(), bytes.size(), status)) {
+        return status;
+    }
+    if (firstTime(call.pid, "randr:modes")) {
+        klog_fmt("BOXEDWINE_X64_RANDR modes=%u current=%ux%u@%u", count, width, height, rate);
+    }
+    return (S64)count;
+}
+
+// { display, width, height, rate } -> RRSetConfigSuccess / RRSetConfigFailed
+//
+// The rate is accepted and reported back but never applied: the host panel
+// runs at whatever iOS gives it, and a program that asked for 60 on a 120 Hz
+// panel wants the mode, not a refused call.
+S64 op_RANDR_SET_MODE(Call& call) {
+    REQUIRE_ARGS(4);
+    REQUIRE_DISPLAY(data, 0);
+    const U32 width = (U32)call.arg(1);
+    const U32 height = (U32)call.arg(2);
+    const U32 rate = (U32)call.arg(3);
+    const XrrModeEntry* entries = nullptr;
+    const U32 count = randrModeList(&entries);
+    KNativeScreenPtr screen = KNativeSystem::getScreen();
+    const U32 fromWidth = screen ? screen->screenWidth() : 0;
+    const U32 fromHeight = screen ? screen->screenHeight() : 0;
+
+    bool listed = false;
+    for (U32 i = 0; i < count; i++) {
+        if (entries[i].width == width && entries[i].height == height) {
+            listed = true;
+            break;
+        }
+    }
+    if (!width || !height || !listed) {
+        klog_fmt("BOXEDWINE_X64_RANDR pid=%u mode-switch %ux%u@%u refused=unlisted",
+                 call.pid, width, height, rate);
+        return RRSetConfigFailed;
+    }
+    {
+        std::lock_guard<std::mutex> lock(randrMutex());
+        RandrRequest& request = randrRequest();
+        request.width = width;
+        request.height = height;
+        request.rate = rate;
+    }
+    if (width != fromWidth || height != fromHeight) {
+        XServer::getServer()->changeScreen(width, height);
+    }
+    klog_fmt("BOXEDWINE_X64_RANDR pid=%u mode-switch %ux%u -> %ux%u@%u result=ok",
+             call.pid, fromWidth, fromHeight, width, height, rate);
+    return RRSetConfigSuccess;
+}
+
 struct OpEntry {
     const char* name;
     OpHandler handler;
@@ -2594,6 +2779,29 @@ static_assert(sizeof(kOps) / sizeof(kOps[0]) == BOXEDWINE_X64_X11_OP_COUNT,
               "every bridge operation needs a handler");
 
 } // namespace
+
+bool x11Bridge64UpdateScreenSize(KProcess* process, U64 displayAddress, U32 width, U32 height) {
+    if (!process || !process->memory64 || !displayAddress) {
+        return false;
+    }
+    KMemory64* memory = process->memory64;
+    GuestPageProbe probe(memory);
+    if (!boxedvn::x11Bridge64RangeAccessible(probe, displayAddress + L::Display::screens, 8, false)) {
+        return false;
+    }
+    U64 screenAddress = 0;
+    memory->memcpyFromGuest(&screenAddress, displayAddress + L::Display::screens, 8);
+    if (!screenAddress ||
+        !boxedvn::x11Bridge64RangeAccessible(probe, screenAddress, L::Screen::size, true)) {
+        return false;
+    }
+    const U32 values[4] = { width, height, (U32)(width * 0.2646), (U32)(height * 0.2646) };
+    memory->memcpyToGuest(screenAddress + L::Screen::width, &values[0], 4);
+    memory->memcpyToGuest(screenAddress + L::Screen::height, &values[1], 4);
+    memory->memcpyToGuest(screenAddress + L::Screen::mwidth, &values[2], 4);
+    memory->memcpyToGuest(screenAddress + L::Screen::mheight, &values[3], 4);
+    return true;
+}
 
 U64 x11Bridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
     if (!cpu || !cpu->memory || !cpu->thread || !cpu->thread->process) {

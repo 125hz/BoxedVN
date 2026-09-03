@@ -314,8 +314,103 @@ BW_OFFSET(XineramaScreenInfo, x_org, 4);
 BW_OFFSET(XineramaScreenInfo, width, 8);
 BW_SIZE(XineramaScreenInfo, 12);
 
+/* Xrandr. tools/x11-64/xrandr.c declares these structures itself, because
+ * the builder needs no libxrandr-dev to produce the library -- but winex11.so
+ * was compiled against the real header, so the two must agree byte for byte.
+ * When the builder does have the header, the numbers the shim asserts against
+ * its own definitions are asserted here against the real ones. */
+#if defined(__has_include)
+#if __has_include(<X11/extensions/Xrandr.h>)
+#include <X11/extensions/Xrandr.h>
+#define BW_HAVE_XRANDR_HEADER 1
+#endif
+#endif
+
+#ifdef BW_HAVE_XRANDR_HEADER
+BW_OFFSET(XRRScreenSize, width, 0);
+BW_OFFSET(XRRScreenSize, height, 4);
+BW_OFFSET(XRRScreenSize, mwidth, 8);
+BW_OFFSET(XRRScreenSize, mheight, 12);
+BW_SIZE(XRRScreenSize, 16);
+
+BW_OFFSET(XRRModeInfo, id, 0);
+BW_OFFSET(XRRModeInfo, width, 8);
+BW_OFFSET(XRRModeInfo, height, 12);
+BW_OFFSET(XRRModeInfo, dotClock, 16);
+BW_OFFSET(XRRModeInfo, hSyncStart, 24);
+BW_OFFSET(XRRModeInfo, hTotal, 32);
+BW_OFFSET(XRRModeInfo, vSyncStart, 40);
+BW_OFFSET(XRRModeInfo, vTotal, 48);
+BW_OFFSET(XRRModeInfo, name, 56);
+BW_OFFSET(XRRModeInfo, nameLength, 64);
+BW_OFFSET(XRRModeInfo, modeFlags, 72);
+BW_SIZE(XRRModeInfo, 80);
+
+BW_OFFSET(XRRScreenResources, timestamp, 0);
+BW_OFFSET(XRRScreenResources, configTimestamp, 8);
+BW_OFFSET(XRRScreenResources, ncrtc, 16);
+BW_OFFSET(XRRScreenResources, crtcs, 24);
+BW_OFFSET(XRRScreenResources, noutput, 32);
+BW_OFFSET(XRRScreenResources, outputs, 40);
+BW_OFFSET(XRRScreenResources, nmode, 48);
+BW_OFFSET(XRRScreenResources, modes, 56);
+BW_SIZE(XRRScreenResources, 64);
+
+BW_OFFSET(XRROutputInfo, timestamp, 0);
+BW_OFFSET(XRROutputInfo, crtc, 8);
+BW_OFFSET(XRROutputInfo, name, 16);
+BW_OFFSET(XRROutputInfo, nameLen, 24);
+BW_OFFSET(XRROutputInfo, mm_width, 32);
+BW_OFFSET(XRROutputInfo, mm_height, 40);
+BW_OFFSET(XRROutputInfo, connection, 48);
+BW_OFFSET(XRROutputInfo, subpixel_order, 50);
+BW_OFFSET(XRROutputInfo, ncrtc, 52);
+BW_OFFSET(XRROutputInfo, crtcs, 56);
+BW_OFFSET(XRROutputInfo, nclone, 64);
+BW_OFFSET(XRROutputInfo, clones, 72);
+BW_OFFSET(XRROutputInfo, nmode, 80);
+BW_OFFSET(XRROutputInfo, npreferred, 84);
+BW_OFFSET(XRROutputInfo, modes, 88);
+BW_SIZE(XRROutputInfo, 96);
+
+BW_OFFSET(XRRCrtcInfo, timestamp, 0);
+BW_OFFSET(XRRCrtcInfo, x, 8);
+BW_OFFSET(XRRCrtcInfo, y, 12);
+BW_OFFSET(XRRCrtcInfo, width, 16);
+BW_OFFSET(XRRCrtcInfo, height, 20);
+BW_OFFSET(XRRCrtcInfo, mode, 24);
+BW_OFFSET(XRRCrtcInfo, rotation, 32);
+BW_OFFSET(XRRCrtcInfo, noutput, 36);
+BW_OFFSET(XRRCrtcInfo, outputs, 40);
+BW_OFFSET(XRRCrtcInfo, rotations, 48);
+BW_OFFSET(XRRCrtcInfo, npossible, 52);
+BW_OFFSET(XRRCrtcInfo, possible, 56);
+BW_SIZE(XRRCrtcInfo, 64);
+
+BW_OFFSET(XRRProviderResources, timestamp, 0);
+BW_OFFSET(XRRProviderResources, nproviders, 8);
+BW_OFFSET(XRRProviderResources, providers, 16);
+BW_SIZE(XRRProviderResources, 24);
+
+/* Wine's get_frequency divides the dot clock by hTotal*vTotal, so the flags
+ * that double or halve it must be the values the shim leaves clear. */
+_Static_assert(RR_Interlace == 0x0010, "RR_Interlace");
+_Static_assert(RR_DoubleScan == 0x0020, "RR_DoubleScan");
+_Static_assert(RR_Rotate_0 == 1, "RR_Rotate_0");
+_Static_assert(RR_Connected == 0, "RR_Connected");
+_Static_assert(RRSetConfigSuccess == 0, "RRSetConfigSuccess");
+_Static_assert(RRSetConfigFailed == 3, "RRSetConfigFailed");
+#endif
+
 /* The bridge ABI itself. */
 _Static_assert(BOXEDWINE_X64_X11_OP_COUNT < 256, "the operation table stays small");
 _Static_assert(BOXEDWINE_X64_X11_MAX_ARGS == 16, "zero through fifteen arguments");
+
+/* The RandR record the host writes and the shim reads: one layout on both
+ * sides, so every field is a uint32_t and nothing is padded. */
+_Static_assert(sizeof(struct boxedwine_x64_x11_randr_mode) == 16, "randr mode record");
+_Static_assert(sizeof(struct boxedwine_x64_x11_randr_state) == 48, "randr state record");
+_Static_assert(offsetof(struct boxedwine_x64_x11_randr_state, modeCount) == 4, "randr modeCount");
+_Static_assert(offsetof(struct boxedwine_x64_x11_randr_state, currentMode) == 20, "randr currentMode");
 
 int boxedwine_x64_x11_layout_check_ok = 1;

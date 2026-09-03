@@ -18,6 +18,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 class CPU64;
+class KProcess;
 
 // The x86-64 guest X11 bridge. Entered from the 64-bit syscall dispatcher
 // for BOXEDWINE_X64_HOSTCALL_X11_BRIDGE with RDI=op, RSI=guest argument
@@ -27,6 +28,13 @@ class CPU64;
 // objects the 32-bit int 0x9b path uses; only the guest-facing marshalling
 // differs. See include/boxedwine_x64_x11_bridge.h for the ABI.
 U64 x11Bridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count);
+
+// Write a new root size into an x86-64 client's Screen record. The 32-bit
+// path in XServer::updateDisplayScreenSize cannot: the Display an x86-64
+// client holds lives in memory the shim owns, laid out for the 64-bit ABI,
+// so its Screen sits at different offsets and behind a 64-bit pointer.
+// Returns whether the record was written.
+bool x11Bridge64UpdateScreenSize(KProcess* process, U64 displayAddress, U32 width, U32 height);
 
 #endif // BOXEDWINE_GUEST_X64
 #endif

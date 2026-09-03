@@ -14,8 +14,9 @@
 
 /*
  * Deterministic stand-ins for the X extension libraries Wine's driver
- * dlopens by name (libXrender, libXrandr, libXinerama, libXi, libXcursor,
- * libXfixes, libXcomposite, libXxf86vm).
+ * dlopens by name (libXrender, libXinerama, libXi, libXcursor, libXfixes,
+ * libXcomposite, libXxf86vm). libXrandr is not among them any more: it
+ * answers for real, from tools/x11-64/xrandr.c.
  *
  * The distro copies of these libraries cannot work here: they speak the X
  * wire protocol through libX11 internals the BoxedWine shim does not have.
@@ -77,34 +78,10 @@ BW_STUB(XRenderFreeGlyphSet)
 BW_STUB(XRenderFreePicture)
 BW_STUB(XRenderSetPictureClipRectangles)
 BW_STUB(XRenderSetPictureTransform)
-#elif BW_STUB_LIBRARY == 2 /* libXrandr.so.2 */
-BW_ABSENT(XRRQueryExtension, 0)
-BW_ABSENT(XRRQueryVersion, 0)
-BW_STUB(XRRConfigCurrentConfiguration)
-BW_STUB(XRRConfigCurrentRate)
-BW_STUB(XRRFreeCrtcInfo)
-BW_STUB(XRRFreeOutputInfo)
-BW_STUB(XRRFreeProviderInfo)
-BW_STUB(XRRFreeProviderResources)
-BW_STUB(XRRFreeScreenConfigInfo)
-BW_STUB(XRRFreeScreenResources)
-BW_STUB(XRRGetCrtcInfo)
-BW_STUB(XRRGetOutputInfo)
-BW_STUB(XRRGetOutputPrimary)
-BW_STUB(XRRGetOutputProperty)
-BW_STUB(XRRGetProviderInfo)
-BW_STUB(XRRGetProviderResources)
-BW_STUB(XRRGetScreenInfo)
-BW_STUB(XRRGetScreenResources)
-BW_STUB(XRRGetScreenResourcesCurrent)
-BW_STUB(XRRGetScreenSizeRange)
-BW_STUB(XRRRates)
-BW_STUB(XRRSelectInput)
-BW_STUB(XRRSetCrtcConfig)
-BW_STUB(XRRSetScreenConfig)
-BW_STUB(XRRSetScreenConfigAndRate)
-BW_STUB(XRRSetScreenSize)
-BW_STUB(XRRSizes)
+/* 2 was libXrandr.so.2, which is no longer a stub: RandR is the one
+ * extension the 64-bit lane answers for real, because winex11 falls back to
+ * a one-entry mode list without it. See tools/x11-64/xrandr.c. The number is
+ * left unused so the others keep the values the build script passes. */
 #elif BW_STUB_LIBRARY == 3 /* libXinerama.so.1 */
 BW_ABSENT(XineramaQueryExtension, 0)
 BW_ABSENT(XineramaQueryVersion, 0)

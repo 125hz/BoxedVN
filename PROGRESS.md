@@ -7191,3 +7191,50 @@ it.
 A `result=-22` on any `BOXEDWINE_X64_DSP` line is the thing to chase: it means
 the emulation refused something wineoss asked for, and the line names the
 request and the value it was given.
+
+## The 64-bit lane had one display mode, because RandR said it was absent
+
+`tools/x11-64/extension_stub.c` answered `XRRQueryExtension` with 0, so Wine
+9.0's `winex11.drv` took its `nores` settings handler, whose mode list is one
+entry: the desktop size, at `screen_bpp`, at 60 Hz. A program that enumerates
+display modes -- `EnumDisplaySettings`, `IDXGIOutput::GetDisplayModeList` --
+found one mode and nothing to switch to, and a full-screen title that reads
+that list before it opens anything can refuse to start on it alone.
+
+The 32-bit lane could not be forwarded to. `source/x11/xrandr.cpp` answers
+XRandR 1.1 -- a size list and one rate -- and narrows even that to three
+sizes at a small desktop; `x11common.cpp`'s 1.2 entry points
+(`XRRGetScreenResources`, `XRRGetOutputInfo`, `XRRGetCrtcInfo`,
+`XRRFreeCrtcInfo`) are `kpanic`. Wine's 1.4 handler uses exactly those.
+
+So the modes are now built once, host-side, by `XrrStandardModeList` in
+`source/x11/xrandr.cpp`: the launch resolution plus 640x480, 800x600,
+1024x768, 1280x720, 1280x800, 1366x768, 1600x900 and 1920x1080, each at 60 Hz
+and at 120 Hz, sorted, deduplicated, and fixed for the life of the process so
+a caller that enumerates, switches and enumerates again is shown the same
+list both times. Two bridge operations carry it: `randr-get-state` writes a
+`boxedwine_x64_x11_randr_state` and its mode records into a guest buffer, and
+`randr-set-mode` validates a request against the list and calls
+`XServer::changeScreen`, the same resize the IA-32 lane's
+`XRRSetScreenConfigAndRate` performs.
+
+`libXrandr.so.2` stopped being a stub. `tools/x11-64/xrandr.c` builds the
+Xrandr structures itself -- one connected output ("BoxedVN") on one CRTC
+whose current mode is the launch resolution -- in the exact x86-64 layout
+`winex11.so` was compiled against, asserted field by field in the file and
+again against the real `<X11/extensions/Xrandr.h>` in `layout_check.c` when
+the builder has it. Three details decide whether Wine accepts it: the version
+must report 1.4 or the RandR 1.0 handler stays; `XRRGetProviderResources`
+must not return NULL, because `xrandr14_get_gpus` fails the whole display
+handler on a NULL but takes a documented fallback on an empty list; and the
+mode timings must divide back to the rate, since Wine reads the refresh rate
+as `(dotClock + hTotal*vTotal/2) / (hTotal*vTotal)` -- so `hTotal` is the
+width, `vTotal` the height, and the dot clock their product times the rate.
+
+A host that serves neither operation makes `XRRQueryExtension` report absent
+again, which is the behaviour that was there before rather than an empty
+resource list.
+
+The witnesses: `BOXEDWINE_X64_RANDR modes= current=WxH@Hz` once, at the first
+query, and one `mode-switch WxH -> WxH@Hz result=ok` per switch. A
+`refused=unlisted` names a size the mode list does not carry.

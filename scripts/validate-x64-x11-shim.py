@@ -67,8 +67,13 @@ SHIM_LIBRARIES = (
 XEXT_PREFIXES = ("XShape", "XShm")
 
 # What winex11.so looks up with dlsym in each extension library, measured
-# from its string table. A stub that misses one makes Wine's LOAD_FUNCPTR
+# from its string table. A library that misses one makes Wine's LOAD_FUNCPTR
 # fail the whole library, which is the same outcome as not shipping it.
+#
+# All but one of these are stubs that answer "extension absent" so Wine takes
+# its core-protocol paths (tools/x11-64/extension_stub.c). libXrandr.so.2 is
+# not: without RandR, winex11 reports exactly one display mode, so it answers
+# for real from tools/x11-64/xrandr.c and must export the same 27 names.
 EXTENSION_EXPORTS = {
     "libXrender.so.1": {
         "XRenderQueryExtension", "XRenderAddGlyphs", "XRenderChangePicture",

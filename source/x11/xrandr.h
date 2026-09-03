@@ -111,4 +111,27 @@ U32 XrrConfigCurrentRate();
 U32 XrrRates(KThread* thread, const DisplayDataPtr& data, U32 screen, U32 sizeIndex, U32 rateCountAddress);
 bool XrrGetSize(KThread* thread, const DisplayDataPtr& displayData, U32 sizeIndex, U32& cx, U32& cy);
 
+// The mode list RandR 1.2+ reports. The XRandR 1.1 path above answers with
+// sizes alone, which is all the 32-bit lane's Xlib asks for; a caller that
+// enumerates through RRGetScreenResources wants a width, a height and a
+// refresh rate per entry, and wants more than the three sizes that path
+// truncates itself to. This builds that list once so both lanes can serve
+// the same modes.
+struct XrrModeEntry {
+	U32 width;
+	U32 height;
+	U32 rate;
+};
+
+// Rates every listed size is offered at. The device panel runs at 120 Hz;
+// 60 Hz is what a program that asks for "the normal one" expects to find.
+#define XRR_MODE_RATE_PRIMARY 60
+#define XRR_MODE_RATE_HIGH 120
+
+// Fills `out` with the standard mode set plus the desktop size, each at
+// XRR_MODE_RATE_PRIMARY, XRR_MODE_RATE_HIGH and `currentRate` when that is
+// neither, sorted by width then height then rate. Returns how many entries
+// were written, never more than maxOut.
+U32 XrrStandardModeList(U32 desktopCx, U32 desktopCy, U32 currentRate, XrrModeEntry* out, U32 maxOut);
+
 #endif

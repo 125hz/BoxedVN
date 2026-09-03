@@ -18,6 +18,7 @@
 
 #include "boxedwine.h"
 #include "x11.h"
+#include "x11bridge64.h"
 #include "knativesystem.h"
 #include "ksocket.h"
 
@@ -768,7 +769,21 @@ void XServer::updateDisplayScreenSize(U32 width, U32 height) {
 	U32 updated = 0;
 	for (const DisplayDataPtr& data : activeDisplays) {
 		KProcessPtr process = data ? data->process.lock() : nullptr;
-		if (!process || !process->memory || !data->displayAddress) {
+		if (!process) {
+			continue;
+		}
+#ifdef BOXEDWINE_GUEST_X64
+		// An x86-64 client's Display is memory the 64-bit shim owns, in the
+		// 64-bit Xlib layout: its Screen sits behind a 64-bit pointer at
+		// offsets the macros below do not describe.
+		if (data->displayAddress64) {
+			if (x11Bridge64UpdateScreenSize(process.get(), data->displayAddress64, width, height)) {
+				++updated;
+			}
+			continue;
+		}
+#endif
+		if (!process->memory || !data->displayAddress) {
 			continue;
 		}
 		KMemory* memory = process->memory;

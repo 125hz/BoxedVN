@@ -147,13 +147,73 @@
     X(GET_SELECTION_OWNER, "get-selection-owner") \
     X(CONVERT_SELECTION, "convert-selection") \
     X(REPORT_UNIMPLEMENTED, "report-unimplemented") \
-    X(TRACE, "trace")
+    X(TRACE, "trace") \
+    X(RANDR_GET_STATE, "randr-get-state") \
+    X(RANDR_SET_MODE, "randr-set-mode")
 
 enum boxedwine_x64_x11_op {
 #define BOXEDWINE_X64_X11_OP_ENUM(name, text) BOXEDWINE_X64_X11_OP_##name,
     BOXEDWINE_X64_X11_OPS(BOXEDWINE_X64_X11_OP_ENUM)
 #undef BOXEDWINE_X64_X11_OP_ENUM
     BOXEDWINE_X64_X11_OP_COUNT
+};
+
+/* ---- RandR 1.2+ -----------------------------------------------------------
+ *
+ * Wine 9.0's winex11 takes its `nores` settings handler -- one display mode,
+ * the desktop size, 60 Hz -- unless XRandR answers. Its RandR 1.4 handler
+ * reads the mode list out of XRRGetScreenResourcesCurrent, XRRGetOutputInfo
+ * and XRRGetCrtcInfo, and switches with XRRSetCrtcConfig.
+ *
+ * Those structures are guest memory in the exact x86-64 Xrandr layout, so
+ * the shim builds them, the same way it builds Display and Screen. What the
+ * host owns is the policy: which modes exist, which one is current, and what
+ * a switch does to the root window. Two operations carry that.
+ *
+ * RANDR_GET_STATE: args = { display, buffer, capacity }. The host writes a
+ * boxedwine_x64_x11_randr_state followed by `modeCount` mode records, and
+ * returns the mode count; short buffers take the usual E_BUFFER path. The
+ * list is fixed for the life of the process -- only the current mode moves --
+ * so a caller that enumerated before a switch sees the same modes after it.
+ *
+ * RANDR_SET_MODE: args = { display, width, height, rate }. The host resizes
+ * the root window the way the IA-32 lane's XRRSetScreenConfigAndRate does and
+ * returns RRSetConfigSuccess (0) or RRSetConfigFailed (3).
+ *
+ * Every field is a uint32_t so the record has one layout on both sides.
+ */
+#define BOXEDWINE_X64_X11_RANDR_STATE_VERSION 1u
+#define BOXEDWINE_X64_X11_RANDR_MAX_MODES 64u
+
+/* Flags on a mode record. */
+#define BOXEDWINE_X64_X11_RANDR_MODE_CURRENT 0x1u
+#define BOXEDWINE_X64_X11_RANDR_MODE_PREFERRED 0x2u
+
+/* No mode is current (the CRTC is disabled). */
+#define BOXEDWINE_X64_X11_RANDR_NO_MODE 0xffffffffu
+
+struct boxedwine_x64_x11_randr_mode {
+    uint32_t width;
+    uint32_t height;
+    uint32_t rate; /* Hz, exact: the shim synthesizes a dot clock that
+                    * divides back to this number in Wine's get_frequency. */
+    uint32_t flags;
+};
+
+struct boxedwine_x64_x11_randr_state {
+    uint32_t version; /* BOXEDWINE_X64_X11_RANDR_STATE_VERSION */
+    uint32_t modeCount;
+    uint32_t currentWidth;
+    uint32_t currentHeight;
+    uint32_t currentRate;
+    uint32_t currentMode; /* index, or BOXEDWINE_X64_X11_RANDR_NO_MODE */
+    uint32_t mmWidth;
+    uint32_t mmHeight;
+    uint32_t minWidth;
+    uint32_t minHeight;
+    uint32_t maxWidth;
+    uint32_t maxHeight;
+    /* modeCount records of boxedwine_x64_x11_randr_mode follow. */
 };
 
 /* Selector for SET_GC_VALUE: args = { display, gc, selector, value }. */

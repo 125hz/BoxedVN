@@ -24,6 +24,103 @@ U32 XrrConfigCurrentRate() {
     return KNativeSystem::getScreen()->screenRate();
 }
 
+// The sizes a full-screen program expects to find when it enumerates display
+// modes. A list with one entry -- which is what winex11's `nores` handler
+// reports, and what the XRandR 1.1 path below narrows to at a small desktop
+// -- makes such a program refuse to start or pick the only thing it is
+// offered. These are the modes any Windows driver would report.
+static const U32 kStandardModeSizes[][2] = {
+    { 640, 480 },
+    { 800, 600 },
+    { 1024, 768 },
+    { 1280, 720 },
+    { 1280, 800 },
+    { 1366, 768 },
+    { 1600, 900 },
+    { 1920, 1080 },
+};
+
+U32 XrrStandardModeList(U32 desktopCx, U32 desktopCy, U32 currentRate, XrrModeEntry* out, U32 maxOut) {
+    if (!out || !maxOut) {
+        return 0;
+    }
+    const U32 maxSizes = (U32)(sizeof(kStandardModeSizes) / sizeof(kStandardModeSizes[0])) + 1;
+    U32 sizes[(sizeof(kStandardModeSizes) / sizeof(kStandardModeSizes[0])) + 1][2];
+    U32 sizeCount = 0;
+
+    // The desktop size first, so it survives a full list; the rest follow and
+    // duplicates of it are dropped.
+    if (desktopCx && desktopCy) {
+        sizes[sizeCount][0] = desktopCx;
+        sizes[sizeCount][1] = desktopCy;
+        sizeCount++;
+    }
+    for (U32 i = 0; i < sizeof(kStandardModeSizes) / sizeof(kStandardModeSizes[0]); i++) {
+        const U32 cx = kStandardModeSizes[i][0];
+        const U32 cy = kStandardModeSizes[i][1];
+        bool duplicate = false;
+        for (U32 j = 0; j < sizeCount; j++) {
+            if (sizes[j][0] == cx && sizes[j][1] == cy) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate && sizeCount < maxSizes) {
+            sizes[sizeCount][0] = cx;
+            sizes[sizeCount][1] = cy;
+            sizeCount++;
+        }
+    }
+
+    U32 rates[3];
+    U32 rateCount = 0;
+    rates[rateCount++] = XRR_MODE_RATE_PRIMARY;
+    rates[rateCount++] = XRR_MODE_RATE_HIGH;
+    if (currentRate && currentRate != XRR_MODE_RATE_PRIMARY && currentRate != XRR_MODE_RATE_HIGH) {
+        rates[rateCount++] = currentRate;
+    }
+
+    // Ascending by width, then height: a caller that takes the first match
+    // for a size gets the same answer every time, and the list reads the way
+    // an EnumDisplaySettings caller expects.
+    for (U32 i = 0; i + 1 < sizeCount; i++) {
+        for (U32 j = 0; j + 1 < sizeCount - i; j++) {
+            if (sizes[j][0] > sizes[j + 1][0] ||
+                (sizes[j][0] == sizes[j + 1][0] && sizes[j][1] > sizes[j + 1][1])) {
+                const U32 cx = sizes[j][0];
+                const U32 cy = sizes[j][1];
+                sizes[j][0] = sizes[j + 1][0];
+                sizes[j][1] = sizes[j + 1][1];
+                sizes[j + 1][0] = cx;
+                sizes[j + 1][1] = cy;
+            }
+        }
+    }
+    for (U32 i = 0; i + 1 < rateCount; i++) {
+        for (U32 j = 0; j + 1 < rateCount - i; j++) {
+            if (rates[j] > rates[j + 1]) {
+                const U32 rate = rates[j];
+                rates[j] = rates[j + 1];
+                rates[j + 1] = rate;
+            }
+        }
+    }
+
+    U32 count = 0;
+    for (U32 i = 0; i < sizeCount; i++) {
+        for (U32 j = 0; j < rateCount; j++) {
+            if (count >= maxOut) {
+                return count;
+            }
+            out[count].width = sizes[i][0];
+            out[count].height = sizes[i][1];
+            out[count].rate = rates[j];
+            count++;
+        }
+    }
+    return count;
+}
+
 bool XrrGetSize(KThread* thread, const DisplayDataPtr& displayData, U32 sizeIndex, U32& cx, U32& cy) {
     KMemory* memory = thread->memory;
     XrrData* data = displayData->xrrData;
