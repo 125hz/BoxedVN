@@ -278,6 +278,23 @@ void KProcess::logExecPhase(const char* phase) const noexcept {
 #endif
 }
 
+// Exactly one process per session is translated, and which one it is decides
+// whether the session feels fast. Reported at launch and again at every exec
+// that keeps the translator, so the log names the owner rather than leaving
+// it to be inferred from the fork markers. `commandLine` is NUL-joined for
+// /proc, so the witness rebuilds a readable command line instead.
+void KProcess::logFexProcess(const std::vector<BString>& args) const noexcept {
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+    if (!this->useFEX64) {
+        return;
+    }
+    BString cmd = BString::join(" ", args);
+    klog_fmt("BOXEDWINE_X64_FEX_PROCESS pid=%u cmd=%s", this->id, cmd.c_str());
+#else
+    (void)args;
+#endif
+}
+
 void KProcess::onExec(KThread* thread) {
     logExecPhase("onexec-begin");
     logExecPhase("cloexec-begin");
@@ -1182,7 +1199,8 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
             this->commandLine+=" ";
         this->commandLine+=argValues[i];
     }
-    
+    this->logFexProcess(argValues);
+
     this->initStdio();
     FsOpenNode* openNode=ElfLoader::inspectNode(currentDirectory, node, loader, interpreter, interpreterArgs);
     if (!openNode) {
@@ -1720,7 +1738,11 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     this->name = Fs::getFileNameFromPath(node->path);
     
     this->commandLine = BString::join("\0", args);
-            
+    // An exec replaces this process's address space, so the identity mapping
+    // it owns is reused rather than duplicated and useFEX64 survives. Say so
+    // here: this is the only way the translator moves to another image.
+    this->logFexProcess(args);
+
     this->path.clear();
     for (U32 i=0;i<envs.size();i++) {
         if (strncmp(envs[i].c_str(), "PATH=", 5)==0) {
@@ -2893,6 +2915,14 @@ U32 KProcess::forkProcess64(KThread* thread, U64 flags, U64 childTid,
         // A fork child cannot own a second identity mapping at the same guest
         // addresses inside this iOS process. It starts on the sparse CPU64
         // path and may exec a helper without clobbering its FEX parent.
+        //
+        // This holds even when the parent goes idle waiting on the child, so
+        // a child that execs cannot inherit the translator either: the
+        // parent's KMemory64 is only torn down by its own execve or its exit,
+        // and while it waits every one of its pages is still mapped at the
+        // identity address the child would need. Placing the translator is
+        // therefore a launch-time decision -- see the exec path, which keeps
+        // useFEX64 because exec replaces this process's address space.
         childProcess->useFEX64 = false;
         childProcess->brkEnd64 = brkEnd64;
         childProcess->entry64 = entry64;

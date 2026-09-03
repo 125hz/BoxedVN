@@ -775,12 +775,31 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Wine's builtin explorer, named the way Wine's unix loader can resolve
+    /// it without falling back to `start.exe`. See `launchX64Desktop`.
+    private static let x64DesktopExplorerPath = "C:\\windows\\system32\\explorer.exe"
+
     /// Opens the container's desktop on the x86-64 lane: Wine64 through FEX,
     /// with the DXMT Direct3D modules projected in, so a 64-bit program
     /// started from the file manager renders the way the cube probe does. The
     /// desktop itself is the same explorer/winefile pair the 32-bit desktop
     /// uses, in the container's own resolution and its separate 64-bit
     /// prefix.
+    ///
+    /// The explorer image is named by its full Windows path rather than as
+    /// the bare word `explorer`, and that decides which process FEX gets.
+    /// Exactly one process per session is translated - the one the launcher
+    /// starts - because a fork child cannot own a second identity mapping.
+    /// Wine's unix loader resolves argv[1] as a path first; a bare `explorer`
+    /// is no path, so it falls back to loading `start.exe` as the main image
+    /// and hands it `/exec explorer ...`. start.exe then CreateProcesses the
+    /// real desktop and waits, which put the translated process to sleep for
+    /// the whole session while explorer and winefile ran on the interpreter
+    /// (session 21:23:27: pid 10 idle at `state=waiting cpu=0.0%`, explorer
+    /// pid 39 and winefile pid 45 both `child_fex=0`). With the full path the
+    /// launched process is explorer itself, so the desktop - windows, GDI,
+    /// the DXMT presentation - is what the translator runs. The 32-bit lane
+    /// keeps the bare name: it has no per-process translator to place.
     func launchX64Desktop(_ container: WineContainer) {
         guard let rootFilesystem else {
             alertMessage = "No root filesystem is installed."
@@ -796,7 +815,7 @@ final class AppModel: ObservableObject {
                 writableRoot: runtime.writableRoot,
                 gameDirectory: runtime.files,
                 sharedDirectory: Storage.sharedFiles,
-                executablePath: "explorer",
+                executablePath: Self.x64DesktopExplorerPath,
                 arguments: ["/desktop=shell,\(container.width)x\(container.height)",
                             "winefile", "D:\\"],
                 environment: X64Runtime.environment,

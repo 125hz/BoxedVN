@@ -567,6 +567,10 @@ private:
     // Bounded exec-phase trace: a fork child that stalls between the
     // remap marker and the loader leaves nothing to say where.
     void logExecPhase(const char* phase) const noexcept;
+    // Names the one process per session that owns the translator, at every
+    // point where it takes or keeps it. Without it a log says only which
+    // pids exist, not which of them the JIT is actually running.
+    void logFexProcess(const std::vector<BString>& args) const noexcept;
     U32 getCurrentDirectoryFromDirFD(FD dirfd, BString& currentDirectory);
     void writeStatX(KMemory* memory, U32 buf, U32 id, U32 rdev, U32 hardLinkCount, U32 userId, U32 groupId, U32 mode, U64 len, U32 atimeSeconds, U32 atimeNano, U32 mtimeSeconds, U32 mtimeNano, U32 ctimeSeconds, U32 ctimeNano);
 
