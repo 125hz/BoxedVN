@@ -343,20 +343,29 @@ private:
 
 BOXEDVN_TEST(top_alias_reservation_succeeds_once_then_returns_eexist) {
     HostedRanges space;
-    CHECK(space.reserveNoReplace(kGuestTopBase, kReservationLength));
+    // The reservation the device made, at its own base. The arena now begins
+    // two gigabytes below that, so a request outside the reservation is a
+    // different question from one that overlaps it, and both are asked here.
+    CHECK(space.reserveNoReplace(kDeviceReservationBase, kReservationLength));
     CHECK(space.pageCount() == kReservationLength / 0x1000ULL);
     // The second identical request is EEXIST -- this is what stopped Wine's
     // search last time, and it must still be refused.
-    CHECK(!space.reserveNoReplace(kGuestTopBase, kReservationLength));
-    // So is any overlapping one.
-    CHECK(!space.reserveNoReplace(kGuestTopBase, 0x1000ULL));
-    CHECK(!space.reserveNoReplace(kGuestTopEnd - 0x1000ULL, 0x1000ULL));
+    CHECK(!space.reserveNoReplace(kDeviceReservationBase, kReservationLength));
+    // So is any overlapping one, at either edge or across the middle.
+    CHECK(!space.reserveNoReplace(kDeviceReservationBase, 0x1000ULL));
+    CHECK(!space.reserveNoReplace(
+        kDeviceReservationBase + kReservationLength - 0x1000ULL, 0x1000ULL));
     CHECK(!space.reserveNoReplace(0x7fffffdb0000ULL, 0x240000ULL));
+    // And the headroom the enlarged arena added is genuinely free: the range
+    // below the reservation is what Wine walked into and was refused before.
+    CHECK(space.reserveNoReplace(kGuestTopBase, 0x1000ULL));
+    CHECK(space.reserveNoReplace(0x7ffffdfb0000ULL,
+                                 0x7ffffdffd000ULL - 0x7ffffdfb0000ULL));
 }
 
 BOXEDVN_TEST(top_alias_map_fixed_replaces_a_subrange_of_the_reservation) {
     HostedRanges space;
-    CHECK(space.reserveNoReplace(kGuestTopBase, kReservationLength));
+    CHECK(space.reserveNoReplace(kDeviceReservationBase, kReservationLength));
     for (const Commit& commit : kDeviceCommits) {
         CHECK(space.mapFixed(commit.address, commit.length, 0x3));
         CHECK(space.protectionAt(commit.address) == 0x3);
@@ -365,8 +374,8 @@ BOXEDVN_TEST(top_alias_map_fixed_replaces_a_subrange_of_the_reservation) {
     }
     // The reservation around the commits is untouched: still present, still
     // inaccessible.
-    CHECK(space.mapped(kGuestTopBase + 0x100000ULL));
-    CHECK(space.protectionAt(kGuestTopBase + 0x100000ULL) == 0);
+    CHECK(space.mapped(kDeviceReservationBase + 0x100000ULL));
+    CHECK(space.protectionAt(kDeviceReservationBase + 0x100000ULL) == 0);
     CHECK(space.pageCount() == kReservationLength / 0x1000ULL);
 }
 
