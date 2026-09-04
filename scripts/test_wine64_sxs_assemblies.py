@@ -359,6 +359,16 @@ class TheBuilderStagesAndGatesOnIt(unittest.TestCase):
         self.assertIn('x86_64-windows" amd64', self.builder)
         self.assertIn('{I386_PE_GUEST_DIR}" x86', self.builder)
 
+    def test_the_stagers_witness_lines_do_not_reach_the_count(self) -> None:
+        # The helper's stdout is captured to get the manifest count, and the
+        # stager prints one witness line per assembly. Without a redirect
+        # those lines land in the count, and from there in the runtime
+        # manifest, where the validator rejects them as malformed keys.
+        helper = self.builder[self.builder.index("stage_sxs_assemblies() {"):]
+        invocation = helper[helper.index('python3 "${WINSXS_STAGER}"'):]
+        invocation = invocation[:invocation.index("|| die")]
+        self.assertIn(">&2", invocation)
+
     def test_each_architecture_goes_into_its_own_archive(self) -> None:
         # A manifest in wine64.zip whose assembly directory links into the
         # i386 tree would dangle whenever the PE32 archive is not mounted,

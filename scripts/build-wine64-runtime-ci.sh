@@ -607,7 +607,7 @@ stage_sxs_assemblies() {
         --arch "${arch}" \
         --module-guest-dir "${module_guest_dir}" \
         --stage-dir "${target}" \
-        --require "${WINSXS_REQUIRED_ASSEMBLY}" \
+        --require "${WINSXS_REQUIRED_ASSEMBLY}" >&2 \
         || die "Could not stage the ${label} side-by-side assemblies from '${pe_dir}'. Without them a prefix has no winsxs tree, ntdll's lookup_winsxs finds nothing, and every activation context that names an assembly fails with STATUS_SXS_CANT_GEN_ACTCTX -- which Wine reports as nothing at all."
     local count
     count="$(find "${target}/${WINSXS_MANIFEST_SUBDIR}" -type f -name '*.manifest' 2>/dev/null | wc -l | tr -d ' ')"
