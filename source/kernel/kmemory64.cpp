@@ -743,6 +743,18 @@ static void k64ReportGuestLaneExhausted(const KMemory64* memory, U64 length,
              (unsigned)(seen + 1), (unsigned)K64_LANE_REPORT_LIMIT);
 }
 
+// The same witness, for a caller that reached its refusal without asking this
+// object to map anything. The mmap placement policy decides most refusals on
+// its own -- an out-of-lane MAP_FIXED_NOREPLACE for a range the guest could
+// touch never reaches mmapAnonymousNoReplace -- and until this existed those
+// refusals were invisible. A device log with 778 of 1025 guest mmaps rejected
+// carried zero BOXEDWINE_X64_LANE_REFUSED lines, and read as though nothing
+// had been refused at all.
+void KMemory64::reportGuestLaneRefusal(const char* op, U64 addr, U64 len,
+                                       int sparseReserved) const {
+    k64ReportGuestLaneRefusal(this, op, addr, len, sparseReserved);
+}
+
 // Monotonic across every address space this image ever builds, so an exec
 // replacement is never confused with the address space it replaced.
 static std::atomic<U64> g_addressSpaceGeneration {1};

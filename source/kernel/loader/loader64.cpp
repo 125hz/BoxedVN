@@ -20,6 +20,9 @@
 #ifdef BOXEDWINE_GUEST_X64
 #include "kmemory64.h"
 #include "cpu64.h"
+// The ranges ntdll reserves for itself when no preloader runs. The guest
+// layout below has to keep out of them; named here rather than repeated.
+#include "guest_low_alias.h"
 #endif
 // ELF p_type values reused from loader.cpp. Kept local here to avoid a
 // cross-file include just for two constants.
@@ -1373,11 +1376,34 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // window available for arbitrary fixed mappings.  The proven iOS FEX
     // layout keeps its host-only allocator furniture below the proven native
     // guest window, so place the BoxedWine guest stack inside that window.
-    // Sparse/interpreter guests retain the conventional Linux address.
+    //
+    // The sparse/interpreter stack used to sit at 0x7FFFFFFFE000, one page
+    // below the canonical top, which is where Linux puts it. Ours differs
+    // from Linux in a way that matters: the whole 8 MiB is mapped at load
+    // time, where Linux maps a few pages and grows on demand. Eight mapped
+    // MiB there land inside the range ntdll reserves for its top-down arena,
+    // [0x7ffffe000000, 0x7fffffff0000), and reserve_area answers a refusal by
+    // halving rather than failing -- so every interpreted Wine process
+    // (wineserver, wineboot, services.exe, explorer) silently ran with 24 MiB
+    // of the 32 MiB it asked for. A device log shows it exactly: one
+    // MAP_FIXED_NOREPLACE for 0x7ffffe000000+0x1ff0000 refused with EEXIST,
+    // then 0xff0000 and 0x800000 granted, then sixteen further probes down to
+    // 0x10000 all refused, per process.
+    //
+    // The stack goes below the arena instead. Nothing else of ours is up
+    // there: the interpreter base and the TLS block sit near 0x7FFFF7800000,
+    // 88 MiB lower, and the guest keeps a conventional high stack address.
+    const U64 SPARSE_STACK_TOP = 0x7FFFFDFFE000ULL;
     const U64 STACK_TOP = mem->nativeIdentityMode()
         ? K64_NATIVE_GUEST_STACK_TOP
-        : 0x7FFFFFFFE000ULL;
+        : SPARSE_STACK_TOP;
     const U64 STACK_SIZE  = 8ULL * 1024 * 1024;
+    // The reason the constant is what it is, checked where it is written: the
+    // stack top, which is the highest address the stack ever occupies, is at
+    // or below the base of the arena, so no page of it is inside.
+    static_assert(SPARSE_STACK_TOP <= boxedvn::kWineArenaTopDownBase,
+                  "the sparse guest stack must lie entirely below the "
+                  "top-down arena ntdll reserves for itself");
     const U64 STACK_BASE  = STACK_TOP - STACK_SIZE;
     U64 mapped = mem->mmapAnonymousFixed(STACK_BASE, STACK_SIZE,
                                          K_PROT_READ | K_PROT_WRITE);

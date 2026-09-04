@@ -1067,6 +1067,61 @@ void reportGuestTopAlias(CPU64* cpu, const char* what, U64 guestAddress,
              (unsigned long long)length, (unsigned)protection);
 }
 
+// Bounded, and generously: ntdll asks for three ranges once per address space
+// and HALVES each one it is refused rather than failing, so the cascade is the
+// evidence. Three lines is a process that got its whole arena; nineteen is one
+// that got a fraction of it and never said so.
+constexpr U64 kGuestWineArenaReports = 48;
+std::atomic<U64> gGuestWineArenaReports {0};
+
+// One line for every guest mmap that lands inside a range ntdll reserves for
+// itself when no preloader runs.
+//
+// Which addresses Wine believes it owns has until now been inferred from the
+// errors it prints when it runs out of them, and inferred wrongly: the
+// map_fixed_area failures at 0x6ffff... are builtin PE image bases and have
+// nothing to do with the arena, while the arena itself -- [0x10000,
+// 0x68000000), [0x7f000000, 0x7fff0000) and [0x7ffffe000000, 0x7fffffff0000),
+// straight out of mmap_init's no-preloader branch -- was never named in a log
+// at all. This names it, says which lane serves it, where its bytes live, and
+// how much of it the guest was actually handed.
+void reportGuestWineArena(CPU64* cpu, U64 guestAddress, U64 length,
+                          U32 protection, bool nativeIdentity, bool hostable,
+                          const char* placement, U64 ret) {
+    const int index = boxedvn::guestWineArenaRangeIndex(guestAddress, length);
+    if (index < 0) {
+        return;
+    }
+    if (gGuestWineArenaReports.fetch_add(1, std::memory_order_relaxed) >=
+        kGuestWineArenaReports) {
+        return;
+    }
+    const boxedvn::GuestWineArenaRange& range =
+        boxedvn::kWineArenaRanges[index];
+    const bool granted = (S64)ret >= 0;
+    const U64 hostBase = (nativeIdentity && hostable)
+                             ? boxedvn::guestToHostAddress(guestAddress)
+                             : 0;
+    const U64 hostEnd = hostBase ? hostBase + length : 0;
+    klog_fmt("BOXEDWINE_X64_WINE_ARENA pid=%d tid=%d space=%llu range=%s "
+             "reserved=[0x%llx,0x%llx) guest=[0x%llx,0x%llx) len=0x%llx "
+             "prot=0x%x native=%d hostable=%d host=[0x%llx,0x%llx) "
+             "placement=%s ret=0x%llx granted=%d",
+             (int)(cpu && cpu->thread ? cpu->thread->process->id : -1),
+             (int)(cpu && cpu->thread ? cpu->thread->id : -1),
+             (unsigned long long)(cpu && cpu->memory
+                                      ? cpu->memory->addressSpaceGeneration()
+                                      : 0),
+             range.name,
+             (unsigned long long)range.base, (unsigned long long)range.end,
+             (unsigned long long)guestAddress,
+             (unsigned long long)(guestAddress + length),
+             (unsigned long long)length, (unsigned)protection,
+             nativeIdentity ? 1 : 0, hostable ? 1 : 0,
+             (unsigned long long)hostBase, (unsigned long long)hostEnd,
+             placement, (unsigned long long)ret, granted ? 1 : 0);
+}
+
 const char* guestMmapPlacementName(boxedvn::GuestMmapPlacement placement) {
     switch (placement) {
         case boxedvn::GuestMmapPlacement::MapExact: return "map-exact";
@@ -1301,6 +1356,26 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
                 1, std::memory_order_relaxed);
             ret = (U64)-K_ENOMEM;
             break;
+    }
+
+    // What Wine believes it owns, stated rather than inferred. Only requests
+    // inside one of ntdll's three self-reservations produce a line.
+    reportGuestWineArena(cpu, alignedAddr, mapLen, (U32)prot, nativeIdentity,
+                         request.exactRangeAllowed,
+                         guestMmapPlacementName(placement), ret);
+
+    // A refusal the placement policy reached on its own still has to reach the
+    // lane witness. These are the ones that matter -- an out-of-lane
+    // MAP_FIXED_NOREPLACE for a range the guest could touch is refused here
+    // and never reaches the mapping path that used to be the only reporter --
+    // and their absence is what made a log with 778 rejections read as though
+    // nothing had been refused.
+    if (nativeIdentity && addr != 0 && !request.exactRangeAllowed &&
+        boxedvn::guestMmapPlacementIsFailure(placement)) {
+        cpu->memory->reportGuestLaneRefusal(
+            "mmap-placement", alignedAddr, mapLen,
+            cpu->memory->sparseReservationOverlaps(alignedAddr, mapLen) ? 1
+                                                                       : 0);
     }
 
     // Diagnostics. The budget is per address space, so a helper process

@@ -7573,3 +7573,35 @@ the packaged Vulkan client actually being a 64-bit object, with witnesses
 naming what the guest found for OpenGL and which renderer it was given. The
 program's own imports are Direct3D 11, so the 32-bit Direct3D 9 translation
 that gets projected was never in the picture.
+
+## The arena was never the problem, and the refusals were never printed
+
+Enlarging the lanes changed nothing for the guest, which turned out to be the
+useful result. Wine's arena does not come from our lanes at all: the preloader
+that would supply one is not in the packaged runtime, our loader links a name
+that does not exist, and the exec falls through to the real loader. That is the
+branch we want, because with no preload information Wine reserves three fixed
+ranges of its own, and we grant all three in full. Wine was never short of the
+space it asked for.
+
+Two real defects came out of looking. The interpreted lane's stack sat inside
+the top-down arena, and Wine halves a reservation rather than failing, so every
+interpreted process had been running on three quarters of the arena it asked
+for, once per process, silently. And our refusal witness was printed only from
+the mapping path, while the placement path refuses out-of-lane fixed mappings
+itself and returns without calling it, so three quarters of all refusals left
+no trace at all. Both are fixed, and the loader witness now says whether the
+target it linked exists.
+
+The addresses that looked like a truncation are not one. They are the
+link-time bases of Wine's own builtins, packed downward below 128 TiB, and each
+failure is exactly one module long; the twin address never appears in any log.
+There is a real hazard underneath, though: the two-operation translation maps
+that band and the top arena onto the same host addresses, and the inverse
+canonicalises to the arena spelling, so a builtin base printed after a round
+trip reads as an arena address. Both facts are asserted now rather than left to
+be rediscovered.
+
+Those relocation failures stay. They are Wine moving its builtins out of a band
+this translation cannot reach, and reaching it needs a translation the backend
+cannot emit without disturbing the flags the guest keeps there.

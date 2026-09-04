@@ -265,6 +265,160 @@ inline constexpr bool guestRangeHostable(std::uint64_t address,
     return address >= kGuestTopBase && end <= kGuestTopEnd;
 }
 
+// ---------------------------------------------------------------------------
+// What Wine actually reserves here, and where that comes from.
+//
+// No preloader runs in this configuration. The packaged wine64 layer carries
+// no wine64-preloader -- the runtime validator never checked for one, and our
+// own /usr/lib/x86_64-linux-gnu/wine/wine-preloader is a guest link created
+// only when that path is ABSENT, pointing at a name the archive does not
+// contain. Every device log shows the consequence: an execve of
+// wine-preloader with argc N, then immediately an execve of the loader itself
+// with argc N-1 and no BOXEDWINE_X64_EXEC line in between, which is Wine's
+// loader/main.c preloader_exec() falling back to execv(argv[1], argv + 1)
+// after the first exec fails.
+//
+// So wine_main_preload_info stays null and ntdll's mmap_init takes its
+// no-preloader branch (dlls/ntdll/unix/virtual.c, Wine 9):
+//
+//     if (preload_info) return;
+//     /* if we don't have a preloader, try to reserve the space now */
+//     reserve_area( (void *)0x000000010000, (void *)0x000068000000 );
+//     reserve_area( (void *)0x00007f000000, (void *)0x00007fff0000 );
+//     reserve_area( (void *)0x7ffffe000000, (void *)0x7fffffff0000 );
+//
+// Those three ranges are the whole arena. Nothing else contributes to it:
+// WINEPRELOADRESERVE is parsed by the preloader that never runs, and ntdll
+// uses it only to EXCLUDE a range from its searches, in
+// find_reserved_free_area_outside_preloader -- it never adds a reserved area.
+// An environment variable therefore cannot hand Wine an arena inside our
+// identity lane, which is why the launch does not try.
+//
+// reserve_area halves recursively rather than failing, so a range this
+// address space does not hand over WHOLE is not refused; it is silently
+// shrunk, and the guest quietly runs with less arena than it asked for. That
+// is the failure mode these assertions exist to prevent, and the reason the
+// mmap path names each of these ranges in the log when the guest asks for it.
+struct GuestWineArenaRange {
+    std::uint64_t base;
+    std::uint64_t end;
+    const char* name;
+};
+
+inline constexpr GuestWineArenaRange kWineArenaRanges[3] = {
+    {0x000000010000ULL, 0x000068000000ULL, "dos-low"},
+    {0x00007f000000ULL, 0x00007fff0000ULL, "teb"},
+    {0x7ffffe000000ULL, 0x7fffffff0000ULL, "top-down"},
+};
+
+// Named on its own because the loader has to keep out of it: it is the only
+// one of the three that a guest layout of ours has ever collided with.
+inline constexpr std::uint64_t kWineArenaTopDownBase = 0x7ffffe000000ULL;
+inline constexpr std::uint64_t kWineArenaTopDownEnd = 0x7fffffff0000ULL;
+
+static_assert(guestRangeHostable(kWineArenaRanges[0].base,
+                                 kWineArenaRanges[0].end -
+                                     kWineArenaRanges[0].base),
+              "ntdll reserves the DOS/low area without a preloader; this "
+              "address space has to be able to host all of it");
+static_assert(guestRangeHostable(kWineArenaRanges[1].base,
+                                 kWineArenaRanges[1].end -
+                                     kWineArenaRanges[1].base),
+              "ntdll reserves the sub-2-GiB TEB area without a preloader");
+static_assert(guestRangeHostable(kWineArenaRanges[2].base,
+                                 kWineArenaRanges[2].end -
+                                     kWineArenaRanges[2].base),
+              "ntdll reserves the top-down arena without a preloader; it must "
+              "lie inside the relocated top lane");
+static_assert(kWineArenaTopDownBase == kWineArenaRanges[2].base &&
+                  kWineArenaTopDownEnd == kWineArenaRanges[2].end,
+              "the named top-down bounds must be the reserved range itself");
+static_assert(kWineArenaTopDownBase >= kGuestTopBase &&
+                  kWineArenaTopDownEnd <= kGuestTopEnd,
+              "the top-down arena must fit inside the lane that serves it");
+
+// True when [address, address+length) lies inside one of the ranges ntdll
+// reserves for itself. Wine halves each range on refusal, so subranges are
+// asked for too and must be recognised.
+inline constexpr int guestWineArenaRangeIndex(std::uint64_t address,
+                                              std::uint64_t length) noexcept {
+    return (length == 0 || address > UINT64_MAX - length)
+               ? -1
+               : (address >= kWineArenaRanges[0].base &&
+                          address + length <= kWineArenaRanges[0].end
+                      ? 0
+                      : (address >= kWineArenaRanges[1].base &&
+                                 address + length <= kWineArenaRanges[1].end
+                             ? 1
+                             : (address >= kWineArenaRanges[2].base &&
+                                        address + length <=
+                                            kWineArenaRanges[2].end
+                                    ? 2
+                                    : -1)));
+}
+
+// ---------------------------------------------------------------------------
+// Wine's builtin PE image bases, which are NOT the arena and must not be
+// mistaken for it.
+//
+// A device log is full of
+//
+//     err:virtual:map_fixed_area out of memory for 0x6fffffc50000-0x6ffffffeb000
+//
+// and the address looks like a top-arena address with one nibble changed --
+// 0x7fffffc50000 with the 7 turned into a 6. It is not. 0x6fffffc50000 is
+// ntdll.dll's link-time ImageBase, and the same address appears in an
+// interpreted process as a FILE-backed mapping naming
+// .../x86_64-windows/ntdll.dll section by section at file offsets 0, 0x1000,
+// 0x6d000 and so on. Every failing range is exactly one module long and they
+// pack downwards from just under 0x700000000000, which is how Wine assigns
+// builtin bases. The twin address 0x7fffffc50000 appears nowhere in any of
+// those logs. Nothing truncates or rewrites anything: Wine asks for its own
+// image bases, this address space cannot host them, and Wine relocates the
+// module, which is what the ERR precedes.
+//
+// The band is stated here because admitting it would be a real bug rather
+// than a fix. Its addresses have SOME of the clear-mask bits set and not
+// others, so the two-instruction translation folds them onto the top arena's
+// host image: the assertion below is that ntdll's own base and its
+// mask-completed twin translate to the SAME host address. Serving both lanes
+// at once would alias two different guest pages onto one host page. A third
+// lane is not reachable by adding a case here; it needs a translation the
+// ARM64 backend can emit without touching NZCV, and this one cannot express
+// it.
+inline constexpr std::uint64_t kWineBuiltinNtdllImageBase = 0x6FFFFFC50000ULL;
+inline constexpr std::uint64_t kWineBuiltinImageBandBase = 0x6FFF00000000ULL;
+inline constexpr std::uint64_t kWineBuiltinImageBandEnd = 0x700000000000ULL;
+
+static_assert(kWineBuiltinNtdllImageBase >= kWineBuiltinImageBandBase &&
+                  kWineBuiltinNtdllImageBase < kWineBuiltinImageBandEnd,
+              "the observed builtin base must lie in the band that names it");
+static_assert(!guestRangeHostable(kWineBuiltinImageBandBase,
+                                  kWineBuiltinImageBandEnd -
+                                      kWineBuiltinImageBandBase),
+              "the builtin image band is outside every lane; Wine relocates");
+static_assert(guestToHostAddress(kWineBuiltinNtdllImageBase) ==
+                  guestToHostAddress(kWineBuiltinNtdllImageBase |
+                                     kGuestTopClearMask),
+              "a builtin image base and its mask-completed twin translate to "
+              "one host address: admitting the band would alias it onto the "
+              "top arena, which is why the refusal is correct");
+static_assert((kWineBuiltinNtdllImageBase | kGuestTopClearMask) >
+                  kGuestTopBase,
+              "the twin the log does not contain would be a top-arena address");
+// And the corollary, which is how the twin got into an OLDER log at all. A
+// host address inside the arena's block canonicalises to the mask-SET form,
+// so a 0x6ffff... guest address that ever reached a host-side report would be
+// printed as its 0x7ffff... twin. Nothing maps there -- the range is refused
+// before it can -- but two logs can spell the same bytes both ways, and a
+// reader comparing them has to know that before concluding that something
+// truncated an address.
+static_assert(hostToGuestAddress(
+                  guestToHostAddress(kWineBuiltinNtdllImageBase)) ==
+                  (kWineBuiltinNtdllImageBase | kGuestTopClearMask),
+              "a builtin image base round-trips through the alias as its "
+              "top-arena twin; the two spellings are one host address");
+
 } // namespace boxedvn
 
 #endif // BOXEDWINE_GUEST_LOW_ALIAS_H

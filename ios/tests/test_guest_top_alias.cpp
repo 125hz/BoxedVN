@@ -421,3 +421,87 @@ BOXEDVN_TEST(top_alias_refuses_ranges_it_cannot_host) {
     // Inside the identity lane nothing changed.
     CHECK(space.reserveNoReplace(kGuestHighBase, 0x1000ULL));
 }
+
+// ---------------------------------------------------------------------------
+// The arena Wine actually reserves, and the band that is not it.
+//
+// No preloader runs here -- the packaged wine64 layer carries no
+// wine64-preloader, so Wine's preloader_exec() falls back to running the
+// loader directly and wine_main_preload_info stays null. ntdll therefore takes
+// mmap_init's no-preloader branch and reserves three ranges for itself. Those
+// three ARE the arena; everything Wine allocates afterwards comes out of them,
+// and a range this address space cannot hand over WHOLE is not refused, it is
+// silently halved.
+
+BOXEDVN_TEST(wine_arena_is_the_three_ranges_ntdll_reserves_for_itself) {
+    CHECK(kWineArenaRanges[0].base == 0x000000010000ULL);
+    CHECK(kWineArenaRanges[0].end == 0x000068000000ULL);
+    CHECK(kWineArenaRanges[1].base == 0x00007f000000ULL);
+    CHECK(kWineArenaRanges[1].end == 0x00007fff0000ULL);
+    CHECK(kWineArenaRanges[2].base == kWineArenaTopDownBase);
+    CHECK(kWineArenaRanges[2].end == kWineArenaTopDownEnd);
+    for (const GuestWineArenaRange& range : kWineArenaRanges) {
+        CHECK(guestRangeHostable(range.base, range.end - range.base));
+    }
+}
+
+BOXEDVN_TEST(wine_arena_subranges_are_recognised_as_arena) {
+    // reserve_area halves on refusal, so the halves have to be recognised or
+    // the witness would fall silent exactly when the guest is being starved.
+    CHECK(guestWineArenaRangeIndex(0x10000ULL, 0x67ff0000ULL) == 0);
+    CHECK(guestWineArenaRangeIndex(0x7f000000ULL, 0xff0000ULL) == 1);
+    CHECK(guestWineArenaRangeIndex(kWineArenaTopDownBase, 0x1ff0000ULL) == 2);
+    CHECK(guestWineArenaRangeIndex(kWineArenaTopDownBase, 0xff0000ULL) == 2);
+    CHECK(guestWineArenaRangeIndex(kWineArenaTopDownBase + 0xff0000ULL,
+                                   0x800000ULL) == 2);
+    // Not arena: one page past the end of each, and a length that overflows.
+    CHECK(guestWineArenaRangeIndex(kWineArenaTopDownEnd, 0x1000ULL) == -1);
+    CHECK(guestWineArenaRangeIndex(0x68000000ULL, 0x1000ULL) == -1);
+    CHECK(guestWineArenaRangeIndex(kGuestHighBase, 0x1000ULL) == -1);
+    CHECK(guestWineArenaRangeIndex(0x10000ULL, 0ULL) == -1);
+}
+
+BOXEDVN_TEST(wine_arena_top_down_range_is_hosted_by_the_relocated_lane) {
+    HostedRanges space;
+    // The whole 32 MiB, in one call, the way ntdll asks for it first.
+    const std::uint64_t length = kWineArenaTopDownEnd - kWineArenaTopDownBase;
+    CHECK(space.reserveNoReplace(kWineArenaTopDownBase, length));
+    CHECK(space.pageCount() == length / 0x1000ULL);
+    CHECK(guestToHostAddress(kWineArenaTopDownBase) ==
+          kWineArenaTopDownBase - kGuestTopClearMask);
+}
+
+BOXEDVN_TEST(wine_builtin_image_bases_are_not_the_arena_and_cannot_be_a_lane) {
+    // The addresses in "err:virtual:map_fixed_area out of memory for
+    // 0x6fffffc50000-0x6ffffffeb000" are ntdll.dll's link-time ImageBase, not
+    // a top-arena address with a nibble changed.
+    CHECK(kWineBuiltinNtdllImageBase == 0x6FFFFFC50000ULL);
+    CHECK(guestWineArenaRangeIndex(kWineBuiltinNtdllImageBase, 0x39B000ULL) ==
+          -1);
+    CHECK(!guestRangeHostable(kWineBuiltinNtdllImageBase, 0x39B000ULL));
+    CHECK(!guestRangeHostable(kWineBuiltinImageBandBase,
+                              kWineBuiltinImageBandEnd -
+                                  kWineBuiltinImageBandBase));
+    HostedRanges space;
+    CHECK(!space.reserveNoReplace(kWineBuiltinNtdllImageBase, 0x39B000ULL));
+    CHECK(!space.mapFixed(kWineBuiltinNtdllImageBase, 0x1000ULL, 0x3));
+    CHECK(space.pageCount() == 0);
+}
+
+BOXEDVN_TEST(wine_builtin_image_base_and_its_twin_are_one_host_address) {
+    // Why the band cannot simply be admitted as a fourth lane: a builtin base
+    // has some clear-mask bits set and not others, so the two-instruction
+    // translation folds it onto the arena's host image.
+    const std::uint64_t twin =
+        kWineBuiltinNtdllImageBase | kGuestTopClearMask;
+    CHECK(twin == 0x7FFFFFC50000ULL);
+    CHECK(twin >= kGuestTopBase && twin < kGuestTopEnd);
+    CHECK(guestToHostAddress(kWineBuiltinNtdllImageBase) ==
+          guestToHostAddress(twin));
+    CHECK(guestToHostAddress(kWineBuiltinNtdllImageBase) == 0x7FFFC50000ULL);
+    // And the corollary: a host address in the arena's block canonicalises to
+    // the mask-SET spelling, so the same bytes can appear in one log as
+    // 0x6ffff... and in another as 0x7ffff...
+    CHECK(hostToGuestAddress(guestToHostAddress(kWineBuiltinNtdllImageBase)) ==
+          twin);
+}

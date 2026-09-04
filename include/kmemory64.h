@@ -632,6 +632,19 @@ public:
     // the proven iOS window (plus the special KUSER shared-data alias).
     bool nativeGuestRangeAllowed(U64 addr, U64 len) const;
 
+    // Report a refused guest range through the same bounded lane witness the
+    // mapping paths use, from a caller that decided the refusal for itself.
+    //
+    // Public because the mmap placement policy (guest_mmap_placement.h) can
+    // refuse a range without this object ever being asked to map it, and
+    // those are the refusals that matter: a device log showed 778 of 1025
+    // guest mmaps rejected and not one BOXEDWINE_X64_LANE_REFUSED line,
+    // because every one of them was decided before the mapping path was
+    // reached. `sparseReserved` is 1 or 0 when the caller could ask the
+    // reservation map safely and -1 where it could not; it is never guessed.
+    void reportGuestLaneRefusal(const char* op, U64 addr, U64 len,
+                                int sparseReserved) const;
+
     // Whether [start, end) of HOST address space is already tracked by this
     // address space. Public only so the mapping planner in native_map_plan.h
     // can ask; it is the same question nativeRangeCovers answers.

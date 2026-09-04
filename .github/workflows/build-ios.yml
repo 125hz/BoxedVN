@@ -447,6 +447,9 @@ jobs:
       - name: Test x86-64 graphics probe contract
         run: python3 -m unittest scripts/test_x64_graphics_probe.py
 
+      - name: Test Wine guest arena contract
+        run: python3 -m unittest scripts/test_x64_wine_arena.py
+
   fex-translator-probe:
     name: FEX translator conformance probes
     runs-on: ubuntu-24.04

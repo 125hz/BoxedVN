@@ -915,12 +915,35 @@ static void reportX64AudioDeviceNodes() {
 // layout names the loader wine, so the lane launches through that name and
 // the packaged wine64 binaries are aliased under it here. A link node with a
 // relative target resolves inside the module directory.
+// A link is not a binary. "status=linked" said only that a guest link node was
+// created, and for wine-preloader that read as though a preloader were
+// available: the packaged wine64 layer has never carried wine64-preloader,
+// scripts/validate-wine64-runtime.sh does not check for it, and the link
+// therefore names a file that does not resolve. Wine's preloader_exec()
+// answers a failed exec of it by running the loader directly
+// (execv(argv[1], argv + 1)), which is visible in every device log as a
+// wine-preloader execve immediately followed by a loader execve with one
+// argument fewer and no BOXEDWINE_X64_EXEC line between them.
+//
+// That is not a defect -- ntdll's mmap_init reserves its own arena precisely
+// when no preloader ran, and that is the branch this lane wants -- but it
+// decides where the guest's address space comes from, so the line has to say
+// it rather than leave it to be inferred from a pair of execve traces.
 static void aliasX64WineLoader(const char* aliasPath, const char* targetName) {
-    if (Fs::getNodeFromLocalPath(B(""), BString::copy(aliasPath), false)) {
-        return;
-    }
     std::shared_ptr<FsNode> moduleRoot =
         Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_MODULE_ROOT), true);
+    const bool targetPresent =
+        moduleRoot &&
+        Fs::getNodeFromLocalPath(B(""),
+                                 B(K_X64_WINE_MODULE_ROOT) + "/" +
+                                     BString::copy(targetName),
+                                 true) != nullptr;
+    if (Fs::getNodeFromLocalPath(B(""), BString::copy(aliasPath), false)) {
+        klog_fmt("BOXEDWINE_X64_LOADER_ALIAS alias=%s target=%s status=present "
+                 "target_present=%d",
+                 aliasPath, targetName, targetPresent ? 1 : 0);
+        return;
+    }
     if (!moduleRoot || !moduleRoot->isDirectory()) {
         klog_fmt("BOXEDWINE_X64_LOADER_ALIAS alias=%s target=%s status=no-module-root",
                  aliasPath, targetName);
@@ -928,8 +951,9 @@ static void aliasX64WineLoader(const char* aliasPath, const char* targetName) {
     }
     Fs::addFileNode(BString::copy(aliasPath), BString::copy(targetName), B(""),
                     false, moduleRoot);
-    klog_fmt("BOXEDWINE_X64_LOADER_ALIAS alias=%s target=%s status=linked",
-             aliasPath, targetName);
+    klog_fmt("BOXEDWINE_X64_LOADER_ALIAS alias=%s target=%s status=linked "
+             "target_present=%d",
+             aliasPath, targetName, targetPresent ? 1 : 0);
 }
 
 // The side-by-side assembly store, projected the way system32 is.
