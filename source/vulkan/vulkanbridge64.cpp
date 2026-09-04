@@ -630,7 +630,36 @@ PFN_vkVoidFunction hostProc(int index) {
     X(VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,                       VkCopyImageToBufferInfo2) \
     X(VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,                               VkBufferImageCopy2) \
     X(VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2,                              VkResolveImageInfo2) \
-    X(VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2,                                   VkImageResolve2)
+    X(VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2,                                   VkImageResolve2) \
+    /* the core commands the audit against Vulkan 1.4 added */ \
+    X(VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,                                  VkBindSparseInfo) \
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES,                  VkPhysicalDeviceGroupProperties) \
+    X(VK_STRUCTURE_TYPE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_INFO_2,           VkImageSparseMemoryRequirementsInfo2) \
+    X(VK_STRUCTURE_TYPE_SPARSE_IMAGE_MEMORY_REQUIREMENTS_2,                VkSparseImageMemoryRequirements2) \
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_INFO_2,        VkPhysicalDeviceSparseImageFormatInfo2) \
+    X(VK_STRUCTURE_TYPE_SPARSE_IMAGE_FORMAT_PROPERTIES_2,                  VkSparseImageFormatProperties2) \
+    X(VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO,              VkSamplerYcbcrConversionCreateInfo) \
+    X(VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,                     VkSamplerYcbcrConversionInfo) \
+    X(VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,                        VkBufferDeviceAddressInfo) \
+    X(VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO,         VkBufferOpaqueCaptureAddressCreateInfo) \
+    X(VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO,         VkDeviceMemoryOpaqueCaptureAddressInfo) \
+    X(VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO,                     VkPrivateDataSlotCreateInfo) \
+    X(VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS,                 VkDeviceBufferMemoryRequirements) \
+    X(VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS,                  VkDeviceImageMemoryRequirements) \
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES,                   VkPhysicalDeviceToolProperties) \
+    X(VK_STRUCTURE_TYPE_MEMORY_MAP_INFO,                                   VkMemoryMapInfo) \
+    X(VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO,                                 VkMemoryUnmapInfo) \
+    X(VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,                               VkImageSubresource2) \
+    X(VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2,                              VkSubresourceLayout2) \
+    X(VK_STRUCTURE_TYPE_RENDERING_AREA_INFO,                               VkRenderingAreaInfo) \
+    X(VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO,                     VkDeviceImageSubresourceInfo) \
+    X(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO,                VkRenderingAttachmentLocationInfo) \
+    X(VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO,             VkRenderingInputAttachmentIndexInfo) \
+    X(VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO,                         VkBindDescriptorSetsInfo) \
+    X(VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,                               VkPushConstantsInfo) \
+    X(VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO,                          VkPushDescriptorSetInfo) \
+    X(VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_WITH_TEMPLATE_INFO,            VkPushDescriptorSetWithTemplateInfo) \
+    X(VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO,                 VkHostImageLayoutTransitionInfo)
 
 struct ChainStructInfo {
     U32 sType;
@@ -668,6 +697,145 @@ bool nodeCarriesGuestCallback(U32 sType) {
         return true;
     default:
         return false;
+    }
+}
+
+// ---- Descriptor update templates --------------------------------------------
+//
+// vkUpdateDescriptorSetWithTemplate is handed a bare `const void* pData` whose
+// length appears nowhere in the call: it is described entirely by the entries
+// the template was created with. So the bridge has to remember, per template,
+// how many bytes the driver is going to read out of that block, or it cannot
+// copy it at all.
+//
+// What it remembers is only a length, and that is enough. Every descriptor a
+// template entry can name is a VkDescriptorImageInfo, a VkDescriptorBufferInfo
+// or a VkBufferView, and none of the three holds a pointer -- they are
+// handles, offsets, enums and sizes -- so once the span is known, a flat copy
+// of it is a complete marshal. The gaps between entries are copied too; they
+// are inside the caller's own block by construction, and the driver does not
+// read them.
+//
+// A template naming a descriptor type this bridge cannot size (a future one,
+// or an acceleration structure) is recorded as unsized, and every update
+// through it is then a named refusal rather than a guess at the length.
+
+U64 descriptorElementSize(VkDescriptorType type) {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        return sizeof(VkDescriptorImageInfo);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+        return sizeof(VkDescriptorBufferInfo);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        return sizeof(VkBufferView);
+    default:
+        return 0;
+    }
+}
+
+// The byte the driver stops reading at for one entry, measured from the start
+// of the caller's block. VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK is the
+// exception the specification carves out: its descriptorCount is a byte count
+// and its stride is not used.
+U64 templateEntryEnd(const VkDescriptorUpdateTemplateEntry& entry, bool* sized) {
+    if (entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+        return (U64)entry.offset + (U64)entry.descriptorCount;
+    }
+    const U64 element = descriptorElementSize(entry.descriptorType);
+    if (!element) {
+        *sized = false;
+        return 0;
+    }
+    if (!entry.descriptorCount) {
+        return (U64)entry.offset;
+    }
+    return (U64)entry.offset +
+           (U64)(entry.descriptorCount - 1) * (U64)entry.stride + element;
+}
+
+// The span of a whole template: the furthest byte any of its entries reaches.
+U64 templateDataSpan(const VkDescriptorUpdateTemplateCreateInfo* info,
+                     bool* sized) {
+    *sized = true;
+    U64 span = 0;
+    if (!info || !info->pDescriptorUpdateEntries) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < info->descriptorUpdateEntryCount; ++i) {
+        const U64 end =
+            templateEntryEnd(info->pDescriptorUpdateEntries[i], sized);
+        if (!*sized) {
+            return 0;
+        }
+        if (end > span) {
+            span = end;
+        }
+    }
+    return span;
+}
+
+// Nothing in the D3D9 chain holds anything like this many templates at once:
+// DXVK creates one per pipeline layout. A build that exceeded the table would
+// record nothing for the surplus, and every update through one of those is
+// refused by name rather than served with a length nobody knows.
+const U32 kMaxDescriptorTemplates = 256;
+
+struct TemplateRecord {
+    VkDescriptorUpdateTemplate handle;
+    U64 bytes;
+    bool sized;
+};
+
+TemplateRecord gTemplates[kMaxDescriptorTemplates] = {};
+
+void noteTemplateCreated(VkDescriptorUpdateTemplate handle, U64 bytes,
+                         bool sized) {
+    BOXEDWINE_CRITICAL_SECTION;
+    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
+        if (gTemplates[i].handle == VK_NULL_HANDLE ||
+            gTemplates[i].handle == handle) {
+            gTemplates[i].handle = handle;
+            gTemplates[i].bytes = bytes;
+            gTemplates[i].sized = sized;
+            return;
+        }
+    }
+    klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkCreateDescriptorUpdateTemplate "
+             "status=template-table-full live=%u",
+             kMaxDescriptorTemplates);
+}
+
+// The recorded span, and whether one was recorded at all. A template the table
+// never saw answers false, which is what an update through it needs to become
+// a refusal instead of a copy of an unknown number of bytes.
+bool templateDataBytes(VkDescriptorUpdateTemplate handle, U64* bytes) {
+    BOXEDWINE_CRITICAL_SECTION;
+    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
+        if (gTemplates[i].handle == handle) {
+            *bytes = gTemplates[i].bytes;
+            return gTemplates[i].sized;
+        }
+    }
+    return false;
+}
+
+void forgetTemplate(VkDescriptorUpdateTemplate handle) {
+    BOXEDWINE_CRITICAL_SECTION;
+    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
+        if (gTemplates[i].handle == handle) {
+            gTemplates[i].handle = VK_NULL_HANDLE;
+            gTemplates[i].bytes = 0;
+            gTemplates[i].sized = false;
+            return;
+        }
     }
 }
 
@@ -1807,147 +1975,136 @@ void Marshal::fixup(U32 sType, U8* host) {
             address(info->pRegions), info->regionCount, false);
         break;
     }
-    default:
+
+    // ---- The core commands the Vulkan 1.4 audit added ----------------------
+
+    case (U32)VK_STRUCTURE_TYPE_BIND_SPARSE_INFO: {
+        // Three arrays of non-extensible structures, each of which holds one
+        // further array of flat bind records. MoltenVK reports no sparse
+        // residency, so nothing should ever arrive here -- but the command is
+        // core 1.0, so winevulkan puts a slot for it in its dispatch table
+        // either way, and a slot is better filled than null.
+        VkBindSparseInfo* info = (VkBindSparseInfo*)host;
+        info->pWaitSemaphores =
+            inArray(info->pWaitSemaphores, info->waitSemaphoreCount);
+        VkSparseBufferMemoryBindInfo* buffers =
+            inArrayWritable<VkSparseBufferMemoryBindInfo>(
+                address(info->pBufferBinds), info->bufferBindCount);
+        info->pBufferBinds = buffers;
+        for (U32 i = 0; buffers && i < info->bufferBindCount && !failed; ++i) {
+            buffers[i].pBinds =
+                inArray(buffers[i].pBinds, buffers[i].bindCount);
+        }
+        VkSparseImageOpaqueMemoryBindInfo* opaque =
+            inArrayWritable<VkSparseImageOpaqueMemoryBindInfo>(
+                address(info->pImageOpaqueBinds), info->imageOpaqueBindCount);
+        info->pImageOpaqueBinds = opaque;
+        for (U32 i = 0;
+             opaque && i < info->imageOpaqueBindCount && !failed; ++i) {
+            opaque[i].pBinds = inArray(opaque[i].pBinds, opaque[i].bindCount);
+        }
+        VkSparseImageMemoryBindInfo* images =
+            inArrayWritable<VkSparseImageMemoryBindInfo>(
+                address(info->pImageBinds), info->imageBindCount);
+        info->pImageBinds = images;
+        for (U32 i = 0; images && i < info->imageBindCount && !failed; ++i) {
+            images[i].pBinds = inArray(images[i].pBinds, images[i].bindCount);
+        }
+        info->pSignalSemaphores =
+            inArray(info->pSignalSemaphores, info->signalSemaphoreCount);
         break;
     }
-}
-
-// ---- Descriptor update templates --------------------------------------------
-//
-// vkUpdateDescriptorSetWithTemplate is handed a bare `const void* pData` whose
-// length appears nowhere in the call: it is described entirely by the entries
-// the template was created with. So the bridge has to remember, per template,
-// how many bytes the driver is going to read out of that block, or it cannot
-// copy it at all.
-//
-// What it remembers is only a length, and that is enough. Every descriptor a
-// template entry can name is a VkDescriptorImageInfo, a VkDescriptorBufferInfo
-// or a VkBufferView, and none of the three holds a pointer -- they are
-// handles, offsets, enums and sizes -- so once the span is known, a flat copy
-// of it is a complete marshal. The gaps between entries are copied too; they
-// are inside the caller's own block by construction, and the driver does not
-// read them.
-//
-// A template naming a descriptor type this bridge cannot size (a future one,
-// or an acceleration structure) is recorded as unsized, and every update
-// through it is then a named refusal rather than a guess at the length.
-
-U64 descriptorElementSize(VkDescriptorType type) {
-    switch (type) {
-    case VK_DESCRIPTOR_TYPE_SAMPLER:
-    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-        return sizeof(VkDescriptorImageInfo);
-    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-        return sizeof(VkDescriptorBufferInfo);
-    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-        return sizeof(VkBufferView);
+    case (U32)VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS: {
+        VkDeviceBufferMemoryRequirements* info =
+            (VkDeviceBufferMemoryRequirements*)host;
+        info->pCreateInfo = (const VkBufferCreateInfo*)chain(
+            address(info->pCreateInfo), false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS: {
+        VkDeviceImageMemoryRequirements* info =
+            (VkDeviceImageMemoryRequirements*)host;
+        info->pCreateInfo = (const VkImageCreateInfo*)chain(
+            address(info->pCreateInfo), false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO: {
+        VkDeviceImageSubresourceInfo* info =
+            (VkDeviceImageSubresourceInfo*)host;
+        info->pCreateInfo = (const VkImageCreateInfo*)chain(
+            address(info->pCreateInfo), false);
+        info->pSubresource = (const VkImageSubresource2*)chain(
+            address(info->pSubresource), false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDERING_AREA_INFO: {
+        VkRenderingAreaInfo* info = (VkRenderingAreaInfo*)host;
+        info->pColorAttachmentFormats = inArrayOptional(
+            info->pColorAttachmentFormats, info->colorAttachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO: {
+        VkRenderingAttachmentLocationInfo* info =
+            (VkRenderingAttachmentLocationInfo*)host;
+        info->pColorAttachmentLocations = inArrayOptional(
+            info->pColorAttachmentLocations, info->colorAttachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO: {
+        VkRenderingInputAttachmentIndexInfo* info =
+            (VkRenderingInputAttachmentIndexInfo*)host;
+        info->pColorAttachmentInputIndices = inArrayOptional(
+            info->pColorAttachmentInputIndices, info->colorAttachmentCount);
+        // Both of these are single optional uint32_t, not arrays: null means
+        // the attachment keeps its default index.
+        info->pDepthInputAttachmentIndex =
+            inArrayOptional(info->pDepthInputAttachmentIndex, 1);
+        info->pStencilInputAttachmentIndex =
+            inArrayOptional(info->pStencilInputAttachmentIndex, 1);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO: {
+        VkBindDescriptorSetsInfo* info = (VkBindDescriptorSetsInfo*)host;
+        info->pDescriptorSets =
+            inArray(info->pDescriptorSets, info->descriptorSetCount);
+        info->pDynamicOffsets =
+            inArrayOptional(info->pDynamicOffsets, info->dynamicOffsetCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO: {
+        VkPushConstantsInfo* info = (VkPushConstantsInfo*)host;
+        info->pValues = inArrayAt(address(info->pValues), info->size, 1);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO: {
+        VkPushDescriptorSetInfo* info = (VkPushDescriptorSetInfo*)host;
+        info->pDescriptorWrites = structArrayTyped<VkWriteDescriptorSet>(
+            address(info->pDescriptorWrites), info->descriptorWriteCount,
+            false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_WITH_TEMPLATE_INFO: {
+        // The same problem vkUpdateDescriptorSetWithTemplate has, with the
+        // template handle and the data in one structure rather than in two
+        // argument words: the length of pData is the span recorded when the
+        // template was created.
+        VkPushDescriptorSetWithTemplateInfo* info =
+            (VkPushDescriptorSetWithTemplateInfo*)host;
+        U64 bytes = 0;
+        if (!templateDataBytes(info->descriptorUpdateTemplate, &bytes)) {
+            klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=%s "
+                     "status=no-span template=0x%llx",
+                     command,
+                     (unsigned long long)(uintptr_t)
+                         info->descriptorUpdateTemplate);
+            fail(address(info->pData), 0);
+            return;
+        }
+        info->pData = inArrayAt(address(info->pData), bytes, 1);
+        break;
+    }
     default:
-        return 0;
-    }
-}
-
-// The byte the driver stops reading at for one entry, measured from the start
-// of the caller's block. VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK is the
-// exception the specification carves out: its descriptorCount is a byte count
-// and its stride is not used.
-U64 templateEntryEnd(const VkDescriptorUpdateTemplateEntry& entry, bool* sized) {
-    if (entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-        return (U64)entry.offset + (U64)entry.descriptorCount;
-    }
-    const U64 element = descriptorElementSize(entry.descriptorType);
-    if (!element) {
-        *sized = false;
-        return 0;
-    }
-    if (!entry.descriptorCount) {
-        return (U64)entry.offset;
-    }
-    return (U64)entry.offset +
-           (U64)(entry.descriptorCount - 1) * (U64)entry.stride + element;
-}
-
-// The span of a whole template: the furthest byte any of its entries reaches.
-U64 templateDataSpan(const VkDescriptorUpdateTemplateCreateInfo* info,
-                     bool* sized) {
-    *sized = true;
-    U64 span = 0;
-    if (!info || !info->pDescriptorUpdateEntries) {
-        return 0;
-    }
-    for (uint32_t i = 0; i < info->descriptorUpdateEntryCount; ++i) {
-        const U64 end =
-            templateEntryEnd(info->pDescriptorUpdateEntries[i], sized);
-        if (!*sized) {
-            return 0;
-        }
-        if (end > span) {
-            span = end;
-        }
-    }
-    return span;
-}
-
-// Nothing in the D3D9 chain holds anything like this many templates at once:
-// DXVK creates one per pipeline layout. A build that exceeded the table would
-// record nothing for the surplus, and every update through one of those is
-// refused by name rather than served with a length nobody knows.
-const U32 kMaxDescriptorTemplates = 256;
-
-struct TemplateRecord {
-    VkDescriptorUpdateTemplate handle;
-    U64 bytes;
-    bool sized;
-};
-
-TemplateRecord gTemplates[kMaxDescriptorTemplates] = {};
-
-void noteTemplateCreated(VkDescriptorUpdateTemplate handle, U64 bytes,
-                         bool sized) {
-    BOXEDWINE_CRITICAL_SECTION;
-    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
-        if (gTemplates[i].handle == VK_NULL_HANDLE ||
-            gTemplates[i].handle == handle) {
-            gTemplates[i].handle = handle;
-            gTemplates[i].bytes = bytes;
-            gTemplates[i].sized = sized;
-            return;
-        }
-    }
-    klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkCreateDescriptorUpdateTemplate "
-             "status=template-table-full live=%u",
-             kMaxDescriptorTemplates);
-}
-
-// The recorded span, and whether one was recorded at all. A template the table
-// never saw answers false, which is what an update through it needs to become
-// a refusal instead of a copy of an unknown number of bytes.
-bool templateDataBytes(VkDescriptorUpdateTemplate handle, U64* bytes) {
-    BOXEDWINE_CRITICAL_SECTION;
-    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
-        if (gTemplates[i].handle == handle) {
-            *bytes = gTemplates[i].bytes;
-            return gTemplates[i].sized;
-        }
-    }
-    return false;
-}
-
-void forgetTemplate(VkDescriptorUpdateTemplate handle) {
-    BOXEDWINE_CRITICAL_SECTION;
-    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
-        if (gTemplates[i].handle == handle) {
-            gTemplates[i].handle = VK_NULL_HANDLE;
-            gTemplates[i].bytes = 0;
-            gTemplates[i].sized = false;
-            return;
-        }
+        break;
     }
 }
 
@@ -4069,6 +4226,468 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         return 0;
     }
 
+    // ---- Core commands the Vulkan 1.4 audit added --------------------------
+    //
+    // These are here because they are CORE, not because the D3D9 path calls
+    // them. winevulkan fills a dispatch-table slot for every core command by
+    // name; a name this bridge cannot resolve leaves that slot null, and a
+    // caller that does not check calls through the hole. A device run ended
+    // exactly that way: a 32-bit indirect call through a mapped table whose
+    // entry was zero.
+
+    case VKB_GetDeviceMemoryCommitment: {
+        VkDeviceSize* committed =
+            (VkDeviceSize*)m.outRequired(A(2), sizeof(VkDeviceSize));
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetDeviceMemoryCommitment)raw)((VkDevice)H(0),
+                                               (VkDeviceMemory)A(1), committed);
+        return 0;
+    }
+    case VKB_GetImageSparseMemoryRequirements: {
+        uint32_t* countSlot = (uint32_t*)m.outRequired(A(2), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkSparseImageMemoryRequirements* requirements =
+            (VkSparseImageMemoryRequirements*)m.out(
+                A(3),
+                (U64)*countSlot * sizeof(VkSparseImageMemoryRequirements));
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetImageSparseMemoryRequirements)raw)(
+            (VkDevice)H(0), (VkImage)A(1), countSlot, requirements);
+        return 0;
+    }
+    case VKB_GetImageSparseMemoryRequirements2: {
+        const VkImageSparseMemoryRequirementsInfo2* info =
+            (const VkImageSparseMemoryRequirementsInfo2*)m.chain(A(1), false);
+        uint32_t* countSlot = (uint32_t*)m.outRequired(A(2), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkSparseImageMemoryRequirements2* requirements =
+            m.structArrayTyped<VkSparseImageMemoryRequirements2>(
+                A(3), *countSlot, true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetImageSparseMemoryRequirements2)raw)((VkDevice)H(0), info,
+                                                       countSlot, requirements);
+        return 0;
+    }
+    case VKB_GetPhysicalDeviceSparseImageFormatProperties: {
+        uint32_t* countSlot = (uint32_t*)m.outRequired(A(6), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkSparseImageFormatProperties* properties =
+            (VkSparseImageFormatProperties*)m.out(
+                A(7), (U64)*countSlot * sizeof(VkSparseImageFormatProperties));
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetPhysicalDeviceSparseImageFormatProperties)raw)(
+            (VkPhysicalDevice)H(0), (VkFormat)U32A(1), (VkImageType)U32A(2),
+            (VkSampleCountFlagBits)U32A(3), (VkImageUsageFlags)U32A(4),
+            (VkImageTiling)U32A(5), countSlot, properties);
+        return 0;
+    }
+    case VKB_GetPhysicalDeviceSparseImageFormatProperties2: {
+        const VkPhysicalDeviceSparseImageFormatInfo2* info =
+            (const VkPhysicalDeviceSparseImageFormatInfo2*)m.chain(A(1), false);
+        uint32_t* countSlot = (uint32_t*)m.outRequired(A(2), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkSparseImageFormatProperties2* properties =
+            m.structArrayTyped<VkSparseImageFormatProperties2>(A(3), *countSlot,
+                                                               true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetPhysicalDeviceSparseImageFormatProperties2)raw)(
+            (VkPhysicalDevice)H(0), info, countSlot, properties);
+        return 0;
+    }
+    case VKB_QueueBindSparse: {
+        const VkBindSparseInfo* infos =
+            m.structArrayTyped<VkBindSparseInfo>(A(2), U32A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkQueueBindSparse)raw)((VkQueue)H(0), U32A(1), infos,
+                                                 (VkFence)A(3));
+    }
+    case VKB_GetRenderAreaGranularity: {
+        VkExtent2D* granularity =
+            (VkExtent2D*)m.outRequired(A(2), sizeof(VkExtent2D));
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetRenderAreaGranularity)raw)((VkDevice)H(0),
+                                              (VkRenderPass)A(1), granularity);
+        return 0;
+    }
+    case VKB_GetRenderingAreaGranularity: {
+        const VkRenderingAreaInfo* info =
+            (const VkRenderingAreaInfo*)m.chain(A(1), false);
+        VkExtent2D* granularity =
+            (VkExtent2D*)m.outRequired(A(2), sizeof(VkExtent2D));
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetRenderingAreaGranularity)raw)((VkDevice)H(0), info,
+                                                 granularity);
+        return 0;
+    }
+    case VKB_TrimCommandPool:
+        ((PFN_vkTrimCommandPool)raw)((VkDevice)H(0), (VkCommandPool)A(1),
+                                     (VkCommandPoolTrimFlags)U32A(2));
+        return 0;
+    case VKB_CmdSetDeviceMask:
+        ((PFN_vkCmdSetDeviceMask)raw)((VkCommandBuffer)H(0), U32A(1));
+        return 0;
+    case VKB_EnumeratePhysicalDeviceGroups: {
+        uint32_t* countSlot = (uint32_t*)m.outRequired(A(1), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkPhysicalDeviceGroupProperties* properties =
+            m.structArrayTyped<VkPhysicalDeviceGroupProperties>(A(2),
+                                                                *countSlot,
+                                                                true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkEnumeratePhysicalDeviceGroups)raw)(
+            (VkInstance)H(0), countSlot, properties);
+    }
+    case VKB_GetDeviceGroupPeerMemoryFeatures: {
+        VkPeerMemoryFeatureFlags* features =
+            (VkPeerMemoryFeatureFlags*)m.outRequired(
+                A(4), sizeof(VkPeerMemoryFeatureFlags));
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetDeviceGroupPeerMemoryFeatures)raw)(
+            (VkDevice)H(0), U32A(1), U32A(2), U32A(3), features);
+        return 0;
+    }
+    case VKB_CreateSamplerYcbcrConversion: {
+        const VkSamplerYcbcrConversionCreateInfo* info =
+            (const VkSamplerYcbcrConversionCreateInfo*)m.chain(A(1), false);
+        VkSamplerYcbcrConversion* out = (VkSamplerYcbcrConversion*)m.outRequired(
+            A(3), sizeof(VkSamplerYcbcrConversion));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateSamplerYcbcrConversion)raw)(
+            (VkDevice)H(0), info, nullptr, out);
+    }
+    case VKB_DestroySamplerYcbcrConversion:
+        ((PFN_vkDestroySamplerYcbcrConversion)raw)(
+            (VkDevice)H(0), (VkSamplerYcbcrConversion)A(1), nullptr);
+        return 0;
+    case VKB_GetPhysicalDeviceToolProperties: {
+        uint32_t* countSlot = (uint32_t*)m.outRequired(A(1), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkPhysicalDeviceToolProperties* properties =
+            m.structArrayTyped<VkPhysicalDeviceToolProperties>(A(2), *countSlot,
+                                                               true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkGetPhysicalDeviceToolProperties)raw)(
+            (VkPhysicalDevice)H(0), countSlot, properties);
+    }
+    case VKB_CmdDrawIndirectCount:
+        ((PFN_vkCmdDrawIndirectCount)raw)(
+            (VkCommandBuffer)H(0), (VkBuffer)A(1), (VkDeviceSize)A(2),
+            (VkBuffer)A(3), (VkDeviceSize)A(4), U32A(5), U32A(6));
+        return 0;
+    case VKB_CmdDrawIndexedIndirectCount:
+        ((PFN_vkCmdDrawIndexedIndirectCount)raw)(
+            (VkCommandBuffer)H(0), (VkBuffer)A(1), (VkDeviceSize)A(2),
+            (VkBuffer)A(3), (VkDeviceSize)A(4), U32A(5), U32A(6));
+        return 0;
+
+    // The three commands that return a 64-bit value rather than a VkResult.
+    // A bridge result is a 64-bit word whose top half is how a refusal is
+    // told apart from an answer, so the address cannot be the return value:
+    // a legitimate device address with the high bits set would read as a
+    // refusal. The guest shim therefore passes the address of a uint64_t on
+    // its own stack as one extra argument word, and the answer is written
+    // there. See BW_A in tools/vulkan-64/vulkan.c.
+    case VKB_GetBufferDeviceAddress: {
+        const VkBufferDeviceAddressInfo* info =
+            (const VkBufferDeviceAddressInfo*)m.chain(A(1), false);
+        uint64_t* out = (uint64_t*)m.outRequired(A(2), sizeof(uint64_t));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        *out = (uint64_t)((PFN_vkGetBufferDeviceAddress)raw)((VkDevice)H(0),
+                                                             info);
+        return 0;
+    }
+    case VKB_GetBufferOpaqueCaptureAddress: {
+        const VkBufferDeviceAddressInfo* info =
+            (const VkBufferDeviceAddressInfo*)m.chain(A(1), false);
+        uint64_t* out = (uint64_t*)m.outRequired(A(2), sizeof(uint64_t));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        *out = ((PFN_vkGetBufferOpaqueCaptureAddress)raw)((VkDevice)H(0), info);
+        return 0;
+    }
+    case VKB_GetDeviceMemoryOpaqueCaptureAddress: {
+        const VkDeviceMemoryOpaqueCaptureAddressInfo* info =
+            (const VkDeviceMemoryOpaqueCaptureAddressInfo*)m.chain(A(1), false);
+        uint64_t* out = (uint64_t*)m.outRequired(A(2), sizeof(uint64_t));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        *out = ((PFN_vkGetDeviceMemoryOpaqueCaptureAddress)raw)((VkDevice)H(0),
+                                                                info);
+        return 0;
+    }
+
+    case VKB_CreatePrivateDataSlot: {
+        const VkPrivateDataSlotCreateInfo* info =
+            (const VkPrivateDataSlotCreateInfo*)m.chain(A(1), false);
+        VkPrivateDataSlot* out =
+            (VkPrivateDataSlot*)m.outRequired(A(3), sizeof(VkPrivateDataSlot));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreatePrivateDataSlot)raw)((VkDevice)H(0), info,
+                                                       nullptr, out);
+    }
+    case VKB_DestroyPrivateDataSlot:
+        ((PFN_vkDestroyPrivateDataSlot)raw)((VkDevice)H(0),
+                                            (VkPrivateDataSlot)A(1), nullptr);
+        return 0;
+    case VKB_SetPrivateData:
+        return (S64)((PFN_vkSetPrivateData)raw)(
+            (VkDevice)H(0), (VkObjectType)U32A(1), (uint64_t)A(2),
+            (VkPrivateDataSlot)A(3), (uint64_t)A(4));
+    case VKB_GetPrivateData: {
+        uint64_t* data = (uint64_t*)m.outRequired(A(4), sizeof(uint64_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetPrivateData)raw)((VkDevice)H(0), (VkObjectType)U32A(1),
+                                    (uint64_t)A(2), (VkPrivateDataSlot)A(3),
+                                    data);
+        return 0;
+    }
+    case VKB_GetDeviceBufferMemoryRequirements: {
+        const VkDeviceBufferMemoryRequirements* info =
+            (const VkDeviceBufferMemoryRequirements*)m.chain(A(1), false);
+        VkMemoryRequirements2* requirements =
+            (VkMemoryRequirements2*)m.chain(A(2), true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetDeviceBufferMemoryRequirements)raw)((VkDevice)H(0), info,
+                                                       requirements);
+        return 0;
+    }
+    case VKB_GetDeviceImageMemoryRequirements: {
+        const VkDeviceImageMemoryRequirements* info =
+            (const VkDeviceImageMemoryRequirements*)m.chain(A(1), false);
+        VkMemoryRequirements2* requirements =
+            (VkMemoryRequirements2*)m.chain(A(2), true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetDeviceImageMemoryRequirements)raw)((VkDevice)H(0), info,
+                                                      requirements);
+        return 0;
+    }
+    case VKB_GetDeviceImageSparseMemoryRequirements: {
+        const VkDeviceImageMemoryRequirements* info =
+            (const VkDeviceImageMemoryRequirements*)m.chain(A(1), false);
+        uint32_t* countSlot = (uint32_t*)m.outRequired(A(2), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkSparseImageMemoryRequirements2* requirements =
+            m.structArrayTyped<VkSparseImageMemoryRequirements2>(
+                A(3), *countSlot, true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetDeviceImageSparseMemoryRequirements)raw)(
+            (VkDevice)H(0), info, countSlot, requirements);
+        return 0;
+    }
+    case VKB_GetImageSubresourceLayout2: {
+        const VkImageSubresource2* subresource =
+            (const VkImageSubresource2*)m.chain(A(2), false);
+        VkSubresourceLayout2* layout =
+            (VkSubresourceLayout2*)m.chain(A(3), true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetImageSubresourceLayout2)raw)((VkDevice)H(0), (VkImage)A(1),
+                                                subresource, layout);
+        return 0;
+    }
+    case VKB_GetDeviceImageSubresourceLayout: {
+        const VkDeviceImageSubresourceInfo* info =
+            (const VkDeviceImageSubresourceInfo*)m.chain(A(1), false);
+        VkSubresourceLayout2* layout =
+            (VkSubresourceLayout2*)m.chain(A(2), true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetDeviceImageSubresourceLayout)raw)((VkDevice)H(0), info,
+                                                     layout);
+        return 0;
+    }
+    case VKB_MapMemory2: {
+        const VkMemoryMapInfo* info =
+            (const VkMemoryMapInfo*)m.chain(A(1), false);
+        U64* slot = (U64*)m.outRequired(A(2), sizeof(U64));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        void* mapped = nullptr;
+        const VkResult result =
+            ((PFN_vkMapMemory2)raw)((VkDevice)H(0), info, &mapped);
+        if (result == VK_SUCCESS) {
+            // Same rule as vkMapMemory: the driver hands back a host address,
+            // and an address inside an alias window is a guest page that the
+            // guest can only hold in its canonical form.
+            *slot = boxedvn::hostToGuestAddress((U64)(uintptr_t)mapped);
+        }
+        return (S64)result;
+    }
+    case VKB_UnmapMemory2: {
+        const VkMemoryUnmapInfo* info =
+            (const VkMemoryUnmapInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkUnmapMemory2)raw)((VkDevice)H(0), info);
+    }
+    case VKB_TransitionImageLayout: {
+        const VkHostImageLayoutTransitionInfo* transitions =
+            m.structArrayTyped<VkHostImageLayoutTransitionInfo>(A(2), U32A(1),
+                                                                false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkTransitionImageLayout)raw)((VkDevice)H(0), U32A(1),
+                                                       transitions);
+    }
+    case VKB_CmdBindIndexBuffer2:
+        ((PFN_vkCmdBindIndexBuffer2)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                         (VkDeviceSize)A(2), (VkDeviceSize)A(3),
+                                         (VkIndexType)U32A(4));
+        return 0;
+    case VKB_CmdSetLineStipple:
+        ((PFN_vkCmdSetLineStipple)raw)((VkCommandBuffer)H(0), U32A(1),
+                                       (uint16_t)A(2));
+        return 0;
+    case VKB_CmdPushDescriptorSet: {
+        const VkWriteDescriptorSet* writes =
+            m.structArrayTyped<VkWriteDescriptorSet>(A(5), U32A(4), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPushDescriptorSet)raw)(
+            (VkCommandBuffer)H(0), (VkPipelineBindPoint)U32A(1),
+            (VkPipelineLayout)A(2), U32A(3), U32A(4), writes);
+        return 0;
+    }
+    case VKB_CmdPushDescriptorSetWithTemplate: {
+        VkDescriptorUpdateTemplate handle = (VkDescriptorUpdateTemplate)A(1);
+        U64 bytes = 0;
+        if (!templateDataBytes(handle, &bytes)) {
+            static std::atomic<U32> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE "
+                         "call=vkCmdPushDescriptorSetWithTemplate "
+                         "template=0x%llx status=no-span",
+                         (unsigned long long)A(1));
+            }
+            return 0;
+        }
+        const void* data = m.inArrayAt(A(4), bytes, 1);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPushDescriptorSetWithTemplate)raw)(
+            (VkCommandBuffer)H(0), handle, (VkPipelineLayout)A(2), U32A(3),
+            data);
+        return 0;
+    }
+    case VKB_CmdSetRenderingAttachmentLocations: {
+        const VkRenderingAttachmentLocationInfo* info =
+            (const VkRenderingAttachmentLocationInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetRenderingAttachmentLocations)raw)((VkCommandBuffer)H(0),
+                                                        info);
+        return 0;
+    }
+    case VKB_CmdSetRenderingInputAttachmentIndices: {
+        const VkRenderingInputAttachmentIndexInfo* info =
+            (const VkRenderingInputAttachmentIndexInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetRenderingInputAttachmentIndices)raw)(
+            (VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdBindDescriptorSets2: {
+        const VkBindDescriptorSetsInfo* info =
+            (const VkBindDescriptorSetsInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBindDescriptorSets2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdPushConstants2: {
+        const VkPushConstantsInfo* info =
+            (const VkPushConstantsInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPushConstants2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdPushDescriptorSet2: {
+        const VkPushDescriptorSetInfo* info =
+            (const VkPushDescriptorSetInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPushDescriptorSet2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdPushDescriptorSetWithTemplate2: {
+        // The template span is resolved inside the chain fixup, which is where
+        // the template handle and the data pointer are in the same structure.
+        const VkPushDescriptorSetWithTemplateInfo* info =
+            (const VkPushDescriptorSetWithTemplateInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPushDescriptorSetWithTemplate2)raw)((VkCommandBuffer)H(0),
+                                                       info);
+        return 0;
+    }
+
     case VKB_CreateXlibSurfaceKHR:
         // Handled before dispatch; unreachable.
         return BOXEDWINE_X64_VK_E_UNIMPL;
@@ -4091,6 +4710,46 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
 #undef F32A
 
 // ---- vkGetInstanceProcAddr / vkGetDeviceProcAddr ----------------------------
+
+// Every author tag Vulkan uses as a command-name suffix. A command whose name
+// ends in one of these came from an extension; a command whose name ends in
+// none of them is core, and every driver that claims the API version it was
+// promoted in must expose it.
+//
+// The distinction is the whole point of the witness below. Wine's winevulkan
+// builds a dispatch table with one slot per command it knows, filled from
+// vkGetDeviceProcAddr by name, and a caller reaching a slot the lookup could
+// not fill calls through a null. A device run ended exactly there: a 32-bit
+// indirect call through a table that was mapped and readable with a zero at
+// the entry it wanted. An extension the driver does not have is the ordinary
+// case and leaves a null nobody dereferences, because a caller only reaches
+// those slots after the extension was enabled. A CORE miss is the dangerous
+// one, and until this line existed the two were indistinguishable in a log.
+const char* const kVendorSuffixes[] = {
+    "KHR", "EXT", "AMD", "AMDX", "NV", "NVX", "INTEL", "ARM", "IMG", "QCOM",
+    "VALVE", "HUAWEI", "GOOGLE", "MVK", "FUCHSIA", "ANDROID", "SEC", "NN",
+    "MESA", "LUNARG", "QNX", "GGP", "KHX",
+};
+
+bool hasVendorSuffix(const char* name) {
+    const size_t length = ::strlen(name);
+    for (U32 i = 0;
+         i < (U32)(sizeof(kVendorSuffixes) / sizeof(kVendorSuffixes[0])); ++i) {
+        const size_t tag = ::strlen(kVendorSuffixes[i]);
+        if (length > tag && !strcmp(name + length - tag, kVendorSuffixes[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// `core-miss` or `extension-miss`, so a log can be filtered down to the
+// dangerous half without knowing the Vulkan registry.
+const char* procAddrMissKind(const char* name) {
+    return hasVendorSuffix(name) ? "extension-miss" : "core-miss";
+}
+
+std::atomic<U32> gCoreMisses{0};
 
 S64 procAddr(KMemory64* memory, U64 handle, U64 nameAddress, U64 inShimTable) {
     char name[128] = {};
@@ -4122,12 +4781,21 @@ S64 procAddr(KMemory64* memory, U64 handle, U64 nameAddress, U64 inShimTable) {
         // The point of the whole operation: a run says by name what the
         // caller wanted that this bridge does not carry, which is a far
         // cheaper way to learn DXVK's real requirement list than guessing it.
-        const U32 refusals = gRefusals.fetch_add(1, std::memory_order_relaxed);
-        if (refusals < kRefusalBudget) {
+        //
+        // A core miss gets its own status and its own budget, because it is a
+        // different kind of event: an extension the bridge does not carry is
+        // expected and harmless, while a CORE command it does not carry is how
+        // a null gets into winevulkan's dispatch table.
+        const char* kind = procAddrMissKind(name);
+        const bool core = !hasVendorSuffix(name);
+        const U32 seen = core
+            ? gCoreMisses.fetch_add(1, std::memory_order_relaxed)
+            : gRefusals.fetch_add(1, std::memory_order_relaxed);
+        if (seen < kRefusalBudget) {
             klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkGetProcAddr "
-                     "missing=%s handle=0x%llx status=%lld",
+                     "missing=%s handle=0x%llx status=%lld kind=%s",
                      name, (unsigned long long)handle,
-                     (long long)BOXEDWINE_X64_VK_E_BADOP);
+                     (long long)BOXEDWINE_X64_VK_E_BADOP, kind);
         }
         return 0;
     }
@@ -4146,12 +4814,20 @@ S64 procAddr(KMemory64* memory, U64 handle, U64 nameAddress, U64 inShimTable) {
         return hostDriver() ? 1 : 0;
     }
     if (!hostProc(index)) {
-        const U32 refusals = gRefusals.fetch_add(1, std::memory_order_relaxed);
-        if (refusals < kRefusalBudget) {
+        // The bridge carries the command and the DRIVER does not. Same split:
+        // a core command MoltenVK cannot resolve is a hole this bridge has no
+        // way to fill, and saying so by name is the only thing that separates
+        // it from an extension nobody enabled.
+        const char* kind = procAddrMissKind(name);
+        const bool core = !hasVendorSuffix(name);
+        const U32 seen = core
+            ? gCoreMisses.fetch_add(1, std::memory_order_relaxed)
+            : gRefusals.fetch_add(1, std::memory_order_relaxed);
+        if (seen < kRefusalBudget) {
             klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkGetProcAddr "
-                     "unsupported=%s handle=0x%llx status=%lld",
+                     "unsupported=%s handle=0x%llx status=%lld kind=%s",
                      name, (unsigned long long)handle,
-                     (long long)BOXEDWINE_X64_VK_E_NOPROC);
+                     (long long)BOXEDWINE_X64_VK_E_NOPROC, kind);
         }
         return 0;
     }

@@ -366,6 +366,60 @@ struct K64Page {
     bool committed() const { return hostData() != nullptr; }
 };
 
+// ---- Guest-lane host fault repair ---------------------------------------
+//
+// A native-identity address space keeps TWO ledgers for the same bytes and
+// they have different granularity:
+//
+//   * `pages`, keyed by 4 KiB CANONICAL guest page, is what the guest -- and
+//     every kernel path -- believes about a page: mapped or not, and with
+//     which K64_PAGE_READ/WRITE bits.
+//   * the host VM, plus `nativeRanges`, is what the hardware will actually
+//     permit. iOS host pages are 16 KiB, so ONE host page carries FOUR guest
+//     pages whose guest permissions need not agree, and mmap/mprotect/munmap
+//     have to reconstruct a safe union for it every time any of the four
+//     changes.
+//
+// FEX dereferences guest addresses directly through the alias (see
+// guest_low_alias.h), so it consults neither `pages` nor the K64_PAGE_* bits:
+// it takes whatever the host VM says. When the two ledgers disagree the guest
+// gets a host fault for a page it is entitled to read, which Wine translates
+// into STATUS_ACCESS_VIOLATION / STATUS_DATATYPE_MISALIGNMENT and the process
+// dies. The interpreter never saw this: it reads through `pages` and merely
+// logs BOXEDWINE_X64_SPARSE_PAGE_MISSING for a page with no buffer.
+//
+// nativeRepairHostFault is the reconciliation, driven from the signal handler
+// with the page table as the authority: it raises the host page to exactly
+// the union its guest subpages are entitled to and to nothing more, so a
+// genuine guest access violation still reaches the guest as one.
+struct K64NativeFaultRepair {
+    // The canonical guest address the faulting host address is the image of.
+    U64 guestAddress = 0;
+    // The enclosing HOST page -- the granule the repair can act on.
+    U64 hostPageStart = 0;
+    U64 hostPageLength = 0;
+    // The host address is the image of a guest address this address space
+    // serves. False for the emulator's own heap and the translated code arena.
+    bool inGuestLane = false;
+    // The page table's verdict on that guest page, and the K_PROT_* bits it
+    // grants. These are the numbers that decide whether a repair is legal.
+    bool pageMapped = false;
+    U32 guestProt = 0;
+    // The union the whole host page is entitled to, over its guest subpages.
+    U32 hostPageProt = 0;
+    // What the OTHER ledger said before the repair: whether a host region
+    // exists there at all, and what it permitted. This is what distinguishes
+    // "no host page" from "host page present but PROT_NONE".
+    bool hostPresent = false;
+    U32 hostProtBefore = 0;
+    // Whether nativeRanges already owned the host page.
+    bool tracked = false;
+    // What the repair did.
+    bool materialised = false;   // a host page was created here
+    bool reprotected = false;    // an existing host page's protection changed
+    const char* decision = "none";
+};
+
 class KMemory64 {
 public:
     explicit KMemory64(KProcess* process, bool nativeIdentity = false);
@@ -413,6 +467,23 @@ public:
     // when this address space is sparse / has not mapped the alias. This is
     // intentionally narrow; it is not a general guest-pointer translation.
     U64 nativeAliasForGuest(U64 guestAddress) const;
+
+    // Reconcile the two ledgers for the host page a translated guest access
+    // faulted on. `hostFaultAddress` is the raw si_addr of the host fault;
+    // `requiredProt` is the minimum K_PROT_* the guest page must already
+    // grant for a repair to be legal (the translator cannot tell the signal
+    // handler whether the access was a load or a store, so callers pass
+    // K_PROT_READ and let a store to a read-only page fault again against the
+    // restored, still-read-only host page).
+    //
+    // Returns true only when the faulting instruction should be retried in
+    // place. Every refusal -- not native, not a guest-lane address, the guest
+    // page genuinely unmapped, the guest page genuinely inaccessible, or the
+    // host operation itself failing -- returns false so the fault stays the
+    // guest fault it was. `report` is filled in either way and is what the
+    // BOXEDWINE_X64_ALIAS_BACKING witness prints.
+    bool nativeRepairHostFault(U64 hostFaultAddress, U32 requiredProt,
+                               K64NativeFaultRepair& report);
 
     // mmap subset: anonymous + fixed only in v1. Returns the mapped guest
     // address, or (U64)-errno on failure. addr MUST be page-aligned and

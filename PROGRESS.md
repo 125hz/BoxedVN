@@ -7354,3 +7354,37 @@ it, and the requeue operations silently woke nobody.
 The stall reporter now prints the whole futex table, so the next occurrence
 says which word each thread waits on, what it expects, what the word holds,
 and whether any wake ever named it.
+
+## A guest page and a host page are not the same size
+
+A 32-bit program ran for a hundred seconds, built its window, and died when
+translated code loaded two bytes from a guest address the host would not read.
+The guest tracks memory in 4 KiB pages; iOS pages are 16 KiB, so every
+protection change rounds outward and four guest pages share one host page.
+Translated code consults neither ledger, it dereferences, so any disagreement
+is fatal. The fault path now reconciles the two: the guest page map is the
+authority, the host page is raised to exactly the union of what the four guest
+pages grant and never more, a page whose bytes live elsewhere is refused, and
+one retry is the limit. BOXEDWINE_X64_ALIAS_BACKING names which ledger was
+wrong, reading the real host protection rather than assuming it. The identity
+lane rounds the same way and is covered by the same repair.
+
+Two readings in the brief were corrected by the evidence: the signal code
+carries no information here, because this platform assigns the same code to
+every bus error, and the page was present but unreadable rather than absent,
+because an absent page arrives as a segmentation fault instead.
+
+## No core Vulkan command resolves to nothing
+
+The 32-bit Direct3D 9 path now creates an instance, enumerates the GPU, reads
+its capabilities, creates a device and gets a queue. It then called a null
+entry in a dispatch table and died. The bridge cannot stop a caller from
+dereferencing a null it was handed, so the fix is not to hand one out: an
+audit of the core command set found 45 commands with no ordinal, of which 42
+are now carried. The three refused are the host image copy family, whose
+pointer length is an image region's byte footprint that the call does not
+state; sizing it wrongly would read or write past the guest's allocation,
+which is the fault the marshalling exists to prevent. They are refused by
+name. A lookup that fails now says whether the name was core or an extension,
+because an extension miss is expected and a core miss is how a table gets a
+hole.

@@ -119,7 +119,26 @@
  *    as the bit pattern of its IEEE-754 binary32 value in the low 32 bits of
  *    an argument word (see the note above BOXEDWINE_X64_VK_COMMANDS), which a
  *    shim built for 4 does not know how to pack. */
-#define BOXEDWINE_X64_VK_ABI_VERSION 5U
+/* 6: the core-completeness pass. A device run got through instance and device
+ *    creation and then died on a 32-bit indirect call through a mapped
+ *    dispatch table whose entry was zero. Wine's winevulkan fills one slot per
+ *    command by name out of vkGetDeviceProcAddr; a name this bridge cannot
+ *    resolve leaves that slot null, and a caller that does not check calls
+ *    through the hole. So the table was audited against every command core
+ *    Vulkan 1.0 through 1.4 defines, and the ones that can be marshalled
+ *    correctly were added -- whether or not the D3D9 path calls them, because
+ *    the slot exists either way.
+ *
+ *    The wire format gained one convention with it: a command that returns a
+ *    64-bit value rather than a VkResult (vkGetBufferDeviceAddress and the two
+ *    opaque-capture-address queries) cannot return it in RAX, because a bridge
+ *    refusal is told from an answer by the top half of that word and a
+ *    legitimate device address may have those bits set. The guest shim passes
+ *    the address of a uint64_t on its own stack as one extra argument word
+ *    instead, and the host writes the answer there. A shim built for 5 has no
+ *    entry point for any of the new commands and does not know the convention,
+ *    which is the whole reason this is a version and not an addition. */
+#define BOXEDWINE_X64_VK_ABI_VERSION 6U
 
 /*
  * The bridge's own refusals, as distinct from a VkResult.
@@ -205,20 +224,38 @@
  * both forms, graphics and compute pipelines, and the vkCmd* family DXVK
  * emits for a frame.
  *
- * What is still absent is absent on purpose, and each omission is a marshal
- * this bridge cannot prove rather than an oversight:
+ * Since ABI 6 the table also carries every command core Vulkan 1.0 through 1.4
+ * defines that can be marshalled correctly, whether or not the D3D9 path calls
+ * it. That is not completeness for its own sake: winevulkan fills one dispatch
+ * slot per command by name, so a core command this bridge cannot resolve
+ * leaves a null in a table a caller may walk without checking. Only three core
+ * commands are refused, and each is refused because the marshal cannot be
+ * proven rather than because nothing calls it:
  *
- *   - vkCmdPushDescriptorSet and its WithTemplate form: VK_KHR_push_descriptor
- *     is not something MoltenVK advertises, and the template form needs an
- *     entry list this bridge would have to keep for a template it never
- *     created a descriptor set from.
+ *   - vkCopyMemoryToImage, vkCopyImageToMemory and vkCopyImageToImage
+ *     (VK_VERSION_1_4, host image copy). VkMemoryToImageCopy and
+ *     VkImageToMemoryCopy carry a `pHostPointer` the driver reads or writes
+ *     directly, whose length is the byte footprint of an image region: it
+ *     depends on the format's texel block size and on memoryRowLength and
+ *     memoryImageHeight, and nothing in the call states it. Sizing it would
+ *     mean carrying a format table, and getting it wrong is a read or a write
+ *     past the guest's own allocation -- the exact fault this bridge exists to
+ *     prevent. They resolve to NULL and the host prints `kind=core-miss`.
+ *
+ * Extension commands are absent in bulk and that is expected: a caller only
+ * reaches an extension's dispatch slot after enabling the extension, so a null
+ * there is never dereferenced. The two kinds are told apart in the log by
+ * `kind=core-miss` versus `kind=extension-miss`, which is what makes the
+ * dangerous half of a run's proc-address misses greppable.
+ *
+ * Still absent among the extensions, with the reason, because each was a
+ * deliberate call rather than an oversight:
+ *
  *   - vkCmdSetVertexInputEXT and the VK_EXT_extended_dynamic_state3 setters:
  *     DXVK emits them only when the matching feature bit is set, and MoltenVK
  *     does not set it.
- *   - vkCmdDraw{,Indexed}IndirectCount: VK_KHR_draw_indirect_count is a
- *     D3D11/12 path, not one the D3D9 chain reaches.
- *   - vkQueueBindSparse, the sparse-residency queries, and the
- *     acceleration-structure and video families: no D3D9 path reaches them.
+ *   - the acceleration-structure, micromap, video and performance-query
+ *     families: no D3D9 path reaches them, and none is core.
  *
  * A run that wants one of these names it through BOXEDWINE_X64_VK_OP_PROC_ADDR
  * and the host prints it, which is still the cheapest way to learn what is
@@ -466,7 +503,79 @@
     X(CmdWriteTimestamp,                         153) \
     X(CmdWriteTimestamp2,                        521) \
     X(CmdCopyQueryPoolResults,                   154) \
-    X(CmdExecuteCommands,                        159)
+    X(CmdExecuteCommands,                        159) \
+    /* core 1.0 the audit found missing */ \
+    X(GetDeviceMemoryCommitment,                  29) \
+    X(GetImageSparseMemoryRequirements,           34) \
+    X(GetPhysicalDeviceSparseImageFormatProperties, 35) \
+    X(QueueBindSparse,                            36) \
+    X(GetRenderAreaGranularity,                   94) \
+    /* core 1.1 */ \
+    X(EnumeratePhysicalDeviceGroups,             226) \
+    X(GetDeviceGroupPeerMemoryFeatures,          228) \
+    X(CmdSetDeviceMask,                          234) \
+    X(TrimCommandPool,                           212) \
+    X(GetImageSparseMemoryRequirements2,         267) \
+    X(GetPhysicalDeviceSparseImageFormatProperties2, 208) \
+    X(CreateSamplerYcbcrConversion,              275) \
+    X(DestroySamplerYcbcrConversion,             277) \
+    /* core 1.2 */ \
+    X(CmdDrawIndirectCount,                      318) \
+    X(CmdDrawIndexedIndirectCount,               321) \
+    X(GetBufferDeviceAddress,                    384) \
+    X(GetBufferOpaqueCaptureAddress,             382) \
+    X(GetDeviceMemoryOpaqueCaptureAddress,       397) \
+    /* core 1.3 */ \
+    X(CreatePrivateDataSlot,                     485) \
+    X(DestroyPrivateDataSlot,                    487) \
+    X(SetPrivateData,                            489) \
+    X(GetPrivateData,                            491) \
+    X(GetDeviceBufferMemoryRequirements,         269) \
+    X(GetDeviceImageMemoryRequirements,          271) \
+    X(GetDeviceImageSparseMemoryRequirements,    273) \
+    X(GetPhysicalDeviceToolProperties,           405) \
+    /* core 1.4 */ \
+    X(CmdBindIndexBuffer2,                       430) \
+    X(CmdSetLineStipple,                         402) \
+    X(CmdPushDescriptorSet,                      210) \
+    X(CmdPushDescriptorSetWithTemplate,          248) \
+    X(CmdBindDescriptorSets2,                    624) \
+    X(CmdPushConstants2,                         626) \
+    X(CmdPushDescriptorSet2,                     628) \
+    X(CmdPushDescriptorSetWithTemplate2,         630) \
+    X(CmdSetRenderingAttachmentLocations,        639) \
+    X(CmdSetRenderingInputAttachmentIndices,     641) \
+    X(MapMemory2,                                615) \
+    X(UnmapMemory2,                              617) \
+    X(GetImageSubresourceLayout2,                599) \
+    X(GetDeviceImageSubresourceLayout,           613) \
+    X(GetRenderingAreaGranularity,                95) \
+    X(TransitionImageLayout,                     531)
+
+/*
+ * The core commands this bridge deliberately does NOT carry.
+ *
+ * Machine-readable on purpose: scripts/test_x64_vulkan_shim.py computes the
+ * set of commands core Vulkan defines out of source/vulkan/vk/vulkan_core.h
+ * and asserts that every one of them is either in the table above or named
+ * here. That is what keeps the audit from rotting -- a header update that adds
+ * a core command fails the test rather than quietly leaving a null in
+ * winevulkan's dispatch table.
+ *
+ * All three are VK_VERSION_1_4 host image copy. VkMemoryToImageCopy and
+ * VkImageToMemoryCopy carry a `pHostPointer` the driver reads or writes
+ * directly, and its length is the byte footprint of an image region: it
+ * depends on the format's texel block size and on memoryRowLength and
+ * memoryImageHeight, none of which the call states. Sizing it would mean
+ * carrying a format table into this bridge, and a wrong size is a read or a
+ * write past the guest's own allocation -- the exact fault the marshal exists
+ * to prevent. They resolve to NULL and the host prints `kind=core-miss`, which
+ * is a named hole rather than a silent one.
+ */
+#define BOXEDWINE_X64_VK_CORE_REFUSALS(X) \
+    X(CopyMemoryToImage) \
+    X(CopyImageToMemory) \
+    X(CopyImageToImage)
 
 /*
  * Alternate spellings that resolve to the same operation.
@@ -542,7 +651,49 @@
     X(CmdResetEvent2KHR,                          CmdResetEvent2) \
     X(CmdWaitEvents2KHR,                          CmdWaitEvents2) \
     X(CmdWriteTimestamp2KHR,                      CmdWriteTimestamp2) \
-    X(QueueSubmit2KHR,                            QueueSubmit2)
+    X(QueueSubmit2KHR,                            QueueSubmit2) \
+    X(EnumeratePhysicalDeviceGroupsKHR,           EnumeratePhysicalDeviceGroups) \
+    X(GetDeviceGroupPeerMemoryFeaturesKHR,        GetDeviceGroupPeerMemoryFeatures) \
+    X(CmdSetDeviceMaskKHR,                        CmdSetDeviceMask) \
+    X(TrimCommandPoolKHR,                         TrimCommandPool) \
+    X(GetImageSparseMemoryRequirements2KHR,       GetImageSparseMemoryRequirements2) \
+    X(GetPhysicalDeviceSparseImageFormatProperties2KHR, GetPhysicalDeviceSparseImageFormatProperties2) \
+    X(CreateSamplerYcbcrConversionKHR,            CreateSamplerYcbcrConversion) \
+    X(DestroySamplerYcbcrConversionKHR,           DestroySamplerYcbcrConversion) \
+    X(CmdDrawIndirectCountKHR,                    CmdDrawIndirectCount) \
+    X(CmdDrawIndirectCountAMD,                    CmdDrawIndirectCount) \
+    X(CmdDrawIndexedIndirectCountKHR,             CmdDrawIndexedIndirectCount) \
+    X(CmdDrawIndexedIndirectCountAMD,             CmdDrawIndexedIndirectCount) \
+    X(GetBufferDeviceAddressKHR,                  GetBufferDeviceAddress) \
+    X(GetBufferDeviceAddressEXT,                  GetBufferDeviceAddress) \
+    X(GetBufferOpaqueCaptureAddressKHR,           GetBufferOpaqueCaptureAddress) \
+    X(GetDeviceMemoryOpaqueCaptureAddressKHR,     GetDeviceMemoryOpaqueCaptureAddress) \
+    X(CreatePrivateDataSlotEXT,                   CreatePrivateDataSlot) \
+    X(DestroyPrivateDataSlotEXT,                  DestroyPrivateDataSlot) \
+    X(SetPrivateDataEXT,                          SetPrivateData) \
+    X(GetPrivateDataEXT,                          GetPrivateData) \
+    X(GetDeviceBufferMemoryRequirementsKHR,       GetDeviceBufferMemoryRequirements) \
+    X(GetDeviceImageMemoryRequirementsKHR,        GetDeviceImageMemoryRequirements) \
+    X(GetDeviceImageSparseMemoryRequirementsKHR,  GetDeviceImageSparseMemoryRequirements) \
+    X(GetPhysicalDeviceToolPropertiesEXT,         GetPhysicalDeviceToolProperties) \
+    X(CmdBindIndexBuffer2KHR,                     CmdBindIndexBuffer2) \
+    X(CmdSetLineStippleKHR,                       CmdSetLineStipple) \
+    X(CmdSetLineStippleEXT,                       CmdSetLineStipple) \
+    X(CmdPushDescriptorSetKHR,                    CmdPushDescriptorSet) \
+    X(CmdPushDescriptorSetWithTemplateKHR,        CmdPushDescriptorSetWithTemplate) \
+    X(CmdBindDescriptorSets2KHR,                  CmdBindDescriptorSets2) \
+    X(CmdPushConstants2KHR,                       CmdPushConstants2) \
+    X(CmdPushDescriptorSet2KHR,                   CmdPushDescriptorSet2) \
+    X(CmdPushDescriptorSetWithTemplate2KHR,       CmdPushDescriptorSetWithTemplate2) \
+    X(CmdSetRenderingAttachmentLocationsKHR,      CmdSetRenderingAttachmentLocations) \
+    X(CmdSetRenderingInputAttachmentIndicesKHR,   CmdSetRenderingInputAttachmentIndices) \
+    X(MapMemory2KHR,                              MapMemory2) \
+    X(UnmapMemory2KHR,                            UnmapMemory2) \
+    X(GetImageSubresourceLayout2KHR,              GetImageSubresourceLayout2) \
+    X(GetImageSubresourceLayout2EXT,              GetImageSubresourceLayout2) \
+    X(GetDeviceImageSubresourceLayoutKHR,         GetDeviceImageSubresourceLayout) \
+    X(GetRenderingAreaGranularityKHR,             GetRenderingAreaGranularity) \
+    X(TransitionImageLayoutEXT,                   TransitionImageLayout)
 
 #define BOXEDWINE_X64_VK_OP_ENUM(name, ordinal) \
     BOXEDWINE_X64_VK_OP_##name = (BOXEDWINE_X64_VK_OP_VK_BASE + (ordinal)),

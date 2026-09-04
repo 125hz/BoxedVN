@@ -852,20 +852,19 @@ class RecordingHalfContract(unittest.TestCase):
             with self.subTest(command=name):
                 self.assertIn(name, self.commands)
 
-    def test_the_deliberate_omissions_stay_omitted(self) -> None:
-        # Each of these is named in the header with the reason it is absent. A
-        # half-marshalled version of any of them would be worse than none: the
-        # first three need an entry list or a feature bit this bridge cannot
-        # see, and the last is a D3D11/12 path.
-        for name in ("CmdPushDescriptorSet", "CmdPushDescriptorSetWithTemplate",
-                     "CmdSetVertexInputEXT", "CmdSetColorBlendEnableEXT",
-                     "CmdDrawIndirectCount", "CmdDrawIndexedIndirectCount",
-                     "QueueBindSparse"):
+    def test_the_deliberate_extension_omissions_stay_omitted(self) -> None:
+        # Extension commands only; the core ones are held by
+        # CoreCompletenessContract below. Each is named in the header with the
+        # reason, and a half-marshalled version would be worse than none.
+        for name in ("CmdSetVertexInputEXT", "CmdSetColorBlendEnableEXT",
+                     "CmdSetColorWriteMaskEXT", "CmdTraceRaysKHR",
+                     "CmdBuildAccelerationStructuresKHR", "CmdDecodeVideoKHR"):
             with self.subTest(command=name):
                 self.assertNotIn(name, self.commands)
         header = BRIDGE_HEADER.read_text(encoding="utf-8")
-        for reason in ("VK_KHR_push_descriptor", "vkCmdSetVertexInputEXT",
-                       "VK_KHR_draw_indirect_count", "vkQueueBindSparse"):
+        for reason in ("vkCmdSetVertexInputEXT",
+                       "VK_EXT_extended_dynamic_state3",
+                       "acceleration-structure"):
             with self.subTest(reason=reason):
                 self.assertIn(reason, header,
                               "an omission has to be recorded with its reason")
@@ -1130,6 +1129,160 @@ class RecordingHalfContract(unittest.TestCase):
                 ("ResetQueryPoolEXT", "ResetQueryPool")):
             with self.subTest(alias=alias):
                 self.assertEqual(aliases.get(alias), core)
+
+
+def core_commands() -> dict[str, str]:
+    """Every command core Vulkan defines, mapped to the version that added it.
+
+    vulkan_core.h is organised as a sequence of feature blocks, each opened by
+    `#define VK_<FEATURE> 1`; the core ones are VK_VERSION_1_0 through
+    VK_VERSION_1_4 and everything else is an extension. Reading the prototypes
+    per block is what makes "is this command core?" a fact from the header
+    rather than a judgement about the name.
+    """
+    versions = {"VK_VERSION_1_0", "VK_VERSION_1_1", "VK_VERSION_1_2",
+                "VK_VERSION_1_3", "VK_VERSION_1_4"}
+    found: dict[str, str] = {}
+    feature = None
+    for line in VULKAN_CORE.read_text(encoding="utf-8").splitlines():
+        opened = re.match(r"#define (VK_[A-Za-z0-9_]+) 1\s*$", line)
+        if opened:
+            feature = opened.group(1)
+            continue
+        proto = re.match(r"VKAPI_ATTR .*VKAPI_CALL (vk[A-Za-z0-9]+)\(", line)
+        if proto and feature in versions and proto.group(1) not in found:
+            found[proto.group(1)] = feature
+    return found
+
+
+def core_refusals() -> set[str]:
+    """BOXEDWINE_X64_VK_CORE_REFUSALS: the core commands the header records as
+    deliberately absent, with the reason written above the list."""
+    text = BRIDGE_HEADER.read_text(encoding="utf-8")
+    start = text.index("#define BOXEDWINE_X64_VK_CORE_REFUSALS(X)")
+    names: set[str] = set()
+    for raw in text[start:].splitlines()[1:]:
+        match = re.match(r"\s*X\((\w+)\)\s*\\?\s*$", raw)
+        if match:
+            names.add(match.group(1))
+            continue
+        if not raw.strip().endswith("\\"):
+            break
+    return names
+
+
+class CoreCompletenessContract(unittest.TestCase):
+    """No core Vulkan command may be a silent hole.
+
+    Wine's winevulkan builds a dispatch table with one slot per command it
+    knows and fills each from vkGetDeviceProcAddr by name. A name the bridge
+    cannot resolve leaves that slot null. For an EXTENSION command that is
+    harmless -- a caller only reaches those slots after enabling the extension
+    -- but for a CORE command it is not, because a caller may reach a core slot
+    unconditionally and DXVK does not check. A device run ended precisely
+    there: instance creation, device creation and vkGetDeviceQueue all
+    succeeded, then the 32-bit process died on an indirect call through a table
+    that was mapped and readable with a zero at the entry it wanted, and the
+    only core commands the bridge had no ordinal for were the four the log's
+    proc-address misses named.
+
+    So the rule is: every core command is either dispatched or explicitly
+    refused with a reason. These tests compute the core set from the header
+    rather than listing it, so a Vulkan header update that adds a core command
+    fails here instead of on a device.
+    """
+
+    def setUp(self) -> None:
+        self.commands = bridge_commands()
+        self.aliases = validator.read_bridge_aliases(BRIDGE_HEADER)
+        self.core = core_commands()
+        self.refused = core_refusals()
+
+    def test_the_core_set_was_actually_found(self) -> None:
+        # A parse that silently found nothing would make every test below pass.
+        self.assertGreater(len(self.core), 200)
+        for name in ("vkCreateInstance", "vkCmdDraw", "vkQueueSubmit2",
+                     "vkGetPhysicalDeviceToolProperties"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.core)
+
+    def test_every_core_command_is_dispatched_or_refused_by_name(self) -> None:
+        served = set(self.commands) | set(self.aliases) | self.refused
+        # The two lookup entry points are core, and the shim answers them
+        # itself rather than dispatching them; they are never null.
+        served |= {"GetInstanceProcAddr", "GetDeviceProcAddr"}
+        holes = sorted(f"{name} ({self.core[name]})"
+                       for name in self.core if name[2:] not in served)
+        self.assertEqual(
+            holes, [],
+            "core command(s) with no ordinal and no recorded refusal; each "
+            "leaves a null in winevulkan's dispatch table: " + ", ".join(holes))
+
+    def test_the_four_commands_the_device_run_named_are_carried(self) -> None:
+        # Filtering that run's proc-address misses down to names with no vendor
+        # suffix left exactly these four.
+        for name in ("EnumeratePhysicalDeviceGroups",
+                     "GetPhysicalDeviceSparseImageFormatProperties",
+                     "GetPhysicalDeviceSparseImageFormatProperties2",
+                     "GetPhysicalDeviceToolProperties"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_every_refusal_names_a_real_core_command(self) -> None:
+        # A refusal for a command that is not core, or no longer exists, is a
+        # stale entry that would mask a real hole.
+        self.assertTrue(self.refused)
+        for name in sorted(self.refused):
+            with self.subTest(command=name):
+                self.assertIn("vk" + name, self.core)
+                self.assertNotIn(name, self.commands,
+                                 "a command cannot be both refused and carried")
+
+    def test_the_refusals_are_recorded_with_their_reason(self) -> None:
+        header = BRIDGE_HEADER.read_text(encoding="utf-8")
+        self.assertIn("pHostPointer", header)
+        self.assertIn("texel block size", header)
+
+    def test_a_core_miss_is_logged_differently_from_an_extension_miss(self) -> None:
+        # The witness. An extension miss is expected and a core miss is how a
+        # table gets a hole; a log that spells them the same way cannot be
+        # filtered down to the dangerous half, which is what made the first
+        # investigation of this fault slow.
+        source = DISPATCHER.read_text(encoding="utf-8")
+        self.assertIn("hasVendorSuffix", source)
+        self.assertIn("procAddrMissKind", source)
+        self.assertIn('"core-miss"', source)
+        self.assertIn('"extension-miss"', source)
+        # Both lookup failure paths have to carry it: one for a name the table
+        # does not have, one for a name the DRIVER does not have.
+        body = source[source.index("S64 procAddr("):]
+        body = body[:body.index("\n#endif // BOXEDWINE_VULKAN")]
+        self.assertEqual(body.count("kind=%s"), 2)
+        self.assertIn("missing=%s", body)
+        self.assertIn("unsupported=%s", body)
+
+    def test_the_vendor_suffix_table_covers_the_tags_in_use(self) -> None:
+        # The classifier is only as good as this list: a tag missing from it
+        # makes an extension command read as core and floods the dangerous
+        # channel. Every suffix that actually appears on a command in
+        # vulkan_core.h has to be there.
+        source = DISPATCHER.read_text(encoding="utf-8")
+        table = source[source.index("kVendorSuffixes[] = {"):]
+        table = table[:table.index("};")]
+        listed = set(re.findall(r'"(\w+)"', table))
+        text = VULKAN_CORE.read_text(encoding="utf-8")
+        every = set(re.findall(r"VKAPI_CALL (vk[A-Za-z0-9]+)\(", text))
+        core = set(core_commands())
+        for name in sorted(every - core):
+            suffix = re.search(r"([A-Z]{2,}|[A-Z][a-z]+)$", name)
+            if not suffix:
+                continue
+            tag = suffix.group(1)
+            if not tag.isupper():
+                continue
+            with self.subTest(command=name, tag=tag):
+                self.assertIn(tag, listed,
+                              f"{name} would be classified as a core miss")
 
 
 class ImportContract(unittest.TestCase):

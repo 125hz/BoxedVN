@@ -382,6 +382,82 @@ static bool isKuserAddress(uint64_t address) {
            address < K64_KUSER_SHARED_BASE + K64_KUSER_SHARED_SIZE;
 }
 
+// A translated guest access takes the HOST's verdict on a guest address, never
+// the page map's: FEX dereferences the alias directly (see guest_low_alias.h),
+// so a page the guest has mapped whose 16 KiB host page lost its backing or its
+// protection arrives here as a host fault on the alias image of that address.
+//
+// Neither the signal number nor si_code identifies the case. Darwin reports an
+// access a region forbids as SIGBUS -- with si_code hard-wired to BUS_ADRALN by
+// the arm64 sendsig(), so it says nothing about alignment -- and an access to
+// an address with no region at all as SIGSEGV/KERN_INVALID_ADDRESS. Only the
+// page map knows what the guest was entitled to, so ask it, repair no more than
+// it entitles the guest to, and retry the instruction in place.
+struct AliasBackingRepairGuard {
+    uint64_t address = 0;
+    uint64_t hostPC = 0;
+    bool armed = false;
+};
+// Per guest thread. A repaired instruction is retried at the SAME host PC, so a
+// repair that did not actually unblock it -- a store to a page the guest itself
+// only granted read, say -- must not be attempted twice: nothing runs between
+// the two faults, so nothing can have changed, and the second one is the guest
+// fault it always was. This is what bounds the retry loop.
+static thread_local AliasBackingRepairGuard gAliasBackingRepairGuard;
+static std::atomic<uint32_t> gAliasBackingReports {0};
+
+static bool repairGuestLaneHostFault(BVNFEXCPU64Adapter* adapter, int signal,
+                                     uint64_t faultAddress, uint64_t hostPC) {
+    if (signal != SIGBUS && signal != SIGSEGV) return false;
+    if (!adapter->process || !adapter->process->memory64) return false;
+
+    K64NativeFaultRepair report;
+    const bool repeat = gAliasBackingRepairGuard.armed &&
+                        gAliasBackingRepairGuard.address == faultAddress &&
+                        gAliasBackingRepairGuard.hostPC == hostPC;
+    bool repaired = false;
+    if (repeat) {
+        report.decision = "repeat";
+    } else {
+        // The translator cannot tell this handler whether the access was a load
+        // or a store, so the page only has to be READABLE for a repair to be
+        // legal. A store to a page the guest granted read alone is restored
+        // read-only, faults again at the same PC, and the guard above hands it
+        // to the guest.
+        repaired = adapter->process->memory64->nativeRepairHostFault(
+            faultAddress, K_PROT_READ, report);
+    }
+
+    // The witness for this failure mode: which guest address the host address
+    // was the image of, what each of the two ledgers said about it, and what
+    // was done. A run that still dies here says which ledger is wrong.
+    if ((report.inGuestLane || repeat) &&
+        gAliasBackingReports.fetch_add(1, std::memory_order_relaxed) < 64) {
+        klog_fmt("BOXEDWINE_X64_ALIAS_BACKING pid=%d tid=%d signal=%d "
+                 "fault=0x%llx guest=0x%llx mapped=%d guest_prot=0x%x "
+                 "host=[0x%llx,0x%llx) host_present=%d host_prot=0x%x "
+                 "tracked=%d page_prot=0x%x materialised=%d reprotected=%d "
+                 "host_pc=0x%llx decision=%s",
+                 adapter->process ? adapter->process->id : -1,
+                 adapter->thread ? adapter->thread->id : -1, signal,
+                 (unsigned long long)faultAddress,
+                 (unsigned long long)report.guestAddress,
+                 report.pageMapped ? 1 : 0, (unsigned)report.guestProt,
+                 (unsigned long long)report.hostPageStart,
+                 (unsigned long long)(report.hostPageStart +
+                                      report.hostPageLength),
+                 report.hostPresent ? 1 : 0, (unsigned)report.hostProtBefore,
+                 report.tracked ? 1 : 0, (unsigned)report.hostPageProt,
+                 report.materialised ? 1 : 0, report.reprotected ? 1 : 0,
+                 (unsigned long long)hostPC, report.decision);
+    }
+
+    gAliasBackingRepairGuard.armed = repaired;
+    gAliasBackingRepairGuard.address = faultAddress;
+    gAliasBackingRepairGuard.hostPC = hostPC;
+    return repaired;
+}
+
 static uint32_t hostSignalTrapNumber(int signal) {
     switch (signal) {
         case SIGSEGV: return 14; // #PF
@@ -1205,6 +1281,18 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             // not spill or advance RIP: this is a host-address repair only.
             return true;
         }
+    }
+
+    // The page map, not the host VM, is the authority on what a guest address
+    // may do. A translated access that faulted on the alias image of a guest
+    // page the page map says is readable is the two ledgers disagreeing, not a
+    // guest fault: reconcile the host page and retry the instruction in place.
+    // Every other case -- a page the guest never mapped, one it revoked access
+    // to, a host address that is not a guest image at all -- falls through and
+    // reaches the guest as the fault it is.
+    if (!generatedException &&
+        repairGuestLaneHostFault(adapter, signal, faultAddress, hostPC)) {
+        return true;
     }
 
     auto* frame = adapter->fexThread->CurrentFrame;

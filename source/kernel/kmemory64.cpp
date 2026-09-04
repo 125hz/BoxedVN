@@ -221,6 +221,46 @@ static bool k64NativeHostRangeFree(U64 start, U64 length) {
 #endif
 }
 
+// What the host VM actually permits at this address, as K_PROT_* bits, and
+// whether a region exists there at all. This is the OTHER ledger: the page map
+// says what the guest is entitled to, this says what the hardware will allow,
+// and a translated guest access that faults inside a guest lane means the two
+// disagree. Reading it is what makes the fault witness able to distinguish
+// "no host page here" from "host page here, but PROT_NONE" -- two different
+// bugs that produce the same guest symptom.
+static U32 k64NativeHostProtOf(U64 address, bool& present) {
+    present = false;
+#if defined(__APPLE__)
+    vm_address_t regionStart = (vm_address_t)address;
+    vm_size_t regionSize = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t objectName = MACH_PORT_NULL;
+    const kern_return_t result = vm_region_64(
+        mach_task_self(), &regionStart, &regionSize, VM_REGION_BASIC_INFO_64,
+        reinterpret_cast<vm_region_info_t>(&info), &infoCount, &objectName);
+    if (objectName != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), objectName);
+    }
+    if (result != KERN_SUCCESS || regionSize == 0) return 0;
+    // vm_region_64 returns the NEXT region when the cursor sits in a hole, so
+    // a region that starts above the address proves the address is unmapped.
+    if ((U64)regionStart > address ||
+        (U64)regionStart + (U64)regionSize <= address) {
+        return 0;
+    }
+    present = true;
+    U32 prot = 0;
+    if (info.protection & VM_PROT_READ) prot |= K_PROT_READ;
+    if (info.protection & VM_PROT_WRITE) prot |= K_PROT_WRITE;
+    if (info.protection & VM_PROT_EXECUTE) prot |= K_PROT_EXEC;
+    return prot;
+#else
+    (void)address;
+    return 0;
+#endif
+}
+
 // The canonical Windows shared-data VA is below iOS's mandatory __PAGEZERO.
 // All emulated processes live in this host process, so one high anonymous
 // mapping can be shared by every KMemory64 instance. The signal bridge rewrites
@@ -986,6 +1026,163 @@ void KMemory64::nativeDemoteSharedPages() {
     k64DTlbInvalidateAll();
 }
 #endif
+
+// Reconcile the page map with the host VM for the host page a translated guest
+// access faulted on. See the K64NativeFaultRepair comment in the header for why
+// the two ledgers can disagree at all.
+//
+// The page map is the authority throughout: this raises the host page to
+// exactly the union its guest subpages are entitled to and to nothing more, so
+// a page the guest never mapped, or mapped PROT_NONE, still faults. It is
+// deliberately the ONLY place that repairs, because every producing path
+// (mmap/mprotect/munmap rounding a 4 KiB guest request out to a 16 KiB host
+// page) would otherwise need its own inverse and a missed one is silent.
+bool KMemory64::nativeRepairHostFault(U64 hostFaultAddress, U32 requiredProt,
+                                      K64NativeFaultRepair& report) {
+    report = K64NativeFaultRepair{};
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
+    if (!nativeIdentityMode()) {
+        report.decision = "not-native";
+        return false;
+    }
+    // Only a host address that is the image of a guest address THIS address
+    // space serves may be repaired. The round trip is the whole test: it holds
+    // for the low alias window, for the high identity lane (where it is the
+    // identity) and for the top-arena alias, and fails for every host pointer
+    // that is not a guest image -- the emulator's own heap, the translated code
+    // arena, the separate KUSER alias mapping.
+    const U64 guestAddress = k64HostToGuestAddress(hostFaultAddress);
+    if (k64GuestToHostAddress(guestAddress) != hostFaultAddress) {
+        report.decision = "outside-lane";
+        return false;
+    }
+    const U64 guestPageAddress = guestAddress & ~K64_PAGE_MASK;
+    if (!nativeGuestRangeAllowed(guestPageAddress, K64_PAGE_SIZE)) {
+        report.decision = "outside-lane";
+        return false;
+    }
+    report.inGuestLane = true;
+    report.guestAddress = guestAddress;
+
+    // Whether this page's bytes are supposed to live at the alias address at
+    // all. A shared-file page that a sparse process demoted back to its
+    // canonical heap buffer is mapped, but its contents are somewhere else, and
+    // conjuring a zero page at the alias would hide that desync rather than
+    // repair it.
+    bool backedAtAlias = false;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        auto it = pages.find(guestPageAddress >> K64_PAGE_SHIFT);
+        if (it == pages.end() || !(it->second->flags & K64_PAGE_MAPPED)) {
+            // The guest never mapped this page. A real access violation, and
+            // the guest has to see it as one.
+            report.decision = "guest-unmapped";
+            return false;
+        }
+        report.pageMapped = true;
+        report.guestProt = k64GuestProtFromPageFlags(it->second->flags);
+        // A shared-file page is reachable through its canonical pointer by
+        // sparse aliases, so it is kept host-writable wherever it is mapped.
+        if (it->second->dataShared) report.guestProt |= K_PROT_READ | K_PROT_WRITE;
+        backedAtAlias = it->second->dataNative &&
+                        it->second->hostData() ==
+                            (U8*)(uintptr_t)k64GuestToHostAddress(guestPageAddress);
+    }
+    if (report.guestProt == 0 ||
+        (report.guestProt & requiredProt) != requiredProt) {
+        // Mapped, but the guest itself revoked access. Also a real access
+        // violation.
+        report.decision = "guest-protected";
+        return false;
+    }
+
+    const U64 hostPage = k64NativeHostPageSize();
+    if (hostPage == 0 || (hostPage % K64_PAGE_SIZE) != 0) {
+        report.decision = "host-page-size";
+        return false;
+    }
+    const U64 hostStart = k64NativeAlignDown(hostFaultAddress, hostPage);
+    report.hostPageStart = hostStart;
+    report.hostPageLength = hostPage;
+
+    // One host page carries four guest pages on iOS and they need not agree,
+    // so the protection this page must carry is their union -- exactly the
+    // union mprotect() reconstructs for a shared edge page. Anything less
+    // would revoke a neighbour; anything more would grant the guest access it
+    // does not have.
+    U32 unionProt = 0;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        // `pages` is keyed by CANONICAL guest page, so the host page has to be
+        // translated back before its subpages can be named.
+        const U64 guestOfHostPage = k64HostToGuestAddress(hostStart);
+        for (U64 sub = 0; sub < hostPage; sub += K64_PAGE_SIZE) {
+            auto it = pages.find((guestOfHostPage + sub) >> K64_PAGE_SHIFT);
+            if (it == pages.end() || !(it->second->flags & K64_PAGE_MAPPED)) {
+                continue;
+            }
+            unionProt |= k64GuestProtFromPageFlags(it->second->flags);
+            if (it->second->dataShared) unionProt |= K_PROT_READ | K_PROT_WRITE;
+        }
+    }
+    if ((unionProt & requiredProt) != requiredProt) {
+        report.decision = "guest-protected";
+        return false;
+    }
+    report.hostPageProt = unionProt;
+
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    report.hostProtBefore = k64NativeHostProtOf(hostStart, report.hostPresent);
+    report.tracked = nativeRangeCovers(hostStart, hostStart + hostPage);
+    if (!report.hostPresent) {
+        if (!backedAtAlias) {
+            // Mapped, but its bytes do not live at the alias. A fresh zero page
+            // would answer the read with the wrong contents, which is worse
+            // than the fault.
+            report.decision = "backing-elsewhere";
+            return false;
+        }
+        // No host page at all behind an address the guest believes in. Claim it
+        // the same way nativeMapAnonymous does -- reserve first, then map --
+        // so a page this process does not own is never replaced. MAP_ANONYMOUS
+        // already delivers zeroes, and the page is new, so nothing is erased.
+        if (!k64NativeHostRangeFree(hostStart, hostPage) ||
+            !k64NativeReserveHostRange(hostStart, hostPage)) {
+            report.decision = "reserve-failed";
+            return false;
+        }
+        const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_BOXEDWINE;
+        void* mapped = ::mmap((void*)(uintptr_t)hostStart, (size_t)hostPage,
+                              PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (mapped == MAP_FAILED || (U64)(uintptr_t)mapped != hostStart) {
+            if (mapped != MAP_FAILED) ::munmap(mapped, (size_t)hostPage);
+            k64NativeReleaseReservedHostRange(hostStart, hostPage);
+            report.decision = "map-failed";
+            return false;
+        }
+        report.materialised = true;
+    }
+    if (::mprotect((void*)(uintptr_t)hostStart, (size_t)hostPage,
+                   k64NativeProt(unionProt)) != 0) {
+        report.decision = "mprotect-failed";
+        return false;
+    }
+    report.reprotected = !report.materialised;
+    // Keep nativeRanges honest about what is now mapped here, or the next
+    // mprotect over this page would refuse for want of coverage and the next
+    // munmap would leave the host page behind.
+    nativeForgetRange(hostStart, hostPage);
+    nativeRanges.emplace(hostStart, NativeRange{hostStart, hostPage, unionProt});
+    k64DTlbInvalidateAll();
+    report.decision = report.materialised ? "materialised" : "reprotected";
+    return true;
+#else
+    (void)hostFaultAddress;
+    (void)requiredProt;
+    report.decision = "not-native";
+    return false;
+#endif
+}
 
 U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
     if (len == 0) return (U64)-K_EINVAL;
