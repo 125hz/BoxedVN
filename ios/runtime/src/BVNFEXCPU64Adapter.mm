@@ -434,10 +434,18 @@ static bool repairGuestLaneHostFault(BVNFEXCPU64Adapter* adapter, int signal,
     // was done. A run that still dies here says which ledger is wrong.
     if ((report.inGuestLane || repeat) &&
         gAliasBackingReports.fetch_add(1, std::memory_order_relaxed) < 64) {
+        // last_op / last_flags name the operation that last wrote the faulting
+        // guest page's rights and the value it wrote; nb_op / nb_flags do the
+        // same for the most recently written OTHER guest subpage of the same
+        // host page. Together they separate the two failures that look
+        // identical from the guest: a page whose whole host page was never
+        // committed, and a page that lost rights its 16 KiB neighbours kept.
         klog_fmt("BOXEDWINE_X64_ALIAS_BACKING pid=%d tid=%d signal=%d "
                  "fault=0x%llx guest=0x%llx mapped=%d guest_prot=0x%x "
                  "host=[0x%llx,0x%llx) host_present=%d host_prot=0x%x "
                  "tracked=%d page_prot=0x%x materialised=%d reprotected=%d "
+                 "last_op=%s last_flags=0x%x last_seq=%u "
+                 "nb_op=%s nb_flags=0x%x nb_seq=%u "
                  "host_pc=0x%llx decision=%s",
                  adapter->process ? adapter->process->id : -1,
                  adapter->thread ? adapter->thread->id : -1, signal,
@@ -450,6 +458,10 @@ static bool repairGuestLaneHostFault(BVNFEXCPU64Adapter* adapter, int signal,
                  report.hostPresent ? 1 : 0, (unsigned)report.hostProtBefore,
                  report.tracked ? 1 : 0, (unsigned)report.hostPageProt,
                  report.materialised ? 1 : 0, report.reprotected ? 1 : 0,
+                 report.lastWriter, (unsigned)report.lastWriteFlags,
+                 (unsigned)report.lastWriteStamp,
+                 report.neighbourWriter, (unsigned)report.neighbourWriteFlags,
+                 (unsigned)report.neighbourWriteStamp,
                  (unsigned long long)hostPC, report.decision);
     }
 

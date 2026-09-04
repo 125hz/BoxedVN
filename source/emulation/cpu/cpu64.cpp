@@ -5713,7 +5713,11 @@ void CPU64::run() {
     int ringPos = 0;
     bool wildFired = false;
 
-    while (!yield) {
+    // backendHandoff, unlike yield, is not a request to stop this guest: it
+    // asks this loop to return to the scheduler so a process that took the
+    // translated role at its own execve is dispatched through FEX instead of
+    // being interpreted for the rest of its life. See KProcess::execve.
+    while (!yield && !backendHandoff) {
         if (tracing && instructionCount >= traceFrom && instructionCount <= traceTo) {
             U64 r = rip;
             klog_fmt("TRACE #%llu RIP=0x%llx %02x %02x %02x %02x  "
@@ -6186,7 +6190,7 @@ U64 CPU64::runBounded(U64 maxInsn) {
     bool tracing = (tf != nullptr);
 
     U64 ran = 0;
-    while (!yield && ran < maxInsn) {
+    while (!yield && !backendHandoff && ran < maxInsn) {
         if (tracing && instructionCount >= traceFrom && instructionCount <= traceTo) {
             U64 r = rip;
             klog_fmt("TRACE #%llu RIP=0x%llx %02x %02x %02x %02x  "

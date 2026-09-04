@@ -3139,9 +3139,13 @@ def main() -> None:
     # the guest page map through canonical ones. Mixing the two looked up an
     # unrelated page for anything served through an alias.
     for required in (
-        "const U64 guestOfFirstHostPage = k64HostToGuestAddress(hostStart);",
-        "k64HostToGuestAddress(hostEnd - hostPage);",
+        # The union over a host page's guest subpages, and the reconciliation
+        # that applies it, both name the subpages canonically.
+        "const U64 guestOfHostPage = k64HostToGuestAddress(hostPageStart);",
         "const U64 guestOfHostPage = k64HostToGuestAddress(host);",
+        # And the reconciliation touches a host page only when the round trip
+        # proves it is the image of a guest address this space serves.
+        "if (k64GuestToHostAddress(k64HostToGuestAddress(host)) != host ||",
         "k64NativeAlignDown(k64GuestToHostAddress(addr), hostPage);",
     ):
         if required not in memory:
@@ -3461,7 +3465,11 @@ def main() -> None:
             "k64NativeReserveHostRange(run.start, run.length)",
             "::mmap((void*)(uintptr_t)run.start, (size_t)run.length,",
             "::memset((void*)(uintptr_t)hostAddr, 0, (size_t)len);",
-            "nativeForgetRange(hostStart, hostLength);",
+            # The interval is recorded read/write and the CALLER narrows it per
+            # host page from the page map. Choosing a protection here could
+            # only be done from plan.exactHostCover, a property of the whole
+            # interval, which is wrong for every host page it shares.
+            "nativeTrackRangeLocked(hostStart, hostLength, 0x3u);",
             "BOXEDWINE_X64_NATIVE_EXTEND guest=[0x%llx,0x%llx) ",
         ],
         "BoxedVN partial native map contract",
@@ -3493,12 +3501,55 @@ def main() -> None:
             raise SystemExit(
                 "a failed partial map must roll back only its own "
                 "reservations and mappings: " + required)
-    # An existing neighbour keeps its access: a shared host page stays
-    # readable and writable whatever protection the request asked for.
-    if "plan.exactHostCover ? k64NativeProt(prot)" not in map_body:
+    # An existing neighbour keeps its access, and this is no longer decided
+    # here. plan.exactHostCover is a property of the WHOLE interval: applying
+    # it left a PROT_NONE reservation whose length was not a multiple of the
+    # host page read/write everywhere, and applied the request's protection to
+    # host pages whose other guest subpages were never named. The mapping path
+    # now leaves the interval read/write and the caller narrows it host page by
+    # host page from the page map, which is the only value that is right for
+    # all four guest pages of a host page at once.
+    if "exactHostCover ?" in map_body:
         raise SystemExit(
-            "a host page shared with a mapped neighbour must keep the "
-            "protection that neighbour needs")
+            "a host page's protection must be the union of its guest "
+            "subpages, not a property of the whole request")
+    reconcile_start = memory_impl.index(
+        "void KMemory64::nativeReconcileHostProt(")
+    reconcile_end = memory_impl.index(newline + "}" + newline, reconcile_start)
+    reconcile_body = memory_impl[reconcile_start:reconcile_end]
+    for required in (
+        # One host page at a time, from the shared union.
+        "for (U64 host = hostStart; host < hostEnd; host += hostPage) {",
+        "nativeHostPageProtLocked(host, hostPage,",
+        "k64NativeProt(runProt)",
+        # An untracked host page is skipped, never a reason to fail the call:
+        # refusing the whole request left the guest pages it named holding the
+        # rights of the reservation they were being committed out of.
+        "!nativeRangeCovers(host, host + hostPage)",
+    ):
+        if required not in reconcile_body:
+            raise SystemExit(
+                "the host protection must be reconciled per host page from "
+                "the page map: " + required)
+    union_start = memory_impl.index("U32 KMemory64::nativeHostPageProtLocked(")
+    union_end = memory_impl.index(newline + "}" + newline, union_start)
+    union_body = memory_impl[union_start:union_end]
+    for required in (
+        "U32 unionProt = 0;",
+        "unionProt |= k64GuestProtFromPageFlags(it->second->flags);",
+        "if (it->second->dataShared) unionProt |= 0x3u;",
+    ):
+        if required not in union_body:
+            raise SystemExit(
+                "the union over a host page's guest subpages lost a term: " +
+                required)
+    # A guest page's rights may only be written by a call that names it, so
+    # nothing may assign K64Page::flags outside its single writer.
+    for banned in ("->flags = ", "->flags |= ", "->flags &= "):
+        if banned in memory_impl:
+            raise SystemExit(
+                "a guest page's flags must be written only through "
+                "K64Page::writeFlags: " + banned)
 
     # Linux brk semantics are unchanged: the new break is returned as asked,
     # not rounded out to a host page.

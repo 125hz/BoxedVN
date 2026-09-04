@@ -7426,3 +7426,56 @@ The call histogram that suggested otherwise was an artifact of a global log
 budget of sixty-four, which the run exhausted before the interesting calls.
 That budget is now per command, so the next log can distinguish a command that
 was never called from one that merely fell off the end.
+
+## Committing memory that was never committed
+
+The 32-bit program that died on an access violation was reading memory Wine
+believed it had committed. Our mprotect rounded the request out to the host
+page size and then failed the whole call if any host page in that range was
+not yet tracked, which is the normal state because pages are materialised
+lazily. It returned an error before writing a single guest page flag, and it
+said nothing. Wine recorded the commit in its own tables, ours still said the
+pages had no rights, and the next read was an access violation Wine could not
+explain. The faulting instruction was an upward copy loop that had read the
+preceding bytes fine, so the rights ended exactly on a host page boundary.
+
+A guest page's rights are now changed only by an operation that names it, a
+host page carries exactly the union of its guest pages recomputed one host
+page at a time, and an untracked host page is skipped rather than failing the
+call. Three related defects went with it, including guard pages that were not
+guarding because the protection was chosen from a property of the whole
+request. Each page now records which operation last wrote its flags, so a
+future fault names the call responsible.
+
+## The translator role belongs to the program, not the shell
+
+Launching anything from the desktop ran it on the interpreter, where it died
+at once. Only one process can be translated, because the identity mapping
+occupies fixed host addresses, and the desktop shell claimed it at startup and
+never used it. Investigation established that the mapping is the only thing
+genuinely exclusive: the translator context, the signal handlers, the escape
+state and the executable arena are all per process, per thread or shared.
+
+The role is no longer seeded on Wine infrastructure. It is claimed at exec by
+the first top-level Windows program, at the one moment when a process has
+released one address space and not yet built the next. It is released when the
+owning address space is destroyed. Moving it out of a live owner is not
+possible: that owner's registers, stacks and compiled blocks contain host
+addresses from the mapping. A second program launched while the first still
+lives is interpreted and says so.
+
+The trade-off is that the desktop shell and file manager now run interpreted.
+The evidence that this is acceptable is that the file manager and every boot
+helper already did, in the same session, and the shell never used the GPU.
+
+## The graphics path is not what stops the frame
+
+An audit of every synchronisation command on the path found nothing wrong, and
+a mechanical check of all 248 commands for argument mismatches found nothing
+either. The timeline semaphore structure that looked like the best suspect is
+carried and holds no pointer, and that run dropped no structures at all. Two
+readings were corrected: no thread is inside the bridge, and the frame image
+was acquired during swapchain setup rather than during a frame, so the frame
+loop never started. The next candidate is the crossing between the 32-bit
+program and the 64-bit graphics layer, and the acquire and present witnesses
+now decide it from one log.

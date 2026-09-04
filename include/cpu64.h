@@ -227,6 +227,15 @@ public:
     U64 mmapNext = 0;
 
     bool yield = false;
+    // Set when this process takes the translated role at execve while this
+    // thread is inside the interpreter's dispatch loop. run() otherwise has
+    // no non-terminal exit: `yield` breaks the loop AND ends the host thread
+    // (normalPlatformMultiThreaded.cpp), so a process that acquired FEX
+    // mid-flight would be interpreted forever. This returns to the scheduler
+    // instead, which re-reads KProcess::useFEX64 and enters the backend with
+    // the architectural state exec published. Cleared by the scheduler before
+    // each dispatch, so it can never latch.
+    bool backendHandoff = false;
     // Set by a syscall (futex WAIT) that parked this thread on a condition in
     // single-threaded cooperative mode. The SYSCALL handler rewinds RIP back
     // to the SYSCALL instruction and yields, so when the scheduler reschedules

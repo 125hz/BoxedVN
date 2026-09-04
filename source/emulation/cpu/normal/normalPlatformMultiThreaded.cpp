@@ -95,6 +95,12 @@ static void platformThread(CPU* cpu) {
                          (unsigned long long)cpu64->rip, process->exe.c_str());
             }
             cpu64->yield = false;
+            // Consume any pending backend handoff. The dispatch below reads
+            // useFEX64 fresh, so a process that took the translated role at
+            // its own execve enters the backend on this pass; leaving the
+            // flag set would stop the interpreter again the moment anything
+            // put the process back on it.
+            cpu64->backendHandoff = false;
             cpu64->deliverPendingSignals();
             try {
 #ifdef BOXEDWINE_FEX64_BACKEND

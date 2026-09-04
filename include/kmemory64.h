@@ -284,6 +284,29 @@ inline void k64InvalidatePageCaches() {
     g_k64PageCacheGeneration.fetch_add(1, std::memory_order_release);
 }
 
+// ---- Who last wrote a guest page's rights -------------------------------
+//
+// The failure this file keeps producing is always the same shape: a page the
+// guest believes it committed reads back as K64_PAGE_MAPPED with no access
+// bits, and nothing in the log says which call put it in that state. Every
+// write of K64Page::flags therefore records its operation, the value it wrote
+// and a wrapping order stamp -- four bytes per page, no log volume of its own.
+// The bounded fault witness prints them when a guest access is finally
+// refused, which is the only moment the answer is needed.
+enum K64PageWriter : U8 {
+    K64_WRITER_NONE = 0,
+    K64_WRITER_MMAP_ANON = 1,   // mmapAnonymousFixed (incl. PROT_NONE reserve)
+    K64_WRITER_MMAP_FILE = 2,   // mmapSharedFile
+    K64_WRITER_MPROTECT = 3,
+    K64_WRITER_MUNMAP = 4,
+    K64_WRITER_COMMIT = 5,      // first touch through a kernel write path
+    K64_WRITER_PIN = 6,         // getRamPtr handing out a host pointer
+    K64_WRITER_CLONE = 7,       // fork snapshot
+    K64_WRITER_COUNT = 8
+};
+
+const char* k64PageWriterName(U8 writer);
+
 // A guest page slot. `data` is allocated lazily: a freshly reserved page (mmap
 // of an address wine may never touch — its huge PROT_NONE reservations) carries
 // no backing buffer (data==nullptr) and reads as zero, so host RAM tracks pages
@@ -293,6 +316,10 @@ inline void k64InvalidatePageCaches() {
 struct K64Page {
     U8* data = nullptr;
     U32 flags = 0;
+    // Provenance of the last write to `flags`. Sits in the padding after it.
+    U8  lastWriter = K64_WRITER_NONE;
+    U8  lastFlags = 0;          // K64_PAGE_* fit in eight bits
+    U16 lastWriteStamp = 0;     // wrapping; orders two recent writers
     // When set, `data` is BORROWED from a process-shared file mapping (wine's
     // server shared-memory section: MAP_SHARED writable file). The buffer is
     // owned by g_sharedFileRegistry and aliased by every process that maps the
@@ -312,6 +339,15 @@ struct K64Page {
     // owned by this slot. The KMemory64 owner unmaps native ranges first.
     bool dataNative = false;
     ~K64Page() { if (!dataShared && !dataNative) delete[] data; }
+    // The ONLY way `flags` is written. Going through one function is what makes
+    // "which operation last changed this page's rights" answerable at all, and
+    // what keeps a rights change tied to an operation that named the page.
+    void writeFlags(U32 value, U8 writer, U16 stamp) {
+        flags = value;
+        lastWriter = writer;
+        lastFlags = (U8)(value & 0xFFu);
+        lastWriteStamp = stamp;
+    }
     U8* hostData() const { return sharedData ? sharedData->load(std::memory_order_acquire) : data; }
     // Allocate + zero the backing buffer on first write/commit. Idempotent.
     U8* commit() {
@@ -414,6 +450,17 @@ struct K64NativeFaultRepair {
     U32 hostProtBefore = 0;
     // Whether nativeRanges already owned the host page.
     bool tracked = false;
+    // The producing side: which operation last wrote the faulting guest page's
+    // flags, what it wrote, and in what order relative to its neighbours. A
+    // refusal fills these too -- that is the case they exist for.
+    const char* lastWriter = "none";
+    U32 lastWriteFlags = 0;
+    U32 lastWriteStamp = 0;
+    // The same three for the host page's other guest subpages, so a rights loss
+    // confined to one 4 KiB page inside a 16 KiB one is visible as such.
+    const char* neighbourWriter = "none";
+    U32 neighbourWriteFlags = 0;
+    U32 neighbourWriteStamp = 0;
     // What the repair did.
     bool materialised = false;   // a host page was created here
     bool reprotected = false;    // an existing host page's protection changed
@@ -741,6 +788,29 @@ private:
     bool nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh);
     bool nativeRangeCovers(U64 start, U64 end) const;
     void nativeForgetRange(U64 start, U64 length);
+    // Record [start, start+length) as tracked with `prot`, coalescing with an
+    // adjacent entry that already carries the same protection. Replaces the
+    // "assign the new protection to every range that merely overlaps" loops,
+    // which rewrote the protection of host pages the request never named.
+    // Caller holds mmapMutex.
+    void nativeTrackRangeLocked(U64 start, U64 length, U32 prot);
+    // The union of what the guest subpages of ONE host page are entitled to.
+    // The page map is the authority and this is its only reading: a host page
+    // carries exactly this and nothing more, so a neighbour is never revoked
+    // and the guest is never granted a right it does not hold. Caller holds
+    // pagesMutex. `report` is optional and collects the provenance of the
+    // subpages other than `excludePage` for the fault witness.
+    U32 nativeHostPageProtLocked(U64 hostPageStart, U64 hostPageSize,
+                                 U64 excludePage,
+                                 K64NativeFaultRepair* report) const;
+    // Bring every host page of [hostStart, hostEnd) to that union, one host
+    // page at a time, after the guest page map has already been updated. Runs
+    // of host pages that want the same protection are issued as one call. A
+    // host page this address space does not track is SKIPPED, never failed:
+    // the fault repair materialises it later from the very same union, and
+    // refusing the whole request instead is how a committed page kept the
+    // rights of the reservation it grew out of. Caller holds mmapMutex.
+    void nativeReconcileHostProt(U64 hostStart, U64 hostEnd);
     void nativeDemoteSharedPages();
     void nativeUnmapAll();
     bool nativeMapKuserAlias(U64 addr, U64 len, bool& fresh);
@@ -752,12 +822,16 @@ private:
     void rangeInsertLocked(U64 startPage, U64 pageCount, U32 prot, U8 kind);
     void rangeRemoveLocked(U64 startPage, U64 pageCount);
 
-    K64Page* getOrAllocPage(U64 pageNum, U32 flagsIfNew);
+    // `writer` names the operation for the provenance record above; it applies
+    // only when the page is actually created here.
+    K64Page* getOrAllocPage(U64 pageNum, U32 flagsIfNew,
+                            U8 writer = K64_WRITER_COMMIT);
     // Allocate (if absent) AND commit a page's backing buffer atomically under
     // pagesMutex; returns the committed buffer. Closes a lost-write race where two
     // host threads first-touching the same page each `new` a buffer and one
     // thread's write lands in an orphaned buffer (see definition).
-    U8* commitPageLocked(U64 pageNum, U32 flagsIfNew);
+    U8* commitPageLocked(U64 pageNum, U32 flagsIfNew,
+                         U8 writer = K64_WRITER_COMMIT);
     K64Page* getPage(U64 pageNum) const;
 };
 

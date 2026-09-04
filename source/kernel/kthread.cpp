@@ -413,6 +413,110 @@ public:
     }
 };
 
+// Every FUTEX_WAKE the guest issues, in a ring.
+//
+// A snapshot line's wake_attempts counts only the wakes that NAMED that
+// waiter's word, so a table full of zeroes is equally consistent with two
+// opposite stories: the guest issued no wake at all, or the guest issued
+// plenty and this table resolved their addresses to something else. The first
+// is a defect above the futex layer -- the thread that owed the wake never ran
+// -- and the second is a defect inside it. Nothing already in the log
+// separates them, because a wake that finds no waiter writes nothing at all:
+// it walks the table, matches nothing, and returns zero, which is also what a
+// perfectly ordinary wake of an already-running thread does.
+//
+// So record them all, with the address each one named. Written under
+// systemFutexesMutex, which every wake path already holds, and read by
+// logFutexSnapshot under that same lock.
+#define FUTEX_WAKE_TRACE_ENTRIES	32
+// How many snapshots may print the whole ring. After that only the running
+// totals are printed, so a watchdog that fires every second cannot turn this
+// into a firehose.
+#define FUTEX_WAKE_TRACE_DUMPS	4
+
+struct futexWakeRecord {
+    U32 pid = 0;
+    U32 tid = 0;
+    U64 guestAddress = 0;
+    U32 operation = 0;
+    U32 requested = 0;
+    // Waiters whose key named this word, whatever became of them, next to the
+    // number actually woken. matched == 0 says the table held no waiter on the
+    // word; matched > woken says it held one and skipped it, and that waiter's
+    // own lastWakeOutcome says why.
+    U32 matched = 0;
+    U32 woken = 0;
+    U32 atMillies = 0;
+    bool isPrivate = false;
+    bool lane64 = false;
+    bool used = false;
+};
+
+static futexWakeRecord systemFutexWakes[FUTEX_WAKE_TRACE_ENTRIES];
+static U32 systemFutexWakeNext = 0;
+static U64 systemFutexWakeCount = 0;
+static U64 systemFutexWakeNobodyCount = 0;
+static U32 systemFutexWakeLastMillies = 0;
+static U32 systemFutexWakeDumps = 0;
+
+// Caller holds systemFutexesMutex.
+static void recordFutexWake(KThread* waker, bool lane64, bool isPrivate,
+                            U64 guestAddress, U32 operation, U32 requested,
+                            U32 matched, U32 woken) {
+    const U32 now = KSystem::getMilliesSinceStart();
+    systemFutexWakeCount++;
+    if (!woken) {
+        systemFutexWakeNobodyCount++;
+    }
+    systemFutexWakeLastMillies = now;
+    futexWakeRecord& record = systemFutexWakes[systemFutexWakeNext];
+    systemFutexWakeNext = (systemFutexWakeNext + 1) % FUTEX_WAKE_TRACE_ENTRIES;
+    record.pid = (waker && waker->process) ? waker->process->id : 0;
+    record.tid = waker ? waker->id : 0;
+    record.guestAddress = guestAddress;
+    record.operation = operation;
+    record.requested = requested;
+    record.matched = matched;
+    record.woken = woken;
+    record.atMillies = now;
+    record.isPrivate = isPrivate;
+    record.lane64 = lane64;
+    record.used = true;
+}
+
+// Caller holds systemFutexesMutex; `now` is the snapshot's own clock reading.
+static void logFutexWakeTrace(U32 now) {
+    if (systemFutexWakeCount == 0) {
+        klog_fmt("Guest futex wake trace: the guest has issued no FUTEX_WAKE "
+                 "at all");
+        return;
+    }
+    klog_fmt("Guest futex wake trace: %llu wake(s), %llu woke nobody, last "
+             "%ums ago",
+             (unsigned long long)systemFutexWakeCount,
+             (unsigned long long)systemFutexWakeNobodyCount,
+             now - systemFutexWakeLastMillies);
+    if (systemFutexWakeDumps >= FUTEX_WAKE_TRACE_DUMPS) {
+        return;
+    }
+    systemFutexWakeDumps++;
+    for (U32 i = 0; i < FUTEX_WAKE_TRACE_ENTRIES; i++) {
+        const futexWakeRecord& record =
+            systemFutexWakes[(systemFutexWakeNext + i) % FUTEX_WAKE_TRACE_ENTRIES];
+        if (!record.used) {
+            continue;
+        }
+        klog_fmt("BOXEDWINE_FUTEX_WAKE_TRACE pid=%04X tid=%04X guest=%llX "
+                 "op=%u lane=%s private=%u requested=%u matched=%u woken=%u "
+                 "age=%ums",
+                 record.pid, record.tid,
+                 (unsigned long long)record.guestAddress, record.operation,
+                 record.lane64 ? "64" : "32", record.isPrivate ? 1 : 0,
+                 record.requested, record.matched, record.woken,
+                 now - record.atMillies);
+    }
+}
+
 static void initFutex(struct futex* f, KThread* thread, U64 address,
                       U64 guestAddress, bool isPrivate,
                       const void* addressSpace, U32 expectedValue,
@@ -600,6 +704,7 @@ void KThread::logFutexSnapshot() {
                  readable ? 1 : 0);
     }
     klog_fmt("Guest futex snapshot complete: %u active waiter(s)", active);
+    logFutexWakeTrace(now);
 }
 
 void KThread::clearFutexes() {
@@ -732,13 +837,16 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
         }
     } else if (cmd ==FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
         U32 count = 0;
+        U32 matched = 0;
         //klog_fmt("%x/%x futux wake addr=%x op=%x val=%x ram=%x", id, process->id, addr, op, value, (U32)ramAddress);
-        {            
+        {
             SystemFutexesLock futexesLock;
+            // The whole table is walked even once `value` waiters have been
+            // woken, which is what the 64-bit lane does: the walk is what
+            // counts the waiters this call named and records what became of
+            // each, and a diagnostic that stops early cannot say whether a
+            // starving waiter was skipped or never named at all.
             for (auto& entry : systemFutexes) {
-                if (count >= value) {
-                    break;
-                }
                 struct futex* f = entry.get();
                 BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(f->cond);
                 if (!f->thread) {
@@ -749,19 +857,43 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
                 // the process id, which is the same thing for a live waiter and
                 // is what the kernel actually keys on; for a shared wait it
                 // compares the host pointer, as before.
-                bool keyCheck = futexKeyMatches(f, isPrivate, memory, addr,
-                                                ramAddress);
-                bool maskCheck = ((cmd != FUTEX_WAKE_BITSET) || (f->mask & val3));
-                bool waiting = f->waiting; // there is a small gap when waiting on a futex between creating the futex and getting the lock for this to be false
-                if (keyCheck && !f->wake && maskCheck) {
-                    if (!waiting) {
-                        continue;
-                    }
-                    f->wake = true;
-                    BOXEDWINE_CONDITION_SIGNAL(f->cond);
-                    count++;
+                if (!futexKeyMatches(f, isPrivate, memory, addr, ramAddress)) {
+                    continue;
                 }
+                // From here down this entry is a waiter on the word being
+                // woken, so every way out below is a wake it did not get. The
+                // 64-bit lane has recorded which one it was since the keying
+                // change; this lane did not, which made wake_attempts=0 on a
+                // snapshot line mean "no 64-bit wake named this word" rather
+                // than "no wake named this word" -- and the whole diagnosis of
+                // a starving waiter rests on that field.
+                ++matched;
+                f->wakeAttempts++;
+                if (count >= value) {
+                    f->lastWakeOutcome = "count-exhausted";
+                    continue;
+                }
+                if (f->wake) {
+                    f->lastWakeOutcome = "already-woken";
+                    continue;
+                }
+                // there is a small gap when waiting on a futex between creating
+                // the futex and getting the lock for this to be false
+                if (!f->waiting) {
+                    f->lastWakeOutcome = "not-parked-yet";
+                    continue;
+                }
+                if ((cmd == FUTEX_WAKE_BITSET) && !(f->mask & val3)) {
+                    f->lastWakeOutcome = "mask-miss";
+                    continue;
+                }
+                f->wake = true;
+                f->lastWakeOutcome = "woken";
+                BOXEDWINE_CONDITION_SIGNAL(f->cond);
+                count++;
             }
+            recordFutexWake(this, false, isPrivate, addr, cmd, value, matched,
+                            count);
         }
         //klog_fmt("    %x/%x futux wake finished addr=%x op=%x val=%x ram=%x count=%d", id, process->id, addr, op, value, (U32)ramAddress, count);
         return count;
@@ -862,8 +994,9 @@ static void reportFutexAddressSplit(struct futex* f, KThread* waker,
 // parked far too long, or one whose word this call cannot see.
 static U32 wakeFutexes64(KThread* waker, bool isPrivate,
                          const void* addressSpace, U64 guestAddress,
-                         U64 ramAddress, U64 count, U32 mask) {
+                         U64 ramAddress, U64 count, U32 mask, U32 command) {
     U32 woken = 0;
+    U32 matched = 0;
     const U32 now = KSystem::getMilliesSinceStart();
     SystemFutexesLock futexesLock;
 
@@ -903,6 +1036,7 @@ static U32 wakeFutexes64(KThread* waker, bool isPrivate,
         // and each has a different meaning. Recording which one it was costs
         // two stores and is the difference between a log that says a waiter is
         // stuck and one that says why.
+        ++matched;
         wait->wakeAttempts++;
         if (woken >= count) {
             wait->lastWakeOutcome = "count-exhausted";
@@ -934,6 +1068,13 @@ static U32 wakeFutexes64(KThread* waker, bool isPrivate,
         BOXEDWINE_CONDITION_SIGNAL(wait->cond);
         ++woken;
     }
+    // Recorded whatever the outcome, and especially when nothing matched: a
+    // wake that names a word this table holds no waiter for is invisible from
+    // the waiters' side, and it is the difference between a guest that has
+    // stopped waking and a guest whose wakes are landing somewhere else.
+    recordFutexWake(waker, true, isPrivate, guestAddress, command,
+                    count > 0xffffffffULL ? 0xffffffffU : (U32)count, matched,
+                    woken);
     return woken;
 }
 
@@ -943,12 +1084,19 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
     if (!guestMemory) {
         return -K_ENOSYS;
     }
+    const U32 command = op & FUTEX_CMD_MASK;
     U8* ram = guestMemory->getRamPtr(addr, sizeof(U32));
     if (!ram) {
+        // The one error the guest never sees. Wine's futex_wake_one and
+        // glibc's lll_futex_wake both discard the return value, so a wake that
+        // cannot resolve its word here vanishes: no waiter is woken, no
+        // wake_attempts is recorded against the waiter that is starving, and
+        // nothing at all is said. Say it.
+        reportUnservedFutex64(this, command, addr, value,
+                              static_cast<U32>(timeoutAddress), val3, 0);
         return -K_EFAULT;
     }
     const U64 ramAddress = reinterpret_cast<U64>(ram);
-    const U32 command = op & FUTEX_CMD_MASK;
     // A private futex is keyed on this address space plus the guest address,
     // so nothing it depends on can be re-pointed underneath a parked thread.
     // Only a shared one needs an address that means the same thing in every
@@ -1184,7 +1332,8 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
         return wakeFutexes64(this, isPrivate, addressSpace, addr, ramAddress,
                              value,
                              command == FUTEX_WAKE_BITSET
-                                 ? val3 : FUTEX_BITSET_MATCH_ANY);
+                                 ? val3 : FUTEX_BITSET_MATCH_ANY,
+                             command);
     }
 
     // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE move waiters from this word onto a
@@ -1210,7 +1359,7 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
         }
         const U32 woken = wakeFutexes64(this, isPrivate, addressSpace, addr,
                                         ramAddress, toWake,
-                                        FUTEX_BITSET_MATCH_ANY);
+                                        FUTEX_BITSET_MATCH_ANY, command);
         reportUnservedFutex64(this, command, addr, value,
                               static_cast<U32>(timeoutAddress), val3, woken);
         return woken;

@@ -211,6 +211,23 @@ public:
     // dispatch progress and no waiting condition - indistinguishable from a
     // spin until the syscall is named.
     std::atomic<U32> diagnosticSyscall{0};
+    // Wine-server witness. A thread that has sent a request to the wineserver
+    // and is blocked reading the reply is indistinguishable, from outside,
+    // from a thread that is legitimately parked waiting on a Windows object:
+    // both sit in KUnixSocketObject::lockCond and neither says what it is
+    // waiting for. A server that answers nobody and a client that is simply
+    // idle look identical, and they are opposite faults. These name the
+    // request: the descriptor the thread is reading, when that read began,
+    // and the first word of the last message it wrote to a socket, which for
+    // the wineserver protocol is the request code. Biased by one where zero
+    // has to mean "not doing this", written by the thread itself on the
+    // syscall path and read by the hang snapshot from another thread.
+    std::atomic<U32> diagnosticSocketReadFd{0};
+    std::atomic<U32> diagnosticSocketReadStartMillies{0};
+    std::atomic<U32> diagnosticSocketWriteFd{0};
+    std::atomic<U32> diagnosticSocketWriteCode{0};
+    std::atomic<U32> diagnosticSocketWriteBytes{0};
+    std::atomic<U32> diagnosticSocketWriteMillies{0};
     BOXEDWINE_CONDITION waitingForSignalToEndCond;
     BOXEDWINE_CONDITION sigWaitCond;
     U64 sigWaitMask = 0;

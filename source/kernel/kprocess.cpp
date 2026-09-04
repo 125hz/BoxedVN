@@ -262,6 +262,127 @@ KProcess::KProcess(U32 id) : id(id), exitOrExecCond(std::make_shared<BoxedWineCo
     this->hasSetSeg[FS] = true;    
 }
 
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+namespace {
+
+// The translated role, and what actually makes it exclusive.
+//
+// FEX runs translated code that dereferences a guest pointer as a host
+// pointer, so the process it runs must own the identity mapping KMemory64
+// builds: three host windows at compile-time constant addresses -- the low
+// alias at K64_NATIVE_LOW_ALIAS_BASE, the image lane at
+// K64_NATIVE_GUEST_IMAGE_BASE, and Wine's top-down arena relocated to
+// K64_NATIVE_TOP_HOST_BASE. Two address spaces cannot both hold those
+// windows; KMemory64::cloneFrom kpanics rather than try, and
+// BVNFEXCPU64Adapter's validAdapter refuses a process without them.
+//
+// Nothing else about the backend is exclusive, though it was long assumed to
+// be. gLiveProcesses is a map keyed on KProcess*, so each translated process
+// already gets its own FEX context, dispatcher, JIT and signal delegator; the
+// host fault handlers are installed once with std::call_once and chain to
+// whatever was there before; the dispatcher's escape state (gExitJump,
+// gCanJump, gActiveCPU, gActiveSignals) is thread_local; and the
+// translated-code pool is shared by construction. The identity mapping is the
+// whole of the constraint.
+//
+// It follows that the role can only move at a point where one address space
+// is gone and the next has not been built -- an execve, after execvReset and
+// after the sibling threads are quiesced, when the process is about to
+// construct a fresh KMemory64. It is never taken from a live owner: that
+// owner's guest registers and stack hold host addresses inside those windows,
+// its translated blocks have those addresses compiled in, and there is no way
+// to move a running address space out from under them. So the rule here is
+// take-when-free, and the role is freed by exactly one event, the destruction
+// of the owning KProcess (which is where ~KMemory64 unmaps the windows).
+BOXEDWINE_MUTEX gTranslatorRoleMutex;
+const KProcess* gTranslatorRoleOwner = nullptr;
+U32 gTranslatorRoleOwnerId = 0;
+
+U32 translatorRoleHolderId() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(gTranslatorRoleMutex);
+    return gTranslatorRoleOwnerId;
+}
+
+bool translatorRoleTryTake(const KProcess* process) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(gTranslatorRoleMutex);
+    if (gTranslatorRoleOwner == process) {
+        return true;
+    }
+    if (gTranslatorRoleOwner != nullptr) {
+        return false;
+    }
+    gTranslatorRoleOwner = process;
+    gTranslatorRoleOwnerId = process ? process->id : 0;
+    return true;
+}
+
+bool translatorRoleRelease(const KProcess* process) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(gTranslatorRoleMutex);
+    if (gTranslatorRoleOwner != process) {
+        return false;
+    }
+    gTranslatorRoleOwner = nullptr;
+    gTranslatorRoleOwnerId = 0;
+    return true;
+}
+
+// Wine's own infrastructure, spelled the way KProcess::execve already spells
+// it when it sets systemProcess, plus the helpers that list has no entry for.
+// Nothing in here ever claims the role: it is not what the user launched.
+// Giving it to one of these is what left the desktop unable to start
+// anything -- in the 2026-09-03 device log the shell held the role for the
+// whole session and made no Direct3D call at all, while every program it
+// started was refused with reason=native-memory.
+bool argsNameWineInfrastructure(const std::vector<BString>& args) {
+    static const char* const kInfrastructure[] = {
+        "wineboot.exe", "winemenubuilder.exe", "services.exe",
+        "plugplay.exe", "winedevice.exe", "explorer.exe", "rpcss.exe",
+        "conhost.exe", "start.exe", "winefile.exe", "wineserver",
+    };
+    for (const BString& arg : args) {
+        for (const char* name : kInfrastructure) {
+            if (arg.endsWith(name, true)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// A top-level Windows program: an absolute Windows path to a .exe outside the
+// Windows directory. That is what a file manager, a shortcut, or the launcher
+// itself hands to the Wine loader, and it is deliberately narrower than "any
+// exec" -- Wine re-execs its loader constantly, and the desktop's own command
+// line names explorer.exe by absolute path too.
+bool argIsTopLevelWindowsProgram(const BString& arg) {
+    // The shortest accepted form is "C:\a.exe".
+    if (arg.length() < 8) {
+        return false;
+    }
+    const char drive = arg.charAt(0);
+    const bool isDriveLetter = (drive >= 'A' && drive <= 'Z') ||
+                               (drive >= 'a' && drive <= 'z');
+    if (!isDriveLetter || arg.charAt(1) != ':' || arg.charAt(2) != '\\') {
+        return false;
+    }
+    if (!arg.endsWith(".exe", true)) {
+        return false;
+    }
+    return !arg.substr(3).startsWith("windows\\", true);
+}
+
+bool argsNameTopLevelWindowsProgram(const std::vector<BString>& args) {
+    for (const BString& arg : args) {
+        if (argIsTopLevelWindowsProgram(arg)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+#endif
+
 // A fork child that execs has to unwind the whole inherited process before it
 // can load its replacement image. When that stalls there is nothing between
 // the remap marker and the loader's first line to say where, so each phase
@@ -398,6 +519,19 @@ KProcess::~KProcess() {
     cpu64 = nullptr;
     delete memory64;
     memory64 = nullptr;
+#if defined(BOXEDWINE_FEX64_BACKEND)
+    // ~KMemory64 has just unmapped the identity windows, so this is the exact
+    // instant the translated role becomes available to another process --
+    // which is why the release is tied to the address space's destruction
+    // rather than to the process's exit status. A holder whose KProcess is
+    // never destroyed keeps the role, and keeps the mapping with it; that is
+    // correct, and the refusal it causes says role-held-by-live-owner.
+    if (translatorRoleRelease(this)) {
+        klog_fmt("BOXEDWINE_X64_TRANSLATOR_ROLE pid=%u action=release "
+                 "holder=%u moved=1 reason=owner-address-space-destroyed",
+                 this->id, this->id);
+    }
+#endif
 #endif
     if (memory) {
         delete memory;
@@ -1149,7 +1283,26 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
     }
 #if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
     if (traceFEX64) {
-        this->useFEX64 = true;
+        // Seed the translated role on the launched process only when that
+        // process is the program the user asked for. A desktop session
+        // launches Wine's shell instead, and the shell holding the role for
+        // the whole session is exactly why nothing started from the desktop
+        // could reach Direct3D: it never made a Metal call itself, while
+        // every program it started was refused with reason=native-memory.
+        // Leaving the role unheld costs the shell speed it does not need and
+        // lets the first program launched from it take the role at its own
+        // exec, which is the one safe transfer point.
+        const U32 holder = translatorRoleHolderId();
+        const bool infrastructure = argsNameWineInfrastructure(argValues);
+        if (!infrastructure && translatorRoleTryTake(this)) {
+            this->useFEX64 = true;
+        }
+        klog_fmt("BOXEDWINE_X64_TRANSLATOR_ROLE pid=%u action=seed holder=%u "
+                 "moved=%u reason=%s",
+                 this->id, holder, this->useFEX64 ? 1U : 0U,
+                 this->useFEX64
+                     ? "launched-program-took-free-role"
+                     : "wine-infrastructure-defers-to-first-program-exec");
         // Record how this launch's processes look for their Wine modules.
         // Consulted rather than copied, so wineboot and every helper Wine
         // execs or forks records under it too, each with its own budget.
@@ -1738,6 +1891,38 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     this->name = Fs::getFileNameFromPath(node->path);
     
     this->commandLine = BString::join("\0", args);
+#ifdef BOXEDWINE_GUEST_X64
+    // Set below when this exec takes the translated role from nobody. Read by
+    // the memory replacement, which has to build an identity mapping for a
+    // process whose previous address space had none.
+    bool claimedTranslatorRole = false;
+#if defined(BOXEDWINE_FEX64_BACKEND)
+    if (this->is64Bit && !this->useFEX64) {
+        // The one safe transfer point. Everything of the old address space is
+        // about to be discarded (execvReset, then a replacement KMemory64),
+        // the sibling threads are quiesced a few lines below, and the identity
+        // windows are claimed by a process that has no pages in them yet. The
+        // role is only ever taken when it is free: a live owner's guest
+        // registers, stack and translated blocks all hold host addresses
+        // inside those windows, so it cannot be moved out from under one.
+        const U32 holder = translatorRoleHolderId();
+        const bool wantsRole = !this->systemProcess &&
+                               !argsNameWineInfrastructure(args) &&
+                               argsNameTopLevelWindowsProgram(args);
+        if (wantsRole && translatorRoleTryTake(this)) {
+            this->useFEX64 = true;
+            claimedTranslatorRole = true;
+        }
+        klog_fmt("BOXEDWINE_X64_TRANSLATOR_ROLE pid=%u action=claim holder=%u "
+                 "moved=%u reason=%s",
+                 this->id, holder, claimedTranslatorRole ? 1U : 0U,
+                 claimedTranslatorRole
+                     ? "top-level-program-took-free-role"
+                     : (wantsRole ? "role-held-by-live-owner"
+                                  : "not-a-top-level-program"));
+    }
+#endif
+#endif
     // An exec replaces this process's address space, so the identity mapping
     // it owns is reused rather than duplicated and useFEX64 survives. Say so
     // here: this is the only way the translator moves to another image.
@@ -1792,8 +1977,13 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         // The SYSCALL implementing execve is still running on cpu64's native
         // call stack. Keep that CPU object alive, replace only its address
         // space, and let ElfLoader64 reseed the architectural entry state.
-        const bool preserveNativeIdentity =
-            this->memory64 && this->memory64->nativeIdentityMode();
+        // A process that already held the translated role keeps the identity
+        // mapping it owns; one that just took it from nobody gets its first.
+        // The old KMemory64 is destroyed below before the replacement maps
+        // anything, so the windows are never claimed twice even in the
+        // preserving case.
+        const bool preserveNativeIdentity = claimedTranslatorRole ||
+            (this->memory64 && this->memory64->nativeIdentityMode());
         KMemory64* replacementMemory =
             new KMemory64(this, preserveNativeIdentity);
         delete this->memory64;
@@ -1859,8 +2049,24 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
 
     //klog("%d/%d exec %s (cwd=%s)", KThread::currentThread()->id, this->id, this->commandLine.c_str(), this->currentDirectory.c_str());
 
+#ifdef BOXEDWINE_GUEST_X64
+    if (claimedTranslatorRole) {
+        // This thread is inside CPU64::run(), whose only exit is `yield` --
+        // and `yield` ends the host thread rather than returning to the
+        // scheduler. Without a second way out the interpreter would keep
+        // stepping the image the loader just built, and the process that has
+        // just taken the translated role would never reach FEX. Ask the
+        // dispatch loop to return instead; the scheduler re-reads useFEX64 on
+        // its next pass and enters the backend with the architectural state
+        // this exec published.
+        CPU64* execCpu = thread->cpu64 ? thread->cpu64 : this->cpu64;
+        if (execCpu) {
+            execCpu->backendHandoff = true;
+        }
+    }
+#endif
     thread->cpu->restart();
-    
+
     return -K_CONTINUE;
 }
 
@@ -2916,13 +3122,17 @@ U32 KProcess::forkProcess64(KThread* thread, U64 flags, U64 childTid,
         // addresses inside this iOS process. It starts on the sparse CPU64
         // path and may exec a helper without clobbering its FEX parent.
         //
-        // This holds even when the parent goes idle waiting on the child, so
-        // a child that execs cannot inherit the translator either: the
+        // This holds even when the parent goes idle waiting on the child: the
         // parent's KMemory64 is only torn down by its own execve or its exit,
         // and while it waits every one of its pages is still mapped at the
-        // identity address the child would need. Placing the translator is
-        // therefore a launch-time decision -- see the exec path, which keeps
-        // useFEX64 because exec replaces this process's address space.
+        // identity address the child would need. A child therefore never
+        // inherits the translator at fork.
+        //
+        // It can still take it at its own exec, which is the point where its
+        // address space is replaced -- see KProcess::execve, which claims the
+        // role for a top-level Windows program when no live process holds it.
+        // That is how a program started from the desktop gets translated
+        // while the shell that started it does not.
         childProcess->useFEX64 = false;
         childProcess->brkEnd64 = brkEnd64;
         childProcess->entry64 = entry64;
@@ -4479,6 +4689,47 @@ void KProcess::logThreadSnapshot(const char* reason) {
                  vulkanText, liveText);
         if (syscallText[0]) {
             klog_fmt("    tid=%04X%s", thread->id, syscallText);
+        }
+        // A thread parked in KUnixSocketObject::lockCond is either waiting on
+        // a Windows object -- which is what a healthy Wine process does all
+        // day -- or waiting for a reply the wineserver never sent, and the
+        // line above cannot tell those apart. This one can: it names the
+        // descriptor being read, how long the read has been parked, and the
+        // request this thread last wrote to a socket. A request older than the
+        // read that has never been answered is a server that stopped
+        // answering.
+        const U32 socketReadFd =
+            thread->diagnosticSocketReadFd.load(std::memory_order_relaxed);
+        if (socketReadFd) {
+            const U32 nowMillies = KSystem::getMilliesSinceStart();
+            const U32 requestFd =
+                thread->diagnosticSocketWriteFd.load(std::memory_order_relaxed);
+            char requestText[128];
+            if (requestFd) {
+                snprintf(requestText, sizeof(requestText),
+                         "request=%u request_fd=%d request_bytes=%u "
+                         "sent=%ums ago",
+                         thread->diagnosticSocketWriteCode.load(
+                             std::memory_order_relaxed),
+                         (int)(requestFd - 1),
+                         thread->diagnosticSocketWriteBytes.load(
+                             std::memory_order_relaxed),
+                         nowMillies - thread->diagnosticSocketWriteMillies.load(
+                             std::memory_order_relaxed));
+            } else {
+                // Blocked on a socket this thread has never written a whole
+                // protocol message to: a pipe, or a wait descriptor. Saying
+                // so is the point -- it is not an unanswered request.
+                snprintf(requestText, sizeof(requestText),
+                         "request=none request_fd=-1 request_bytes=0 "
+                         "sent=never");
+            }
+            klog_fmt("    tid=%04X BOXEDWINE_SERVER_WAIT read_fd=%u "
+                     "waiting=%ums %s",
+                     thread->id, socketReadFd - 1,
+                     nowMillies - thread->diagnosticSocketReadStartMillies.load(
+                         std::memory_order_relaxed),
+                     requestText);
         }
         // A live, runnable EIP with rising native CPU time is the signature of
         // a translated guest spin. x86 instructions are variable length, so

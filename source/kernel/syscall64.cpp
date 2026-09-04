@@ -50,6 +50,10 @@
 #if defined(BOXEDWINE_DXMT_NATIVE)
 #include "BVNFrameRate.h"
 #include "BVNDXMTDisplay.h"
+// BOXEDWINE_DXMT_HOST_POINTER_TAG: the bit that tells the rewritten unix
+// sources a pointer inside a parameter block is already a host address. The
+// shader-cache-path substitution below is the only place this side sets it.
+#include "boxedwine_dxmt_guest_pointer.h"
 extern "C" const void *dxmt_winemetal_unix_call_funcs[];
 #endif
 
@@ -804,6 +808,25 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (!fdesc->canWrite()) {
         return (U64)-K_EINVAL;
     }
+    // The wineserver protocol is one fixed-size request written to the request
+    // socket followed by a reply read back from it, and the request code is
+    // the first field of the request header. Remembering it costs four stores
+    // and is what lets the hang snapshot below say WHICH request a stalled
+    // thread is still owed an answer to.
+    if (fdesc->kobject->type == KTYPE_UNIX_SOCKET) {
+        const int requestOpcode =
+            boxedvn::wineServerRequestOpcode(buffer.data(), count);
+        if (requestOpcode >= 0) {
+            cpu->thread->diagnosticSocketWriteCode.store(
+                (U32)requestOpcode, std::memory_order_relaxed);
+            cpu->thread->diagnosticSocketWriteBytes.store(
+                (U32)count, std::memory_order_relaxed);
+            cpu->thread->diagnosticSocketWriteFd.store(
+                (U32)fd + 1, std::memory_order_relaxed);
+            cpu->thread->diagnosticSocketWriteMillies.store(
+                KSystem::getMilliesSinceStart(), std::memory_order_relaxed);
+        }
+    }
     U32 wrote = fdesc->kobject->writeNative(buffer.data(), (U32)count);
     // A connected stream socket whose peer object is TRANSIENTLY unreferenced
     // under boot-time fd-table churn returns -K_EWOULDBLOCK (see
@@ -1380,6 +1403,45 @@ static U64 sys_shmctl64(CPU64* cpu, U64 shmid, U64 cmd, U64 buf) {
 // self-deadlock. Env-gated so it's a clean A/B with no cost when off.
 static std::recursive_mutex g_serialTeardownMutex;
 static bool g_serialTeardownInit = false, g_serialTeardownOn = false;
+
+// The session ends when the process the launcher started ends, and something
+// has to tell the runtime that it did.
+//
+// That used to be reported only from the translator's own retirement path
+// (reportLaunchedProcessRetired in BVNFEXBackend.mm), which was correct while
+// the launched process was always the translated one. It is not any more: a
+// desktop session leaves the translated role unheld so the first program
+// started from the shell can take it, which means the shell -- still the
+// process the launcher started -- now exits through the interpreter and never
+// passes through the translator's unwind at all. Without this the desktop
+// could be closed and the session would go on running its helpers with
+// nothing left to show.
+//
+// Only the launched process, never a program it started: a program quit from
+// inside the desktop must not take the desktop down with it. The runtime
+// keeps the first report and ignores the rest, so the translator path
+// reporting the same ending is harmless.
+static void noteLaunchedProcessExit64(CPU64* cpu, U64 status, bool group) {
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_FEX64_BACKEND)
+    if (!group || !cpu || !cpu->thread || !cpu->thread->process) {
+        return;
+    }
+    KProcess* launched = cpu->thread->process.get();
+    if (launched->parentId > 1) {
+        return;
+    }
+    char module[BVN_MAX_MODULE_NAME];
+    module[0] = '\0';
+    launched->dllSearch.lastUnresolvedModule(module, sizeof(module));
+    BVNRuntimeNoteLaunchedProcessExited((uint32_t)launched->id,
+                                        (uint32_t)status, module);
+#else
+    (void)cpu;
+    (void)status;
+    (void)group;
+#endif
+}
+
 static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
     if (!g_serialTeardownInit) {
         g_serialTeardownOn = std::getenv("BW64_SERIAL_TEARDOWN") != nullptr;
@@ -1387,15 +1449,24 @@ static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
     }
     if (cpu->thread && cpu->thread->process) {
         KProcess* p = cpu->thread->process.get();
-        klog_fmt("CPU64: %s syscall, status=%lld  pid=%d exe='%s' cmd='%s'",
+        klog_fmt("CPU64: %s syscall, status=%lld  pid=%d tid=%04X exe='%s' "
+                 "cmd='%s'",
                  group ? "exit_group" : "exit", (long long)status,
-                 (int)p->id, p->exe.c_str(), p->commandLine.c_str());
+                 (int)p->id, cpu->thread->id, p->exe.c_str(),
+                 p->commandLine.c_str());
         // The third of the three lifecycle markers, so a child's scheduling,
         // first syscall and exit can be matched up without hunting.
+        //
+        // A plain exit (group=0) ends ONE thread, and until the tid was on the
+        // line nothing said which: a device capture showed a process whose
+        // surviving threads were all parked in futex waits owed a wake, and a
+        // fifth thread leaving through here, and the two could only be joined
+        // by elimination. A thread that exits owing a wake is exactly the
+        // shape a starving waiter has, so the marker has to name it.
         klog_fmt("BOXEDWINE_X64_PROC_EXIT pid=%u parent=%u status=%lld "
-                 "group=%d exe='%s'",
+                 "group=%d exe='%s' tid=%04X",
                  (unsigned)p->id, (unsigned)p->parentId, (long long)status,
-                 group ? 1 : 0, p->exe.c_str());
+                 group ? 1 : 0, p->exe.c_str(), cpu->thread->id);
     } else {
         klog_fmt("CPU64: %s syscall, status=%lld",
                  group ? "exit_group" : "exit", (long long)status);
@@ -1413,6 +1484,7 @@ static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
         BVNDXMTDisplayNoteProcessExited(cpu->thread->process->id);
     }
 #endif
+    noteLaunchedProcessExit64(cpu, status, group);
     // Stop this thread's run loop now, whatever else happens below.
     cpu->yield = true;
     if (cpu->thread && cpu->thread->process) {
@@ -1584,7 +1656,16 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
             if ((S32)got >= 0) got = (U32)total;
         } else {
             // Socket/pipe: a short read is correct (blocking semantics) — single shot.
+            // readNative parks inside KUnixSocketObject on an empty buffer, so
+            // this window IS the wait; the snapshot reads these two while the
+            // thread is still inside it.
+            cpu->thread->diagnosticSocketReadStartMillies.store(
+                KSystem::getMilliesSinceStart(), std::memory_order_relaxed);
+            cpu->thread->diagnosticSocketReadFd.store(
+                (U32)fd + 1, std::memory_order_relaxed);
             got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+            cpu->thread->diagnosticSocketReadFd.store(
+                0, std::memory_order_relaxed);
         }
     }
     // Both outcomes of the read land in the socket ring, not just a success.
@@ -2575,9 +2656,24 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
         for (size_t i = 1; i < args.size(); i++)
             klog_fmt("sys_execve64:   argv[%d]='%s'", (int)i, args[i].c_str());
     }
+    // WINELOADER says which loader the re-exec chain picked. WINEDEBUG and
+    // WINEDLLOVERRIDES are printed beside it because they are the two the
+    // launch sets to change what a guest reports about itself, and until now
+    // nothing said whether either survived the double fork and the
+    // preloader's re-exec. A 64-bit session whose whole capture contains not
+    // one Wine debug line is either a Wine that was asked for none or a
+    // WINEDEBUG that never arrived, and those are different problems.
+    // Bounded by construction: a handful of execs per session, one line each.
+    static const char* const kWitnessedEnvironment[] = {
+        "WINELOADER=", "WINEDEBUG=", "WINEDLLOVERRIDES=",
+    };
     for (auto& e : envs) {
-        if (strncmp(e.c_str(), "WINELOADER=", 11) == 0)
-            klog_fmt("sys_execve64:   env %s", e.c_str());
+        for (const char* prefix : kWitnessedEnvironment) {
+            if (strncmp(e.c_str(), prefix, strlen(prefix)) == 0) {
+                klog_fmt("sys_execve64:   env %s", e.c_str());
+                break;
+            }
+        }
         if (getenv("BW64_ENVDUMP"))
             klog_fmt("sys_execve64:   ENV %s", e.c_str());
     }
@@ -4052,6 +4148,176 @@ extern "C" void boxedwineDxmtReportRecentCalls(void) {
 // above carries the steady state.
 static const U32 kDxmtOpeningCallLogBudget = 128;
 
+#if defined(BOXEDWINE_DXMT_NATIVE)
+// ---- The Metal shader cache path --------------------------------------------
+//
+// dxgi.dll asks Metal, in its DllMain and before a program has reached any
+// Direct3D entry point at all, to put the framework's own cache under a path
+// of its own: str::format("dxmt/", exe name, "/com.apple.metal"). It is
+// relative, and it is the only unix call a program that gives up during
+// startup ever makes -- a device capture whose entire DXMT trace was
+// `index=119` is what named this call in the table above.
+//
+// DXMT's unix side resolves a relative path against
+// confstr(_CS_DARWIN_USER_CACHE_DIR), creates the directory, hands the result
+// to Metal, and then checks that Metal reports the same path back. Every
+// device run so far has printed "Failed to set Metal cache path, fallback to
+// system default" from the failing half of that check, and the system default
+// is not a place this app can keep anything across launches: every shader the
+// translator produces is produced again next time.
+//
+// The one directory the app can promise exists and is writable is its own
+// Caches directory, which BVNPathCaches() creates at first use and which the
+// system is free to purge -- exactly the contract a shader cache wants.
+// Handing DXMT an absolute path under it takes confstr out of the question
+// entirely, because its resolver short-circuits on a leading slash.
+//
+// The parameter block is
+//
+//   struct unixcall_setmetalcachepath {
+//       struct WMTConstMemoryPointer path;  /* one `const void*` on x86-64 */
+//       uint64_t ret_success;
+//   };
+//
+// in src/winemetal/winemetal_thunks.h of the pinned checkout, so the pointer
+// is at offset 0 and the result the guest reads at offset 8. The replacement
+// is written back with BOXEDWINE_DXMT_HOST_POINTER_TAG set: that is the bit
+// the rewritten unix sources already use to recognise a host pointer the
+// guest handed back, so the string is read where it actually lives rather
+// than through the guest address rule. Nothing on the guest side looks at
+// `path` again once the call returns.
+//
+// Whether Metal then accepts it is the question the log could not answer
+// before, so the result is printed either way.
+static const U64 kDxmtUnixCallSetMetalShaderCachePath = 119;
+
+// DXMT's own path is well under this. A longer one is not the call this
+// knows about, and is left exactly as the guest built it.
+static const size_t kDxmtShaderCachePathMax = 512;
+
+struct DxmtSetCachePathBlock {
+    U64 path;
+    U64 retSuccess;
+};
+
+struct DxmtShaderCachePathWitness {
+    char requested[kDxmtShaderCachePathMax];
+    const char* used;
+    bool blockReadable;
+};
+
+// A NUL-terminated string named by a guest pointer inside a parameter block,
+// validated a byte at a time against the same rule the dispatcher applies to
+// the block itself. Called once per process, so the per-byte check costs
+// nothing worth avoiding and cannot walk off the end of a mapping.
+static bool boxedwineDxmtReadGuestString64(CPU64* cpu, U64 guestPointer,
+                                           char* out, size_t outSize) {
+    if (!cpu || !cpu->memory || !guestPointer || !out || outSize == 0) {
+        return false;
+    }
+    for (size_t i = 0; i + 1 < outSize; i++) {
+        const U64 guest = guestPointer + i;
+        const U64 host = boxedvn::guestToHostAddress(guest);
+        if (!boxedvn::guestRangeHostable(guest, 1) ||
+            !cpu->memory->nativeRangeCoversForPlan(host, host + 1)) {
+            return false;
+        }
+        const char c = *reinterpret_cast<const char*>(
+            static_cast<uintptr_t>(host));
+        out[i] = c;
+        if (c == 0) {
+            return true;
+        }
+    }
+    out[outSize - 1] = 0;
+    return false;
+}
+
+static void boxedwineDxmtBeginShaderCachePath64(
+    CPU64* cpu, U64 hostArgs, DxmtShaderCachePathWitness& witness) {
+    witness.requested[0] = 0;
+    witness.used = nullptr;
+    witness.blockReadable = false;
+    if (!cpu || !cpu->memory) {
+        return;
+    }
+    if (!cpu->memory->nativeRangeCoversForPlan(
+            hostArgs, hostArgs + sizeof(DxmtSetCachePathBlock))) {
+        return;
+    }
+    witness.blockReadable = true;
+    DxmtSetCachePathBlock* block = reinterpret_cast<DxmtSetCachePathBlock*>(
+        static_cast<uintptr_t>(hostArgs));
+    if (!boxedwineDxmtReadGuestString64(cpu, block->path, witness.requested,
+                                        sizeof(witness.requested))) {
+        return;
+    }
+    if (witness.requested[0] == '/') {
+        // Already absolute: DXMT's resolver will use it unchanged, and
+        // whoever chose it knew more than this does.
+        witness.used = witness.requested;
+        return;
+    }
+#if defined(BOXEDWINE_IOS)
+    // BVNPathCaches() creates the directory on its first call and caches the
+    // result for the process. That accessor is not itself synchronised, but
+    // the app resolves the same path during startup and this runs seconds
+    // later, on the one guest thread that can reach DXMT at all.
+    //
+    // Whatever is handed to Metal has to stay alive and stay put for the rest
+    // of the process: the guest's parameter block now points at it, and DXMT
+    // reads it after this returns. Each distinct path therefore gets its own
+    // heap string that is never freed and never moved -- a vector of strings
+    // would move them on its next growth, and the block would be left holding
+    // a dangling host pointer.
+    static std::mutex pathMutex;
+    static std::vector<std::string*> handedToMetal;
+    const char* absolute = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(pathMutex);
+        const char* caches = BVNPathCaches();
+        if (!caches || !caches[0]) {
+            return;
+        }
+        std::string candidate(caches);
+        if (candidate.empty() || candidate.back() != '/') {
+            candidate += '/';
+        }
+        candidate += witness.requested;
+        for (std::string* held : handedToMetal) {
+            if (*held == candidate) {
+                absolute = held->c_str();
+                break;
+            }
+        }
+        if (!absolute) {
+            handedToMetal.push_back(new std::string(candidate));
+            absolute = handedToMetal.back()->c_str();
+        }
+    }
+    witness.used = absolute;
+    block->path = boxedwine_dxmt_tag_host_pointer((U64)(uintptr_t)absolute);
+#endif
+}
+
+static void boxedwineDxmtEndShaderCachePath64(
+    CPU64* cpu, U64 hostArgs, const DxmtShaderCachePathWitness& witness,
+    S32 status) {
+    U64 accepted = 0;
+    if (witness.blockReadable && cpu && cpu->memory) {
+        const DxmtSetCachePathBlock* block =
+            reinterpret_cast<const DxmtSetCachePathBlock*>(
+                static_cast<uintptr_t>(hostArgs));
+        accepted = block->retSuccess;
+    }
+    klog_fmt("BOXEDWINE_DXMT_SHADER_CACHE requested='%s' used='%s' "
+             "accepted=%llu status=%d",
+             witness.requested[0] ? witness.requested : "(unreadable)",
+             witness.used ? witness.used : "(unchanged)",
+             (unsigned long long)accepted, status);
+}
+#endif  // BOXEDWINE_DXMT_NATIVE
+
 static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     static std::atomic<U32> callLogCount{0};
     const U32 logOrdinal = callLogCount.fetch_add(1, std::memory_order_relaxed);
@@ -4074,6 +4340,13 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
             // KProcess::clone gives a sparse KMemory64 (fex=0). Such a
             // process cannot present at all; D3D11CreateDevice reports "No
             // default adapter available" and the program exits.
+            //
+            // A program launched from the desktop no longer lands here: the
+            // shell does not take the translated role, so the program claims
+            // it at its own execve and arrives with an identity mapping. What
+            // still lands here is a program started while another one already
+            // holds the role -- the role is only ever taken when free, never
+            // from a live owner. BOXEDWINE_X64_TRANSLATOR_ROLE says which.
             klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d "
                      "reason=native-memory pid=%u fex=%d",
                      logOrdinal, -K_ENOSYS, processId,
@@ -4148,7 +4421,21 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         gDxmtRecentCalls[slot].tid = cpu && cpu->thread ? cpu->thread->id : 0;
         gDxmtRecentCalls[slot].ordinal = logOrdinal;
     }
+    // Three stores, not a 512-byte zero fill: this runs on the per-frame
+    // path, and only the shader-cache call ever fills the buffer.
+    DxmtShaderCachePathWitness cachePath;
+    cachePath.requested[0] = 0;
+    cachePath.used = nullptr;
+    cachePath.blockReadable = false;
+    const bool isShaderCachePath =
+        callIndex == kDxmtUnixCallSetMetalShaderCachePath;
+    if (isShaderCachePath) {
+        boxedwineDxmtBeginShaderCachePath64(cpu, args, cachePath);
+    }
     const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
+    if (isShaderCachePath) {
+        boxedwineDxmtEndShaderCachePath64(cpu, args, cachePath, status);
+    }
     if (logCall) {
         klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d",
                  logOrdinal, status);

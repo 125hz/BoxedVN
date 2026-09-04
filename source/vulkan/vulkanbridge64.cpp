@@ -3269,9 +3269,29 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         if (!m.ok()) {
             return m.error(false);
         }
-        return (S64)((PFN_vkAcquireNextImageKHR)raw)(
+        const VkResult result = ((PFN_vkAcquireNextImageKHR)raw)(
             (VkDevice)H(0), (VkSwapchainKHR)A(1), (uint64_t)A(2),
             (VkSemaphore)A(3), (VkFence)A(4), imageIndex);
+        // Unbudgeted, and paired with the present witness, because an acquire
+        // that succeeds and is never followed by a present is the shape of the
+        // hang this lane is in. What it prints is exactly what a reader needs
+        // to tell "the bridge lost the signal" from "the caller never came
+        // back": which objects the acquire was asked to signal (either may be
+        // null, and a null one must STAY null), the full 64-bit timeout, and
+        // the image index that goes back to the guest.
+        static std::atomic<U32> reported{0};
+        const U32 seen = reported.fetch_add(1, std::memory_order_relaxed);
+        if (seen < 8 || (seen % 60) == 0) {
+            klog_fmt("BOXEDWINE_X64_VULKAN_ACQUIRE n=%u swapchain=0x%llx "
+                     "timeout=0x%llx semaphore=0x%llx fence=0x%llx "
+                     "index=%u status=%d",
+                     seen, (unsigned long long)A(1),
+                     (unsigned long long)A(2), (unsigned long long)A(3),
+                     (unsigned long long)A(4),
+                     (result == VK_SUCCESS && imageIndex) ? *imageIndex : 0xffffffffu,
+                     (int)result);
+        }
+        return (S64)result;
     }
     case VKB_AcquireNextImage2KHR: {
         const VkAcquireNextImageInfoKHR* info =
@@ -3295,8 +3315,17 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         // One line per sixty presents, plus the first: enough to say the lane
         // is presenting and at what rate, cheap enough to leave on.
         if (presents < 3 || (presents % 60) == 0) {
-            klog_fmt("BOXEDWINE_X64_VULKAN_PRESENT frame=%u status=%d",
-                     presents, (int)result);
+            // The image index and wait semaphore are named for the same reason
+            // the acquire names them: the pair of lines is what says whether
+            // the image an acquire handed the guest is the image the guest
+            // presented, and whether it waited on the semaphore the acquire
+            // signalled.
+            klog_fmt("BOXEDWINE_X64_VULKAN_PRESENT frame=%u swapchains=%u "
+                     "index=%u waits=%u status=%d",
+                     presents, info ? info->swapchainCount : 0,
+                     (info && info->pImageIndices && info->swapchainCount)
+                         ? info->pImageIndices[0] : 0xffffffffu,
+                     info ? info->waitSemaphoreCount : 0, (int)result);
         }
         return (S64)result;
     }

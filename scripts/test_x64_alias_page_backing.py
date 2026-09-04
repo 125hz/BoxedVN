@@ -46,6 +46,41 @@ STATUS_ACCESS_VIOLATION and commits the page from its own handler. Passing
 Darwin's SIGBUS through delivered guest signal 7 with trap 17, which Wine reads
 as STATUS_DATATYPE_MISALIGNMENT: the page-fault handler never ran.
 
+The run after THAT one delivered the page fault correctly and the program died
+anyway, at guest 0xbe0000 where the previous run had died at 0xd88000:
+
+    BOXEDWINE_X64_ALIAS_BACKING ... guest=0xbe0000 mapped=1 guest_prot=0x0
+                                    decision=guest-protected
+    BOXEDWINE_FEX64_GUEST_FAULT ... guest_signal=11 trap=14 guest_si_code=2
+    BOXEDWINE_SESSION_PROGRAM_EXIT status=0xc0000005
+
+So Wine saw STATUS_ACCESS_VIOLATION for a page it believed it had committed and
+passed it to the program: the refusal itself was wrong. Both addresses are
+16 KiB aligned and neither is 64 KiB aligned, which is the host page size and
+nothing else in the system; the faulting loop had read the preceding bytes
+without faulting, so the rights ended exactly at a host page boundary. The
+producing side was mprotect: it asked nativeRangeCovers about the whole
+HOST-ROUNDED interval and returned -EINVAL for the ENTIRE request when any host
+page in it -- including an edge host page the request only partly covered, or
+one the lazy fault repair had not yet materialised -- was untracked. It returned
+before writing a single guest page's flags and logged nothing, so the pages Wine
+had just committed kept the flags of the PROT_NONE reservation they were being
+committed out of. Two more paths applied one protection across a whole interval
+the same way: nativeMapAnonymous chose between the requested protection and
+read/write from plan.exactHostCover, a property of the WHOLE interval, and both
+mprotect and mmapSharedFile then assigned that value to every tracked range the
+interval merely overlapped.
+
+The rule the tests below now hold is one sentence in two directions: a guest
+page's rights change only in an operation that names it, and a host page carries
+exactly the union of what its four guest pages hold, recomputed per host page
+whenever any of them changes. An untracked host page is skipped rather than
+failing the call. A guest page also remembers which operation last wrote its
+flags and what it wrote, and the fault witness prints that for the faulting page
+and for its most recently written neighbour in the same host page -- which is
+what separates "the whole host page was never committed" from "this 4 KiB page
+lost rights its neighbours kept".
+
 These tests hold both halves in place: the page map stays the authority, the
 repair never grants more than the page map grants, the retry is bounded, the
 witness that will identify the producing ledger keeps printing every fact
@@ -145,11 +180,28 @@ class TheRepairIsDrivenByThePageMap(unittest.TestCase):
     def test_the_union_is_taken_over_the_whole_host_page(self) -> None:
         # One 16 KiB host page carries four 4 KiB guest pages, so a repair that
         # looked only at the faulting guest page would revoke its neighbours.
-        self.assertIn("for (U64 sub = 0; sub < hostPage; sub += K64_PAGE_SIZE)",
-                      self.body)
+        # The union now has exactly ONE definition, shared with every producing
+        # path, so the repair reaches it by calling that.
+        self.assertIn("nativeHostPageProtLocked(hostStart, hostPage,", self.body)
+        union = function_body(
+            self.source, "U32 KMemory64::nativeHostPageProtLocked(")
+        self.assertIn(
+            "for (U64 sub = 0; sub < hostPageSize; sub += K64_PAGE_SIZE)",
+            union)
         # `pages` is keyed by CANONICAL guest page, so the host page has to be
         # translated back before its subpages can be named.
-        self.assertIn("k64HostToGuestAddress(hostStart)", self.body)
+        self.assertIn("k64HostToGuestAddress(hostPageStart)", union)
+
+    def test_the_union_is_computed_before_the_refusal(self) -> None:
+        # A refused fault has to say what the REST of the host page holds. A
+        # guest page with no rights beside three that have them is a
+        # granularity defect; one whose whole host page has none is a
+        # reservation the guest has genuinely not committed. The witness could
+        # not tell those apart while the union was computed after the return.
+        union = self.body.index("unionProt = nativeHostPageProtLocked(")
+        refusal = self.body.index('report.decision = "guest-protected"')
+        self.assertLess(union, refusal)
+        self.assertIn("report.hostPageProt = unionProt;", self.body)
 
     def test_only_a_guest_image_address_is_repaired(self) -> None:
         # The round trip is the whole membership test: it holds for the low
@@ -187,10 +239,11 @@ class TheRepairIsDrivenByThePageMap(unittest.TestCase):
         self.assertIn('report.decision = "backing-elsewhere"', self.body)
 
     def test_the_repair_keeps_the_native_range_ledger_honest(self) -> None:
-        # Otherwise the next mprotect over this page refuses for want of
-        # coverage and the next munmap leaves the host page behind.
-        self.assertIn("nativeForgetRange(hostStart, hostPage)", self.body)
-        self.assertIn("nativeRanges.emplace(hostStart,", self.body)
+        # Otherwise the next munmap leaves the host page behind. Exactly this
+        # host page is recorded -- nativeTrackRangeLocked forgets and re-adds
+        # the named interval and nothing else.
+        self.assertIn("nativeTrackRangeLocked(hostStart, hostPage, unionProt)",
+                      self.body)
         self.assertIn("k64DTlbInvalidateAll()", self.body)
 
     def test_every_exit_names_a_decision(self) -> None:
@@ -556,6 +609,216 @@ class AReservationIsAMappedPageWithNoRights(unittest.TestCase):
             self.source, "bool KMemory64::nativeRepairHostFault(")
         self.assertIn("if (report.guestProt == 0 ||", body)
         self.assertIn('report.decision = "guest-protected"', body)
+
+
+class AGuestPageChangesOnlyInACallThatNamesIt(unittest.TestCase):
+    """The producing rule. A 4 KiB guest page's rights may be written only by
+    an operation whose own guest range covers it -- never as a side effect of
+    the 16 KiB host page it happens to share."""
+
+    def setUp(self) -> None:
+        self.source = read(KMEMORY_SOURCE)
+        self.header = read(KMEMORY_HEADER)
+
+    def test_there_is_exactly_one_writer_of_a_page_s_flags(self) -> None:
+        # Routing every write through K64Page::writeFlags is what makes the
+        # rule checkable at all, and what lets the page remember its writer.
+        self.assertIn("void writeFlags(U32 value, U8 writer, U16 stamp) {",
+                      self.header)
+        stray = re.findall(r"(?:page|copy|it->second)->flags\s*(?:=|\|=|&=)\s",
+                           self.source)
+        self.assertEqual(stray, [],
+                         "a guest page's flags are written outside writeFlags")
+
+    def test_each_producer_writes_only_the_pages_of_its_own_request(self) -> None:
+        # Every flag-writing loop is bounded by the REQUEST's guest page range,
+        # so no host-page rounding can reach a page the caller did not name.
+        for signature in ("U64 KMemory64::mmapAnonymousFixed(",
+                          "U64 KMemory64::mmapSharedFile(",
+                          "U64 KMemory64::mprotect(",
+                          "U64 KMemory64::munmap("):
+            body = function_body(self.source, signature)
+            self.assertIn("for (U64 i = 0; i < pageCount; i++)", body,
+                          f"{signature} lost its request-bounded write loop")
+            self.assertIn("writeFlags(", body,
+                          f"{signature} no longer records who wrote the flags")
+
+    def test_every_producer_names_itself(self) -> None:
+        for writer, signature in (
+                ("K64_WRITER_MMAP_ANON", "U64 KMemory64::mmapAnonymousFixed("),
+                ("K64_WRITER_MMAP_FILE", "U64 KMemory64::mmapSharedFile("),
+                ("K64_WRITER_MPROTECT", "U64 KMemory64::mprotect("),
+                ("K64_WRITER_MUNMAP", "U64 KMemory64::munmap(")):
+            self.assertIn(writer, function_body(self.source, signature))
+
+
+class AHostPageCarriesTheUnionOfItsGuestPages(unittest.TestCase):
+    """The consuming rule, in both directions. The host protection of a 16 KiB
+    page is the union of what its four guest pages hold -- recomputed per host
+    page, never a single value spread across an interval."""
+
+    def setUp(self) -> None:
+        self.source = read(KMEMORY_SOURCE)
+
+    def test_no_producer_computes_a_host_protection_of_its_own(self) -> None:
+        # The old mprotect took the union of the FIRST and LAST host page's
+        # neighbours and applied that one value to every host page between
+        # them, and mmapSharedFile applied `prot | 0x3` the same way. Both are
+        # gone: nativeReconcileHostProt is the only caller of ::mprotect on a
+        # guest-lane host page outside the fault repair.
+        for signature in ("U64 KMemory64::mprotect(",
+                          "U64 KMemory64::mmapSharedFile(",
+                          "U64 KMemory64::munmap(",
+                          "U64 KMemory64::mmapAnonymousFixed("):
+            body = function_body(self.source, signature)
+            self.assertNotIn("::mprotect((void*)", body,
+                             f"{signature} still sets a host protection itself")
+            self.assertIn("nativeReconcileHostProt(", body)
+
+    def test_the_reconciliation_walks_one_host_page_at_a_time(self) -> None:
+        body = function_body(
+            self.source, "void KMemory64::nativeReconcileHostProt(")
+        self.assertIn("for (U64 host = hostStart; host < hostEnd; host += hostPage)",
+                      body)
+        self.assertIn("nativeHostPageProtLocked(host, hostPage,", body)
+
+    def test_an_untracked_host_page_is_skipped_and_never_fails_the_call(self) -> None:
+        # This is the defect that cleared a committed page's rights: mprotect
+        # asked nativeRangeCovers about the whole HOST-rounded interval and
+        # returned -EINVAL for the entire request when an edge host page was
+        # untracked, so the guest pages it named kept the flags of the
+        # reservation they were being committed out of.
+        mprotect = function_body(self.source, "U64 KMemory64::mprotect(")
+        self.assertNotIn("nativeRangeCovers(hostStart, hostEnd)", mprotect)
+        reconcile = function_body(
+            self.source, "void KMemory64::nativeReconcileHostProt(")
+        self.assertIn("!nativeRangeCovers(host, host + hostPage)", reconcile)
+        self.assertIn("continue;", reconcile)
+
+    def test_the_page_map_is_written_before_the_host_is_reconciled(self) -> None:
+        # The reconciliation reads the map, so it has to run after the write or
+        # it would restore the protection the request just changed.
+        mprotect = function_body(self.source, "U64 KMemory64::mprotect(")
+        write = mprotect.index("K64_WRITER_MPROTECT")
+        reconcile = mprotect.index("nativeReconcileHostProt(reconcileStart")
+        self.assertLess(write, reconcile)
+
+    def test_a_guard_page_that_owns_its_host_page_is_representable(self) -> None:
+        # Wine uses PROT_NONE guard pages deliberately. The union is 0 when all
+        # four guest subpages grant nothing, and k64NativeProt(0) is PROT_NONE,
+        # so such a host page genuinely faults. A guard page that SHARES a host
+        # page with an accessible neighbour cannot be enforced at 16 KiB
+        # granularity, and the union is the side to err on: revoking the
+        # neighbour would kill a page the guest is entitled to.
+        reconcile = function_body(
+            self.source, "void KMemory64::nativeReconcileHostProt(")
+        self.assertIn("k64NativeProt(runProt)", reconcile)
+        native_prot = function_body(self.source, "static int k64NativeProt(")
+        self.assertIn("int result = 0;", native_prot)
+        union = function_body(
+            self.source, "U32 KMemory64::nativeHostPageProtLocked(")
+        self.assertIn("U32 unionProt = 0;", union)
+        # Nothing may raise a page that grants nothing, except a pinned buffer
+        # whose host pointer a blocked futex waiter still holds.
+        self.assertIn("if (it->second->flags & K64_PAGE_PINNED) unionProt |= 0x3u;",
+                      union)
+
+    def test_an_executable_page_stays_host_readable(self) -> None:
+        # K64_PAGE_EXEC is guest metadata, but the translator reads the bytes
+        # of a page the guest may execute. Without the read term, an
+        # execute-only guest page whose host page nothing else claims would
+        # become PROT_NONE now that the union can lower a protection, and the
+        # decoder would fault on its own instruction fetch.
+        union = function_body(
+            self.source, "U32 KMemory64::nativeHostPageProtLocked(")
+        self.assertIn("if (it->second->flags & K64_PAGE_EXEC) unionProt |= 0x1u;",
+                      union)
+
+    def test_the_ledger_is_only_rewritten_for_the_named_interval(self) -> None:
+        # `range.prot = ...` over every entry that merely OVERLAPPED the
+        # interval rewrote the recorded protection of host pages the request
+        # never named.
+        self.assertNotIn("range.prot = ", self.source)
+        track = function_body(
+            self.source, "void KMemory64::nativeTrackRangeLocked(")
+        self.assertIn("nativeForgetRange(start, length);", track)
+        self.assertIn("nativeRanges.emplace(mergedStart,", track)
+
+    def test_the_mapping_path_leaves_the_protection_to_the_reconciliation(self) -> None:
+        # nativeMapAnonymous could only choose from plan.exactHostCover, a
+        # property of the WHOLE interval: a request whose length was not a
+        # multiple of the host page left every host page in it read/write, so a
+        # PROT_NONE reservation was PROT_NONE nowhere.
+        body = function_body(self.source, "bool KMemory64::nativeMapAnonymous(")
+        self.assertNotIn("const int finalProt", body)
+        self.assertNotIn("plan.exactHostCover ?", body)
+        self.assertIn("nativeTrackRangeLocked(hostStart, hostLength, 0x3u)",
+                      body)
+        anon = function_body(self.source, "U64 KMemory64::mmapAnonymousFixed(")
+        self.assertIn("nativeReconcileHostProt(", anon)
+
+
+class ThePageRemembersWhoWroteItsRights(unittest.TestCase):
+    """The witness the next device log needs: which operation last wrote the
+    faulting guest page's flags, and what it wrote."""
+
+    def setUp(self) -> None:
+        self.header = read(KMEMORY_HEADER)
+        self.source = read(KMEMORY_SOURCE)
+        self.adapter = read(ADAPTER)
+
+    def test_the_record_is_four_bytes_and_lives_on_the_page(self) -> None:
+        struct = self.header.split("struct K64Page {", 1)[1].split("\n};", 1)[0]
+        for field in ("U8  lastWriter", "U8  lastFlags", "U16 lastWriteStamp"):
+            self.assertIn(field, struct)
+
+    def test_every_operation_that_can_write_flags_has_a_name(self) -> None:
+        for writer in ("K64_WRITER_NONE", "K64_WRITER_MMAP_ANON",
+                       "K64_WRITER_MMAP_FILE", "K64_WRITER_MPROTECT",
+                       "K64_WRITER_MUNMAP", "K64_WRITER_COMMIT",
+                       "K64_WRITER_PIN", "K64_WRITER_CLONE"):
+            self.assertIn(writer, self.header)
+        names = function_body(self.source, "const char* k64PageWriterName(")
+        for name in ("mmap-anon", "mmap-file", "mprotect", "munmap", "commit",
+                     "pin", "clone", "none"):
+            self.assertIn(f'"{name}"', names)
+
+    def test_the_report_carries_the_faulting_page_and_a_neighbour(self) -> None:
+        struct = self.header.split("struct K64NativeFaultRepair {", 1)[1]
+        struct = struct.split("};", 1)[0]
+        for field in ("lastWriter", "lastWriteFlags", "lastWriteStamp",
+                      "neighbourWriter", "neighbourWriteFlags",
+                      "neighbourWriteStamp"):
+            self.assertIn(field, struct)
+
+    def test_the_refusal_path_fills_them_in(self) -> None:
+        # The case they exist for is the refusal, so they must be recorded
+        # before nativeRepairHostFault returns false.
+        body = function_body(
+            self.source, "bool KMemory64::nativeRepairHostFault(")
+        record = body.index("report.lastWriter = k64PageWriterName(")
+        refusal = body.index('report.decision = "guest-protected"')
+        self.assertLess(record, refusal)
+
+    def test_the_witness_prints_them_and_is_still_bounded(self) -> None:
+        line = self.adapter.split(WITNESS, 1)[1].split(");", 1)[0]
+        for field in ("last_op=%s", "last_flags=0x%x", "last_seq=%u",
+                      "nb_op=%s", "nb_flags=0x%x", "nb_seq=%u"):
+            self.assertIn(field, line)
+        body = self.adapter.split(
+            "static bool repairGuestLaneHostFault(", 1)[1]
+        self.assertIn("gAliasBackingReports.fetch_add(1, std::memory_order_relaxed) < 64",
+                      body)
+
+    def test_the_volume_of_the_new_host_witness_is_bounded_too(self) -> None:
+        reconcile = function_body(
+            self.source, "void KMemory64::nativeReconcileHostProt(")
+        self.assertIn("BOXEDWINE_X64_HOST_REPROTECT", reconcile)
+        self.assertIn("reprotectFailures.fetch_add(std::memory_order_relaxed"
+                      .replace("std::memory_order_relaxed",
+                               "1, std::memory_order_relaxed"),
+                      reconcile)
+        self.assertIn("16)", reconcile)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,29 @@ backwards wastes a device run, so it is pinned below:
     three of those things. The corrections to it are real but they are NOT what
     the device is running, and no contract below claims otherwise.
 
+A LATER RUN, SAME TABLE. A device capture then showed a 32-bit Direct3D 9
+program reaching vkAcquireNextImageKHR and stopping, with all four threads of
+its process parked:
+
+    BOXEDWINE_FUTEX_SNAPSHOT pid=000A tid=000B guest=7A54494040 expected=0
+        actual=0 waiting=1 wake=0 private=1 age=31706ms deadline=none
+        wake_attempts=0 last_wake=none
+
+Four words eight bytes apart in one page of Wine's 64-bit arena, each waited on
+by one thread with no timeout, is Wine's thread-alert mechanism: ntdll's
+tid_alert_blocks, one `union tid_alert_entry` per Windows thread, waited on by
+NtWaitForAlertByThreadId and woken by NtAlertThreadByThreadId, which sets the
+word to 1 and only then wakes it. The stall dumps agree exactly -- rax=0xca
+(futex), rsi=0x80 (FUTEX_WAIT|FUTEX_PRIVATE_FLAG), rdx=0 (expect zero), r10=0
+(no timeout), rdi = the word.
+
+The word still reading 0 says the exchange never happened, so no alert was ever
+sent. But wake_attempts=0 could not carry that conclusion on its own: this
+table counted a wake only in the 64-bit lane, and it says nothing whatever
+about a wake that named a word it holds no waiter for. Those are opposite
+faults -- one above this layer, one inside it -- and the last four classes in
+this file pin the witnesses that separate them.
+
 Source-level contracts on purpose: building the emulator needs the iOS
 toolchain, and there is no host compiler here.
 """
@@ -52,6 +75,8 @@ FEX_BACKEND = REPO / "ios" / "runtime" / "src" / "BVNFEXBackend.mm"
 KMEMORY64_H = REPO / "include" / "kmemory64.h"
 MT_PLATFORM = (REPO / "source" / "emulation" / "cpu" / "normal" /
                "normalPlatformMultiThreaded.cpp")
+KTHREAD_H = REPO / "include" / "kthread.h"
+KPROCESS = REPO / "source" / "kernel" / "kprocess.cpp"
 
 
 def read(path: Path) -> str:
@@ -88,6 +113,25 @@ def cooperative_half(source: str) -> str:
 def wake_helper(source: str) -> str:
     """The body of wakeFutexes64, which sits above KThread::futex64."""
     start = source.index("static U32 wakeFutexes64(")
+    return source[start:source.index("\n}", start)]
+
+
+def thirty_two_bit_wake(source: str) -> str:
+    """The WAKE branch of the 32-bit KThread::futex."""
+    start = source.index(
+        "    } else if (cmd ==FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {")
+    return source[start:source.index("        return count;", start)]
+
+
+def wake_recorder(source: str) -> str:
+    """The body of recordFutexWake."""
+    start = source.index("static void recordFutexWake(")
+    return source[start:source.index("\n}", start)]
+
+
+def wake_trace_dump(source: str) -> str:
+    """The body of logFutexWakeTrace."""
+    start = source.index("static void logFutexWakeTrace(")
     return source[start:source.index("\n}", start)]
 
 
@@ -468,6 +512,186 @@ class TheSnapshotRunsWhenAThreadStalls(unittest.TestCase):
         resume = self.source.index("const kern_return_t resumeResult = thread_resume(")
         snapshot = self.source.index("KThread::logFutexSnapshot();")
         self.assertLess(resume, snapshot)
+
+
+class EveryWakeTheGuestIssuesIsRecorded(unittest.TestCase):
+    """The witness that separates "the guest woke nobody" from "the guest woke
+    somebody else".
+
+    A wake that finds no waiter writes nothing anywhere: it walks the table,
+    matches nothing and returns zero, which is also what an ordinary wake of an
+    already-running thread does. So a run in which every waiter reports
+    wake_attempts=0 is equally consistent with a guest that has stopped issuing
+    wakes and with a guest whose wakes all land on addresses this table
+    resolves differently -- and those have opposite causes.
+    """
+
+    def setUp(self) -> None:
+        self.source = read(KTHREAD)
+
+    def test_the_ring_and_its_dump_budget_are_bounded(self) -> None:
+        self.assertIn("#define FUTEX_WAKE_TRACE_ENTRIES\t32", self.source)
+        self.assertIn("#define FUTEX_WAKE_TRACE_DUMPS\t4", self.source)
+        dump = wake_trace_dump(self.source)
+        self.assertIn("if (systemFutexWakeDumps >= FUTEX_WAKE_TRACE_DUMPS) {",
+                      dump)
+        self.assertIn("systemFutexWakeDumps++;", dump)
+
+    def test_the_trace_line_names_the_word_and_what_became_of_it(self) -> None:
+        dump = wake_trace_dump(self.source)
+        self.assertIn("BOXEDWINE_FUTEX_WAKE_TRACE", dump)
+        for field in ("pid=%04X", "tid=%04X", "guest=%llX", "op=%u",
+                      "private=%u", "requested=%u", "matched=%u", "woken=%u",
+                      "age=%ums"):
+            self.assertIn(field, dump, f"the wake trace omits {field}")
+
+    def test_a_wake_that_matched_nobody_is_still_recorded(self) -> None:
+        # The whole point: the interesting wake is the one that woke nobody.
+        body = wake_helper(self.source)
+        recorded = body.index("recordFutexWake(waker, true, isPrivate,")
+        self.assertLess(recorded, body.index("    return woken;"))
+        recorder = wake_recorder(self.source)
+        self.assertIn("if (!woken) {", recorder)
+        self.assertIn("systemFutexWakeNobodyCount++;", recorder)
+
+    def test_both_lanes_record_into_the_same_ring(self) -> None:
+        self.assertIn("recordFutexWake(waker, true, isPrivate,",
+                      wake_helper(self.source))
+        self.assertIn("recordFutexWake(this, false, isPrivate, addr, cmd,",
+                      thirty_two_bit_wake(self.source))
+
+    def test_the_snapshot_prints_the_totals_next_to_the_waiters(self) -> None:
+        start = self.source.index("void KThread::logFutexSnapshot() {")
+        body = self.source[start:self.source.index("\n}", start)]
+        self.assertIn("logFutexWakeTrace(now);", body)
+        dump = wake_trace_dump(self.source)
+        # A run with no wake at all has to say so in words: an absent trace
+        # section would read as a missing feature, not as a silent guest.
+        self.assertIn("the guest has issued no FUTEX_WAKE", dump)
+        self.assertIn("%llu wake(s), %llu woke nobody, last ", dump)
+
+    def test_the_ring_is_written_under_the_lock_wakes_already_hold(self) -> None:
+        # No new lock, and no lock ordering to get wrong: both wake paths and
+        # the snapshot already hold systemFutexesMutex.
+        self.assertIn("// Caller holds systemFutexesMutex.", self.source)
+        self.assertIn("SystemFutexesLock futexesLock;",
+                      thirty_two_bit_wake(self.source))
+        self.assertIn("SystemFutexesLock futexesLock;",
+                      wake_helper(self.source))
+
+
+class BothLanesAccountForAWakeTheySkip(unittest.TestCase):
+    """wake_attempts is the field the diagnosis rests on, and the 32-bit lane
+    did not maintain it: a snapshot line reading zero meant "no 64-bit wake
+    named this word", which is not the same claim at all."""
+
+    def setUp(self) -> None:
+        self.body = thirty_two_bit_wake(read(KTHREAD))
+
+    def test_the_thirty_two_bit_lane_counts_the_attempt(self) -> None:
+        self.assertIn("f->wakeAttempts++;", self.body)
+
+    def test_it_records_why_a_waiter_was_skipped(self) -> None:
+        for outcome in ('"count-exhausted"', '"already-woken"',
+                        '"not-parked-yet"', '"mask-miss"', '"woken"'):
+            self.assertIn(outcome, self.body)
+
+    def test_it_walks_the_whole_table(self) -> None:
+        # Breaking out at the wake budget skips the waiters that would have
+        # been named, which is exactly the evidence a starving waiter needs.
+        self.assertNotIn("if (count >= value) {\n                    break;",
+                         self.body)
+        self.assertIn(
+            'if (count >= value) {\n                    '
+            'f->lastWakeOutcome = "count-exhausted";', self.body)
+
+
+class AWakeThatCannotResolveItsWordSaysSo(unittest.TestCase):
+    """Wine's futex_wake_one and glibc's lll_futex_wake both discard the
+    syscall's return value, so an error on the wake side is invisible to the
+    guest AND, until now, to the log."""
+
+    def setUp(self) -> None:
+        self.body = futex64_body(read(KTHREAD))
+
+    def test_the_command_is_known_before_the_word_is_resolved(self) -> None:
+        command = self.body.index("const U32 command = op & FUTEX_CMD_MASK;")
+        ram = self.body.index(
+            "U8* ram = guestMemory->getRamPtr(addr, sizeof(U32));")
+        self.assertLess(command, ram)
+
+    def test_the_fault_is_reported_before_it_is_returned(self) -> None:
+        fault = self.body.index("        return -K_EFAULT;")
+        report = self.body.index(
+            "reportUnservedFutex64(this, command, addr, value,")
+        self.assertLess(report, fault)
+
+
+class AServerRequestWithNoReplyIsNamed(unittest.TestCase):
+    """The other half of the log's ambiguity. Every other process in the
+    capture sat in KUnixSocketObject::lockCond, which is what a healthy Wine
+    process does all day AND what a client whose server stopped answering does
+    forever."""
+
+    def test_the_thread_carries_the_request_it_is_waiting_on(self) -> None:
+        header = read(KTHREAD_H)
+        for field in ("std::atomic<U32> diagnosticSocketReadFd{0};",
+                      "std::atomic<U32> diagnosticSocketReadStartMillies{0};",
+                      "std::atomic<U32> diagnosticSocketWriteFd{0};",
+                      "std::atomic<U32> diagnosticSocketWriteCode{0};",
+                      "std::atomic<U32> diagnosticSocketWriteBytes{0};",
+                      "std::atomic<U32> diagnosticSocketWriteMillies{0};"):
+            self.assertIn(field, header)
+
+    def test_the_read_that_blocks_is_the_window_that_is_marked(self) -> None:
+        source = read(SYSCALL64)
+        start = source.index(
+            "            // Socket/pipe: a short read is correct")
+        window = source[start:source.index("\n        }", start)]
+        self.assertIn("diagnosticSocketReadStartMillies.store(", window)
+        self.assertIn("diagnosticSocketReadFd.store(", window)
+        self.assertIn("readNative(tmp.data(), (U32)count);", window)
+        # Cleared on the way out, or every thread that ever read a socket would
+        # look like it is still waiting on one.
+        self.assertIn("diagnosticSocketReadFd.store(\n                0,",
+                      window)
+
+    def test_the_request_is_decoded_by_the_existing_helper(self) -> None:
+        source = read(SYSCALL64)
+        self.assertIn("if (fdesc->kobject->type == KTYPE_UNIX_SOCKET) {",
+                      source)
+        self.assertIn("boxedvn::wineServerRequestOpcode(buffer.data(), count);",
+                      source)
+        self.assertIn("cpu->thread->diagnosticSocketWriteCode.store(", source)
+
+    def test_the_snapshot_names_the_stalled_exchange(self) -> None:
+        source = read(KPROCESS)
+        self.assertIn("BOXEDWINE_SERVER_WAIT", source)
+        for field in ("read_fd=%u", "waiting=%ums", "request=%u",
+                      "request_fd=%d", "request_bytes=%u", "sent=%ums ago"):
+            self.assertIn(field, source, f"the server witness omits {field}")
+
+
+class AThreadExitNamesTheThread(unittest.TestCase):
+    """A plain exit ends ONE thread. The capture showed a process whose four
+    surviving threads were all parked on alert words owed a wake and a fifth
+    thread leaving through the exit syscall, and which thread that was could
+    only be established by elimination -- from a gap in the alert block's
+    stride. A thread that exits owing a wake is precisely the shape a starving
+    waiter has, so the marker names it."""
+
+    def setUp(self) -> None:
+        self.source = read(SYSCALL64)
+
+    def test_the_exit_marker_carries_the_thread(self) -> None:
+        self.assertIn("\"group=%d exe='%s' tid=%04X\"", self.source)
+        self.assertIn("group ? 1 : 0, p->exe.c_str(), cpu->thread->id);",
+                      self.source)
+
+    def test_the_lifecycle_marker_prefix_is_unchanged(self) -> None:
+        # scripts/test-fex-exit-dispatch-contract.py requires this literal.
+        self.assertIn("BOXEDWINE_X64_PROC_EXIT pid=%u parent=%u status=%lld ",
+                      self.source)
 
 
 if __name__ == "__main__":

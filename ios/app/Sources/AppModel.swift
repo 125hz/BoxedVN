@@ -650,7 +650,25 @@ final class AppModel: ObservableObject {
         static let environment = [
             // winedevice and the mount manager trace why the 64-bit
             // desktop's drive links never appear; both are quiet at boot.
-            "WINEDEBUG=warn+module,warn+seh,+winedevice,+mountmgr",
+            //
+            // msgbox is the one channel that carries text this platform
+            // cannot see any other way. A program that refuses to start
+            // paints its reason into a window, and Wine rasterises that text
+            // in-process and hands the X server pixels, so the server has no
+            // string to log; the caption reaches it as WM_NAME and is
+            // recorded (include/guest_dialog_trace.h), but the body does not.
+            // Wine's own user32 message box writes the body to this channel
+            // and to nothing else. It is one line per message box, so the
+            // volume is the number of times a program stops to talk.
+            //
+            // Whether any of this arrives is a separate question and an open
+            // one: three 64-bit captures contain no Wine debug output at all,
+            // not even the err and fixme classes that are on by default,
+            // while 32-bit captures of the same build are full of them.
+            // sys_execve64 now prints WINEDEBUG beside WINELOADER for every
+            // exec in the chain, so the next capture says whether the value
+            // below reached the process that was supposed to honour it.
+            "WINEDEBUG=warn+module,warn+seh,+winedevice,+mountmgr,+msgbox",
             "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
             // DXMT's own logging. It is not wined3d, so no WINEDEBUG channel
             // reaches it: `+d3d11` and `+dxgi` name Wine's implementations,
@@ -1054,19 +1072,25 @@ final class AppModel: ObservableObject {
     /// prefix.
     ///
     /// The explorer image is named by its full Windows path rather than as
-    /// the bare word `explorer`, and that decides which process FEX gets.
-    /// Exactly one process per session is translated - the one the launcher
-    /// starts - because a fork child cannot own a second identity mapping.
-    /// Wine's unix loader resolves argv[1] as a path first; a bare `explorer`
-    /// is no path, so it falls back to loading `start.exe` as the main image
-    /// and hands it `/exec explorer ...`. start.exe then CreateProcesses the
-    /// real desktop and waits, which put the translated process to sleep for
-    /// the whole session while explorer and winefile ran on the interpreter
-    /// (session 21:23:27: pid 10 idle at `state=waiting cpu=0.0%`, explorer
-    /// pid 39 and winefile pid 45 both `child_fex=0`). With the full path the
-    /// launched process is explorer itself, so the desktop - windows, GDI,
-    /// the DXMT presentation - is what the translator runs. The 32-bit lane
-    /// keeps the bare name: it has no per-process translator to place.
+    /// the bare word `explorer`, so the process the launcher starts is the
+    /// desktop itself. Wine's unix loader resolves argv[1] as a path first; a
+    /// bare `explorer` is no path, so it falls back to loading `start.exe` as
+    /// the main image and hands it `/exec explorer ...`, which leaves an
+    /// extra process asleep in the middle of the session for no purpose.
+    ///
+    /// The desktop shell does NOT get the translator. Exactly one process per
+    /// session can be translated, because only one can own the identity
+    /// mapping of the guest address space, and the shell is the wrong one to
+    /// give it to: it makes no Direct3D call all session, while every program
+    /// it starts is refused for want of native memory and dies at once (log
+    /// 2026-09-03, `BOXEDWINE_DXMT_RETURN ... reason=native-memory pid=45`,
+    /// then `status=0xC0000005`). The kernel therefore leaves the role unheld
+    /// for a launch whose command line names Wine's own infrastructure, and
+    /// the first top-level Windows program started from the desktop takes it
+    /// at its own exec - see `KProcess::execve`. The shell and the file
+    /// manager run on the interpreter, which is what they already did on the
+    /// 32-bit lane. The 32-bit lane keeps the bare name: it has no
+    /// per-process translator to place.
     func launchX64Desktop(_ container: WineContainer) {
         guard let rootFilesystem else {
             alertMessage = "No root filesystem is installed."

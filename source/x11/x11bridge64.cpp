@@ -41,6 +41,7 @@
 #include "kmemory64.h"
 #include "knativesystem.h"
 #include "x11_bridge64_policy.h"
+#include "guest_dialog_trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -225,6 +226,105 @@ void reportResult(const Call& call, const char* name, S64 result, U64 detail) {
     }
     klog_fmt("BOXEDWINE_X64_X11_BRIDGE pid=%u op=%s result=%lld window=0x%llx",
              call.pid, name, (long long)result, (unsigned long long)detail);
+}
+
+// ---- What a guest dialog says -----------------------------------------------
+//
+// See include/guest_dialog_trace.h for why the caption is all the server can
+// see and where the body text comes from instead. These three functions are
+// the whole of it: one that prints a bounded, de-duplicated line, one the
+// two property operations share, and one that names a window when it is
+// mapped so a caption set before the map is attached to something.
+
+void reportDialogText(const Call& call, U32 window, const char* propertyName,
+                      const U8* bytes, U32 length) {
+    char text[K_GUEST_DIALOG_TEXT_MAX + 1];
+    if (boxedvn::guestDialogSanitizeText(bytes, length, text, sizeof(text)) == 0) {
+        return;
+    }
+    // Wine re-sets a window's name on every caption change, and a program
+    // that repaints a status line does that continuously. The same text on
+    // the same property of the same window is worth exactly one line.
+    if (!firstTime(call.pid, std::string("dialog:") + propertyName + ":" +
+                                 std::to_string(window) + ":" + text)) {
+        return;
+    }
+    const boxedvn::GuestDialogTraceSlot slot = boxedvn::guestDialogTraceSlot();
+    if (slot == boxedvn::K_GUEST_DIALOG_TRACE_LAST) {
+        klog_fmt("BOXEDWINE_X64_GUEST_DIALOG budget=spent lines=%d",
+                 (int)K_GUEST_DIALOG_TRACE_BUDGET);
+        return;
+    }
+    if (slot != boxedvn::K_GUEST_DIALOG_TRACE_PRINT) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_GUEST_DIALOG pid=%u window=0x%x property=%s "
+             "text='%s'",
+             call.pid, window, propertyName, text);
+}
+
+// The one entry both XChangeProperty and XSetTextProperty reach. The atom is
+// resolved to its name here rather than compared as a number because
+// _NET_WM_NAME is interned per session.
+void noteWindowText(const Call& call, U32 window, U32 property, U32 format,
+                    const U8* bytes, U32 length) {
+    if (format != 8 || length == 0 || bytes == nullptr) {
+        return;
+    }
+    BString name;
+    if (!XServer::getServer()->getAtom(property, name)) {
+        return;
+    }
+    if (!boxedvn::guestDialogPropertyIsName(name.c_str())) {
+        return;
+    }
+    reportDialogText(call, window, name.c_str(), bytes, length);
+}
+
+void reportDialogWindow(const Call& call, const XWindowPtr& w) {
+    if (!w) {
+        return;
+    }
+    XPropertyPtr transient = w->getProperty(XA_WM_TRANSIENT_FOR);
+    const bool hasTransientFor = transient && transient->length >= 4 &&
+                                 transient->value != nullptr;
+    if (!boxedvn::guestDialogWindowIsInteresting(w->width(), w->height(),
+                                                 hasTransientFor,
+                                                 w->overrideRedirect())) {
+        return;
+    }
+    if (!firstTime(call.pid, std::string("dialog-map:") + std::to_string(w->id))) {
+        return;
+    }
+    const boxedvn::GuestDialogTraceSlot slot = boxedvn::guestDialogTraceSlot();
+    if (slot != boxedvn::K_GUEST_DIALOG_TRACE_PRINT) {
+        return;
+    }
+    // WM_NAME is the predefined atom Wine sets through XSetTextProperty and
+    // _NET_WM_NAME the interned one it sets through XChangeProperty; the
+    // server's own id for the second is a constant here (x11.h). Whichever
+    // arrived first is the caption.
+    XPropertyPtr name = w->getProperty(XA_WM_NAME);
+    if (!name || !name->length) {
+        name = w->getProperty(_NET_WM_NAME);
+    }
+    XPropertyPtr windowClass = w->getProperty(XA_WM_CLASS);
+    char title[K_GUEST_DIALOG_TEXT_MAX + 1];
+    char klass[K_GUEST_DIALOG_TEXT_MAX + 1];
+    boxedvn::guestDialogSanitizeText(name ? name->value : nullptr,
+                                     name ? name->length : 0,
+                                     title, sizeof(title));
+    boxedvn::guestDialogSanitizeText(windowClass ? windowClass->value : nullptr,
+                                     windowClass ? windowClass->length : 0,
+                                     klass, sizeof(klass));
+    U32 transientFor = 0;
+    if (hasTransientFor) {
+        memcpy(&transientFor, transient->value, sizeof(transientFor));
+    }
+    klog_fmt("BOXEDWINE_X64_GUEST_DIALOG pid=%u window=0x%x op=map "
+             "geometry=%d,%d %ux%u transient_for=0x%x class='%s' title='%s'",
+             call.pid, w->id, w->x(), w->y(), w->width(), w->height(),
+             transientFor, klass, title);
 }
 
 // ---- Display lookup ---------------------------------------------------------
@@ -1096,6 +1196,7 @@ S64 op_MAP_WINDOW(Call& call) {
     }
     const S64 result = server->mapWindow(data, w);
     reportResult(call, "map-window", result, w->id);
+    reportDialogWindow(call, w);
     return result;
 }
 
@@ -1379,6 +1480,7 @@ S64 op_CHANGE_PROPERTY(Call& call) {
         }
     }
     w->setProperty(property, type, format, (U32)bytes.size(), bytes.data(), true);
+    noteWindowText(call, w->id, property, format, bytes.data(), (U32)bytes.size());
     return Success;
 }
 
@@ -1593,6 +1695,7 @@ S64 op_SET_TEXT_PROPERTY(Call& call) {
         return BOXEDWINE_X64_X11_E_FAULT;
     }
     w->setProperty((U32)call.arg(3), encoding, format, (U32)bytes.size(), bytes.data(), true);
+    noteWindowText(call, w->id, (U32)call.arg(3), format, bytes.data(), (U32)bytes.size());
     return Success;
 }
 

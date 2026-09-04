@@ -180,6 +180,10 @@ void runThreadSlice(KThread* thread) {
         CPU64* cpu64 = thread->cpu64 ? thread->cpu64 : thread->process->cpu64;
         if (cpu64) {
             cpu64->yield = false;
+            // The cooperative scheduler has no FEX dispatch, so a handoff
+            // request here can only end this slice. Clear it so it does not
+            // shorten every later slice as well.
+            cpu64->backendHandoff = false;
             cpu64->deliverPendingSignals();
             try {
                 cpu64->runBounded(static_cast<U64>(contextTimeRemaining));

@@ -1302,6 +1302,225 @@ class SwapchainMaintenanceContract(unittest.TestCase):
                 self.assertIn("hostToGuestAddress", body)
 
 
+class SignallingPathContract(unittest.TestCase):
+    """Every command that accepts a synchronisation object the driver must
+    later signal, and the argument plumbing that carries it.
+
+    A device run reached vkQueueSubmit2 and vkAcquireNextImageKHR, both
+    status=0, and then every guest thread parked forever. The shape that would
+    explain that from inside this bridge is a handle accepted and never
+    signalled: a semaphore dropped on the way to the driver, a fence forwarded
+    in the wrong argument slot, a null that became a stale handle, a timeline
+    value truncated to 32 bits, or a timeout narrowed so a wait never ends.
+    These tests make each of those unrepresentable rather than merely absent.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+        self.shim = SHIM_SOURCE.read_text(encoding="utf-8")
+        self.pairs = chain_structs()
+
+    def case_body(self, name: str) -> str:
+        start = self.source.index(f"case VKB_{name}:")
+        rest = self.source[start + 1:]
+        end = re.search(r"^\s*case VKB_\w+:", rest, re.MULTILINE)
+        return rest[:end.start()] if end else rest
+
+    def packed_words(self) -> dict[str, int]:
+        """How many argument words the guest ICD packs for each command."""
+        packed: dict[str, int] = {}
+        for match in re.finditer(r"\bBW_([RVBA])\s*\(", self.shim):
+            start = match.end() - 1
+            depth = 0
+            fields = 1
+            end = start
+            for i in range(start, len(self.shim)):
+                char = self.shim[i]
+                if char in "([":
+                    depth += 1
+                elif char in ")]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+                elif char == "," and depth == 1:
+                    fields += 1
+            call = self.shim[match.start():end + 1]
+            name = re.match(r"BW_[RVBA]\s*\(\s*(\w+)", call).group(1)
+            words = fields - 1
+            if match.group(1) == "A":
+                words += 1  # BW_A appends the 64-bit result slot
+            packed[name] = words
+        return packed
+
+    def highest_index_read(self, name: str) -> int:
+        body = self.case_body(name)
+        indices = [int(n) for n in
+                   re.findall(r"\b(?:A|H|U32A|F32A)\((\d+)\)", body)]
+        return max(indices) + 1 if indices else 0
+
+    def test_no_dispatcher_case_reads_past_what_the_guest_packs(self) -> None:
+        # The general form of the plumbing bug, over the whole table rather
+        # than the handful of commands anyone thought to check. A case that
+        # reads A(n) beyond the packed count gets a zero -- which for a
+        # semaphore or fence argument is VK_NULL_HANDLE, i.e. an object the
+        # driver is never asked to signal, and a wait that never ends.
+        packed = self.packed_words()
+        commands = bridge_commands()
+        offenders = []
+        for name in sorted(packed):
+            if name not in commands:
+                continue  # the macro definition itself, not a call site
+            read = self.highest_index_read(name)
+            if read > packed[name]:
+                offenders.append(f"{name}: packs {packed[name]}, reads A({read - 1})")
+        self.assertEqual(offenders, [], "; ".join(offenders))
+
+    def test_the_argument_arity_check_actually_saw_the_table(self) -> None:
+        packed = self.packed_words()
+        commands = bridge_commands()
+        covered = [n for n in commands if n in packed]
+        self.assertGreaterEqual(len(covered), len(commands) - 2,
+                                "the shim scan missed commands, so the arity "
+                                "test above proves nothing")
+
+    def test_a_timeout_crosses_as_a_full_64_bit_value(self) -> None:
+        # A narrowed timeout is a plausible source of both failure modes: a
+        # wait that never ends and a wait that returns early. UINT64_MAX -- the
+        # value DXVK passes -- truncates to 32 bits as 0xffffffff, which is
+        # about four seconds rather than forever.
+        for command, slot in (("WaitForFences", 4), ("WaitSemaphores", 2),
+                              ("AcquireNextImageKHR", 2)):
+            with self.subTest(command=command):
+                body = self.case_body(command)
+                self.assertIn(f"(uint64_t)A({slot})", body,
+                              "the timeout must be taken as the whole "
+                              "argument word")
+                self.assertNotIn(f"U32A({slot})", body,
+                                 "a 32-bit read of the timeout slot narrows it")
+
+    def test_the_acquire_forwards_both_signal_objects_in_order(self) -> None:
+        # vkAcquireNextImageKHR signals a semaphore, a fence, or both, and
+        # either may be VK_NULL_HANDLE. A null must stay null: a driver treats
+        # "no semaphore" and "a semaphore" completely differently, and a
+        # swapped pair would signal the wrong kind of object.
+        body = self.case_body("AcquireNextImageKHR")
+        self.assertIn("(VkSemaphore)A(3), (VkFence)A(4)", body)
+        self.assertIn("(VkSwapchainKHR)A(1)", body)
+        self.assertIn("outRequired(A(5)", body)
+        # A cast of the raw argument word is what keeps a zero a null; nothing
+        # may substitute a remembered or defaulted handle.
+        self.assertNotIn("VK_NULL_HANDLE", body)
+
+    def test_every_queue_submission_forwards_its_fence(self) -> None:
+        # The fence is the only thing that tells the caller a submission
+        # finished. Dropping it is a wait that never ends.
+        for command in ("QueueSubmit", "QueueSubmit2"):
+            with self.subTest(command=command):
+                body = self.case_body(command)
+                self.assertIn("(VkFence)A(3)", body)
+                self.assertIn("U32A(1)", body)
+                self.assertIn("structArrayTyped", body)
+
+    def test_the_semaphore_arrays_are_marshalled_with_their_values(self) -> None:
+        # A timeline wait is a semaphore array and a VALUE array of the same
+        # length. Marshalling the handles and not the values is a wait on
+        # whatever the shadow happened to contain.
+        wait = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO:"):]
+        wait = wait[:wait.index("break;")]
+        self.assertIn("pSemaphores, info->semaphoreCount", wait)
+        self.assertIn("pValues, info->semaphoreCount", wait)
+        timeline = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO:"):]
+        timeline = timeline[:timeline.index("break;")]
+        self.assertIn("pWaitSemaphoreValues", timeline)
+        self.assertIn("pSignalSemaphoreValues", timeline)
+
+    def test_submit_info_2_marshals_all_three_arrays_by_their_own_type(self) -> None:
+        # Wait and signal are VkSemaphoreSubmitInfo (48 bytes, carrying a
+        # 64-bit value and a 64-bit stage mask); command buffers are a
+        # different, smaller structure. Using one element size for both would
+        # walk the wrong stride and hand the driver nonsense handles.
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_SUBMIT_INFO_2:"):]
+        body = body[:body.index("break;")]
+        self.assertEqual(body.count("structArrayTyped<VkSemaphoreSubmitInfo>"), 2)
+        self.assertEqual(
+            body.count("structArrayTyped<VkCommandBufferSubmitInfo>"), 1)
+        for member in ("pWaitSemaphoreInfos", "pCommandBufferInfos",
+                       "pSignalSemaphoreInfos"):
+            with self.subTest(member=member):
+                self.assertIn(f"info->{member} =", body)
+
+    def test_timeline_semaphore_creation_survives_the_chain(self) -> None:
+        # The type and the initial value live in a VkSemaphoreTypeCreateInfo on
+        # the pNext chain. If that node were dropped, the driver would make a
+        # BINARY semaphore while the program believed it had a timeline one --
+        # every later wait on a value would then be waiting for something that
+        # can never happen. The structure holds no pointer, so being in the
+        # table is sufficient: the byte copy carries initialValue.
+        listed = {stype for stype, _struct in self.pairs}
+        for stype in ("VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO",
+                      "VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO",
+                      "VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO",
+                      "VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO",
+                      "VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO"):
+            with self.subTest(stype=stype):
+                self.assertIn(stype, listed)
+        text = VULKAN_CORE.read_text(encoding="utf-8")
+        body = re.search(r"typedef struct VkSemaphoreTypeCreateInfo \{(.*?)\} "
+                         r"VkSemaphoreTypeCreateInfo;", text, re.S).group(1)
+        self.assertIn("initialValue", body)
+        pointers = [line for line in body.splitlines()
+                    if "*" in line and "pNext" not in line]
+        self.assertEqual(pointers, [],
+                         "VkSemaphoreTypeCreateInfo grew a pointer member, so "
+                         "the byte copy is no longer sufficient for it")
+
+    def test_the_counter_and_signal_paths_carry_the_full_value(self) -> None:
+        counter = self.case_body("GetSemaphoreCounterValue")
+        self.assertIn("outRequired(A(2), sizeof(uint64_t))", counter)
+        self.assertIn("(VkSemaphore)A(1)", counter)
+        signal = self.case_body("SignalSemaphore")
+        self.assertIn("m.chain(A(1), false)", signal)
+
+    def test_the_fence_paths_are_plumbed(self) -> None:
+        status = self.case_body("GetFenceStatus")
+        self.assertIn("(VkFence)A(1)", status)
+        for command in ("WaitForFences", "ResetFences"):
+            with self.subTest(command=command):
+                body = self.case_body(command)
+                self.assertIn("inArrayAt(\n            A(2), U32A(1), sizeof(VkFence))",
+                              body.replace("\r", ""))
+
+    def test_present_marshals_every_array_it_is_given(self) -> None:
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_PRESENT_INFO_KHR:"):]
+        body = body[:body.index("break;")]
+        for member in ("pWaitSemaphores", "pSwapchains", "pImageIndices",
+                       "pResults"):
+            with self.subTest(member=member):
+                self.assertIn(f"info->{member} =", body)
+
+    def test_the_acquire_and_present_witnesses_are_a_readable_pair(self) -> None:
+        # An acquire that succeeds and is never followed by a present is the
+        # shape of the hang. Both witnesses are unbudgeted so the pair survives
+        # any amount of other traffic, and both name the image index so a
+        # reader can tell whether the image the guest was handed is the image
+        # it presented.
+        self.assertIn("BOXEDWINE_X64_VULKAN_ACQUIRE", self.source)
+        acquire = self.case_body("AcquireNextImageKHR")
+        for field in ("swapchain=", "timeout=", "semaphore=", "fence=",
+                      "index=", "status="):
+            with self.subTest(field=field):
+                self.assertIn(field, acquire)
+        present = self.case_body("QueuePresentKHR")
+        for field in ("index=", "waits=", "status="):
+            with self.subTest(field=field):
+                self.assertIn(field, present)
+
+
 def core_commands() -> dict[str, str]:
     """Every command core Vulkan defines, mapped to the version that added it.
 
