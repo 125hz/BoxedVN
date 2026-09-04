@@ -599,6 +599,38 @@ std::vector<std::string> BVNBuildLaunchArguments(
                 argv.push_back("-x64modules");
                 argv.push_back(modules);
             }
+            // The 32-bit half of the same decision, and the one thing a
+            // launch that opens the desktop cannot decide for itself.
+            //
+            // A caller that names one program knows its PE header and asks
+            // for DXVK's d3d9 only when that program is i386. A caller that
+            // opens the desktop names no program at all: the user picks it
+            // afterwards in the file manager, and it may be either width. So
+            // this lane has to carry both renderers, or a 32-bit program
+            // started from the desktop reaches wined3d - which needs OpenGL
+            // or Vulkan, has neither here, and returns E_FAIL into a message
+            // box - while the same program started from the app's own menu
+            // reaches DXVK and runs.
+            //
+            // Carrying it costs a 64-bit program nothing. The projection
+            // writes into the prefix's syswow64 only (startupArgs.cpp,
+            // projectX64WineDxvkD3d9), which no 64-bit image loads from, and
+            // it reports and returns when the DXVK tree is not staged. A
+            // caller that set the variable itself still wins, so a
+            // deliberate "Wine's own d3d9" is still expressible.
+            const std::string wow64D3d9Key =
+                std::string(K_X64_WOW64_D3D9_ENV) + "=";
+            bool callerSetWow64D3d9 = false;
+            for (const std::string& entry : launch.environment) {
+                if (entry.rfind(wow64D3d9Key, 0) == 0) {
+                    callerSetWow64D3d9 = true;
+                    break;
+                }
+            }
+            if (!callerSetWow64D3d9) {
+                argv.push_back("-env");
+                argv.push_back(wow64D3d9Key + K_X64_WOW64_D3D9_DXVK);
+            }
         }
     }
     for (const std::string& entry : launch.environment) {

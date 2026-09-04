@@ -292,8 +292,14 @@ namespace {
 // owner's guest registers and stack hold host addresses inside those windows,
 // its translated blocks have those addresses compiled in, and there is no way
 // to move a running address space out from under them. So the rule here is
-// take-when-free, and the role is freed by exactly one event, the destruction
-// of the owning KProcess (which is where ~KMemory64 unmaps the windows).
+// take-when-free.
+//
+// Free means the windows are unmapped, which is ~KMemory64. That is reached
+// from two places, and it took a device log to learn that the second one was
+// needed: KProcess::deleteThread, when the last thread of the owner is gone
+// -- the normal case, and the one that covers a program that exits, crashes,
+// is killed, or leaves a zombie nobody reaps -- and ~KProcess, which is now
+// only the backstop for an owner destroyed without that path ever running.
 BOXEDWINE_MUTEX gTranslatorRoleMutex;
 const KProcess* gTranslatorRoleOwner = nullptr;
 U32 gTranslatorRoleOwnerId = 0;
@@ -324,6 +330,130 @@ bool translatorRoleRelease(const KProcess* process) {
     gTranslatorRoleOwner = nullptr;
     gTranslatorRoleOwnerId = 0;
     return true;
+}
+
+bool translatorRoleHeldBy(const KProcess* process) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(gTranslatorRoleMutex);
+    return process != nullptr && gTranslatorRoleOwner == process;
+}
+
+// Destroy the translated address space of a process that can never run
+// again, and release the role in the same breath.
+//
+// The release used to live only in ~KProcess, which is a later moment than
+// it reads as. exit_group does not destroy a KProcess: it kills the threads,
+// runs cleanupProcess and leaves the object in KSystem::processes as a
+// zombie for waitpid to collect, and a zombie's KMemory64 is still mapped.
+// So the identity windows -- and the role with them -- outlived the program
+// that owned them, for as long as nobody reaped it. The 2026-09-03 23:01
+// desktop capture is that defect in full: pid 45 claimed the role and
+// exited, and the two double-clicks after it were both refused with
+// role-held-by-live-owner while no thread of pid 45 existed.
+//
+// This is the correct instant instead, and it is safe for the same reason
+// execve's claim is: no thread of the process survives, so no guest
+// register, no stack slot and no translated block can name an address inside
+// the windows again. It covers every ending, because every ending funnels
+// through exitgroup -- a clean exit, a fatal signal turned into an exit by
+// kfatalProcessExit64, a kill from another process, and the zombie any of
+// them leaves behind.
+//
+// The unmap happens inside the role mutex on purpose. Releasing first would
+// leave a window in which another process could be told the role is free
+// while the host windows were still mapped, and MAP_FIXED would then map the
+// new owner's pages over the dead one's without a word.
+void releaseTranslatedAddressSpaceOfDeadProcess(KProcess* process,
+                                                const char* reason) {
+    if (!process) {
+        return;
+    }
+    // Asked before the role mutex is taken: getThreadCount takes threadsMutex
+    // and nothing takes those two in the other order. A process with no
+    // threads here is either terminated, in which case it gains none, or is
+    // not the owner and is refused below anyway.
+    if (process->getThreadCount() != 0) {
+        return;
+    }
+    bool released = false;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(gTranslatorRoleMutex);
+        if (gTranslatorRoleOwner != process) {
+            return;
+        }
+        CPU64* deadCpu = process->cpu64;
+        process->cpu64 = nullptr;
+        delete deadCpu;
+        // ~KMemory64 is what unmaps the windows.
+        KMemory64* deadMemory = process->memory64;
+        process->memory64 = nullptr;
+        delete deadMemory;
+        gTranslatorRoleOwner = nullptr;
+        gTranslatorRoleOwnerId = 0;
+        released = true;
+    }
+    if (released) {
+        klog_fmt("BOXEDWINE_X64_TRANSLATOR_ROLE pid=%u action=release "
+                 "holder=%u moved=1 reason=%s",
+                 process->id, process->id, reason);
+    }
+}
+
+// The one transfer from a holder that is not this process which can be
+// proven safe: the holder has already exited and only its zombie is left.
+//
+// Design A in docs/PLAN_DESKTOP_LAUNCH_UNDER_FEX64.md wanted more than this
+// -- taking the role from an owner that is merely idle, so a launcher could
+// hand it to the program it starts. That remains impossible for the reason
+// recorded above translatorRoleTryTake: an idle owner is a live owner, its
+// registers and its compiled blocks still hold host addresses inside the
+// windows, and it resumes into them. "Has exited" is the whole of the safe
+// subset, and it is decided here rather than assumed, from the two facts
+// that make it true: the process is terminated and no thread of it survives.
+bool reclaimTranslatorRoleFromExitedHolder(U32 holderId) {
+    if (!holderId) {
+        return false;
+    }
+    KProcessPtr holder = KSystem::getProcess(holderId);
+    if (!holder) {
+        // Already collected. Its destructor either has released the role or
+        // is about to; there is nothing here to tear down either way.
+        return false;
+    }
+    if (!translatorRoleHeldBy(holder.get())) {
+        return false;
+    }
+    if (!holder->isTerminated() || holder->getThreadCount() != 0) {
+        return false;
+    }
+    releaseTranslatedAddressSpaceOfDeadProcess(holder.get(),
+                                               "holder-exited-uncollected");
+    return translatorRoleHolderId() == 0;
+}
+
+// How the process blocking this claim is related to the process making it.
+// A launcher chain reads as holder_rel=ancestor, which is the shape design A
+// was written for; two unrelated programs read as holder_rel=unrelated. The
+// walk is bounded because a broken parent chain must not hang an exec.
+const char* translatorRoleHolderRelation(U32 holderId,
+                                         const KProcess* claimer) {
+    if (!holderId || !claimer) {
+        return "none";
+    }
+    if (holderId == claimer->id) {
+        return "self";
+    }
+    U32 walk = claimer->parentId;
+    for (int hops = 0; hops < 32 && walk > 1; ++hops) {
+        if (walk == holderId) {
+            return "ancestor";
+        }
+        KProcessPtr parent = KSystem::getProcess(walk);
+        if (!parent) {
+            return "unknown";
+        }
+        walk = parent->parentId;
+    }
+    return "unrelated";
 }
 
 // Wine's own infrastructure, spelled the way KProcess::execve already spells
@@ -520,12 +650,15 @@ KProcess::~KProcess() {
     delete memory64;
     memory64 = nullptr;
 #if defined(BOXEDWINE_FEX64_BACKEND)
-    // ~KMemory64 has just unmapped the identity windows, so this is the exact
-    // instant the translated role becomes available to another process --
-    // which is why the release is tied to the address space's destruction
-    // rather than to the process's exit status. A holder whose KProcess is
-    // never destroyed keeps the role, and keeps the mapping with it; that is
-    // correct, and the refusal it causes says role-held-by-live-owner.
+    // ~KMemory64 has just unmapped the identity windows, so this is an
+    // instant at which the translated role becomes available -- but not
+    // normally the first one. deleteThread reaches this teardown as soon as
+    // the owner's last thread is gone, which is what a program started from
+    // the desktop actually needs: exit_group leaves the KProcess alive as a
+    // zombie until waitpid collects it, and the role must not wait for that.
+    // This release is therefore the backstop, and a session in which it is
+    // the line that fires is a session where an owner was destroyed without
+    // its last thread passing through deleteThread.
     if (translatorRoleRelease(this)) {
         klog_fmt("BOXEDWINE_X64_TRANSLATOR_ROLE pid=%u action=release "
                  "holder=%u moved=1 reason=owner-address-space-destroyed",
@@ -729,6 +862,21 @@ void KProcess::deleteThread(KThread* thread) {
         cleanupProcess();
     }
     delete thread;
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_FEX64_BACKEND)
+    // After `delete thread`, never before: ~KThread writes the guest's
+    // clear_child_tid through this process's KMemory64 and futex-wakes the
+    // joiner, and it declines to delete a CPU64 that is still the process's
+    // own. Both would be reading freed memory the other way round.
+    //
+    // This is the last moment at which any thread of this process could have
+    // executed a guest instruction, which is what makes releasing the
+    // identity windows here safe. It is also the only moment that catches a
+    // terminated process: exitgroup leaves a zombie behind for waitpid, and
+    // waiting for ~KProcess meant the role stayed held until somebody
+    // collected it -- which for a program started from the desktop nobody
+    // reliably does.
+    releaseTranslatedAddressSpaceOfDeadProcess(this, "owner-last-thread-gone");
+#endif
     // don't call into getProcess while holding threadsCondition
     if (!this->terminated && this->getThreadCount() == 0) {
         KProcessPtr parent = KSystem::getProcess(this->parentId);
@@ -1909,15 +2057,36 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         const bool wantsRole = !this->systemProcess &&
                                !argsNameWineInfrastructure(args) &&
                                argsNameTopLevelWindowsProgram(args);
+        // A holder that has already exited is not a live owner, however the
+        // process table still lists it: exit_group leaves a zombie whose
+        // KMemory64 keeps the identity windows mapped until waitpid collects
+        // it. Tear that down here so this exec sees the role for what it is,
+        // free. This is what makes a second double-click from the desktop
+        // work -- in the 2026-09-03 23:01 capture the first program had
+        // exited 120 lines before the second one asked, and the second was
+        // refused anyway.
+        const bool reclaimed =
+            wantsRole && holder != 0 && holder != this->id &&
+            reclaimTranslatorRoleFromExitedHolder(holder);
         if (wantsRole && translatorRoleTryTake(this)) {
             this->useFEX64 = true;
             claimedTranslatorRole = true;
         }
+        // Who is actually standing in the way, after the reclaim above had
+        // its chance, and how that process is related to this one. A
+        // launcher that is still running while the program it started execs
+        // is holder_rel=ancestor, and that line is the only evidence that
+        // says whether launcher chains matter in a real session.
+        const U32 blocking =
+            claimedTranslatorRole ? 0U : translatorRoleHolderId();
         klog_fmt("BOXEDWINE_X64_TRANSLATOR_ROLE pid=%u action=claim holder=%u "
-                 "moved=%u reason=%s",
+                 "moved=%u reclaimed=%u blocking=%u holder_rel=%s reason=%s",
                  this->id, holder, claimedTranslatorRole ? 1U : 0U,
+                 reclaimed ? 1U : 0U, blocking,
+                 translatorRoleHolderRelation(blocking, this),
                  claimedTranslatorRole
-                     ? "top-level-program-took-free-role"
+                     ? (reclaimed ? "top-level-program-took-reclaimed-role"
+                                  : "top-level-program-took-free-role")
                      : (wantsRole ? "role-held-by-live-owner"
                                   : "not-a-top-level-program"));
     }

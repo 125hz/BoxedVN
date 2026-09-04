@@ -148,6 +148,22 @@ enum Preferences {
         }
         return UserDefaults.standard.bool(forKey: soundEnabledKey)
     }
+
+    static let verboseWineTraceKey = "BoxedVN.x64.verboseWineTrace"
+
+    /// Whether a Run-program launch on the 64-bit lane turns on Wine's relay
+    /// trace of the guest's own Windows API calls.
+    ///
+    /// Off by default and read here rather than from the Settings view, for
+    /// the reason at the top of this type: the launch runs from AppModel and
+    /// has to see the current value whether or not Settings was ever opened.
+    /// An absent key reads as false, which is the wanted default - the trace
+    /// costs a call's worth of log lines per call and exists for one
+    /// question, which is what a program's startup check asked for before it
+    /// stopped.
+    static var verboseWineTrace: Bool {
+        UserDefaults.standard.bool(forKey: verboseWineTraceKey)
+    }
 }
 
 struct MemoryReport {

@@ -7641,3 +7641,49 @@ large-address-aware and still runs out. And the same bit can be set after the
 fact on a program we do not build, which is what the usual Windows tool does,
 but doing that to a program that treats pointers as signed corrupts it, so it
 is a decision for a person rather than a build script.
+
+## Launching from the desktop: the role comes back now
+
+Design B shipped, and the first program double-clicked from the desktop ran
+translated, but the second was refused as held by a live owner that had been
+gone for a hundred lines. The release lived in the process destructor, and a
+process that exits is not destroyed: it becomes a zombie until something reaps
+it, and nothing reaps a program started from the desktop. The address space is
+torn down and the role released when the owner's last thread dies, which covers
+a clean exit, a crash turned into an exit by the fatal-signal path, and a kill.
+An exec that finds the holder terminated with no surviving thread reclaims
+first. The desktop launch also now carries the Direct3D 9 projection a 32-bit
+program needs, which the app only requested after reading a program's header,
+and a desktop launch names no program. A launcher that outlives the game it
+starts still leaves the game interpreted; the claim witness now names the
+blocking holder and its relation, so the log says when that is what happened.
+
+## The frame's interim size was manufactured by our own attach
+
+A 32-bit program built two swapchains for one window in 1.2 seconds and then
+its command-stream thread exited and everything waited on it. The interim size
+was not a layout race: attaching the presentation view assigned its frame, and
+on a view that carries its letterbox as bounds plus a transform, setting the
+frame rewrites the bounds through the inverse transform. The guest's capability
+query landed in the eleven milliseconds before the poll repaired it. The view is
+now re-taken by the host before the first fit, and attach and detach refit
+inline instead of assigning a frame the fit owns. A witness prints the layer's
+natural size beside the guest window size at each attach.
+
+Five presentation notifications the watchdog and the frame counters depend on
+were never called by the 64-bit lane, so "no frame for twelve seconds" had been
+printed by every run that reached a surface regardless of truth. They are wired,
+and acquire and present are timed on this lane.
+
+## Seeing the call a program fails on
+
+The 64-bit program's last observable act before its own error dialog is loading
+winsock, immediately after loading the client libraries from its own directory;
+then three seconds of silence, no file opened, no exception, and the dialog.
+What it asked in that silence went through Wine's server, which our syscall
+trace cannot see. A verbose trace setting, off by default and applied only to
+Run program, turns on Wine's call relay restricted to the six modules that name
+a decision, with the relay lines exempt from the flood limiter. One gap on that
+path is closed: the 64-bit lane answered a hostname its own hosts file never
+mentioned, which is the failed local resolution every 64-bit session opened
+with and no 32-bit one did.

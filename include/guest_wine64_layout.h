@@ -266,6 +266,83 @@
 #define K_X64_WINED3D_RENDERER_NAME "renderer"
 #define K_X64_WINED3D_RENDERER_VULKAN "vulkan"
 
+// Relay tracing, for the one question a device log cannot otherwise answer:
+// which Windows call a program's startup check made before it stopped and
+// painted a message box.
+//
+// Nothing else here can see a guest's API calls. The syscall trace sees file
+// opens, the X bridge sees windows and their captions, and a check that reads
+// the registry, asks for a named object or looks at an environment variable
+// does none of those -- a device capture of exactly that shape carried no
+// guest activity at all between the program's imports finishing and its error
+// dialog appearing. Wine can see them: +relay writes one line per call into a
+// traced module, with the arguments, the return value and the caller's own
+// return address.
+//
+// Unrestricted it answers nothing, because it buries the answer: relay over a
+// whole process writes tens of thousands of lines a second. Wine restricts it
+// from the registry and from nowhere else -- HKCU\Software\Wine\Debug values
+// RelayInclude and RelayExclude, each a ';'-separated list of "module" or
+// "module.function" entries, read once when the first traced call is made and
+// with no environment variable of their own. So a launch that asks for the
+// trace writes them into the 64-bit prefix, the way the audio driver and the
+// wined3d renderer are written (configureX64WineRelayFilter in
+// source/sdl/startupArgs.cpp).
+//
+// The include list is the modules whose calls name a decision rather than
+// bookkeeping: advapi32 (the registry and service queries a licence or
+// configuration check makes), kernel32 and kernelbase (named objects, the
+// environment, module handles, GetProcAddress, system information), user32
+// (the message box itself -- its relay line carries the caller's return
+// address, which is what names the module that raised the dialog), version
+// (file version probing) and ws2_32 (what a client library does when it
+// cannot reach the service it expects). ntdll is deliberately absent: every
+// heap allocation and every critical section enters through it, so including
+// it is indistinguishable from not restricting the trace at all.
+//
+// The exclude list removes what those modules are called for per loop
+// iteration rather than per decision, and the message loop a modal box runs
+// once it is up -- which would otherwise fill the log after the answer had
+// already been written, and keep filling it for as long as the dialog stands.
+//
+// The values stay in the prefix once written. That costs nothing: relay
+// happens only when WINEDEBUG names the channel as well, which only a launch
+// with the setting on does, so a prefix carrying the filter behaves exactly
+// as it did before for every other launch.
+#define K_X64_WINE_TRACE_ENV "BOXEDVN_X64_WINE_TRACE"
+#define K_X64_WINE_TRACE_RELAY "relay"
+// The channels the iOS launch appends to WINEDEBUG when the setting is on,
+// kept here so the two sides can be compared by a test rather than by memory.
+// loaddll names each module as it is attached and debugstr carries whatever
+// the program passes to OutputDebugString -- which for a wrapper layer is
+// frequently the reason itself. Both are one line per event, not per call.
+#define K_X64_WINE_TRACE_CHANNELS "+relay,+loaddll,+debugstr"
+// The doubled backslashes are the registry file's own escaping: user.reg
+// spells this section "[Software\\Wine\\Debug]" on disk.
+#define K_X64_WINE_DEBUG_REGISTRY_SECTION "Software\\\\Wine\\\\Debug"
+#define K_X64_WINE_RELAY_INCLUDE_NAME "RelayInclude"
+#define K_X64_WINE_RELAY_EXCLUDE_NAME "RelayExclude"
+#define K_X64_WINE_RELAY_INCLUDE \
+    "advapi32;kernel32;kernelbase;user32;version;ws2_32"
+#define K_X64_WINE_RELAY_EXCLUDE \
+    "kernel32.GetLastError;kernel32.SetLastError;" \
+    "kernelbase.GetLastError;kernelbase.SetLastError;" \
+    "kernel32.GetTickCount;kernel32.GetTickCount64;" \
+    "kernelbase.GetTickCount;kernelbase.GetTickCount64;" \
+    "kernel32.QueryPerformanceCounter;kernelbase.QueryPerformanceCounter;" \
+    "kernel32.GetSystemTimeAsFileTime;kernelbase.GetSystemTimeAsFileTime;" \
+    "kernel32.GetCurrentThreadId;kernel32.GetCurrentProcessId;" \
+    "kernel32.TlsGetValue;kernel32.TlsSetValue;" \
+    "kernelbase.TlsGetValue;kernelbase.TlsSetValue;" \
+    "kernel32.MultiByteToWideChar;kernel32.WideCharToMultiByte;" \
+    "kernelbase.MultiByteToWideChar;kernelbase.WideCharToMultiByte;" \
+    "user32.PeekMessageA;user32.PeekMessageW;" \
+    "user32.GetMessageA;user32.GetMessageW;" \
+    "user32.TranslateMessage;user32.DispatchMessageA;user32.DispatchMessageW;" \
+    "user32.DefWindowProcA;user32.DefWindowProcW;" \
+    "user32.MsgWaitForMultipleObjects;user32.MsgWaitForMultipleObjectsEx;" \
+    "user32.GetQueueStatus"
+
 // The DXMT modules are built as Wine builtins (their DOS stub carries Wine's
 // builtin marker so winemetal.dll can bind to winemetal.so through
 // __wine_unix_call). Wine treats a builtin-marked PE found outside its module

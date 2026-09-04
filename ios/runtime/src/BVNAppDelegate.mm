@@ -83,6 +83,14 @@ extern "C" bool BVNLogStartSessionFile(void);
 
 static void BVNSyncGuestX11PatchGeometry(UIView* presentation);
 
+// Defined below, beside the presentation fit whose invariants they express.
+// The attach lives up here with the rest of the UIKit lifecycle and needs
+// them: moving SDL's view between hosts must not disturb the pixel geometry
+// the guest's swapchain was built against.
+static bool BVNGuestPresentationFitOwnsView(UIView* view);
+static void BVNRefitGuestPresentationNow(void);
+static void BVNLogGuestPresentationExtent(const char* stage);
+
 @interface BVNAppDelegate ()
 - (void)logPresentationTree:(const char*)stage;
 @end
@@ -268,12 +276,46 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     self.libraryWindow.windowLevel = UIWindowLevelNormal;
     self.libraryWindow.hidden = NO;
     [self.libraryWindow makeKeyAndVisible];
+    // The move must never leave the presenting layer at an interim size.
+    //
+    // The guest queries vkGetPhysicalDeviceSurfaceCapabilitiesKHR from its own
+    // thread, and MoltenVK answers with the layer's natural drawable size -
+    // bounds x contentsScale. Assigning -frame here published exactly such an
+    // interim size. The Metal view carries its letterbox as bounds (the guest
+    // resolution, contentsScale 1) plus an affine transform, and -setFrame: on
+    // a transformed view rewrites its BOUNDS through the inverse transform: a
+    // 370x278 pt host frame under the 0.5 scale left by the previous fit
+    // became bounds 740x555. The geometry poll put the guest resolution back
+    // eleven milliseconds later, but by then the guest had already built its
+    // swapchain at 740x555 - and a swapchain whose extent differs from the
+    // layer returns VK_SUBOPTIMAL_KHR on every acquire, so it was torn down
+    // and rebuilt immediately.
+    //
+    // The DXMT path has never churned, and it avoids this from the other side:
+    // BVNDXMTMetalView's -layoutSubviews deliberately leaves contentsScale and
+    // drawableSize alone, so the layer's pixel extent belongs to the swapchain
+    // and UIKit only ever moves the frame. This gives the Vulkan view the same
+    // division - the fit owns the pixels, the host owns the placement - by
+    // leaving the frame alone and re-fitting inline, in this same main-thread
+    // turn, rather than waiting for the poll to notice.
+    const BOOL fitOwnsRoot = BVNGuestPresentationFitOwnsView(root);
+    BVNLogGuestPresentationExtent("attach-enter");
     if (root.superview != host) {
         [root removeFromSuperview];
-        root.frame = host.bounds;
-        root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
-                                UIViewAutoresizingFlexibleHeight;
+        if (!fitOwnsRoot) {
+            // No fit owns this view - the software desktop, or a surface that
+            // does not exist yet. It has no pixel geometry to protect and
+            // should simply fill the host.
+            root.frame = host.bounds;
+            root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                    UIViewAutoresizingFlexibleHeight;
+        }
         [host insertSubview:root atIndex:0];
+    }
+    if (fitOwnsRoot) {
+        // Placement only: bounds, contentsScale and drawableSize come out of
+        // this as the guest resolution, which is what they already were.
+        BVNRefitGuestPresentationNow();
     }
     BVNGuestOverlayInstall();
     BVNDXMTDisplayAttach();
@@ -283,6 +325,7 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
         host.bounds.size.width, host.bounds.size.height];
     BVNLogWrite(BVNLogLevelInfo, "frontend", message.UTF8String);
     [self logPresentationTree:"attach"];
+    BVNLogGuestPresentationExtent("attach-done");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self logPresentationTree:"attach+3s"];
@@ -332,12 +375,22 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     if (guestWindow == nil || root == nil) {
         return;
     }
+    // The same rule as the attach: a fitted Metal view's -frame is not ours
+    // to assign, because assigning it rewrites the bounds the guest's
+    // swapchain was created against. Move the view, then re-fit it against
+    // the window it landed in.
+    const BOOL fitOwnsRoot = BVNGuestPresentationFitOwnsView(root);
     if (root.superview != guestWindow) {
         [root removeFromSuperview];
-        root.frame = guestWindow.bounds;
-        root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
-                                UIViewAutoresizingFlexibleHeight;
+        if (!fitOwnsRoot) {
+            root.frame = guestWindow.bounds;
+            root.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                    UIViewAutoresizingFlexibleHeight;
+        }
         [guestWindow insertSubview:root atIndex:0];
+    }
+    if (fitOwnsRoot) {
+        BVNRefitGuestPresentationNow();
     }
     guestWindow.windowLevel = UIWindowLevelNormal;
     guestWindow.alpha = 1.0;
@@ -349,6 +402,7 @@ static UITextField* BVNSDLKeyboardTextField(UIViewController* controller) {
     BVNLogWrite(BVNLogLevelInfo, "frontend",
                 "Guest presentation returned to SDL's window.");
     [self logPresentationTree:"detach"];
+    BVNLogGuestPresentationExtent("detach");
 }
 
 // Landscape with the live view on screen means the guest gets the whole
@@ -1247,6 +1301,23 @@ extern "C" void BVNRegisterGuestVulkanSurface(void* surface) {
     }
     NSValue* key = [NSValue valueWithPointer:surface];
     gGuestVulkanSurfaceViews[key] = view;
+
+    // Take the live view host back BEFORE the caller fits this surface.
+    //
+    // SDL builds a fresh SDL_uikitmetalview for a Vulkan surface and installs
+    // it by re-assigning the view controller's view, which drops it back into
+    // SDL's own window. kvulkanSDL then calls BVNApplyGuestPresentationAspect
+    // immediately, still inside the same synchronous main-thread block - so a
+    // view still sitting in SDL's window at that point is fitted against the
+    // wrong container, and the geometry poll re-takes the host and re-fits a
+    // few milliseconds later. The guest reads the first answer, not the
+    // second. Moving here makes the first fit the only fit, computed against
+    // the host the picture actually ends up in.
+    UIView* liveHost = gActivePresentationHost ?: gGuestPresentationHost;
+    if (delegate != nil && liveHost != nil && liveHost.window != nil &&
+        view.superview != liveHost) {
+        [delegate attachGuestPresentationToHost:liveHost];
+    }
 
     // SDL installs the CAMetalLayer as soon as vkCreateSurface succeeds,
     // before the guest has submitted or presented anything. An untouched
@@ -2242,6 +2313,111 @@ extern "C" void BVNApplyGuestPresentationAspect(void* surface,
         view.bounds.size.width, view.bounds.size.height,
         drawable.width, drawable.height, view.layer.contentsScale];
     BVNLogWrite(BVNLogLevelInfo, "graphics", message.UTF8String);
+}
+
+// True while the guest's presentation fit owns this view's pixel geometry.
+//
+// A fitted Metal view's bounds ARE the guest resolution, its contentsScale is
+// pinned to 1, and the letterbox is an affine transform on top; the layer's
+// natural drawable size is therefore exactly the extent the guest's swapchain
+// is created at. Nothing may assign such a view's -frame.
+static bool BVNGuestPresentationFitOwnsView(UIView* view) {
+    if (view == nil || gGuestPresentationSurface == nullptr ||
+        gGuestPresentationGuestWidth == 0 ||
+        gGuestPresentationGuestHeight == 0) {
+        return false;
+    }
+    NSValue* key = [NSValue valueWithPointer:gGuestPresentationSurface];
+    return gGuestVulkanSurfaceViews[key] == view;
+}
+
+// Re-applies the recorded fit against whatever the Metal view's superview is
+// now, in the caller's own main-thread turn. The attach uses this so the layer
+// is never left describing a container it has already left; the 200 ms poll in
+// BVNSyncGuestPresentationGeometry keeps its role as the backstop for changes
+// nobody announced.
+//
+// A no-op when the container has not moved and the view's own geometry is
+// still intact, so calling it on every attach costs two comparisons and adds
+// no log line.
+static void BVNRefitGuestPresentationNow(void) {
+    if (gGuestPresentationSurface == nullptr ||
+        gGuestPresentationGuestWidth == 0 ||
+        gGuestPresentationGuestHeight == 0) {
+        return;
+    }
+    NSValue* key = [NSValue valueWithPointer:gGuestPresentationSurface];
+    UIView* view = gGuestVulkanSurfaceViews[key];
+    UIView* container = view.superview;
+    if (view == nil || container == nil) {
+        return;
+    }
+    const bool geometryIntact =
+        lround(view.bounds.size.width) ==
+            (long)gGuestPresentationGuestWidth &&
+        lround(view.bounds.size.height) ==
+            (long)gGuestPresentationGuestHeight &&
+        view.layer.contentsScale == 1.0;
+    if (geometryIntact &&
+        CGRectEqualToRect(container.bounds, gLastFittedBounds) &&
+        UIEdgeInsetsEqualToEdgeInsets(container.safeAreaInsets,
+                                      gLastFittedInsets)) {
+        return;
+    }
+    BVNApplyGuestPresentationAspect(gGuestPresentationSurface,
+                                    gGuestPresentationGuestWidth,
+                                    gGuestPresentationGuestHeight,
+                                    gGuestPresentationMode);
+}
+
+// The witness for swapchain churn: the presenting layer's pixel geometry and
+// the guest window it has to agree with, at the instant the presentation is
+// moved.
+//
+// MoltenVK answers vkGetPhysicalDeviceSurfaceCapabilitiesKHR with the layer's
+// natural drawable size, so any line here whose natural or drawable differs
+// from guest dates a swapchain the guest was forced to rebuild. agrees=1 on
+// every line of a session means no move ever published an interim size;
+// agrees=-1 means there was no surface yet, which is not a disagreement.
+static void BVNLogGuestPresentationExtent(const char* stage) {
+    UIView* view = nil;
+    if (gGuestPresentationSurface != nullptr) {
+        view = gGuestVulkanSurfaceViews[
+            [NSValue valueWithPointer:gGuestPresentationSurface]];
+    }
+    UIView* host = gActivePresentationHost ?: gGuestPresentationHost;
+    UIView* container = view.superview;
+    const CGSize bounds = view != nil ? view.bounds.size : CGSizeZero;
+    const CGFloat scale = view != nil ? view.layer.contentsScale : 0.0;
+    CGSize drawable = CGSizeZero;
+    if ([view.layer isKindOfClass:CAMetalLayer.class]) {
+        drawable = ((CAMetalLayer*)view.layer).drawableSize;
+    }
+    const long naturalWidth = lround(bounds.width * scale);
+    const long naturalHeight = lround(bounds.height * scale);
+    const int agrees = view == nil ? -1 :
+        ((naturalWidth == (long)gGuestPresentationGuestWidth &&
+          naturalHeight == (long)gGuestPresentationGuestHeight &&
+          lround(drawable.width) == (long)gGuestPresentationGuestWidth &&
+          lround(drawable.height) == (long)gGuestPresentationGuestHeight)
+             ? 1 : 0);
+    NSString* text = [NSString stringWithFormat:
+        @"BOXEDVN_PRESENTATION_EXTENT stage=%s view=%@ bounds=%.0fx%.0f "
+         "scale=%.2f natural=%ldx%ld drawable=%.0fx%.0f guest=%ux%u "
+         "container=%@ containerBounds=%.0fx%.0f host=%@ "
+         "hostBounds=%.0fx%.0f agrees=%d",
+        stage, view != nil ? NSStringFromClass([view class]) : @"nil",
+        (double)bounds.width, (double)bounds.height, (double)scale,
+        naturalWidth, naturalHeight,
+        (double)drawable.width, (double)drawable.height,
+        gGuestPresentationGuestWidth, gGuestPresentationGuestHeight,
+        container != nil ? NSStringFromClass([container class]) : @"nil",
+        (double)container.bounds.size.width,
+        (double)container.bounds.size.height,
+        host != nil ? NSStringFromClass([host class]) : @"nil",
+        (double)host.bounds.size.width, (double)host.bounds.size.height,
+        agrees];
+    BVNLogWrite(BVNLogLevelInfo, "graphics", text.UTF8String);
 }
 
 // Reports the layer's NATURAL drawable size - bounds x contentsScale, which

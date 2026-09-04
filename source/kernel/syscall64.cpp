@@ -1834,6 +1834,61 @@ void kfatalProcessExit64(CPU64* cpu, U32 status, const char* reason) {
     }
 }
 
+// The node name this machine answers to, read from /etc/hostname.
+//
+// glibc's gethostname() is uname().nodename, and getaddrinfo() of that name is
+// resolved through /etc/hosts. Both files are virtual and both are built from
+// the host's own name (openHosts/openHostname in source/kernel/knativesocket.cpp
+// write "127.0.1.1\t<host name>"), so a nodename that does not come from the
+// same place resolves to nothing at all: the 64-bit lane answered a constant
+// here, and every session of it opened with
+// `err:winediag:getaddrinfo Failed to resolve your host name IP` while the
+// IA-32 lane, which has always read the file (KSystem::uname), did not.
+//
+// That is not cosmetic for a program whose startup touches winsock. Wine's
+// ws2_32 resolves the local host on initialisation, and a client library that
+// asks the same question gets a failure that has nothing to do with the
+// network being absent.
+//
+// Same fallback as the IA-32 lane's, and the same trim: /etc/hostname is a
+// name and a newline.
+static void x64GuestNodeName(char* out, size_t size) {
+    if (size == 0) {
+        return;
+    }
+    std::strncpy(out, "boxedwine64", size - 1);
+    out[size - 1] = 0;
+    std::shared_ptr<FsNode> node =
+        Fs::getNodeFromLocalPath(B(""), B("/etc/hostname"), true);
+    if (!node || node->isDirectory()) {
+        return;
+    }
+    FsOpenNode* openNode = node->open(K_O_RDONLY);
+    if (!openNode) {
+        return;
+    }
+    char name[65] = {};
+    const S32 got =
+        (S32)openNode->readNative((U8*)name, (U32)(sizeof(name) - 1));
+    openNode->close();
+    delete openNode;
+    if (got <= 0) {
+        return;
+    }
+    name[got < (S32)sizeof(name) - 1 ? got : (S32)sizeof(name) - 1] = 0;
+    for (char* c = name; *c; c++) {
+        if (*c == '\r' || *c == '\n') {
+            *c = 0;
+            break;
+        }
+    }
+    if (name[0] == 0) {
+        return;
+    }
+    std::strncpy(out, name, size - 1);
+    out[size - 1] = 0;
+}
+
 // struct utsname is 6 × 65-byte fixed strings on x86-64 Linux (390 bytes).
 static U64 sys_uname64(CPU64* cpu, U64 bufAddr) {
     if (!bufAddr) return (U64)-K_EFAULT;
@@ -1842,8 +1897,10 @@ static U64 sys_uname64(CPU64* cpu, U64 bufAddr) {
     auto setField = [&](int idx, const char* s) {
         std::strncpy(buf + idx * 65, s, 64);
     };
+    char nodeName[65] = {};
+    x64GuestNodeName(nodeName, sizeof(nodeName));
     setField(0, "Linux");                  // sysname
-    setField(1, "boxedwine64");            // nodename
+    setField(1, nodeName);                 // nodename, from /etc/hostname
     setField(2, "6.1.0-boxedwine");        // release — pretend modern kernel
     setField(3, "#1 SMP boxedwine64");     // version
     setField(4, "x86_64");                 // machine

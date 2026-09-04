@@ -1531,6 +1531,8 @@ struct SettingsView: View {
     private var orientationLock = true
     @AppStorage("BoxedVN.fex64.strictMemoryOrdering")
     private var strictMemoryOrdering = false
+    @AppStorage(Preferences.verboseWineTraceKey)
+    private var verboseWineTrace = false
     @AppStorage(Preferences.soundEnabledKey)
     private var soundEnabled = true
     @AppStorage("BoxedVN.presentation.fillCropPercent")
@@ -1546,6 +1548,18 @@ struct SettingsView: View {
                      + "instead of assuming the hardware provides it. Slower, "
                      + "but the fix for crashes where a pointer reads as zero. "
                      + "Takes effect on the next launch.")
+            }
+            Section {
+                Toggle("Verbose Wine trace", isOn: $verboseWineTrace)
+            } footer: {
+                Text("Records the Windows calls a 64-bit program makes, so a "
+                     + "program that stops at an error dialog of its own says "
+                     + "which call it stopped on. Wine's relay trace, "
+                     + "restricted to the registry, process, window and "
+                     + "networking modules so the log stays readable, and "
+                     + "applied to Run program only. Slow, and only worth it "
+                     + "while diagnosing one program. Takes effect on the "
+                     + "next launch.")
             }
             Section {
                 Toggle("Orientation lock", isOn: $orientationLock)

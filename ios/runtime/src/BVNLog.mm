@@ -34,6 +34,7 @@
 #import <Foundation/Foundation.h>
 #import <os/log.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -221,6 +222,39 @@ uint64_t floodHash(const char* text, size_t length) {
     return hash;
 }
 
+// Wine's relay trace is exempt from the allowance above.
+//
+// Turning relay on is the only way this platform can see a guest's Windows
+// API calls, and those lines are repetitive by their nature: a startup check
+// that loops over a table writes one near-identical line per iteration, and a
+// call made with the same arguments from the same site writes a line that is
+// identical byte for byte. The allowance would therefore drop exactly the run
+// that was worth turning the trace on for, and would drop it silently apart
+// from a count.
+//
+// Exempt before a slot is claimed, not after, so relay output cannot occupy
+// all sixty-four slots and leave a genuine flood of something else unlimited.
+//
+// Recognised by the shape Wine writes and only that shape: a hexadecimal
+// thread id, a colon, then "Call " or "Ret  ". Both may sit behind BoxedVN's
+// timestamp or behind the "[guest fd=2 pid=N exe]" prefix sys_write64 adds,
+// so the whole head of the line is searched rather than its first column.
+// Nothing else in this project writes that pattern, and a line without it is
+// limited exactly as before.
+bool floodExemptRelay(const char* text, size_t length) {
+    const size_t limit = length < 128 ? length : 128;
+    for (size_t i = 1; i + 6 <= limit; ++i) {
+        if (text[i] != ':' || isxdigit((unsigned char)text[i - 1]) == 0) {
+            continue;
+        }
+        if (memcmp(text + i + 1, "Call ", 5) == 0 ||
+            memcmp(text + i + 1, "Ret  ", 5) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // True when the line should reach the sinks. Writes the previous window's
 // summaries itself. Caller must NOT hold gMutex.
 bool floodAdmit(const char* text, size_t length) {
@@ -243,6 +277,13 @@ bool floodAdmit(const char* text, size_t length) {
             slot = FloodSlot();
         }
         gFloodWindowStart = now;
+    }
+    if (floodExemptRelay(text, length)) {
+        pthread_mutex_unlock(&gFloodMutex);
+        if (!summaries.empty()) {
+            writeToSinks(summaries.data(), summaries.size());
+        }
+        return true;
     }
     FloodSlot* match = nullptr;
     FloodSlot* empty = nullptr;

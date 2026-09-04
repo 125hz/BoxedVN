@@ -137,6 +137,24 @@ static bool guestWantsWow64Dxvk(const std::vector<BString>& envValues) {
     return wanted;
 }
 
+// Whether this launch asked for Wine's relay trace of the guest's Windows API
+// calls, restricted to the modules K_X64_WINE_RELAY_INCLUDE names.
+//
+// Opt-in and only on the exact value, like the DXVK d3d9 projection above: an
+// unset variable, an empty one or any other spelling leaves the prefix's Debug
+// key alone, so a session that did not ask for the trace cannot acquire one
+// from a session that did.
+static bool guestWantsWineRelayTrace(const std::vector<BString>& envValues) {
+    const BString prefix = B(K_X64_WINE_TRACE_ENV "=");
+    bool wanted = false;
+    for (const BString& entry : envValues) {
+        if (entry.startsWith(prefix)) {
+            wanted = (entry == prefix + B(K_X64_WINE_TRACE_RELAY));
+        }
+    }
+    return wanted;
+}
+
 // Make every process of an x86-64 session resolve glibc's IFUNC string and
 // memory routines to non-VEX implementations.
 //
@@ -886,6 +904,98 @@ static void configureX64WineD3dRenderer(const BString& winePrefix) {
              "the renderer is left as it stands rather than naming a backend "
              "this lane cannot reach");
     }
+}
+
+// Relay tracing is restricted from the registry and from nowhere else: Wine
+// reads HKCU\Software\Wine\Debug values RelayInclude and RelayExclude once,
+// when the first traced call is made, and neither has an environment variable.
+// So a launch that asked for the trace writes both here, into the prefix it is
+// about to open, by exactly the route the audio driver and the wined3d
+// renderer take -- read, edit, sibling temp file, rename -- and for the same
+// reason: a process killed mid-write must not leave a truncated user.reg,
+// which Wine treats as an empty registry and silently reinitialises.
+//
+// Both values are written together or not at all. The include list without
+// the exclude list is the flood the include list exists to prevent, and a
+// prefix carrying only half of the pair would produce a log nobody can read
+// while looking exactly like one that was configured.
+//
+// A prefix that has not booted yet has no user.reg to edit and gets the values
+// on its next launch, which is the behaviour the other two registry values
+// here have had since they were added.
+static void configureX64WineRelayFilter(const BString& winePrefix) {
+    const char* registryStatus = "no-user-reg";
+
+    const BString userRegistry = winePrefix + "/user.reg";
+    std::shared_ptr<FsNode> node =
+        Fs::getNodeFromLocalPath(B(""), userRegistry, true);
+    BString nativePath = node ? node->nativePath : B("");
+    if (node && !node->isDirectory() && !nativePath.isEmpty()) {
+        std::string contents;
+        bool readable = true;
+        {
+            std::ifstream in(nativePath.c_str(), std::ios::binary);
+            if (!in) {
+                readable = false;
+            } else {
+                in.seekg(0, std::ios::end);
+                const std::streamoff size = in.tellg();
+                in.seekg(0, std::ios::beg);
+                if (size > 0) {
+                    contents.resize((size_t)size);
+                    in.read(&contents[0], (std::streamsize)contents.size());
+                    readable = in.good();
+                }
+            }
+        }
+        if (!readable) {
+            registryStatus = "unreadable";
+        } else {
+            // Both edits are made before either is judged: |= on a bool, not
+            // ||, so the second call is not skipped once the first has already
+            // reported a change.
+            bool changed = setGuestWineRegistryValue(
+                contents, K_X64_WINE_DEBUG_REGISTRY_SECTION,
+                K_X64_WINE_RELAY_INCLUDE_NAME,
+                "\"" K_X64_WINE_RELAY_INCLUDE "\"");
+            changed |= setGuestWineRegistryValue(
+                contents, K_X64_WINE_DEBUG_REGISTRY_SECTION,
+                K_X64_WINE_RELAY_EXCLUDE_NAME,
+                "\"" K_X64_WINE_RELAY_EXCLUDE "\"");
+            if (!changed) {
+                registryStatus = "present";
+            } else {
+                const BString tempPath = nativePath + ".boxedvn-relay";
+                bool wrote = false;
+                {
+                    std::ofstream out(tempPath.c_str(),
+                                      std::ios::binary | std::ios::trunc);
+                    if (out) {
+                        out.write(contents.data(),
+                                  (std::streamsize)contents.size());
+                        wrote = out.good();
+                    }
+                }
+                std::error_code ec;
+                if (wrote) {
+                    std::filesystem::rename(tempPath.c_str(),
+                                            nativePath.c_str(), ec);
+                }
+                if (!wrote || ec) {
+                    std::filesystem::remove(tempPath.c_str(), ec);
+                    registryStatus = "unwritable";
+                } else {
+                    registryStatus = "written";
+                }
+            }
+        }
+    }
+
+    klog_fmt("BOXEDWINE_X64_WINE_RELAY registry=%s channels=%s include='%s' "
+             "exclude='%s' prefix=%s",
+             registryStatus, K_X64_WINE_TRACE_CHANNELS,
+             K_X64_WINE_RELAY_INCLUDE, K_X64_WINE_RELAY_EXCLUDE,
+             winePrefix.c_str());
 }
 
 // The two OSS nodes Wine's driver opens, taken through the guest filesystem
@@ -1787,6 +1897,13 @@ bool StartUpArgs::apply() {
         // reads the prefix.
         reportX64GuestOpenGl();
         configureX64WineD3dRenderer(winePrefix);
+        // The relay filter, when the launch asked for the trace. Last of the
+        // three prefix edits for the same reason they are all here: wineserver
+        // reads user.reg once, when the first process of the session reaches
+        // it, so every value has to be in the file before that happens.
+        if (guestWantsWineRelayTrace(envValues)) {
+            configureX64WineRelayFilter(winePrefix);
+        }
     }
 
     if (!this->ddrawOverridePath.isEmpty()) {

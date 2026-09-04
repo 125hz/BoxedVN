@@ -1524,6 +1524,214 @@ class SignallingPathContract(unittest.TestCase):
                 self.assertIn(field, present)
 
 
+class PresentationBackendContract(unittest.TestCase):
+    """The notifications the native presentation backend is written to receive.
+
+    KVulkan declares five: registerVulkanSwapchain, destroyVulkanSwapchain,
+    acquireVulkanSwapchain, submitVulkanWorkload and presentVulkanSwapchain.
+    Until this revision no lane called any of them, and three separate
+    diagnostics were built on top of that silence:
+
+      - the iOS first-frame watchdog fires on !firstPresentObserved, and only
+        presentVulkanSwapchain ever sets it. "Produced no frame for 12
+        seconds" was therefore printed by every run that reached a surface,
+        whether or not the guest presented, so the line carried no
+        information;
+      - registerVulkanSwapchain is what fills swapchainSurfaces, and both
+        acquireVulkanSwapchain and presentVulkanSwapchain return at their
+        first lookup into an empty map;
+      - "iOS guest performance: N Vulkan frames/sec" counts through
+        bvnReportPresentRate(), which only presentVulkanSwapchain calls.
+
+    A witness that cannot fire is worse than no witness, because a reader
+    treats its absence as evidence. These tests keep the wiring attached.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+        self.header = (REPO / "include" / "kvulkan.h").read_text(
+            encoding="utf-8")
+
+    def case_body(self, name: str) -> str:
+        start = self.source.index(f"case VKB_{name}:")
+        rest = self.source[start + 1:]
+        end = re.search(r"^\s*case VKB_\w+:", rest, re.MULTILINE)
+        return rest[:end.start()] if end else rest
+
+    def swapchain_notifications(self) -> set[str]:
+        """The notification set, read from KVulkan rather than listed here.
+
+        Taking it from the header means a sixth notification added to the
+        interface is caught by this test instead of quietly joining the five
+        that already went uncalled.
+        """
+        found = set()
+        for match in re.finditer(r"virtual\s+void\s+(\w*Vulkan\w*)\s*\(",
+                                 self.header):
+            name = match.group(1)
+            if name in ("createVulkanSurface", "destroyVulkanSurface"):
+                continue  # surface lifetime, served by createXlibSurface
+            found.add(name)
+        return found
+
+    def test_every_kvulkan_notification_is_actually_called(self) -> None:
+        notifications = self.swapchain_notifications()
+        self.assertTrue(notifications,
+                        "the header scan found no notifications at all, so it "
+                        "stopped working rather than proving anything")
+        for name in sorted(notifications):
+            with self.subTest(notification=name):
+                self.assertIn(f"->{name}(", self.source,
+                              f"{name} is declared for this backend and never "
+                              "called, so whatever it feeds reports silence "
+                              "as a fact")
+
+    def test_the_swapchain_is_registered_against_its_own_surface(self) -> None:
+        # The pairing is what every later lookup is keyed on. Registering
+        # against anything but the create-info's surface would attribute
+        # frames to the wrong view.
+        body = self.case_body("CreateSwapchainKHR")
+        self.assertIn("registerVulkanSwapchain((void*)*out,", body)
+        self.assertIn("(void*)info->surface", body)
+        self.assertIn("result == VK_SUCCESS", body)
+        self.assertLess(body.index("result == VK_SUCCESS"),
+                        body.index("registerVulkanSwapchain"),
+                        "a failed create leaves *out untouched, so it must "
+                        "not be registered")
+
+    def test_the_swapchain_is_unregistered_before_it_is_destroyed(self) -> None:
+        body = self.case_body("DestroySwapchainKHR")
+        self.assertIn("destroyVulkanSwapchain((void*)A(1))", body)
+        self.assertLess(body.index("destroyVulkanSwapchain"),
+                        body.index("PFN_vkDestroySwapchainKHR"),
+                        "the backend has to drop the handle while it is still "
+                        "a handle")
+
+    def test_both_acquire_forms_notify(self) -> None:
+        # Reasoning from the absence of an acquire only works when every way
+        # of acquiring reports. vkAcquireNextImage2KHR names its swapchain
+        # inside the info structure rather than in an argument slot.
+        one = self.case_body("AcquireNextImageKHR")
+        self.assertIn("acquireVulkanSwapchain(\n                (void*)A(1),",
+                      one.replace("\r", ""))
+        two = self.case_body("AcquireNextImage2KHR")
+        self.assertIn("(void*)info->swapchain", two)
+        self.assertIn("acquireVulkanSwapchain", two)
+
+    def test_both_submit_forms_notify_under_their_own_name(self) -> None:
+        for command, api in (("QueueSubmit", "vkQueueSubmit"),
+                             ("QueueSubmit2", "vkQueueSubmit2")):
+            with self.subTest(command=command):
+                body = self.case_body(command)
+                self.assertIn("submitVulkanWorkload", body)
+                self.assertIn(f'"{api}"', body)
+                self.assertIn("U32A(1)", body)
+
+    def test_the_present_notifies_once_per_swapchain(self) -> None:
+        # A present may carry several swapchains, and the backend keys its
+        # per-surface frame state by swapchain, so one notification for the
+        # batch would leave every swapchain but one looking unpresented.
+        body = self.case_body("QueuePresentKHR")
+        self.assertIn("for (uint32_t i = 0; i < info->swapchainCount; ++i)",
+                      body)
+        self.assertIn("presentVulkanSwapchain(\n                        "
+                      "(void*)info->pSwapchains[i]", body.replace("\r", ""))
+        self.assertIn("info->pResults", body,
+                      "per-swapchain results say which swapchain failed")
+
+    def test_the_present_and_acquire_are_timed_on_this_lane_too(self) -> None:
+        # The IA-32 lane has timed these since build 72. This lane did not, so
+        # "iOS guest present path: N ms inside vkQueuePresentKHR" reported
+        # zero for every 64-bit run however long the compositor held the
+        # drawable -- another witness reporting silence as a fact.
+        self.assertIn("bvnHostPresent::recordPresent", self.source)
+        self.assertIn("bvnHostPresent::recordAcquire", self.source)
+        self.assertIn("index == VKB_QueuePresentKHR", self.source)
+        self.assertIn("index == VKB_AcquireNextImageKHR", self.source)
+
+
+class SurfaceExtentContract(unittest.TestCase):
+    """Whether the extent the host reports for a surface is the size of the
+    guest window that surface was made from.
+
+    A device run built two swapchains for one window inside 1.2 seconds: the
+    first at 740x555, the second at 804x585. The X11 window was 804x585 for
+    the whole run; the host's presentation layer re-parented its view during
+    the first frame and the capability query DXVK made inside that window saw
+    the transient size. Nothing in the log said so -- only that two
+    "Buffer size" lines disagreed, which several unrelated causes produce.
+
+    The fix for the churn is not in this file. Saying that the churn happened,
+    and when, is.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+
+    def case_body(self, name: str) -> str:
+        start = self.source.index(f"case VKB_{name}:")
+        rest = self.source[start + 1:]
+        end = re.search(r"^\s*case VKB_\w+:", rest, re.MULTILINE)
+        return rest[:end.start()] if end else rest
+
+    def test_the_surface_records_the_window_it_was_made_from(self) -> None:
+        self.assertIn("rememberSurfaceWindow(", self.source)
+        self.assertIn("struct SurfaceWindow", self.source)
+        # createXlibSurface is the only place a window id is in hand.
+        create = self.source[self.source.index("S64 createXlibSurface("):]
+        create = create[:create.index("\n}\n")]
+        self.assertIn("rememberSurfaceWindow(handle, (U32)windowId", create)
+        self.assertIn("window_size=%ux%u", create)
+
+    def test_both_capability_queries_carry_the_witness(self) -> None:
+        # The same rule the map witness follows: reasoning from the absence of
+        # a mismatch only works when every path that could report one does.
+        for command in ("GetPhysicalDeviceSurfaceCapabilitiesKHR",
+                        "GetPhysicalDeviceSurfaceCapabilities2KHR"):
+            with self.subTest(command=command):
+                body = self.case_body(command)
+                self.assertIn("noteSurfaceExtent(", body)
+        two = self.case_body("GetPhysicalDeviceSurfaceCapabilities2KHR")
+        self.assertIn("(U64)info->surface", two,
+                      "the 2KHR form names its surface inside the info "
+                      "structure, not in an argument slot")
+        self.assertIn("&capabilities->surfaceCapabilities", two)
+
+    def test_the_witness_names_both_sizes_and_the_verdict(self) -> None:
+        body = self.source[self.source.index("void noteSurfaceExtent("):]
+        body = body[:body.index("\n}\n")]
+        for field in ("window_size=", "current=", "min=", "max=", "agrees=",
+                      "mismatches=", "status="):
+            with self.subTest(field=field):
+                self.assertIn(field, body)
+
+    def test_the_undefined_extent_is_not_a_mismatch(self) -> None:
+        # 0xffffffff in both fields means "the extent is whatever the
+        # swapchain asks for". Reporting that as a disagreement would make
+        # every platform that uses it look broken.
+        body = self.source[self.source.index("void noteSurfaceExtent("):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("0xffffffffu", body)
+        self.assertIn("undefined", body)
+        self.assertIn("!undefined", body)
+
+    def test_a_surface_this_bridge_did_not_make_is_not_judged(self) -> None:
+        # Wine builds surfaces through other paths. Those have no recorded
+        # window, and calling that a mismatch would be inventing evidence.
+        body = self.source[self.source.index("void noteSurfaceExtent("):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("known &&", body)
+        self.assertIn("known ? (mismatch ? 0 : 1) : -1", body)
+
+    def test_the_swapchain_witness_pairs_the_request_with_the_window(self) -> None:
+        body = self.case_body("CreateSwapchainKHR")
+        self.assertIn("BOXEDWINE_X64_VULKAN_SWAPCHAIN", body)
+        for field in ("window_size=", "requested=", "old=", "status="):
+            with self.subTest(field=field):
+                self.assertIn(field, body)
+        self.assertIn("info->imageExtent.width", body)
+
+
 def core_commands() -> dict[str, str]:
     """Every command core Vulkan defines, mapped to the version that added it.
 

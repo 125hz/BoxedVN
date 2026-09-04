@@ -701,6 +701,49 @@ final class AppModel: ObservableObject {
         /// whose layer carries no DXVK are both unaffected.
         static let wow64Environment =
             environment + ["BOXEDVN_WOW64_D3D9=dxvk"]
+
+        /// The WINEDEBUG channels Settings' "Verbose Wine trace" adds, and
+        /// the variable that tells the emulator to write the relay filter
+        /// into the prefix before Wine opens it.
+        ///
+        /// relay is the only thing on this platform that can see a guest's
+        /// Windows API calls at all: the syscall trace sees file opens and
+        /// the X bridge sees windows, so a startup check that reads the
+        /// registry, asks for a named object or looks at an environment
+        /// variable is invisible - a device capture of exactly that shape
+        /// carried no guest activity whatever between the program's imports
+        /// finishing and its error dialog appearing. loaddll names each
+        /// module as it attaches and debugstr carries whatever the program
+        /// passes to OutputDebugString, both one line per event.
+        ///
+        /// Which modules relay covers is not settable from the environment:
+        /// Wine reads RelayInclude and RelayExclude from
+        /// HKCU\Software\Wine\Debug and from nowhere else. The variable
+        /// below is what makes the emulator write them, and the list itself
+        /// lives beside them in include/guest_wine64_layout.h
+        /// (K_X64_WINE_TRACE_CHANNELS, K_X64_WINE_RELAY_INCLUDE) so the two
+        /// halves can be compared by a test rather than by memory.
+        static let verboseTraceChannels = "+relay,+loaddll,+debugstr"
+        static let verboseTraceAssignment = "BOXEDVN_X64_WINE_TRACE=relay"
+        static let wineDebugAssignmentPrefix = "WINEDEBUG="
+
+        /// `base` with the verbose trace folded in, or `base` unchanged when
+        /// the setting is off.
+        ///
+        /// The channels are appended to whichever WINEDEBUG the lane already
+        /// sets rather than replacing it: msgbox is what carries the text of
+        /// the dialog the trace is being turned on to explain, and losing it
+        /// would trade the answer for the evidence. A caller that supplied a
+        /// WINEDEBUG of its own still wins over all of this, in
+        /// BVNLaunchArguments.
+        static func withVerboseTrace(_ base: [String],
+                                     enabled: Bool) -> [String] {
+            guard enabled else { return base }
+            return base.map {
+                $0.hasPrefix(wineDebugAssignmentPrefix)
+                    ? $0 + "," + verboseTraceChannels : $0
+            } + [verboseTraceAssignment]
+        }
     }
 
     /// Locates the bundled Wine64, glibc and DXMT resources for `container`
@@ -1014,8 +1057,14 @@ final class AppModel: ObservableObject {
                 // Only a 32-bit program gets the DXVK d3d9 projection: it is
                 // the WoW64 lane's renderer and has nothing to do with the
                 // 64-bit lane, which reaches Direct3D 11 through DXMT.
-                environment: isWoW64Program ? X64Runtime.wow64Environment
-                                            : X64Runtime.environment,
+                // Settings' "Verbose Wine trace" applies here and only
+                // here: this is the launch that runs a program whose startup
+                // can fail for a reason of its own, and the trace is far too
+                // expensive to leave on for the probes and the desktop.
+                environment: X64Runtime.withVerboseTrace(
+                    isWoW64Program ? X64Runtime.wow64Environment
+                                   : X64Runtime.environment,
+                    enabled: Preferences.verboseWineTrace),
                 workingDirectory: program.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,

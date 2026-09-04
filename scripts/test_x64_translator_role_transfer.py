@@ -53,6 +53,8 @@ SYSCALL64 = REPO / "source" / "kernel" / "syscall64.cpp"
 ADAPTER = REPO / "ios" / "runtime" / "src" / "BVNFEXCPU64Adapter.mm"
 BACKEND = REPO / "ios" / "runtime" / "src" / "BVNFEXBackend.mm"
 APP_MODEL = REPO / "ios" / "app" / "Sources" / "AppModel.swift"
+LAUNCH_ARGUMENTS = REPO / "ios" / "runtime" / "src" / "BVNLaunchArguments.cpp"
+PLAN = REPO / "docs" / "PLAN_DESKTOP_LAUNCH_UNDER_FEX64.md"
 
 BACKSLASH = "\\"
 
@@ -291,8 +293,11 @@ class TheDecisionIsWitnessed(unittest.TestCase):
             self.assertIn(action, self.source)
 
     def test_the_witness_says_who_held_it_and_whether_it_moved(self) -> None:
+        # Four decision points: the seed at launch, the claim at exec, the
+        # release when the owner's last thread goes, and the release in
+        # ~KProcess that is now only the backstop for the third.
         lines = re.findall(r'"BOXEDWINE_X64_TRANSLATOR_ROLE[^;]*', self.source)
-        self.assertEqual(len(lines), 3,
+        self.assertEqual(len(lines), 4,
                          "one witness per decision point, no more and no less")
         for line in lines:
             self.assertIn("pid=%u", line)
@@ -304,6 +309,260 @@ class TheDecisionIsWitnessed(unittest.TestCase):
         # "no translator" is not a diagnosis. These two are.
         self.assertIn("role-held-by-live-owner", self.source)
         self.assertIn("not-a-top-level-program", self.source)
+
+    def test_every_reason_the_role_can_move_is_spelled_out(self) -> None:
+        for reason in ("launched-program-took-free-role",
+                       "wine-infrastructure-defers-to-first-program-exec",
+                       "top-level-program-took-free-role",
+                       "top-level-program-took-reclaimed-role",
+                       "owner-last-thread-gone",
+                       "holder-exited-uncollected",
+                       "owner-address-space-destroyed"):
+            self.assertIn(reason, self.source,
+                          f"no witness ever prints reason={reason}")
+
+    def test_the_claim_witness_names_what_blocked_it(self) -> None:
+        # A refusal that says only "held" cannot tell a launcher chain (the
+        # holder is an ancestor of the process asking) from two unrelated
+        # programs, and that distinction is the whole of design A's case.
+        claim = self.source.split(
+            '"BOXEDWINE_X64_TRANSLATOR_ROLE pid=%u action=claim', 1)[1]
+        claim = claim.split(";", 1)[0]
+        for field in ("reclaimed=%u", "blocking=%u", "holder_rel=%s"):
+            self.assertIn(field, claim)
+
+    def test_the_relation_walk_cannot_hang_an_exec(self) -> None:
+        walk = self.source.split("const char* translatorRoleHolderRelation(",
+                                 1)[1]
+        walk = walk.split(chr(10) + "}", 1)[0]
+        self.assertIn("hops < 32", walk)
+        for relation in ('"self"', '"ancestor"', '"unrelated"', '"unknown"',
+                         '"none"'):
+            self.assertIn(relation, walk)
+
+
+class TheRoleIsReleasedWhenTheOwnerDies(unittest.TestCase):
+    """Every ending, not only the one that destroys the KProcess.
+
+    From the 2026-09-03 23:01 desktop capture, in order: pid 45 claimed the
+    role and ran translated; pid 45 exited cleanly; the next two programs the
+    user double-clicked were both refused with role-held-by-live-owner, and
+    both died on the interpreter with 0xC000001D. Nothing was alive to hold
+    the role. exit_group leaves the KProcess in KSystem::processes as a
+    zombie for waitpid to collect, a zombie's KMemory64 still owns the
+    identity windows, and ~KProcess -- which is where the release lived --
+    does not run until somebody reaps it. Nobody reliably does.
+    """
+
+    def setUp(self) -> None:
+        self.source = read(KPROCESS)
+
+    def _function(self, signature: str) -> str:
+        body = self.source.split(signature, 1)[1]
+        return body[:body.index("\n}")]
+
+    def test_exitgroup_cannot_be_where_the_windows_are_freed(self) -> None:
+        # It marks the process terminated and stops there: the address space
+        # outlives it on purpose, because waitpid has not run yet.
+        body = self.source.split("U32 KProcess::exitgroup(", 1)[1]
+        body = body[:body.index("U32 KProcess::fchdir(")]
+        self.assertIn("this->terminated = true;", body)
+        self.assertNotIn("delete memory64", body)
+
+    def test_the_last_thread_of_the_owner_frees_them_instead(self) -> None:
+        body = self._function("void KProcess::deleteThread(")
+        self.assertIn(
+            "releaseTranslatedAddressSpaceOfDeadProcess(this, "
+            '"owner-last-thread-gone");', body)
+
+    def test_it_runs_after_the_thread_is_destroyed(self) -> None:
+        # ~KThread writes the guest's clear_child_tid through this process's
+        # KMemory64 and declines to delete a CPU64 that is still the
+        # process's own. Both are reads of what this call frees.
+        body = self._function("void KProcess::deleteThread(")
+        self.assertLess(
+            body.index("delete thread;"),
+            body.index("releaseTranslatedAddressSpaceOfDeadProcess"),
+            "the release must not run before ~KThread has finished")
+
+    def test_the_teardown_refuses_while_any_thread_survives(self) -> None:
+        body = self._function(
+            "void releaseTranslatedAddressSpaceOfDeadProcess(")
+        self.assertIn("if (process->getThreadCount() != 0) {", body)
+
+    def test_the_teardown_only_ever_touches_the_registered_owner(self) -> None:
+        body = self._function(
+            "void releaseTranslatedAddressSpaceOfDeadProcess(")
+        self.assertIn("if (gTranslatorRoleOwner != process) {", body)
+
+    def test_the_windows_are_unmapped_before_the_role_reads_free(self) -> None:
+        # Releasing first would advertise the role while MAP_FIXED could
+        # still map a new owner's pages over the dead one's.
+        body = self._function(
+            "void releaseTranslatedAddressSpaceOfDeadProcess(")
+        self.assertLess(
+            body.index(
+                "BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(gTranslatorRoleMutex);"),
+            body.index("delete deadMemory;"))
+        self.assertLess(body.index("delete deadMemory;"),
+                        body.index("gTranslatorRoleOwner = nullptr;"))
+
+    def test_the_process_stops_naming_what_was_deleted(self) -> None:
+        body = self._function(
+            "void releaseTranslatedAddressSpaceOfDeadProcess(")
+        self.assertLess(body.index("process->cpu64 = nullptr;"),
+                        body.index("delete deadCpu;"))
+        self.assertLess(body.index("process->memory64 = nullptr;"),
+                        body.index("delete deadMemory;"))
+
+    def test_the_destructor_is_still_a_backstop_and_is_null_safe(self) -> None:
+        destructor = self._function("KProcess::~KProcess() {")
+        self.assertIn("delete memory64;", destructor)
+        self.assertIn("memory64 = nullptr;", destructor)
+        self.assertIn("translatorRoleRelease(this)", destructor)
+
+    def test_every_ending_a_program_can_have_reaches_exitgroup(self) -> None:
+        # A crash, a kill and a guest exit_group are the same path from here
+        # on, so one release covers all three.
+        source = read(SYSCALL64)
+        self.assertIn("process->exitgroup(cpu->thread, (U32)status);", source)
+        fatal = source.split("void kfatalProcessExit64(", 1)[1]
+        fatal = fatal[:fatal.index("\n}")]
+        self.assertIn("process->exitgroup(cpu->thread, status);", fatal)
+
+
+class TheRoleMovesOnlyFromAHolderThatHasExited(unittest.TestCase):
+    """The provable half of design A, and the line where it stops.
+
+    Design A wanted the role taken from an owner that is merely idle, so a
+    launcher could hand it to the program it starts. That is still refused,
+    and the reason has not changed: an idle owner is a live owner, its
+    registers and its compiled blocks hold host addresses inside the windows,
+    and it resumes into them. "Has exited" is the whole of the safe subset.
+    """
+
+    def setUp(self) -> None:
+        self.source = read(KPROCESS)
+        self.reclaim = self.source.split(
+            "bool reclaimTranslatorRoleFromExitedHolder(", 1)[1]
+        self.reclaim = self.reclaim[:self.reclaim.index("\n}")]
+        self.execve = self.source.split("U32 KProcess::execve(", 1)[1]
+        self.execve = self.execve[
+            :self.execve.index("void KProcess::signalProcess(")]
+
+    def test_it_needs_both_facts_that_make_a_holder_dead(self) -> None:
+        self.assertIn("!holder->isTerminated()", self.reclaim)
+        self.assertIn("holder->getThreadCount() != 0", self.reclaim)
+
+    def test_it_only_ever_tears_down_the_registered_holder(self) -> None:
+        self.assertIn("translatorRoleHeldBy(holder.get())", self.reclaim)
+
+    def test_the_holder_is_looked_up_by_id_not_kept_as_a_pointer(self) -> None:
+        # A raw pointer to the owner would be a use-after-free the moment it
+        # was collected; the process table hands back a reference instead.
+        self.assertIn("KProcessPtr holder = KSystem::getProcess(holderId);",
+                      self.reclaim)
+
+    def test_why_a_live_owner_is_still_refused_is_written_down(self) -> None:
+        self.assertIn("an idle owner is a live owner", self.source)
+
+    def test_exec_tries_the_reclaim_before_it_asks_to_take(self) -> None:
+        self.assertLess(
+            self.execve.index("reclaimTranslatorRoleFromExitedHolder(holder)"),
+            self.execve.index(
+                "if (wantsRole && translatorRoleTryTake(this)) {"))
+
+    def test_a_process_never_reclaims_from_itself_or_from_nobody(self) -> None:
+        guard = self.execve.split("const bool reclaimed =", 1)[1][:400]
+        self.assertIn("wantsRole &&", guard)
+        self.assertIn("holder != 0", guard)
+        self.assertIn("holder != this->id", guard)
+
+
+class TheDesktopLaunchCarriesWhatAProgramNeeds(unittest.TestCase):
+    """A program must not depend on which door it was started through."""
+
+    def setUp(self) -> None:
+        self.app = read(APP_MODEL)
+        self.launch = read(LAUNCH_ARGUMENTS)
+
+    def _swift_body(self, name: str) -> str:
+        body = self.app.split("func " + name + "(", 1)[1]
+        return body[:body.index("\n    }")]
+
+    def _dxmt_block(self) -> str:
+        block = self.launch.split("if (launch.useDXMT) {", 1)[1]
+        return block[:block.index("\n        }")]
+
+    def test_only_the_program_launch_can_choose_the_32bit_renderer(self):
+        # The app knows one program's PE header and asks for DXVK's d3d9 when
+        # it is i386. The desktop names no program at all -- the user picks
+        # one afterwards in the file manager, and it may be either width.
+        program = self._swift_body("launchX64Program")
+        desktop = self._swift_body("launchX64Desktop")
+        self.assertIn("X64Runtime.wow64Environment", program)
+        self.assertNotIn("X64Runtime.wow64Environment", desktop)
+        self.assertIn("X64Runtime.environment", desktop)
+
+    def test_that_is_the_only_thing_the_two_environments_differ_by(self):
+        table = self.app.split("static let wow64Environment", 1)[1][:200]
+        self.assertIn('environment + ["BOXEDVN_WOW64_D3D9=dxvk"]', table)
+
+    def test_the_runtime_supplies_it_on_the_translated_lane_instead(self):
+        block = self._dxmt_block()
+        self.assertIn("K_X64_WOW64_D3D9_ENV", block)
+        self.assertIn("K_X64_WOW64_D3D9_DXVK", block)
+
+    def test_a_caller_that_set_it_still_wins(self) -> None:
+        block = self._dxmt_block()
+        self.assertIn("bool callerSetWow64D3d9 = false;", block)
+        self.assertIn("if (!callerSetWow64D3d9) {", block)
+
+    def test_the_dxmt_modules_are_the_same_directory_either_way(self) -> None:
+        # The program launch names the staging directory outright; the
+        # desktop launch does not pass one, and -x64modules falls back to the
+        # working directory, which for the desktop IS that same directory.
+        self.assertIn("launch.dxmtModuleDirectory.empty()", self.launch)
+        self.assertIn("? launch.workingDirectory", self.launch)
+        program = self._swift_body("launchX64Program")
+        desktop = self._swift_body("launchX64Desktop")
+        self.assertIn("dxmtModuleDirectory: runtime.guestWorkingDirectory",
+                      program)
+        self.assertIn("workingDirectory: runtime.guestWorkingDirectory",
+                      desktop)
+        self.assertNotIn("dxmtModuleDirectory:", desktop)
+
+    def test_the_module_overrides_reach_the_child_by_inheritance(self) -> None:
+        # WINEDLLOVERRIDES and the DXMT log settings are passed to the
+        # emulator once, at launch, so every guest process in the session
+        # inherits them -- which is why the desktop's children already have
+        # them and no per-program plumbing exists for them.
+        table = self.app.split("static let environment = [", 1)[1]
+        table = table[:table.index(chr(10) + "        ]")]
+        for setting in ("WINEDLLOVERRIDES=", "DXMT_LOG_LEVEL=",
+                        "DXMT_LOG_PATH=", "WINEDEBUG="):
+            self.assertIn(setting, table)
+
+
+class ThePlanSaysWhatShippedAndWhatRemains(unittest.TestCase):
+    def setUp(self) -> None:
+        self.plan = read(PLAN)
+
+    def test_design_b_is_marked_shipped_with_its_commit(self) -> None:
+        self.assertIn("design B shipped at `957383ad`", self.plan)
+
+    def test_the_device_evidence_is_quoted_not_summarised(self) -> None:
+        self.assertIn("BOXEDWINE_X64_EXEC_REMAP pid=45 fex=1 native=1",
+                      self.plan)
+        self.assertIn("role-held-by-live-owner", self.plan)
+
+    def test_the_working_directory_question_is_answered_from_a_log(self):
+        # It is the shell's to set, and the capture shows that it does.
+        self.assertIn("BOXEDWINE_X64_GETCWD", self.plan)
+
+    def test_what_is_open_is_written_as_what_is_open(self) -> None:
+        self.assertIn("## What is still open", self.plan)
+        self.assertNotIn("Nothing here is", self.plan)
 
 
 class TheSessionStillEndsWithTheLaunchedProcess(unittest.TestCase):

@@ -94,7 +94,12 @@
 #include <SDL_vulkan.h>
 #endif
 
+#ifdef BOXEDWINE_IOS
+#include "bvnhostpresent.h"
+#include <chrono>
+#endif
 #include <atomic>
+#include <mutex>
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
@@ -2234,6 +2239,149 @@ void Marshal::fixup(U32 sType, U8* host) {
     }
 }
 
+// ---- The surface registry ---------------------------------------------------
+//
+// Which X11 window a VkSurfaceKHR was made from, and how big that window was
+// when it was made.
+//
+// The native presentation backend already holds this (KVulkdanSDLImpl keeps a
+// VulkanSurfaceRecord per surface), but it holds it behind its own lock and
+// exposes only isPresentationSurface(). This bridge needs the size to answer a
+// question the backend never asks: whether the extent the host reports for a
+// surface is the size of the guest window that surface was made from.
+//
+// A device run said it is not. The guest window was 804x585 for the whole run,
+// and the host's presentation layer briefly re-parented its view during the
+// first frame; the capability query that DXVK made inside that window returned
+// 740x555, DXVK built a swapchain at 740x555, discovered the disagreement, and
+// tore the whole swapchain down and rebuilt it at 804x585. Nothing in the log
+// said that the extent had moved -- only that two swapchains were created with
+// different "Buffer size" lines, which is a symptom several unrelated causes
+// share. Recording the window size here makes the next log say it outright.
+struct SurfaceWindow {
+    U64 surface = 0;
+    U32 windowId = 0;
+    U32 width = 0;
+    U32 height = 0;
+};
+
+std::mutex gSurfaceWindowsMutex;
+std::vector<SurfaceWindow> gSurfaceWindows;
+
+void rememberSurfaceWindow(U64 surface, U32 windowId, U32 width, U32 height) {
+    if (!surface) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(gSurfaceWindowsMutex);
+    for (SurfaceWindow& record : gSurfaceWindows) {
+        if (record.surface == surface) {
+            record.windowId = windowId;
+            record.width = width;
+            record.height = height;
+            return;
+        }
+    }
+    gSurfaceWindows.push_back({surface, windowId, width, height});
+}
+
+// Returns false for a surface this bridge did not create, which is not an
+// error: Wine builds surfaces through other paths and the witness simply has
+// nothing to compare against for those.
+bool surfaceWindow(U64 surface, SurfaceWindow* out) {
+    if (!surface) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(gSurfaceWindowsMutex);
+    for (const SurfaceWindow& record : gSurfaceWindows) {
+        if (record.surface == surface) {
+            *out = record;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- The native presentation backend ----------------------------------------
+//
+// KVulkan carries five notifications the presentation backend uses to tell a
+// created Metal view from a guest that actually presented a frame:
+// registerVulkanSwapchain, destroyVulkanSwapchain, acquireVulkanSwapchain,
+// submitVulkanWorkload and presentVulkanSwapchain. Until this revision NO lane
+// called any of them, so every one of the diagnostics built on top of them was
+// reasoning from an empty table:
+//
+//   - the first-frame watchdog fires on !firstPresentObserved, and
+//     firstPresentObserved is set only by presentVulkanSwapchain, so it could
+//     never be cleared. "Produced no frame for 12 seconds" was true of every
+//     run that ever reached a surface, whether or not the guest presented.
+//   - registerVulkanSwapchain is the swapchain-rebuild-storm detector, and
+//     with an empty swapchainSurfaces map acquireVulkanSwapchain and
+//     presentVulkanSwapchain return at their first lookup.
+//   - "iOS guest performance: N Vulkan frames/sec" counts presents through
+//     bvnReportPresentRate(), which only presentVulkanSwapchain calls.
+//
+// So the wiring below is not new instrumentation; it is the connection those
+// three witnesses were always written against. It also means the watchdog's
+// verdict becomes evidence: after this, "no frame for 12 seconds" says the
+// guest made no successful vkQueuePresentKHR, rather than saying nothing.
+KVulkanPtr presentationBackend() {
+    return KNativeSystem::getVulkan();
+}
+
+// ---- The surface extent witness ---------------------------------------------
+//
+// Budgeted while the extent agrees with the guest window, unbudgeted while it
+// does not, because a disagreement is the interesting event and a program that
+// queries capabilities every frame would otherwise spend the budget on the
+// boring case. A disagreement that repeats is rate-limited to one line a
+// second by the count, not silenced: a storm of them IS the finding.
+std::atomic<U32> gSurfaceExtentReports{0};
+std::atomic<U32> gSurfaceExtentMismatches{0};
+
+void noteSurfaceExtent(const char* call, U32 tid, U64 surface,
+                       const VkSurfaceCapabilitiesKHR* capabilities,
+                       VkResult result) {
+    if (!capabilities) {
+        return;
+    }
+    SurfaceWindow window;
+    const bool known = surfaceWindow(surface, &window);
+    // 0xffffffff in both fields is the "the extent is whatever the swapchain
+    // asks for" encoding, which is not a disagreement with anything.
+    const bool undefined = capabilities->currentExtent.width == 0xffffffffu &&
+                           capabilities->currentExtent.height == 0xffffffffu;
+    const bool mismatch = known && !undefined &&
+        (capabilities->currentExtent.width != window.width ||
+         capabilities->currentExtent.height != window.height);
+    const U32 seen = gSurfaceExtentReports.fetch_add(
+        1, std::memory_order_relaxed);
+    U32 mismatches = 0;
+    if (mismatch) {
+        mismatches = gSurfaceExtentMismatches.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    }
+    if (!mismatch && seen >= 6 && result >= 0) {
+        return;
+    }
+    if (mismatch && mismatches > 8 && (mismatches % 60) != 0) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_VULKAN_SURFACE_EXTENT call=%s tid=%04X "
+             "surface=0x%llx window=0x%x window_size=%ux%u current=%ux%u "
+             "min=%ux%u max=%ux%u images=%u..%u agrees=%d mismatches=%u "
+             "status=%d",
+             call, tid, (unsigned long long)surface,
+             known ? window.windowId : 0, window.width, window.height,
+             capabilities->currentExtent.width,
+             capabilities->currentExtent.height,
+             capabilities->minImageExtent.width,
+             capabilities->minImageExtent.height,
+             capabilities->maxImageExtent.width,
+             capabilities->maxImageExtent.height,
+             capabilities->minImageCount, capabilities->maxImageCount,
+             known ? (mismatch ? 0 : 1) : -1, mismatches, (int)result);
+}
+
 // ---- vkCreateXlibSurfaceKHR -------------------------------------------------
 //
 // The one command that is not forwarded. The guest hands a
@@ -2272,6 +2420,9 @@ S64 createXlibSurface(KMemory64* memory, U64 instance, U64 createInfo,
     }
     const U64 handle = (U64)surface;
     memory->memcpyToGuest(surfaceOut, &handle, sizeof(handle));
+    const U32 windowWidth = xWindow ? xWindow->width() : 0;
+    const U32 windowHeight = xWindow ? xWindow->height() : 0;
+    rememberSurfaceWindow(handle, (U32)windowId, windowWidth, windowHeight);
     // Wine builds throwaway surfaces purely to probe adapter capabilities;
     // only a real presentation surface may take over the fake-fullscreen
     // target, which is the rule the IA-32 lane already follows.
@@ -2279,8 +2430,9 @@ S64 createXlibSurface(KMemory64* memory, U64 instance, U64 createInfo,
         XServer::getServer()->setFakeFullScreenWindow(xWindow);
     }
     klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkCreateXlibSurfaceKHR "
-             "window=0x%x surface=0x%llx status=0",
-             (U32)windowId, (unsigned long long)handle);
+             "window=0x%x surface=0x%llx window_size=%ux%u status=0",
+             (U32)windowId, (unsigned long long)handle, windowWidth,
+             windowHeight);
     return VK_SUCCESS;
 }
 
@@ -2856,8 +3008,13 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error(false);
         }
-        return (S64)((PFN_vkQueueSubmit)raw)((VkQueue)H(0), U32A(1), submits,
-                                             (VkFence)A(3));
+        const VkResult result = ((PFN_vkQueueSubmit)raw)(
+            (VkQueue)H(0), U32A(1), submits, (VkFence)A(3));
+        if (KVulkanPtr backend = presentationBackend()) {
+            backend->submitVulkanWorkload((int)result, U32A(1),
+                                          "vkQueueSubmit");
+        }
+        return (S64)result;
     }
 
     case VKB_AllocateMemory: {
@@ -3164,8 +3321,12 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error(false);
         }
-        return (S64)((PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)raw)(
-            (VkPhysicalDevice)H(0), (VkSurfaceKHR)A(1), capabilities);
+        const VkResult result =
+            ((PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)raw)(
+                (VkPhysicalDevice)H(0), (VkSurfaceKHR)A(1), capabilities);
+        noteSurfaceExtent("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", tid,
+                          A(1), capabilities, result);
+        return (S64)result;
     }
     case VKB_GetPhysicalDeviceSurfaceFormatsKHR: {
         uint32_t* countSlot = (uint32_t*)m.outRequired(A(2), sizeof(uint32_t));
@@ -3201,8 +3362,20 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error(false);
         }
-        return (S64)((PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR)raw)(
-            (VkPhysicalDevice)H(0), info, capabilities);
+        const VkResult result =
+            ((PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR)raw)(
+                (VkPhysicalDevice)H(0), info, capabilities);
+        // The surface is named inside the info structure here rather than in
+        // an argument slot, and the capabilities arrive inside a wrapper. Both
+        // are read out of the SHADOWS -- the copies the driver was given and
+        // wrote into -- because the guest's own memory does not carry the
+        // driver's answer until the marshal flushes.
+        if (info && capabilities) {
+            noteSurfaceExtent("vkGetPhysicalDeviceSurfaceCapabilities2KHR",
+                              tid, (U64)info->surface,
+                              &capabilities->surfaceCapabilities, result);
+        }
+        return (S64)result;
     }
     case VKB_GetPhysicalDeviceSurfaceFormats2KHR: {
         const VkPhysicalDeviceSurfaceInfo2KHR* info =
@@ -3250,10 +3423,49 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error();
         }
-        return (S64)((PFN_vkCreateSwapchainKHR)raw)((VkDevice)H(0), info,
-                                                    nullptr, out);
+        const VkResult result = ((PFN_vkCreateSwapchainKHR)raw)(
+            (VkDevice)H(0), info, nullptr, out);
+        if (result == VK_SUCCESS && info && out && *out) {
+            // The pairing the presentation backend was always written to
+            // receive: without it swapchainSurfaces stays empty, and every
+            // acquire and present notification below returns at its first
+            // lookup.
+            if (KVulkanPtr backend = presentationBackend()) {
+                backend->registerVulkanSwapchain((void*)*out,
+                                                 (void*)info->surface);
+            }
+        }
+        // What the guest asked for, beside the window it asked for it on. A
+        // device run built one swapchain at 740x555 and a second at 804x585
+        // on a window that was 804x585 throughout; this line and the extent
+        // witness above are what say which of the two the host had reported.
+        if (info) {
+            SurfaceWindow window;
+            const bool known = surfaceWindow((U64)info->surface, &window);
+            static std::atomic<U32> reported{0};
+            const U32 seen = reported.fetch_add(1, std::memory_order_relaxed);
+            if (seen < 8 || (seen % 60) == 0 || result != VK_SUCCESS) {
+                klog_fmt("BOXEDWINE_X64_VULKAN_SWAPCHAIN n=%u tid=%04X "
+                         "surface=0x%llx window=0x%x window_size=%ux%u "
+                         "requested=%ux%u images=%u mode=%d old=0x%llx "
+                         "swapchain=0x%llx status=%d",
+                         seen, tid, (unsigned long long)info->surface,
+                         known ? window.windowId : 0, window.width,
+                         window.height, info->imageExtent.width,
+                         info->imageExtent.height, info->minImageCount,
+                         (int)info->presentMode,
+                         (unsigned long long)info->oldSwapchain,
+                         (unsigned long long)(out ? *out : 0), (int)result);
+            }
+        }
+        return (S64)result;
     }
     case VKB_DestroySwapchainKHR:
+        if (A(1)) {
+            if (KVulkanPtr backend = presentationBackend()) {
+                backend->destroyVulkanSwapchain((void*)A(1));
+            }
+        }
         ((PFN_vkDestroySwapchainKHR)raw)((VkDevice)H(0), (VkSwapchainKHR)A(1),
                                          nullptr);
         return 0;
@@ -3302,6 +3514,12 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
                      (result == VK_SUCCESS && imageIndex) ? *imageIndex : 0xffffffffu,
                      (int)result);
         }
+        if (KVulkanPtr backend = presentationBackend()) {
+            backend->acquireVulkanSwapchain(
+                (void*)A(1), (int)result,
+                (result == VK_SUCCESS && imageIndex) ? *imageIndex
+                                                     : 0xffffffffu);
+        }
         return (S64)result;
     }
     case VKB_AcquireNextImage2KHR: {
@@ -3311,8 +3529,21 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error(false);
         }
-        return (S64)((PFN_vkAcquireNextImage2KHR)raw)((VkDevice)H(0), info,
-                                                      imageIndex);
+        const VkResult result = ((PFN_vkAcquireNextImage2KHR)raw)(
+            (VkDevice)H(0), info, imageIndex);
+        // Same notification as the one-argument form, reading the swapchain
+        // out of the shadow the driver was handed rather than an argument
+        // slot. Both forms have to report, or "the guest never acquired" is a
+        // claim about only one of the two ways of acquiring.
+        if (info) {
+            if (KVulkanPtr backend = presentationBackend()) {
+                backend->acquireVulkanSwapchain(
+                    (void*)info->swapchain, (int)result,
+                    (result == VK_SUCCESS && imageIndex) ? *imageIndex
+                                                         : 0xffffffffu);
+            }
+        }
+        return (S64)result;
     }
     case VKB_QueuePresentKHR: {
         const VkPresentInfoKHR* info =
@@ -3339,6 +3570,23 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
                      (info && info->pImageIndices && info->swapchainCount)
                          ? info->pImageIndices[0] : 0xffffffffu,
                      info ? info->waitSemaphoreCount : 0, (int)result);
+        }
+        // One notification per swapchain the present names, because a present
+        // may carry several and the backend keys its per-surface frame state
+        // by swapchain. The array is the marshalled shadow, so it is safe to
+        // walk it here.
+        if (info && info->pSwapchains) {
+            if (KVulkanPtr backend = presentationBackend()) {
+                for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                    // Per-swapchain results, when the caller asked for them,
+                    // are what say which swapchain failed; without pResults
+                    // every swapchain in the batch shares the call's result.
+                    const int status = info->pResults ? (int)info->pResults[i]
+                                                      : (int)result;
+                    backend->presentVulkanSwapchain(
+                        (void*)info->pSwapchains[i], status);
+                }
+            }
         }
         return (S64)result;
     }
@@ -3409,8 +3657,13 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error(false);
         }
-        return (S64)((PFN_vkQueueSubmit2)raw)((VkQueue)H(0), U32A(1), submits,
-                                              (VkFence)A(3));
+        const VkResult result = ((PFN_vkQueueSubmit2)raw)(
+            (VkQueue)H(0), U32A(1), submits, (VkFence)A(3));
+        if (KVulkanPtr backend = presentationBackend()) {
+            backend->submitVulkanWorkload((int)result, U32A(1),
+                                          "vkQueueSubmit2");
+        }
+        return (S64)result;
     }
 
     // ---- Events and query pools --------------------------------------------
@@ -5161,11 +5414,35 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
         } else {
             // One marshal per dispatch. It owns the shadows the driver was
             // given and the write-backs the guest is owed; both end here.
+#ifdef BOXEDWINE_IOS
+            // The IA-32 lane has timed these two since build 72; this lane
+            // never did, so "iOS guest present path: N ms inside
+            // vkQueuePresentKHR" reported zero for every 64-bit run no matter
+            // how long the compositor held the drawable. Two clock reads on
+            // two commands, exactly as the other lane does it.
+            const bool timed = (index == VKB_QueuePresentKHR ||
+                                index == VKB_AcquireNextImageKHR);
+            const auto started = timed
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point();
+#endif
             Marshal marshal(memory, name);
             result = dispatchCommand(index, marshal, args, count, tid);
             if (marshal.ok()) {
                 marshal.flush();
             }
+#ifdef BOXEDWINE_IOS
+            if (timed) {
+                const std::uint64_t us = (std::uint64_t)
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - started).count();
+                if (index == VKB_QueuePresentKHR) {
+                    bvnHostPresent::recordPresent(us);
+                } else {
+                    bvnHostPresent::recordAcquire(us);
+                }
+            }
+#endif
         }
         const U32 seen =
             gCommandCalls[index].fetch_add(1, std::memory_order_relaxed);
