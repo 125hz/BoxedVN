@@ -7388,3 +7388,41 @@ which is the fault the marshalling exists to prevent. They are refused by
 name. A lookup that fails now says whether the name was core or an extension,
 because an extension miss is expected and a core miss is how a table gets a
 hole.
+
+## A reserved page is not a misaligned one
+
+The 32-bit program that died reading a guest address was reading a page the
+guest had mapped with no access rights, which is how a reservation Wine has
+not yet committed looks. Wine commits it from its own fault handler, but only
+when it sees a page fault. This platform reports a protection failure as a bus
+error, we passed that through, and Wine read it as a misalignment and gave up.
+The fault is now classified from the guest page table rather than the host
+signal number: unmapped or protection-denied becomes a segmentation fault with
+the page-fault trap and the guest address, and only a genuine alignment fault
+stays a bus error. The unaligned handler still runs first, so that path cannot
+regress.
+
+Two readings of the earlier witness were wrong and are corrected: the host
+page was present, and the zeros in the line were uninitialised fields the
+repair never filled because it returns before probing.
+
+## The swapchain exists; the frame loop was never reached
+
+The 32-bit graphics path now creates a real surface and swapchain, two images
+at 804 by 585, and compiles its shaders. No frame follows. The dropped
+extension structures were real and one of them is visible in the guest's own
+output, where a present-mode query read back the zero it supplied itself, but
+they are not the cause. Marshalling them exposed a genuine defect in the
+opposite direction: a written-back structure holding a pointer would have had
+the host pointer copied into guest memory, which is the outward form of the
+fault this bridge exists to prevent. Output pointers are now restored before
+write-back, with a test that derives the affected structures from the headers
+rather than naming one.
+
+The account of the missing frame rests on witnesses that survive the log
+budget: nothing presented, nothing mapped, no call failed, and every futex
+waiter's age grows without bound, so the process is stopped rather than idle.
+The call histogram that suggested otherwise was an artifact of a global log
+budget of sixty-four, which the run exhausted before the interesting calls.
+That budget is now per command, so the next log can distinguish a command that
+was never called from one that merely fell off the end.

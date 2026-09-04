@@ -49,6 +49,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include "fex64loaderhandoff.h"
 #include "kmemory64.h"
 #include "kprocess.h"
+#include "ksignal.h"   // K_SIGSEGV / K_SEGV_* / K_BUS_ADRALN
 #include "kthread.h"
 #include "syscall64.h"
 #include "wine_nt_syscall_memory.h"
@@ -519,6 +520,104 @@ static uint32_t hostSignalGuestNumber(int signal) {
         case SIGFPE: return 8;
         default: return static_cast<uint32_t>(signal);
     }
+}
+
+// How a translated memory fault is described to the guest.
+struct GuestMemoryFaultClass {
+    uint32_t signal = 0;
+    uint32_t trapNumber = 0;
+    uint32_t code = 0;
+    uint64_t address = 0;
+    // The page map, not the host signal, decided this. False means the fault
+    // is not a guest-lane memory access and the host's own verdict stands.
+    bool fromPageMap = false;
+};
+
+// Classify a translated guest memory fault the way Linux would, from the page
+// map rather than from the host signal number.
+//
+// Linux raises SIGSEGV for BOTH memory faults a guest can recover from: an
+// address with no mapping is SEGV_MAPERR, and a mapped page whose protection
+// forbids the access is SEGV_ACCERR. Both carry trap 14 (#PF), and Wine turns
+// both into STATUS_ACCESS_VIOLATION -- the status its guard pages, its stack
+// growth and its commit-on-demand all run from. A 32-bit WoW64 view that
+// NtAllocateVirtualMemory reserved but has not committed is precisely the
+// second case: mapped, with no access rights at all, waiting for Wine's own
+// page-fault handler to commit it.
+//
+// Darwin describes the same fault as SIGBUS, and its arm64 sendsig() hard-wires
+// si_code to BUS_ADRALN for EVERY SIGBUS, so neither the host signal number nor
+// its code carries any information about which fault this was. Passing them
+// through delivered the guest SIGBUS with trap 17, which Wine reads as
+// STATUS_DATATYPE_MISALIGNMENT: the page-fault handler never ran and the
+// process died on its own reservation.
+//
+// The page map is the only ledger that knows what the guest was entitled to,
+// so it is what classifies the fault -- exactly as it is what authorises the
+// repair above. Only a fault on a page the map says the access WAS entitled to
+// can be an alignment fault, and that one keeps SIGBUS and trap 17; FEX's own
+// unaligned handler has already had first refusal on it at the top of the
+// fault path, so nothing that FEX can emulate in place reaches here at all.
+//
+// The address handed to the guest is the canonical guest address, never the
+// host alias the translator dereferenced.
+static GuestMemoryFaultClass classifyGuestMemoryFault(
+    BVNFEXCPU64Adapter* adapter, int signal, int hostSignalCode,
+    uint64_t faultAddress) {
+    GuestMemoryFaultClass result;
+    result.signal = hostSignalGuestNumber(signal);
+    result.trapNumber = hostSignalTrapNumber(signal);
+    result.code = static_cast<uint32_t>(hostSignalCode);
+    result.address = faultAddress;
+    if (signal != SIGBUS && signal != SIGSEGV) return result;
+
+    KMemory64* memory = adapter->process ? adapter->process->memory64 : nullptr;
+    if (!memory || !memory->nativeIdentityMode()) return result;
+
+    // The same membership test nativeRepairHostFault applies: only a host
+    // address that is the image of a guest address THIS address space serves
+    // can be described in guest terms at all. Everything else -- the
+    // emulator's own heap, the translated code arena, the kuser alias -- keeps
+    // the host's verdict and its host address.
+    const uint64_t guestAddress = k64HostToGuestAddress(faultAddress);
+    if (k64GuestToHostAddress(guestAddress) != faultAddress) return result;
+    const uint64_t guestPageAddress = guestAddress & ~K64_PAGE_MASK;
+    if (!memory->nativeGuestRangeAllowed(guestPageAddress, K64_PAGE_SIZE)) {
+        return result;
+    }
+    result.address = guestAddress;
+    result.fromPageMap = true;
+
+    const uint64_t pageNumber = guestAddress >> K64_PAGE_SHIFT;
+    const bool mapped = memory->isPageMapped(pageNumber);
+    // The translator cannot tell this handler whether the access was a load or
+    // a store, so read is the only right the page has to grant for the access
+    // to have been entitled -- the same requiredProt the repair asks for.
+    const bool readable =
+        mapped && (memory->getPageFlags(pageNumber) & K64_PAGE_READ) != 0;
+    if (!mapped || !readable) {
+        result.signal = K_SIGSEGV;
+        result.trapNumber = 14; // #PF
+        result.code = mapped ? K_SEGV_ACCERR : K_SEGV_MAPERR;
+        return result;
+    }
+    if (signal == SIGBUS) {
+        // The map entitles the access, so this is not a protection fault and
+        // not a missing translation. Alignment is what is left, and it is a
+        // genuine one: FEX declined to emulate it.
+        result.signal = K_SIGBUS;
+        result.trapNumber = 17;
+        result.code = K_BUS_ADRALN;
+        return result;
+    }
+    // A host SIGSEGV on a page the map says is readable is the two ledgers
+    // disagreeing about a page that exists, which the repair above already
+    // declined to reconcile. It is still a page fault to the guest, and the
+    // page is mapped, so it is an access error rather than a missing one.
+    result.signal = K_SIGSEGV;
+    result.trapNumber = 14; // #PF
+    result.code = K_SEGV_ACCERR;
+    return result;
 }
 
 // Read one guest qword through the SAME canonical-to-host translation the
@@ -1296,10 +1395,24 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     }
 
     auto* frame = adapter->fexThread->CurrentFrame;
-    uint32_t guestSignal = hostSignalGuestNumber(signal);
-    uint32_t guestTrapNumber = hostSignalTrapNumber(signal);
-    uint32_t guestSignalCode = static_cast<uint32_t>(siginfo->si_code);
-    uint64_t guestFaultAddress = faultAddress;
+    // The host signal number does not classify a memory fault on this
+    // platform; the page map does. See classifyGuestMemoryFault. A fault FEX
+    // generated on purpose is excluded: its si_addr describes the trapping
+    // stub rather than a guest access, and the branch below takes the whole
+    // architectural description from FEX instead.
+    GuestMemoryFaultClass faultClass;
+    faultClass.signal = hostSignalGuestNumber(signal);
+    faultClass.trapNumber = hostSignalTrapNumber(signal);
+    faultClass.code = static_cast<uint32_t>(siginfo->si_code);
+    faultClass.address = faultAddress;
+    if (!generatedException) {
+        faultClass = classifyGuestMemoryFault(adapter, signal,
+                                              siginfo->si_code, faultAddress);
+    }
+    uint32_t guestSignal = faultClass.signal;
+    uint32_t guestTrapNumber = faultClass.trapNumber;
+    uint32_t guestSignalCode = faultClass.code;
+    uint64_t guestFaultAddress = faultClass.address;
 
     if (generatedException) {
         // The GuestSignal_* stub already ran SpillStaticRegs, so the frame is
@@ -1465,13 +1578,17 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             }
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT pid=%d tid=%d host_signal=%d "
                      "si_code=%d fault=0x%llx host_pc=0x%llx in_code=%d generated=%d "
-                     "guest_signal=%u trap=%u guest_rip=0x%llx cs=0x%x ss=0x%x "
+                     "guest_signal=%u trap=%u guest_si_code=%u "
+                     "guest_fault=0x%llx pagemap=%d guest_rip=0x%llx cs=0x%x ss=0x%x "
                      "decode=%u bytes=%s",
                      adapter->process->id, adapter->thread->id, signal,
                      static_cast<int>(siginfo->si_code),
                      static_cast<unsigned long long>(faultAddress),
                      static_cast<unsigned long long>(hostPC), inCodeBuffer ? 1 : 0,
                      generatedException ? 1 : 0, guestSignal, guestTrapNumber,
+                     guestSignalCode,
+                     static_cast<unsigned long long>(guestFaultAddress),
+                     faultClass.fromPageMap ? 1 : 0,
                      static_cast<unsigned long long>(rip),
                      static_cast<unsigned>(frame->State.cs_idx),
                      static_cast<unsigned>(frame->State.ss_idx),

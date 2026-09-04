@@ -135,10 +135,24 @@ std::atomic<U32> gPresents{0};
 std::atomic<U32> gRefusals{0};
 std::atomic<U32> gDroppedNodes{0};
 
-// Budgeted so a program that renders does not drown the log: the first 64
-// dispatched commands are named, and after that only the ones that fail, the
-// ones the table does not carry, and one line every 60 presents.
-const U32 kNamedCallBudget = 64;
+// Budgeted PER COMMAND, not globally, and the difference is not cosmetic.
+//
+// A global budget is spent by whatever the program does most. A device run
+// reached exactly 64 dispatched calls before the budget closed, and 24 of
+// those were eight repetitions of the same three pipeline-creation commands;
+// everything after -- the command pool, the command buffer, the surface, both
+// swapchains, and whatever the presenter did next -- was invisible. The
+// conclusion drawn from that log ("no command pool, no submit, no present at
+// all") was an artifact of the budget rather than a fact about the run, and it
+// pointed the next investigation at the wrong half of the system.
+//
+// So each command carries its own small budget, a failure is named whatever
+// the budget says, and a global ceiling still keeps a program that renders
+// from filling the log. A command that starts and then stops is now visible as
+// one whose first calls are present and whose later ones are not, instead of
+// being indistinguishable from a command that was never called.
+const U32 kPerCommandBudget = 4;
+const U32 kNamedCallCeiling = 4096;
 const U32 kRefusalBudget = 64;
 
 // ---- The command table ------------------------------------------------------
@@ -165,6 +179,11 @@ const U64 kCommandOp[VKB_COUNT] = {
     BOXEDWINE_X64_VK_COMMANDS(VKB_OP)
 #undef VKB_OP
 };
+
+// How many times each command has been dispatched this session. The budget
+// above reads it; a run's own log also reports it as `seen=`, which turns the
+// line into a per-command call counter at no extra cost.
+std::atomic<U32> gCommandCalls[VKB_COUNT];
 
 int commandIndexForOp(U64 op) {
     for (int i = 0; i < VKB_COUNT; ++i) {
@@ -659,7 +678,31 @@ PFN_vkVoidFunction hostProc(int index) {
     X(VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,                               VkPushConstantsInfo) \
     X(VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO,                          VkPushDescriptorSetInfo) \
     X(VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_WITH_TEMPLATE_INFO,            VkPushDescriptorSetWithTemplateInfo) \
-    X(VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO,                 VkHostImageLayoutTransitionInfo)
+    X(VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO,                   VkHostImageLayoutTransitionInfo) \
+    /* VK_EXT_surface_maintenance1 and VK_EXT_swapchain_maintenance1. DXVK \
+     * enables both and chains them onto the surface capability query, the \
+     * swapchain create info and every present; a device run dropped all \
+     * three it used, and the presenter's own log line said so -- it \
+     * reported "Present mode: VK_PRESENT_MODE_FIFO_KHR (dynamic: no)", \
+     * which is what DXVK concludes when the compatibility node comes back \
+     * carrying the zero it put there itself. */ \
+    X(VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT,                            VkSurfacePresentModeEXT) \
+    X(VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT,            VkSurfacePresentScalingCapabilitiesEXT) \
+    X(VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT,              VkSurfacePresentModeCompatibilityEXT) \
+    X(VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT,             VkSwapchainPresentModesCreateInfoEXT) \
+    X(VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT,                     VkSwapchainPresentModeInfoEXT) \
+    X(VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT,                    VkSwapchainPresentFenceInfoEXT) \
+    X(VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT,           VkSwapchainPresentScalingCreateInfoEXT) \
+    X(VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_EXT,                   VkReleaseSwapchainImagesInfoEXT) \
+    /* The other four nodes the same run dropped. All are feature or \
+     * property queries whose absence reads to DXVK as "not supported", \
+     * which is the safe direction -- but the drop also reached \
+     * vkCreateDevice, where a feature DXVK asked to enable then silently \
+     * was not. */ \
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES,         VkPhysicalDeviceLineRasterizationFeatures) \
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES,              VkPhysicalDeviceMaintenance5Features) \
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES,            VkPhysicalDeviceMaintenance5Properties) \
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, VkPhysicalDeviceExtendedDynamicState3PropertiesEXT)
 
 struct ChainStructInfo {
     U32 sType;
@@ -1166,7 +1209,32 @@ public:
 
     // ---- Completion ---------------------------------------------------------
 
+    // A pointer member of a structure the driver WRITES INTO. The shadow
+    // holds the host address the driver was given; the guest must get its own
+    // pointer back, because flush() copies the whole body of a written-back
+    // node and would otherwise store a host address in guest memory -- the
+    // exact fault this file exists to prevent, in the one direction that is
+    // easy to miss, since it travels outward rather than inward.
+    //
+    // Until VK_EXT_surface_maintenance1 arrived, no structure in the table was
+    // both written back and holder of a pointer, so the hazard was latent.
+    // VkSurfacePresentModeCompatibilityEXT is the first, and the contract test
+    // holds every future one to the same rule.
+    void restorePointer(void* field, U64 guest) {
+        if (failed || !field) {
+            return;
+        }
+        Restore record = { field, guest };
+        restores.push_back(record);
+    }
+
     void flush() {
+        // Before anything is copied out: a pointer member the driver was
+        // handed a shadow for goes back to being the guest's own pointer.
+        for (size_t i = 0; i < restores.size(); ++i) {
+            ::memcpy(restores[i].field, &restores[i].guest, sizeof(U64));
+        }
+        restores.clear();
         for (size_t i = 0; i < records.size(); ++i) {
             const WriteBack& record = records[i];
             if (!record.stride) {
@@ -1215,6 +1283,13 @@ private:
         // 0 for a flat block; otherwise the size of one extensible structure,
         // whose pNext must not be written back.
         U32 stride;
+    };
+
+    // One pointer member of a written-back structure, and the guest value that
+    // has to be standing in the shadow by the time flush() copies it out.
+    struct Restore {
+        void* field;
+        U64 guest;
     };
 
     void* allocate(U64 bytes) {
@@ -1319,6 +1394,7 @@ private:
     const char* command;
     std::vector<void*> blocks;
     std::vector<WriteBack> records;
+    std::vector<Restore> restores;
     bool failed = false;
 };
 
@@ -2083,6 +2159,56 @@ void Marshal::fixup(U32 sType, U8* host) {
             false);
         break;
     }
+    // ---- Surface and swapchain maintenance1 --------------------------------
+
+    case (U32)VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT: {
+        // The one node in the table that the driver WRITES INTO and that holds
+        // a pointer, so it is the one place both halves matter. DXVK runs the
+        // two-call idiom through it: the first call has presentModeCount 0 and
+        // pPresentModes null and collects the count, the second passes an
+        // array of that size and collects the modes.
+        VkSurfacePresentModeCompatibilityEXT* info =
+            (VkSurfacePresentModeCompatibilityEXT*)host;
+        const U64 guestModes = address(info->pPresentModes);
+        info->pPresentModes = outArray(info->pPresentModes,
+                                       info->presentModeCount);
+        // Without this the write-back would hand the guest the shadow's own
+        // host address in place of its array pointer.
+        restorePointer(&info->pPresentModes, guestModes);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT: {
+        VkSwapchainPresentModesCreateInfoEXT* info =
+            (VkSwapchainPresentModesCreateInfoEXT*)host;
+        info->pPresentModes =
+            inArray(info->pPresentModes, info->presentModeCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT: {
+        VkSwapchainPresentModeInfoEXT* info =
+            (VkSwapchainPresentModeInfoEXT*)host;
+        info->pPresentModes =
+            inArray(info->pPresentModes, info->swapchainCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT: {
+        // One fence per swapchain, attached to a present and signalled when
+        // the presentation engine is done with the image. DXVK waits on it
+        // before reusing that image, so a dropped node here is a wait on a
+        // fence nothing will ever signal.
+        VkSwapchainPresentFenceInfoEXT* info =
+            (VkSwapchainPresentFenceInfoEXT*)host;
+        info->pFences = inArray(info->pFences, info->swapchainCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_EXT: {
+        VkReleaseSwapchainImagesInfoEXT* info =
+            (VkReleaseSwapchainImagesInfoEXT*)host;
+        info->pImageIndices =
+            inArray(info->pImageIndices, info->imageIndexCount);
+        break;
+    }
+
     case (U32)VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_WITH_TEMPLATE_INFO: {
         // The same problem vkUpdateDescriptorSetWithTemplate has, with the
         // template handle and the data in one structure rather than in two
@@ -4564,7 +4690,20 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
             // Same rule as vkMapMemory: the driver hands back a host address,
             // and an address inside an alias window is a guest page that the
             // guest can only hold in its canonical form.
-            *slot = boxedvn::hostToGuestAddress((U64)(uintptr_t)mapped);
+            const U64 handed =
+                boxedvn::hostToGuestAddress((U64)(uintptr_t)mapped);
+            *slot = handed;
+            // The same witness vkMapMemory prints, and for the same reason: a
+            // run that maps no memory has not begun to upload anything, and
+            // that is a fact worth being able to read off a log directly.
+            static std::atomic<U32> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                klog_fmt("BOXEDWINE_X64_VULKAN_MAP call=vkMapMemory2 "
+                         "host=0x%llx guest=0x%llx low4g=%d",
+                         (unsigned long long)(uintptr_t)mapped,
+                         (unsigned long long)handed,
+                         (handed >> 32) == 0 ? 1 : 0);
+            }
         }
         return (S64)result;
     }
@@ -4686,6 +4825,16 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         ((PFN_vkCmdPushDescriptorSetWithTemplate2)raw)((VkCommandBuffer)H(0),
                                                        info);
         return 0;
+    }
+
+    case VKB_ReleaseSwapchainImagesEXT: {
+        const VkReleaseSwapchainImagesInfoEXT* info =
+            (const VkReleaseSwapchainImagesInfoEXT*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkReleaseSwapchainImagesEXT)raw)((VkDevice)H(0),
+                                                           info);
     }
 
     case VKB_CreateXlibSurfaceKHR:
@@ -4954,12 +5103,15 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
                 marshal.flush();
             }
         }
+        const U32 seen =
+            gCommandCalls[index].fetch_add(1, std::memory_order_relaxed);
         const U32 named = gNamedCalls.fetch_add(1, std::memory_order_relaxed);
-        if (named < kNamedCallBudget || result < 0) {
+        if (result < 0 ||
+            (seen < kPerCommandBudget && named < kNamedCallCeiling)) {
             klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=%s pid=%u args=%llu "
-                     "status=%lld",
+                     "status=%lld seen=%u",
                      name, pid, (unsigned long long)count,
-                     (long long)result);
+                     (long long)result, seen + 1);
         }
         writeBack = false; // the marshal wrote the results back itself
 #else

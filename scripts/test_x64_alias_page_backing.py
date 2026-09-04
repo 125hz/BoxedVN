@@ -26,10 +26,32 @@ and the host VM plus nativeRanges at the iOS host page size of 16 KiB -- and
 FEX consults only the second one, because the translator dereferences the alias
 directly. When they disagree the guest is killed for reading a page it mapped.
 
-These tests hold the reconciliation in place: the page map stays the authority,
-the repair never grants more than the page map grants, the retry is bounded,
-and the witness that will identify the producing ledger keeps printing every
-fact needed to tell "no host page" from "host page, wrong protection".
+The device run that followed showed the repair working exactly as designed and
+the program dying anyway:
+
+    BOXEDWINE_X64_ALIAS_BACKING  ... guest=0xd88000 mapped=1 guest_prot=0x0
+    BOXEDWINE_FEX64_GUEST_FAULT  ... guest_signal=7 trap=17 guest_rip=0x7a6fb0b0
+
+mapped=1 with guest_prot=0x0 is a page the guest reserved and has not committed
+-- which is what NtAllocateVirtualMemory's MEM_RESERVE leaves behind, and what
+mmapAnonymousFixed records for PROT_NONE: K64_PAGE_MAPPED with neither
+K64_PAGE_READ nor K64_PAGE_WRITE. The repair refused it, correctly, because the
+page map does not entitle the guest to read it. (The host= and host_present=
+fields on that line are the report's untouched defaults: the refusal returns
+before either is probed, so they are not evidence that the host page is absent.)
+
+What was wrong was the signal that refusal turned into. On Linux that access is
+SIGSEGV with SEGV_ACCERR and trap 14, which Wine turns into
+STATUS_ACCESS_VIOLATION and commits the page from its own handler. Passing
+Darwin's SIGBUS through delivered guest signal 7 with trap 17, which Wine reads
+as STATUS_DATATYPE_MISALIGNMENT: the page-fault handler never ran.
+
+These tests hold both halves in place: the page map stays the authority, the
+repair never grants more than the page map grants, the retry is bounded, the
+witness that will identify the producing ledger keeps printing every fact
+needed to tell "no host page" from "host page, wrong protection", and the
+signal the guest is finally handed is classified from the page map rather than
+from a host signal number that cannot carry the distinction.
 
 Source-level contracts on purpose: building the emulator needs the iOS
 toolchain, and there is no host on which the ARM64 signal path can be run.
@@ -46,6 +68,7 @@ KMEMORY_HEADER = REPO / "include" / "kmemory64.h"
 KMEMORY_SOURCE = REPO / "source" / "kernel" / "kmemory64.cpp"
 ADAPTER = REPO / "ios" / "runtime" / "src" / "BVNFEXCPU64Adapter.mm"
 ALIAS_HEADER = REPO / "include" / "guest_low_alias.h"
+KSIGNAL_HEADER = REPO / "include" / "ksignal.h"
 FEX_BUILD = REPO / "scripts" / "build-fex64-fex.sh"
 
 # The witness line. Every one of these fields has to survive, because the point
@@ -331,6 +354,208 @@ class TheTranslatorStillDereferencesDirectly(unittest.TestCase):
         # different host addresses for one guest address.
         build = read(FEX_BUILD)
         self.assertNotIn("fex32-guest-window-bias.patch", build)
+
+
+class TheGuestSignalIsClassifiedFromThePageMap(unittest.TestCase):
+    """The second half of the failure: the refusal above is right, and the
+    signal it was turned into was wrong."""
+
+    def setUp(self) -> None:
+        self.source = read(ADAPTER)
+        self.body = function_body(
+            self.source, "static GuestMemoryFaultClass classifyGuestMemoryFault(")
+
+    def test_the_page_map_is_what_is_consulted(self) -> None:
+        # Not the host signal number, and not si_code: on Darwin neither can
+        # tell a protection failure from an alignment fault.
+        self.assertIn("isPageMapped(pageNumber)", self.body)
+        self.assertIn("getPageFlags(pageNumber) & K64_PAGE_READ", self.body)
+
+    def test_an_unmapped_guest_address_is_a_mapping_error(self) -> None:
+        self.assertIn("result.code = mapped ? K_SEGV_ACCERR : K_SEGV_MAPERR;",
+                      self.body)
+
+    def test_a_mapped_page_that_forbids_the_access_is_an_access_error(self) -> None:
+        # A Wine MEM_RESERVE view is exactly this: K64_PAGE_MAPPED with no
+        # K64_PAGE_READ. Wine commits it on demand from its own handler, but
+        # only ever reaches that handler for STATUS_ACCESS_VIOLATION.
+        self.assertIn("if (!mapped || !readable) {", self.body)
+        self.assertIn("result.signal = K_SIGSEGV;", self.body)
+        self.assertIn("K_SEGV_ACCERR", self.body)
+
+    def test_both_page_fault_verdicts_carry_trap_14(self) -> None:
+        # Trap 14 is #PF. Wine's exception dispatcher reads the trap number, so
+        # a SIGSEGV that still said 17 would be no better than the SIGBUS was.
+        self.assertEqual(self.body.count("result.trapNumber = 14; // #PF"), 2,
+                         "both SIGSEGV verdicts must name #PF")
+
+    def test_only_an_entitled_access_stays_a_bus_error(self) -> None:
+        # An alignment fault is the one memory fault left on a page the map
+        # says the guest may read, so that is the only path that keeps SIGBUS.
+        bus = self.body.index("result.signal = K_SIGBUS;")
+        readable_gate = self.body.index("if (!mapped || !readable) {")
+        self.assertLess(readable_gate, bus,
+                        "SIGBUS must only be reachable past the page-map gate")
+        self.assertIn("result.trapNumber = 17;", self.body)
+        self.assertIn("result.code = K_BUS_ADRALN;", self.body)
+
+    def test_the_guest_sees_the_guest_address_not_the_host_alias(self) -> None:
+        # The translator dereferenced the alias, so si_addr is a host address.
+        # Handing 0x7800d88000 to a 32-bit guest names no address it has.
+        self.assertIn(
+            "const uint64_t guestAddress = k64HostToGuestAddress(faultAddress);",
+            self.body)
+        self.assertIn("result.address = guestAddress;", self.body)
+
+    def test_only_a_guest_lane_address_is_reclassified(self) -> None:
+        # Same membership test the repair applies: the round trip through the
+        # alias, then the window guard. A fault on the emulator's own heap or
+        # on the code arena keeps the host verdict AND the host address.
+        self.assertIn("k64GuestToHostAddress(guestAddress) != faultAddress",
+                      self.body)
+        self.assertIn("nativeGuestRangeAllowed(guestPageAddress, K64_PAGE_SIZE)",
+                      self.body)
+        self.assertIn("result.fromPageMap = true;", self.body)
+
+    def test_only_memory_faults_are_reclassified(self) -> None:
+        # SIGILL and SIGFPE describe the instruction, not an address; the page
+        # map has nothing to say about them.
+        self.assertIn(
+            "if (signal != SIGBUS && signal != SIGSEGV) return result;",
+            self.body)
+
+
+class TheClassificationReachesTheGuest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source = read(ADAPTER)
+        # The DEFINITION, not the no-op stub of the same name at the top of the
+        # file: splitting on the bare name would put the whole file in scope
+        # and make every ordering assertion below meaningless.
+        self.handler = self.source.split(
+            "BVNFEXCPU64Adapter* adapter, const void* signalConfigPointer, "
+            "int signal,", 1)[1]
+
+    def test_the_guest_signal_comes_from_the_classification(self) -> None:
+        for field in ("uint32_t guestSignal = faultClass.signal;",
+                      "uint32_t guestTrapNumber = faultClass.trapNumber;",
+                      "uint32_t guestSignalCode = faultClass.code;",
+                      "uint64_t guestFaultAddress = faultClass.address;"):
+            self.assertIn(field, self.handler)
+
+    def test_the_classified_values_are_what_is_raised(self) -> None:
+        # raiseSyncFault is the architectural operation; it is what builds the
+        # Linux siginfo frame the guest handler reads.
+        self.assertIn("raiseSyncFault(\n            guestSignal, guestTrapNumber,\n"
+                      "            static_cast<int>(guestSignalCode), guestFaultAddress)",
+                      self.handler)
+
+    def test_fex_still_gets_first_refusal_on_an_unaligned_access(self) -> None:
+        # FEX emulates the atomic in place or backpatches the access and says
+        # how far the host PC moves. Nothing may come between that and the
+        # fault, or an emulable unaligned atomic would be turned into a guest
+        # signal instead of being completed.
+        unaligned = self.handler.index("HandleUnalignedAccess(")
+        classify = self.handler.index("classifyGuestMemoryFault(")
+        self.assertLess(unaligned, classify,
+                        "the classifier must not run before FEX's own handler")
+        # And it is still entered on exactly the host description Darwin gives
+        # an unaligned atomic, with no page-map precondition of its own.
+        self.assertIn(
+            "if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inCodeBuffer) {",
+            self.source)
+
+    def test_the_repair_is_still_tried_before_the_classification(self) -> None:
+        # A page the map DOES entitle the guest to is repaired and retried; it
+        # must never be classified into a guest signal at all.
+        repair = self.handler.index("repairGuestLaneHostFault(adapter, signal,")
+        classify = self.handler.index("classifyGuestMemoryFault(")
+        self.assertLess(repair, classify)
+
+    def test_a_fex_generated_exception_is_never_reclassified(self) -> None:
+        # Its si_addr describes FEX's own trapping stub, not a guest access.
+        self.assertIn("if (!generatedException) {\n"
+                      "        faultClass = classifyGuestMemoryFault(adapter, signal,\n"
+                      "                                              siginfo->si_code, faultAddress);\n"
+                      "    }", self.handler)
+        # And the generated branch still overrides all four from FEX's own
+        # architectural description.
+        generated = self.handler.split("if (generatedException) {", 1)[1]
+        for field in ("guestSignal = hostSignalGuestNumber(faultData.Signal);",
+                      "guestTrapNumber = faultData.TrapNo;",
+                      "guestSignalCode = faultData.si_code;",
+                      "guestFaultAddress = frame->State.rip;"):
+            self.assertIn(field, generated)
+
+    def test_the_witness_says_what_the_guest_was_handed(self) -> None:
+        # host_signal / si_code alone cannot be read back into a verdict, which
+        # is the whole point; the line has to carry both sides.
+        start = self.source.index(
+            '"BOXEDWINE_FEX64_GUEST_FAULT pid=%d tid=%d host_signal=%d "')
+        line = self.source[start:].split(");", 1)[0]
+        for field in ("host_signal=%d", "si_code=%d", "fault=0x%llx",
+                      "guest_signal=%u", "trap=%u", "guest_si_code=%u",
+                      "guest_fault=0x%llx", "pagemap=%d"):
+            self.assertIn(field, line,
+                          f"the fault witness stopped printing {field}")
+
+
+class TheSignalCodesAreLinuxs(unittest.TestCase):
+    def setUp(self) -> None:
+        self.header = read(KSIGNAL_HEADER)
+
+    def test_the_codes_carry_the_values_a_linux_guest_expects(self) -> None:
+        # asm-generic/siginfo.h. Wine reads si_code out of the frame CPU64
+        # builds, so a wrong value here is a wrong exception record.
+        for name, value in (("K_SEGV_MAPERR", 1), ("K_SEGV_ACCERR", 2),
+                            ("K_BUS_ADRALN", 1), ("K_BUS_ADRERR", 2),
+                            ("K_BUS_OBJERR", 3)):
+            match = re.search(rf"^#define {name}\s+(\d+)", self.header, re.M)
+            self.assertIsNotNone(match, f"{name} is not defined")
+            self.assertEqual(int(match.group(1)), value)
+
+    def test_the_guest_signal_numbers_are_linuxs(self) -> None:
+        # Darwin numbers SIGBUS 10 and SIGSEGV 11; Linux numbers them 7 and 11.
+        for name, value in (("K_SIGSEGV", 11), ("K_SIGBUS", 7)):
+            match = re.search(rf"^#define {name}\s+(\d+)", self.header, re.M)
+            self.assertIsNotNone(match)
+            self.assertEqual(int(match.group(1)), value)
+
+
+class AReservationIsAMappedPageWithNoRights(unittest.TestCase):
+    """Why the page carried no protection at all, from the producing side."""
+
+    def setUp(self) -> None:
+        self.source = read(KMEMORY_SOURCE)
+
+    def test_prot_none_records_a_mapped_page_with_no_access_bits(self) -> None:
+        # Wine reserves address space before committing it, and a reserved view
+        # reaches this address space as PROT_NONE. Both producers start from
+        # K64_PAGE_MAPPED and add READ/WRITE only for the requested protection,
+        # so prot 0 leaves mapped=1 with guest_prot=0x0 -- exactly what the
+        # device witness printed.
+        for producer in ("U32 flags = K64_PAGE_MAPPED;",
+                         "U32 newFlags = K64_PAGE_MAPPED;"):
+            self.assertIn(producer, self.source)
+        self.assertIn("if (prot & 0x1) flags |= K64_PAGE_READ;", self.source)
+        self.assertIn("if (prot & 0x1) newFlags |= K64_PAGE_READ;", self.source)
+
+    def test_the_protection_bits_are_read_and_write_only(self) -> None:
+        # K64_PAGE_EXEC is guest metadata, so nothing else can zero the
+        # protection of a page the page map still calls mapped.
+        body = function_body(self.source, "static U32 k64GuestProtFromPageFlags(")
+        self.assertIn("if (flags & K64_PAGE_READ) prot |= 0x1;", body)
+        self.assertIn("if (flags & K64_PAGE_WRITE) prot |= 0x2;", body)
+        self.assertIn("K64_PAGE_EXEC intentionally remains guest metadata only",
+                      body)
+
+    def test_the_repair_refuses_a_reservation_rather_than_committing_it(self) -> None:
+        # Committing it here would be BoxedWine deciding what Wine's own
+        # page-fault handler is for. The refusal is right; delivering it as a
+        # page fault is what makes the refusal usable.
+        body = function_body(
+            self.source, "bool KMemory64::nativeRepairHostFault(")
+        self.assertIn("if (report.guestProt == 0 ||", body)
+        self.assertIn('report.decision = "guest-protected"', body)
 
 
 if __name__ == "__main__":

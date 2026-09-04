@@ -1131,6 +1131,177 @@ class RecordingHalfContract(unittest.TestCase):
                 self.assertEqual(aliases.get(alias), core)
 
 
+class SwapchainMaintenanceContract(unittest.TestCase):
+    """The surface and swapchain maintenance1 families, and the write-back
+    hazard the first of them exposed.
+
+    A device run reached a swapchain and then never presented. Every
+    VK_EXT_surface_maintenance1 and VK_EXT_swapchain_maintenance1 node DXVK
+    chained was dropped, and the presenter's own output showed the consequence:
+    it reported `Present mode: VK_PRESENT_MODE_FIFO_KHR (dynamic: no)`, which
+    is what DXVK concludes when VkSurfacePresentModeCompatibilityEXT comes back
+    carrying the zero DXVK itself put there.
+
+    VkSurfacePresentModeCompatibilityEXT is also the first structure in the
+    table that the driver WRITES INTO and that holds a pointer, which is a
+    hazard the marshal had never had to face: the write-back copies a node's
+    whole body, so the shadow's own host address would have been stored into
+    guest memory.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+        self.pairs = chain_structs()
+        self.listed = {stype for stype, _struct in self.pairs}
+        self.commands = bridge_commands()
+
+    def test_the_surface_maintenance1_nodes_are_carried(self) -> None:
+        for stype in ("VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT",
+                      "VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT",
+                      "VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT"):
+            with self.subTest(stype=stype):
+                self.assertIn(stype, self.listed)
+
+    def test_the_swapchain_maintenance1_nodes_are_carried(self) -> None:
+        for stype in ("VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT",
+                      "VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT",
+                      "VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT",
+                      "VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT",
+                      "VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_EXT"):
+            with self.subTest(stype=stype):
+                self.assertIn(stype, self.listed)
+
+    def test_the_present_fence_is_marshalled(self) -> None:
+        # The one whose absence is a hang rather than a degradation: DXVK
+        # attaches a fence per swapchain to every present and waits on it
+        # before reusing that image. A dropped node is a wait on a fence
+        # nothing will ever signal.
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT:"):]
+        body = body[:body.index("break;")]
+        self.assertIn("info->pFences = inArray(info->pFences, info->swapchainCount)",
+                      body)
+
+    def test_the_nodes_the_device_run_dropped_are_all_covered_now(self) -> None:
+        # The complete set of sTypes that run reported as unknown-stype. If any
+        # is still absent the same run would drop it again.
+        for stype in (
+                "VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT",                 # 1000274000
+                "VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT",   # 1000274002
+                "VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT",  # 1000275002
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES",  # 1000259000
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES",   # 1000470000
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES", # 1000470001
+                "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT"):  # 1000455001
+            with self.subTest(stype=stype):
+                self.assertIn(stype, self.listed)
+
+    def test_release_swapchain_images_is_dispatchable(self) -> None:
+        self.assertIn("ReleaseSwapchainImagesEXT", self.commands)
+        self.assertIn("case VKB_ReleaseSwapchainImagesEXT:", self.source)
+
+    def test_a_written_back_pointer_member_is_restored_to_the_guests_own(self) -> None:
+        # The hazard. flush() copies a written-back node's whole body, so a
+        # pointer member left holding the shadow's address would put a HOST
+        # address into guest memory -- the fault this file exists to prevent,
+        # travelling outward instead of inward.
+        self.assertIn("void restorePointer(void* field, U64 guest)", self.source)
+        self.assertIn("struct Restore", self.source)
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT:"):]
+        body = body[:body.index("break;")]
+        self.assertIn("outArray(", body)
+        self.assertIn("restorePointer(&info->pPresentModes", body)
+        self.assertLess(body.index("outArray("), body.index("restorePointer("),
+                        "the guest pointer has to be captured before the shadow "
+                        "replaces it")
+
+    def output_structs_holding_a_pointer(self) -> list[tuple[str, str]]:
+        """Chain-table structures Vulkan marks as OUTPUT that hold a pointer.
+
+        The header itself carries the marker: an extensible structure the
+        driver writes into declares `void* pNext`, and one the caller only
+        reads declares `const void* pNext`. So "is this written back?" is a
+        fact from vulkan_core.h rather than a judgement, and every such
+        structure with a pointer member of its own is subject to the restore
+        rule.
+        """
+        text = VULKAN_CORE.read_text(encoding="utf-8")
+        found = []
+        for stype, struct in self.pairs:
+            match = re.search(r"typedef struct " + struct + r" \{(.*?)\} "
+                              + struct + r";", text, re.S)
+            if not match:
+                continue
+            body = match.group(1)
+            if not re.search(r"^\s*void\*\s+pNext;", body, re.M):
+                continue  # const void* pNext: an input structure
+            members = [line for line in body.splitlines()
+                       if "*" in line and "pNext" not in line]
+            if members:
+                found.append((stype, struct))
+        return found
+
+    def test_every_output_structure_with_a_pointer_restores_it(self) -> None:
+        # The general form of the rule, so the NEXT one is caught here rather
+        # than on a device. Today exactly one structure qualifies; the test is
+        # written to find them rather than to list them.
+        candidates = self.output_structs_holding_a_pointer()
+        self.assertTrue(candidates,
+                        "the header scan found no output structures at all, "
+                        "which means it stopped working rather than that none "
+                        "exist")
+        for stype, struct in candidates:
+            with self.subTest(struct=struct):
+                marker = f"case (U32){stype}:"
+                self.assertIn(marker, self.source,
+                              f"{struct} is written back and holds a pointer, "
+                              "so it needs a fixup")
+                body = self.source[self.source.index(marker):]
+                body = body[:body.index("break;")]
+                self.assertIn("restorePointer(", body,
+                              f"{struct} would carry a host address back into "
+                              "guest memory")
+
+    def test_the_restore_runs_before_anything_is_copied_out(self) -> None:
+        flush = self.source[self.source.index("    void flush() {"):]
+        flush = flush[:flush.index("\n    }\n")]
+        self.assertLess(flush.index("restores"), flush.index("records"),
+                        "a pointer member must be put back before the "
+                        "write-back copies the body over it")
+
+    def test_the_per_command_log_budget_replaced_the_global_one(self) -> None:
+        # The global budget was spent by whatever the program did most: a
+        # device run reached exactly 64 dispatched calls, 24 of them eight
+        # repetitions of three pipeline-creation commands, and the entire
+        # recording and presentation half of the run was invisible. The
+        # conclusion drawn from that log was an artifact of the budget.
+        self.assertIn("kPerCommandBudget", self.source)
+        self.assertIn("kNamedCallCeiling", self.source)
+        self.assertIn("gCommandCalls[VKB_COUNT]", self.source)
+        self.assertNotIn("kNamedCallBudget", self.source)
+        body = self.source[self.source.index("gCommandCalls[index].fetch_add"):]
+        body = body[:body.index("}")]
+        self.assertIn("result < 0", body)
+        self.assertIn("seen < kPerCommandBudget", body)
+        self.assertIn("seen=%u", body)
+
+    def test_both_map_paths_carry_the_address_witness(self) -> None:
+        # Reasoning from the ABSENCE of a witness only works when every path
+        # that could have produced it has one. vkMapMemory had the witness and
+        # vkMapMemory2 did not, so "no memory was ever mapped" was a weaker
+        # claim than it looked.
+        self.assertEqual(self.source.count("BOXEDWINE_X64_VULKAN_MAP"), 2)
+        for command in ("MapMemory", "MapMemory2"):
+            with self.subTest(command=command):
+                start = self.source.index(f"case VKB_{command}:")
+                rest = self.source[start + 1:]
+                end = re.search(r"^\s*case VKB_\w+:", rest, re.MULTILINE)
+                body = rest[:end.start()] if end else rest
+                self.assertIn("BOXEDWINE_X64_VULKAN_MAP", body)
+                self.assertIn("hostToGuestAddress", body)
+
+
 def core_commands() -> dict[str, str]:
     """Every command core Vulkan defines, mapped to the version that added it.
 

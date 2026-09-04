@@ -138,7 +138,13 @@
  *    instead, and the host writes the answer there. A shim built for 5 has no
  *    entry point for any of the new commands and does not know the convention,
  *    which is the whole reason this is a version and not an addition. */
-#define BOXEDWINE_X64_VK_ABI_VERSION 6U
+/* 7: the surface / swapchain maintenance1 pass. A device run reached a
+ *    swapchain and then never presented; the bridge was dropping every
+ *    VK_EXT_surface_maintenance1 and VK_EXT_swapchain_maintenance1 node DXVK
+ *    chained onto the capability query, the swapchain create info and the
+ *    present. Those structures are now carried, and vkReleaseSwapchainImagesEXT
+ *    with them -- one more command, so one more version. */
+#define BOXEDWINE_X64_VK_ABI_VERSION 7U
 
 /*
  * The bridge's own refusals, as distinct from a VkResult.
@@ -550,7 +556,12 @@
     X(GetImageSubresourceLayout2,                599) \
     X(GetDeviceImageSubresourceLayout,           613) \
     X(GetRenderingAreaGranularity,                95) \
-    X(TransitionImageLayout,                     531)
+    X(TransitionImageLayout,                     531) \
+    /* VK_EXT_swapchain_maintenance1: DXVK calls this to give back an image it
+     * acquired and decided not to present. Not core, but it is in the family
+     * whose chain structures this bridge now carries, and a swapchain the
+     * presenter cannot release images from is one it stops acquiring from. */ \
+    X(ReleaseSwapchainImagesEXT,                 612)
 
 /*
  * The core commands this bridge deliberately does NOT carry.

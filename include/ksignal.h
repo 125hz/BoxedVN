@@ -95,6 +95,24 @@
 #define K_TRAP_BRKPT	1	/* process breakpoint */
 #define K_TRAP_TRACE	2	/* process trace trap */
 
+// The SIGSEGV si_code values. Linux raises SEGV_MAPERR for an access to an
+// address with no mapping at all and SEGV_ACCERR for one the mapping's own
+// protection forbids -- a reserved-but-uncommitted view is exactly the
+// second case, a page that exists with no access rights. Wine turns both
+// into STATUS_ACCESS_VIOLATION, which is what its guard pages, its stack
+// growth and its commit-on-demand all key on, so a memory fault the guest is
+// meant to recover from has to arrive as one of these and not as a bus error.
+#define K_SEGV_MAPERR	1	/* address not mapped to object */
+#define K_SEGV_ACCERR	2	/* invalid permissions for mapped object */
+
+// The SIGBUS si_code values. Darwin's arm64 sendsig() stamps BUS_ADRALN onto
+// every SIGBUS it raises, so the host code carries no information; the guest
+// is only ever handed this signal for an access the page map says it was
+// entitled to make, which leaves alignment as the fault it actually is.
+#define K_BUS_ADRALN	1	/* invalid address alignment */
+#define K_BUS_ADRERR	2	/* non-existent physical address */
+#define K_BUS_OBJERR	3	/* object specific hardware error */
+
 #define K_SS_ONSTACK 1
 #define K_SS_DISABLE 4
 

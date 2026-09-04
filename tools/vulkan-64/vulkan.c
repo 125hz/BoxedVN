@@ -1018,6 +1018,11 @@ VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingAttachmentLocations(VkCommandBuffer 
 VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingInputAttachmentIndices(VkCommandBuffer commandBuffer, const void* pInputAttachmentIndexInfo)
 { BW_V(CmdSetRenderingInputAttachmentIndices, U(commandBuffer), U(pInputAttachmentIndexInfo)); }
 
+/* -- Swapchain maintenance1 ------------------------------------------------ */
+
+VKAPI_ATTR VkResult VKAPI_CALL vkReleaseSwapchainImagesEXT(VkDevice device, const void* pReleaseInfo)
+{ BW_R(ReleaseSwapchainImagesEXT, U(device), U(pReleaseInfo)); }
+
 /* -- Procedure lookup ------------------------------------------------------ */
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName);
