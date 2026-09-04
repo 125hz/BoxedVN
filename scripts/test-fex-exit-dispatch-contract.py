@@ -4140,6 +4140,15 @@ def main() -> None:
                     "and reopening one nests it: {}".format(
                         patch_path.name, number, line[1:]))
 
+    # The watchdog must not take a lock the thread it suspended can own.
+    poll = backend.split('extern "C" void BVNFEXBackendPollExecutionTrace(void)', 1)[1]
+    suspended = poll.split("thread_suspend(", 1)[1].split("thread_resume(", 1)[0]
+    active_lines = "\n".join(line.split("//", 1)[0] for line in suspended.splitlines())
+    for forbidden in ("IsAddressInCodeBuffer(", "RestoreRIPFromHostPC(",
+                      "std::lock_guard", "std::unique_lock", "memory->readq("):
+        if forbidden in active_lines:
+            raise SystemExit("watchdog can deadlock its suspended thread: " + forbidden)
+
     print("FEX exit-dispatch and loader-boundary contracts verified")
 
 

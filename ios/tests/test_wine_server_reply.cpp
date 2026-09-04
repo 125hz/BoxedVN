@@ -49,6 +49,24 @@ std::array<std::uint8_t, K_WINE_SERVER_MESSAGE_BYTES> admittedReply(
 
 }  // namespace
 
+BOXEDVN_TEST(wine_thread_termination_keeps_windows_exception_status) {
+    auto message = emptyMessage();
+    putDword(message.data(), 0, K_WINE_REQ_TERMINATE_THREAD);
+    putDword(message.data(), 12, 0xfffffffe); // current Windows thread
+    putDword(message.data(), 16, 0xc0000005); // access violation, not Linux exit(0)
+    auto decoded = decodeWineTerminateThreadRequest(message.data(), message.size());
+    CHECK(decoded.valid);
+    CHECK_EQ(decoded.handle, 0xfffffffeu);
+    CHECK_EQ(decoded.exitCode, 0xc0000005u);
+    CHECK(!decodeWineTerminateThreadRequest(message.data(), 16).valid);
+    CHECK(!decodeWineTerminateThreadRequest(nullptr, 64).valid);
+    putDword(message.data(), 4, 4); // variable payload cannot be this request
+    CHECK(!decodeWineTerminateThreadRequest(message.data(), message.size()).valid);
+    putDword(message.data(), 4, 0);
+    putDword(message.data(), 0, K_WINE_REQ_INIT_PROCESS_DONE);
+    CHECK(!decodeWineTerminateThreadRequest(message.data(), message.size()).valid);
+}
+
 BOXEDVN_TEST(wine_server_request_opcode_needs_a_whole_message) {
     auto request = emptyMessage();
     putDword(request.data(), 0, K_WINE_REQ_INIT_PROCESS_DONE);

@@ -296,9 +296,8 @@
 // (the message box itself -- its relay line carries the caller's return
 // address, which is what names the module that raised the dialog), version
 // (file version probing) and ws2_32 (what a client library does when it
-// cannot reach the service it expects). ntdll is deliberately absent: every
-// heap allocation and every critical section enters through it, so including
-// it is indistinguishable from not restricting the trace at all.
+// cannot reach the service it expects). Only two thread-exit functions from
+// ntdll are included; tracing its heap and locking calls would flood the log.
 //
 // The exclude list removes what those modules are called for per loop
 // iteration rather than per decision, and the message loop a modal box runs
@@ -316,14 +315,15 @@
 // loaddll names each module as it is attached and debugstr carries whatever
 // the program passes to OutputDebugString -- which for a wrapper layer is
 // frequently the reason itself. Both are one line per event, not per call.
-#define K_X64_WINE_TRACE_CHANNELS "+relay,+loaddll,+debugstr"
+#define K_X64_WINE_TRACE_CHANNELS "+relay,+loaddll,+debugstr,+seh"
 // The doubled backslashes are the registry file's own escaping: user.reg
 // spells this section "[Software\\Wine\\Debug]" on disk.
 #define K_X64_WINE_DEBUG_REGISTRY_SECTION "Software\\\\Wine\\\\Debug"
 #define K_X64_WINE_RELAY_INCLUDE_NAME "RelayInclude"
 #define K_X64_WINE_RELAY_EXCLUDE_NAME "RelayExclude"
 #define K_X64_WINE_RELAY_INCLUDE \
-    "advapi32;kernel32;kernelbase;user32;version;ws2_32"
+    "advapi32;kernel32;kernelbase;user32;version;ws2_32;" \
+    "ntdll.NtTerminateThread;ntdll.RtlExitUserThread"
 #define K_X64_WINE_RELAY_EXCLUDE \
     "kernel32.GetLastError;kernel32.SetLastError;" \
     "kernelbase.GetLastError;kernelbase.SetLastError;" \

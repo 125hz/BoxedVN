@@ -13,6 +13,7 @@
 
 #include "syscall64.h"
 #include "cpu64.h"
+#include "guest_signal_frame64.h"
 #include "kmemory64.h"
 #include "knativesystem.h"
 #include "guest_mmap_diagnostics.h"
@@ -881,6 +882,17 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         const int requestOpcode =
             boxedvn::wineServerRequestOpcode(buffer.data(), count);
         if (requestOpcode >= 0) {
+            const auto termination = boxedvn::decodeWineTerminateThreadRequest(
+                buffer.data(), count);
+            static std::atomic<U32> terminationReports{0};
+            if (termination.valid &&
+                terminationReports.fetch_add(1, std::memory_order_relaxed) < 64) {
+                klog_fmt("BOXEDWINE_X64_WINE_TERMINATE_THREAD_REQUEST pid=%u tid=%04X "
+                         "fd=%u handle=0x%08x exit_code=0x%08x syscall_rip=0x%llx",
+                         cpu->thread->process->id, cpu->thread->id, (U32)fd,
+                         termination.handle, termination.exitCode,
+                         (unsigned long long)cpu->rip);
+            }
             cpu->thread->diagnosticSocketWriteCode.store(
                 (U32)requestOpcode, std::memory_order_relaxed);
             cpu->thread->diagnosticSocketWriteBytes.store(
@@ -3449,34 +3461,18 @@ static U64 sys_statfs64_common(CPU64* cpu, U64 bufPtr) {
 // We use the Linux-glibc layout so any handler compiled for x86-64 Linux
 // can read it directly. Field offsets and sizes:
 //
-//   off  +0   rt_sigframe header                       (8 bytes pretty + pad)
-//             — actually just the saved restorer addr (8 bytes), kernel
-//               relies on the handler to RET into it; we always set RIP
-//               from the saved RIP in mcontext on sigreturn so the header
-//               is informational only.
-//   off  +8   siginfo_t (128 bytes)
-//   off +136  ucontext_t
-//      +0     uc_flags          (8)
-//      +8     uc_link           (8)
-//      +16    uc_stack          (24: ss_sp, ss_flags+pad, ss_size)
-//      +40    uc_mcontext.gregs[23]  — see gregs index table below
-//                                       (23 * 8 = 184 bytes)
-//      +224   uc_mcontext.fpregs (8 — pointer; we set 0 → no FPU restore)
-//      +232   uc_mcontext.__reserved[8]  (64 bytes — zeroed)
-//      +296   uc_sigmask        (8 — single qword, rest of 128-byte sigset
-//                                    region is zero-padded)
-//      +424   __fpregs_mem      (we don't write this for now)
-//
-// Total frame size we allocate on the stack: 16-aligned, round up to 1024.
-// (Linux's actual frame is ~600 bytes with fpregs_mem; we shrink because
-// we never populate fpregs.)
+// Frame placement is defined in guest_signal_frame64.h: restorer followed
+// immediately by ucontext, then siginfo and a 64-aligned FXSAVE image. None
+// of the payload may sit below handler RSP. ucontext uses Linux offsets:
+// mcontext +40, fpregs pointer +224, sigmask +296. Translated AVX threads
+// include the standard XSAVE header and YMM upper halves.
 //
 // gregs[] index, matching <sys/ucontext.h> REG_* enum:
 //   0:R8   1:R9   2:R10  3:R11  4:R12  5:R13  6:R14  7:R15
 //   8:RDI  9:RSI 10:RBP 11:RBX 12:RDX 13:RAX 14:RCX 15:RSP
 //  16:RIP 17:EFL 18:CSGSFS 19:ERR 20:TRAPNO 21:OLDMASK 22:CR2
-#define X64_SIGFRAME_SIZE          1024
-#define X64_UCONTEXT_OFF_IN_FRAME  136   // after siginfo
+#define X64_SIGFRAME_SIZE          boxedvn::signal64FrameSize
+#define X64_UCONTEXT_OFF_IN_FRAME  boxedvn::signal64UcontextOffset
 #define X64_MCONTEXT_OFF_IN_UCTX    40
 #define X64_GREGS_OFF_IN_UCTX       X64_MCONTEXT_OFF_IN_UCTX
 #define X64_SIGMASK_OFF_IN_UCTX    296
@@ -3541,9 +3537,11 @@ static U64 buildSignalFrame(CPU64* cpu, U64 framePtr) {
     // delivery overwrites these afterwards via the fault-info it has.
     // OLDMASK = caller's sigmask before this delivery (we set it to current)
     cpu->memory->writeq(gregsPtr + 8 * X64_GREG_OLDMASK, cpu->sigMask);
-    // fpregs pointer = 0 (we don't snapshot XMM/x87 here yet — the next
-    // increment after delivery wiring lands)
-    cpu->memory->writeq(mctxPtr + 184, 0);
+    const U64 fpPtr = framePtr + boxedvn::signal64FpOffset;
+    const auto fp = boxedvn::saveGuestSignalFpState64(*cpu);
+    cpu->memory->memcpyToGuest(fpPtr, &fp, sizeof(fp));
+    cpu->memory->writeq(mctxPtr + 184, fpPtr);
+    if (cpu->signalXsave) cpu->memory->writeq(uctxPtr, 1); // UC_FP_XSTATE
     // uc_sigmask
     cpu->memory->writeq(uctxPtr + X64_SIGMASK_OFF_IN_UCTX, cpu->sigMask);
     return uctxPtr;
@@ -3651,6 +3649,24 @@ static U64 restoreSignalFrame(CPU64* cpu, U64 uctxPtr) {
     cpu->rip              = cpu->memory->readq(gregsPtr + 8 * X64_GREG_RIP);
     cpu->rflags           = (U32)cpu->memory->readq(gregsPtr + 8 * X64_GREG_EFL);
     cpu->sigMask          = cpu->memory->readq(uctxPtr   + X64_SIGMASK_OFF_IN_UCTX);
+    // Wine may modify the pointed-to FXSAVE image to resume a Windows
+    // exception. Restore that image, not a private pre-handler snapshot.
+    const U64 fpPtr = cpu->memory->readq(mctxPtr + 184);
+    if (fpPtr) {
+        boxedvn::GuestSignalFpState64 fp{};
+        cpu->memory->memcpyFromGuest(&fp.legacy, fpPtr, sizeof(fp.legacy));
+        const auto info = boxedvn::guestSignalXstateInfo64(fp.legacy);
+        bool extended = cpu->signalXsave &&
+            info.magic == boxedvn::signal64XstateMagic1 &&
+            info.extendedSize == 836 && info.stateSize == 832 &&
+            (info.features & ~7ull) == 0;
+        if (extended) {
+            cpu->memory->memcpyFromGuest(&fp.features, fpPtr + 512, 836 - 512);
+            extended = fp.magic2 == boxedvn::signal64XstateMagic2 &&
+                fp.compaction == 0 && (fp.features & ~7ull) == 0;
+        }
+        boxedvn::restoreGuestSignalFpState64(*cpu, fp, extended);
+    }
     // Resume in the code segment the frame names. For a thread that never
     // left the 64-bit segment this restores what it already had; for a WoW64
     // thread it is how execution returns to 32-bit code, both after a fault
@@ -3699,15 +3715,9 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
     if (sa.handler == 0 /*SIG_DFL*/ || sa.handler == 1 /*SIG_IGN*/) return false;
 
     // Pick stack: SA_ONSTACK requires a non-DISABLED altstack.
-    U64 baseSp;
-    if ((sa.flags & X64_SA_ONSTACK) && cpu->sigAltStack.ssSp != 0 &&
-        (cpu->sigAltStack.ssFlags & 2 /*SS_DISABLE*/) == 0) {
-        baseSp = cpu->sigAltStack.ssSp + cpu->sigAltStack.ssSize;
-    } else {
-        baseSp = cpu->reg[X64_RSP].u64 - 128; // red zone
-    }
-    // 16-align then reserve the frame.
-    U64 frameBase = (baseSp - X64_SIGFRAME_SIZE) & ~(U64)15;
+    const U64 frameBase = boxedvn::signal64FrameBase(
+        cpu->reg[X64_RSP].u64, cpu->sigAltStack.ssSp, cpu->sigAltStack.ssSize,
+        (sa.flags & X64_SA_ONSTACK) && !(cpu->sigAltStack.ssFlags & 2));
 
     U64 uctxPtr = buildSignalFrame(cpu, frameBase);
     enterSignalHandlerSegments(cpu);
@@ -3730,7 +3740,10 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
     // and leaves RSP = uctxPtr, which is what rt_sigreturn expects.
     cpu->reg[X64_RSP].setU64(retSlot);
     cpu->reg[X64_RDI].setU64(sig);      // arg1: signal number
-    cpu->reg[X64_RSI].setU64(0);        // arg2: siginfo (we don't synth one)
+    const U64 siPtr = frameBase + boxedvn::signal64SiginfoOffset;
+    cpu->memory->writed(siPtr, sig);
+    cpu->memory->writed(siPtr + 8, (U32)-6); // SI_TKILL
+    cpu->reg[X64_RSI].setU64(siPtr);
     cpu->reg[X64_RDX].setU64(uctxPtr);  // arg3: ucontext pointer
     cpu->rip = sa.handler;
 
@@ -3782,14 +3795,9 @@ bool CPU64::raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr) {
     if (!sa.installed) return false;
     if (sa.handler == 0 /*SIG_DFL*/ || sa.handler == 1 /*SIG_IGN*/) return false;
 
-    U64 baseSp;
-    if ((sa.flags & X64_SA_ONSTACK) && this->sigAltStack.ssSp != 0 &&
-        (this->sigAltStack.ssFlags & 2 /*SS_DISABLE*/) == 0) {
-        baseSp = this->sigAltStack.ssSp + this->sigAltStack.ssSize;
-    } else {
-        baseSp = this->reg[X64_RSP].u64 - 128; // red zone
-    }
-    U64 frameBase = (baseSp - X64_SIGFRAME_SIZE) & ~(U64)15;
+    const U64 frameBase = boxedvn::signal64FrameBase(
+        this->reg[X64_RSP].u64, this->sigAltStack.ssSp, this->sigAltStack.ssSize,
+        (sa.flags & X64_SA_ONSTACK) && !(this->sigAltStack.ssFlags & 2));
 
     U64 uctxPtr = buildSignalFrame(this, frameBase);
     enterSignalHandlerSegments(this);
@@ -3800,11 +3808,10 @@ bool CPU64::raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr) {
     this->memory->writeq(gregsPtr + 8 * X64_GREG_ERR, 0);
     this->memory->writeq(gregsPtr + 8 * X64_GREG_CR2, faultAddr);
 
-    // Synthesize a siginfo_t at the start of the frame (the siginfo region sits
-    // before the ucontext at X64_UCONTEXT_OFF_IN_FRAME). Layout (x86-64):
+    // Synthesize siginfo above the handler stack. Layout (x86-64):
     //   int si_signo @0; int si_errno @4; int si_code @8; then the union,
     //   where the SIGFPE/SIGSEGV variant places void* si_addr @16.
-    U64 siPtr = frameBase;
+    U64 siPtr = frameBase + boxedvn::signal64SiginfoOffset;
     this->memory->writed(siPtr + 0, sig);
     this->memory->writed(siPtr + 4, 0);
     this->memory->writed(siPtr + 8, (U32)siCode);

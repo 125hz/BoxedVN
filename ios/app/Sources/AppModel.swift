@@ -560,7 +560,9 @@ final class AppModel: ObservableObject {
                 executablePath:
                     "d:\\.boxedvn-x64-diagnostics\\boxedvn-d3d9-cube.exe",
                 arguments: [],
-                environment: X64Runtime.wow64Environment,
+                environment: X64Runtime.withVerboseTrace(
+                    X64Runtime.wow64Environment,
+                    enabled: Preferences.verboseWineTrace),
                 workingDirectory: runtime.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,
@@ -723,7 +725,7 @@ final class AppModel: ObservableObject {
         /// lives beside them in include/guest_wine64_layout.h
         /// (K_X64_WINE_TRACE_CHANNELS, K_X64_WINE_RELAY_INCLUDE) so the two
         /// halves can be compared by a test rather than by memory.
-        static let verboseTraceChannels = "+relay,+loaddll,+debugstr"
+        static let verboseTraceChannels = "+relay,+loaddll,+debugstr,+seh"
         static let verboseTraceAssignment = "BOXEDVN_X64_WINE_TRACE=relay"
         static let wineDebugAssignmentPrefix = "WINEDEBUG="
 
@@ -988,7 +990,9 @@ final class AppModel: ObservableObject {
                 executablePath:
                     "d:\\.boxedvn-x64-diagnostics\\boxedvn-d3d11-cube-x64.exe",
                 arguments: [],
-                environment: X64Runtime.environment,
+                environment: X64Runtime.withVerboseTrace(
+                    X64Runtime.environment,
+                    enabled: Preferences.verboseWineTrace),
                 workingDirectory: runtime.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,
@@ -1158,7 +1162,9 @@ final class AppModel: ObservableObject {
                 executablePath: Self.x64DesktopExplorerPath,
                 arguments: ["/desktop=shell,\(container.width)x\(container.height)",
                             "winefile", "D:\\"],
-                environment: X64Runtime.environment,
+                environment: X64Runtime.withVerboseTrace(
+                    X64Runtime.environment,
+                    enabled: Preferences.verboseWineTrace),
                 workingDirectory: runtime.guestWorkingDirectory,
                 width: container.width,
                 height: container.height,

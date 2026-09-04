@@ -1552,14 +1552,11 @@ struct SettingsView: View {
             Section {
                 Toggle("Verbose Wine trace", isOn: $verboseWineTrace)
             } footer: {
-                Text("Records the Windows calls a 64-bit program makes, so a "
-                     + "program that stops at an error dialog of its own says "
-                     + "which call it stopped on. Wine's relay trace, "
-                     + "restricted to the registry, process, window and "
-                     + "networking modules so the log stays readable, and "
-                     + "applied to Run program only. Slow, and only worth it "
-                     + "while diagnosing one program. Takes effect on the "
-                     + "next launch.")
+                Text("Records Windows calls, exceptions and thread exits for "
+                     + "programs running under 64-bit Wine, including 32-bit "
+                     + "programs. Applies to Run program, both cube tests and "
+                     + "the 64-bit desktop on the next launch. Tracing slows "
+                     + "programs down; turn it off after collecting a log.")
             }
             Section {
                 Toggle("Orientation lock", isOn: $orientationLock)

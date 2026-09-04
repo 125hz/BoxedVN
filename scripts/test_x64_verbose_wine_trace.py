@@ -122,12 +122,9 @@ class TheIncludeListStaysSmall(unittest.TestCase):
         self.assertLessEqual(len(self.include), 8,
                              "this is no longer a restriction")
 
-    def test_it_names_modules_rather_than_functions(self) -> None:
-        # A module entry traces everything in it; the include list is meant to
-        # be broad within a few modules, not a guess at function names.
-        for entry in self.include:
-            self.assertNotIn(".", entry,
-                             f"{entry} narrows the include list to one call")
+    def test_only_thread_exit_calls_are_traced_in_ntdll(self) -> None:
+        self.assertEqual({entry for entry in self.include if "." in entry},
+                         {"ntdll.NtTerminateThread", "ntdll.RtlExitUserThread"})
 
     def test_the_modules_a_startup_check_actually_calls_are_there(self) -> None:
         for module in ("advapi32", "kernel32", "kernelbase", "user32"):
@@ -199,7 +196,7 @@ class TheSettingIsOffUntilItIsAskedFor(unittest.TestCase):
         self.assertIn("+ [verboseTraceAssignment]", body)
 
 
-class OnlyTheRunProgramLaunchGetsIt(unittest.TestCase):
+class AllWine64LaunchesHonorTheSetting(unittest.TestCase):
     def setUp(self) -> None:
         self.app = read(APP_MODEL)
 
@@ -210,15 +207,13 @@ class OnlyTheRunProgramLaunchGetsIt(unittest.TestCase):
         self.assertIn("X64Runtime.withVerboseTrace(", body)
         self.assertIn("enabled: Preferences.verboseWineTrace", body)
 
-    def test_nothing_else_does(self) -> None:
-        # The probes and the desktop run unattended and long; relay on those
-        # is a cost with no question attached.
-        self.assertEqual(self.app.count("X64Runtime.withVerboseTrace("), 1)
+    def test_cubes_and_desktop_can_trace_the_same_failure(self) -> None:
+        self.assertEqual(self.app.count("X64Runtime.withVerboseTrace("), 4)
         for launcher in ("func launchX64GraphicsProbe(",
                          "func launchX64Desktop("):
             body = self.app.split(launcher, 1)
             self.assertEqual(len(body), 2, f"{launcher} moved")
-            self.assertNotIn("withVerboseTrace",
+            self.assertIn("withVerboseTrace",
                              body[1].split("\n    }\n", 1)[0])
 
 

@@ -45,6 +45,8 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include "boxedwine.h"
 #include "boxedvn/fex_exit_dispatch_contract.h"
 #include "cpu64.h"
+#include "guest_signal_frame64.h"
+#include "fex_x87_state.h"
 #include "guest_segment_table.h"
 #include "fex64loaderhandoff.h"
 #include "kmemory64.h"
@@ -86,57 +88,30 @@ static thread_local BVNFEXCPU64Adapter* gCurrentAdapter = nullptr;
 static std::atomic<uint32_t> gLiveSyscallTraceOrdinal {0};
 static std::atomic<uint32_t> gSyscallRedirectReports {0};
 
-// FEX stores x87 state in a stack-relative view (the MM array is indexed by
-// physical stack slot, while AbridgedFTW bits are indexed by ST(i)). CPU64's
-// soft FPU has the same physical register representation, so the bridge can
-// preserve it without inventing a second floating-point ABI. CPU64 currently
-// has no MXCSR member; its 0F AE handlers are deliberately no-ops, so there is
-// no MXCSR state to copy here.
+// Both register arrays AND tag bits use physical R(i). Only the external
+// FXSAVE image stores registers in logical ST(i) order. FEX stores the entire
+// three-bit TOP in one flags byte (X87.cpp::GetX87Top).
+static_assert(FEXCore::X86State::X87FLAG_IE_LOC == 32 &&
+              FEXCore::X86State::X87FLAG_C2_LOC == 42 &&
+              FEXCore::X86State::X87FLAG_TOP_LOC == 43 &&
+              FEXCore::X86State::X87FLAG_C3_LOC == 46 &&
+              FEXCore::X86State::X87FLAG_B_LOC == 47);
 static void syncFPUFromFEX(CPU64* cpu, const FEXCore::Core::CPUState& state) {
     if (!cpu) return;
     cpu->fpu.SetCW(state.FCW);
+    cpu->mxcsr = state.mxcsr;
 
-    uint16_t status = 0;
-    constexpr uint8_t exceptionBits[] = {
-        FEXCore::X86State::X87FLAG_IE_LOC,
-        FEXCore::X86State::X87FLAG_DE_LOC,
-        FEXCore::X86State::X87FLAG_ZE_LOC,
-        FEXCore::X86State::X87FLAG_OE_LOC,
-        FEXCore::X86State::X87FLAG_UE_LOC,
-        FEXCore::X86State::X87FLAG_PE_LOC,
-    };
-    constexpr uint16_t exceptionMasks[] = {
-        FPU_SW_IE, FPU_SW_DE, FPU_SW_ZE, FPU_SW_OE, FPU_SW_UE, FPU_SW_PE,
-    };
-    for (size_t i = 0; i < std::size(exceptionBits); ++i) {
-        if (state.flags[exceptionBits[i]] & 1u) status |= exceptionMasks[i];
-    }
-    if (state.flags[FEXCore::X86State::X87FLAG_ES_LOC] & 1u)
-        status |= FPU_SW_ES;
-    if (state.flags[FEXCore::X86State::X87FLAG_C0_LOC] & 1u)
-        status |= 0x0100;
-    if (state.flags[FEXCore::X86State::X87FLAG_C1_LOC] & 1u)
-        status |= 0x0200;
-    if (state.flags[FEXCore::X86State::X87FLAG_C2_LOC] & 1u)
-        status |= 0x0400;
-    if (state.flags[FEXCore::X86State::X87FLAG_C3_LOC] & 1u)
-        status |= 0x4000;
-    const uint16_t top =
-        static_cast<uint16_t>((state.flags[FEXCore::X86State::X87FLAG_TOP_LOC] & 1u) |
-                              ((state.flags[FEXCore::X86State::X87FLAG_TOP_LOC + 1] & 1u) << 1) |
-                              ((state.flags[FEXCore::X86State::X87FLAG_TOP_LOC + 2] & 1u) << 2));
-    status |= static_cast<uint16_t>((top & 7u) << 11);
-    if (state.flags[FEXCore::X86State::X87FLAG_B_LOC] & 1u)
-        status |= 0x8000;
+    const uint16_t status = boxedvn::fexX87Status(state.flags);
     cpu->fpu.SetSW(status);
 
     for (uint32_t stackIndex = 0; stackIndex < 8; ++stackIndex) {
-        const uint32_t physical = (stackIndex - top) & 7u;
+        const uint32_t physical = stackIndex;
         cpu->fpu.regs[physical].signif = state.mm[physical][0];
         cpu->fpu.regs[physical].signExp =
             static_cast<uint16_t>(state.mm[physical][1]);
-        cpu->fpu.tags[physical] =
-            (state.AbridgedFTW & (1u << stackIndex)) ? TAG_Valid : TAG_Empty;
+        cpu->fpu.tags[physical] = boxedvn::guestX87Tag(state.mm[physical][0],
+            static_cast<uint16_t>(state.mm[physical][1]),
+            (state.AbridgedFTW & (1u << physical)) != 0);
         cpu->fpu.isRegCached[physical] = false;
     }
     cpu->fpu.isMMXInUse = false;
@@ -145,37 +120,24 @@ static void syncFPUFromFEX(CPU64* cpu, const FEXCore::Core::CPUState& state) {
 static void syncFEXFromFPU(FEXCore::Core::CPUState& state, CPU64* cpu) {
     if (!cpu) return;
     state.FCW = static_cast<uint16_t>(cpu->fpu.CW());
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (state.mxcsr != cpu->mxcsr) {
+        uint64_t fpcr;
+        __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+        fpcr = boxedvn::guestMxcsrToArmFpcr(fpcr, cpu->mxcsr);
+        __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+    }
+#endif
+    state.mxcsr = cpu->mxcsr;
     const uint16_t status = static_cast<uint16_t>(cpu->fpu.SW());
-    const uint8_t exceptionBits[] = {
-        FEXCore::X86State::X87FLAG_IE_LOC,
-        FEXCore::X86State::X87FLAG_DE_LOC,
-        FEXCore::X86State::X87FLAG_ZE_LOC,
-        FEXCore::X86State::X87FLAG_OE_LOC,
-        FEXCore::X86State::X87FLAG_UE_LOC,
-        FEXCore::X86State::X87FLAG_PE_LOC,
-    };
-    const uint16_t exceptionMasks[] = {
-        FPU_SW_IE, FPU_SW_DE, FPU_SW_ZE, FPU_SW_OE, FPU_SW_UE, FPU_SW_PE,
-    };
-    for (size_t i = 0; i < std::size(exceptionBits); ++i)
-        state.flags[exceptionBits[i]] = (status & exceptionMasks[i]) ? 1 : 0;
-    state.flags[FEXCore::X86State::X87FLAG_ES_LOC] =
-        (status & FPU_SW_ES) ? 1 : 0;
-    state.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (status >> 8) & 1;
-    state.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (status >> 9) & 1;
-    state.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (status >> 10) & 1;
-    state.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (status >> 14) & 1;
-    const uint32_t top = (status >> 11) & 7u;
-    state.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = top & 1u;
-    state.flags[FEXCore::X86State::X87FLAG_TOP_LOC + 1] = (top >> 1) & 1u;
-    state.flags[FEXCore::X86State::X87FLAG_TOP_LOC + 2] = (top >> 2) & 1u;
-    state.flags[FEXCore::X86State::X87FLAG_B_LOC] = (status >> 15) & 1;
+    boxedvn::setFexX87Status(state.flags, status);
 
     state.AbridgedFTW = 0;
     for (uint32_t stackIndex = 0; stackIndex < 8; ++stackIndex) {
-        const uint32_t physical = (stackIndex - top) & 7u;
-        state.mm[physical][0] = cpu->fpu.regs[physical].signif;
-        state.mm[physical][1] = cpu->fpu.regs[physical].signExp;
+        const uint32_t physical = stackIndex;
+        const auto& value = cpu->fpu.getReg(physical);
+        state.mm[physical][0] = value.signif;
+        state.mm[physical][1] = value.signExp;
         if (cpu->fpu.tags[physical] != TAG_Empty)
             state.AbridgedFTW |= static_cast<uint8_t>(1u << stackIndex);
     }
@@ -324,11 +286,14 @@ extern "C" bool BVNFEXCPU64AdapterSyncFromFEX(BVNFEXCPU64Adapter* adapter,
     cpu->seg.gs = frame->State.gs_idx;
     cpu->seg.valid = true;
     std::array<__uint128_t, 16> xmmLow {};
+    std::array<__uint128_t, 16> ymmHigh {};
     adapter->context->ReconstructXMMRegisters(
-        adapter->fexThread, xmmLow.data(), nullptr);
+        adapter->fexThread, xmmLow.data(), ymmHigh.data());
     for (unsigned i = 0; i < 16; ++i) {
         std::memcpy(&cpu->xmm[i], &xmmLow[i], sizeof(cpu->xmm[i]));
+        std::memcpy(&cpu->ymmHigh[i], &ymmHigh[i], sizeof(cpu->ymmHigh[i]));
     }
+    cpu->signalXsave = true; // appleHostFeatures enables AVX (split NEON lanes).
     syncFPUFromFEX(cpu, frame->State);
     return true;
 }
@@ -368,11 +333,13 @@ extern "C" bool BVNFEXCPU64AdapterSyncToFEX(BVNFEXCPU64Adapter* adapter,
         frame->State.gs_idx = cpu->seg.gs;
     }
     std::array<__uint128_t, 16> xmmLow {};
+    std::array<__uint128_t, 16> ymmHigh {};
     for (unsigned i = 0; i < 16; ++i) {
         std::memcpy(&xmmLow[i], &cpu->xmm[i], sizeof(cpu->xmm[i]));
+        std::memcpy(&ymmHigh[i], &cpu->ymmHigh[i], sizeof(cpu->ymmHigh[i]));
     }
     adapter->context->SetXMMRegistersFromState(
-        adapter->fexThread, xmmLow.data(), nullptr);
+        adapter->fexThread, xmmLow.data(), ymmHigh.data());
     syncFEXFromFPU(frame->State, cpu);
     return true;
 }
@@ -516,7 +483,7 @@ static void reportGeneratedGuestFault(
         memory->nativeGuestRangeAllowed(rip, 16)) {
         uint8_t instruction[16] = {};
         vm_size_t read = 0;
-        if (vm_read_overwrite(mach_task_self(), rip, sizeof(instruction),
+        if (vm_read_overwrite(mach_task_self(), k64GuestToHostAddress(rip), sizeof(instruction),
                               reinterpret_cast<vm_address_t>(instruction),
                               &read) == KERN_SUCCESS &&
             read == sizeof(instruction)) {
@@ -1452,7 +1419,6 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         guestTrapNumber = faultData.TrapNo;
         guestSignalCode = faultData.si_code;
         guestFaultAddress = frame->State.rip;
-        reportGeneratedGuestFault(adapter, frame, faultData);
         if (recoverTranslatedLoaderHandoff(
                 adapter, frame, faultData, context, config)) {
             return true;
@@ -1510,6 +1476,8 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         machine->__ss.__pc = frame->Pointers.DispatcherLoopTopFillSRA;
         return machine->__ss.__pc != 0;
     }
+    // Expected WoW64 gates above must not exhaust the opcode report budget.
+    if (generatedException) reportGeneratedGuestFault(adapter, frame, faultData);
     // Every device run of the x86-64 cube ended with Wine reporting a
     // "page fault on read access to 0" at RtlInterlockedPushEntrySList's
     // `lock cmpxchg16b [r8]` during process exit, with the loads of [r8]

@@ -532,12 +532,9 @@ FEXCore::HostFeatures appleHostFeatures() {
     //
     // The 256-bit halves live in State.avx_high inside the frame rather than
     // in a static host register -- Arm64Emitter spills and fills only
-    // State.xmm.sse.data unless SVE256 is present -- so the CPU64 adapter's
-    // register exchange stays correct unchanged: it passes a null YMM_High to
-    // ReconstructXMMRegisters/SetXMMRegistersFromState, which copies just the
-    // SSE halves and leaves avx_high alone across the round trip, and the
-    // signal path restores the same 128-bit lanes out of the host V
-    // registers that the emitter spilled them from.
+    // State.xmm.sse.data unless SVE256 is present. The CPU64 adapter exchanges
+    // both halves through FEX's reconstruction APIs so a Linux signal frame
+    // can preserve AVX state and honor Wine's changes to the saved context.
     features.SupportsAVX = true;
     features.SupportsSVE128 = false;
     features.SupportsSVE256 = false;
@@ -763,7 +760,7 @@ bool readNativeGuestQword(KMemory64* memory, uint64_t address,
     }
     vm_size_t bytesRead = 0;
     return vm_read_overwrite(
-        mach_task_self(), address, sizeof(value),
+        mach_task_self(), k64GuestToHostAddress(address), sizeof(value),
         reinterpret_cast<vm_address_t>(&value), &bytesRead) ==
             KERN_SUCCESS &&
         bytesRead == sizeof(value);
@@ -2050,12 +2047,13 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                             }
                         }
                     }
-                    if (processState->fex->context->IsAddressInCodeBuffer(
-                            threadState->fexThread, snapshot.hostPC)) {
-                        const uint64_t restored =
-                            processState->fex->context->RestoreRIPFromHostPC(
-                                threadState->fexThread, snapshot.hostPC);
-                        if (restored != 0) snapshot.guestRIP = restored;
+                    // Never call FEX's code-buffer queries while suspended.
+                    // CPUBackend::IsAddressInCodeBuffer takes IosMigrateLock;
+                    // the sampled thread may own it and cannot release it
+                    // until we resume it. The fixed executable pool needs no
+                    // lock. Keep the frame RIP as a sample, not an exact PC
+                    // reconstruction through mutable JIT metadata.
+                    if (poolOwns(reinterpret_cast<const void*>(snapshot.hostPC))) {
 
                         // Static-register allocation keeps live guest GPRs in
                         // ARM64 registers while translated code is running.
@@ -2081,11 +2079,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                         }
                     }
                     if (snapshot.hostLR >= 4 &&
-                        processState->fex->context->IsAddressInCodeBuffer(
-                            threadState->fexThread, snapshot.hostLR - 4)) {
-                        snapshot.hostCallGuestRIP =
-                            processState->fex->context->RestoreRIPFromHostPC(
-                                threadState->fexThread, snapshot.hostLR - 4);
+                        poolOwns(reinterpret_cast<const void*>(snapshot.hostLR - 4))) {
                         snapshot.hostCallCodeAddress =
                             (snapshot.hostLR - 16) & ~uint64_t {3};
                         vm_size_t hostCallCodeBytes = 0;
@@ -2229,7 +2223,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
         if (snapshot.emitSample) {
             const double cpuPercent = snapshot.cpuUsage * 100.0 /
                 static_cast<double>(TH_USAGE_SCALE);
-            reportf("BOXEDWINE_FEX64_SAMPLE poll=%llu pid=%u tid=%u state=%s cpu=%.1f%% host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx entry_rip=0x%llx frame_rip=0x%llx faults=%llu handled=%llu new_faults=%llu last_signal=%llu last_address=0x%llx last_fault_pc=0x%llx history=[%s]",
+            reportf("BOXEDWINE_FEX64_SAMPLE poll=%llu pid=%u tid=%u state=%s cpu=%.1f%% host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx rip_source=frame entry_rip=0x%llx frame_rip=0x%llx faults=%llu handled=%llu new_faults=%llu last_signal=%llu last_address=0x%llx last_fault_pc=0x%llx history=[%s]",
                     static_cast<unsigned long long>(snapshot.poll),
                     snapshot.processId, snapshot.threadId,
                     machRunStateName(snapshot.runState), cpuPercent,
@@ -2293,7 +2287,7 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
             }
         }
         if (snapshot.emitWarning) {
-            reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx entry_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",
+            reportf("BOXEDWINE_FEX64_STALL pid=%u tid=%u stable_samples=%u state=%s host_pc=0x%llx host_lr=0x%llx host_sp=0x%llx guest_rip=0x%llx rip_source=frame entry_rip=0x%llx faults=%llu handled=%llu last_signal=%llu last_address=0x%llx history=[%s]",
                     snapshot.processId, snapshot.threadId,
                     snapshot.stablePolls,
                     machRunStateName(snapshot.runState),

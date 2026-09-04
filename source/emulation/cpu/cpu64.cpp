@@ -12,6 +12,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include "cpu64.h"
+#include "guest_signal_frame64.h"
 #include "wine_nt_syscall_memory.h"
 #include "cmpxchg16b.h"
 #include "sse42_string_compare.h"
@@ -94,6 +95,9 @@ void CPU64::cloneRegistersFrom(const CPU64* from) {
         xmm[i] = from->xmm[i];
     }
     fpu = from->fpu;
+    mxcsr = from->mxcsr;
+    signalXsave = from->signalXsave;
+    for (unsigned i = 0; i < 16; ++i) ymmHigh[i] = from->ymmHigh[i];
     // Signal state is process-wide in glibc's model; copy the parent's so the
     // new thread observes the same handler/mask registrations (delivery across
     // threads is a later milestone).
@@ -5081,8 +5085,7 @@ dsp_54:
     // 0.0 -> "0.00000"; later calls bound the GOT and skipped the resolver,
     // so they were correct. That "first %f prints 0" was the real bug (NOT
     // x87 80-bit precision). We model the legacy 512-byte FXSAVE area only
-    // for the XMM block (offset 160, 16 regs x 16 bytes); MXCSR/x87 state is
-    // not modeled here but the resolver doesn't depend on it.
+    // with x87, MXCSR and all sixteen XMM registers, shared with signal frames.
     if (op == 0x0F && fetchByte(rip + opOff + 1) == 0xAE) {
         U8 aeModrm = fetchByte(rip + opOff + 2);
         U8 aeReg = (aeModrm >> 3) & 7;
@@ -5090,21 +5093,18 @@ dsp_54:
         ModRM m = decodeModRM(rip + opOff + 2, p, 0);
         U32 used = opOff + 2 + m.length;
         if (aeMod != 3 && aeReg == 0) {
-            // FXSAVE m512byte — save XMM0..15 into the legacy area.
-            for (int i = 0; i < 16; i++) {
-                memory->writeq(m.effAddr + 160 + i * 16,     xmm[i].lo);
-                memory->writeq(m.effAddr + 160 + i * 16 + 8, xmm[i].hi);
-            }
+            const auto fp = boxedvn::saveGuestFxState64(*this);
+            memory->memcpyToGuest(m.effAddr, &fp, sizeof(fp));
         } else if (aeMod != 3 && aeReg == 1) {
-            // FXRSTOR m512byte — restore XMM0..15 from the legacy area.
-            for (int i = 0; i < 16; i++) {
-                xmm[i].lo = memory->readq(m.effAddr + 160 + i * 16);
-                xmm[i].hi = memory->readq(m.effAddr + 160 + i * 16 + 8);
-            }
+            boxedvn::GuestFxState64 fp{};
+            memory->memcpyFromGuest(&fp, m.effAddr, sizeof(fp));
+            boxedvn::restoreGuestFxState64(*this, fp);
+        } else if (aeMod != 3 && aeReg == 2) {
+            mxcsr = memory->readd(m.effAddr) & 0xffff;
+        } else if (aeMod != 3 && aeReg == 3) {
+            memory->writed(m.effAddr, mxcsr);
         }
-        // LDMXCSR(/2), STMXCSR(/3) and the fences remain no-ops: we don't
-        // model MXCSR exception/rounding bits, and memory ordering is moot
-        // for a single-stepped interpreter.
+        // The fence encodings have no additional register-state effect.
         rip += used;
         return used;
     }

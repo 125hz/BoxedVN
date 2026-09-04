@@ -34,6 +34,7 @@ add_executable(boxedvn_tests
     test_syscall_tail_ring.cpp
     test_wine_server_reply.cpp
     test_guest_segment_table.cpp
+    test_guest_signal_frame64.cpp
     test_launch_preflight.cpp
     test_exec_transition.cpp
     test_x64_runtime_dir.cpp

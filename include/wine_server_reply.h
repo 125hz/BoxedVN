@@ -36,6 +36,7 @@
 // REQ_init_process_done in Wine 9.0's generated request list. The opcode is
 // the first field of the request header.
 #define K_WINE_REQ_INIT_PROCESS_DONE 4
+#define K_WINE_REQ_TERMINATE_THREAD 8
 
 #if defined(__cplusplus)
 
@@ -60,6 +61,29 @@ inline int wineServerRequestOpcode(const std::uint8_t* message,
                  ((std::uint32_t)message[1] << 8) |
                  ((std::uint32_t)message[2] << 16) |
                  ((std::uint32_t)message[3] << 24));
+}
+
+struct WineTerminateThreadRequest {
+    bool valid = false;
+    std::uint32_t handle = 0;
+    std::uint32_t exitCode = 0;
+};
+
+// Wine 9.0 server_protocol.h: 12-byte request_header, handle at 12,
+// exit_code at 16. Both variable request/reply lengths must be zero.
+// Linux pthread_exit eventually calls exit(0), losing this Windows status.
+inline WineTerminateThreadRequest decodeWineTerminateThreadRequest(
+    const std::uint8_t* message, std::uint64_t length) noexcept {
+    WineTerminateThreadRequest result;
+    if (wineServerRequestOpcode(message, length) != K_WINE_REQ_TERMINATE_THREAD)
+        return result;
+    for (unsigned i = 4; i < 12; ++i) if (message[i]) return result;
+    for (unsigned i = 0; i < 4; ++i) {
+        result.handle |= std::uint32_t(message[12 + i]) << (8 * i);
+        result.exitCode |= std::uint32_t(message[16 + i]) << (8 * i);
+    }
+    result.valid = true;
+    return result;
 }
 
 // Decode the reply to REQ_init_process_done. `length` must be the whole

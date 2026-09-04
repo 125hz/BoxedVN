@@ -113,6 +113,11 @@ public:
     // before main() runs.
     struct Xmm { U64 lo = 0; U64 hi = 0; };
     Xmm   xmm[16] = {};
+    U32 mxcsr = 0x1f80;
+    // FEX advertises AVX; the interpreter does not. The kernel still needs
+    // the upper halves when it constructs a translated thread's signal frame.
+    Xmm ymmHigh[16] = {};
+    bool signalXsave = false;
 
     // x87 FPU state — shared with the 32-bit CPU's FPU implementation. We
     // only use the register-side methods (FLD/FADD/...) and do all memory
