@@ -358,6 +358,113 @@ inline constexpr int guestWineArenaRangeIndex(std::uint64_t address,
 }
 
 // ---------------------------------------------------------------------------
+// The ceiling that actually binds, which is not the size of the arena.
+//
+// The arena above is 1.7 GiB and the low lane hosts eight, so the obvious
+// reading of
+//
+//     err:virtual:allocate_virtual_memory out of memory for allocation,
+//                                          base (nil) size 48d30000
+//
+// is that Wine ran out of arena and a larger one would fix it. It would not,
+// and the reason belongs here because the change that follows from it is not a
+// change to any of the three ranges.
+//
+// That allocation came from a 32-bit image running under WoW64, and every
+// allocation the 32-bit half makes arrives at ntdll carrying an explicit
+// ceiling. dlls/wow64/syscall.c reads the process's own HighestUserAddress
+// once and keeps it:
+//
+//     highest_user_address = (ULONG_PTR)info.HighestUserAddress;
+//     default_zero_bits    = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+//
+// wow64_NtAllocateVirtualMemory passes get_zero_bits(zero_bits), which
+// substitutes default_zero_bits whenever the caller asked for none, and ntdll
+// turns that straight back into limit_high through get_zero_bits_limit().
+// What HighestUserAddress is comes from virtual_set_large_address_space():
+//
+//     if (is_wow64())
+//         user_space_wow_limit = ((main_image_info.ImageCharacteristics &
+//                                  IMAGE_FILE_LARGE_ADDRESS_AWARE)
+//                                 ? limit_4g : limit_2g) - 1;
+//
+// So the IMAGE decides: 2 GiB for an ordinary 32-bit PE, 4 GiB for one linked
+// large-address-aware. That is Windows' rule faithfully implemented, not a
+// Wine limitation, and no reservation anyone could hand Wine reaches past it.
+//
+// Under the 2 GiB ceiling the entire space a 32-bit process can allocate from
+// is [0x10000, 0x80000000), and Wine partitions it into two halves that cannot
+// be combined. map_view tries map_reserved_area first, which can only place a
+// view INSIDE a range mmap_add_reserved_area knows about; failing that it
+// tries map_free_area, which probes with MAP_FIXED_NOREPLACE and can therefore
+// only place a view OUTSIDE those ranges, because a reserved range is a real
+// PROT_NONE mapping and answers EEXIST. So the largest single allocation an
+// ordinary 32-bit process can obtain is the larger of
+//
+//     the longest free run inside [0x10000, 0x68000000)     -- 1.62 GiB
+//     the longest free run inside [0x68000000, 0x7f000000)  --  368 MiB
+//
+// and 0x48d30000 is 1.14 GiB. Merging those two -- reserving up to 0x7f000000
+// rather than 0x68000000 -- would raise the first to 1.98 GiB, and that is the
+// most an arena change can ever be worth to a 32-bit process. It also cannot
+// be done from this side: mmap_init's constants are reachable only through a
+// preloader, and Wine's own preloader reserves the same addresses
+// (loader/preloader.c, { 0x10000, 0x100000 }, { 0x110000, 0x67ef0000 },
+// { 0x7f000000, 0xff0000 }, { 0x7ffffe000000, 0x1ff0000 }), so it would take a
+// patched ntdll or a patched preloader to move them at all.
+//
+// Raising the image's own ceiling to 4 GiB is worth more and costs a linker
+// flag. [0x80000000, 0x100000000) is two contiguous gigabytes that no
+// reservation covers, that nothing in this address space places anything in,
+// and that the low lane already hosts: Wine's map_free_area walks straight
+// into it as soon as the image stops declaring that it cannot be there.
+//
+// A 64-bit image is not in this band at all. Its allocations carry no ceiling,
+// map_view falls through to an unhinted anon_mmap_alloc, and that draws from
+// the identity lane's mmap region -- 21.5 GiB, none of it arena. This is why
+// only the WoW64 lane has ever produced this error.
+inline constexpr std::uint64_t kWow64LimitDefault = 0x80000000ULL;
+inline constexpr std::uint64_t kWow64LimitLargeAddressAware = 0x100000000ULL;
+
+// The lowest address Wine will place a view at (address_space_start keeps the
+// DOS area free), and therefore where both the reservations and the census
+// bands below begin.
+inline constexpr std::uint64_t kGuestLowBandStart = 0x10000ULL;
+
+static_assert(kWow64LimitDefault < kWow64LimitLargeAddressAware,
+              "the large-address-aware ceiling is the higher of the two");
+static_assert(kWow64LimitLargeAddressAware <= kGuestLowLimit,
+              "both WoW64 ceilings must lie inside the low alias window, or "
+              "raising an image's ceiling hands it addresses this address "
+              "space would then refuse");
+static_assert(guestRangeHostable(kGuestLowBandStart,
+                                 kWow64LimitLargeAddressAware -
+                                     kGuestLowBandStart),
+              "the whole 4 GiB a large-address-aware 32-bit image allocates "
+              "from has to be hostable in one lane");
+static_assert(kWineArenaRanges[0].end < kWow64LimitDefault,
+              "the DOS/low reservation is a fraction of the 2 GiB an ordinary "
+              "32-bit image addresses; the rest of that band is reachable "
+              "only through map_free_area, which cannot enter a reservation");
+static_assert(kWineArenaRanges[1].end <= kWow64LimitDefault,
+              "so is the sub-2-GiB TEB reservation");
+static_assert(kWineArenaRanges[2].base >= kWow64LimitLargeAddressAware,
+              "the top-down arena is above every 32-bit ceiling; it belongs "
+              "to the 64-bit half and must not be counted against them");
+
+// The bands the address-space census reports. The first three are the ranges
+// ntdll reserves; the last two are not reservations at all but the two
+// ceilings above, present so a log says how much of what the process could
+// have used was actually in use. They deliberately overlap the first two.
+inline constexpr GuestWineArenaRange kGuestCensusBands[5] = {
+    {kWineArenaRanges[0].base, kWineArenaRanges[0].end, "dos-low"},
+    {kWineArenaRanges[1].base, kWineArenaRanges[1].end, "teb"},
+    {kWineArenaRanges[2].base, kWineArenaRanges[2].end, "top-down"},
+    {kGuestLowBandStart, kWow64LimitDefault, "wow-2g"},
+    {kGuestLowBandStart, kWow64LimitLargeAddressAware, "wow-4g"},
+};
+
+// ---------------------------------------------------------------------------
 // Wine's builtin PE image bases, which are NOT the arena and must not be
 // mistaken for it.
 //

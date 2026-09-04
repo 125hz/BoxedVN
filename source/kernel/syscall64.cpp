@@ -1168,6 +1168,20 @@ bool guestMmapSummaryDue(U64 ordinal) {
     return ordinal >= kGuestMmapDetailLines && (ordinal & (ordinal - 1)) == 0;
 }
 
+// When the address-space census fires. A request this large is one that eats a
+// band rather than a page of one -- Wine's map_reserved_area commits a whole
+// view with a single MAP_FIXED anonymous mmap, so a 256 MiB Wine allocation
+// arrives here as a 256 MiB request -- and a refusal above the smaller figure
+// is the guest being told no for a range it will not shrug off. The first
+// milestone is late on purpose: at ordinal 32 a process is still its own
+// loader, and the census is about what the program did afterwards. A refusal
+// is asked for first and forced, because it is the one event that is always
+// worth a picture and the only one that can arrive after everything else has
+// stopped happening.
+constexpr U64 kGuestArenaCensusLargeRequest = 16ULL << 20;
+constexpr U64 kGuestArenaCensusRefusedRequest = 1ULL << 20;
+constexpr U64 kGuestArenaCensusFirstMilestone = 128;
+
 } // namespace
 
 // The return address of whoever called the libc mmap wrapper, when it can be
@@ -1376,6 +1390,31 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
             "mmap-placement", alignedAddr, mapLen,
             cpu->memory->sparseReservationOverlaps(alignedAddr, mapLen) ? 1
                                                                        : 0);
+    }
+
+    // How much of each band is left. The failure this exists to explain issues
+    // no syscall at all -- Wine's map_free_area gives up at an early return
+    // that neither logs nor mmaps, and "out of memory for allocation, base
+    // (nil) size 48d30000" is the whole of the evidence -- so the state at the
+    // moment of failure can only be approached, never captured. These three
+    // triggers are what comes closest: a large request is what consumes a
+    // band, a refused one is what proves it is consumed, and the milestone
+    // bounds how stale the last picture can be. The milestone starts late
+    // because the first hundred mmaps of a process are its loader, and the
+    // budget inside the census is per address space for the same reason.
+    const char* censusReason = nullptr;
+    bool censusForced = false;
+    if ((S64)ret < 0 && mapLen >= kGuestArenaCensusRefusedRequest) {
+        censusReason = "refused";
+        censusForced = true;
+    } else if (mapLen >= kGuestArenaCensusLargeRequest) {
+        censusReason = "large-request";
+    } else if (ordinal >= kGuestArenaCensusFirstMilestone &&
+               (ordinal & (ordinal - 1)) == 0) {
+        censusReason = "milestone";
+    }
+    if (censusReason) {
+        cpu->memory->reportGuestArenaCensus(censusReason, mapLen, censusForced);
     }
 
     // Diagnostics. The budget is per address space, so a helper process

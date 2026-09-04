@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <vector>
 
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
 #include <sys/mman.h>
@@ -566,6 +567,95 @@ std::atomic<U32> g_k64LaneRefusalReports {0};
 std::atomic<U32> g_k64LaneExhaustedReports {0};
 constexpr U32 K64_LANE_REPORT_LIMIT = 64;
 
+// The census walks the whole page map and builds a bitmap over four gigabytes
+// of guest pages, so it is a report and not a metric. The budget is spent per
+// ADDRESS SPACE (KMemory64::arenaCensusReports), not globally: the loader and
+// the short-lived helpers each build one and would otherwise spend the whole
+// allowance before the process that fails has started.
+//
+// Four of the twelve are reachable only by a forced census. Everything else --
+// large requests, milestones -- arrives steadily from the first instruction a
+// process executes, so an unreserved budget would be spent long before the
+// first thing goes wrong, and a refusal is the one event always worth a
+// picture.
+constexpr U32 K64_ARENA_CENSUS_LIMIT = 12;
+constexpr U32 K64_ARENA_CENSUS_RESERVED = 4;
+
+// A page bitmap over one contiguous run of guest pages. Two bits per page:
+// mapped at all, and mapped with some access. Wine's PROT_NONE reservations
+// are mapped-and-inaccessible, and the difference between the two is exactly
+// the difference between "the guest is holding this" and "the guest is using
+// this", which is the thing a census has to be able to say.
+struct K64PageBitmap {
+    U64 firstPage = 0;
+    U64 pageCount = 0;
+    std::vector<U64> mapped;
+    std::vector<U64> accessible;
+
+    void reset(U64 first, U64 count) {
+        firstPage = first;
+        pageCount = count;
+        mapped.assign((size_t)((count + 63) >> 6), 0);
+        accessible.assign((size_t)((count + 63) >> 6), 0);
+    }
+    bool covers(U64 page) const {
+        return page >= firstPage && (page - firstPage) < pageCount;
+    }
+    void mark(U64 page, bool isAccessible) {
+        const U64 index = page - firstPage;
+        mapped[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+        if (isAccessible) {
+            accessible[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+        }
+    }
+    bool test(const std::vector<U64>& bits, U64 page) const {
+        const U64 index = page - firstPage;
+        return ((bits[(size_t)(index >> 6)] >> (index & 63)) & 1ULL) != 0;
+    }
+};
+
+// What one band looks like right now. `largestFree` is the number the guest's
+// allocator actually decides on: Wine places a view either in the longest free
+// run inside a reservation (map_reserved_area) or in the longest free run
+// outside every reservation (map_free_area), and a request longer than both
+// fails with no syscall and no message beyond its own size.
+struct K64BandCensus {
+    U64 mappedBytes = 0;
+    U64 accessibleBytes = 0;
+    U64 largestFree = 0;
+    U64 largestFreeAt = 0;
+};
+
+K64BandCensus k64MeasureBand(const K64PageBitmap& bits, U64 base, U64 end) {
+    K64BandCensus out;
+    if (end <= base) return out;
+    const U64 firstPage = base >> K64_PAGE_SHIFT;
+    const U64 endPage = end >> K64_PAGE_SHIFT;
+    U64 runStart = firstPage;
+    U64 run = 0;
+    for (U64 page = firstPage; page < endPage; page++) {
+        // A page outside the bitmap is a page this census cannot see; treat it
+        // as occupied rather than report a free run that may not exist.
+        const bool known = bits.covers(page);
+        const bool isMapped = !known || bits.test(bits.mapped, page);
+        if (isMapped) {
+            out.mappedBytes += K64_PAGE_SIZE;
+            if (known && bits.test(bits.accessible, page)) {
+                out.accessibleBytes += K64_PAGE_SIZE;
+            }
+            run = 0;
+        } else {
+            if (run == 0) runStart = page;
+            run++;
+            if (run > out.largestFree >> K64_PAGE_SHIFT) {
+                out.largestFree = run << K64_PAGE_SHIFT;
+                out.largestFreeAt = runStart << K64_PAGE_SHIFT;
+            }
+        }
+    }
+    return out;
+}
+
 // The lane a refused range came closest to, and by how many bytes it missed.
 // A range that OVERLAPS a lane without being contained in it is its own
 // answer: such a range is refused rather than split, because one mapping has
@@ -753,6 +843,106 @@ static void k64ReportGuestLaneExhausted(const KMemory64* memory, U64 length,
 void KMemory64::reportGuestLaneRefusal(const char* op, U64 addr, U64 len,
                                        int sparseReserved) const {
     k64ReportGuestLaneRefusal(this, op, addr, len, sparseReserved);
+}
+
+// The address-space census.
+//
+// The previous round's witness said which ranges Wine asked for and that it
+// got all of them; it could not say what happened to them afterwards, so a
+// second "out of memory for allocation, base (nil) size 48d30000" would have
+// carried exactly as much information as the first. This is the missing half:
+// for each band, how much the guest is holding, how much of that it can
+// actually touch, and how long the longest free run left in it is.
+//
+// Five bands, from guest_low_alias.h. Three are ntdll's own reservations. The
+// other two are not reservations at all -- they are the 2 GiB and 4 GiB
+// ceilings ntdll applies to a 32-bit image depending on whether it is marked
+// large-address-aware -- and they are here because that is the constraint the
+// failing allocation actually hit. `highest` settles which of the two is in
+// force without needing to read anything out of the guest: a run whose highest
+// mapped byte below four gigabytes never passes 0x80000000 is a run under the
+// 2 GiB ceiling.
+//
+// Two bitmaps rather than one, because the bands are far apart: everything a
+// 32-bit image can address is below 4 GiB, and the top-down arena is at
+// 0x7ffffe000000. Both are built in a single pass over the page map, which is
+// the only pass that has to hold pagesMutex.
+//
+// This runs for interpreted address spaces too. They take the same three
+// reservations, they share this page map, and the band that used to be
+// silently halved under them -- the top-down arena, before the interpreted
+// stack moved out of it -- is one of the five reported here.
+void KMemory64::reportGuestArenaCensus(const char* reason, U64 wanted,
+                                       bool force) const {
+    const U32 limit = force ? K64_ARENA_CENSUS_LIMIT
+                            : (K64_ARENA_CENSUS_LIMIT -
+                               K64_ARENA_CENSUS_RESERVED);
+    // Claim a slot, or return without spending one. A plain fetch_add would
+    // burn the reserved slots on the unforced calls it then declined to
+    // print, which is the opposite of reserving them.
+    U32 seen = arenaCensusReports.load(std::memory_order_relaxed);
+    for (;;) {
+        if (seen >= limit) return;
+        if (arenaCensusReports.compare_exchange_weak(
+                seen, seen + 1, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+
+    K64PageBitmap low;
+    K64PageBitmap top;
+    low.reset(0, boxedvn::kWow64LimitLargeAddressAware >> K64_PAGE_SHIFT);
+    top.reset(boxedvn::kWineArenaTopDownBase >> K64_PAGE_SHIFT,
+              (boxedvn::kWineArenaTopDownEnd - boxedvn::kWineArenaTopDownBase)
+                  >> K64_PAGE_SHIFT);
+
+    const U32 accessibleMask = K64_PAGE_READ | K64_PAGE_WRITE | K64_PAGE_EXEC;
+    U64 highestLow = 0;
+    U64 trackedPages = 0;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        trackedPages = (U64)pages.size();
+        for (const auto& entry : pages) {
+            const K64Page* page = entry.second.get();
+            if (!page || !(page->flags & K64_PAGE_MAPPED)) continue;
+            const bool accessible = (page->flags & accessibleMask) != 0;
+            const U64 pageNumber = entry.first;
+            if (low.covers(pageNumber)) {
+                low.mark(pageNumber, accessible);
+                const U64 pageEnd = (pageNumber + 1) << K64_PAGE_SHIFT;
+                if (pageEnd > highestLow) highestLow = pageEnd;
+            } else if (top.covers(pageNumber)) {
+                top.mark(pageNumber, accessible);
+            }
+        }
+    }
+
+    for (const boxedvn::GuestWineArenaRange& band : boxedvn::kGuestCensusBands) {
+        const K64PageBitmap& bits =
+            (band.base >= boxedvn::kWineArenaTopDownBase) ? top : low;
+        const K64BandCensus census = k64MeasureBand(bits, band.base, band.end);
+        const U64 length = band.end - band.base;
+        klog_fmt("BOXEDWINE_X64_ARENA_CENSUS gen=%llu reason=%s want=0x%llx "
+                 "band=%s range=[0x%llx,0x%llx) len=0x%llx mapped=0x%llx "
+                 "accessible=0x%llx free=0x%llx largest_free=0x%llx "
+                 "largest_free_at=0x%llx fits=%d native=%d highest=0x%llx "
+                 "pages=%llu (%u/%u)",
+                 (unsigned long long)addressSpaceGeneration(),
+                 reason ? reason : "?", (unsigned long long)wanted,
+                 band.name,
+                 (unsigned long long)band.base, (unsigned long long)band.end,
+                 (unsigned long long)length,
+                 (unsigned long long)census.mappedBytes,
+                 (unsigned long long)census.accessibleBytes,
+                 (unsigned long long)(length - census.mappedBytes),
+                 (unsigned long long)census.largestFree,
+                 (unsigned long long)census.largestFreeAt,
+                 (wanted && census.largestFree >= wanted) ? 1 : 0,
+                 nativeIdentityMode() ? 1 : 0,
+                 (unsigned long long)highestLow,
+                 (unsigned long long)trackedPages,
+                 (unsigned)(seen + 1), (unsigned)limit);
+    }
 }
 
 // Monotonic across every address space this image ever builds, so an exec

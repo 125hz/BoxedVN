@@ -10,8 +10,10 @@ widened:
                                              0x6fffffc50000-0x6ffffffeb000
 
 with not one BOXEDWINE_X64_LANE_REFUSED line anywhere, which reads as "we
-refuse nothing". Three separate things in that reading are wrong, and this
-file is where each of them is nailed down.
+refuse nothing". Four separate things in that reading are wrong -- the first
+three about where the arena comes from and what the addresses in those errors
+are, the fourth about the fix they suggest -- and this file is where each of
+them is nailed down.
 
 1. Where the arena comes from.
 
@@ -70,6 +72,45 @@ file is where each of them is nailed down.
    without ever calling the mapping path that reports lane refusals, so a run
    that rejected 778 of 1025 guest mmaps printed no LANE_REFUSED line at all.
 
+4. Why a bigger arena would not have helped, and what does.
+
+   The arena is 1.7 GiB and the low lane hosts eight, so the obvious next move
+   was to hand Wine more of it. That move is worth at most 368 MiB and cannot
+   be made from this side at all.
+
+   The failing allocation came from a 32-bit image under WoW64, and every
+   allocation the 32-bit half makes carries a ceiling the IMAGE declares.
+   ntdll's virtual_set_large_address_space() sets user_space_wow_limit to
+   limit_2g - 1, or limit_4g - 1 for an image marked
+   IMAGE_FILE_LARGE_ADDRESS_AWARE; dlls/wow64/syscall.c reads the resulting
+   HighestUserAddress into default_zero_bits, wow64_NtAllocateVirtualMemory
+   substitutes it whenever the caller passed no zero_bits, and
+   get_zero_bits_limit() turns it back into limit_high. 0x48d30000 is 1.14 GiB
+   and the probe was an ordinary PE, so it was being allocated inside two.
+
+   Inside that ceiling Wine's two placement paths cannot be combined. map_view
+   tries map_reserved_area, which only places views INSIDE a reserved range,
+   then map_free_area, which probes MAP_FIXED_NOREPLACE and therefore only
+   places views OUTSIDE every reserved range -- a reservation is a real
+   PROT_NONE mapping and answers EEXIST. So the largest single allocation an
+   ordinary 32-bit process can obtain is the longer of the free run in
+   [0x10000, 0x68000000) and the one in [0x68000000, 0x7f000000): 1.62 GiB and
+   368 MiB. Merging them is all an arena change is worth, and mmap_init's
+   constants are reachable only through a preloader -- whose own table
+   (loader/preloader.c) reserves the same addresses -- or through a patched
+   ntdll.
+
+   The image's own ceiling is worth more and costs a linker flag.
+   [0x80000000, 0x100000000) is two contiguous gigabytes that no reservation
+   covers, that this address space places nothing in, and that the low lane
+   already hosts. The probe is linked --large-address-aware and the bit is
+   checked in the file rather than in the link line.
+
+   And when the next log still shows a program running out, it will say why:
+   Wine reaches its failure without issuing a syscall, so the census in
+   kmemory64.cpp reports each band's occupancy and longest free run at the
+   events that come closest to it.
+
 And one thing our own layout got wrong: the sparse/interpreter guest stack
 was placed at 0x7FFFFFFFE000 with all 8 MiB mapped at load time, which lands
 inside the top-down arena ntdll reserves. reserve_area answers a refusal by
@@ -95,6 +136,7 @@ SYSCALLS = REPO / "source" / "kernel" / "syscall64.cpp"
 KMEMORY_HEADER = REPO / "include" / "kmemory64.h"
 KMEMORY_SOURCE = REPO / "source" / "kernel" / "kmemory64.cpp"
 STARTUP = REPO / "source" / "sdl" / "startupArgs.cpp"
+PROBE_BUILD = REPO / "scripts" / "build-guest-graphics-probe.sh"
 
 # ntdll's own reservations, from mmap_init's no-preloader branch. These are
 # Wine's constants, not ours; they are repeated here so a change to the header
@@ -113,6 +155,37 @@ HIGH_END = 0x7F80000000
 TOP_BASE = 0x7FFF80000000
 TOP_END = 0x7FFFFFFF0000
 TOP_CLEAR_MASK = 0x7F8000000000
+
+# The ceilings ntdll applies to a 32-bit image under WoW64, from
+# virtual_set_large_address_space(). These are Windows' figures, not ours.
+WOW64_LIMIT_DEFAULT = 0x80000000
+WOW64_LIMIT_LARGE_ADDRESS_AWARE = 0x100000000
+
+# The lowest address Wine will place a view at (address_space_start).
+LOW_BAND_START = 0x10000
+
+# The size the device log shows being refused: 1.14 GiB, base (nil).
+REFUSED_ALLOCATION = 0x48D30000
+
+CENSUS = "BOXEDWINE_X64_ARENA_CENSUS"
+CENSUS_BANDS = ("dos-low", "teb", "top-down", "wow-2g", "wow-4g")
+CENSUS_FIELDS = (
+    "gen=%llu",
+    "reason=%s",
+    "want=0x%llx",
+    "band=%s",
+    "range=[0x%llx,0x%llx)",
+    "len=0x%llx",
+    "mapped=0x%llx",
+    "accessible=0x%llx",
+    "free=0x%llx",
+    "largest_free=0x%llx",
+    "largest_free_at=0x%llx",
+    "fits=%d",
+    "native=%d",
+    "highest=0x%llx",
+    "pages=%llu",
+)
 
 # ntdll.dll's link-time ImageBase, and the "one nibble changed" twin the log
 # was suspected of having truncated.
@@ -206,6 +279,199 @@ class TheArenaIsTheThreeRangesNtdllReserves(unittest.TestCase):
     def test_a_subrange_of_a_reserved_range_is_recognised(self) -> None:
         # Wine halves, so the halves have to be recognised as arena too.
         self.assertIn("int guestWineArenaRangeIndex(", self.header)
+
+
+class TheCeilingIsTheImagesAndNotTheArenas(unittest.TestCase):
+    """The reason a larger arena would not have fixed the failing run."""
+
+    def setUp(self) -> None:
+        self.header = read(ALIAS_HEADER)
+
+    def test_both_wow64_ceilings_are_named_with_wines_own_derivation(self) -> None:
+        self.assertIn("kWow64LimitDefault = 0x%xULL" % WOW64_LIMIT_DEFAULT,
+                      self.header)
+        self.assertIn("kWow64LimitLargeAddressAware = 0x%xULL"
+                      % WOW64_LIMIT_LARGE_ADDRESS_AWARE, self.header)
+        # Where the two figures come from, so neither can be "adjusted".
+        self.assertIn("virtual_set_large_address_space()", self.header)
+        self.assertIn("IMAGE_FILE_LARGE_ADDRESS_AWARE", self.header)
+        self.assertIn("default_zero_bits", self.header)
+        self.assertIn("get_zero_bits_limit()", self.header)
+
+    def test_both_ceilings_lie_inside_the_low_lane(self) -> None:
+        # Recomputed: raising an image's ceiling is only safe because every
+        # address it then reaches for is one this address space can host.
+        for limit in (WOW64_LIMIT_DEFAULT, WOW64_LIMIT_LARGE_ADDRESS_AWARE):
+            self.assertTrue(hostable(LOW_BAND_START, limit - LOW_BAND_START))
+        self.assertLessEqual(WOW64_LIMIT_LARGE_ADDRESS_AWARE, LOW_LIMIT)
+
+    def test_the_refused_allocation_does_not_fit_the_reserved_low_range(self) -> None:
+        # The arithmetic that settles it. Under the 2 GiB ceiling a 32-bit
+        # process has exactly two runs to be placed in, and they cannot be
+        # combined: map_reserved_area only places INSIDE a reservation and
+        # map_free_area only OUTSIDE one.
+        reserved = WINE_ARENA[0][1] - WINE_ARENA[0][0]
+        gap = WINE_ARENA[1][0] - WINE_ARENA[0][1]
+        self.assertLess(gap, REFUSED_ALLOCATION)
+        # The request is more than half the reserved range, so ONE view placed
+        # anywhere near the middle of it makes the request unsatisfiable for
+        # the life of the process. That is why it fails with the band far from
+        # full.
+        self.assertGreater(2 * REFUSED_ALLOCATION, reserved)
+        # Merging the two -- reserving to 0x7f000000 -- is the whole of what an
+        # arena change could be worth, and it stays under the same ceiling.
+        merged = reserved + gap
+        self.assertGreater(merged, reserved)
+        self.assertLess(merged, WOW64_LIMIT_DEFAULT)
+        # Raising the image's ceiling is worth more: the entire band above
+        # 2 GiB, which no reservation covers at all.
+        above_2g = WOW64_LIMIT_LARGE_ADDRESS_AWARE - WOW64_LIMIT_DEFAULT
+        self.assertGreater(above_2g, REFUSED_ALLOCATION)
+        for base, end in WINE_ARENA:
+            self.assertFalse(base < WOW64_LIMIT_LARGE_ADDRESS_AWARE
+                             and end > WOW64_LIMIT_DEFAULT)
+
+    def test_the_arena_cannot_be_enlarged_from_this_side(self) -> None:
+        # Both doors, named, so the next reader does not reopen either without
+        # knowing what is behind it.
+        self.assertIn("loader/preloader.c", self.header)
+        self.assertIn("patched ntdll or a patched preloader", self.header)
+
+    def test_a_64_bit_image_is_not_in_this_band_at_all(self) -> None:
+        self.assertIn("A 64-bit image is not in this band at all", self.header)
+
+    def test_the_top_down_arena_is_above_every_32_bit_ceiling(self) -> None:
+        # It is the 64-bit half's, it is where Wine relocates its builtins to,
+        # and nothing here may be read as counting it against a 32-bit budget.
+        self.assertGreaterEqual(WINE_ARENA[2][0],
+                                WOW64_LIMIT_LARGE_ADDRESS_AWARE)
+        self.assertIn("the top-down arena is above every 32-bit ceiling",
+                      self.header)
+
+
+class TheCensusBandsAreDeclared(unittest.TestCase):
+    def setUp(self) -> None:
+        self.header = read(ALIAS_HEADER)
+
+    def test_the_bands_are_the_three_reservations_plus_the_two_ceilings(self) -> None:
+        table = self.header[self.header.index("kGuestCensusBands[5]"):]
+        table = table[:table.index("};")]
+        names = re.findall(r'"([a-z0-9-]+)"\}', table)
+        self.assertEqual(tuple(names), CENSUS_BANDS)
+
+    def test_the_ceiling_bands_are_not_described_as_reservations(self) -> None:
+        self.assertIn("the last two are not reservations at all", self.header)
+
+
+class TheCensusSaysWhatIsLeft(unittest.TestCase):
+    """A second out-of-memory has to arrive with the occupancy attached."""
+
+    def setUp(self) -> None:
+        self.memory = read(KMEMORY_SOURCE)
+        self.header = read(KMEMORY_HEADER)
+        self.source = read(SYSCALLS)
+
+    def test_the_census_names_every_field_a_reader_needs(self) -> None:
+        self.assertIn(CENSUS, self.memory)
+        for field in CENSUS_FIELDS:
+            self.assertIn(field, self.memory)
+
+    def test_the_census_reports_the_longest_free_run(self) -> None:
+        # The number Wine's allocator actually decides on. Totals alone would
+        # not have distinguished "the band is full" from "the band is in two
+        # pieces", which is the difference this failure turns on.
+        self.assertIn("largest_free=0x%llx", self.memory)
+        self.assertIn("out.largestFree = run << K64_PAGE_SHIFT;", self.memory)
+
+    def test_the_census_separates_held_from_used(self) -> None:
+        # Wine's reservations are mapped and inaccessible; a census that could
+        # not tell those from committed pages would report a full band from
+        # the first reserve_area call.
+        self.assertIn("K64_PAGE_READ | K64_PAGE_WRITE | K64_PAGE_EXEC",
+                      self.memory)
+        self.assertIn("mapped at all, and mapped with some access",
+                      self.memory)
+
+    def test_the_census_says_which_ceiling_is_in_force(self) -> None:
+        # Not readable from the guest, but decidable from the evidence: a run
+        # whose highest mapped byte below 4 GiB never passes 0x80000000 is a
+        # run under the 2 GiB ceiling.
+        self.assertIn("if (pageEnd > highestLow) highestLow = pageEnd;",
+                      self.memory)
+        self.assertIn("never passes 0x80000000", self.memory)
+
+    def test_an_unseen_page_counts_as_occupied(self) -> None:
+        # A free run this census cannot vouch for must not be reported as one.
+        self.assertIn("as occupied rather than report a free run that may not "
+                      "exist", self.memory)
+
+    def test_the_budget_is_per_address_space(self) -> None:
+        self.assertIn("mutable std::atomic<U32> arenaCensusReports {0};",
+                      self.header)
+        self.assertIn("constexpr U32 K64_ARENA_CENSUS_LIMIT = 12;", self.memory)
+
+    def test_refusals_reach_slots_nothing_else_can(self) -> None:
+        # An unreserved budget is spent by the loader and the milestones long
+        # before the first thing goes wrong, and a refusal is the one event
+        # that can arrive after everything else has stopped happening.
+        self.assertIn("constexpr U32 K64_ARENA_CENSUS_RESERVED = 4;",
+                      self.memory)
+        self.assertIn("const U32 limit = force ? K64_ARENA_CENSUS_LIMIT",
+                      self.memory)
+        self.assertIn("censusForced = true;", self.source)
+
+    def test_a_declined_census_does_not_spend_a_slot(self) -> None:
+        # A plain fetch_add would burn the reserved slots on the calls it then
+        # declined to print, which is the opposite of reserving them.
+        self.assertIn("arenaCensusReports.compare_exchange_weak(",
+                      self.memory)
+        self.assertNotIn("arenaCensusReports.fetch_add(", self.memory)
+
+    def test_the_census_covers_interpreted_address_spaces_too(self) -> None:
+        # Same three reservations, same page map, and the top-down arena is one
+        # of the bands -- which is what checks the stack having moved out of it.
+        self.assertIn("This runs for interpreted address spaces too.",
+                      self.memory)
+        self.assertIn("native=%d", self.memory)
+
+    def test_the_triggers_are_the_ones_closest_to_the_failure(self) -> None:
+        self.assertIn("constexpr U64 kGuestArenaCensusLargeRequest = "
+                      "16ULL << 20;", self.source)
+        self.assertIn("constexpr U64 kGuestArenaCensusRefusedRequest = "
+                      "1ULL << 20;", self.source)
+        self.assertIn("constexpr U64 kGuestArenaCensusFirstMilestone = 128;",
+                      self.source)
+        for reason in ('"large-request"', '"refused"', '"milestone"'):
+            self.assertIn(reason, self.source)
+        self.assertIn("cpu->memory->reportGuestArenaCensus(censusReason, "
+                      "mapLen, censusForced);", self.source)
+
+    def test_the_census_says_why_it_cannot_be_exact(self) -> None:
+        # Wine gives up without issuing a syscall, so there is no call to hang
+        # the report on and the census can only approach the moment.
+        self.assertIn("issues no mmap", self.header)
+        self.assertIn("can only be approached, never captured", self.source)
+
+
+class TheProbeCanReachTheAddressSpaceWeHost(unittest.TestCase):
+    def setUp(self) -> None:
+        self.script = read(PROBE_BUILD)
+
+    def test_the_probe_is_linked_large_address_aware(self) -> None:
+        self.assertIn("-Wl,--large-address-aware", self.script)
+
+    def test_the_flag_is_checked_in_the_file_and_not_the_link_line(self) -> None:
+        # objdump renders the field differently across binutils versions; the
+        # byte does not. e_lfanew at 0x3c, PE signature, then the 20-byte COFF
+        # header whose last two bytes are Characteristics.
+        self.assertIn('read_le_at 60 4 "${OUTPUT}"', self.script)
+        self.assertIn('!= "50450000"', self.script)
+        self.assertIn("read_le_at $(( PE_HEADER_OFFSET + 22 )) 2", self.script)
+        self.assertIn("CHARACTERISTICS & 0x20", self.script)
+
+    def test_the_reason_for_the_flag_is_recorded_where_it_is_applied(self) -> None:
+        self.assertIn("user_space_wow_limit", self.script)
+        self.assertIn("0x48d30000", self.script)
 
 
 class TheBuiltinImageBandIsNotTheArena(unittest.TestCase):

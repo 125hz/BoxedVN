@@ -645,6 +645,23 @@ public:
     void reportGuestLaneRefusal(const char* op, U64 addr, U64 len,
                                 int sparseReserved) const;
 
+    // One line per address band this guest allocates from, saying how much of
+    // it is mapped, how much of that is accessible, and how long the longest
+    // free run left in it is.
+    //
+    // Public and driven from the mmap syscall because the failure it exists to
+    // explain reaches no syscall at all: Wine's map_view tries its reserved
+    // areas, then walks the gaps between its own views, and when neither holds
+    // a run as long as the request map_free_area returns NULL from an early
+    // return that logs nothing and issues no mmap. All that survives is
+    // "out of memory for allocation, base (nil) size <n>", which names the
+    // size and nothing else. `reason` says what prompted the census and
+    // `wanted` is the request that prompted it, or 0. `force` reaches the
+    // slots held back for refusals, which are the events always worth a
+    // picture. See kmemory64.cpp.
+    void reportGuestArenaCensus(const char* reason, U64 wanted,
+                                bool force) const;
+
     // Whether [start, end) of HOST address space is already tracked by this
     // address space. Public only so the mapping planner in native_map_plan.h
     // can ask; it is the same question nativeRangeCovers answers.
@@ -901,6 +918,13 @@ private:
     // Assigned once at construction from a process-global counter. See
     // addressSpaceGeneration().
     U64 generation = 0;
+
+    // How many address-space censuses this address space has already spent.
+    // Per address space on purpose: the loader and the short-lived helpers
+    // each build one, and a global budget would be exhausted before the
+    // process that runs out of address space has started. Mutable because the
+    // census is a const observation.
+    mutable std::atomic<U32> arenaCensusReports {0};
 
     // Reserved address-space ranges drawn from the active mmap region (the
     // historical sparse base or K64_NATIVE_GUEST_MMAP_BASE).

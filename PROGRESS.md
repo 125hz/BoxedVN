@@ -7605,3 +7605,39 @@ be rediscovered.
 Those relocation failures stay. They are Wine moving its builtins out of a band
 this translation cannot reach, and reaching it needs a translation the backend
 cannot emit without disturbing the flags the guest keeps there.
+
+## The ceiling was in the image, not the arena
+
+The allocation that killed a 32-bit program was never short of arena. Tracing
+the call through the WoW64 layer shows every allocation from the 32-bit half
+carries a ceiling the image itself declares: a program not marked
+large-address-aware is held to two gigabytes, and the request was 1.14 GiB
+inside it. Worse, that two gigabytes is in two pieces Wine cannot combine,
+because a view is placed either inside a reserved range or outside every
+reserved range, never across one, so the largest single allocation available
+was the longer of two runs. Nothing reached our memory layer at all, which is
+why the run recorded no refusal for it, and why enlarging the low arena could
+not have helped.
+
+The probe is linked large-address-aware now, with the flag verified by reading
+the characteristics word out of the built file rather than trusting a tool's
+rendering of it. That opens the two gigabytes above the old ceiling, a range
+no reservation covers and nothing of ours occupies, and which the low lane
+already hosts. The three reserved ranges are untouched, so the arena the guest
+relocates its builtins into is exactly as it was, and it is now asserted to
+sit above both 32-bit ceilings so it can never be counted against one.
+
+A census now reports each band with how much is mapped, how much is
+accessible, the largest free run and where it starts, so an address space that
+fills says which band ran out and whether it ran out because it was full or
+because it was in two pieces. It cannot be exact, since the guest reaches this
+failure without issuing a syscall, and the code says so where it is emitted.
+
+Two findings recorded rather than acted on. Merging the two low pieces is
+worth 368 MiB and needs a patched Wine unix library, whose interfaces are
+private and unversioned, so a mismatch is a crash at startup rather than a
+missing feature; not worth it until a program appears that is
+large-address-aware and still runs out. And the same bit can be set after the
+fact on a program we do not build, which is what the usual Windows tool does,
+but doing that to a program that treats pointers as signed corrupts it, so it
+is a decision for a person rather than a build script.
