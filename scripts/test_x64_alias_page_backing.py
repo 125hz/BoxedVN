@@ -186,6 +186,50 @@ def function_body(source: str, signature: str) -> str:
     return source[start:end]
 
 
+class GuestLanes:
+    """The layout as guest_low_alias.h states it, and the translation it
+    defines, parsed rather than restated.
+
+    Every number here is read from the header. A model that recomputed the
+    identity lane's end as base + 2 * limit -- which is what it used to be --
+    would keep passing while testing none of the lane that was added.
+    """
+
+    def __init__(self) -> None:
+        header = read(ALIAS_HEADER)
+
+        def literal(name: str) -> int:
+            found = re.search(name + r" = (0x[0-9A-Fa-f]+)ULL", header)
+            if found is None:
+                raise AssertionError("guest_low_alias.h has no " + name)
+            return int(found.group(1), 16)
+
+        self.base = literal("kGuestLowAliasBase")
+        self.limit = literal("kGuestLowLimit")
+        self.high_end = literal("kGuestHighEnd")
+        self.top_base = literal("kGuestTopBase")
+        self.top_end = literal("kGuestTopEnd")
+        self.clear = literal("kGuestTopClearMask")
+        self.alias_end = self.base + self.limit
+        self.high_base = self.alias_end
+        # Derived exactly as the header derives them.
+        self.block_span = self.base & -self.base
+        self.block_end = self.base + self.block_span
+        self.top_host_base = self.top_base & ~self.clear
+        self.top_host_end = self.top_host_base + (self.top_end - self.top_base)
+
+    def translate(self, guest: int) -> int:
+        """The two instructions the translator emits, in that order."""
+        return (guest | self.base) & ~self.clear
+
+    def untranslate(self, host: int) -> int:
+        if self.base <= host < self.alias_end:
+            return host - self.base
+        if self.top_host_base <= host < self.top_host_end:
+            return host | self.clear
+        return host
+
+
 class TheRepairIsDrivenByThePageMap(unittest.TestCase):
     def setUp(self) -> None:
         self.source = read(KMEMORY_SOURCE)
@@ -420,17 +464,19 @@ class TheTranslatorStillDereferencesDirectly(unittest.TestCase):
         # carries the base's bits and touches none of the clear mask, so the
         # 64-bit lane is dereferenced at its own address and is backed by the
         # very same nativeRanges/mprotect bookkeeping.
-        header = read(ALIAS_HEADER)
-        base = int(re.search(r"kGuestLowAliasBase = (0x[0-9A-Fa-f]+)ULL",
-                             header).group(1), 16)
-        limit = int(re.search(r"kGuestLowLimit = (0x[0-9A-Fa-f]+)ULL",
-                              header).group(1), 16)
-        clear = int(re.search(r"kGuestTopClearMask = (0x[0-9A-Fa-f]+)ULL",
-                              header).group(1), 16)
-        high_base = base + limit
-        high_end = high_base + limit
-        for address in (high_base, high_base + 0x1000, high_end - 0x1000):
-            self.assertEqual((address | base) & ~clear, address)
+        #
+        # The lane's end is READ, not derived from the low limit: it no longer
+        # equals base + 2*limit, and computing it that way would silently stop
+        # testing the part of the lane that was just added.
+        lanes = GuestLanes()
+        for address in (lanes.high_base, lanes.high_base + 0x1000,
+                        lanes.high_end - 0x1000):
+            self.assertEqual(lanes.translate(address), address)
+        # And across the whole lane at 64 MiB, both directions.
+        address = lanes.high_base
+        while address < lanes.high_end:
+            self.assertEqual(lanes.translate(address), address)
+            address += 0x4000000
 
     def test_the_unapplied_window_bias_patch_is_not_in_the_build(self) -> None:
         # scripts/fex64-patches/fex32-guest-window-bias.patch is an earlier,
@@ -992,6 +1038,253 @@ class TheHostReprotectWitnessIsBounded(unittest.TestCase):
                                "1, std::memory_order_relaxed"),
                       reconcile)
         self.assertIn("16)", reconcile)
+
+
+class TheIdentityLaneFillsTheBlockTheTranslationAllows(unittest.TestCase):
+    """The lane used to be one kGuestLowLimit wide because the invariant was
+    written too strictly, not because anything required it.
+
+    The device log that prompted this shows Wine refusing to run for want of
+    address space:
+
+        err:virtual:try_map_free_area mmap() error Cannot allocate memory,
+            range 0x7ffffdfb0000-0x7ffffdffd000, unix_prot 0x7
+        err:virtual:allocate_virtual_memory out of memory for allocation,
+            base (nil) size 48d30000
+
+    The first is Wine walking down from its own user-space limit and falling
+    off the bottom of a 32 MiB arena. The second is a 1.2 GiB anonymous
+    allocation with no requested address, which the placement search had to
+    find inside an 8 GiB identity lane that already held the image, the brk
+    lane, the interpreter, the stack and TLS.
+    """
+
+    def setUp(self) -> None:
+        self.lanes = GuestLanes()
+
+    def test_the_block_is_the_ceiling_and_the_arithmetic_sets_it(self) -> None:
+        # The alias base is a contiguous run of ones; the block that starts at
+        # it and spans its lowest set bit is exactly the set of addresses that
+        # already carry all of its bits. Outside that block the OR is not the
+        # identity, so no host address there can ever serve a guest lane -- no
+        # matter what the host would be willing to map.
+        lanes = self.lanes
+        self.assertEqual(lanes.block_span, lanes.base & -lanes.base)
+        self.assertEqual(lanes.block_end, lanes.base + lanes.block_span)
+        # Every address in the block carries every base bit and no mask bit.
+        address = lanes.base
+        while address < lanes.block_end:
+            self.assertEqual(address & lanes.base, lanes.base)
+            self.assertEqual(address & lanes.clear, 0)
+            address += 0x10000000
+        # And the first address above it does not.
+        self.assertNotEqual(lanes.block_end & lanes.base, lanes.base)
+
+    def test_every_host_lane_lies_inside_the_block(self) -> None:
+        lanes = self.lanes
+        for start, end in ((lanes.base, lanes.alias_end),
+                           (lanes.high_base, lanes.high_end),
+                           (lanes.top_host_base, lanes.top_host_end)):
+            self.assertGreaterEqual(start, lanes.base)
+            self.assertLessEqual(end, lanes.block_end)
+            self.assertLess(start, end)
+
+    def test_the_three_host_lanes_tile_without_overlapping(self) -> None:
+        lanes = self.lanes
+        self.assertEqual(lanes.alias_end, lanes.high_base)
+        self.assertEqual(lanes.high_end, lanes.top_host_base)
+        # Only the 64 KiB the arena's fixed top end leaves above its image.
+        self.assertEqual(lanes.block_end - lanes.top_host_end, 0x10000)
+
+    def test_the_lane_is_bigger_than_it_was_and_still_exact(self) -> None:
+        lanes = self.lanes
+        self.assertGreater(lanes.high_end - lanes.high_base, lanes.limit)
+        self.assertEqual(lanes.high_end - lanes.high_base, 22 << 30)
+        # Exactness at the two ends and at every 256 MiB between them.
+        self.assertEqual(lanes.translate(lanes.high_base), lanes.high_base)
+        self.assertEqual(lanes.translate(lanes.high_end - 1),
+                         lanes.high_end - 1)
+        address = lanes.high_base
+        while address < lanes.high_end:
+            self.assertEqual(lanes.translate(address), address)
+            address += 0x10000000
+
+    def test_the_arena_relocation_is_exact_and_injective(self) -> None:
+        # Every mask bit is set across the arena, so the translation is a
+        # subtraction of a constant, which is injective; and the image lands
+        # inside the block, so the OR contributes nothing.
+        lanes = self.lanes
+        seen_low = lanes.translate(lanes.top_base)
+        seen_high = lanes.translate(lanes.top_end - 1)
+        self.assertEqual(seen_low, lanes.top_host_base)
+        self.assertEqual(seen_high, lanes.top_host_end - 1)
+        address = lanes.top_base
+        while address < lanes.top_end:
+            self.assertEqual(lanes.translate(address), address - lanes.clear)
+            self.assertEqual(lanes.untranslate(lanes.translate(address)),
+                             address)
+            address += 0x1000000
+
+    def test_the_arena_now_holds_the_probe_the_device_was_refused(self) -> None:
+        # 0x7ffffdfb0000-0x7ffffdffd000 was 320 KiB below the old arena base.
+        lanes = self.lanes
+        self.assertLess(lanes.top_base, 0x7FFFFDFB0000)
+        self.assertLessEqual(0x7FFFFDFFD000, lanes.top_end)
+        # The reservation the device made at the old base is still inside.
+        self.assertLess(lanes.top_base, 0x7FFFFE000000)
+        self.assertLessEqual(0x7FFFFE000000 + 0x1FF0000, lanes.top_end)
+
+    def test_the_two_headers_agree_on_every_number(self) -> None:
+        # The emulator and the pure translation header must not merely intend
+        # the same layout; they must compute the same bits. There is no C++
+        # compiler on the development host, so the mirroring static_asserts in
+        # kmemory64.h cannot be relied on to catch a divergence here.
+        header = read(KMEMORY_HEADER)
+        lanes = self.lanes
+        for macro, value in (
+            ("K64_NATIVE_LOW_ALIAS_BASE", lanes.base),
+            ("K64_NATIVE_LOW_GUEST_LIMIT", lanes.limit),
+            ("K64_NATIVE_TOP_GUEST_BASE", lanes.top_base),
+            ("K64_NATIVE_TOP_GUEST_END", lanes.top_end),
+            ("K64_NATIVE_TOP_CLEAR_MASK", lanes.clear),
+        ):
+            found = re.search(
+                r"#define\s+" + macro + r"\s+(0x[0-9A-Fa-f]+)ULL", header)
+            self.assertIsNotNone(found, macro)
+            self.assertEqual(int(found.group(1), 16), value, macro)
+        # The identity lane's end is derived from the arena's host block in
+        # kmemory64.h, so the two can never be moved apart.
+        self.assertIn(
+            "#define K64_NATIVE_GUEST_HIGH_END     K64_NATIVE_TOP_HOST_BASE",
+            header)
+
+    def test_the_superseded_crossing_assert_is_gone(self) -> None:
+        # It is a sufficient condition for a lane of exactly kGuestLowLimit
+        # bytes, and it refuses every larger lane that is equally exact. Left
+        # in place beside its replacement it would simply refuse to compile.
+        for header in (read(ALIAS_HEADER), read(KMEMORY_HEADER)):
+            self.assertNotIn("^ (kGuestHighEnd - 1)) < kGuestLowLimit", header)
+            self.assertNotIn(
+                "^ (K64_NATIVE_GUEST_HIGH_END - 1)) <", header)
+
+    def test_the_placement_search_stops_at_the_lane_not_the_window(self) -> None:
+        # The window reaches past the identity lane and up to the arena's host
+        # block. A candidate found above the lane would be refused by
+        # mmapAnonymousFixed as -EINVAL, which a caller reads as a bad
+        # argument rather than as an exhausted address space.
+        body = function_body(read(KMEMORY_SOURCE),
+                             "U64 KMemory64::mmapReserveAndMap(")
+        self.assertIn(
+            "const U64 laneEndPage = K64_NATIVE_GUEST_HIGH_END >> "
+            "K64_PAGE_SHIFT;", body)
+        self.assertNotIn("K64_NATIVE_GUEST_WINDOW_END", body)
+        self.assertIn("k64ReportGuestLaneExhausted(", body)
+
+
+class TheRefusalWitnessNamesTheRangeThatWasAskedFor(unittest.TestCase):
+    """A refusal was invisible from our side: the guest's own diagnostic was
+    the only evidence one had happened."""
+
+    def setUp(self) -> None:
+        self.source = read(KMEMORY_SOURCE)
+
+    def test_the_permitted_ranges_are_printed_once_at_startup(self) -> None:
+        body = function_body(self.source,
+                             "static void k64ReportGuestLanesOnce(")
+        self.assertIn("g_k64LanesReported.exchange(true", body)
+        # Every lane, both spaces, and the furniture placed inside them.
+        for field in ("BOXEDWINE_X64_GUEST_LANES gen=",
+                      "BOXEDWINE_X64_GUEST_LANES low guest=",
+                      "BOXEDWINE_X64_GUEST_LANES identity guest=",
+                      "BOXEDWINE_X64_GUEST_LANES top guest=",
+                      "BOXEDWINE_X64_GUEST_LANES furniture image="):
+            self.assertIn(field, body)
+        for macro in ("K64_NATIVE_LOW_GUEST_LIMIT",
+                      "K64_NATIVE_GUEST_IMAGE_BASE",
+                      "K64_NATIVE_GUEST_HIGH_END",
+                      "K64_NATIVE_TOP_GUEST_BASE",
+                      "K64_NATIVE_TOP_GUEST_END",
+                      "K64_NATIVE_TOP_HOST_BASE",
+                      "K64_NATIVE_GUEST_MMAP_BASE",
+                      "K64_NATIVE_GUEST_INTERP_BASE",
+                      "K64_NATIVE_GUEST_STACK_TOP",
+                      "K64_NATIVE_GUEST_TLS_BASE"):
+            self.assertIn(macro, body)
+
+    def test_the_ceiling_is_probed_rather_than_asserted(self) -> None:
+        # The "empirically safe interval" comment had no evidence behind it.
+        # The probe uses the same non-destructive primitive the mapping path
+        # uses, so what it reports is what a real mapping would have got.
+        body = function_body(self.source,
+                             "static void k64ReportGuestLanesOnce(")
+        self.assertIn("k64ProbeHostPageReservable(", body)
+        self.assertIn("BOXEDWINE_X64_GUEST_LANES probe stride=", body)
+        probe = function_body(self.source,
+                              "bool k64ProbeHostPageReservable(")
+        self.assertIn("k64NativeReserveHostRange(", probe)
+        # It must hand the reservation straight back, or the witness would
+        # consume the address space it is measuring.
+        self.assertIn("k64NativeReleaseReservedHostRange(", probe)
+
+    def test_the_witness_runs_before_any_of_our_own_mappings_exist(self) -> None:
+        constructor = function_body(
+            self.source,
+            "KMemory64::KMemory64(KProcess* process, bool nativeIdentity)")
+        self.assertIn("k64ReportGuestLanesOnce(generation)", constructor)
+
+    def test_a_refusal_names_the_range_and_the_nearest_lane(self) -> None:
+        body = function_body(self.source,
+                             "static void k64ReportGuestLaneRefusal(")
+        for field in ("op=%s", "addr=0x%llx", "len=0x%llx", "end=0x%llx",
+                      "nearest=%s", "straddles=%d", "miss=0x%llx",
+                      "sparse_reserved=%d"):
+            self.assertIn(field, body)
+        self.assertIn("BOXEDWINE_X64_LANE_REFUSED", body)
+
+    def test_the_lane_table_is_the_one_the_guard_actually_applies(self) -> None:
+        # The witness must not describe lanes the guard does not offer, or a
+        # log line would name a range the guest was never able to use.
+        table = self.source.split("const K64GuestLane k64GuestLanes[3] = {",
+                                  1)[1].split("};", 1)[0]
+        guard = function_body(self.source,
+                              "bool KMemory64::nativeGuestRangeAllowed(")
+        for macro in ("K64_NATIVE_LOW_GUEST_LIMIT",
+                      "K64_NATIVE_GUEST_IMAGE_BASE",
+                      "K64_NATIVE_GUEST_HIGH_END",
+                      "K64_NATIVE_TOP_GUEST_BASE",
+                      "K64_NATIVE_TOP_GUEST_END"):
+            self.assertIn(macro, table)
+            self.assertIn(macro, guard)
+
+    def test_every_refusal_path_names_itself(self) -> None:
+        # Including the one that used to say nothing at all: the -ENOMEM that
+        # MAP_FIXED_NOREPLACE returns for an address no lane can back.
+        for operation in ("mmap-fixed", "mmap-file", "mmap-noreplace",
+                          "mprotect", "munmap"):
+            self.assertIn('"%s"' % operation, self.source)
+        no_replace = function_body(self.source,
+                                   "U64 KMemory64::mmapAnonymousNoReplace(")
+        self.assertIn("k64ReportGuestLaneRefusal(this, \"mmap-noreplace\"",
+                      no_replace)
+
+    def test_a_refusal_says_whether_the_guest_was_told_it_owned_the_range(self) -> None:
+        # Wine takes a granted PROT_NONE reservation as proof the range is
+        # usable and later commits inside it. The commit is what gets refused,
+        # and without this field the log cannot tell that case apart from a
+        # wild fixed-address probe.
+        no_replace = function_body(self.source,
+                                   "U64 KMemory64::mmapAnonymousNoReplace(")
+        self.assertIn("sparseReservationOverlaps(addr, mapLen)", no_replace)
+
+    def test_both_witnesses_are_bounded(self) -> None:
+        # A guest answers a refusal by probing again; an unbounded line here
+        # would be the log flood the sparse-reservation path exists to stop.
+        self.assertIn("constexpr U32 K64_LANE_REPORT_LIMIT = 64;", self.source)
+        for name in ("g_k64LaneRefusalReports", "g_k64LaneExhaustedReports"):
+            self.assertIn(name + ".fetch_add(1, std::memory_order_relaxed)",
+                          self.source)
+        self.assertEqual(
+            self.source.count("if (seen >= K64_LANE_REPORT_LIMIT) return;"), 2)
 
 
 if __name__ == "__main__":

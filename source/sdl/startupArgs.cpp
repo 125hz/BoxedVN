@@ -653,6 +653,241 @@ static void configureX64AudioDriver(const BString& winePrefix) {
     }
 }
 
+// Read one string value out of a Wine user.reg, in the same file format the
+// writer above edits. Returns the empty string when the section or the value
+// is absent, which is the state that matters for the renderer: wined3d reads
+// an absent value as WINED3D_RENDERER_AUTO and picks its OpenGL adapter.
+//
+// Deliberately the mirror of setGuestWineRegistryValue and no larger. It
+// recognises the same three shapes -- a header at the start of a line, an
+// optional "#time=" line, quoted assignments until the next section -- and
+// claims to understand nothing else.
+static std::string getGuestWineRegistryValue(const std::string& contents,
+                                             const std::string& section,
+                                             const std::string& name) {
+    const std::string header = "[" + section + "]";
+    const std::string namePrefix = "\"" + name + "\"=";
+
+    size_t sectionStart = contents.find(header);
+    while (sectionStart != std::string::npos && sectionStart != 0 &&
+           contents[sectionStart - 1] != '\n') {
+        sectionStart = contents.find(header, sectionStart + 1);
+    }
+    if (sectionStart == std::string::npos) {
+        return std::string();
+    }
+    size_t sectionEnd = contents.find("\n[", sectionStart);
+    if (sectionEnd == std::string::npos) {
+        sectionEnd = contents.length();
+    } else {
+        sectionEnd++;
+    }
+    size_t cursor = contents.find('\n', sectionStart);
+    while (cursor != std::string::npos && cursor < sectionEnd) {
+        const size_t lineStart = cursor + 1;
+        size_t lineEnd = contents.find('\n', lineStart);
+        if (lineEnd == std::string::npos || lineEnd > sectionEnd) {
+            lineEnd = sectionEnd;
+        }
+        if (contents.compare(lineStart, namePrefix.length(), namePrefix) == 0) {
+            std::string value =
+                contents.substr(lineStart + namePrefix.length(),
+                                lineEnd - lineStart - namePrefix.length());
+            if (!value.empty() && value.back() == '\r') {
+                value.pop_back();
+            }
+            // A string value carries the file's own quotes. Anything else --
+            // a dword, say -- is not this value's type and is returned as it
+            // stands rather than guessed at.
+            if (value.size() >= 2 && value.front() == '"' &&
+                value.back() == '"') {
+                value = value.substr(1, value.size() - 2);
+            }
+            return value;
+        }
+        if (lineEnd >= sectionEnd) {
+            break;
+        }
+        cursor = lineEnd;
+    }
+    return std::string();
+}
+
+// The ELF class of one guest file, asked of the mounted filesystem rather
+// than of the build. A packaging listing is not what the guest loader sees:
+// on this lane the file that answers a soname is routinely the IA-32 lane's
+// shim from the root filesystem, which no 64-bit packaging step ever placed.
+static const char* x64GuestFileElfClass(const BString& path) {
+    std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(B(""), path, true);
+    if (!node || node->isDirectory()) {
+        return "none";
+    }
+    FsOpenNode* probe = node->open(K_O_RDONLY);
+    if (!probe) {
+        return "unreadable";
+    }
+    U8 ident[5] = {};
+    const U32 got = probe->readNative(ident, (U32)sizeof(ident));
+    probe->close();
+    delete probe;
+    return boxedvn::guestElfClassName(ident, got);
+}
+
+// One line naming what a 64-bit guest process gets when it asks its loader for
+// the OpenGL client library, so a log answers that without Wine's wgl channel
+// being turned on -- and answers it with a path and an ELF class rather than
+// with a sentence that reads identically whether the file is absent or
+// present and unusable.
+//
+// A device run reported only "Failed to load libGL: libGL.so.1: wrong ELF
+// class: ELFCLASS32" followed by "OpenGL support is disabled", which does not
+// say which of eight candidate paths answered, and would have said the same
+// had a usable library been staged one directory earlier. See
+// K_X64_GUEST_OPENGL_LIB_PATH in include/guest_wine64_layout.h for why the
+// expected answer is the IA-32 lane's shim and why it is left where it is.
+static void reportX64GuestOpenGl() {
+    const char* firstClass = "none";
+    BString firstPath = B("(none)");
+    BString bindsPath = B("(none)");
+    bool binds = false;
+    for (const std::string& candidate :
+         boxedvn::guestLibrarySearchPaths(K_X64_GUEST_OPENGL_SONAME)) {
+        const BString path = BString::copy(candidate.c_str());
+        const char* elfClass = x64GuestFileElfClass(path);
+        if (std::string(elfClass) == "none") {
+            continue;
+        }
+        if (std::string(firstClass) == "none") {
+            firstClass = elfClass;
+            firstPath = path;
+        }
+        // The loader does not stop at the first file it opens; it stops at
+        // the first one it can use. Both are reported, because on this lane
+        // they are different files whenever they exist at all.
+        if (boxedvn::guestElfClassIsUsable(elfClass)) {
+            bindsPath = path;
+            binds = true;
+            break;
+        }
+    }
+    klog_fmt("BOXEDWINE_X64_OPENGL soname=%s found=%s class=%s binds=%s "
+             "lane64=%s",
+             K_X64_GUEST_OPENGL_SONAME, firstPath.c_str(), firstClass,
+             bindsPath.c_str(),
+             x64GuestFileElfClass(B(K_X64_GUEST_OPENGL_LIB_PATH)));
+    if (!binds) {
+        klog("BOXEDWINE_X64_OPENGL status=absent: this build defines no GL "
+             "backend, the host is Metal-only and the 64-bit X11 bridge serves "
+             "no GLX, so wined3d's OpenGL adapter cannot be built and every "
+             "Direct3D route has to be Vulkan or Metal; see "
+             "docs/KNOWN_LIMITATIONS_IOS.md section 3");
+    }
+}
+
+// wined3d chooses its backend once, from HKCU\Software\Wine\Direct3D value
+// "renderer", and Wine 9 reads an absent value as WINED3D_RENDERER_AUTO, which
+// is its OpenGL adapter. On a lane with no OpenGL that default is the one
+// choice guaranteed to fail, and it fails late: a device run of a 32-bit
+// Direct3D 11 program loaded Wine's own d3d11, which loaded wined3d, which
+// loaded opengl32, which reached for the library the witness above reports,
+// and only then said "Failed to get a GL context for adapter".
+//
+// So name the adapter the lane actually packages. Written here rather than by
+// the iOS prefix policy because that policy prepares the IA-32 lane's prefix
+// only -- the 64-bit lane's prefix is this launch's, the same one the audio
+// driver value above is written into, and the write follows the same rule as
+// that one: only when the backend is really there. A prefix that has not
+// booted yet has no user.reg to edit and gets the value on its next launch,
+// which is the behaviour the audio value has had since it was added.
+static void configureX64WineD3dRenderer(const BString& winePrefix) {
+    const char* vulkanClass =
+        x64GuestFileElfClass(B(K_X64_GUEST_VULKAN_LIB_PATH));
+    const bool vulkanUsable = boxedvn::guestElfClassIsUsable(vulkanClass);
+    const char* registryStatus = "no-user-reg";
+    std::string renderer;
+
+    const BString userRegistry = winePrefix + "/user.reg";
+    std::shared_ptr<FsNode> node =
+        Fs::getNodeFromLocalPath(B(""), userRegistry, true);
+    BString nativePath = node ? node->nativePath : B("");
+    if (node && !node->isDirectory() && !nativePath.isEmpty()) {
+        std::string contents;
+        bool readable = true;
+        {
+            std::ifstream in(nativePath.c_str(), std::ios::binary);
+            if (!in) {
+                readable = false;
+            } else {
+                in.seekg(0, std::ios::end);
+                const std::streamoff size = in.tellg();
+                in.seekg(0, std::ios::beg);
+                if (size > 0) {
+                    contents.resize((size_t)size);
+                    in.read(&contents[0], (std::streamsize)contents.size());
+                    readable = in.good();
+                }
+            }
+        }
+        if (!readable) {
+            registryStatus = "unreadable";
+        } else {
+            renderer = getGuestWineRegistryValue(
+                contents, K_X64_WINED3D_REGISTRY_SECTION,
+                K_X64_WINED3D_RENDERER_NAME);
+            if (!boxedvn::shouldConfigureX64WineD3dVulkan(vulkanUsable)) {
+                registryStatus = "skipped";
+            } else if (!setGuestWineRegistryValue(
+                           contents, K_X64_WINED3D_REGISTRY_SECTION,
+                           K_X64_WINED3D_RENDERER_NAME,
+                           "\"" K_X64_WINED3D_RENDERER_VULKAN "\"")) {
+                registryStatus = "present";
+                renderer = K_X64_WINED3D_RENDERER_VULKAN;
+            } else {
+                // Sibling temp file and rename, as the audio value does: a
+                // process killed mid-write must not leave a truncated
+                // user.reg, which Wine treats as an empty registry and
+                // silently reinitialises.
+                const BString tempPath = nativePath + ".boxedvn-d3d";
+                bool wrote = false;
+                {
+                    std::ofstream out(tempPath.c_str(),
+                                      std::ios::binary | std::ios::trunc);
+                    if (out) {
+                        out.write(contents.data(),
+                                  (std::streamsize)contents.size());
+                        wrote = out.good();
+                    }
+                }
+                std::error_code ec;
+                if (wrote) {
+                    std::filesystem::rename(tempPath.c_str(),
+                                            nativePath.c_str(), ec);
+                }
+                if (!wrote || ec) {
+                    std::filesystem::remove(tempPath.c_str(), ec);
+                    registryStatus = "unwritable";
+                } else {
+                    registryStatus = K_X64_WINED3D_RENDERER_VULKAN;
+                    renderer = K_X64_WINED3D_RENDERER_VULKAN;
+                }
+            }
+        }
+    }
+
+    klog_fmt("BOXEDWINE_X64_WINED3D_RENDERER vulkan_client=%s registry=%s "
+             "renderer=%s adapter=%s prefix=%s",
+             vulkanClass, registryStatus,
+             renderer.empty() ? "(unset)" : renderer.c_str(),
+             boxedvn::wined3dAdapterForRenderer(renderer),
+             winePrefix.c_str());
+    if (!vulkanUsable) {
+        klog("BOXEDWINE_X64_WINED3D_RENDERER status=no-vulkan-client: the "
+             "64-bit Vulkan client library is missing or is the IA-32 shim, so "
+             "the renderer is left as it stands rather than naming a backend "
+             "this lane cannot reach");
+    }
+}
+
 // The two OSS nodes Wine's driver opens, taken through the guest filesystem
 // after every overlay is mounted. They are registered unconditionally in
 // buildVirtualFileSystem() and shared with the IA-32 lane, so the interesting
@@ -1522,6 +1757,12 @@ bool StartUpArgs::apply() {
         // the tree the guest will actually search. See docs/PLAN_X64_AUDIO.md.
         reportX64AudioDeviceNodes();
         configureX64AudioDriver(winePrefix);
+        // Graphics, in the same place and for the same reason: both the GL
+        // witness and the renderer decision have to see the mounted guest
+        // filesystem, and the renderer has to be settled before wineserver
+        // reads the prefix.
+        reportX64GuestOpenGl();
+        configureX64WineD3dRenderer(winePrefix);
     }
 
     if (!this->ddrawOverridePath.isEmpty()) {

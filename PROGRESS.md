@@ -7523,3 +7523,53 @@ requiring version 6 silently got version 5, with different structure sizes. The
 runtime builder now stages a winsxs tree for both architectures from the
 modules it already packages, gated on the common controls assembly being
 present, so a build that would ship the old silent substitution fails instead.
+
+## Wine says what is wrong, and it is address space
+
+With Wine's channels audible the three failures name themselves. A 64-bit
+program fails dozens of mappings around 0x7ffffd... and 0x6ffff... and then
+puts up its own error dialog, whose text the message-box channel now carries. A
+32-bit program's renderer thread exits mid-frame because a 1.14 GiB allocation
+with no requested address failed. Both are our address space, not their code.
+
+The permitted windows were half empty for no reason. The translation is one OR
+with the alias base and one AND with the top mask, and the arithmetic admits
+exactly the 32 GiB block that starts at the base and spans its lowest set bit;
+nothing outside it can be a host address for a guest lane however much the
+device would give. Of that block, 8 GiB of alias and 8 GiB of identity lane
+were used and about 16 GiB in the middle was refused. The identity lane is now
+22 GiB and Wine's top-down arena 2 GiB, which leaves 64 KiB of the block idle,
+and the placement lane for mappings with no requested address grows from about
+5 GiB to 21.5 GiB. The window constants that bounded this were never measured;
+they arrived in the first commit of this path and were never revisited.
+
+The assert that limited the lane was sufficient rather than necessary: it
+demanded the lane not cross a bit boundary, which is true of a lane exactly one
+low limit wide and false of every larger lane that is equally exact. It is
+replaced by block containment, which is the property that actually holds, with
+the proof recorded beside it. A startup witness now sweeps the block with the
+non-destructive reservation the memory layer already uses and prints what the
+device granted, so the ceiling is measured rather than asserted, and a refused
+range names the lane it missed.
+
+One class remains unfixable by any width of window: a commit at an absolute
+address outside the three islands, which no OR and AND pair can reach. Wine
+assumes 128 TiB and we can name 32 GiB at fixed places it knows nothing about.
+The cheaper answer there is to constrain Wine's own idea of its address space
+rather than the translator's, and the new witness records whether such an
+address was earlier granted as a sparse reservation, which would explain why
+Wine believes it owns it.
+
+## The renderer was never chosen
+
+A 32-bit program reached OpenGL, which this platform does not have, and
+wined3d then failed to make a device. The cause was not the wrong-architecture
+library it tried to load: Wine reports OpenGL disabled identically whether the
+library is missing or unusable, and a real one could not work here anyway
+because our X server serves no GLX. The cause is that the value telling wined3d
+to use Vulkan is written by prefix preparation that the translated lane skips
+entirely, so it has never been set on this side. It is written now, gated on
+the packaged Vulkan client actually being a 64-bit object, with witnesses
+naming what the guest found for OpenGL and which renderer it was given. The
+program's own imports are Direct3D 11, so the 32-bit Direct3D 9 translation
+that gets projected was never in the picture.

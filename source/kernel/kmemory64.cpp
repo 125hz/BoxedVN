@@ -517,6 +517,232 @@ void KMemory64::flushTranslatedCodeInvalidations() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The permitted-range witness.
+//
+// A refusal has been invisible from this side. Each refusal path returned an
+// errno and, at best, one line naming the address but never what WOULD have
+// been acceptable, so the only evidence a refusal had happened at all was the
+// guest's own diagnostic -- and until Wine's debug channels reached the device
+// log there was none. Two things are printed so the next log can answer "is
+// the guest still being refused, and where":
+//
+//   * Once per host process: every guest range this address space accepts, the
+//     host block each is served from, the furniture placed inside them, and
+//     what the HOST answered when the same non-destructive reservation
+//     primitive the mapping path uses was pointed across the block. The
+//     layout's ceiling is arithmetic -- see the alias block in kmemory64.h --
+//     but whether the device hands over the addresses inside it has only ever
+//     been assumed. This measures it instead of assuming it.
+//   * For a refusal: the operation, the exact range asked for, which lane it
+//     came nearest to and by how far, and whether the guest had previously
+//     been GRANTED that address as an inaccessible sparse reservation. That
+//     last field is the one that separates a wild fixed-address probe from a
+//     commit inside a reservation this address space told the guest it owned.
+//
+// Both are bounded. A guest answers a refusal by probing again, so an
+// unbounded line here would be the log flood the sparse-reservation path
+// exists to prevent.
+
+namespace {
+
+struct K64GuestLane {
+    const char* name;
+    U64 base;
+    U64 end;
+};
+
+// Exactly the three ranges nativeGuestRangeAllowed accepts, in its own order.
+// If that function grows a fourth, this table is what makes the omission
+// visible: the witness would name a lane the guest was never offered.
+const K64GuestLane k64GuestLanes[3] = {
+    {"low",      0,                           K64_NATIVE_LOW_GUEST_LIMIT},
+    {"identity", K64_NATIVE_GUEST_IMAGE_BASE, K64_NATIVE_GUEST_HIGH_END},
+    {"top",      K64_NATIVE_TOP_GUEST_BASE,   K64_NATIVE_TOP_GUEST_END},
+};
+
+std::atomic<bool> g_k64LanesReported {false};
+std::atomic<U32> g_k64LaneRefusalReports {0};
+std::atomic<U32> g_k64LaneExhaustedReports {0};
+constexpr U32 K64_LANE_REPORT_LIMIT = 64;
+
+// The lane a refused range came closest to, and by how many bytes it missed.
+// A range that OVERLAPS a lane without being contained in it is its own
+// answer: such a range is refused rather than split, because one mapping has
+// to land in one host lane, and calling that "N bytes short of the identity
+// lane" would hide the fact that the address itself was perfectly acceptable.
+const char* k64NearestGuestLane(U64 addr, U64 end, U64& missBy,
+                                bool& straddles) {
+    const char* best = "none";
+    U64 bestMiss = ~(U64)0;
+    missBy = 0;
+    straddles = false;
+    for (U32 i = 0; i < 3; i++) {
+        const K64GuestLane& lane = k64GuestLanes[i];
+        if (addr < lane.end && end > lane.base) {
+            straddles = true;
+            missBy = (end > lane.end ? end - lane.end : 0) +
+                     (addr < lane.base ? lane.base - addr : 0);
+            return lane.name;
+        }
+        const U64 miss = (end <= lane.base) ? (lane.base - end)
+                                            : (addr - lane.end);
+        if (miss < bestMiss) {
+            bestMiss = miss;
+            best = lane.name;
+        }
+    }
+    missBy = bestMiss;
+    return best;
+}
+
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && defined(__APPLE__)
+// Will the host still hand over this address? vm_allocate with VM_FLAGS_FIXED
+// fails with KERN_NO_SPACE rather than replacing whatever is already there, so
+// the question is asked without disturbing anything, and the reservation is
+// handed straight back. It is the same primitive the mapping path itself uses,
+// so a yes here is the yes a real mapping would have received.
+//
+// Darwin only: the non-Darwin reservation fallback has no matching release, so
+// probing there would leak one mapping per probe.
+bool k64ProbeHostPageReservable(U64 hostAddress) {
+    const U64 length = 0x4000ULL;   // one iOS host page
+    if (!k64NativeReserveHostRange(hostAddress, length)) return false;
+    k64NativeReleaseReservedHostRange(hostAddress, length);
+    return true;
+}
+#endif
+
+} // namespace
+
+// One line per lane, then the furniture, then what the host actually said.
+// Called from the first native-identity address space this process builds, at
+// which point none of our own mappings exist yet, so the probe measures the
+// host and not ourselves.
+static void k64ReportGuestLanesOnce(U64 generation) {
+    if (g_k64LanesReported.exchange(true, std::memory_order_relaxed)) return;
+    klog_fmt("BOXEDWINE_X64_GUEST_LANES gen=%llu block=[0x%llx,0x%llx) "
+             "span=%lluMiB window=[0x%llx,0x%llx)",
+             (unsigned long long)generation,
+             (unsigned long long)K64_NATIVE_LOW_ALIAS_BASE,
+             (unsigned long long)K64_NATIVE_ALIAS_BLOCK_END,
+             (unsigned long long)(K64_NATIVE_ALIAS_BLOCK_SPAN >> 20),
+             (unsigned long long)K64_NATIVE_GUEST_WINDOW_START,
+             (unsigned long long)K64_NATIVE_GUEST_WINDOW_END);
+    klog_fmt("BOXEDWINE_X64_GUEST_LANES low guest=[0x0,0x%llx) "
+             "host=[0x%llx,0x%llx) size=%lluMiB",
+             (unsigned long long)K64_NATIVE_LOW_GUEST_LIMIT,
+             (unsigned long long)K64_NATIVE_LOW_ALIAS_BASE,
+             (unsigned long long)K64_NATIVE_LOW_ALIAS_END,
+             (unsigned long long)(K64_NATIVE_LOW_GUEST_LIMIT >> 20));
+    klog_fmt("BOXEDWINE_X64_GUEST_LANES identity guest=[0x%llx,0x%llx) "
+             "host=identity size=%lluMiB",
+             (unsigned long long)K64_NATIVE_GUEST_IMAGE_BASE,
+             (unsigned long long)K64_NATIVE_GUEST_HIGH_END,
+             (unsigned long long)((K64_NATIVE_GUEST_HIGH_END -
+                                   K64_NATIVE_GUEST_IMAGE_BASE) >> 20));
+    klog_fmt("BOXEDWINE_X64_GUEST_LANES top guest=[0x%llx,0x%llx) "
+             "host=[0x%llx,0x%llx) size=%lluMiB clear_mask=0x%llx",
+             (unsigned long long)K64_NATIVE_TOP_GUEST_BASE,
+             (unsigned long long)K64_NATIVE_TOP_GUEST_END,
+             (unsigned long long)K64_NATIVE_TOP_HOST_BASE,
+             (unsigned long long)K64_NATIVE_TOP_HOST_END,
+             (unsigned long long)(K64_NATIVE_TOP_GUEST_LENGTH >> 20),
+             (unsigned long long)K64_NATIVE_TOP_CLEAR_MASK);
+    klog_fmt("BOXEDWINE_X64_GUEST_LANES furniture image=0x%llx brk_end=0x%llx "
+             "mmap=[0x%llx,0x%llx) %lluMiB interp=0x%llx stack_top=0x%llx "
+             "tls=0x%llx",
+             (unsigned long long)K64_NATIVE_GUEST_IMAGE_BASE,
+             (unsigned long long)K64_NATIVE_GUEST_HEAP_LIMIT,
+             (unsigned long long)K64_NATIVE_GUEST_MMAP_BASE,
+             (unsigned long long)K64_NATIVE_GUEST_HIGH_END,
+             (unsigned long long)((K64_NATIVE_GUEST_HIGH_END -
+                                   K64_NATIVE_GUEST_MMAP_BASE) >> 20),
+             (unsigned long long)K64_NATIVE_GUEST_INTERP_BASE,
+             (unsigned long long)K64_NATIVE_GUEST_STACK_TOP,
+             (unsigned long long)K64_NATIVE_GUEST_TLS_BASE);
+#if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && defined(__APPLE__)
+    // A stride sweep of the whole block plus the last host page of each lane.
+    // Sixty-four probes, each a vm_allocate/vm_deallocate pair, once per
+    // process. It is a witness and not a guarantee -- a granted probe says the
+    // address was free at this instant -- but a lane whose far end is refused
+    // here is a lane this layout cannot actually use, and that is exactly the
+    // fact the "empirically safe interval" comment has been asserting without
+    // evidence since the FEX path was first added.
+    const U64 stride = 0x20000000ULL;   // 512 MiB
+    U32 probes = 0;
+    U32 granted = 0;
+    U64 highest = 0;
+    for (U64 host = K64_NATIVE_LOW_ALIAS_BASE;
+         host < K64_NATIVE_ALIAS_BLOCK_END; host += stride) {
+        probes++;
+        if (k64ProbeHostPageReservable(host)) {
+            granted++;
+            highest = host;
+        }
+    }
+    const int lowEnd =
+        k64ProbeHostPageReservable(K64_NATIVE_LOW_ALIAS_END - 0x4000ULL) ? 1 : 0;
+    const int identityEnd =
+        k64ProbeHostPageReservable(K64_NATIVE_GUEST_HIGH_END - 0x4000ULL) ? 1 : 0;
+    const int topEnd =
+        k64ProbeHostPageReservable(K64_NATIVE_TOP_HOST_END - 0x4000ULL) ? 1 : 0;
+    klog_fmt("BOXEDWINE_X64_GUEST_LANES probe stride=0x%llx probes=%u "
+             "granted=%u highest=0x%llx last_page low=%d identity=%d top=%d",
+             (unsigned long long)stride, (unsigned)probes, (unsigned)granted,
+             (unsigned long long)highest, lowEnd, identityEnd, topEnd);
+#else
+    klog_fmt("BOXEDWINE_X64_GUEST_LANES probe unavailable on this host");
+#endif
+}
+
+// One line for a refused range. `sparseReserved` is 1 or 0 when the caller
+// could ask the reservation map safely, and -1 where it could not; it is never
+// guessed, because "the guest was told it owned this" and "we never heard of
+// this address" are the two answers that matter and confusing them would make
+// the witness worse than silence.
+static void k64ReportGuestLaneRefusal(const KMemory64* memory, const char* op,
+                                      U64 addr, U64 len, int sparseReserved) {
+    if (!memory || !memory->nativeIdentityMode()) return;
+    const U32 seen =
+        g_k64LaneRefusalReports.fetch_add(1, std::memory_order_relaxed);
+    if (seen >= K64_LANE_REPORT_LIMIT) return;
+    const U64 end = (len && addr <= UINT64_MAX - len) ? addr + len : addr;
+    U64 missBy = 0;
+    bool straddles = false;
+    const char* lane = k64NearestGuestLane(addr, end, missBy, straddles);
+    klog_fmt("BOXEDWINE_X64_LANE_REFUSED op=%s gen=%llu addr=0x%llx len=0x%llx "
+             "end=0x%llx nearest=%s straddles=%d miss=0x%llx "
+             "sparse_reserved=%d (%u/%u)",
+             op ? op : "?",
+             (unsigned long long)memory->addressSpaceGeneration(),
+             (unsigned long long)addr, (unsigned long long)len,
+             (unsigned long long)end, lane, straddles ? 1 : 0,
+             (unsigned long long)missBy, sparseReserved,
+             (unsigned)(seen + 1), (unsigned)K64_LANE_REPORT_LIMIT);
+}
+
+// The other shape of refusal: no address was asked for, and the search for one
+// reached the end of the lane it draws from. Wine reads the errno as "out of
+// memory for allocation, base (nil)", which says nothing about how much lane
+// there was; this says it.
+static void k64ReportGuestLaneExhausted(const KMemory64* memory, U64 length,
+                                        U64 cursorPage, U64 laneEndPage) {
+    if (!memory || !memory->nativeIdentityMode()) return;
+    const U32 seen =
+        g_k64LaneExhaustedReports.fetch_add(1, std::memory_order_relaxed);
+    if (seen >= K64_LANE_REPORT_LIMIT) return;
+    const U64 cursor = cursorPage << K64_PAGE_SHIFT;
+    const U64 laneEnd = laneEndPage << K64_PAGE_SHIFT;
+    klog_fmt("BOXEDWINE_X64_LANE_EXHAUSTED gen=%llu want=0x%llx first_free="
+             "0x%llx lane_end=0x%llx remaining=0x%llx (%u/%u)",
+             (unsigned long long)memory->addressSpaceGeneration(),
+             (unsigned long long)length, (unsigned long long)cursor,
+             (unsigned long long)laneEnd,
+             (unsigned long long)(laneEnd > cursor ? laneEnd - cursor : 0),
+             (unsigned)(seen + 1), (unsigned)K64_LANE_REPORT_LIMIT);
+}
+
 // Monotonic across every address space this image ever builds, so an exec
 // replacement is never confused with the address space it replaced.
 static std::atomic<U64> g_addressSpaceGeneration {1};
@@ -528,6 +754,15 @@ KMemory64::KMemory64(KProcess* process, bool nativeIdentity) : process(process) 
 #else
     (void)nativeIdentity;
 #endif
+    // The first native address space of the process prints the lane table and
+    // probes the host block. Here rather than at the first refusal, because a
+    // log that shows only refusals cannot say whether the ranges on offer were
+    // the ones intended; and here rather than later, because none of our own
+    // mappings exist yet, so the probe measures the host and not ourselves.
+    // Read through the member, which is false in every build that has no
+    // native mode, so the call is compiled in unconditionally and cannot go
+    // stale in a configuration nobody builds.
+    if (this->nativeIdentity) k64ReportGuestLanesOnce(generation);
 }
 KMemory64::~KMemory64() {
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
@@ -1418,6 +1653,11 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
                  (unsigned long long)addr, (unsigned long long)len,
                  (unsigned long long)K64_NATIVE_GUEST_WINDOW_START,
                  (unsigned long long)K64_NATIVE_GUEST_WINDOW_END);
+        // No lock is held here, so the reservation map can be asked.
+        k64ReportGuestLaneRefusal(
+            this, "mmap-fixed", addr, pageCount << K64_PAGE_SHIFT,
+            sparseReservationOverlaps(addr, pageCount << K64_PAGE_SHIFT)
+                ? 1 : 0);
         return (U64)-K_EINVAL;
     }
 
@@ -1545,6 +1785,10 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
         klog_fmt("KMemory64: reject native shared map outside guest window "
                  "addr=0x%llx len=0x%llx", (unsigned long long)addr,
                  (unsigned long long)len);
+        k64ReportGuestLaneRefusal(
+            this, "mmap-file", addr, pageCount << K64_PAGE_SHIFT,
+            sparseReservationOverlaps(addr, pageCount << K64_PAGE_SHIFT)
+                ? 1 : 0);
         return (U64)-K_EINVAL;
     }
 
@@ -1892,6 +2136,15 @@ U64 KMemory64::mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot) {
         // again -- across a region where every address is equally unhostable
         // that is an unbounded walk. -ENOMEM is the true answer and ends the
         // search at the first probe.
+        //
+        // This was the one refusal that said nothing at all. mmapMutex is
+        // held and is recursive, so the reservation map is safe to ask -- and
+        // it is the answer worth having here: a range this test just found
+        // unmapped, but that overlaps a granted sparse reservation, is the
+        // guest committing inside address space it was told it owned.
+        k64ReportGuestLaneRefusal(this, "mmap-noreplace", addr, mapLen,
+                                  sparseReservationOverlaps(addr, mapLen)
+                                      ? 1 : 0);
         return (U64)-K_ENOMEM;
     }
 
@@ -1962,9 +2215,18 @@ U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
     }
     // `candidate` now points at a hole large enough (either before `it` or past
     // the last range — address space above is effectively unbounded for us).
-    const U64 windowEndPage = K64_NATIVE_GUEST_WINDOW_END >> K64_PAGE_SHIFT;
+    //
+    // The bound is the IDENTITY LANE's end, not the host window's. The window
+    // reaches past the lane and up to the top-arena host block, which this
+    // search must never place a mapping in: a candidate above the lane would
+    // be found here and then refused by mmapAnonymousFixed as -EINVAL, which a
+    // caller reads as a bad argument rather than as an exhausted address
+    // space. The lane end makes the two agree and makes the answer -ENOMEM.
+    const U64 laneEndPage = K64_NATIVE_GUEST_HIGH_END >> K64_PAGE_SHIFT;
     if (nativeIdentityMode() &&
-        (candidate > windowEndPage || pageCount > windowEndPage - candidate)) {
+        (candidate > laneEndPage || pageCount > laneEndPage - candidate)) {
+        k64ReportGuestLaneExhausted(this, pageCount << K64_PAGE_SHIFT,
+                                    candidate, laneEndPage);
         return (U64)-K_ENOMEM;
     }
     U64 addr = candidate << K64_PAGE_SHIFT;
@@ -1998,6 +2260,10 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
             klog_fmt("KMemory64: reject native mprotect outside guest window "
                      "addr=0x%llx len=0x%llx", (unsigned long long)addr,
                      (unsigned long long)len);
+            k64ReportGuestLaneRefusal(
+                this, "mprotect", addr, pageCount << K64_PAGE_SHIFT,
+                sparseReservationOverlaps(addr, pageCount << K64_PAGE_SHIFT)
+                    ? 1 : 0);
             return (U64)-K_EINVAL;
         }
         const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);
@@ -2101,6 +2367,11 @@ U64 KMemory64::munmap(U64 addr, U64 len) {
             klog_fmt("KMemory64: reject native munmap outside guest window "
                      "addr=0x%llx len=0x%llx", (unsigned long long)addr,
                      (unsigned long long)len);
+            // The sparse reservation, if there was one, was already released
+            // above -- so 0 here is a fact about the map as it now stands and
+            // not an answer to whether the guest ever held this range.
+            k64ReportGuestLaneRefusal(
+                this, "munmap", addr, pageCount << K64_PAGE_SHIFT, -1);
             return (U64)-K_EINVAL;
         }
         const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);

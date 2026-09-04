@@ -180,6 +180,92 @@
 #define K_X64_GUEST_VULKAN_LIB_PATH \
     K_X64_GUEST_X11_LIB_DIR "/" K_X64_GUEST_VULKAN_SONAME
 
+// What the 64-bit lane has for OpenGL, which is nothing, and why nothing is
+// the settled answer rather than a gap waiting to be filled.
+//
+// docs/KNOWN_LIMITATIONS_IOS.md section 3 states the build-wide position: this
+// build defines no GL backend, because upstream's software GL is a macOS
+// dylib pair (OSMesa over LLVM) that does not exist for iOS and would need a
+// JIT of its own. Two further facts make it specific to this lane. The host is
+// Metal-only, so even a perfect guest client library would have nothing to
+// bind to; and the 64-bit X11 client libraries in the directory above are a
+// bridge to BoxedWine's built-in X server (tools/x11-64), which serves no GLX
+// opcodes -- so a Mesa libGL staged here would load and then fail at
+// glXQueryExtension instead of at dlopen.
+//
+// The consequence a device log shows is not a missing file. The soname
+// resolves: the loader walks the same search order it walks for
+// libvulkan.so.1 and reaches /lib/libGL.so.1, which is the IA-32 lane's own
+// guest shim (tools/opengl, an i386 ELF trapping through `int 0x99`). A
+// 64-bit process is refused it for its ELF class, and Wine reports
+//
+//   err:wgl:init_opengl Failed to load libGL: libGL.so.1: wrong ELF class:
+//                       ELFCLASS32
+//   err:wgl:init_opengl OpenGL support is disabled.
+//
+// which is byte for byte the same outcome as the file not being there at all:
+// init_opengl disables OpenGL on any dlopen failure, whatever the reason. So
+// removing the IA-32 file from this lane's view would change the sentence and
+// nothing else, and that file is the IA-32 lane's working GL client library --
+// it is found second, not shipped for us. It stays.
+//
+// What must never happen instead is this lane acquiring a GL library of its
+// own that cannot work. The shim directory heads LD_LIBRARY_PATH, so anything
+// named libGL.so.1 there is found FIRST, ahead of the IA-32 file, and a
+// wrong-class or non-ELF file there would fail identically while looking like
+// ours. scripts/build-wine64-runtime-ci.sh and
+// scripts/validate-wine64-runtime.sh therefore allow the entry to be absent --
+// that is the documented state -- and require an ELF64 x86-64 object if it is
+// ever present.
+//
+// The startup witness (BOXEDWINE_X64_OPENGL in source/sdl/startupArgs.cpp)
+// resolves the soname the way the guest loader does and names the file that
+// answers and its ELF class, so a future log states this without Wine's wgl
+// channel being enabled.
+#define K_X64_GUEST_OPENGL_SONAME "libGL.so.1"
+#define K_X64_GUEST_OPENGL_LIB_PATH \
+    K_X64_GUEST_X11_LIB_DIR "/" K_X64_GUEST_OPENGL_SONAME
+
+// The directories the guest's ld-linux tries for a bare soname, in the order a
+// device run was observed trying them: LD_LIBRARY_PATH first (which for a
+// 64-bit launch is the shim directory above, see
+// K_X64_GUEST_LIBRARY_PATH_ASSIGNMENT), then the multiarch pair, then the
+// unsuffixed pair. The glibc-hwcaps subdirectories the same run tried are
+// omitted deliberately: nothing packages into them, and a witness that lists
+// paths nobody fills says less, not more.
+#define K_X64_GUEST_LIBRARY_SEARCH_DIR_COUNT 5
+#define K_X64_GUEST_LIBRARY_SEARCH_DIRS \
+    {K_X64_GUEST_X11_LIB_DIR, "/lib/x86_64-linux-gnu", \
+     "/usr/lib/x86_64-linux-gnu", "/lib", "/usr/lib"}
+
+// wined3d does not choose its backend from what is installed. It reads
+// HKCU\Software\Wine\Direct3D value "renderer" once, and Wine 9's
+// wined3d_get_renderer() maps the default -- WINED3D_RENDERER_AUTO, which is
+// what an unset value means -- to WINED3D_RENDERER_OPENGL
+// (dlls/wined3d/wined3d_main.c). adapter_vk.c is the only place that would
+// load winevulkan.dll, and it is reached only when the value says "vulkan".
+//
+// So on a lane with no OpenGL an unset value is not "pick what works": it is
+// "pick the one thing that cannot". A device run of a 32-bit Direct3D 11
+// program proves the shape end to end -- Wine's own 32-bit d3d11 loaded
+// wined3d, wined3d loaded opengl32, opengl32 reached for libGL.so.1 above, and
+// wined3d_adapter_gl_init failed for want of a pixel format. winevulkan.dll
+// appears nowhere in that run's module searches, so it was never tried.
+//
+// The value is written into the 64-bit prefix by the launch
+// (configureX64WineD3dRenderer in source/sdl/startupArgs.cpp) rather than by
+// the iOS prefix policy, which prepares only the IA-32 lane's prefix. It is
+// written ONLY when the 64-bit Vulkan client library is packaged and is an
+// ELF64 object, for the same reason the audio driver's registry value is
+// written only when the driver is packaged: naming a backend that is not there
+// leaves wined3d with no adapter rather than with a fallback.
+//
+// The doubled backslashes are the registry file's own escaping. user.reg
+// spells the section "[Software\\Wine\\Direct3D]" on disk.
+#define K_X64_WINED3D_REGISTRY_SECTION "Software\\\\Wine\\\\Direct3D"
+#define K_X64_WINED3D_RENDERER_NAME "renderer"
+#define K_X64_WINED3D_RENDERER_VULKAN "vulkan"
+
 // The DXMT modules are built as Wine builtins (their DOS stub carries Wine's
 // builtin marker so winemetal.dll can bind to winemetal.so through
 // __wine_unix_call). Wine treats a builtin-marked PE found outside its module
@@ -379,6 +465,94 @@ inline bool x64Wow64D3d9UsesDxvk(const char* value) {
 // (non-DXMT) Direct3D rather than none.
 inline bool shouldOverlayX64WineModule(bool sourceExists, bool sourceIsDirectory) {
     return sourceExists && !sourceIsDirectory;
+}
+
+// The name of the ELF class in a guest file's identification bytes, given
+// however many bytes were actually read.
+//
+// Named rather than reduced to a boolean because "nothing there", "there and
+// not an object at all", "there and the wrong architecture" and "there and
+// usable" are four different states that Wine's loader collapses into one
+// message -- and on this lane the wrong-architecture one is the common case,
+// because the IA-32 lane's guest shims answer to the same sonames.
+inline const char* guestElfClassName(const unsigned char* bytes,
+                                     unsigned long length) {
+    static const unsigned char magic[4] = {0x7f, 'E', 'L', 'F'};
+    if (bytes == nullptr || length == 0) {
+        return "unreadable";
+    }
+    // Whatever was read is compared against as much of the magic as it
+    // covers, so a short read of something that is not an ELF at all is still
+    // named "not-elf" rather than blamed on the read.
+    for (unsigned long i = 0; i < length && i < 4; ++i) {
+        if (bytes[i] != magic[i]) {
+            return "not-elf";
+        }
+    }
+    if (length < 5) {
+        return "unreadable";
+    }
+    // EI_CLASS: 2 is ELFCLASS64, 1 is ELFCLASS32 -- the IA-32 lane's shim.
+    if (bytes[4] == 2) {
+        return "elf64";
+    }
+    if (bytes[4] == 1) {
+        return "elf32";
+    }
+    return "elf-unknown";
+}
+
+// True when a class name from the function above is the only one a 64-bit
+// guest process can bind to.
+inline bool guestElfClassIsUsable(const char* className) {
+    return className != nullptr && std::string(className) == "elf64";
+}
+
+// The paths the guest's ld-linux would try for a bare soname, in the order it
+// tries them. Returned whole so a witness can report which one answered
+// rather than only whether something did: the file that answers here is
+// routinely the IA-32 lane's, and its path is what says so.
+inline std::vector<std::string> guestLibrarySearchPaths(
+    const std::string& soname) {
+    const char* dirs[] = K_X64_GUEST_LIBRARY_SEARCH_DIRS;
+    std::vector<std::string> paths;
+    for (const char* dir : dirs) {
+        paths.push_back(std::string(dir) + "/" + soname);
+    }
+    return paths;
+}
+
+// The wined3d adapter a given HKCU\Software\Wine\Direct3D "renderer" value
+// selects, with the empty string standing for the value being absent.
+//
+// The absent case is the one worth spelling out: Wine 9 maps
+// WINED3D_RENDERER_AUTO to the OpenGL adapter, so a prefix that says nothing
+// has asked for the one backend this lane cannot provide.
+inline const char* wined3dAdapterForRenderer(const std::string& renderer) {
+    if (renderer.empty()) {
+        return "opengl";
+    }
+    if (renderer == K_X64_WINED3D_RENDERER_VULKAN) {
+        return "vulkan";
+    }
+    if (renderer == "gl" || renderer == "opengl") {
+        return "opengl";
+    }
+    if (renderer == "gdi" || renderer == "no3d") {
+        return "no3d";
+    }
+    return "unknown";
+}
+
+// Whether a 64-bit launch writes renderer=vulkan into its prefix.
+//
+// Gated on the lane's own Vulkan client library being present and usable, not
+// on the value being absent: pointing wined3d at a backend whose client
+// library is missing or is the IA-32 shim leaves it with no adapter at all,
+// which is worse than the OpenGL adapter it would otherwise fail to build.
+// This is the same rule the audio driver's registry value follows.
+inline bool shouldConfigureX64WineD3dVulkan(bool vulkanClientIsUsable) {
+    return vulkanClientIsUsable;
 }
 
 // True when the first bytes of a guest file are a PE image signature. Passed

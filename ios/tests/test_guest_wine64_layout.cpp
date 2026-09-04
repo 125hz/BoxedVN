@@ -329,3 +329,98 @@ BOXEDVN_TEST(dll_search_trace_records_nothing_when_it_is_not_armed) {
     CHECK_EQ(std::string(module), std::string());
     CHECK_EQ(trace.probes(), 0u);
 }
+
+BOXEDVN_TEST(wine64_layout_states_that_this_lane_has_no_opengl) {
+    // The soname the guest asks its loader for, and the one path in the
+    // search order this lane owns. Nothing stages a file there: the build
+    // defines no GL backend, the host is Metal-only and the 64-bit X11
+    // bridge serves no GLX.
+    CHECK_EQ(std::string(K_X64_GUEST_OPENGL_SONAME), std::string("libGL.so.1"));
+    CHECK_EQ(std::string(K_X64_GUEST_OPENGL_LIB_PATH),
+             std::string(K_X64_GUEST_X11_LIB_DIR) + "/libGL.so.1");
+
+    const std::vector<std::string> paths =
+        boxedvn::guestLibrarySearchPaths(K_X64_GUEST_OPENGL_SONAME);
+    CHECK_EQ((int)paths.size(), K_X64_GUEST_LIBRARY_SEARCH_DIR_COUNT);
+    // LD_LIBRARY_PATH first: a file this lane staged would be found ahead of
+    // everything else, which is why a wrong-class one there is refused at
+    // packaging time.
+    CHECK_EQ(paths.front(), std::string(K_X64_GUEST_OPENGL_LIB_PATH));
+    // And the path a device run actually reached: the IA-32 lane's own shim
+    // in the root filesystem, which answers this soname and is rejected for
+    // its ELF class.
+    CHECK(std::find(paths.begin(), paths.end(), std::string("/lib/libGL.so.1"))
+          != paths.end());
+    // The same order serves the Vulkan soname, whose shim this lane does
+    // stage, so the two witnesses cannot disagree about where they looked.
+    const std::vector<std::string> vulkan =
+        boxedvn::guestLibrarySearchPaths(K_X64_GUEST_VULKAN_SONAME);
+    CHECK_EQ(vulkan.front(), std::string(K_X64_GUEST_VULKAN_LIB_PATH));
+}
+
+BOXEDVN_TEST(wine64_layout_names_an_elf_class_rather_than_reducing_it_to_a_flag) {
+    // Four states, because Wine's loader collapses them into one message and
+    // the witness exists to take them apart again.
+    const unsigned char elf64[5] = {0x7f, 'E', 'L', 'F', 2};
+    const unsigned char elf32[5] = {0x7f, 'E', 'L', 'F', 1};
+    const unsigned char script[5] = {'#', '!', '/', 'b', 'i'};
+    CHECK_EQ(std::string(boxedvn::guestElfClassName(elf64, 5)),
+             std::string("elf64"));
+    CHECK_EQ(std::string(boxedvn::guestElfClassName(elf32, 5)),
+             std::string("elf32"));
+    CHECK_EQ(std::string(boxedvn::guestElfClassName(script, 5)),
+             std::string("not-elf"));
+    CHECK_EQ(std::string(boxedvn::guestElfClassName(nullptr, 0)),
+             std::string("unreadable"));
+    // A read too short to reach EI_CLASS is not a verdict about the file.
+    CHECK_EQ(std::string(boxedvn::guestElfClassName(elf64, 4)),
+             std::string("unreadable"));
+    // But a short read that already contradicts the magic is.
+    CHECK_EQ(std::string(boxedvn::guestElfClassName(script, 2)),
+             std::string("not-elf"));
+
+    CHECK(boxedvn::guestElfClassIsUsable("elf64"));
+    CHECK(!boxedvn::guestElfClassIsUsable("elf32"));
+    CHECK(!boxedvn::guestElfClassIsUsable("none"));
+    CHECK(!boxedvn::guestElfClassIsUsable(nullptr));
+}
+
+BOXEDVN_TEST(wine64_layout_reads_an_unset_wined3d_renderer_as_the_opengl_adapter) {
+    // Wine 9 maps WINED3D_RENDERER_AUTO -- what an absent value means -- to
+    // the OpenGL adapter, which on this lane is the one backend that cannot
+    // be built. A prefix that says nothing has asked for it.
+    CHECK_EQ(std::string(boxedvn::wined3dAdapterForRenderer("")),
+             std::string("opengl"));
+    CHECK_EQ(std::string(boxedvn::wined3dAdapterForRenderer("gl")),
+             std::string("opengl"));
+    CHECK_EQ(std::string(boxedvn::wined3dAdapterForRenderer(
+                 K_X64_WINED3D_RENDERER_VULKAN)),
+             std::string("vulkan"));
+    CHECK_EQ(std::string(boxedvn::wined3dAdapterForRenderer("gdi")),
+             std::string("no3d"));
+    CHECK_EQ(std::string(boxedvn::wined3dAdapterForRenderer("no3d")),
+             std::string("no3d"));
+    // A value Wine does not recognise is reported as unknown rather than
+    // silently read as the default, because the two are not the same event.
+    CHECK_EQ(std::string(boxedvn::wined3dAdapterForRenderer("mesa")),
+             std::string("unknown"));
+}
+
+BOXEDVN_TEST(wine64_layout_names_the_vulkan_renderer_only_when_its_client_is_there) {
+    // Naming a backend whose client library is missing or is the IA-32 shim
+    // leaves wined3d with no adapter at all, which is worse than the OpenGL
+    // adapter it would otherwise fail to build. Same rule as the audio driver
+    // registry value.
+    CHECK(boxedvn::shouldConfigureX64WineD3dVulkan(true));
+    CHECK(!boxedvn::shouldConfigureX64WineD3dVulkan(false));
+    CHECK(!boxedvn::shouldConfigureX64WineD3dVulkan(
+        boxedvn::guestElfClassIsUsable("elf32")));
+
+    // The section as user.reg spells it on disk, which is the escaped form:
+    // the C literal carries two backslashes per separator so the file gets
+    // the two the registry format uses.
+    CHECK_EQ(std::string(K_X64_WINED3D_REGISTRY_SECTION),
+             std::string("Software\\\\Wine\\\\Direct3D"));
+    CHECK_EQ(std::string(K_X64_WINED3D_RENDERER_NAME), std::string("renderer"));
+    CHECK_EQ(std::string(K_X64_WINED3D_RENDERER_VULKAN), std::string("vulkan"));
+}

@@ -3071,16 +3071,18 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------ #
-    # Wine's top-down arena. It reserves [0x7ffffe000000, 0x7fffffff0000)     #
-    # and commits accessible subranges inside it; every one was refused as    #
-    # outside the identity lane, and the search that followed reached         #
-    # 8,388,609 mmaps at about 98% of a core.                                 #
+    # Wine's top-down arena. Wine reserves inside [.., 0x7fffffff0000) and    #
+    # commits accessible subranges; every one was refused as outside the      #
+    # identity lane, and the search that followed reached 8,388,609 mmaps at  #
+    # about 98% of a core. The arena was then 32 MiB and Wine's own           #
+    # try_map_free_area walked off the bottom of it; the base is now as far   #
+    # down as clearing the mask can reach without leaving the alias block.    #
     # ------------------------------------------------------------------ #
     alias_header = read(repository / "include/guest_low_alias.h")
     require_ordered(
         alias_header,
         [
-            "inline constexpr std::uint64_t kGuestTopBase = 0x7FFFFE000000ULL;",
+            "inline constexpr std::uint64_t kGuestTopBase = 0x7FFF80000000ULL;",
             "inline constexpr std::uint64_t kGuestTopEnd = 0x7FFFFFFF0000ULL;",
             "inline constexpr std::uint64_t kGuestTopClearMask = 0x7F8000000000ULL;",
             "kGuestTopBase & ~kGuestTopClearMask;",
@@ -3090,7 +3092,13 @@ def main() -> None:
             "(kGuestHighEnd & kGuestTopClearMask) == 0,",
             "((kGuestLowLimit - 1) & kGuestTopClearMask) == 0,",
             "((kGuestLowAliasEnd - 1) & kGuestTopClearMask) == 0,",
+            "((kGuestAliasBlockEnd - 1) & kGuestTopClearMask) == 0,",
             "kGuestTopHostBase >= kGuestHighEnd,",
+            # Injectivity: the relocated image has to stay inside the block, or
+            # two arena addresses would collide on one host address.
+            "static_assert(kGuestTopHostBase >= kGuestLowAliasBase &&",
+            "kGuestTopHostEnd <= kGuestAliasBlockEnd,",
+            "static_assert(kGuestTopHostBase == kGuestHighEnd,",
             "(kGuestTopHostEnd - 1) < kGuestTopBase,",
             "inline constexpr bool isTopArenaGuestAddress(",
             "return (guestAddress | kGuestLowAliasBase) & ~kGuestTopClearMask;",
@@ -3101,13 +3109,55 @@ def main() -> None:
         "BoxedVN guest top-arena alias contract",
     )
 
+    # ------------------------------------------------------------------ #
+    # The identity lane, and the block that bounds every lane.             #
+    #                                                                      #
+    # The lane used to stop one kGuestLowLimit above its base because the   #
+    # invariant was written as "must not cross an alias-base bit boundary", #
+    # which is sufficient for a lane of exactly that size and refuses every  #
+    # larger one that is equally exact. The invariant that actually holds is #
+    # containment in the block that begins at the alias base and spans its    #
+    # LOWEST set bit: adding less than that bit cannot clear a base bit, so    #
+    # the OR is the identity for every address in it.                          #
+    # ------------------------------------------------------------------ #
+    require_ordered(
+        alias_header,
+        [
+            "inline constexpr std::uint64_t kGuestAliasBlockSpan =",
+            "kGuestLowAliasBase & (~kGuestLowAliasBase + 1);",
+            "inline constexpr std::uint64_t kGuestAliasBlockEnd =",
+            "kGuestLowAliasBase + kGuestAliasBlockSpan;",
+            "inline constexpr std::uint64_t kGuestHighEnd = 0x7F80000000ULL;",
+            "static_assert(kGuestLowAliasBase != 0,",
+            "static_assert((kGuestLowAliasBase & (kGuestAliasBlockSpan - 1)) "
+            "== 0,",
+            "static_assert(kGuestHighBase >= kGuestLowAliasBase &&",
+            "kGuestHighBase < kGuestHighEnd &&",
+            "kGuestHighEnd <= kGuestAliasBlockEnd,",
+        ],
+        "BoxedVN identity lane containment contract",
+    )
+    # The superseded test must be gone, not merely joined by its replacement:
+    # leaving it in place would refuse the very lane its replacement admits.
+    if "(kGuestHighBase ^ (kGuestHighEnd - 1)) < kGuestLowLimit" in alias_header:
+        raise SystemExit(
+            "the identity lane's crossing test was replaced by block "
+            "containment; leaving it in refuses the enlarged lane"
+        )
+
     memory_header = read(repository / "include/kmemory64.h")
     require_ordered(
         memory_header,
         [
-            "#define K64_NATIVE_TOP_GUEST_BASE     0x7FFFFE000000ULL",
+            "#define K64_NATIVE_ALIAS_BLOCK_SPAN   (K64_NATIVE_LOW_ALIAS_BASE &",
+            "#define K64_NATIVE_ALIAS_BLOCK_END    (K64_NATIVE_LOW_ALIAS_BASE +",
+            "#define K64_NATIVE_TOP_GUEST_BASE     0x7FFF80000000ULL",
             "#define K64_NATIVE_TOP_GUEST_END      0x7FFFFFFF0000ULL",
             "#define K64_NATIVE_TOP_CLEAR_MASK     0x7F8000000000ULL",
+            # The identity lane's end is derived from the arena's host block,
+            # so the two cannot be moved independently and the block cannot
+            # acquire a gap the guest is never offered.
+            "#define K64_NATIVE_GUEST_HIGH_END     K64_NATIVE_TOP_HOST_BASE",
             # Mirrored constants must be asserted equal, not merely similar.
             "K64_NATIVE_TOP_GUEST_BASE == boxedvn::kGuestTopBase,",
             "K64_NATIVE_TOP_GUEST_END == boxedvn::kGuestTopEnd,",
@@ -3115,6 +3165,9 @@ def main() -> None:
             "K64_NATIVE_TOP_HOST_BASE == boxedvn::kGuestTopHostBase,",
             "K64_NATIVE_TOP_HOST_BASE >= K64_NATIVE_GUEST_HIGH_END,",
             "K64_NATIVE_TOP_HOST_END <= K64_NATIVE_GUEST_WINDOW_END,",
+            "static_assert(K64_NATIVE_TOP_HOST_BASE >= K64_NATIVE_LOW_ALIAS_BASE &&",
+            "K64_NATIVE_TOP_HOST_END <= K64_NATIVE_ALIAS_BLOCK_END,",
+            "static_assert(K64_NATIVE_TOP_HOST_BASE == K64_NATIVE_GUEST_HIGH_END,",
             "static inline U64 k64GuestToHostAddress(U64 guestAddress) {",
             "return (guestAddress | K64_NATIVE_LOW_ALIAS_BASE) &",
             "~K64_NATIVE_TOP_CLEAR_MASK;",

@@ -34,16 +34,51 @@ constexpr Commit kDeviceCommits[] = {
     {0x7fffffc50000ULL, 0x39b000ULL},
 };
 
-// The reservation itself.
+// The reservation itself, at the base the arena used to start from.
+constexpr std::uint64_t kDeviceReservationBase = 0x7ffffe000000ULL;
 constexpr std::uint64_t kReservationLength = 0x1ff0000ULL;
 
 } // namespace
 
 BOXEDVN_TEST(top_alias_covers_the_reservation_the_device_asked_for) {
-    CHECK(kGuestTopBase == 0x7ffffe000000ULL);
+    CHECK(kGuestTopBase == 0x7fff80000000ULL);
     CHECK(kGuestTopEnd == 0x7fffffff0000ULL);
-    CHECK(kGuestTopLength == kReservationLength);
-    CHECK(guestRangeHostable(kGuestTopBase, kReservationLength));
+    CHECK(kGuestTopLength == 0x7fff0000ULL);
+    // The reservation the device asked for is inside the arena, and there is
+    // now room BELOW it. The arena used to begin exactly at that reservation's
+    // base, so Wine's own try_map_free_area walked down past it and off the
+    // bottom of the lane: the device log shows
+    // 0x7ffffdfb0000-0x7ffffdffd000 refused, 320 KiB below the old base.
+    CHECK(guestRangeHostable(kDeviceReservationBase, kReservationLength));
+    CHECK(kGuestTopBase < kDeviceReservationBase);
+    CHECK(guestRangeHostable(0x7ffffdfb0000ULL,
+                             0x7ffffdffd000ULL - 0x7ffffdfb0000ULL));
+    CHECK(guestRangeHostable(kGuestTopBase, kGuestTopLength));
+}
+
+BOXEDVN_TEST(the_identity_lane_and_the_arena_split_one_fixed_budget) {
+    // Both lanes are cut from the same 32 GiB block, so this is zero-sum: the
+    // arena's base and the identity lane's end are one number, related by the
+    // mask. The budget is the block, less the low alias window, less the
+    // 64 KiB that the arena's fixed top end leaves above its host image.
+    CHECK(kGuestTopBase == (kGuestTopClearMask | kGuestTopHostBase));
+    CHECK(kGuestTopHostBase == kGuestHighEnd);
+    const std::uint64_t identity = kGuestHighEnd - kGuestHighBase;
+    const std::uint64_t arena = kGuestTopLength;
+    CHECK(identity + arena ==
+          kGuestAliasBlockEnd - kGuestLowAliasEnd - 0x10000ULL);
+    // The split as it stands: 22 GiB of identity lane, 2 GiB of arena.
+    CHECK(identity == 22ULL * 1024 * 1024 * 1024);
+    CHECK(arena == 2ULL * 1024 * 1024 * 1024 - 0x10000ULL);
+    // Neither can be widened except at the other's expense, and neither can
+    // leave the block: below kGuestLowAliasEnd the arena's host image would
+    // collide with the low alias window, and at kGuestAliasBlockEnd addresses
+    // stop carrying the base's bits, so the OR stops being the identity.
+    CHECK(kGuestTopHostBase > kGuestLowAliasEnd);
+    CHECK(kGuestTopHostEnd <= kGuestAliasBlockEnd);
+    // One page below the arena is a guest address no lane can serve: it is in
+    // the hole between the identity lane's guest addresses and the arena's.
+    CHECK(!guestRangeHostable(kGuestTopBase - 0x1000ULL, 0x1000ULL));
 }
 
 BOXEDVN_TEST(top_alias_hosts_every_commit_the_device_asked_for) {
@@ -126,6 +161,31 @@ BOXEDVN_TEST(top_alias_selector_bits_separate_the_lanes) {
     CHECK(((kGuestHighEnd - 1) & kGuestTopClearMask) == 0);
 }
 
+BOXEDVN_TEST(top_alias_and_the_identity_lane_tile_the_alias_block) {
+    // The three host lanes are the whole of one block and nothing else: the
+    // block that begins at the alias base and spans its lowest set bit. That
+    // containment, not any lane size, is what makes the OR the identity on
+    // every address it is applied to.
+    CHECK(kGuestAliasBlockSpan == (kGuestLowAliasBase & (~kGuestLowAliasBase + 1)));
+    CHECK(kGuestAliasBlockEnd == kGuestLowAliasBase + kGuestAliasBlockSpan);
+    CHECK(kGuestLowAliasBase == 0x7800000000ULL);
+    CHECK(kGuestAliasBlockEnd == 0x8000000000ULL);
+    // Low alias, then identity, then the arena's host block, edge to edge.
+    CHECK(kGuestLowAliasEnd == kGuestHighBase);
+    CHECK(kGuestHighEnd == kGuestTopHostBase);
+    CHECK(kGuestTopHostEnd <= kGuestAliasBlockEnd);
+    // Every address in the block already carries every base bit, which is the
+    // property the whole translation rests on. Sampled at 256 MiB across all
+    // 32 GiB of it, plus both exact ends.
+    CHECK((kGuestLowAliasBase & kGuestLowAliasBase) == kGuestLowAliasBase);
+    CHECK(((kGuestAliasBlockEnd - 1) & kGuestLowAliasBase) == kGuestLowAliasBase);
+    for (std::uint64_t host = kGuestLowAliasBase; host < kGuestAliasBlockEnd;
+         host += 0x10000000ULL) {
+        CHECK((host & kGuestLowAliasBase) == kGuestLowAliasBase);
+        CHECK((host & kGuestTopClearMask) == 0);
+    }
+}
+
 BOXEDVN_TEST(top_alias_does_not_overlap_the_other_lanes) {
     // Three host lanes, and they have to tile without touching.
     CHECK(kGuestLowAliasEnd == kGuestHighBase);
@@ -193,9 +253,21 @@ BOXEDVN_TEST(top_alias_leaves_the_existing_lanes_unchanged) {
     CHECK(kGuestLowAliasBase == 0x7800000000ULL);
     CHECK(kGuestLowAliasEnd == 0x7A00000000ULL);
     CHECK(kGuestHighBase == 0x7A00000000ULL);
-    CHECK(kGuestHighEnd == 0x7C00000000ULL);
+    // The identity lane's end moved: it now runs to the arena's host block
+    // rather than stopping one kGuestLowLimit above its base. Everything the
+    // old lane offered is still offered, at the same addresses.
+    CHECK(kGuestHighEnd == 0x7F80000000ULL);
+    CHECK(kGuestHighEnd > 0x7C00000000ULL);
     CHECK(guestRangeHostable(0, kGuestLowLimit));
     CHECK(guestRangeHostable(kGuestHighBase, kGuestLowLimit));
+    CHECK(guestRangeHostable(kGuestHighBase, kGuestHighEnd - kGuestHighBase));
+    // And the identity holds across the whole of the enlarged lane, sampled
+    // at 16 MiB, not merely across the eight GiB it used to be.
+    for (std::uint64_t guest = kGuestHighBase; guest < kGuestHighEnd;
+         guest += 0x1000000ULL) {
+        CHECK(guestToHostAddress(guest) == guest);
+    }
+    CHECK(guestToHostAddress(kGuestHighEnd - 1) == kGuestHighEnd - 1);
     CHECK(isLowAliasedGuestAddress(0x7ffe0308ULL));
     CHECK(!isLowAliasedGuestAddress(kGuestTopBase));
 }

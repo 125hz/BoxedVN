@@ -930,6 +930,85 @@ for _inherited in list(vars(WineserverArchiveValidation)):
         setattr(WindowDriverPackaging, _inherited, None)
 
 
+class OpenGlLanePackaging(WineserverArchiveValidation):
+    """The 64-bit lane ships no OpenGL, and the archive has to prove it.
+
+    A device run of a 32-bit Direct3D 11 program was given the IA-32 lane's own
+    libGL.so.1 out of the shared root filesystem and reported "wrong ELF class:
+    ELFCLASS32" before disabling OpenGL. That file belongs to the other lane
+    and stays where it is; this build defines no GL backend, the host is
+    Metal-only and the 64-bit X11 client libraries bridge to a built-in X
+    server that serves no GLX, so there is nothing to require here.
+
+    What the archive must never carry is a libGL.so.1 of its own that a 64-bit
+    guest cannot bind to. The shim directory heads LD_LIBRARY_PATH, so a file
+    there is found FIRST and fails in exactly the same way -- while looking
+    like something this lane supplied on purpose.
+    """
+
+    def test_an_archive_with_no_opengl_client_is_accepted_and_names_the_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertEqual(code, 0, output)
+            # Reported rather than passed over in silence: an absent check and
+            # an absent library look identical in a build log otherwise.
+            self.assertIn("WINE64_OPENGL client=none", output)
+
+    def test_an_ia32_opengl_client_in_the_shim_directory_is_rejected(self) -> None:
+        # The exact file the device run was given, staged where this lane's
+        # own library would go. It would be found before /lib/libGL.so.1 and
+        # rejected for the same reason.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            with zipfile.ZipFile(wine, "a") as archive:
+                archive.writestr(X11_SHIM_DIR + "/libGL.so.1",
+                                 elf(machine=3, elf_class=1, body=b"lane32 gl"))
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("libGL.so.1", output)
+            self.assertIn("ELFCLASS64", output)
+
+    def test_an_opengl_client_outside_the_shim_directory_is_checked_too(self) -> None:
+        # The multiarch directories are on the same search path, so a file
+        # there is no more usable than one in the shim directory.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            with zipfile.ZipFile(wine, "a") as archive:
+                archive.writestr("usr/lib/x86_64-linux-gnu/libGL.so.1",
+                                 elf(machine=3, elf_class=1, body=b"lane32 gl"))
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("libGL.so.1", output)
+
+    def test_an_x86_64_opengl_client_is_allowed(self) -> None:
+        # Absence is the state, not the rule. If a usable library is ever
+        # built for this target the packaging must not stand in its way -- the
+        # gate is about the ELF class, not about the file existing.
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            server = elf(body=b"wineserver64 payload")
+            glibc, wine, _ = self.build_archives(directory, server)
+            with zipfile.ZipFile(wine, "a") as archive:
+                archive.writestr(X11_SHIM_DIR + "/libGL.so.1",
+                                 elf(body=b"x86-64 gl"))
+            code, output = self.run_validator(directory, glibc, wine)
+            self.assertEqual(code, 0, output)
+            self.assertIn("WINE64_OPENGL client=" + X11_SHIM_DIR + "/libGL.so.1",
+                          output)
+
+
+for _inherited in list(vars(WineserverArchiveValidation)):
+    if _inherited.startswith("test_"):
+        setattr(OpenGlLanePackaging, _inherited, None)
+
+
 class Wow64LayerBuilderContract(unittest.TestCase):
     """The builder has to package both architectures, and prove which is which.
 

@@ -43,6 +43,16 @@ X11_SHIM_LIBRARIES=(
 # with no adapter at all.
 VULKAN_SHIM=""
 VULKAN_SHIM_SONAME="libvulkan.so.1"
+# OpenGL has no equivalent and is not going to get one. This build defines no
+# GL backend (docs/KNOWN_LIMITATIONS_IOS.md section 3), the host is Metal-only
+# and the 64-bit X11 client libraries are a bridge to BoxedWine's built-in X
+# server, which serves no GLX -- so there is nothing here to stage and the
+# soname is named only so the check below can refuse a wrong one. The shim
+# directory heads the guest's LD_LIBRARY_PATH, so a file of this name there is
+# found ahead of the IA-32 lane's own shim at /lib/libGL.so.1 and would fail
+# identically while looking like ours. See K_X64_GUEST_OPENGL_LIB_PATH in
+# include/guest_wine64_layout.h.
+OPENGL_SHIM_SONAME="libGL.so.1"
 # The prebuilt 32-bit DXVK the app already ships (ios/app/Dxvk). It is staged
 # under a directory of its own inside the 32-bit PE layer rather than over
 # i386-windows/d3d9.dll, so a launch that does not ask for it gets Wine's own
@@ -715,6 +725,21 @@ if [[ -n "${VULKAN_SHIM}" ]]; then
     log "BoxedWine x86-64 Vulkan ICD packaged: ${X11_SHIM_GUEST_DIR}/${VULKAN_SHIM_SONAME}"
 else
     warn "No --vulkan-shim: the 64-bit lane has no Vulkan client library and wined3d/DXVK get no adapter."
+fi
+
+# The lane's OpenGL state, recorded rather than assumed. Nothing stages a GL
+# client library and nothing is expected to, so absence is the state this logs
+# -- but if some future change ever puts one here it has to be an x86-64
+# object, for the reason given beside OPENGL_SHIM_SONAME above. A wrong-class
+# file in this directory is not a degraded OpenGL; it is the same failure the
+# IA-32 shim already produces, wearing our name.
+opengl_client="${STAGE}${X11_SHIM_GUEST_DIR}/${OPENGL_SHIM_SONAME}"
+if [[ -e "${opengl_client}" ]]; then
+    is_elf64_x86_64 "${opengl_client}" \
+        || die "'${opengl_client}' is not an x86-64 ELF shared object. This directory heads the guest's LD_LIBRARY_PATH, so this file is found before the IA-32 lane's own ${OPENGL_SHIM_SONAME} and is rejected for its ELF class exactly as that one is."
+    log "x86-64 OpenGL client library packaged: ${X11_SHIM_GUEST_DIR}/${OPENGL_SHIM_SONAME}"
+else
+    log "No x86-64 OpenGL client library, which is this build's settled state: with no GL backend the 64-bit lane's Direct3D is DXMT or wined3d's Vulkan adapter, and wined3d has to be told so -- an unset renderer means its OpenGL adapter."
 fi
 
 # The builtin the loader reaches for first after the server handshake. If it is

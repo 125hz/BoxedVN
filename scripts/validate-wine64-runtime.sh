@@ -505,6 +505,32 @@ done
 check_zip_path "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/libvulkan.so.1"
 check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${X11_SHIM_DIR}/libvulkan.so.1"
 
+# OpenGL, which this lane deliberately does not have. There is no library to
+# require: the build defines no GL backend (docs/KNOWN_LIMITATIONS_IOS.md
+# section 3), the host is Metal-only, and the 64-bit X11 client libraries
+# bridge to BoxedWine's built-in X server, which serves no GLX -- so even a
+# real Mesa build staged here would load and then fail at glXQueryExtension.
+#
+# What this refuses is a libGL.so.1 in the archive that a 64-bit guest cannot
+# bind to. A device run of a 32-bit Direct3D 11 program showed the loader
+# walking the search path for this soname and reaching /lib/libGL.so.1, the
+# IA-32 lane's own shim in the root filesystem, which Wine reported as "wrong
+# ELF class: ELFCLASS32" before disabling OpenGL. That file belongs to the
+# other lane and stays where it is; a file of the same name in this archive
+# would be found FIRST -- the shim directory heads LD_LIBRARY_PATH -- and would
+# fail in the same way while looking like ours.
+opengl_entries="$({ unzip -Z1 "${WINE_ARCHIVE}" 2>/dev/null || true; } \
+    | sed 's#^\./##' | grep -E '(^|/)libGL\.so(\.[0-9]+)*$' || true)"
+if [[ -n "${opengl_entries}" ]]; then
+    while IFS= read -r opengl_entry; do
+        [[ -n "${opengl_entry}" ]] || continue
+        check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${opengl_entry}"
+        ok "WINE64_OPENGL client=${opengl_entry} class=elf64-x86-64"
+    done <<< "${opengl_entries}"
+else
+    ok "WINE64_OPENGL client=none: the 64-bit lane ships no OpenGL client library, so wined3d has to be given its Vulkan adapter -- an unset renderer means the OpenGL one, which cannot be built here"
+fi
+
 # ---------------------------------------------------------------------------
 # Audio inventory. See docs/PLAN_X64_AUDIO.md sections 5.0 and 5.2.
 #

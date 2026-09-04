@@ -64,14 +64,27 @@ class KThread;
 #define K64_KUSER_SHARED_BASE 0x7ffe0000ULL
 #define K64_KUSER_SHARED_SIZE 0x10000ULL
 
-// Native-identity guests are directly dereferenced by the ARM64 translator,
-// so their guest addresses must be host-mappable.  On iOS the malloc xzone
-// reserves the broad 4 GiB..64 GiB band, while the executable arena occupies
-// the range immediately below this window.  Keep all native guest mappings in
-// the empirically safe interval below.  Sparse/interpreter guests retain
-// their normal Linux-style addresses and do not use these limits.
-#define K64_NATIVE_GUEST_WINDOW_START 0x7048000000ULL
-#define K64_NATIVE_GUEST_WINDOW_END   0x7fffff0000ULL
+// The host interval every native-identity mapping lands in.
+//
+// This was a pair of literals described as "the empirically safe interval on
+// this host". Nothing in this tree ever established them: both arrived with
+// the first commit of the FEX path, with no probe, no measurement and no test,
+// and neither was ever revisited. The start, 0x7048000000, sits BELOW the
+// alias base, so no lane has been able to reach it since the alias landed; the
+// end, 0x7fffff0000, is the top of the alias block less one 64 KiB page. The
+// real ceiling on the layout is not a property of iOS at all -- it is
+// K64_NATIVE_ALIAS_BLOCK_END below, which the single-OR translation forces.
+//
+// So the window is derived now and states a fact rather than an assumption: it
+// is exactly the span of host addresses this layout can name, from the alias
+// base to the end of the relocated arena's host block. What the DEVICE will
+// actually hand over inside that span is a different question, and one that
+// can be tested instead of assumed: the startup witness in kmemory64.cpp
+// probes it with the same non-destructive reservation primitive the mapping
+// path uses, and prints what it found. Sparse/interpreter guests keep normal
+// Linux-style addresses and do not use these limits.
+#define K64_NATIVE_GUEST_WINDOW_START K64_NATIVE_LOW_ALIAS_BASE
+#define K64_NATIVE_GUEST_WINDOW_END   K64_NATIVE_TOP_HOST_END
 
 // Windows x86-64 binaries and Wine's loader genuinely require CANONICAL low
 // guest addresses: the initial TEB block is reserved below 2 GiB, KUSER_SHARED
@@ -97,11 +110,27 @@ class KThread;
 #define K64_NATIVE_LOW_ALIAS_END      (K64_NATIVE_LOW_ALIAS_BASE + \
                                        K64_NATIVE_LOW_GUEST_LIMIT)
 
-// The high identity lanes move above the alias window, into the 8 GiB block
-// whose every address already carries the alias base's bits.
+// The whole host layout lives in ONE block: the interval that begins at the
+// alias base and spans the base's LOWEST set bit. Every address in it already
+// carries every bit of the base -- adding less than the lowest set bit cannot
+// clear one -- and none carries a bit above the base's run, so the OR is the
+// identity there and the arena mask is clear throughout. Nothing outside this
+// block can ever be a host address for a guest lane, however much address
+// space iOS would hand over: the arithmetic is the ceiling, not the host.
+// [0x7800000000, 0x8000000000) -- 32 GiB, and that is the entire budget.
+#define K64_NATIVE_ALIAS_BLOCK_SPAN   (K64_NATIVE_LOW_ALIAS_BASE & \
+                                       (~K64_NATIVE_LOW_ALIAS_BASE + 1ULL))
+#define K64_NATIVE_ALIAS_BLOCK_END    (K64_NATIVE_LOW_ALIAS_BASE + \
+                                       K64_NATIVE_ALIAS_BLOCK_SPAN)
+
+// The high identity lane moves above the alias window and runs to the base of
+// the relocated arena's host block, which is the next thing in that 32 GiB
+// block. It stopped one K64_NATIVE_LOW_GUEST_LIMIT above its base before --
+// not because anything required that, but because the invariant was stated as
+// "the lane must not cross an alias-base bit boundary", which holds for a lane
+// of exactly that size and refuses every larger one that is equally exact.
+// Sixteen GiB of the block were never offered to the guest as a result.
 #define K64_NATIVE_GUEST_IMAGE_BASE   K64_NATIVE_LOW_ALIAS_END
-#define K64_NATIVE_GUEST_HIGH_END     (K64_NATIVE_GUEST_IMAGE_BASE + \
-                                       K64_NATIVE_LOW_GUEST_LIMIT)
 
 // Wine's top-down arena and the host block it is served from. Wine reserves
 // [K64_NATIVE_TOP_GUEST_BASE, K64_NATIVE_TOP_GUEST_END) PROT_NONE and then
@@ -110,7 +139,21 @@ class KThread;
 // identity and the host would have to map 0x7ffffe000000 itself. Bits 39..46
 // are set in every arena address and clear in every other hostable one, so
 // clearing that field is the whole relocation and a no-op elsewhere.
-#define K64_NATIVE_TOP_GUEST_BASE     0x7FFFFE000000ULL
+//
+// The base and K64_NATIVE_GUEST_HIGH_END are the same number under the mask:
+// the arena's host block begins exactly where the identity lane ends, so
+// widening one narrows the other byte for byte. What they share is fixed by
+// the arithmetic -- the alias block, less the low alias window, less the
+// 64 KiB the arena's fixed top end leaves unused above its image, which is
+// 24 GiB less 64 KiB in total.
+//
+// The arena was 32 MiB of that, and a device log shows Wine's
+// try_map_free_area walking down from its own user-space limit and running out
+// 320 KiB below the old base: it wanted more of this range than was on offer.
+// It is 2 GiB now and the identity lane has the other 22. Neither is a figure
+// Wine asked for; they are a split, and the witness in kmemory64.cpp is what
+// will say whether it is the right one.
+#define K64_NATIVE_TOP_GUEST_BASE     0x7FFF80000000ULL
 #define K64_NATIVE_TOP_GUEST_END      0x7FFFFFFF0000ULL
 #define K64_NATIVE_TOP_GUEST_LENGTH   (K64_NATIVE_TOP_GUEST_END - \
                                        K64_NATIVE_TOP_GUEST_BASE)
@@ -119,6 +162,11 @@ class KThread;
                                        ~K64_NATIVE_TOP_CLEAR_MASK)
 #define K64_NATIVE_TOP_HOST_END       (K64_NATIVE_TOP_HOST_BASE + \
                                        K64_NATIVE_TOP_GUEST_LENGTH)
+
+// Derived, not chosen: the identity lane ends exactly where the arena's host
+// block begins, so the alias block holds no gap the guest cannot be offered.
+#define K64_NATIVE_GUEST_HIGH_END     K64_NATIVE_TOP_HOST_BASE
+
 // Keep automatic mappings out of the executable's program-break growth lane.
 // Starting mmap(NULL, ...) at IMAGE_BASE let ld-linux place libc immediately
 // above a small PIE, so glibc's first brk expansion collided with libc. One
@@ -178,9 +226,30 @@ static_assert((K64_NATIVE_GUEST_IMAGE_BASE & K64_NATIVE_LOW_ALIAS_BASE) ==
 static_assert(((K64_NATIVE_GUEST_HIGH_END - 1) & K64_NATIVE_LOW_ALIAS_BASE) ==
               K64_NATIVE_LOW_ALIAS_BASE,
               "high identity lane end must contain the alias base bits");
-static_assert((K64_NATIVE_GUEST_IMAGE_BASE ^ (K64_NATIVE_GUEST_HIGH_END - 1)) <
-              K64_NATIVE_LOW_GUEST_LIMIT,
-              "high identity lane must not cross an alias-base bit boundary");
+// The identity lane's correctness proof, replacing the older
+// "must not cross an alias-base bit boundary" test. For any A in
+// [K64_NATIVE_LOW_ALIAS_BASE, K64_NATIVE_ALIAS_BLOCK_END),
+// A = K64_NATIVE_LOW_ALIAS_BASE + d with d below the base's lowest set bit.
+// Every base bit is at or above that bit, so the base's bits below it are zero
+// across the whole of d and base + d == base | d; hence A & base == base and
+// the OR is the identity for EVERY address in the lane, not merely at its two
+// ends. A also stays below the block end, so it carries no bit above the
+// base's run and the arena mask is clear throughout. The old test asserted a
+// condition sufficient only for a lane of exactly K64_NATIVE_LOW_GUEST_LIMIT
+// bytes; containment is the invariant that actually holds.
+static_assert(K64_NATIVE_ALIAS_BLOCK_SPAN != 0 &&
+              (K64_NATIVE_LOW_ALIAS_BASE &
+               (K64_NATIVE_ALIAS_BLOCK_SPAN - 1)) == 0,
+              "the block span must be the alias base's lowest set bit");
+static_assert(K64_NATIVE_GUEST_IMAGE_BASE >= K64_NATIVE_LOW_ALIAS_BASE &&
+              K64_NATIVE_GUEST_IMAGE_BASE < K64_NATIVE_GUEST_HIGH_END &&
+              K64_NATIVE_GUEST_HIGH_END <= K64_NATIVE_ALIAS_BLOCK_END,
+              "the identity lane must lie inside the alias base's own block");
+static_assert(K64_NATIVE_ALIAS_BLOCK_SPAN == boxedvn::kGuestAliasBlockSpan,
+              "the alias block span must match the shared translation "
+              "contract");
+static_assert(K64_NATIVE_ALIAS_BLOCK_END == boxedvn::kGuestAliasBlockEnd,
+              "the alias block end must match the shared translation contract");
 static_assert((K64_NATIVE_GUEST_MMAP_BASE & (K64_NATIVE_GUEST_LAYOUT_ALIGN - 1)) == 0,
               "native mmap base must satisfy the iOS host-page layout contract");
 static_assert(K64_NATIVE_GUEST_IMAGE_BASE < K64_NATIVE_GUEST_HEAP_LIMIT,
@@ -212,6 +281,21 @@ static_assert(K64_NATIVE_TOP_HOST_BASE >= K64_NATIVE_GUEST_HIGH_END,
               "the top host alias must sit above the identity lane");
 static_assert(K64_NATIVE_TOP_HOST_END <= K64_NATIVE_GUEST_WINDOW_END,
               "the top host alias must stay inside the proven host window");
+// The arena's translation is exact and injective for the same reason the
+// identity lane's is. Every mask bit is set across the arena, so
+// guest & ~mask == guest - K64_NATIVE_TOP_CLEAR_MASK, sweeping
+// [K64_NATIVE_TOP_HOST_BASE, K64_NATIVE_TOP_HOST_END) one address for one.
+// Requiring that image to sit inside the alias block makes
+// (guest | base) & ~mask == (guest & ~mask) | base == guest & ~mask: the OR
+// contributes nothing, the subtraction is the whole relocation, and no two
+// arena addresses can land on one host address.
+static_assert(K64_NATIVE_TOP_HOST_BASE >= K64_NATIVE_LOW_ALIAS_BASE &&
+              K64_NATIVE_TOP_HOST_END <= K64_NATIVE_ALIAS_BLOCK_END,
+              "the relocated arena's host image must lie inside the alias "
+              "block, or clearing the mask would not be exact");
+static_assert(K64_NATIVE_TOP_HOST_BASE == K64_NATIVE_GUEST_HIGH_END,
+              "the identity lane must end exactly where the arena's host "
+              "block begins");
 static_assert(K64_NATIVE_TOP_GUEST_BASE > K64_NATIVE_GUEST_HIGH_END,
               "the arena must sit above the identity lane");
 #endif

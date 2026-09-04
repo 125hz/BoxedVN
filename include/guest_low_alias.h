@@ -46,21 +46,59 @@ inline constexpr std::uint64_t kGuestLowAliasBase = 0x7800000000ULL;
 inline constexpr std::uint64_t kGuestLowAliasEnd =
     kGuestLowAliasBase + kGuestLowLimit;
 
-// High identity lanes begin immediately above the alias window and stay within
-// one aligned block, so every address in them carries the base's bits.
+// The ONE block the whole host layout lives in, and the real ceiling on it.
+// The alias base is a contiguous run of ones, so the interval that begins at
+// it and spans its LOWEST set bit is exactly the set of addresses that already
+// carry every one of its bits: adding anything smaller than that bit cannot
+// clear one, and cannot reach a bit above the run either. Every host address
+// this address space ever dereferences -- the alias window, the identity lane
+// and the relocated top arena -- has to lie inside it, because outside it the
+// OR is not the identity. Address space the host might grant elsewhere is
+// unreachable whatever the host says. For the base below that block is
+// [0x7800000000, 0x8000000000): 32 GiB, and that is the whole budget.
+inline constexpr std::uint64_t kGuestAliasBlockSpan =
+    kGuestLowAliasBase & (~kGuestLowAliasBase + 1);
+inline constexpr std::uint64_t kGuestAliasBlockEnd =
+    kGuestLowAliasBase + kGuestAliasBlockSpan;
+
+// The high identity lane begins immediately above the alias window and runs to
+// the base of the relocated top arena, which is the next thing in the block.
+// It used to stop one kGuestLowLimit above its base -- not because anything
+// required that, but because the invariant below was stated as "the lane must
+// not cross an alias-base bit boundary", which is sufficient for a lane of
+// exactly that size and refuses every larger one that is equally exact. The
+// sixteen GiB between the old end and the arena were simply never offered.
+// Spelled as a literal because the arena's host base is derived further down;
+// the two are asserted equal there, so neither can move without the other.
 inline constexpr std::uint64_t kGuestHighBase = kGuestLowAliasEnd;
-inline constexpr std::uint64_t kGuestHighEnd = kGuestHighBase + kGuestLowLimit;
+inline constexpr std::uint64_t kGuestHighEnd = 0x7F80000000ULL;
 
 static_assert((kGuestLowLimit & (kGuestLowLimit - 1)) == 0,
               "low guest limit must be a power of two");
 static_assert((kGuestLowAliasBase & (kGuestLowLimit - 1)) == 0,
               "alias base must be aligned to the low limit so OR adds");
+static_assert(kGuestLowAliasBase != 0,
+              "the alias base must have a lowest set bit to span a block");
+static_assert((kGuestLowAliasBase & (kGuestAliasBlockSpan - 1)) == 0,
+              "the block span must be the alias base's lowest set bit, so no "
+              "base bit lies below it");
+// The identity lane's correctness proof, in one statement. For any A in
+// [kGuestLowAliasBase, kGuestAliasBlockEnd), A = kGuestLowAliasBase + d with
+// d < the base's lowest set bit. Every base bit is at or above that bit, so
+// the base's bits below it are all zero across the whole of d and
+// base + d == base | d. Hence A & base == base -- the OR is the identity for
+// every address in the lane, not merely at its two ends -- and A stays below
+// kGuestAliasBlockEnd, so it carries no bit above the base's run either and
+// the top-arena mask is clear throughout. Containment is the invariant;
+// equal lane sizes never were.
+static_assert(kGuestHighBase >= kGuestLowAliasBase &&
+              kGuestHighBase < kGuestHighEnd &&
+              kGuestHighEnd <= kGuestAliasBlockEnd,
+              "the identity lane must lie inside the alias base's own block");
 static_assert((kGuestHighBase & kGuestLowAliasBase) == kGuestLowAliasBase,
               "high lane base must already contain the alias base bits");
 static_assert(((kGuestHighEnd - 1) & kGuestLowAliasBase) == kGuestLowAliasBase,
               "high lane end must already contain the alias base bits");
-static_assert((kGuestHighBase ^ (kGuestHighEnd - 1)) < kGuestLowLimit,
-              "high lane must not cross an alias-base bit boundary");
 
 // ---------------------------------------------------------------------------
 // Wine's top-down arena.
@@ -88,7 +126,25 @@ static_assert((kGuestHighBase ^ (kGuestHighEnd - 1)) < kGuestLowLimit,
 // which works because every arena address has bits 39..46 all set and every
 // other hostable guest address has them all clear. Clearing that field is the
 // relocation, and it is a no-op everywhere else.
-inline constexpr std::uint64_t kGuestTopBase = 0x7FFFFE000000ULL;
+//
+// How far DOWN the arena may reach is the other half of one decision. Its host
+// image is kGuestTopBase - kGuestTopClearMask, so the base and the image move
+// together, and the image has to land in the alias block, above the low alias
+// window and above the identity lane. The last of those is the binding one:
+// the arena's base and kGuestHighEnd are the SAME NUMBER, related by the mask
+// (kGuestTopBase == (kGuestTopClearMask | kGuestTopHostBase)), so widening the
+// arena narrows the identity lane byte for byte. What the two share is fixed:
+// the block, less the low alias window, less the 64 KiB that the arena's fixed
+// top end leaves unused above its image -- 24 GiB less 64 KiB, and no more,
+// whatever the host would be willing to give.
+//
+// The arena was 32 MiB of that, which is why the device log shows Wine's
+// try_map_free_area walking down from its own user-space limit and running out
+// 320 KiB below the old base. It is 2 GiB now and the identity lane has the
+// other 22. Neither figure is one Wine asked for; they are a split, and the
+// only way to know whether it is the right one is the witness in
+// kmemory64.cpp, which now says which lane a refusal fell outside of.
+inline constexpr std::uint64_t kGuestTopBase = 0x7FFF80000000ULL;
 inline constexpr std::uint64_t kGuestTopEnd = 0x7FFFFFFF0000ULL;
 inline constexpr std::uint64_t kGuestTopLength = kGuestTopEnd - kGuestTopBase;
 
@@ -113,8 +169,25 @@ static_assert(((kGuestLowLimit - 1) & kGuestTopClearMask) == 0,
               "canonical low addresses must not touch the clear mask");
 static_assert(((kGuestLowAliasEnd - 1) & kGuestTopClearMask) == 0,
               "the low alias window must not touch the clear mask");
+static_assert(((kGuestAliasBlockEnd - 1) & kGuestTopClearMask) == 0,
+              "no address in the alias block may touch the clear mask");
 static_assert(kGuestTopHostBase >= kGuestHighEnd,
               "the top host alias must sit above the identity lane");
+// The arena's translation is exact and injective for the same reason the
+// identity lane's is. For g in [kGuestTopBase, kGuestTopEnd) every mask bit
+// is set, so g & ~mask == g - kGuestTopClearMask, which sweeps
+// [kGuestTopHostBase, kGuestTopHostEnd) one address for one. Requiring that
+// image to lie inside the alias block makes
+// (g | base) & ~mask == (g & ~mask) | base == g & ~mask: the OR contributes
+// nothing, the subtraction is the whole translation, and no two arena
+// addresses can collide.
+static_assert(kGuestTopHostBase >= kGuestLowAliasBase &&
+              kGuestTopHostEnd <= kGuestAliasBlockEnd,
+              "the relocated arena's host image must lie inside the alias "
+              "block, or clearing the mask would not be exact");
+static_assert(kGuestTopHostBase == kGuestHighEnd,
+              "the identity lane must end exactly where the arena's host "
+              "block begins, so the block carries no unreachable gap");
 static_assert(kGuestTopHostBase % 0x4000ULL == 0,
               "the top host alias must be host-page aligned");
 static_assert((kGuestTopHostBase | kGuestLowAliasBase) == kGuestTopHostBase,
