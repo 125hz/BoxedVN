@@ -697,6 +697,116 @@ static void aliasX64WineLoader(const char* aliasPath, const char* targetName) {
              aliasPath, targetName);
 }
 
+// The side-by-side assembly store, projected the way system32 is.
+//
+// Wine ships no winsxs tree and wine.inf never mentions one. A real prefix gets
+// its winsxs from wineboot's fake-DLL install: install_fake_dll calls
+// register_fake_dll for every builtin it copies in, which enumerates that
+// module's RT_MANIFEST resources and writes
+// windows\winsxs\manifests\<arch>_<name>_<key>_<version>_<lang>_deadbeef.manifest
+// plus windows\winsxs\<same stem>\<file> for each resource NAMED WINE_MANIFEST
+// (dlls/setupapi/fakedll.c). This lane never gets that pass -- system32 here is
+// the in-memory projection below rather than a directory wineboot filled in --
+// so a prefix has no winsxs at all.
+//
+// Nothing reports that, which is why it survived. ntdll's lookup_winsxs is the
+// FIRST thing lookup_assembly tries; with no manifests directory it returns
+// STATUS_NO_SUCH_FILE and the loader falls through to the private-assembly
+// probes beside the program -- <dir>\<name>.dll, <dir>\<name>.manifest and the
+// two <name>\<name> forms. A device log shows exactly those four probes missing
+// for Microsoft.Windows.Common-Controls, in the launched program and in Wine's
+// own helpers. When they miss, parse_depend_manifests fails the whole
+// activation context with STATUS_SXS_CANT_GEN_ACTCTX, and the program runs with
+// none: a manifest asking for common controls version 6 gets version 5.
+//
+// The tree is staged at K_X64_GUEST_WINSXS_DIR by the runtime builder, from the
+// packaged modules' own WINE_MANIFEST resources, with the assembly directories
+// holding guest links to the packaged modules rather than copies. Both
+// architectures stage at that one path -- the 64-bit half in wine64.zip and the
+// 32-bit half in the PE32 archive -- so what is projected here is their union.
+//
+// Two levels deep and no deeper: that is the shape Wine creates, and a generic
+// recursive copy would follow whatever a future staging put there.
+static void projectX64WineSxsAssemblies(const BString& winePrefix) {
+    const BString winsxs = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
+                           K_GUEST_WINE_WINDOWS "/" K_GUEST_WINE_WINSXS;
+    std::shared_ptr<FsNode> stagedRoot =
+        Fs::getNodeFromLocalPath(B(""), B(K_X64_GUEST_WINSXS_DIR), true);
+    if (!stagedRoot || !stagedRoot->isDirectory()) {
+        // A runtime assembled before this staging existed. Named rather than
+        // silent: this is the state in which every program gets version 5.
+        klog_fmt("BOXEDWINE_X64_SXS_OVERLAY source=%s destination=%s "
+                 "manifests=0 assemblies=0 status=no-staged-tree",
+                 K_X64_GUEST_WINSXS_DIR, winsxs.c_str());
+        return;
+    }
+    Fs::makeLocalDirs(winsxs);
+    std::shared_ptr<FsNode> destinationRoot =
+        Fs::getNodeFromLocalPath(B(""), winsxs, true);
+    if (!destinationRoot || !destinationRoot->isDirectory()) {
+        klog_fmt("BOXEDWINE_X64_SXS_OVERLAY source=%s destination=%s "
+                 "manifests=0 assemblies=0 status=unavailable",
+                 K_X64_GUEST_WINSXS_DIR, winsxs.c_str());
+        return;
+    }
+
+    U32 manifests = 0;
+    U32 assemblyFiles = 0;
+    U32 preserved = 0;
+    std::vector<std::shared_ptr<FsNode> > stagedChildren;
+    stagedRoot->getAllChildren(stagedChildren);
+    destinationRoot->reserveChildren(stagedChildren.size());
+    for (const std::shared_ptr<FsNode>& child : stagedChildren) {
+        if (!child || child->name.isEmpty() || !child->isDirectory()) {
+            continue;
+        }
+        const BString childDestination = winsxs + "/" + child->name;
+        Fs::makeLocalDirs(childDestination);
+        std::shared_ptr<FsNode> childDestinationNode =
+            Fs::getNodeFromLocalPath(B(""), childDestination, true);
+        if (!childDestinationNode || !childDestinationNode->isDirectory()) {
+            continue;
+        }
+        const bool isManifestDirectory =
+            child->name == K_X64_GUEST_WINSXS_MANIFEST_SUBDIR;
+        std::vector<std::shared_ptr<FsNode> > entries;
+        child->getAllChildren(entries);
+        childDestinationNode->reserveChildren(entries.size());
+        for (const std::shared_ptr<FsNode>& entry : entries) {
+            if (!entry || entry->name.isEmpty()) {
+                continue;
+            }
+            const BString destination = childDestination + "/" + entry->name;
+            const bool destinationExists =
+                Fs::getNodeFromLocalPath(B(""), destination, false) != nullptr;
+            // The same non-destructive rule system32 uses: a real file an
+            // installer put in the prefix always wins. A third-party assembly
+            // installed into this prefix is exactly that case.
+            if (!boxedvn::shouldProjectGuestWineSystemModule(
+                    true, entry->isDirectory(), destinationExists)) {
+                if (destinationExists) {
+                    ++preserved;
+                }
+                continue;
+            }
+            Fs::addFileNode(destination, entry->path, B(""), false,
+                            childDestinationNode);
+            if (isManifestDirectory) {
+                ++manifests;
+            } else {
+                ++assemblyFiles;
+            }
+        }
+    }
+    // The witness for the prefix: how many assemblies this launch made
+    // activatable at all. Zero is the state the private-assembly probes in an
+    // older log were the only evidence of.
+    klog_fmt("BOXEDWINE_X64_SXS_OVERLAY source=%s destination=%s manifests=%u "
+             "assemblies=%u preserved=%u status=ready",
+             K_X64_GUEST_WINSXS_DIR, winsxs.c_str(), manifests, assemblyFiles,
+             preserved);
+}
+
 static void projectX64WineSystemModules(const BString& winePrefix) {
     const BString system32 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
                              K_GUEST_WINE_WINDOWS "/" K_GUEST_WINE_SYSTEM32;
@@ -1385,6 +1495,10 @@ bool StartUpArgs::apply() {
         aliasX64WineLoader(K_X64_WINE_LOADER, K_X64_WINE_LOADER64_NAME);
         aliasX64WineLoader(K_X64_WINE_PRELOADER, K_X64_WINE_PRELOADER64_NAME);
         projectX64WineSystemModules(winePrefix);
+        // Beside system32, and before any process starts: ntdll builds a
+        // process's activation context during LdrInitializeThunk, so a
+        // winsxs that appears later is a winsxs no process ever saw.
+        projectX64WineSxsAssemblies(winePrefix);
         // The guest ld-linux resolves winex11.so's libX11/libXext through
         // LD_LIBRARY_PATH before the multiarch directories. Put BoxedWine's
         // own x86-64 X11 client libraries first so the driver binds to the

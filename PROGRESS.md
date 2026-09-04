@@ -7479,3 +7479,47 @@ was acquired during swapchain setup rather than during a frame, so the frame
 loop never started. The next candidate is the crossing between the 32-bit
 program and the 64-bit graphics layer, and the acquire and present witnesses
 now decide it from one log.
+
+## Wine had muted itself, and we told it to
+
+The 64-bit lane produced no Wine diagnostics at all, whatever channels the
+launch enabled. Wine decides at startup whether its standard error is the null
+device by comparing the device number of descriptor 2 against the device number
+of /dev/null, and if they match it disables every channel, errors and warnings
+included, before it ever reads the channel configuration. Our file status wrote
+a device number of zero for every file, so a terminal and the null device
+compared equal and Wine went quiet. The device number now comes from the node,
+and a witness prints both sides of the comparison so this can never be silent
+again. Nothing else in the tree could have shown it: the two lines that did
+appear come from a library with its own logger, and the 32-bit lane's messages
+come from a path with no channel check.
+
+## The graphics layer is not what stops the frame; a thread is
+
+The test program never blocks for messages, so a missing message cannot explain
+its freeze. Reconstructing the thread timeline from the wait ages shows the
+main thread acquiring an image, waking a worker, and parking, and that worker
+running for most of a second while the translator compiled fresh code for it
+and then exiting without ever submitting or presenting. Everything else is
+correctly waiting on a thread that is gone, and the graphics layer logged no
+error, on a stream this run captured. A departing thread now reports how many
+bridge calls it made, its last twelve syscalls, and a snapshot of every
+survivor taken at the instant it left, since a later sample cannot tell who was
+already parked from who parked afterwards.
+
+## A page nobody committed, and the assembly that was never there
+
+The remaining fault in the other program is not ours: the address lies in
+Wine's reserved arena, no operation ever touched that page, and Wine's own
+records agreed, which is why its handler produced an access violation rather
+than committing. The faulting code is a widening copy whose cursor and limit
+disagree, so the pointer was computed earlier, and the process exit names the
+common controls library.
+
+That library is also the one Wine could not activate: the prefix had no
+side-by-side tree at all, because Wine ships none and its prefix setup never
+builds one, so every activation context naming an assembly failed and a program
+requiring version 6 silently got version 5, with different structure sizes. The
+runtime builder now stages a winsxs tree for both architectures from the
+modules it already packages, gated on the common controls assembly being
+present, so a build that would ship the old silent substitution fails instead.

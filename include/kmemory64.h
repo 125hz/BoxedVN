@@ -320,6 +320,17 @@ struct K64Page {
     U8  lastWriter = K64_WRITER_NONE;
     U8  lastFlags = 0;          // K64_PAGE_* fit in eight bits
     U16 lastWriteStamp = 0;     // wrapping; orders two recent writers
+    // The write BEFORE the last one that actually changed the value. A page
+    // reserved PROT_NONE and a page committed and then freed back to a
+    // reservation are indistinguishable from lastWriter alone: both read
+    // mmap-anon with K64_PAGE_MAPPED and nothing else. This says which, and
+    // it is the difference between a wild guest pointer into address space
+    // nothing ever used and a use-after-free of memory the guest DID commit.
+    // Only a write that changes `flags` shifts it, so re-reserving an already
+    // reserved page cannot erase the commit that came before.
+    U8  priorWriter = K64_WRITER_NONE;
+    U8  priorFlags = 0;
+    U16 priorWriteStamp = 0;
     // When set, `data` is BORROWED from a process-shared file mapping (wine's
     // server shared-memory section: MAP_SHARED writable file). The buffer is
     // owned by g_sharedFileRegistry and aliased by every process that maps the
@@ -343,6 +354,11 @@ struct K64Page {
     // "which operation last changed this page's rights" answerable at all, and
     // what keeps a rights change tied to an operation that named the page.
     void writeFlags(U32 value, U8 writer, U16 stamp) {
+        if (value != flags) {
+            priorWriter = lastWriter;
+            priorFlags = lastFlags;
+            priorWriteStamp = lastWriteStamp;
+        }
         flags = value;
         lastWriter = writer;
         lastFlags = (U8)(value & 0xFFu);
@@ -428,6 +444,14 @@ struct K64Page {
 // with the page table as the authority: it raises the host page to exactly
 // the union its guest subpages are entitled to and to nothing more, so a
 // genuine guest access violation still reaches the guest as one.
+//
+// How far either side of a REFUSED fault the committed neighbourhood below is
+// looked for: 1024 guest pages, 4 MiB. Big enough to bracket the heap block a
+// walking loop overran, small enough that the bounded scan stays two thousand
+// map lookups on a path that is about to kill the process anyway.
+#define K64_FAULT_NEIGHBOURHOOD_PAGES 1024
+
+// The report the repair fills in, whether it repairs or refuses.
 struct K64NativeFaultRepair {
     // The canonical guest address the faulting host address is the image of.
     U64 guestAddress = 0;
@@ -461,6 +485,25 @@ struct K64NativeFaultRepair {
     const char* neighbourWriter = "none";
     U32 neighbourWriteFlags = 0;
     U32 neighbourWriteStamp = 0;
+    // The write before the last CHANGE to the faulting page's flags. lastWriter
+    // says "mmap-anon wrote K64_PAGE_MAPPED" for a page that was reserved and
+    // never used AND for a page that was committed, freed, and re-reserved --
+    // the same three fields, the same values. These separate them: prior rights
+    // that include K64_PAGE_READ mean the guest DID commit this page once and
+    // something took it back, which is a use-after-free and not a wild pointer.
+    const char* priorWriter = "none";
+    U32 priorWriteFlags = 0;
+    U32 priorWriteStamp = 0;
+    // The committed neighbourhood of a REFUSED fault, within
+    // K64_FAULT_NEIGHBOURHOOD_PAGES either way. `committedBelow` is the first
+    // address the guest could NOT read below the fault -- the end of whatever
+    // buffer a walking loop ran off -- and `committedAbove` is the base of the
+    // next readable page. Zero means nothing readable within the window. A
+    // fault whose two ends bracket a small hole is a loop that overran its
+    // buffer; one with nothing either way is a pointer into address space the
+    // guest never used at all.
+    U64 committedBelow = 0;
+    U64 committedAbove = 0;
     // What the repair did.
     bool materialised = false;   // a host page was created here
     bool reprotected = false;    // an existing host page's protection changed
@@ -803,6 +846,13 @@ private:
     U32 nativeHostPageProtLocked(U64 hostPageStart, U64 hostPageSize,
                                  U64 excludePage,
                                  K64NativeFaultRepair* report) const;
+    // Fill report.committedBelow / report.committedAbove for a fault that is
+    // about to be REFUSED: the nearest readable guest page on either side of
+    // the faulting one, within K64_FAULT_NEIGHBOURHOOD_PAGES. Only the refusal
+    // paths call it -- a repaired fault happens thousands of times a run and
+    // must not pay for a scan. Caller holds pagesMutex.
+    void nativeCommittedNeighbourhoodLocked(U64 guestPageNumber,
+                                            K64NativeFaultRepair& report) const;
     // Bring every host page of [hostStart, hostEnd) to that union, one host
     // page at a time, after the guest page map has already been updated. Runs
     // of host pages that want the same protection are issued as one call. A

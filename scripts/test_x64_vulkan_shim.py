@@ -37,6 +37,9 @@ IMPORTS = SHIM_DIR / "winex11-vulkan-imports.txt"
 BRIDGE_HEADER = REPO / "include" / "boxedwine_x64_vulkan_bridge.h"
 VKDEF = REPO / "source" / "vulkan" / "vkdef.h"
 DISPATCHER = REPO / "source" / "vulkan" / "vulkanbridge64.cpp"
+DISPATCHER_HEADER = REPO / "source" / "vulkan" / "vulkanbridge64.h"
+THREAD_HEADER = REPO / "include" / "kthread.h"
+SYSCALL64 = REPO / "source" / "kernel" / "syscall64.cpp"
 VULKAN_CORE = REPO / "source" / "vulkan" / "vk" / "vulkan_core.h"
 IA32_LANE = REPO / "source" / "vulkan" / "vulkancommon.cpp"
 BUILD_SCRIPT = REPO / "scripts" / "build-boxedwine-x64-vulkan.sh"
@@ -1895,6 +1898,151 @@ class ValidatorContract(unittest.TestCase):
         driver.write_bytes(b"\x00" + b"\x00".join(n.encode() for n in kept) + b"\x00")
         with self.assertRaises(validator.ValidationError):
             validator.validate(path, IMPORTS, BRIDGE_HEADER, driver)
+
+
+class CallingThreadContract(unittest.TestCase):
+    """Which guest thread made a bridge call, and whether it survived to
+    finish the frame it started.
+
+    A device capture of the 32-bit Direct3D 9 probe ended with a successful
+    vkAcquireNextImageKHR -- full 64-bit timeout, a real semaphore, image index
+    0 -- no present of any kind, and every surviving thread of the process
+    parked in a futex wait on Wine's per-thread alert table with no wake
+    attempted for thirty seconds. At that same instant a fifth thread left the
+    process through exit(2). The probe's frame loop peeks for messages and
+    renders unconditionally, so it cannot have been waiting for a message; and
+    the bridge's own witnesses named only the process, so "the thread that
+    acquired the image is the thread that left" could be neither stated nor
+    refused. It is the difference between a renderer worker retiring on
+    schedule and the thread driving the swapchain disappearing mid-frame, and
+    those are opposite diagnoses.
+
+    These tests keep the thread on the record at both ends: on every bridge
+    call, and on the exit of any thread that leaves a live process behind.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+        self.header = DISPATCHER_HEADER.read_text(encoding="utf-8")
+        self.thread_header = THREAD_HEADER.read_text(encoding="utf-8")
+        self.syscalls = SYSCALL64.read_text(encoding="utf-8")
+
+    def case_body(self, name: str) -> str:
+        start = self.source.index(f"case VKB_{name}:")
+        rest = self.source[start + 1:]
+        end = re.search(r"^\s*case VKB_\w+:", rest, re.MULTILINE)
+        return rest[:end.start()] if end else rest
+
+    def exit_witness(self) -> str:
+        start = self.syscalls.index("static void noteThreadExit64(")
+        rest = self.syscalls[start:]
+        end = re.search(r"^static \w", rest[1:], re.MULTILINE)
+        return rest[:end.start() + 1] if end else rest
+
+    def test_the_swapchain_witnesses_name_the_calling_thread(self) -> None:
+        # The acquire and the present are the pair the hang is read from. A
+        # pair that names only the process cannot say whether one thread did
+        # both, which is the question a missing present asks first.
+        for command in ("AcquireNextImageKHR", "QueuePresentKHR"):
+            with self.subTest(command=command):
+                self.assertIn("tid=%04X", self.case_body(command))
+
+    def test_the_per_command_witness_names_the_calling_thread(self) -> None:
+        # Same reason, over every dispatched command: the order in which
+        # threads reach the bridge is what separates a renderer that hands its
+        # frame to a worker from one whose worker has gone.
+        head = self.source[:self.source.index('"args=%llu status=%lld seen=%u"')]
+        witness = head[head.rindex("klog_fmt("):]
+        self.assertIn("BOXEDWINE_X64_VULKAN_BRIDGE", witness)
+        self.assertIn("tid=%04X", witness)
+        self.assertIn("name, pid, tid,", self.source)
+
+    def test_the_dispatcher_is_handed_the_calling_thread(self) -> None:
+        self.assertIn(
+            "S64 dispatchCommand(int index, Marshal& m, const U64* args, "
+            "U64 count, U32 tid)", self.source)
+        self.assertIn("dispatchCommand(index, marshal, args, count, tid)",
+                      self.source)
+
+    def test_every_dispatch_records_the_command_on_the_thread(self) -> None:
+        # A line printed from inside the bridge cannot say anything about a
+        # thread that has already left the process. The record has to live on
+        # the thread so a witness fired somewhere else can read it.
+        self.assertIn("diagnosticVulkanBridgeCall.store(", self.source)
+        self.assertIn("diagnosticVulkanBridgeCalls.fetch_add(", self.source)
+        self.assertIn("std::atomic<U32> diagnosticVulkanBridgeCall{0};",
+                      self.thread_header)
+        self.assertIn("std::atomic<U64> diagnosticVulkanBridgeCalls{0};",
+                      self.thread_header)
+
+    def test_the_recorded_command_is_never_cleared(self) -> None:
+        # The 32-bit lane's diagnosticVulkanCall is cleared on the way out,
+        # because it answers "what is this thread inside right now". This one
+        # answers "what was this thread doing at all", and a thread that has
+        # returned from the bridge -- or exited -- must still answer it.
+        for path in (DISPATCHER, SYSCALL64):
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn("diagnosticVulkanBridgeCall.store(0", text)
+
+    def test_the_command_name_is_reachable_from_outside_the_bridge(self) -> None:
+        self.assertIn("const char* vulkanBridge64CommandName(U32 callPlusOne);",
+                      self.header)
+        self.assertIn("const char* vulkanBridge64CommandName(U32 callPlusOne) {",
+                      self.source)
+        self.assertIn("vulkanBridge64CommandName(", self.syscalls)
+
+    def test_a_lone_thread_exit_is_witnessed(self) -> None:
+        self.assertIn("BOXEDWINE_X64_THREAD_EXIT", self.syscalls)
+        witness = self.exit_witness()
+        for field in ("pid=%u", "tid=%04X", "rip=0x%llx", "rsp=0x%llx",
+                      "siblings=%u", "vulkan_calls=%llu", "last_vulkan=%s"):
+            with self.subTest(field=field):
+                self.assertIn(field, witness)
+
+    def test_the_thread_exit_witness_fires_only_for_a_single_thread_exit(self) -> None:
+        # exit_group already has its own marker and its own diagnostics. This
+        # one exists for the exit that leaves a process running, because that
+        # is the one whose survivors can starve.
+        self.assertIn("if (!group) {\n            noteThreadExit64(cpu);",
+                      self.syscalls)
+
+    def test_the_thread_exit_witness_snapshots_the_parked_threads(self) -> None:
+        # Taken at the instant of the exit, not by a watchdog seconds later:
+        # what has to be established is whether the survivors were ALREADY
+        # asleep when the thread left, which no later sample can distinguish
+        # from threads that parked afterwards.
+        witness = self.exit_witness()
+        self.assertIn("KThread::logFutexSnapshot();", witness)
+        self.assertIn("if (live <= 1) {", witness)
+        self.assertLess(witness.index("if (live <= 1) {"),
+                        witness.index("KThread::logFutexSnapshot();"))
+
+    def test_the_thread_exit_witness_names_the_departing_syscalls(self) -> None:
+        # A thread that returned from its start routine and a thread that was
+        # taken out of one are indistinguishable from the exit alone. The
+        # syscalls it made getting there are not, so the process-wide ring is
+        # replayed for this thread only.
+        witness = self.exit_witness()
+        self.assertIn("X64_THREAD_EXIT_TAIL", witness)
+        self.assertIn("r.threadId != thread->id", witness)
+        self.assertIn("matching > 12 ? matching - 12 : 0", witness)
+        # And the ring is not claimed: a later exit_group still prints it whole.
+        self.assertNotIn("claimDump", witness)
+
+    def test_the_thread_exit_witness_is_budgeted(self) -> None:
+        witness = self.exit_witness()
+        self.assertIn("reported.fetch_add(1, std::memory_order_relaxed) >= 16",
+                      witness)
+
+    def test_the_thread_exit_witness_cannot_fault(self) -> None:
+        # It reads the guest stack for the return address that reached the
+        # exit. A diagnostic must never be the thing that faults, so the read
+        # happens only where the page table says the page is mapped.
+        witness = self.exit_witness()
+        self.assertIn("isPageMapped(rsp >> K64_PAGE_SHIFT)", witness)
+        self.assertLess(witness.index("isPageMapped"),
+                        witness.index("readq(rsp)"))
 
 
 class BuildScriptContract(unittest.TestCase):

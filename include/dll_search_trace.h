@@ -58,6 +58,13 @@
 #include <atomic>
 #include <cstddef>
 
+// The side-by-side half of the same search. Kept in a header of its own
+// because what it reads is a different question -- which assembly a process
+// activated, not which module it found -- and because it must not be budgeted
+// against the module trace: a spent budget is exactly when the answer stops
+// being visible.
+#include "guest_sxs_activation.h"
+
 namespace boxedvn {
 
 // True when a path could be part of a module search. Deliberately narrow: a
@@ -73,9 +80,17 @@ inline bool dllSearchPathIsInteresting(const char* path) {
         "x86_64-unix",     // its Unix half
         "/wine",           // any module root, canonical or compatibility
         "system32",        // the prefix's Windows system directory
+        "winsxs",          // the side-by-side assembly store
         ".dll",
         ".exe",
         ".so",
+        // The side-by-side lookup is part of resolving a module and none of
+        // the markers above see it: a private-assembly probe is
+        // <program directory>\<assembly name>.manifest, which shares no text
+        // with a module tree or the system directory. A device log therefore
+        // showed the `.dll` half of that probe and not the `.manifest` half,
+        // which is the half that proves the winsxs lookup had already failed.
+        ".manifest",
     };
     for (const char* marker : markers) {
         for (const char* cursor = path; *cursor; ++cursor) {
@@ -290,6 +305,11 @@ public:
         if (!dllSearchTraceEnabled()) {
             return;
         }
+        // Before the module-name test below, which only accepts a path ending
+        // in ".dll": half of what the side-by-side lookup touches is a
+        // ".manifest", and that half is the half that says whether the winsxs
+        // store answered.
+        sxsActivation.noteResult(path, result);
         char name[K_DLL_SEARCH_MODULE_NAME_MAX];
         if (!dllSearchModuleName(path, name, sizeof(name))) {
             return;
@@ -387,6 +407,13 @@ public:
         return probeCount.load(std::memory_order_relaxed);
     }
 
+    // The side-by-side outcomes this process has decided and not yet reported.
+    // Public because the wording of the line belongs to the caller, exactly as
+    // it does for the module-search operations above.
+    SxsActivationTrace& sxs() {
+        return sxsActivation;
+    }
+
 private:
     struct Slot {
         char name[K_DLL_SEARCH_MODULE_NAME_MAX] = {0};
@@ -425,6 +452,7 @@ private:
         }
     }
 
+    SxsActivationTrace sxsActivation;
     std::atomic<unsigned> budget {K_DLL_SEARCH_TRACE_BUDGET};
     std::atomic<unsigned> probeCount {0};
     mutable std::atomic<bool> lock {false};

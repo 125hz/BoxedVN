@@ -29,6 +29,8 @@
 #include "BVNRuntime.h"
 #endif
 #include "krandom.h"
+// K_S_IFMT/K__S_IFCHR: the file-type bits the stderr witness classifies with.
+#include "kstat.h"
 #include "boxedwine_x64_hostcall.h"
 #include "boxedwine_x64_x11_bridge.h"
 #include "boxedwine_x64_vulkan_bridge.h"
@@ -532,6 +534,20 @@ static void reportDllSearch(KProcess* process, const char* op, const char* path,
     // survive a spent budget, because that is exactly when the log stops
     // saying it. See BOXEDWINE_X64_IMPORT_MISSING at exit.
     process->dllSearch.noteResult(path, result);
+    // Which side-by-side assembly this process actually activated, and from
+    // where. Unbudgeted and at most one line per assembly: the module trace's
+    // budget bounds how much of a search is printed, and this is the one
+    // answer that must survive a spent budget. A log that carries only the
+    // probe misses leaves "did the program get version 6 or version 5" to be
+    // inferred, which is what a device capture of a crash in the common
+    // controls left it as. See include/guest_sxs_activation.h.
+    boxedvn::SxsActivationReport sxsReport;
+    while (process->dllSearch.sxs().takeReport(sxsReport)) {
+        klog_fmt("BOXEDWINE_X64_SXS_ACTIVATION pid=%u assembly=%s version=%s "
+                 "arch=%s source=%s status=%s",
+                 (unsigned)process->id, sxsReport.assembly, sxsReport.version,
+                 sxsReport.arch, sxsReport.source, sxsReport.status);
+    }
     const boxedvn::DllSearchTrace::Decision decision =
         process->dllSearch.record(path);
     if (decision == boxedvn::DllSearchTrace::Decision::Silent) {
@@ -628,6 +644,54 @@ void reportFontconfigLoaded(KProcess* process, const char* cachePath) {
     klog_fmt("BOXEDWINE_X64_FONTCONFIG pid=%u config='/etc/fonts/fonts.conf' "
              "status=loaded first_cache='%s'",
              (unsigned)pid, cachePath ? cachePath : "(null)");
+}
+
+// Whether Wine says anything at all, decided by two stats.
+//
+// ntdll's unix side initialises its debug channels lazily, the first time any
+// module writes a TRACE/WARN/ERR/FIXME, and the first thing that
+// initialisation does is ask whether the process's stderr is /dev/null:
+// fstat(2), stat("/dev/null"), and if both are character devices reporting
+// the same st_rdev it clears the default channel flags and returns WITHOUT
+// ever reading WINEDEBUG. err and fixme are on by default, so losing that
+// comparison is the difference between an ordinary Wine log and total
+// silence. It is in the shipped module, not inferred: init_options in
+// x86_64-unix/ntdll.so, reached from __wine_dbg_get_channel_flags.
+//
+// This lane used to lose it for a reason that had nothing to do with Wine.
+// writeStatBuf64 answered st_rdev 0 for every file, so stderr -- which is
+// /dev/tty0, k_mdev(4, 0) -- and /dev/null -- k_mdev(1, 3) -- were
+// indistinguishable, and every 64-bit process muted itself before the
+// environment was ever consulted. Both answers are printed once per process
+// now, so a log shows the comparison instead of leaving it to be inferred
+// from an absence of output.
+std::mutex wineDebugStderrMutex;
+std::vector<U64> wineDebugStderrReported;
+
+// slot separates the two subjects so each is reported once per process.
+bool claimWineDebugStderrWitness(U32 pid, U32 slot) {
+    const U64 key = ((U64)pid << 8) | slot;
+    std::lock_guard<std::mutex> guard(wineDebugStderrMutex);
+    for (U64 seen : wineDebugStderrReported) {
+        if (seen == key) {
+            return false;
+        }
+    }
+    wineDebugStderrReported.push_back(key);
+    return true;
+}
+
+void reportWineDebugStderrIdentity(KProcess* process, const char* subject,
+                                   U32 slot, U32 mode, U64 rdev) {
+    const U32 pid = process ? process->id : 0;
+    if (!claimWineDebugStderrWitness(pid, slot)) {
+        return;
+    }
+    klog_fmt("BOXEDWINE_X64_WINEDEBUG pid=%u subject=%s mode=0%o rdev=0x%llx "
+             "chr=%d",
+             (unsigned)pid, subject, (unsigned)mode,
+             (unsigned long long)rdev,
+             (mode & K_S_IFMT) == K__S_IFCHR ? 1 : 0);
 }
 
 }  // namespace
@@ -1442,6 +1506,104 @@ static void noteLaunchedProcessExit64(CPU64* cpu, U64 status, bool group) {
 #endif
 }
 
+// A plain exit(2) ends ONE thread and leaves the process running, and the
+// question a hang asks about such an exit is always the same: could the
+// threads that remain make progress without it?
+//
+// A device capture of the 32-bit Direct3D 9 probe on this lane ended exactly
+// here. The last graphics event on record was a successful
+// vkAcquireNextImageKHR -- full 64-bit timeout, a real semaphore, image index
+// 0 -- and no present ever followed it. One thread then left through this
+// syscall, and from that instant every surviving thread of the process sat in
+// a futex wait on Wine's per-thread alert table with no wake even attempted,
+// for the thirty seconds until the capture ended. The probe's own frame loop
+// peeks for messages and renders unconditionally, so it cannot be waiting for
+// a message; it can only be inside Direct3D. The two facts could be joined
+// only by elimination, because nothing said what the departing thread had been
+// doing, or what the survivors were waiting for when it went.
+//
+// So say both. The Vulkan counters name the departing thread's role without
+// any guess about which of the renderer's worker threads is which: the thread
+// that acquired the swapchain image leaving the process is a different defect
+// from a compiler worker retiring on schedule, and the counts separate them.
+// The futex snapshot, taken at the instant of the exit rather than by a
+// watchdog seconds later, says whether the survivors were already parked -- a
+// thread that leaves while every sibling is asleep was the last runnable
+// thread in the process, and its exit is the end of the run.
+//
+// Budgeted, because a program that starts and retires worker threads all day
+// must not turn this into a firehose, and the first few are the ones that
+// matter.
+static void noteThreadExit64(CPU64* cpu) {
+    KThread* thread = cpu ? cpu->thread : nullptr;
+    if (!thread || !thread->process) {
+        return;
+    }
+    static std::atomic<U32> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+    KProcess* process = thread->process.get();
+    // This thread has not been removed yet, so the survivors are one fewer.
+    const U32 live = process->getThreadCount();
+    const U32 lastCall =
+        thread->diagnosticVulkanBridgeCall.load(std::memory_order_relaxed);
+    const char* lastName = vulkanBridge64CommandName(lastCall);
+    // Read through the page table and only where the page is mapped: a
+    // diagnostic must never be the thing that faults.
+    const U64 rsp = cpu->reg[X64_RSP].u64;
+    U64 returnAddress = 0;
+    if (cpu->memory && rsp && cpu->memory->isPageMapped(rsp >> K64_PAGE_SHIFT)) {
+        returnAddress = cpu->memory->readq(rsp);
+    }
+    klog_fmt("BOXEDWINE_X64_THREAD_EXIT pid=%u tid=%04X rip=0x%llx "
+             "syscall_rip=0x%llx rsp=0x%llx return=0x%llx siblings=%u "
+             "vulkan_calls=%llu last_vulkan=%s",
+             (unsigned)process->id, thread->id,
+             (unsigned long long)cpu->rip,
+             (unsigned long long)cpu->syscallRip,
+             (unsigned long long)rsp, (unsigned long long)returnAddress,
+             live ? live - 1 : 0,
+             (unsigned long long)thread->diagnosticVulkanBridgeCalls.load(
+                 std::memory_order_relaxed),
+             lastName ? lastName : "none");
+    // Only while siblings remain. The last thread of a process leaving has no
+    // survivors to starve, and its exit is the process ending normally.
+    if (live <= 1) {
+        return;
+    }
+    KThread::logFutexSnapshot();
+    // The departing thread's own last syscalls. A thread that returned from
+    // its start routine and a thread that was taken out of one look identical
+    // from the exit alone; the syscalls it made on the way there do not. The
+    // ring is process-wide, so it is filtered to this thread and capped at the
+    // most recent dozen, and it is deliberately NOT claimed -- a later
+    // exit_group still gets to print the whole ring.
+    unsigned matching = 0;
+    process->syscallTail.forEach([&](const boxedvn::SyscallTailRecord& r) {
+        if (r.threadId == thread->id) {
+            ++matching;
+        }
+    });
+    const unsigned skip = matching > 12 ? matching - 12 : 0;
+    unsigned position = 0;
+    process->syscallTail.forEach([&](const boxedvn::SyscallTailRecord& r) {
+        if (r.threadId != thread->id || position++ < skip) {
+            return;
+        }
+        klog_fmt("  X64_THREAD_EXIT_TAIL[%llu] tid=%04X nr=%llu (%s) "
+                 "rip=0x%llx a=(0x%llx,0x%llx,0x%llx) -> %lld state=%s",
+                 (unsigned long long)r.sequence, thread->id,
+                 (unsigned long long)r.number, x64SyscallName(r.number),
+                 (unsigned long long)r.syscallRip,
+                 (unsigned long long)r.arguments[0],
+                 (unsigned long long)r.arguments[1],
+                 (unsigned long long)r.arguments[2],
+                 (long long)r.result,
+                 x64SyscallTailStateName(r.state));
+    });
+}
+
 static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
     if (!g_serialTeardownInit) {
         g_serialTeardownOn = std::getenv("BW64_SERIAL_TEARDOWN") != nullptr;
@@ -1467,6 +1629,9 @@ static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
                  "group=%d exe='%s' tid=%04X",
                  (unsigned)p->id, (unsigned)p->parentId, (long long)status,
                  group ? 1 : 0, p->exe.c_str(), cpu->thread->id);
+        if (!group) {
+            noteThreadExit64(cpu);
+        }
     } else {
         klog_fmt("CPU64: %s syscall, status=%lld",
                  group ? "exit_group" : "exit", (long long)status);
@@ -2119,8 +2284,14 @@ static U64 sys_pwrite64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
 // writeStatBuf64 — write the x86-64 Linux struct stat (144 bytes) into
 // guest memory. Field offsets match the canonical glibc/kernel layout for
 // __NR_fstat / __NR_newfstatat result buffers on x86-64.
+//
+// st_rdev is the node's own device number, not zero. It used to be zero for
+// everything, which made every character device in the emulated /dev the same
+// device as every other one, and Wine reads exactly that field to decide
+// whether its stderr is /dev/null -- see reportWineDebugStderrIdentity above
+// for what a wrong answer there costs.
 static void writeStatBuf64(KMemory64* mem, U64 addr, U64 size, U32 mode,
-                            U64 ino, U32 uid, U32 gid, U64 mtime) {
+                            U64 ino, U32 uid, U32 gid, U64 mtime, U64 rdev) {
     U8 buf[144];
     std::memset(buf, 0, sizeof(buf));
     auto put64 = [&](U32 off, U64 v) { std::memcpy(buf + off, &v, 8); };
@@ -2132,7 +2303,7 @@ static void writeStatBuf64(KMemory64* mem, U64 addr, U64 size, U32 mode,
     put32(28, uid);           // st_uid
     put32(32, gid);           // st_gid
     put32(36, 0);             // __pad0
-    put64(40, 0);             // st_rdev
+    put64(40, rdev);          // st_rdev
     put64(48, size);          // st_size
     put64(56, 4096);          // st_blksize
     put64(64, (size + 511) / 512); // st_blocks (512-byte units)
@@ -2188,7 +2359,12 @@ static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSym
     U32 mode  = node->getMode();
     U64 ino   = node->id;
     U64 mtime = node->lastModified() / 1000; // ms → seconds
-    writeStatBuf64(cpu->memory, statbuf, size, mode, ino, 1000, 1000, mtime);
+    if (!strcmp(path, "/dev/null")) {
+        reportWineDebugStderrIdentity(cpu->thread->process.get(), "/dev/null",
+                                      2, mode, node->rdev);
+    }
+    writeStatBuf64(cpu->memory, statbuf, size, mode, ino, 1000, 1000, mtime,
+                   node->rdev);
     return 0;
 }
 
@@ -2232,19 +2408,27 @@ static U64 sys_fstat64(CPU64* cpu, U64 fd, U64 statbuf) {
     U32 mode = 0100644; // S_IFREG | 0644
     U64 ino = 0;
     U64 mtime = 0;
+    U64 rdev = 0;
     if (kfile && kfile->openFile) {
         size = (U64)kfile->openFile->length();
         if (kfile->openFile->node) {
             mode  = kfile->openFile->node->getMode();
             ino   = kfile->openFile->node->id;
             mtime = (U64)kfile->openFile->node->lastModified();
+            rdev  = kfile->openFile->node->rdev;
         }
     } else {
         // Non-file kobject (socket/pipe): claim S_IFCHR so callers don't
-        // assume seekable.
+        // assume seekable. A pipe is not a device, so it keeps rdev 0, which
+        // is now distinct from every device in the emulated /dev.
         mode = 0020666;
     }
-    writeStatBuf64(cpu->memory, statbuf, size, mode, ino, 1000, 1000, mtime);
+    if (fd == 2) {
+        reportWineDebugStderrIdentity(cpu->thread->process.get(), "stderr", 1,
+                                      mode, rdev);
+    }
+    writeStatBuf64(cpu->memory, statbuf, size, mode, ino, 1000, 1000, mtime,
+                   rdev);
     return 0;
 }
 
@@ -4189,6 +4373,30 @@ static const U32 kDxmtOpeningCallLogBudget = 128;
 //
 // Whether Metal then accepts it is the question the log could not answer
 // before, so the result is printed either way.
+//
+// It answered accepted=0, and the pinned checkout says why it cannot be a
+// path problem. src/winemetal/unix/cache.c is:
+//
+//   resolved_path = resolve_cache_dir(path, false);
+//   MTLSetShaderCachePath(resolved_path);
+//   params->ret_success =
+//       [MTLGetShaderCachePath() isEqualToString:resolved_path];
+//
+// and resolve_cache_dir puts confstr(_CS_DARWIN_USER_CACHE_DIR) in front only
+// of a relative path -- its createDirectoryAtPath:withIntermediateDirectories
+// runs either way. So the directory exists, an absolute path comes back
+// unchanged, and the only thing that can fail is the comparison: Metal did
+// not take the path it was given.
+//
+// That leaves order. Metal accepts a shader cache path only while it has no
+// cache open, and this app creates an MTLDevice of its own before any guest
+// module attaches -- the presentation layer is prepared during launch, about
+// half a second before dxgi.dll's DllMain makes this call. The remedy is not
+// here: the same request has to be made during app startup, before that layer
+// exists, with the very string the guest will later ask for, since the
+// comparison is against exactly what was set. That needs the guest
+// executable's name at a point in the launch where only the container has it,
+// which is why it is not done here.
 static const U64 kDxmtUnixCallSetMetalShaderCachePath = 119;
 
 // DXMT's own path is well under this. A longer one is not the call this
@@ -4204,6 +4412,11 @@ struct DxmtShaderCachePathWitness {
     char requested[kDxmtShaderCachePathMax];
     const char* used;
     bool blockReadable;
+    // Whether the substituted path is a directory this app can actually
+    // create. DXMT creates it too, so this is not what makes the call work --
+    // it is what keeps a bad substitution from being mistaken for Metal
+    // refusing a good one, which is the reading the log has to support.
+    bool directoryReady;
 };
 
 // A NUL-terminated string named by a guest pointer inside a parameter block,
@@ -4238,6 +4451,7 @@ static void boxedwineDxmtBeginShaderCachePath64(
     witness.requested[0] = 0;
     witness.used = nullptr;
     witness.blockReadable = false;
+    witness.directoryReady = false;
     if (!cpu || !cpu->memory) {
         return;
     }
@@ -4256,6 +4470,9 @@ static void boxedwineDxmtBeginShaderCachePath64(
         // Already absolute: DXMT's resolver will use it unchanged, and
         // whoever chose it knew more than this does.
         witness.used = witness.requested;
+#if defined(BOXEDWINE_IOS)
+        witness.directoryReady = BVNPathEnsureDirectory(witness.requested);
+#endif
         return;
     }
 #if defined(BOXEDWINE_IOS)
@@ -4296,6 +4513,13 @@ static void boxedwineDxmtBeginShaderCachePath64(
         }
     }
     witness.used = absolute;
+    // Not what makes the call succeed: DXMT's resolver creates this directory
+    // itself, absolute or not. It is a check that the path this side invented
+    // is one the app can create at all -- BVNPathCaches() makes only its own
+    // root, and the dxmt/<exe>/com.apple.metal tree under it has never been
+    // made before -- so a substitution that could never work is distinguished
+    // in the log from a Metal that refused a perfectly good path.
+    witness.directoryReady = BVNPathEnsureDirectory(absolute);
     block->path = boxedwine_dxmt_tag_host_pointer((U64)(uintptr_t)absolute);
 #endif
 }
@@ -4311,9 +4535,10 @@ static void boxedwineDxmtEndShaderCachePath64(
         accepted = block->retSuccess;
     }
     klog_fmt("BOXEDWINE_DXMT_SHADER_CACHE requested='%s' used='%s' "
-             "accepted=%llu status=%d",
+             "directory=%d accepted=%llu status=%d",
              witness.requested[0] ? witness.requested : "(unreadable)",
              witness.used ? witness.used : "(unchanged)",
+             witness.directoryReady ? 1 : 0,
              (unsigned long long)accepted, status);
 }
 #endif  // BOXEDWINE_DXMT_NATIVE
@@ -4421,12 +4646,13 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         gDxmtRecentCalls[slot].tid = cpu && cpu->thread ? cpu->thread->id : 0;
         gDxmtRecentCalls[slot].ordinal = logOrdinal;
     }
-    // Three stores, not a 512-byte zero fill: this runs on the per-frame
+    // Four stores, not a 512-byte zero fill: this runs on the per-frame
     // path, and only the shader-cache call ever fills the buffer.
     DxmtShaderCachePathWitness cachePath;
     cachePath.requested[0] = 0;
     cachePath.used = nullptr;
     cachePath.blockReadable = false;
+    cachePath.directoryReady = false;
     const bool isShaderCachePath =
         callIndex == kDxmtUnixCallSetMetalShaderCachePath;
     if (isShaderCachePath) {

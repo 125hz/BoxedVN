@@ -40,6 +40,14 @@
 #define K_GUEST_WINE_C_LINK "c:"
 #define K_GUEST_WINE_WINDOWS "windows"
 #define K_GUEST_WINE_SYSTEM32 "system32"
+// Where Wine looks for a side-by-side assembly before it looks anywhere else.
+// ntdll's lookup_winsxs builds <windows dir>\winsxs\manifests and searches it
+// with a wildcard on the assembly's identity; only when that finds nothing does
+// lookup_assembly fall through to the private-assembly probes beside the
+// program. Wine creates this tree during wineboot's fake-DLL install, which
+// this lane does not get, so the launch projects a staged one in the same way
+// it projects system32. See K_X64_GUEST_WINSXS_DIR.
+#define K_GUEST_WINE_WINSXS "winsxs"
 // Wine keeps its kernel drivers one level below system32, and the service
 // entries wine.inf writes name them there: the mount manager's is
 // ServiceBinary="%11%\drivers\mountmgr.sys". The packaged builtin tree is
@@ -175,6 +183,14 @@ inline std::string guestWineSystem32Path(const std::string& prefix) {
 
 inline std::string guestWineDriversPath(const std::string& prefix) {
     return guestWineSystem32Path(prefix) + "/" + K_GUEST_WINE_DRIVERS;
+}
+
+// The side-by-side assembly store, beside system32 rather than inside it:
+// lookup_winsxs builds its path from the windows directory, not the system
+// directory, and a tree under system32 would never be looked at.
+inline std::string guestWineWinsxsPath(const std::string& prefix) {
+    return guestWineDriveCPath(prefix) + "/" + K_GUEST_WINE_WINDOWS + "/" +
+           K_GUEST_WINE_WINSXS;
 }
 
 // True for a packaged builtin that belongs in system32\drivers. Wine names a

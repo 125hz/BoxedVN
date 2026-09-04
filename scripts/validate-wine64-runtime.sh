@@ -644,6 +644,55 @@ done
 check_zip_guest_link "${PE32_ARCHIVE}" usr/lib/wine/i386-windows \
     "/${PE32_DIR}"
 
+# Wine's side-by-side assemblies.
+#
+# Wine ships no winsxs tree; a real prefix gets one from wineboot's fake-DLL
+# install, which writes a manifest per builtin carrying an RT_MANIFEST resource
+# named WINE_MANIFEST (dlls/setupapi/fakedll.c). This lane never gets that pass,
+# so the staged tree is the only winsxs a prefix will ever see -- and its
+# absence is silent from the guest side: ntdll's lookup_winsxs simply finds
+# nothing, lookup_assembly falls through to the private-assembly probes beside
+# the program, and parse_depend_manifests fails the whole activation context
+# with STATUS_SXS_CANT_GEN_ACTCTX. A program requiring common controls version
+# 6 then loads version 5 and nothing anywhere says so.
+#
+# Checked by name and not by count for the same reason the 32-bit import chain
+# is: a tree holding every assembly except the one a manifest names passes any
+# count.
+WINSXS_DIR=usr/lib/boxedwine64-winsxs
+WINSXS_MANIFEST_DIR="${WINSXS_DIR}/manifests"
+check_zip_winsxs_assembly() {
+    local archive="$1"
+    local prefix="$2"
+    local description="$3"
+    local matches
+    matches="$(unzip -Z1 "${archive}" 2>/dev/null | sed 's#^\./##' \
+        | awk -v prefix="${prefix}" \
+            'index($0, prefix) == 1 && substr($0, length($0) - 8) == ".manifest" { count++ } END { print count + 0 }')"
+    (( matches > 0 )) \
+        || die "'$(basename "${archive}")' carries no ${description} side-by-side manifest under ${WINSXS_MANIFEST_DIR}.\nWithout it every activation context naming that assembly fails, and the program silently gets the version 5 common controls."
+    ok "$(basename "${archive}"): ${matches} ${description} side-by-side manifest(s)"
+}
+WINSXS_COMMON_CONTROLS=microsoft.windows.common-controls
+check_zip_winsxs_assembly "${WINE_ARCHIVE}" \
+    "${WINSXS_MANIFEST_DIR}/amd64_${WINSXS_COMMON_CONTROLS}_" \
+    "64-bit ${WINSXS_COMMON_CONTROLS}"
+check_zip_winsxs_assembly "${PE32_ARCHIVE}" \
+    "${WINSXS_MANIFEST_DIR}/x86_${WINSXS_COMMON_CONTROLS}_" \
+    "32-bit ${WINSXS_COMMON_CONTROLS}"
+# The assembly directory the manifest's identity resolves to. Wine's
+# find_actctx_dll builds windows\winsxs\<stem>\<dll> from it, so a manifest
+# with no directory beside it redirects the load to a path that does not
+# exist -- which is worse than no activation context at all.
+for winsxs_archive in "${WINE_ARCHIVE}" "${PE32_ARCHIVE}"; do
+    winsxs_dir_count="$(unzip -Z1 "${winsxs_archive}" 2>/dev/null | sed 's#^\./##' \
+        | awk -v prefix="${WINSXS_DIR}/" -v manifests="${WINSXS_MANIFEST_DIR}/" \
+            'index($0, prefix) == 1 && index($0, manifests) != 1 && substr($0, length($0)) != "/" { count++ } END { print count + 0 }')"
+    (( winsxs_dir_count > 0 )) \
+        || die "'$(basename "${winsxs_archive}")' carries side-by-side manifests but no assembly directories under ${WINSXS_DIR}. A redirected load would resolve to a path that is not there."
+    ok "$(basename "${winsxs_archive}"): ${winsxs_dir_count} side-by-side assembly file(s)"
+done
+
 # The 32-bit DXVK override, staged beside the i386 builtins rather than over
 # them so a launch that does not ask for it is unchanged. d3d9.dll is the one
 # module the WoW64 Direct3D 9 lane needs; the rest ride along if the app

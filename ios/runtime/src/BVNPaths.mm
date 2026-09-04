@@ -188,6 +188,20 @@ extern "C" const char* BVNPathCaches(void) {
                               /*excludeFromBackup=*/false);
 }
 
+extern "C" bool BVNPathEnsureDirectory(const char* path) {
+    // Absolute only: a relative path would be created against whatever
+    // working directory the caller happens to have, which for a guest-driven
+    // caller is not a place this app owns.
+    if (path == nullptr || path[0] != '/') {
+        return false;
+    }
+    NSString* full = [NSString stringWithUTF8String:path];
+    if (full == nil) {
+        return false;
+    }
+    return ensureDirectory(full, /*excludeFromBackup=*/false) != nil;
+}
+
 extern "C" const char* BVNPathBundledRootFilesystemZip(void) {
     if (gBundledRootfs.resolved) {
         return gBundledRootfs.value.empty() ? nullptr

@@ -264,6 +264,12 @@ const char* BVNPathFonts(void);
 // Caches: regenerable data, safe for the system to purge.
 const char* BVNPathCaches(void);
 
+// Creates an absolute directory and every missing parent of it, and says
+// whether it exists afterwards. For a path handed to a framework that will
+// only accept a directory that is already there -- Metal's shader cache is
+// the one caller -- where the app, not the guest, has to make it.
+bool BVNPathEnsureDirectory(const char* path);
+
 // The pinned root filesystem archive that shipped in the app bundle, or NULL
 // when the build was made without one (see scripts/fetch-rootfs.sh and the
 // BOXEDVN_BUNDLE_ROOTFS build option).

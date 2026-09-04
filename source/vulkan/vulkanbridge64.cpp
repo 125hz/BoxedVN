@@ -2499,8 +2499,14 @@ VkInstance resolutionInstance(int index, const U64* args) {
     return gInstance;
 }
 
-S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
+// `tid` is the guest thread that made the call. It is carried in only so the
+// two swapchain witnesses can name it: an acquire and a present that come from
+// different threads is normal, an acquire from a thread that then leaves the
+// process is not, and neither statement could be made from a line that named
+// only the process.
+S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) {
     (void)count;
+    (void)tid;
     if (index == VKB_DestroyInstance &&
         !instanceIsLive((VkInstance)(uintptr_t)args[0])) {
         // Settled before resolution, because resolution would dereference the
@@ -3278,14 +3284,19 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         // to tell "the bridge lost the signal" from "the caller never came
         // back": which objects the acquire was asked to signal (either may be
         // null, and a null one must STAY null), the full 64-bit timeout, and
-        // the image index that goes back to the guest.
+        // the image index that goes back to the guest. It also names the
+        // calling thread, because the next question after "the acquire
+        // succeeded and no present followed" is "did the thread that acquired
+        // survive to present", and only a tid can answer that against the
+        // thread-exit witness.
         static std::atomic<U32> reported{0};
         const U32 seen = reported.fetch_add(1, std::memory_order_relaxed);
         if (seen < 8 || (seen % 60) == 0) {
-            klog_fmt("BOXEDWINE_X64_VULKAN_ACQUIRE n=%u swapchain=0x%llx "
+            klog_fmt("BOXEDWINE_X64_VULKAN_ACQUIRE n=%u tid=%04X "
+                     "swapchain=0x%llx "
                      "timeout=0x%llx semaphore=0x%llx fence=0x%llx "
                      "index=%u status=%d",
-                     seen, (unsigned long long)A(1),
+                     seen, tid, (unsigned long long)A(1),
                      (unsigned long long)A(2), (unsigned long long)A(3),
                      (unsigned long long)A(4),
                      (result == VK_SUCCESS && imageIndex) ? *imageIndex : 0xffffffffu,
@@ -3319,10 +3330,12 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
             // the acquire names them: the pair of lines is what says whether
             // the image an acquire handed the guest is the image the guest
             // presented, and whether it waited on the semaphore the acquire
-            // signalled.
-            klog_fmt("BOXEDWINE_X64_VULKAN_PRESENT frame=%u swapchains=%u "
+            // signalled. The thread is named for the same reason the acquire
+            // names it.
+            klog_fmt("BOXEDWINE_X64_VULKAN_PRESENT frame=%u tid=%04X "
+                     "swapchains=%u "
                      "index=%u waits=%u status=%d",
-                     presents, info ? info->swapchainCount : 0,
+                     presents, tid, info ? info->swapchainCount : 0,
                      (info && info->pImageIndices && info->swapchainCount)
                          ? info->pImageIndices[0] : 0xffffffffu,
                      info ? info->waitSemaphoreCount : 0, (int)result);
@@ -5030,12 +5043,25 @@ U64 vulkanBridge64Capabilities(CPU64* cpu) {
     return capabilities;
 }
 
+const char* vulkanBridge64CommandName(U32 callPlusOne) {
+#ifdef BOXEDWINE_VULKAN
+    if (!callPlusOne || callPlusOne > (U32)VKB_COUNT) {
+        return nullptr;
+    }
+    return kCommandName[callPlusOne - 1];
+#else
+    (void)callPlusOne;
+    return nullptr;
+#endif
+}
+
 U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
     if (!cpu || !cpu->memory || !cpu->thread || !cpu->thread->process) {
         return (U64)(S64)BOXEDWINE_X64_VK_E_FAULT;
     }
     KMemory64* memory = cpu->memory;
     const U32 pid = (U32)cpu->thread->process->id;
+    const U32 tid = (U32)cpu->thread->id;
     const U64 capabilities = vulkanBridge64Capabilities(cpu);
 
     if (count > BOXEDWINE_X64_VK_MAX_ARGS) {
@@ -5106,6 +5132,15 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
             return (U64)(S64)BOXEDWINE_X64_VK_E_BADOP;
         }
         name = kCommandName[index];
+        // Recorded on the thread before the call, and never cleared. This is
+        // what lets a witness fired somewhere else entirely -- the thread-exit
+        // marker in sys_exit64 -- say that the thread that just left the
+        // process was the one that had been driving Vulkan, which no line
+        // printed from inside this file can say about a thread that is gone.
+        cpu->thread->diagnosticVulkanBridgeCall.store(
+            (U32)index + 1, std::memory_order_relaxed);
+        cpu->thread->diagnosticVulkanBridgeCalls.fetch_add(
+            1, std::memory_order_relaxed);
         if (!(capabilities & BOXEDWINE_X64_VK_CAP_IDENTITY_MEMORY)) {
             // The DXMT rule: a forked child has a sparse KMemory64 and cannot
             // hold a host Vulkan handle. Refuse by name rather than fault
@@ -5127,7 +5162,7 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
             // One marshal per dispatch. It owns the shadows the driver was
             // given and the write-backs the guest is owed; both end here.
             Marshal marshal(memory, name);
-            result = dispatchCommand(index, marshal, args, count);
+            result = dispatchCommand(index, marshal, args, count, tid);
             if (marshal.ok()) {
                 marshal.flush();
             }
@@ -5137,9 +5172,9 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
         const U32 named = gNamedCalls.fetch_add(1, std::memory_order_relaxed);
         if (result < 0 ||
             (seen < kPerCommandBudget && named < kNamedCallCeiling)) {
-            klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=%s pid=%u args=%llu "
-                     "status=%lld seen=%u",
-                     name, pid, (unsigned long long)count,
+            klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=%s pid=%u tid=%04X "
+                     "args=%llu status=%lld seen=%u",
+                     name, pid, tid, (unsigned long long)count,
                      (long long)result, seen + 1);
         }
         writeBack = false; // the marshal wrote the results back itself

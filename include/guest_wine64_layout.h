@@ -235,6 +235,52 @@
      "win32u.dll", "opengl32.dll", "wined3d.dll", "d3d9.dll", "zlib1.dll", \
      "libgcc_s_dw2-1.dll"}
 
+// The side-by-side assemblies, staged apart from the module trees.
+//
+// Wine ships no winsxs tree and wine.inf never mentions one. A real prefix
+// gets its winsxs from wineboot's fake-DLL install: install_fake_dll calls
+// register_fake_dll for every builtin it copies into the prefix, and that
+// enumerates the module's RT_MANIFEST resources and writes
+// windows\winsxs\manifests\<arch>_<name>_<key>_<version>_<lang>_deadbeef.manifest
+// plus windows\winsxs\<same stem>\<file> for each one whose resource NAME
+// begins with WINE_MANIFEST (dlls/setupapi/fakedll.c).
+//
+// On this lane that pass produces nothing: the prefix's system32 is the
+// in-memory projection below rather than a directory wineboot filled in, and a
+// device run recorded system32 left empty by a wineboot that exited 0. The
+// consequence is not a missing file anyone reports. ntdll's lookup_winsxs is
+// the FIRST thing lookup_assembly tries, so an empty winsxs sends the loader
+// on to the private-assembly probes -- <appdir>\<name>.dll,
+// <appdir>\<name>.manifest and the two <name>\<name> forms -- and when those
+// miss, parse_depend_manifests fails the whole activation context with
+// STATUS_SXS_CANT_GEN_ACTCTX. A program whose manifest requires
+// Microsoft.Windows.Common-Controls 6.0 then runs with no activation context
+// and gets the version 5 common controls, whose structures and behaviours are
+// not the ones it was built against.
+//
+// scripts/stage-wine64-sxs-assemblies.py performs the same derivation at
+// packaging time, from the same source of truth -- the packaged modules' own
+// WINE_MANIFEST resources -- and stages it here; the launch projects it into
+// the prefix the way it projects system32. Staged in a directory of its own
+// rather than under the module root because Wine appends an architecture
+// directory to every module root it searches, and the 32-bit half ships in the
+// separate PE32 archive at the same guest path, so the two merge in the guest.
+#define K_X64_GUEST_WINSXS_DIR "/usr/lib/boxedwine64-winsxs"
+#define K_X64_GUEST_WINSXS_MANIFEST_SUBDIR "manifests"
+#define K_X64_GUEST_WINSXS_MANIFEST_DIR \
+    K_X64_GUEST_WINSXS_DIR "/" K_X64_GUEST_WINSXS_MANIFEST_SUBDIR
+// The suffix Wine gives every manifest it writes, and the trailer it appends
+// to the stem. lookup_manifest_file reads the trailer back to tell a
+// Wine-provided assembly from one an installer put in the same directory.
+#define K_X64_SXS_MANIFEST_SUFFIX ".manifest"
+#define K_X64_SXS_ASSEMBLY_TRAILER "deadbeef"
+// The assembly whose absence is the failure this staging exists to prevent,
+// and the two architecture tokens Wine substitutes for an empty
+// processorArchitecture (current_arch in fakedll.c).
+#define K_X64_SXS_REQUIRED_ASSEMBLY "Microsoft.Windows.Common-Controls"
+#define K_X64_SXS_ARCH_64 "amd64"
+#define K_X64_SXS_ARCH_32 "x86"
+
 // The builtin whose absence is the failure this layout exists to prevent. It
 // is the first PE module Wine loads after the server handshake, so a guest
 // that cannot see this file gets as far as Windows code and no further.

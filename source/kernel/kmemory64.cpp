@@ -870,6 +870,45 @@ U32 KMemory64::nativeHostPageProtLocked(U64 hostPageStart, U64 hostPageSize,
     return unionProt;
 }
 
+// The nearest READABLE guest page either side of a faulting one. A refusal
+// says the guest was not entitled to the address; this says what it WAS
+// entitled to nearby, which is the fact that separates the two ways a program
+// reaches such an address.
+//
+// A loop walking a buffer off its end faults on the first page past it, so the
+// last readable page below the fault ends exactly where the buffer ends and
+// `committedBelow` names that boundary -- the size of the object the guest
+// overran, computed from its own base. A pointer that never pointed at
+// anything has no readable page below it at all within the window.
+//
+// `committedAbove` closes the other case: a small hole with committed memory
+// on both sides is a page whose rights were lost, which is this file's own
+// failure mode; a hole that runs to the end of the window is address space the
+// guest genuinely has not committed.
+void KMemory64::nativeCommittedNeighbourhoodLocked(
+    U64 guestPageNumber, K64NativeFaultRepair& report) const {
+    report.committedBelow = 0;
+    report.committedAbove = 0;
+    for (U64 step = 1; step <= K64_FAULT_NEIGHBOURHOOD_PAGES; step++) {
+        if (step > guestPageNumber) break;
+        auto it = pages.find(guestPageNumber - step);
+        if (it == pages.end()) continue;
+        if (!(it->second->flags & K64_PAGE_MAPPED)) continue;
+        if (!(it->second->flags & K64_PAGE_READ)) continue;
+        // The first address past the last page the guest could read.
+        report.committedBelow = (guestPageNumber - step + 1) << K64_PAGE_SHIFT;
+        break;
+    }
+    for (U64 step = 1; step <= K64_FAULT_NEIGHBOURHOOD_PAGES; step++) {
+        auto it = pages.find(guestPageNumber + step);
+        if (it == pages.end()) continue;
+        if (!(it->second->flags & K64_PAGE_MAPPED)) continue;
+        if (!(it->second->flags & K64_PAGE_READ)) continue;
+        report.committedAbove = (guestPageNumber + step) << K64_PAGE_SHIFT;
+        break;
+    }
+}
+
 // Bring the host VM back into agreement with the page map over [hostStart,
 // hostEnd), one host page at a time and in BOTH directions: a host page whose
 // guest subpages all lost their rights becomes PROT_NONE, which is what makes
@@ -1259,6 +1298,7 @@ bool KMemory64::nativeRepairHostFault(U64 hostFaultAddress, U32 requiredProt,
     // host page has none is a reservation the guest has genuinely not
     // committed. The witness could not tell those apart before.
     bool backedAtAlias = false;
+    bool entitled = false;
     U32 unionProt = 0;
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
@@ -1266,6 +1306,7 @@ bool KMemory64::nativeRepairHostFault(U64 hostFaultAddress, U32 requiredProt,
         if (it == pages.end() || !(it->second->flags & K64_PAGE_MAPPED)) {
             // The guest never mapped this page. A real access violation, and
             // the guest has to see it as one.
+            nativeCommittedNeighbourhoodLocked(guestPageNumber, report);
             report.decision = "guest-unmapped";
             return false;
         }
@@ -1278,18 +1319,30 @@ bool KMemory64::nativeRepairHostFault(U64 hostFaultAddress, U32 requiredProt,
         report.lastWriter = k64PageWriterName(it->second->lastWriter);
         report.lastWriteFlags = it->second->lastFlags;
         report.lastWriteStamp = it->second->lastWriteStamp;
+        // And the write before the last CHANGE, which is the only thing that
+        // says whether these rights were ever anything else.
+        report.priorWriter = k64PageWriterName(it->second->priorWriter);
+        report.priorWriteFlags = it->second->priorFlags;
+        report.priorWriteStamp = it->second->priorWriteStamp;
         backedAtAlias = it->second->dataNative &&
                         it->second->hostData() ==
                             (U8*)(uintptr_t)k64GuestToHostAddress(guestPageAddress);
         unionProt = nativeHostPageProtLocked(hostStart, hostPage,
                                              guestPageNumber, &report);
+        // Decided under the same lock that read the numbers it is decided
+        // from, so the refusal below and the neighbourhood scan that explains
+        // it can never disagree about which case this is.
+        entitled = report.guestProt != 0 &&
+                   (report.guestProt & requiredProt) == requiredProt &&
+                   (unionProt & requiredProt) == requiredProt;
+        if (!entitled) {
+            nativeCommittedNeighbourhoodLocked(guestPageNumber, report);
+        }
     }
     report.hostPageStart = hostStart;
     report.hostPageLength = hostPage;
     report.hostPageProt = unionProt;
-    if (report.guestProt == 0 ||
-        (report.guestProt & requiredProt) != requiredProt ||
-        (unionProt & requiredProt) != requiredProt) {
+    if (!entitled) {
         // Mapped, but the guest itself revoked access. Also a real access
         // violation.
         report.decision = "guest-protected";

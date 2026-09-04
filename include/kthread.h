@@ -199,6 +199,19 @@ public:
     // is stored rather than a string because the watchdog reads this from
     // another thread, and a shared name buffer would be a data race.
     std::atomic<U32> diagnosticVulkanCall{0};
+    // The 64-bit lane's counterpart, and it answers a different question. The
+    // field above names the call a thread is INSIDE, for a watchdog sampling a
+    // live process, and is cleared on the way out. This one is never cleared:
+    // it names the last Vulkan command the thread dispatched over the bridge,
+    // so a thread that has already left the bridge - or left the process - can
+    // still be identified as the one that was driving the graphics. A device
+    // capture ended with a successful vkAcquireNextImageKHR, four threads
+    // parked in futex waits owed no wake, and a fifth thread exiting; nothing
+    // on record said whether the thread that left was the one that had
+    // acquired, and those are opposite diagnoses. Biased by one, so zero means
+    // this thread never reached the bridge at all.
+    std::atomic<U32> diagnosticVulkanBridgeCall{0};
+    std::atomic<U64> diagnosticVulkanBridgeCalls{0};
     // Guest memory faults serviced for this thread. A fault that cannot be
     // resolved is retried on the same instruction, so the thread stays
     // RUNNABLE, executes no new dispatches, and never updates its EIP - the

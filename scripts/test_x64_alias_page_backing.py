@@ -81,6 +81,39 @@ and for its most recently written neighbour in the same host page -- which is
 what separates "the whole host page was never committed" from "this 4 KiB page
 lost rights its neighbours kept".
 
+That mprotect fix is in, and the run after it refused guest 0xd88000 with the
+provenance printed:
+
+    BOXEDWINE_X64_ALIAS_BACKING ... guest=0xd88000 mapped=1 guest_prot=0x0
+        host_present=0 tracked=0 last_op=mmap-anon last_flags=0x20 last_seq=6226
+        nb_op=mmap-anon nb_flags=0x20 nb_seq=6226 decision=guest-protected
+
+This time the refusal is right, and three independent facts say so. The page's
+rights were last written by the anonymous PROT_NONE mmap that created it, with
+the same stamp as its neighbour, so no mprotect ever named it. The syscall tail
+contains no mmap, mprotect or madvise anywhere inside it; the nearest memory
+calls are mmap(0xed0000, 0x910000, PROT_NONE, MAP_FIXED) and
+mprotect(0xed0000, 0x910000, PROT_READ|PROT_WRITE), which we answered with
+0xed0000 and 0 -- a region 0x148000 bytes ABOVE the fault, and both of them
+completed before the fault rather than in response to it. And Wine's own views
+tree, which is a ledger we do not write, reached the same verdict: its handler
+committed nothing and the process terminated with 0xc0000005 in a 32-bit
+word-copy loop (rax=0xd88000, rcx=0xff14c8, edx on the stack), which is what
+Wine does for an address no view of its owns.
+
+So the guest read memory it never committed, on a wild or overrun pointer, and
+the defect is upstream of this file. What the witness still could not say is
+which of those two it was, and the answer decides where to look next. Two
+things were missing, and both are now recorded. A page remembers the write
+BEFORE the last one that changed its flags: Wine restores a freed view by
+re-mmapping it PROT_NONE over the reserved arena, so a never-used reservation
+and a use-after-free of a committed block are the same last_op with the same
+last_flags, and only the prior write separates them. And a refused fault names
+the nearest readable page either side of itself, bounded, so a cursor that
+walked off the end of a real buffer -- which ends exactly where the readable
+pages below it stop -- is distinguishable from a pointer that never addressed
+anything at all.
+
 These tests hold both halves in place: the page map stays the authority, the
 repair never grants more than the page map grants, the retry is bounded, the
 witness that will identify the producing ledger keeps printing every fact
@@ -607,7 +640,12 @@ class AReservationIsAMappedPageWithNoRights(unittest.TestCase):
         # page fault is what makes the refusal usable.
         body = function_body(
             self.source, "bool KMemory64::nativeRepairHostFault(")
-        self.assertIn("if (report.guestProt == 0 ||", body)
+        # The entitlement is decided under the same lock that read the page,
+        # and the refusal is that decision rather than a second reading of it.
+        self.assertIn("entitled = report.guestProt != 0 &&", body)
+        self.assertIn("(report.guestProt & requiredProt) == requiredProt &&", body)
+        self.assertIn("(unionProt & requiredProt) == requiredProt;", body)
+        self.assertIn("if (!entitled) {", body)
         self.assertIn('report.decision = "guest-protected"', body)
 
 
@@ -809,6 +847,141 @@ class ThePageRemembersWhoWroteItsRights(unittest.TestCase):
             "static bool repairGuestLaneHostFault(", 1)[1]
         self.assertIn("gAliasBackingReports.fetch_add(1, std::memory_order_relaxed) < 64",
                       body)
+
+    def test_the_page_also_remembers_the_write_before_the_last_change(self) -> None:
+        # Without this, lastWriter answers the wrong question. A page reserved
+        # PROT_NONE and never used, and a page the guest committed and then
+        # freed back into the reservation, both read
+        # last_op=mmap-anon last_flags=0x20: Wine restores a freed view by
+        # re-mmapping it PROT_NONE over the reserved arena, which is the same
+        # producer writing the same value. Only the write before the last
+        # change separates a wild pointer from a use-after-free.
+        struct = self.header.split("struct K64Page {", 1)[1].split("\n};", 1)[0]
+        for field in ("U8  priorWriter", "U8  priorFlags",
+                      "U16 priorWriteStamp"):
+            self.assertIn(field, struct)
+        # And it only shifts on a write that CHANGES the value, so re-reserving
+        # an already reserved page cannot erase the commit that came before.
+        write = self.header.split(
+            "void writeFlags(U32 value, U8 writer, U16 stamp) {", 1)[1]
+        write = write.split("\n    }", 1)[0]
+        self.assertIn("if (value != flags) {", write)
+        self.assertIn("priorWriter = lastWriter;", write)
+        self.assertIn("priorFlags = lastFlags;", write)
+        self.assertIn("priorWriteStamp = lastWriteStamp;", write)
+
+    def test_the_prior_write_reaches_the_witness(self) -> None:
+        struct = self.header.split("struct K64NativeFaultRepair {", 1)[1]
+        struct = struct.split("};", 1)[0]
+        for field in ("priorWriter", "priorWriteFlags", "priorWriteStamp"):
+            self.assertIn(field, struct)
+        body = function_body(
+            self.source, "bool KMemory64::nativeRepairHostFault(")
+        record = body.index("report.priorWriter = k64PageWriterName(")
+        refusal = body.index('report.decision = "guest-protected"')
+        self.assertLess(record, refusal, "the refusal must carry the prior write")
+        line = self.adapter.split(WITNESS, 1)[1].split(");", 1)[0]
+        for field in ("prior_op=%s", "prior_flags=0x%x", "prior_seq=%u"):
+            self.assertIn(field, line)
+
+
+class ARefusedFaultNamesTheMemoryAroundIt(unittest.TestCase):
+    """The remaining question a refusal cannot answer on its own.
+
+    The device run at revision 957383ad refused guest 0xd88000 correctly: the
+    page carried K64_PAGE_MAPPED and nothing else, its last writer was the
+    anonymous PROT_NONE mmap that created it, and Wine -- whose own views tree
+    is an independent ledger -- agreed, raising STATUS_ACCESS_VIOLATION and
+    terminating with 0xc0000005 rather than committing anything. The syscall
+    tail names no mmap, mprotect or madvise inside that page at all; the
+    nearest are mmap(0xed0000, 0x910000, PROT_NONE) and
+    mprotect(0xed0000, 0x910000, PROT_READ|PROT_WRITE), 0x148000 bytes above
+    it, which we answered with the address asked for and 0.
+
+    So the guest read memory it never committed and the refusal was right. What
+    the witness could not say is HOW the guest got there, and the two shapes
+    have different culprits: a cursor that walked off the end of a real buffer
+    (the last readable page below the fault ends exactly at that buffer's end),
+    versus a pointer that never addressed anything (nothing readable either
+    way). The bounded scan below is what will tell them apart, and it runs only
+    on a refusal -- the run repaired 3752 faults successfully before this one,
+    and none of them may pay for it.
+    """
+
+    def setUp(self) -> None:
+        self.header = read(KMEMORY_HEADER)
+        self.source = read(KMEMORY_SOURCE)
+        self.adapter = read(ADAPTER)
+        self.body = function_body(
+            self.source, "void KMemory64::nativeCommittedNeighbourhoodLocked(")
+
+    def test_the_scan_is_bounded_in_both_directions(self) -> None:
+        match = re.search(r"^#define K64_FAULT_NEIGHBOURHOOD_PAGES\s+(\d+)",
+                          self.header, re.M)
+        self.assertIsNotNone(match)
+        self.assertLessEqual(int(match.group(1)), 4096,
+                             "the scan runs in a signal handler")
+        self.assertEqual(
+            self.body.count("step <= K64_FAULT_NEIGHBOURHOOD_PAGES"), 2,
+            "both directions must be bounded")
+        # And it never walks below page zero.
+        self.assertIn("if (step > guestPageNumber) break;", self.body)
+
+    def test_only_a_readable_page_counts_as_committed(self) -> None:
+        # A page that is mapped with no rights is part of the same reservation
+        # the fault is in; counting it would report the hole as zero pages wide
+        # and hide the very distinction the scan exists to draw.
+        self.assertEqual(self.body.count("K64_PAGE_MAPPED"), 2)
+        self.assertEqual(self.body.count("K64_PAGE_READ"), 2)
+
+    def test_the_boundary_below_is_the_first_unreadable_address(self) -> None:
+        # committedBelow is the END of the object the guest overran, not the
+        # base of its last page: a loop that walked off a buffer stops exactly
+        # there, and the buffer's size follows from its own base.
+        self.assertIn(
+            "report.committedBelow = (guestPageNumber - step + 1) << K64_PAGE_SHIFT;",
+            self.body)
+        self.assertIn(
+            "report.committedAbove = (guestPageNumber + step) << K64_PAGE_SHIFT;",
+            self.body)
+
+    def test_only_a_refusal_pays_for_the_scan(self) -> None:
+        # Every repaired fault would otherwise cost two thousand map lookups.
+        repair = function_body(
+            self.source, "bool KMemory64::nativeRepairHostFault(")
+        self.assertEqual(
+            repair.count("nativeCommittedNeighbourhoodLocked(guestPageNumber, report)"),
+            2, "exactly the two page-map refusals scan")
+        unmapped = repair.index('report.decision = "guest-unmapped"')
+        scan = repair.index(
+            "nativeCommittedNeighbourhoodLocked(guestPageNumber, report)")
+        self.assertLess(scan, unmapped)
+        # The successful path must not reach it at all: the scan sits behind
+        # the entitlement decision.
+        self.assertIn("if (!entitled) {\n            nativeCommittedNeighbourhoodLocked(",
+                      repair)
+
+    def test_the_scan_runs_under_the_lock_that_owns_the_page_map(self) -> None:
+        # It reads `pages` directly, and nativeRepairHostFault calls it from
+        # inside its own pagesMutex section rather than taking the lock twice.
+        declaration = self.header.split(
+            "void nativeCommittedNeighbourhoodLocked(", 1)[0]
+        self.assertIn("Caller holds pagesMutex.", declaration[-600:])
+        self.assertNotIn("BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX", self.body)
+
+    def test_the_witness_prints_both_boundaries(self) -> None:
+        struct = self.header.split("struct K64NativeFaultRepair {", 1)[1]
+        struct = struct.split("};", 1)[0]
+        for field in ("committedBelow", "committedAbove"):
+            self.assertIn(field, struct)
+        line = self.adapter.split(WITNESS, 1)[1].split(");", 1)[0]
+        for field in ("commit_below=0x%llx", "commit_above=0x%llx"):
+            self.assertIn(field, line)
+
+
+class TheHostReprotectWitnessIsBounded(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source = read(KMEMORY_SOURCE)
 
     def test_the_volume_of_the_new_host_witness_is_bounded_too(self) -> None:
         reconcile = function_body(

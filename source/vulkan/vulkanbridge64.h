@@ -33,4 +33,11 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count);
 // serve Vulkan at all.
 U64 vulkanBridge64Capabilities(CPU64* cpu);
 
+// The command name behind a KThread::diagnosticVulkanBridgeCall value: the
+// dispatch index biased by one, so zero means the thread never called the
+// bridge. Returns nullptr when the value names no command, which is how a
+// caller outside this file reports "this thread did no Vulkan" without
+// knowing anything about the command table.
+const char* vulkanBridge64CommandName(U32 callPlusOne);
+
 #endif

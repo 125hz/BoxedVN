@@ -58,6 +58,35 @@ DXVK_I386_OPTIONAL_MODULES=(dxgi.dll d3d11.dll d3d10core.dll)
 WINE_MODULE_ROOT="/usr/lib/x86_64-linux-gnu/wine"
 # Defined after the root it hangs off: the i386 DXVK staging directory.
 DXVK_I386_GUEST_DIR="${WINE_MODULE_ROOT}/dxvk-i386"
+# Wine's side-by-side assemblies, staged in a directory of their own.
+#
+# Wine ships no winsxs tree and wine.inf never mentions one: the tree in a real
+# prefix is a by-product of wineboot's fake-DLL install, which calls
+# register_fake_dll for every builtin it copies into the prefix and writes
+# windows\winsxs\manifests\<arch>_<name>_<key>_<version>_<lang>_deadbeef.manifest
+# for each module carrying an RT_MANIFEST resource NAMED WINE_MANIFEST
+# (dlls/setupapi/fakedll.c). This lane never gets that pass -- the prefix's
+# system32 is an in-memory projection of the packaged tree rather than a
+# directory wineboot filled in, and a device run recorded system32 still empty
+# after a wineboot that exited 0 -- so the winsxs half is missing with it.
+#
+# Nothing reports that. ntdll's lookup_winsxs is the FIRST thing
+# lookup_assembly tries; an empty winsxs sends the loader on to the
+# private-assembly probes beside the program, and when those miss too
+# parse_depend_manifests fails the entire activation context with
+# STATUS_SXS_CANT_GEN_ACTCTX. A program whose manifest requires
+# Microsoft.Windows.Common-Controls 6.0 then runs with no activation context at
+# all and reaches the version 5 common controls instead, which is a different
+# set of structure sizes and behaviours from the ones it was built against.
+#
+# The staging is the same derivation from the same source of truth: the
+# packaged modules' own WINE_MANIFEST resources. A hand-written tree would
+# drift from the Wine build the layer carries; this one cannot.
+WINSXS_GUEST_DIR="/usr/lib/boxedwine64-winsxs"
+WINSXS_STAGER="${BOXEDVN_SCRIPT_DIR}/stage-wine64-sxs-assemblies.py"
+# The assembly the gate is on. Every other assembly the tree registers rides
+# along; this is the one whose absence has been seen to matter.
+WINSXS_REQUIRED_ASSEMBLY="Microsoft.Windows.Common-Controls"
 # The 32-bit PE builtin tree for new WoW64, extracted from the SAME libwine
 # version's i386 package by the caller. Ubuntu's wine64 package ships only the
 # 64-bit trees; the i386 package's i386-unix tree is the OLD WoW64 (it needs
@@ -556,6 +585,65 @@ if [[ -n "${I386_PE_DIR}" ]]; then
     done
 fi
 
+# ---- Side-by-side assemblies ----------------------------------------------
+#
+# See WINSXS_GUEST_DIR above for why this exists at all. Each architecture is
+# staged into the archive that carries its module tree: a manifest in wine64.zip
+# whose assembly directory links into the i386 tree would dangle whenever the
+# PE32 archive is not mounted, which is the same argument the loader links make.
+# Both land at the same guest path, so the guest sees one merged tree.
+require_file "${WINSXS_STAGER}" \
+    "The side-by-side assembly stager is part of this repository; a checkout missing it cannot produce a prefix that activates common controls."
+WINSXS_MANIFEST_SUBDIR="manifests"
+stage_sxs_assemblies() {
+    local pe_dir="$1" arch="$2" module_guest_dir="$3" stage_root="$4" label="$5"
+    local target="${stage_root}${WINSXS_GUEST_DIR}"
+    mkdir -p "${target}"
+    # The stager fails when the tree registers no required assembly. That is a
+    # build failure on purpose: the alternative is a runtime that looks
+    # complete and silently gives every program the version 5 common controls.
+    python3 "${WINSXS_STAGER}" \
+        --pe-dir "${pe_dir}" \
+        --arch "${arch}" \
+        --module-guest-dir "${module_guest_dir}" \
+        --stage-dir "${target}" \
+        --require "${WINSXS_REQUIRED_ASSEMBLY}" \
+        || die "Could not stage the ${label} side-by-side assemblies from '${pe_dir}'. Without them a prefix has no winsxs tree, ntdll's lookup_winsxs finds nothing, and every activation context that names an assembly fails with STATUS_SXS_CANT_GEN_ACTCTX -- which Wine reports as nothing at all."
+    local count
+    count="$(find "${target}/${WINSXS_MANIFEST_SUBDIR}" -type f -name '*.manifest' 2>/dev/null | wc -l | tr -d ' ')"
+    (( count > 0 )) \
+        || die "The staged ${label} side-by-side tree contains no manifests."
+    printf '%s\n' "${count}"
+}
+# The stem Wine gives the assembly this gate is on. Built here rather than
+# searched for by substring: the file name is <arch>_<name>_<key>_<version>_...
+# lowercased, so an architecture-qualified prefix is what distinguishes the
+# 64-bit registration from the 32-bit one.
+WINSXS_COMMON_CONTROLS_PREFIX_64="amd64_$(printf '%s' "${WINSXS_REQUIRED_ASSEMBLY}" | tr 'A-Z' 'a-z')_"
+WINSXS_COMMON_CONTROLS_PREFIX_32="x86_$(printf '%s' "${WINSXS_REQUIRED_ASSEMBLY}" | tr 'A-Z' 'a-z')_"
+WINSXS_MANIFEST_COUNT_64="$(stage_sxs_assemblies \
+    "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows" amd64 \
+    "${WINE_MODULE_ROOT}/x86_64-windows" "${STAGE}" "64-bit")"
+log "Side-by-side assemblies packaged: ${WINSXS_GUEST_DIR} (${WINSXS_MANIFEST_COUNT_64} amd64 manifests)"
+WINSXS_MANIFEST_COUNT_32=0
+if [[ -n "${I386_PE_DIR}" ]]; then
+    WINSXS_MANIFEST_COUNT_32="$(stage_sxs_assemblies \
+        "${PE32_STAGE}${I386_PE_GUEST_DIR}" x86 \
+        "${I386_PE_GUEST_DIR}" "${PE32_STAGE}" "32-bit")"
+    log "Side-by-side assemblies packaged: ${WINSXS_GUEST_DIR} (${WINSXS_MANIFEST_COUNT_32} x86 manifests)"
+fi
+# Named, not counted: the count alone would pass a tree that registered every
+# assembly except the one a program's manifest actually requires.
+find "${STAGE}${WINSXS_GUEST_DIR}/${WINSXS_MANIFEST_SUBDIR}" -maxdepth 1 -type f \
+    -name "${WINSXS_COMMON_CONTROLS_PREFIX_64}*.manifest" -print -quit | grep -q . \
+    || die "The staged 64-bit side-by-side tree has no ${WINSXS_REQUIRED_ASSEMBLY} manifest. A program whose application manifest requires version 6 of that assembly gets no activation context and loads the version 5 common controls instead -- a different set of structure sizes and control behaviours, and nothing in the guest reports the substitution."
+if [[ -n "${I386_PE_DIR}" ]]; then
+    find "${PE32_STAGE}${WINSXS_GUEST_DIR}/${WINSXS_MANIFEST_SUBDIR}" -maxdepth 1 \
+        -type f -name "${WINSXS_COMMON_CONTROLS_PREFIX_32}*.manifest" -print -quit \
+        | grep -q . \
+        || die "The staged 32-bit side-by-side tree has no ${WINSXS_REQUIRED_ASSEMBLY} manifest. The WoW64 lane's ntdll builds its own activation contexts and searches the same winsxs directory for an x86 assembly; without one, a 32-bit program requiring version 6 gets version 5."
+fi
+
 # The prebuilt 32-bit DXVK, staged beside the i386 builtins rather than over
 # them. Nothing projects it into a prefix unless the launch asks for it, so a
 # runtime carrying it behaves exactly as one that does not until
@@ -987,6 +1075,12 @@ sha256_file() {
         printf '%s_dll_sha256=%s\n' "${wow64_module}" \
             "$(sha256_file "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${wow64_module}.dll")"
     done
+    # The side-by-side half, recorded so a runtime assembled before this
+    # staging existed is distinguishable from one that has it. Zero here is
+    # exactly the shape that gives every program the version 5 common
+    # controls, and nothing downstream would otherwise say so.
+    printf 'winsxs_manifests_amd64=%s\n' "${WINSXS_MANIFEST_COUNT_64}"
+    printf 'winsxs_manifests_x86=%s\n' "${WINSXS_MANIFEST_COUNT_32}"
     if [[ -n "${DXMT_UNIXLIB}" ]]; then
         printf 'dxmt_unixlib_sha256=%s\n' "$(sha256_file "${DXMT_UNIXLIB}")"
     fi

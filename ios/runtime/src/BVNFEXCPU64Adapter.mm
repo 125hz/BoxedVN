@@ -440,12 +440,25 @@ static bool repairGuestLaneHostFault(BVNFEXCPU64Adapter* adapter, int signal,
         // host page. Together they separate the two failures that look
         // identical from the guest: a page whose whole host page was never
         // committed, and a page that lost rights its 16 KiB neighbours kept.
+        //
+        // prior_op / prior_flags are the write before the last CHANGE to the
+        // faulting page. A reservation the guest never used and a block the
+        // guest committed, freed, and had re-reserved under it both read
+        // last_op=mmap-anon last_flags=0x20; only the prior write says which,
+        // and only one of the two is a use-after-free.
+        //
+        // commit_below / commit_above bracket the refusal with the nearest
+        // memory the guest COULD read. A loop walking off the end of a buffer
+        // faults on the first page past it, so commit_below is that buffer's
+        // end; a pointer that never addressed anything has neither.
         klog_fmt("BOXEDWINE_X64_ALIAS_BACKING pid=%d tid=%d signal=%d "
                  "fault=0x%llx guest=0x%llx mapped=%d guest_prot=0x%x "
                  "host=[0x%llx,0x%llx) host_present=%d host_prot=0x%x "
                  "tracked=%d page_prot=0x%x materialised=%d reprotected=%d "
                  "last_op=%s last_flags=0x%x last_seq=%u "
                  "nb_op=%s nb_flags=0x%x nb_seq=%u "
+                 "prior_op=%s prior_flags=0x%x prior_seq=%u "
+                 "commit_below=0x%llx commit_above=0x%llx "
                  "host_pc=0x%llx decision=%s",
                  adapter->process ? adapter->process->id : -1,
                  adapter->thread ? adapter->thread->id : -1, signal,
@@ -462,6 +475,10 @@ static bool repairGuestLaneHostFault(BVNFEXCPU64Adapter* adapter, int signal,
                  (unsigned)report.lastWriteStamp,
                  report.neighbourWriter, (unsigned)report.neighbourWriteFlags,
                  (unsigned)report.neighbourWriteStamp,
+                 report.priorWriter, (unsigned)report.priorWriteFlags,
+                 (unsigned)report.priorWriteStamp,
+                 (unsigned long long)report.committedBelow,
+                 (unsigned long long)report.committedAbove,
                  (unsigned long long)hostPC, report.decision);
     }
 
