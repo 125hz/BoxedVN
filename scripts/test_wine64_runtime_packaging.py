@@ -167,6 +167,28 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+
+# The side-by-side tree the runtime builder stages from the PE modules. The
+# validator names the assembly rather than counting manifests, so a fixture
+# that registered some other assembly would not stand in for it.
+WINSXS_DIR = "usr/lib/boxedwine64-winsxs"
+WINSXS_COMMON_CONTROLS = "microsoft.windows.common-controls"
+
+
+def winsxs_stem(arch: str) -> str:
+    """<arch>_<name>_<key>_<version>_<lang>_deadbeef, as Wine spells it."""
+    return (arch + "_" + WINSXS_COMMON_CONTROLS
+            + "_6595b64144ccf1df_6.0.2600.2982_none_deadbeef")
+
+
+def write_winsxs(archive, arch: str, dll: str) -> None:
+    stem = winsxs_stem(arch)
+    archive.writestr(WINSXS_DIR + "/manifests/" + stem + ".manifest",
+                     b"<assembly/>")
+    archive.writestr(WINSXS_DIR + "/" + stem + "/" + dll,
+                     pe(body=dll.encode()))
+
+
 class WineserverPackagingContract(unittest.TestCase):
     """The builder must never package the shell wrapper as a guest binary."""
 
@@ -327,6 +349,7 @@ class WineserverArchiveValidation(unittest.TestCase):
                              pe(body=wow64_module.encode()))
         for nls in ("c_20127.nls", "locale.nls", "l_intl.nls"):
             archive.writestr(DATA_ROOT + "/nls/" + nls, b"nls:" + nls.encode())
+        write_winsxs(archive, "amd64", "comctl32.dll")
         for link, target in self.compatibility_links():
             archive.writestr(link + ".link", guest_link(target))
 
@@ -344,6 +367,7 @@ class WineserverArchiveValidation(unittest.TestCase):
                                  pe(machine=getattr(self, "_dxvk_machine",
                                                     PE32_MACHINE),
                                     body=b"dxvk:" + dxvk_module.encode()))
+            write_winsxs(archive, "x86", "comctl32.dll")
             archive.writestr("usr/lib/wine/i386-windows.link",
                              guest_link("/" + PE32_DIR))
 

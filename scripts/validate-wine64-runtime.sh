@@ -170,6 +170,11 @@ if [[ -n "${MANIFEST}" ]]; then
             x11_shim_libx11_sha256) MANIFEST_X11_SHIM_LIBX11_SHA256="${value}" ;;
             vulkan_shim_sha256) MANIFEST_VULKAN_SHIM_SHA256="${value}" ;;
             dxvk_i386_modules) MANIFEST_DXVK_I386_MODULES="${value}" ;;
+            # How many side-by-side manifests each architecture registered.
+            # Recorded rather than gated on here: the archive checks below
+            # name the assembly that has to be present, which a count cannot.
+            winsxs_manifests_amd64) MANIFEST_WINSXS_MANIFESTS_AMD64="${value}" ;;
+            winsxs_manifests_x86) MANIFEST_WINSXS_MANIFESTS_X86="${value}" ;;
             source)         MANIFEST_SOURCE="${value}" ;;
             source_image)   MANIFEST_SOURCE_IMAGE="${value}" ;;
             wine_address_contract) MANIFEST_WINE_ADDRESS_CONTRACT="${value}" ;;
