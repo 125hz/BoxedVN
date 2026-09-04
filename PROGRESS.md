@@ -7307,3 +7307,50 @@ Unknown sTypes are dropped rather than guessed, and nodes carrying guest
 callbacks (debug utils, debug report, memory report) are dropped by name.
 Thirteen commands were added for the Direct3D 9 bootstrap path; the ABI is
 version 3. Command-buffer recording is still absent, which is the next wall.
+
+## Direct3D 9 in the 32-bit lane reached the driver, and the bridge grew its
+## recording half
+
+With the pointer marshalling in, a 32-bit program loaded DXVK, found Wine's
+Vulkan entry point and called vkCreateInstance, which failed with
+VK_ERROR_EXTENSION_NOT_PRESENT. The 64-bit bridge forwarded extension names
+verbatim while the IA-32 lane has always translated them: Wine's winevulkan
+maps its own Win32 surface onto whatever platform surface the driver reports,
+and MoltenVK offers a Metal surface, not an X11 one. Enumeration now renames
+the host's platform surface to the X11 spelling (exactly one entry, never
+changing the count) and instance creation substitutes the Metal spelling back.
+
+Two defects surfaced with it. Instance-level commands resolved through a
+single remembered instance that vkDestroyInstance cleared inline, so every
+such command failed in the window between one instance dying and the next
+being created; there is now a liveness registry and each command resolves
+through its own instance. And the bridge's refusal codes shared the numeric
+range of VkResult, so a refusal reached the guest as a plausible driver
+error; they now live below the 32-bit floor and the guest ICD maps any of
+them to a single initialisation failure.
+
+The recording half followed: 205 commands, command pools and buffers,
+synchronisation, resources, descriptors, both render pass generations,
+graphics and compute pipelines with their full nests, and the vkCmd family
+DXVK emits. Two structures needed care. A descriptor write ignores two of its
+three array pointers depending on the descriptor type, and the ignored ones
+hold stale guest pointers in a reused scratch array, so they are nulled. And
+an update through a descriptor template carries no length, so the span is
+measured from the template's entries at creation and remembered.
+
+## Futex waiters are keyed the way Linux keys them
+
+A 32-bit program now creates its own window and then parks. The cause is not
+proven: the log ends two seconds after the stall detector fires, which cannot
+distinguish a long timeout from a permanent wait. What the investigation did
+prove is that pinning a page keeps its buffer alive but does not stop the
+shared-file mapping from being re-pointed, so a waiter that registered a host
+pointer and a waker that resolves one later could compare unequal and lose
+the wake. Private futexes are now keyed on the address space and the guest
+address, as the kernel keys them, and only shared futexes use a host pointer.
+A plain wait also recorded no wakeup mask, so a bitset wake could never reach
+it, and the requeue operations silently woke nobody.
+
+The stall reporter now prints the whole futex table, so the next occurrence
+says which word each thread waits on, what it expects, what the word holds,
+and whether any wake ever named it.

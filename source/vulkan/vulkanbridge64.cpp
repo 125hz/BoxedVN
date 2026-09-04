@@ -219,9 +219,95 @@ int commandIndexForAlias(const char* name) {
 
 PFN_vkGetInstanceProcAddr gGetInstanceProcAddr = nullptr;
 bool gDriverTried = false;
-VkInstance gInstance = VK_NULL_HANDLE;
 PFN_vkVoidFunction gResolved[VKB_COUNT] = {};
 VkInstance gResolvedFor[VKB_COUNT] = {};
+
+// ---- Live instances ---------------------------------------------------------
+//
+// MoltenVK is the driver directly, with no Khronos loader in front of it, so
+// vkGetInstanceProcAddr(VK_NULL_HANDLE, name) answers only for the four global
+// commands the Vulkan specification names -- vkEnumerateInstanceVersion,
+// vkEnumerateInstance{Layer,Extension}Properties and vkCreateInstance. Every
+// other command needs a live VkInstance to be looked up through.
+//
+// That is why this list exists rather than a single "current instance". A
+// device run showed Wine's adapter probe creating an instance, enumerating the
+// physical device, and then calling vkDestroyInstance twice: the first call
+// destroyed the instance and cleared the current one, and the second had
+// nothing left to resolve `vkDestroyInstance` through, so the bridge answered
+// BOXEDWINE_X64_VK_E_NOPROC to a command that returns void. The same hole
+// swallowed every instance-level command in the window between one instance
+// being destroyed and the next being created, and would have leaked a second
+// live instance whose destroy arrived after the first.
+//
+// A host Vulkan handle is a host pointer, so this list is also the only thing
+// standing between a stale handle and a dereference inside Metal: a destroy
+// for a handle that is not here does nothing at all.
+const U32 kMaxLiveInstances = 8;
+VkInstance gLiveInstances[kMaxLiveInstances] = {};
+
+// The instance instance-level resolution goes through by default: any live
+// one, most recently created first. Commands that carry their own VkInstance
+// resolve through that instead (see resolutionInstance).
+VkInstance gInstance = VK_NULL_HANDLE;
+
+bool instanceIsLive(VkInstance instance) {
+    if (instance == VK_NULL_HANDLE) {
+        return false;
+    }
+    for (U32 i = 0; i < kMaxLiveInstances; ++i) {
+        if (gLiveInstances[i] == instance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void noteInstanceCreated(VkInstance instance) {
+    BOXEDWINE_CRITICAL_SECTION;
+    gInstance = instance;
+    for (U32 i = 0; i < kMaxLiveInstances; ++i) {
+        if (gLiveInstances[i] == VK_NULL_HANDLE) {
+            gLiveInstances[i] = instance;
+            return;
+        }
+    }
+    // Nothing in the D3D9 path holds eight instances at once; a build that
+    // manages it would leak the ninth rather than risk destroying a handle it
+    // cannot vouch for, and this line is how a log would say so.
+    klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkCreateInstance "
+             "status=instance-table-full live=%u",
+             kMaxLiveInstances);
+}
+
+// Remove an instance from the list, returning false when it was not there --
+// which is what a second vkDestroyInstance for the same handle looks like.
+bool forgetInstance(VkInstance instance) {
+    BOXEDWINE_CRITICAL_SECTION;
+    bool found = false;
+    for (U32 i = 0; i < kMaxLiveInstances; ++i) {
+        if (gLiveInstances[i] == instance) {
+            gLiveInstances[i] = VK_NULL_HANDLE;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    if (gInstance == instance) {
+        // Re-point at whatever is still alive, so the commands that have no
+        // instance argument of their own keep resolving.
+        gInstance = VK_NULL_HANDLE;
+        for (U32 i = 0; i < kMaxLiveInstances; ++i) {
+            if (gLiveInstances[i] != VK_NULL_HANDLE) {
+                gInstance = gLiveInstances[i];
+                break;
+            }
+        }
+    }
+    return true;
+}
 
 PFN_vkGetInstanceProcAddr hostDriver() {
     if (!gDriverTried) {
@@ -245,16 +331,21 @@ PFN_vkGetInstanceProcAddr hostDriver() {
 // commands as well. Resolving through the instance rather than through
 // vkGetDeviceProcAddr keeps one lookup path for commands whose first argument
 // is a VkQueue or a VkCommandBuffer, which carry no VkDevice to look up with.
-PFN_vkVoidFunction hostProc(int index) {
+//
+// `resolveWith` is the instance to look the command up through. It is a
+// parameter rather than a read of gInstance because a command that carries its
+// own VkInstance must resolve through THAT one: vkDestroyInstance has to
+// resolve while the instance it is about to destroy is still the only live one.
+PFN_vkVoidFunction hostProc(int index, VkInstance resolveWith) {
     PFN_vkGetInstanceProcAddr gipa = hostDriver();
     if (!gipa || index < 0 || index >= VKB_COUNT) {
         return nullptr;
     }
-    if (gResolved[index] && gResolvedFor[index] == gInstance) {
+    if (gResolved[index] && gResolvedFor[index] == resolveWith) {
         return gResolved[index];
     }
-    PFN_vkVoidFunction fn = gipa(gInstance, kCommandName[index]);
-    if (!fn && gInstance != VK_NULL_HANDLE) {
+    PFN_vkVoidFunction fn = gipa(resolveWith, kCommandName[index]);
+    if (!fn && resolveWith != VK_NULL_HANDLE) {
         fn = gipa(VK_NULL_HANDLE, kCommandName[index]);
     }
     if (!fn) {
@@ -262,15 +353,19 @@ PFN_vkVoidFunction hostProc(int index) {
         // not the core one because the instance is Vulkan 1.0.
         buildAliasTable();
         if (gCommandAlias[index]) {
-            fn = gipa(gInstance, gCommandAlias[index]);
-            if (!fn && gInstance != VK_NULL_HANDLE) {
+            fn = gipa(resolveWith, gCommandAlias[index]);
+            if (!fn && resolveWith != VK_NULL_HANDLE) {
                 fn = gipa(VK_NULL_HANDLE, gCommandAlias[index]);
             }
         }
     }
     gResolved[index] = fn;
-    gResolvedFor[index] = gInstance;
+    gResolvedFor[index] = resolveWith;
     return fn;
+}
+
+PFN_vkVoidFunction hostProc(int index) {
+    return hostProc(index, gInstance);
 }
 
 // ---- The extensible-structure table -----------------------------------------
@@ -440,7 +535,102 @@ PFN_vkVoidFunction hostProc(int index) {
     X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT) \
     X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT,     VkPhysicalDeviceIndexTypeUint8FeaturesEXT) \
     X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_IMAGE_ARRAYS_FEATURES_EXT,   VkPhysicalDeviceYcbcrImageArraysFeaturesEXT) \
-    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,    VkPhysicalDeviceDescriptorBufferFeaturesEXT)
+    X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,    VkPhysicalDeviceDescriptorBufferFeaturesEXT) \
+    /* command pools, command buffers and the "2" submit path */ \
+    X(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,                          VkCommandPoolCreateInfo) \
+    X(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,                      VkCommandBufferAllocateInfo) \
+    X(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,                         VkCommandBufferBeginInfo) \
+    X(VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,                   VkCommandBufferInheritanceInfo) \
+    X(VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO,         VkCommandBufferInheritanceRenderingInfo) \
+    X(VK_STRUCTURE_TYPE_SUBMIT_INFO_2,                                     VkSubmitInfo2) \
+    X(VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,                             VkSemaphoreSubmitInfo) \
+    X(VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,                        VkCommandBufferSubmitInfo) \
+    /* events and query pools */ \
+    X(VK_STRUCTURE_TYPE_EVENT_CREATE_INFO,                                 VkEventCreateInfo) \
+    X(VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,                            VkQueryPoolCreateInfo) \
+    /* buffer views and samplers */ \
+    X(VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,                           VkBufferViewCreateInfo) \
+    X(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,                               VkSamplerCreateInfo) \
+    X(VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,                VkSamplerReductionModeCreateInfo) \
+    X(VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT,       VkSamplerCustomBorderColorCreateInfoEXT) \
+    /* shader modules and pipeline caches */ \
+    X(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,                         VkShaderModuleCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,                        VkPipelineCacheCreateInfo) \
+    /* layouts, descriptor pools and descriptor writes */ \
+    X(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,                       VkPipelineLayoutCreateInfo) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,                 VkDescriptorSetLayoutCreateInfo) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,   VkDescriptorSetLayoutBindingFlagsCreateInfo) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT,                     VkDescriptorSetLayoutSupport) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT, VkDescriptorSetVariableDescriptorCountLayoutSupport) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,                       VkDescriptorPoolCreateInfo) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,                      VkDescriptorSetAllocateInfo) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO, VkDescriptorSetVariableDescriptorCountAllocateInfo) \
+    X(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,                              VkWriteDescriptorSet) \
+    X(VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,                               VkCopyDescriptorSet) \
+    X(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK,         VkWriteDescriptorSetInlineUniformBlock) \
+    X(VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,            VkDescriptorUpdateTemplateCreateInfo) \
+    /* render passes, both forms, and framebuffers */ \
+    X(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,                           VkRenderPassCreateInfo) \
+    X(VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,                 VkRenderPassMultiviewCreateInfo) \
+    X(VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO,   VkRenderPassInputAttachmentAspectCreateInfo) \
+    X(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,                         VkRenderPassCreateInfo2) \
+    X(VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,                          VkAttachmentDescription2) \
+    X(VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,                            VkAttachmentReference2) \
+    X(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,                             VkSubpassDescription2) \
+    X(VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,                              VkSubpassDependency2) \
+    X(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,         VkSubpassDescriptionDepthStencilResolve) \
+    X(VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,                           VkFramebufferCreateInfo) \
+    X(VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO,               VkFramebufferAttachmentsCreateInfo) \
+    X(VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO,                 VkFramebufferAttachmentImageInfo) \
+    /* pipelines and every state structure they nest */ \
+    X(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,                     VkGraphicsPipelineCreateInfo) \
+    X(VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,                      VkComputePipelineCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,                 VkPipelineShaderStageCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,           VkPipelineVertexInputStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,         VkPipelineInputAssemblyStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,           VkPipelineTessellationStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,               VkPipelineViewportStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,          VkPipelineRasterizationStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT, VkPipelineRasterizationStateStreamCreateInfoEXT) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT, VkPipelineRasterizationConservativeStateCreateInfoEXT) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT, VkPipelineRasterizationDepthClipStateCreateInfoEXT) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO,     VkPipelineRasterizationLineStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,            VkPipelineMultisampleStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,          VkPipelineDepthStencilStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,            VkPipelineColorBlendStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT,              VkPipelineColorWriteCreateInfoEXT) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,                VkPipelineDynamicStateCreateInfo) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,                    VkPipelineRenderingCreateInfo) \
+    X(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,         VkGraphicsPipelineLibraryCreateInfoEXT) \
+    X(VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,                  VkPipelineLibraryCreateInfoKHR) \
+    /* recording: render pass and dynamic rendering scopes */ \
+    X(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,                            VkRenderPassBeginInfo) \
+    X(VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO,                 VkRenderPassAttachmentBeginInfo) \
+    X(VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO,                                VkSubpassBeginInfo) \
+    X(VK_STRUCTURE_TYPE_SUBPASS_END_INFO,                                  VkSubpassEndInfo) \
+    X(VK_STRUCTURE_TYPE_RENDERING_INFO,                                    VkRenderingInfo) \
+    X(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,                         VkRenderingAttachmentInfo) \
+    /* recording: barriers, in both the 1.0 and the synchronization2 form */ \
+    X(VK_STRUCTURE_TYPE_MEMORY_BARRIER,                                    VkMemoryBarrier) \
+    X(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,                             VkBufferMemoryBarrier) \
+    X(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,                              VkImageMemoryBarrier) \
+    X(VK_STRUCTURE_TYPE_DEPENDENCY_INFO,                                   VkDependencyInfo) \
+    X(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,                                  VkMemoryBarrier2) \
+    X(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,                           VkBufferMemoryBarrier2) \
+    X(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,                            VkImageMemoryBarrier2) \
+    /* recording: the copy_commands2 forms and their region structures */ \
+    X(VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,                                VkCopyBufferInfo2) \
+    X(VK_STRUCTURE_TYPE_BUFFER_COPY_2,                                     VkBufferCopy2) \
+    X(VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,                                 VkCopyImageInfo2) \
+    X(VK_STRUCTURE_TYPE_IMAGE_COPY_2,                                      VkImageCopy2) \
+    X(VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,                                 VkBlitImageInfo2) \
+    X(VK_STRUCTURE_TYPE_IMAGE_BLIT_2,                                      VkImageBlit2) \
+    X(VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,                       VkCopyBufferToImageInfo2) \
+    X(VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,                       VkCopyImageToBufferInfo2) \
+    X(VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,                               VkBufferImageCopy2) \
+    X(VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2,                              VkResolveImageInfo2) \
+    X(VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2,                                   VkImageResolve2)
 
 struct ChainStructInfo {
     U32 sType;
@@ -569,6 +759,54 @@ public:
             return nullptr;
         }
         return inRequired(guest, count * elementSize);
+    }
+
+    // An input array Vulkan allows to be null even when its count is not zero.
+    // The pipeline state structures are full of these -- pViewports is null
+    // whenever VK_DYNAMIC_STATE_VIEWPORT is set, and VkSubpassDescription's
+    // pResolveAttachments is null whenever the subpass does not resolve --
+    // and inArray would call each of them a bad pointer.
+    template <typename T>
+    const T* inArrayOptional(const T* guestPointer, U64 count) {
+        if (failed || !count || !guestPointer) {
+            return nullptr;
+        }
+        return (const T*)inRequired(address(guestPointer), count * sizeof(T));
+    }
+
+    // An input array of NON-extensible structures whose own members hold
+    // pointers: VkDescriptorSetLayoutBinding::pImmutableSamplers and
+    // VkSubpassDescription's five attachment arrays are the two the recording
+    // half needs. structArray cannot serve them -- it reads an sType they do
+    // not have -- so the block comes back writable and the caller walks it.
+    template <typename T>
+    T* inArrayWritable(U64 guest, U64 count) {
+        if (failed || !count) {
+            return nullptr;
+        }
+        return (T*)inRequired(guest, count * sizeof(T));
+    }
+
+    // An extensible structure that was copied as part of an enclosing one:
+    // VkComputePipelineCreateInfo::stage, which is a whole
+    // VkPipelineShaderStageCreateInfo by value. The shadow still holds the
+    // guest's own pNext, because block() copied the bytes verbatim, so the
+    // chain is mirrored from there and then the structure's own pointer
+    // members are marshalled. `sType` is the statically known type rather
+    // than the field the guest wrote: the member's type is fixed by the
+    // enclosing structure, and a guest that mis-set the field would otherwise
+    // steer the marshal.
+    void embedded(void* host, U32 sType) {
+        if (failed || !host) {
+            return;
+        }
+        VkBaseOutStructure* node = (VkBaseOutStructure*)host;
+        node->pNext = (VkBaseOutStructure*)chainOptional(address(node->pNext),
+                                                         false);
+        if (failed) {
+            return;
+        }
+        fixup(sType, (U8*)host);
     }
 
     // An output array stays optional: VkPresentInfoKHR::pResults is the only
@@ -1076,8 +1314,640 @@ void Marshal::fixup(U32 sType, U8* host) {
         info->pPresentIds = inArray(info->pPresentIds, info->swapchainCount);
         break;
     }
+
+    // ---- Command buffers and the "2" submit path ---------------------------
+
+    case (U32)VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: {
+        VkCommandBufferBeginInfo* info = (VkCommandBufferBeginInfo*)host;
+        // Ignored for a primary command buffer, and a caller that begins one
+        // may leave whatever it likes here; null is what a primary begin
+        // normally carries and chainOptional keeps it null.
+        info->pInheritanceInfo = (const VkCommandBufferInheritanceInfo*)
+            chainOptional(address(info->pInheritanceInfo), false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO: {
+        VkCommandBufferInheritanceRenderingInfo* info =
+            (VkCommandBufferInheritanceRenderingInfo*)host;
+        info->pColorAttachmentFormats = inArrayOptional(
+            info->pColorAttachmentFormats, info->colorAttachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_SUBMIT_INFO_2: {
+        VkSubmitInfo2* info = (VkSubmitInfo2*)host;
+        info->pWaitSemaphoreInfos =
+            structArrayTyped<VkSemaphoreSubmitInfo>(
+                address(info->pWaitSemaphoreInfos),
+                info->waitSemaphoreInfoCount, false);
+        info->pCommandBufferInfos =
+            structArrayTyped<VkCommandBufferSubmitInfo>(
+                address(info->pCommandBufferInfos),
+                info->commandBufferInfoCount, false);
+        info->pSignalSemaphoreInfos =
+            structArrayTyped<VkSemaphoreSubmitInfo>(
+                address(info->pSignalSemaphoreInfos),
+                info->signalSemaphoreInfoCount, false);
+        break;
+    }
+
+    // ---- Shader modules, pipeline caches and layouts -----------------------
+
+    case (U32)VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: {
+        VkShaderModuleCreateInfo* info = (VkShaderModuleCreateInfo*)host;
+        // SPIR-V, sized in BYTES by codeSize however it is spelled as
+        // uint32_t*. inArrayAt with an element size of one is the byte count.
+        info->pCode = (const uint32_t*)inArrayAt(address(info->pCode),
+                                                 (U64)info->codeSize, 1);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO: {
+        VkPipelineCacheCreateInfo* info = (VkPipelineCacheCreateInfo*)host;
+        info->pInitialData = inArrayAt(address(info->pInitialData),
+                                       (U64)info->initialDataSize, 1);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: {
+        VkPipelineLayoutCreateInfo* info = (VkPipelineLayoutCreateInfo*)host;
+        info->pSetLayouts = inArray(info->pSetLayouts, info->setLayoutCount);
+        info->pPushConstantRanges = inArray(info->pPushConstantRanges,
+                                            info->pushConstantRangeCount);
+        break;
+    }
+
+    // ---- Descriptor set layouts, pools, sets and writes --------------------
+
+    case (U32)VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: {
+        VkDescriptorSetLayoutCreateInfo* info =
+            (VkDescriptorSetLayoutCreateInfo*)host;
+        VkDescriptorSetLayoutBinding* bindings =
+            inArrayWritable<VkDescriptorSetLayoutBinding>(
+                address(info->pBindings), info->bindingCount);
+        info->pBindings = bindings;
+        for (U32 i = 0; bindings && i < info->bindingCount && !failed; ++i) {
+            VkDescriptorSetLayoutBinding* binding = &bindings[i];
+            // pImmutableSamplers is read only for the two sampler-bearing
+            // descriptor types and is ignored -- and therefore may hold
+            // anything at all -- for every other one. Following it there
+            // would be dereferencing a value the guest never set.
+            if (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                binding->descriptorType ==
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                binding->pImmutableSamplers = inArrayOptional(
+                    binding->pImmutableSamplers, binding->descriptorCount);
+            } else {
+                binding->pImmutableSamplers = nullptr;
+            }
+        }
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO: {
+        VkDescriptorSetLayoutBindingFlagsCreateInfo* info =
+            (VkDescriptorSetLayoutBindingFlagsCreateInfo*)host;
+        info->pBindingFlags =
+            inArrayOptional(info->pBindingFlags, info->bindingCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: {
+        VkDescriptorPoolCreateInfo* info = (VkDescriptorPoolCreateInfo*)host;
+        info->pPoolSizes = inArray(info->pPoolSizes, info->poolSizeCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: {
+        VkDescriptorSetAllocateInfo* info = (VkDescriptorSetAllocateInfo*)host;
+        info->pSetLayouts =
+            inArray(info->pSetLayouts, info->descriptorSetCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO: {
+        VkDescriptorSetVariableDescriptorCountAllocateInfo* info =
+            (VkDescriptorSetVariableDescriptorCountAllocateInfo*)host;
+        info->pDescriptorCounts =
+            inArrayOptional(info->pDescriptorCounts, info->descriptorSetCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: {
+        // The awkward one. Exactly one of the three arrays is read, chosen by
+        // descriptorType, and the other two are ignored -- so they hold
+        // whatever the caller left there, which for DXVK is a stale pointer
+        // from the previous write in the same scratch array. Marshalling the
+        // chosen one and NULLing the rest is the only reading of this
+        // structure that hands the driver nothing it did not mean.
+        VkWriteDescriptorSet* info = (VkWriteDescriptorSet*)host;
+        const VkDescriptorImageInfo* images = nullptr;
+        const VkDescriptorBufferInfo* buffers = nullptr;
+        const VkBufferView* views = nullptr;
+        switch (info->descriptorType) {
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+            images = inArray(info->pImageInfo, info->descriptorCount);
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+            buffers = inArray(info->pBufferInfo, info->descriptorCount);
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            views = inArray(info->pTexelBufferView, info->descriptorCount);
+            break;
+        case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+            // The data is in a VkWriteDescriptorSetInlineUniformBlock on the
+            // pNext chain, which the walker has already handled; all three
+            // arrays are ignored.
+            break;
+        default:
+            // A descriptor type whose payload this bridge cannot size -- a
+            // future one, or an acceleration structure. Refuse rather than
+            // pick one of the three arrays and hope; the type is named
+            // because that is the only way a run says which one arrived.
+            klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=%s "
+                     "status=unsized-descriptor-type descriptorType=%d "
+                     "count=%u",
+                     command, (int)info->descriptorType,
+                     info->descriptorCount);
+            fail(address(info->pImageInfo), info->descriptorCount);
+            return;
+        }
+        info->pImageInfo = images;
+        info->pBufferInfo = buffers;
+        info->pTexelBufferView = views;
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK: {
+        VkWriteDescriptorSetInlineUniformBlock* info =
+            (VkWriteDescriptorSetInlineUniformBlock*)host;
+        info->pData = inArrayAt(address(info->pData), info->dataSize, 1);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO: {
+        VkDescriptorUpdateTemplateCreateInfo* info =
+            (VkDescriptorUpdateTemplateCreateInfo*)host;
+        info->pDescriptorUpdateEntries =
+            inArray(info->pDescriptorUpdateEntries,
+                    info->descriptorUpdateEntryCount);
+        break;
+    }
+
+    // ---- Render passes, both forms, and framebuffers -----------------------
+
+    case (U32)VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO: {
+        VkRenderPassCreateInfo* info = (VkRenderPassCreateInfo*)host;
+        info->pAttachments = inArray(info->pAttachments, info->attachmentCount);
+        VkSubpassDescription* subpasses = inArrayWritable<VkSubpassDescription>(
+            address(info->pSubpasses), info->subpassCount);
+        info->pSubpasses = subpasses;
+        for (U32 i = 0; subpasses && i < info->subpassCount && !failed; ++i) {
+            VkSubpassDescription* subpass = &subpasses[i];
+            subpass->pInputAttachments = inArrayOptional(
+                subpass->pInputAttachments, subpass->inputAttachmentCount);
+            subpass->pColorAttachments = inArrayOptional(
+                subpass->pColorAttachments, subpass->colorAttachmentCount);
+            // Optional even with a non-zero colour count: a subpass that does
+            // not resolve leaves it null, and its length is the COLOUR count.
+            subpass->pResolveAttachments = inArrayOptional(
+                subpass->pResolveAttachments, subpass->colorAttachmentCount);
+            subpass->pDepthStencilAttachment =
+                (const VkAttachmentReference*)in(
+                    address(subpass->pDepthStencilAttachment),
+                    sizeof(VkAttachmentReference));
+            subpass->pPreserveAttachments = inArrayOptional(
+                subpass->pPreserveAttachments,
+                subpass->preserveAttachmentCount);
+        }
+        info->pDependencies =
+            inArray(info->pDependencies, info->dependencyCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO: {
+        VkRenderPassMultiviewCreateInfo* info =
+            (VkRenderPassMultiviewCreateInfo*)host;
+        info->pViewMasks = inArrayOptional(info->pViewMasks, info->subpassCount);
+        info->pViewOffsets =
+            inArrayOptional(info->pViewOffsets, info->dependencyCount);
+        info->pCorrelationMasks = inArrayOptional(info->pCorrelationMasks,
+                                                  info->correlationMaskCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO: {
+        VkRenderPassInputAttachmentAspectCreateInfo* info =
+            (VkRenderPassInputAttachmentAspectCreateInfo*)host;
+        info->pAspectReferences =
+            inArray(info->pAspectReferences, info->aspectReferenceCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2: {
+        VkRenderPassCreateInfo2* info = (VkRenderPassCreateInfo2*)host;
+        info->pAttachments = structArrayTyped<VkAttachmentDescription2>(
+            address(info->pAttachments), info->attachmentCount, false);
+        info->pSubpasses = structArrayTyped<VkSubpassDescription2>(
+            address(info->pSubpasses), info->subpassCount, false);
+        info->pDependencies = structArrayTyped<VkSubpassDependency2>(
+            address(info->pDependencies), info->dependencyCount, false);
+        info->pCorrelatedViewMasks = inArrayOptional(
+            info->pCorrelatedViewMasks, info->correlatedViewMaskCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2: {
+        VkSubpassDescription2* info = (VkSubpassDescription2*)host;
+        info->pInputAttachments = structArrayTyped<VkAttachmentReference2>(
+            address(info->pInputAttachments), info->inputAttachmentCount,
+            false);
+        info->pColorAttachments = structArrayTyped<VkAttachmentReference2>(
+            address(info->pColorAttachments), info->colorAttachmentCount,
+            false);
+        info->pResolveAttachments =
+            info->pResolveAttachments
+                ? structArrayTyped<VkAttachmentReference2>(
+                      address(info->pResolveAttachments),
+                      info->colorAttachmentCount, false)
+                : nullptr;
+        info->pDepthStencilAttachment = (const VkAttachmentReference2*)
+            chainOptional(address(info->pDepthStencilAttachment), false);
+        info->pPreserveAttachments = inArrayOptional(
+            info->pPreserveAttachments, info->preserveAttachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE: {
+        VkSubpassDescriptionDepthStencilResolve* info =
+            (VkSubpassDescriptionDepthStencilResolve*)host;
+        info->pDepthStencilResolveAttachment = (const VkAttachmentReference2*)
+            chainOptional(address(info->pDepthStencilResolveAttachment), false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO: {
+        VkFramebufferCreateInfo* info = (VkFramebufferCreateInfo*)host;
+        // Null with a non-zero count for an imageless framebuffer, whose
+        // attachments come from VkFramebufferAttachmentsCreateInfo instead.
+        info->pAttachments =
+            inArrayOptional(info->pAttachments, info->attachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO: {
+        VkFramebufferAttachmentsCreateInfo* info =
+            (VkFramebufferAttachmentsCreateInfo*)host;
+        info->pAttachmentImageInfos =
+            structArrayTyped<VkFramebufferAttachmentImageInfo>(
+                address(info->pAttachmentImageInfos),
+                info->attachmentImageInfoCount, false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO: {
+        VkFramebufferAttachmentImageInfo* info =
+            (VkFramebufferAttachmentImageInfo*)host;
+        info->pViewFormats =
+            inArray(info->pViewFormats, info->viewFormatCount);
+        break;
+    }
+
+    // ---- Pipelines ---------------------------------------------------------
+
+    case (U32)VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO: {
+        VkGraphicsPipelineCreateInfo* info =
+            (VkGraphicsPipelineCreateInfo*)host;
+        info->pStages = structArrayTyped<VkPipelineShaderStageCreateInfo>(
+            address(info->pStages), info->stageCount, false);
+        // Every state pointer is optional: a pipeline library provides only
+        // the states in its own subset, and a pipeline with rasterization
+        // discarded omits the fragment-output ones.
+        info->pVertexInputState = (const VkPipelineVertexInputStateCreateInfo*)
+            chainOptional(address(info->pVertexInputState), false);
+        info->pInputAssemblyState =
+            (const VkPipelineInputAssemblyStateCreateInfo*)chainOptional(
+                address(info->pInputAssemblyState), false);
+        info->pTessellationState =
+            (const VkPipelineTessellationStateCreateInfo*)chainOptional(
+                address(info->pTessellationState), false);
+        info->pViewportState = (const VkPipelineViewportStateCreateInfo*)
+            chainOptional(address(info->pViewportState), false);
+        info->pRasterizationState =
+            (const VkPipelineRasterizationStateCreateInfo*)chainOptional(
+                address(info->pRasterizationState), false);
+        info->pMultisampleState =
+            (const VkPipelineMultisampleStateCreateInfo*)chainOptional(
+                address(info->pMultisampleState), false);
+        info->pDepthStencilState =
+            (const VkPipelineDepthStencilStateCreateInfo*)chainOptional(
+                address(info->pDepthStencilState), false);
+        info->pColorBlendState = (const VkPipelineColorBlendStateCreateInfo*)
+            chainOptional(address(info->pColorBlendState), false);
+        info->pDynamicState = (const VkPipelineDynamicStateCreateInfo*)
+            chainOptional(address(info->pDynamicState), false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: {
+        VkComputePipelineCreateInfo* info = (VkComputePipelineCreateInfo*)host;
+        // The one by-value extensible member in the whole table.
+        embedded(&info->stage,
+                 (U32)VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: {
+        VkPipelineShaderStageCreateInfo* info =
+            (VkPipelineShaderStageCreateInfo*)host;
+        info->pName = string(address(info->pName));
+        // VkSpecializationInfo has no sType, so it cannot go through the
+        // chain walker; its two pointers are marshalled by hand. pData is
+        // opaque bytes sized by dataSize, which is exactly what the driver
+        // reads.
+        VkSpecializationInfo* specialization = (VkSpecializationInfo*)in(
+            address(info->pSpecializationInfo), sizeof(VkSpecializationInfo));
+        if (specialization) {
+            specialization->pMapEntries = inArray(
+                specialization->pMapEntries, specialization->mapEntryCount);
+            specialization->pData =
+                inArrayAt(address(specialization->pData),
+                          (U64)specialization->dataSize, 1);
+        }
+        info->pSpecializationInfo = specialization;
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO: {
+        VkPipelineVertexInputStateCreateInfo* info =
+            (VkPipelineVertexInputStateCreateInfo*)host;
+        info->pVertexBindingDescriptions =
+            inArrayOptional(info->pVertexBindingDescriptions,
+                            info->vertexBindingDescriptionCount);
+        info->pVertexAttributeDescriptions =
+            inArrayOptional(info->pVertexAttributeDescriptions,
+                            info->vertexAttributeDescriptionCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO: {
+        VkPipelineViewportStateCreateInfo* info =
+            (VkPipelineViewportStateCreateInfo*)host;
+        // Null with a non-zero count whenever the matching dynamic state is
+        // enabled, which is how DXVK builds every graphics pipeline.
+        info->pViewports =
+            inArrayOptional(info->pViewports, info->viewportCount);
+        info->pScissors = inArrayOptional(info->pScissors, info->scissorCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: {
+        VkPipelineMultisampleStateCreateInfo* info =
+            (VkPipelineMultisampleStateCreateInfo*)host;
+        // ceil(rasterizationSamples / 32) VkSampleMask words, which is the
+        // length the specification gives it. rasterizationSamples is a single
+        // bit of VkSampleCountFlagBits, so its numeric value is the sample
+        // count; a zero (which is invalid) yields zero words and a null.
+        const U64 words = ((U64)info->rasterizationSamples + 31u) / 32u;
+        info->pSampleMask = (const VkSampleMask*)inArrayOptional(
+            info->pSampleMask, words);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: {
+        VkPipelineColorBlendStateCreateInfo* info =
+            (VkPipelineColorBlendStateCreateInfo*)host;
+        info->pAttachments =
+            inArrayOptional(info->pAttachments, info->attachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT: {
+        VkPipelineColorWriteCreateInfoEXT* info =
+            (VkPipelineColorWriteCreateInfoEXT*)host;
+        info->pColorWriteEnables =
+            inArrayOptional(info->pColorWriteEnables, info->attachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO: {
+        VkPipelineDynamicStateCreateInfo* info =
+            (VkPipelineDynamicStateCreateInfo*)host;
+        info->pDynamicStates =
+            inArray(info->pDynamicStates, info->dynamicStateCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: {
+        VkPipelineRenderingCreateInfo* info =
+            (VkPipelineRenderingCreateInfo*)host;
+        info->pColorAttachmentFormats = inArrayOptional(
+            info->pColorAttachmentFormats, info->colorAttachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR: {
+        VkPipelineLibraryCreateInfoKHR* info =
+            (VkPipelineLibraryCreateInfoKHR*)host;
+        info->pLibraries = inArray(info->pLibraries, info->libraryCount);
+        break;
+    }
+
+    // ---- Recording ---------------------------------------------------------
+
+    case (U32)VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO: {
+        VkRenderPassBeginInfo* info = (VkRenderPassBeginInfo*)host;
+        info->pClearValues =
+            inArrayOptional(info->pClearValues, info->clearValueCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO: {
+        VkRenderPassAttachmentBeginInfo* info =
+            (VkRenderPassAttachmentBeginInfo*)host;
+        info->pAttachments = inArray(info->pAttachments, info->attachmentCount);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RENDERING_INFO: {
+        VkRenderingInfo* info = (VkRenderingInfo*)host;
+        info->pColorAttachments = structArrayTyped<VkRenderingAttachmentInfo>(
+            address(info->pColorAttachments), info->colorAttachmentCount,
+            false);
+        info->pDepthAttachment = (const VkRenderingAttachmentInfo*)
+            chainOptional(address(info->pDepthAttachment), false);
+        info->pStencilAttachment = (const VkRenderingAttachmentInfo*)
+            chainOptional(address(info->pStencilAttachment), false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_DEPENDENCY_INFO: {
+        VkDependencyInfo* info = (VkDependencyInfo*)host;
+        info->pMemoryBarriers = structArrayTyped<VkMemoryBarrier2>(
+            address(info->pMemoryBarriers), info->memoryBarrierCount, false);
+        info->pBufferMemoryBarriers =
+            structArrayTyped<VkBufferMemoryBarrier2>(
+                address(info->pBufferMemoryBarriers),
+                info->bufferMemoryBarrierCount, false);
+        info->pImageMemoryBarriers = structArrayTyped<VkImageMemoryBarrier2>(
+            address(info->pImageMemoryBarriers), info->imageMemoryBarrierCount,
+            false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2: {
+        VkCopyBufferInfo2* info = (VkCopyBufferInfo2*)host;
+        info->pRegions = structArrayTyped<VkBufferCopy2>(
+            address(info->pRegions), info->regionCount, false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2: {
+        VkCopyImageInfo2* info = (VkCopyImageInfo2*)host;
+        info->pRegions = structArrayTyped<VkImageCopy2>(
+            address(info->pRegions), info->regionCount, false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2: {
+        VkBlitImageInfo2* info = (VkBlitImageInfo2*)host;
+        info->pRegions = structArrayTyped<VkImageBlit2>(
+            address(info->pRegions), info->regionCount, false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2: {
+        VkCopyBufferToImageInfo2* info = (VkCopyBufferToImageInfo2*)host;
+        info->pRegions = structArrayTyped<VkBufferImageCopy2>(
+            address(info->pRegions), info->regionCount, false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2: {
+        VkCopyImageToBufferInfo2* info = (VkCopyImageToBufferInfo2*)host;
+        info->pRegions = structArrayTyped<VkBufferImageCopy2>(
+            address(info->pRegions), info->regionCount, false);
+        break;
+    }
+    case (U32)VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2: {
+        VkResolveImageInfo2* info = (VkResolveImageInfo2*)host;
+        info->pRegions = structArrayTyped<VkImageResolve2>(
+            address(info->pRegions), info->regionCount, false);
+        break;
+    }
     default:
         break;
+    }
+}
+
+// ---- Descriptor update templates --------------------------------------------
+//
+// vkUpdateDescriptorSetWithTemplate is handed a bare `const void* pData` whose
+// length appears nowhere in the call: it is described entirely by the entries
+// the template was created with. So the bridge has to remember, per template,
+// how many bytes the driver is going to read out of that block, or it cannot
+// copy it at all.
+//
+// What it remembers is only a length, and that is enough. Every descriptor a
+// template entry can name is a VkDescriptorImageInfo, a VkDescriptorBufferInfo
+// or a VkBufferView, and none of the three holds a pointer -- they are
+// handles, offsets, enums and sizes -- so once the span is known, a flat copy
+// of it is a complete marshal. The gaps between entries are copied too; they
+// are inside the caller's own block by construction, and the driver does not
+// read them.
+//
+// A template naming a descriptor type this bridge cannot size (a future one,
+// or an acceleration structure) is recorded as unsized, and every update
+// through it is then a named refusal rather than a guess at the length.
+
+U64 descriptorElementSize(VkDescriptorType type) {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        return sizeof(VkDescriptorImageInfo);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+        return sizeof(VkDescriptorBufferInfo);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        return sizeof(VkBufferView);
+    default:
+        return 0;
+    }
+}
+
+// The byte the driver stops reading at for one entry, measured from the start
+// of the caller's block. VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK is the
+// exception the specification carves out: its descriptorCount is a byte count
+// and its stride is not used.
+U64 templateEntryEnd(const VkDescriptorUpdateTemplateEntry& entry, bool* sized) {
+    if (entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+        return (U64)entry.offset + (U64)entry.descriptorCount;
+    }
+    const U64 element = descriptorElementSize(entry.descriptorType);
+    if (!element) {
+        *sized = false;
+        return 0;
+    }
+    if (!entry.descriptorCount) {
+        return (U64)entry.offset;
+    }
+    return (U64)entry.offset +
+           (U64)(entry.descriptorCount - 1) * (U64)entry.stride + element;
+}
+
+// The span of a whole template: the furthest byte any of its entries reaches.
+U64 templateDataSpan(const VkDescriptorUpdateTemplateCreateInfo* info,
+                     bool* sized) {
+    *sized = true;
+    U64 span = 0;
+    if (!info || !info->pDescriptorUpdateEntries) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < info->descriptorUpdateEntryCount; ++i) {
+        const U64 end =
+            templateEntryEnd(info->pDescriptorUpdateEntries[i], sized);
+        if (!*sized) {
+            return 0;
+        }
+        if (end > span) {
+            span = end;
+        }
+    }
+    return span;
+}
+
+// Nothing in the D3D9 chain holds anything like this many templates at once:
+// DXVK creates one per pipeline layout. A build that exceeded the table would
+// record nothing for the surplus, and every update through one of those is
+// refused by name rather than served with a length nobody knows.
+const U32 kMaxDescriptorTemplates = 256;
+
+struct TemplateRecord {
+    VkDescriptorUpdateTemplate handle;
+    U64 bytes;
+    bool sized;
+};
+
+TemplateRecord gTemplates[kMaxDescriptorTemplates] = {};
+
+void noteTemplateCreated(VkDescriptorUpdateTemplate handle, U64 bytes,
+                         bool sized) {
+    BOXEDWINE_CRITICAL_SECTION;
+    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
+        if (gTemplates[i].handle == VK_NULL_HANDLE ||
+            gTemplates[i].handle == handle) {
+            gTemplates[i].handle = handle;
+            gTemplates[i].bytes = bytes;
+            gTemplates[i].sized = sized;
+            return;
+        }
+    }
+    klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkCreateDescriptorUpdateTemplate "
+             "status=template-table-full live=%u",
+             kMaxDescriptorTemplates);
+}
+
+// The recorded span, and whether one was recorded at all. A template the table
+// never saw answers false, which is what an update through it needs to become
+// a refusal instead of a copy of an unknown number of bytes.
+bool templateDataBytes(VkDescriptorUpdateTemplate handle, U64* bytes) {
+    BOXEDWINE_CRITICAL_SECTION;
+    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
+        if (gTemplates[i].handle == handle) {
+            *bytes = gTemplates[i].bytes;
+            return gTemplates[i].sized;
+        }
+    }
+    return false;
+}
+
+void forgetTemplate(VkDescriptorUpdateTemplate handle) {
+    BOXEDWINE_CRITICAL_SECTION;
+    for (U32 i = 0; i < kMaxDescriptorTemplates; ++i) {
+        if (gTemplates[i].handle == handle) {
+            gTemplates[i].handle = VK_NULL_HANDLE;
+            gTemplates[i].bytes = 0;
+            gTemplates[i].sized = false;
+            return;
+        }
     }
 }
 
@@ -1131,11 +2001,189 @@ S64 createXlibSurface(KMemory64* memory, U64 instance, U64 createInfo,
     return VK_SUCCESS;
 }
 
+// ---- The platform surface extension -----------------------------------------
+//
+// Wine's winevulkan asks the display driver which host surface extension to
+// use and substitutes that name for the application's VK_KHR_win32_surface
+// before the call reaches this bridge. The display driver here is winex11.drv,
+// which answers VK_KHR_xlib_surface unconditionally because it is an X11
+// driver. MoltenVK has no Xlib surface extension -- it has
+// VK_EXT_metal_surface -- so a bridge that forwarded the names verbatim handed
+// MoltenVK a name it does not have, and a device run showed exactly that: Wine's
+// own adapter probe succeeded (it enables no surface extension at all) and
+// DXVK's vkCreateInstance answered VK_ERROR_EXTENSION_NOT_PRESENT the moment it
+// asked for a surface.
+//
+// The IA-32 lane has always translated in both directions
+// (vk_EnumerateInstanceExtensionProperties and vk_CreateInstance in
+// source/vulkan/vulkancommon.cpp). This is the same translation:
+//
+//   enumeration: the host's platform surface name -> VK_KHR_xlib_surface
+//   creation:    VK_KHR_xlib_surface -> the host's platform surface name
+//
+// A rename rather than an addition, so the property count is identical in both
+// halves of the two-call idiom and a caller that sized its array from the first
+// call is still right on the second.
+//
+// There is no device-level equivalent. Every platform surface extension is
+// instance-level; VK_KHR_swapchain, the device-level half of presentation, is
+// spelled the same on both sides. The IA-32 lane translates nothing in
+// vk_EnumerateDeviceExtensionProperties or vk_CreateDevice either.
+const char* const kGuestSurfaceExtension = "VK_KHR_xlib_surface";
+
+#if defined(BOXEDWINE_IOS)
+// SDL's UIKit Vulkan backend creates a CAMetalLayer-backed VkSurfaceKHR
+// through VK_EXT_metal_surface, and createXlibSurface() below reaches that
+// same path through KNativeSystem::getVulkan().
+const char* const kHostSurfaceExtension = "VK_EXT_metal_surface";
+#elif defined(__MACH__)
+const char* const kHostSurfaceExtension = "VK_MVK_macos_surface";
+#elif defined(_WIN32)
+const char* const kHostSurfaceExtension = "VK_KHR_win32_surface";
+#else
+// A host whose driver already reports the name Wine expects. Spelled out
+// rather than left to the IA-32 lane's #else, which names
+// VK_KHR_win32_surface unconditionally and would rewrite a Linux host's own
+// Xlib surface extension away. Both directions are the identity here.
+const char* const kHostSurfaceExtension = "VK_KHR_xlib_surface";
+#endif
+
+// Every name the enumeration will accept as "the host's platform surface".
+// More than one, because a build may meet a driver that reports a platform
+// surface it was not compiled for -- MoltenVK reports both
+// VK_EXT_metal_surface and VK_MVK_ios_surface -- and the answer Wine needs is
+// the same in every case. Exactly ONE entry is ever renamed, and the one this
+// build can actually deliver is preferred, so the reported list never carries
+// VK_KHR_xlib_surface twice.
+const char* const kHostSurfaceAliases[] = {
+    "VK_EXT_metal_surface",
+    "VK_MVK_macos_surface",
+    "VK_MVK_ios_surface",
+    "VK_KHR_win32_surface",
+    "VK_KHR_xcb_surface",
+    "VK_KHR_wayland_surface",
+};
+
+bool isHostSurfaceAlias(const char* name) {
+    for (U32 i = 0;
+         i < (U32)(sizeof(kHostSurfaceAliases) / sizeof(kHostSurfaceAliases[0]));
+         ++i) {
+        if (!strcmp(name, kHostSurfaceAliases[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::atomic<U32> gSurfaceRenameReports{0};
+
+// Rewrite the host's platform surface extension in an enumerated property
+// array to the name Wine's X11 driver expects. Returns the number of entries
+// rewritten, which is 0 or 1 -- never more, so the count the guest was given
+// stays exactly what the driver reported.
+U32 renameHostSurfaceExtension(VkExtensionProperties* properties, U32 count) {
+    if (!properties || !count) {
+        return 0;
+    }
+    int hostChoice = -1;
+    int aliasChoice = -1;
+    for (U32 i = 0; i < count; ++i) {
+        const char* name = properties[i].extensionName;
+        if (!strcmp(name, kGuestSurfaceExtension)) {
+            // The driver already reports the name Wine wants. Renaming a
+            // second entry onto it would report it twice.
+            return 0;
+        }
+        if (hostChoice < 0 && !strcmp(name, kHostSurfaceExtension)) {
+            hostChoice = (int)i;
+        }
+        if (aliasChoice < 0 && isHostSurfaceAlias(name)) {
+            aliasChoice = (int)i;
+        }
+    }
+    const int chosen = hostChoice >= 0 ? hostChoice : aliasChoice;
+    const U32 reported =
+        gSurfaceRenameReports.fetch_add(1, std::memory_order_relaxed);
+    if (chosen < 0) {
+        // Loud, and deliberately so. Without a platform surface in the list
+        // winevulkan has nothing to map VK_KHR_win32_surface onto, DXVK is
+        // told the surface extension it requires is absent, and the failure
+        // that follows says nothing about why.
+        if (reported < 4) {
+            klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE "
+                     "call=vkEnumerateInstanceExtensionProperties "
+                     "surface=none count=%u status=no-platform-surface",
+                     count);
+        }
+        return 0;
+    }
+    char* slot = properties[chosen].extensionName;
+    if (reported < 4) {
+        klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE "
+                 "call=vkEnumerateInstanceExtensionProperties surface=%s "
+                 "reported=%s preferred=%d count=%u",
+                 slot, kGuestSurfaceExtension, hostChoice >= 0 ? 1 : 0, count);
+    }
+    size_t length = ::strlen(kGuestSurfaceExtension);
+    if (length > VK_MAX_EXTENSION_NAME_SIZE - 1) {
+        length = VK_MAX_EXTENSION_NAME_SIZE - 1;
+    }
+    ::memset(slot, 0, VK_MAX_EXTENSION_NAME_SIZE);
+    ::memcpy(slot, kGuestSurfaceExtension, length);
+    return 1;
+}
+
+std::atomic<U32> gSurfaceSubstituteReports{0};
+
+// The other direction: put the host's own platform surface name back before
+// the create info reaches the driver. The array and its strings are the
+// marshal's own host allocations, so the entry is repointed at a static
+// literal rather than rewritten in place.
+U32 substituteHostSurfaceExtension(const char* const* names, U32 count) {
+    if (!names || !count || !strcmp(kHostSurfaceExtension,
+                                    kGuestSurfaceExtension)) {
+        return 0;
+    }
+    const char** writable = const_cast<const char**>(names);
+    U32 substituted = 0;
+    for (U32 i = 0; i < count; ++i) {
+        if (names[i] && !strcmp(names[i], kGuestSurfaceExtension)) {
+            writable[i] = kHostSurfaceExtension;
+            ++substituted;
+        }
+    }
+    if (substituted) {
+        const U32 reported =
+            gSurfaceSubstituteReports.fetch_add(1, std::memory_order_relaxed);
+        if (reported < 4) {
+            klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkCreateInstance "
+                     "requested=%s forwarded=%s count=%u",
+                     kGuestSurfaceExtension, kHostSurfaceExtension,
+                     substituted);
+        }
+    }
+    return substituted;
+}
+
 // ---- The dispatcher ---------------------------------------------------------
 
 #define A(n) args[n]
 #define H(n) ((void*)(uintptr_t)args[n])
 #define U32A(n) ((uint32_t)args[n])
+
+// The mirror image of bw_f32() in tools/vulkan-64/vulkan.c. A float parameter
+// crosses as the bit pattern of its IEEE-754 binary32 value in the low 32 bits
+// of an argument word, so it is read back out of the object representation
+// rather than converted: casting the word 0x3fc00000 to float would give
+// 1069547520.0f where the guest passed 1.5f.
+float f32(U64 word) {
+    const uint32_t bits = (uint32_t)word;
+    float value = 0.0f;
+    ::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+#define F32A(n) f32(args[n])
 
 // H(n) is for a Vulkan HANDLE, which is a host value the driver gave out and
 // never a guest address. Everything else that is a pointer goes through the
@@ -1149,9 +2197,45 @@ S64 createXlibSurface(KMemory64* memory, U64 instance, U64 createInfo,
 // Every command below is called through its real prototype, so the compiler
 // checks each cast. Nothing here is generated; a command is in the table
 // because it was added deliberately.
+// The instance a command is looked up through. A command that carries its own
+// VkInstance uses that one: it is alive by the caller's own contract, whereas
+// the bridge's current instance may be a different one, or none at all when
+// the last instance is in the middle of being destroyed.
+VkInstance resolutionInstance(int index, const U64* args) {
+    switch (index) {
+    case VKB_DestroyInstance:
+    case VKB_EnumeratePhysicalDevices:
+    case VKB_DestroySurfaceKHR:
+        if (args[0]) {
+            return (VkInstance)(uintptr_t)args[0];
+        }
+        break;
+    default:
+        break;
+    }
+    return gInstance;
+}
+
 S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
     (void)count;
-    PFN_vkVoidFunction raw = hostProc(index);
+    if (index == VKB_DestroyInstance &&
+        !instanceIsLive((VkInstance)(uintptr_t)args[0])) {
+        // Settled before resolution, because resolution would dereference the
+        // handle. A host Vulkan handle is a host pointer: a destroy for one
+        // this bridge did not hand out, or already destroyed, can only be
+        // answered by doing nothing. vkDestroyInstance returns void, so there
+        // is no error to report and none is invented -- an earlier revision
+        // reported BOXEDWINE_X64_VK_E_NOPROC here, which is what a device run
+        // saw when Wine's adapter probe destroyed its instance twice.
+        static std::atomic<U32> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+            klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkDestroyInstance "
+                     "instance=0x%llx status=not-live",
+                     (unsigned long long)args[0]);
+        }
+        return 0;
+    }
+    PFN_vkVoidFunction raw = hostProc(index, resolutionInstance(index, args));
     if (!raw) {
         return BOXEDWINE_X64_VK_E_NOPROC;
     }
@@ -1182,13 +2266,24 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         if (!m.ok()) {
             return m.error();
         }
+        const U32 capacity = *countSlot;
         VkExtensionProperties* properties = (VkExtensionProperties*)m.out(
-            A(2), (U64)*countSlot * sizeof(VkExtensionProperties));
+            A(2), (U64)capacity * sizeof(VkExtensionProperties));
         if (!m.ok()) {
             return m.error();
         }
-        return (S64)((PFN_vkEnumerateInstanceExtensionProperties)raw)(
-            layer, countSlot, properties);
+        const VkResult result =
+            ((PFN_vkEnumerateInstanceExtensionProperties)raw)(layer, countSlot,
+                                                              properties);
+        // Before the write-back, and only over what the driver actually
+        // wrote: on the first call of the two-call idiom `properties` is null
+        // and only the count comes back, and the rename cannot change a count
+        // it never touches.
+        if (result == VK_SUCCESS || result == VK_INCOMPLETE) {
+            const U32 written = *countSlot < capacity ? *countSlot : capacity;
+            renameHostSurfaceExtension(properties, written);
+        }
+        return (S64)result;
     }
     case VKB_CreateInstance: {
         const VkInstanceCreateInfo* info =
@@ -1197,22 +2292,25 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         if (!m.ok()) {
             return m.error();
         }
+        // The other half of the surface-extension translation. The shadow
+        // create info is this marshal's own memory, so the name Wine handed
+        // down is replaced with the one the driver actually has.
+        substituteHostSurfaceExtension(info->ppEnabledExtensionNames,
+                                       info->enabledExtensionCount);
         const VkResult result =
             ((PFN_vkCreateInstance)raw)(info, nullptr, out);
         if (result == VK_SUCCESS && out && *out) {
-            // Every later resolution goes through this instance; a second
-            // instance simply replaces it and the per-command cache is keyed
-            // on which instance resolved it.
-            gInstance = *out;
+            noteInstanceCreated(*out);
         }
         return (S64)result;
     }
     case VKB_DestroyInstance: {
+        // Liveness was settled above, before resolution. Dropping it from the
+        // list first re-points the bridge's current instance at whatever is
+        // still alive, so a second live instance keeps working.
         VkInstance instance = (VkInstance)H(0);
+        forgetInstance(instance);
         ((PFN_vkDestroyInstance)raw)(instance, nullptr);
-        if (gInstance == instance) {
-            gInstance = VK_NULL_HANDLE;
-        }
         return 0;
     }
     case VKB_EnumeratePhysicalDevices: {
@@ -1919,6 +3017,1058 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
         }
         return (S64)result;
     }
+    // ---- Command pools and command buffers ---------------------------------
+
+    case VKB_CreateCommandPool: {
+        const VkCommandPoolCreateInfo* info =
+            (const VkCommandPoolCreateInfo*)m.chain(A(1), false);
+        VkCommandPool* out =
+            (VkCommandPool*)m.outRequired(A(3), sizeof(VkCommandPool));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateCommandPool)raw)((VkDevice)H(0), info,
+                                                   nullptr, out);
+    }
+    case VKB_DestroyCommandPool:
+        ((PFN_vkDestroyCommandPool)raw)((VkDevice)H(0), (VkCommandPool)A(1),
+                                        nullptr);
+        return 0;
+    case VKB_ResetCommandPool:
+        return (S64)((PFN_vkResetCommandPool)raw)(
+            (VkDevice)H(0), (VkCommandPool)A(1),
+            (VkCommandPoolResetFlags)U32A(2));
+    case VKB_AllocateCommandBuffers: {
+        const VkCommandBufferAllocateInfo* info =
+            (const VkCommandBufferAllocateInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error();
+        }
+        // The output array's length lives inside the create info, which is why
+        // it is sized only after the info has been copied.
+        VkCommandBuffer* out = (VkCommandBuffer*)m.outRequired(
+            A(2), (U64)info->commandBufferCount * sizeof(VkCommandBuffer));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkAllocateCommandBuffers)raw)((VkDevice)H(0), info,
+                                                        out);
+    }
+    case VKB_FreeCommandBuffers: {
+        const VkCommandBuffer* buffers = (const VkCommandBuffer*)m.inArrayAt(
+            A(3), U32A(2), sizeof(VkCommandBuffer));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkFreeCommandBuffers)raw)((VkDevice)H(0), (VkCommandPool)A(1),
+                                        U32A(2), buffers);
+        return 0;
+    }
+    case VKB_BeginCommandBuffer: {
+        const VkCommandBufferBeginInfo* info =
+            (const VkCommandBufferBeginInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkBeginCommandBuffer)raw)((VkCommandBuffer)H(0),
+                                                    info);
+    }
+    case VKB_EndCommandBuffer:
+        return (S64)((PFN_vkEndCommandBuffer)raw)((VkCommandBuffer)H(0));
+    case VKB_ResetCommandBuffer:
+        return (S64)((PFN_vkResetCommandBuffer)raw)(
+            (VkCommandBuffer)H(0), (VkCommandBufferResetFlags)U32A(1));
+    case VKB_QueueSubmit2: {
+        const VkSubmitInfo2* submits =
+            m.structArrayTyped<VkSubmitInfo2>(A(2), U32A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkQueueSubmit2)raw)((VkQueue)H(0), U32A(1), submits,
+                                              (VkFence)A(3));
+    }
+
+    // ---- Events and query pools --------------------------------------------
+
+    case VKB_CreateEvent: {
+        const VkEventCreateInfo* info =
+            (const VkEventCreateInfo*)m.chain(A(1), false);
+        VkEvent* out = (VkEvent*)m.outRequired(A(3), sizeof(VkEvent));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateEvent)raw)((VkDevice)H(0), info, nullptr,
+                                             out);
+    }
+    case VKB_DestroyEvent:
+        ((PFN_vkDestroyEvent)raw)((VkDevice)H(0), (VkEvent)A(1), nullptr);
+        return 0;
+    case VKB_GetEventStatus:
+        return (S64)((PFN_vkGetEventStatus)raw)((VkDevice)H(0), (VkEvent)A(1));
+    case VKB_SetEvent:
+        return (S64)((PFN_vkSetEvent)raw)((VkDevice)H(0), (VkEvent)A(1));
+    case VKB_ResetEvent:
+        return (S64)((PFN_vkResetEvent)raw)((VkDevice)H(0), (VkEvent)A(1));
+    case VKB_CreateQueryPool: {
+        const VkQueryPoolCreateInfo* info =
+            (const VkQueryPoolCreateInfo*)m.chain(A(1), false);
+        VkQueryPool* out =
+            (VkQueryPool*)m.outRequired(A(3), sizeof(VkQueryPool));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateQueryPool)raw)((VkDevice)H(0), info, nullptr,
+                                                 out);
+    }
+    case VKB_DestroyQueryPool:
+        ((PFN_vkDestroyQueryPool)raw)((VkDevice)H(0), (VkQueryPool)A(1),
+                                      nullptr);
+        return 0;
+    case VKB_GetQueryPoolResults: {
+        // dataSize is the caller's own byte count for pData; the driver writes
+        // at most that many.
+        void* data = m.outRequired(A(5), A(4));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkGetQueryPoolResults)raw)(
+            (VkDevice)H(0), (VkQueryPool)A(1), U32A(2), U32A(3), (size_t)A(4),
+            data, (VkDeviceSize)A(6), (VkQueryResultFlags)U32A(7));
+    }
+    case VKB_ResetQueryPool:
+        ((PFN_vkResetQueryPool)raw)((VkDevice)H(0), (VkQueryPool)A(1), U32A(2),
+                                    U32A(3));
+        return 0;
+
+    // ---- Buffer views and samplers -----------------------------------------
+
+    case VKB_CreateBufferView: {
+        const VkBufferViewCreateInfo* info =
+            (const VkBufferViewCreateInfo*)m.chain(A(1), false);
+        VkBufferView* out =
+            (VkBufferView*)m.outRequired(A(3), sizeof(VkBufferView));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateBufferView)raw)((VkDevice)H(0), info, nullptr,
+                                                  out);
+    }
+    case VKB_DestroyBufferView:
+        ((PFN_vkDestroyBufferView)raw)((VkDevice)H(0), (VkBufferView)A(1),
+                                       nullptr);
+        return 0;
+    case VKB_CreateSampler: {
+        const VkSamplerCreateInfo* info =
+            (const VkSamplerCreateInfo*)m.chain(A(1), false);
+        VkSampler* out = (VkSampler*)m.outRequired(A(3), sizeof(VkSampler));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateSampler)raw)((VkDevice)H(0), info, nullptr,
+                                               out);
+    }
+    case VKB_DestroySampler:
+        ((PFN_vkDestroySampler)raw)((VkDevice)H(0), (VkSampler)A(1), nullptr);
+        return 0;
+
+    // ---- Shader modules and pipeline caches --------------------------------
+
+    case VKB_CreateShaderModule: {
+        const VkShaderModuleCreateInfo* info =
+            (const VkShaderModuleCreateInfo*)m.chain(A(1), false);
+        VkShaderModule* out =
+            (VkShaderModule*)m.outRequired(A(3), sizeof(VkShaderModule));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateShaderModule)raw)((VkDevice)H(0), info,
+                                                    nullptr, out);
+    }
+    case VKB_DestroyShaderModule:
+        ((PFN_vkDestroyShaderModule)raw)((VkDevice)H(0), (VkShaderModule)A(1),
+                                         nullptr);
+        return 0;
+    case VKB_CreatePipelineCache: {
+        const VkPipelineCacheCreateInfo* info =
+            (const VkPipelineCacheCreateInfo*)m.chain(A(1), false);
+        VkPipelineCache* out =
+            (VkPipelineCache*)m.outRequired(A(3), sizeof(VkPipelineCache));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreatePipelineCache)raw)((VkDevice)H(0), info,
+                                                     nullptr, out);
+    }
+    case VKB_DestroyPipelineCache:
+        ((PFN_vkDestroyPipelineCache)raw)((VkDevice)H(0), (VkPipelineCache)A(1),
+                                          nullptr);
+        return 0;
+    case VKB_GetPipelineCacheData: {
+        // The two-call idiom again, with a size_t rather than a uint32_t
+        // capacity slot.
+        size_t* sizeSlot = (size_t*)m.outRequired(A(2), sizeof(size_t));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        void* data = m.out(A(3), (U64)*sizeSlot);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkGetPipelineCacheData)raw)(
+            (VkDevice)H(0), (VkPipelineCache)A(1), sizeSlot, data);
+    }
+    case VKB_MergePipelineCaches: {
+        const VkPipelineCache* sources = (const VkPipelineCache*)m.inArrayAt(
+            A(3), U32A(2), sizeof(VkPipelineCache));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkMergePipelineCaches)raw)(
+            (VkDevice)H(0), (VkPipelineCache)A(1), U32A(2), sources);
+    }
+
+    // ---- Pipeline and descriptor set layouts -------------------------------
+
+    case VKB_CreatePipelineLayout: {
+        const VkPipelineLayoutCreateInfo* info =
+            (const VkPipelineLayoutCreateInfo*)m.chain(A(1), false);
+        VkPipelineLayout* out =
+            (VkPipelineLayout*)m.outRequired(A(3), sizeof(VkPipelineLayout));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreatePipelineLayout)raw)((VkDevice)H(0), info,
+                                                      nullptr, out);
+    }
+    case VKB_DestroyPipelineLayout:
+        ((PFN_vkDestroyPipelineLayout)raw)((VkDevice)H(0),
+                                           (VkPipelineLayout)A(1), nullptr);
+        return 0;
+    case VKB_CreateDescriptorSetLayout: {
+        const VkDescriptorSetLayoutCreateInfo* info =
+            (const VkDescriptorSetLayoutCreateInfo*)m.chain(A(1), false);
+        VkDescriptorSetLayout* out = (VkDescriptorSetLayout*)m.outRequired(
+            A(3), sizeof(VkDescriptorSetLayout));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateDescriptorSetLayout)raw)((VkDevice)H(0), info,
+                                                           nullptr, out);
+    }
+    case VKB_DestroyDescriptorSetLayout:
+        ((PFN_vkDestroyDescriptorSetLayout)raw)(
+            (VkDevice)H(0), (VkDescriptorSetLayout)A(1), nullptr);
+        return 0;
+    case VKB_GetDescriptorSetLayoutSupport: {
+        const VkDescriptorSetLayoutCreateInfo* info =
+            (const VkDescriptorSetLayoutCreateInfo*)m.chain(A(1), false);
+        VkDescriptorSetLayoutSupport* support =
+            (VkDescriptorSetLayoutSupport*)m.chain(A(2), true);
+        if (!m.ok()) {
+            return m.error();
+        }
+        ((PFN_vkGetDescriptorSetLayoutSupport)raw)((VkDevice)H(0), info,
+                                                   support);
+        return 0;
+    }
+
+    // ---- Descriptor pools, sets and updates --------------------------------
+
+    case VKB_CreateDescriptorPool: {
+        const VkDescriptorPoolCreateInfo* info =
+            (const VkDescriptorPoolCreateInfo*)m.chain(A(1), false);
+        VkDescriptorPool* out =
+            (VkDescriptorPool*)m.outRequired(A(3), sizeof(VkDescriptorPool));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateDescriptorPool)raw)((VkDevice)H(0), info,
+                                                      nullptr, out);
+    }
+    case VKB_DestroyDescriptorPool:
+        ((PFN_vkDestroyDescriptorPool)raw)((VkDevice)H(0),
+                                           (VkDescriptorPool)A(1), nullptr);
+        return 0;
+    case VKB_ResetDescriptorPool:
+        return (S64)((PFN_vkResetDescriptorPool)raw)(
+            (VkDevice)H(0), (VkDescriptorPool)A(1),
+            (VkDescriptorPoolResetFlags)U32A(2));
+    case VKB_AllocateDescriptorSets: {
+        const VkDescriptorSetAllocateInfo* info =
+            (const VkDescriptorSetAllocateInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error();
+        }
+        VkDescriptorSet* out = (VkDescriptorSet*)m.outRequired(
+            A(2), (U64)info->descriptorSetCount * sizeof(VkDescriptorSet));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkAllocateDescriptorSets)raw)((VkDevice)H(0), info,
+                                                        out);
+    }
+    case VKB_FreeDescriptorSets: {
+        const VkDescriptorSet* sets = (const VkDescriptorSet*)m.inArrayAt(
+            A(3), U32A(2), sizeof(VkDescriptorSet));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        return (S64)((PFN_vkFreeDescriptorSets)raw)(
+            (VkDevice)H(0), (VkDescriptorPool)A(1), U32A(2), sets);
+    }
+    case VKB_UpdateDescriptorSets: {
+        const VkWriteDescriptorSet* writes =
+            m.structArrayTyped<VkWriteDescriptorSet>(A(2), U32A(1), false);
+        const VkCopyDescriptorSet* copies =
+            m.structArrayTyped<VkCopyDescriptorSet>(A(4), U32A(3), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkUpdateDescriptorSets)raw)((VkDevice)H(0), U32A(1), writes,
+                                          U32A(3), copies);
+        return 0;
+    }
+    case VKB_CreateDescriptorUpdateTemplate: {
+        const VkDescriptorUpdateTemplateCreateInfo* info =
+            (const VkDescriptorUpdateTemplateCreateInfo*)m.chain(A(1), false);
+        VkDescriptorUpdateTemplate* out =
+            (VkDescriptorUpdateTemplate*)m.outRequired(
+                A(3), sizeof(VkDescriptorUpdateTemplate));
+        if (!m.ok()) {
+            return m.error();
+        }
+        const VkResult result =
+            ((PFN_vkCreateDescriptorUpdateTemplate)raw)((VkDevice)H(0), info,
+                                                        nullptr, out);
+        if (result == VK_SUCCESS && out && *out) {
+            // Measured from the marshalled entries, which are this marshal's
+            // own memory and therefore safe to walk.
+            bool sized = true;
+            const U64 bytes = templateDataSpan(info, &sized);
+            noteTemplateCreated(*out, bytes, sized);
+            if (!sized) {
+                klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE "
+                         "call=vkCreateDescriptorUpdateTemplate "
+                         "status=unsized-entries entries=%u",
+                         info->descriptorUpdateEntryCount);
+            }
+        }
+        return (S64)result;
+    }
+    case VKB_DestroyDescriptorUpdateTemplate: {
+        VkDescriptorUpdateTemplate handle = (VkDescriptorUpdateTemplate)A(1);
+        forgetTemplate(handle);
+        ((PFN_vkDestroyDescriptorUpdateTemplate)raw)((VkDevice)H(0), handle,
+                                                     nullptr);
+        return 0;
+    }
+    case VKB_UpdateDescriptorSetWithTemplate: {
+        VkDescriptorUpdateTemplate handle = (VkDescriptorUpdateTemplate)A(2);
+        U64 bytes = 0;
+        if (!templateDataBytes(handle, &bytes)) {
+            // A template this bridge has no span for. The command returns
+            // void, so the refusal is a log line and a skipped update rather
+            // than an invented error -- but it is named, because a descriptor
+            // set that silently kept its old contents is otherwise a rendering
+            // bug with no trace.
+            static std::atomic<U32> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE "
+                         "call=vkUpdateDescriptorSetWithTemplate "
+                         "template=0x%llx status=no-span",
+                         (unsigned long long)A(2));
+            }
+            return 0;
+        }
+        // Flat: every descriptor a template entry names is handles, offsets
+        // and enums, so the span copies whole.
+        const void* data = m.inArrayAt(A(3), bytes, 1);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkUpdateDescriptorSetWithTemplate)raw)(
+            (VkDevice)H(0), (VkDescriptorSet)A(1), handle, data);
+        return 0;
+    }
+
+    // ---- Render passes and framebuffers ------------------------------------
+
+    case VKB_CreateRenderPass: {
+        const VkRenderPassCreateInfo* info =
+            (const VkRenderPassCreateInfo*)m.chain(A(1), false);
+        VkRenderPass* out =
+            (VkRenderPass*)m.outRequired(A(3), sizeof(VkRenderPass));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateRenderPass)raw)((VkDevice)H(0), info, nullptr,
+                                                  out);
+    }
+    case VKB_CreateRenderPass2: {
+        const VkRenderPassCreateInfo2* info =
+            (const VkRenderPassCreateInfo2*)m.chain(A(1), false);
+        VkRenderPass* out =
+            (VkRenderPass*)m.outRequired(A(3), sizeof(VkRenderPass));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateRenderPass2)raw)((VkDevice)H(0), info,
+                                                   nullptr, out);
+    }
+    case VKB_DestroyRenderPass:
+        ((PFN_vkDestroyRenderPass)raw)((VkDevice)H(0), (VkRenderPass)A(1),
+                                       nullptr);
+        return 0;
+    case VKB_CreateFramebuffer: {
+        const VkFramebufferCreateInfo* info =
+            (const VkFramebufferCreateInfo*)m.chain(A(1), false);
+        VkFramebuffer* out =
+            (VkFramebuffer*)m.outRequired(A(3), sizeof(VkFramebuffer));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateFramebuffer)raw)((VkDevice)H(0), info,
+                                                   nullptr, out);
+    }
+    case VKB_DestroyFramebuffer:
+        ((PFN_vkDestroyFramebuffer)raw)((VkDevice)H(0), (VkFramebuffer)A(1),
+                                        nullptr);
+        return 0;
+
+    // ---- Pipelines ----------------------------------------------------------
+
+    case VKB_CreateGraphicsPipelines: {
+        const VkGraphicsPipelineCreateInfo* infos =
+            m.structArrayTyped<VkGraphicsPipelineCreateInfo>(A(3), U32A(2),
+                                                             false);
+        VkPipeline* out = (VkPipeline*)m.outRequired(
+            A(5), (U64)U32A(2) * sizeof(VkPipeline));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateGraphicsPipelines)raw)(
+            (VkDevice)H(0), (VkPipelineCache)A(1), U32A(2), infos, nullptr,
+            out);
+    }
+    case VKB_CreateComputePipelines: {
+        const VkComputePipelineCreateInfo* infos =
+            m.structArrayTyped<VkComputePipelineCreateInfo>(A(3), U32A(2),
+                                                            false);
+        VkPipeline* out = (VkPipeline*)m.outRequired(
+            A(5), (U64)U32A(2) * sizeof(VkPipeline));
+        if (!m.ok()) {
+            return m.error();
+        }
+        return (S64)((PFN_vkCreateComputePipelines)raw)(
+            (VkDevice)H(0), (VkPipelineCache)A(1), U32A(2), infos, nullptr,
+            out);
+    }
+    case VKB_DestroyPipeline:
+        ((PFN_vkDestroyPipeline)raw)((VkDevice)H(0), (VkPipeline)A(1), nullptr);
+        return 0;
+
+    // ---- Recording: render pass and dynamic rendering scopes ---------------
+
+    case VKB_CmdBeginRenderPass: {
+        const VkRenderPassBeginInfo* info =
+            (const VkRenderPassBeginInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBeginRenderPass)raw)((VkCommandBuffer)H(0), info,
+                                        (VkSubpassContents)U32A(2));
+        return 0;
+    }
+    case VKB_CmdNextSubpass:
+        ((PFN_vkCmdNextSubpass)raw)((VkCommandBuffer)H(0),
+                                    (VkSubpassContents)U32A(1));
+        return 0;
+    case VKB_CmdEndRenderPass:
+        ((PFN_vkCmdEndRenderPass)raw)((VkCommandBuffer)H(0));
+        return 0;
+    case VKB_CmdBeginRenderPass2: {
+        const VkRenderPassBeginInfo* info =
+            (const VkRenderPassBeginInfo*)m.chain(A(1), false);
+        const VkSubpassBeginInfo* begin =
+            (const VkSubpassBeginInfo*)m.chain(A(2), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBeginRenderPass2)raw)((VkCommandBuffer)H(0), info, begin);
+        return 0;
+    }
+    case VKB_CmdNextSubpass2: {
+        const VkSubpassBeginInfo* begin =
+            (const VkSubpassBeginInfo*)m.chain(A(1), false);
+        const VkSubpassEndInfo* end =
+            (const VkSubpassEndInfo*)m.chain(A(2), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdNextSubpass2)raw)((VkCommandBuffer)H(0), begin, end);
+        return 0;
+    }
+    case VKB_CmdEndRenderPass2: {
+        const VkSubpassEndInfo* end =
+            (const VkSubpassEndInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdEndRenderPass2)raw)((VkCommandBuffer)H(0), end);
+        return 0;
+    }
+    case VKB_CmdBeginRendering: {
+        const VkRenderingInfo* info =
+            (const VkRenderingInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBeginRendering)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdEndRendering:
+        ((PFN_vkCmdEndRendering)raw)((VkCommandBuffer)H(0));
+        return 0;
+
+    // ---- Recording: binding -------------------------------------------------
+
+    case VKB_CmdBindPipeline:
+        ((PFN_vkCmdBindPipeline)raw)((VkCommandBuffer)H(0),
+                                     (VkPipelineBindPoint)U32A(1),
+                                     (VkPipeline)A(2));
+        return 0;
+    case VKB_CmdBindDescriptorSets: {
+        const VkDescriptorSet* sets = (const VkDescriptorSet*)m.inArrayAt(
+            A(5), U32A(4), sizeof(VkDescriptorSet));
+        const uint32_t* offsets = (const uint32_t*)m.inArrayAt(
+            A(7), U32A(6), sizeof(uint32_t));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBindDescriptorSets)raw)(
+            (VkCommandBuffer)H(0), (VkPipelineBindPoint)U32A(1),
+            (VkPipelineLayout)A(2), U32A(3), U32A(4), sets, U32A(6), offsets);
+        return 0;
+    }
+    case VKB_CmdBindIndexBuffer:
+        ((PFN_vkCmdBindIndexBuffer)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                        (VkDeviceSize)A(2),
+                                        (VkIndexType)U32A(3));
+        return 0;
+    case VKB_CmdBindVertexBuffers: {
+        const VkBuffer* buffers =
+            (const VkBuffer*)m.inArrayAt(A(3), U32A(2), sizeof(VkBuffer));
+        const VkDeviceSize* offsets = (const VkDeviceSize*)m.inArrayAt(
+            A(4), U32A(2), sizeof(VkDeviceSize));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBindVertexBuffers)raw)((VkCommandBuffer)H(0), U32A(1),
+                                          U32A(2), buffers, offsets);
+        return 0;
+    }
+    case VKB_CmdBindVertexBuffers2: {
+        const VkBuffer* buffers =
+            (const VkBuffer*)m.inArrayAt(A(3), U32A(2), sizeof(VkBuffer));
+        const VkDeviceSize* offsets = (const VkDeviceSize*)m.inArrayAt(
+            A(4), U32A(2), sizeof(VkDeviceSize));
+        // pSizes and pStrides are optional even with a non-zero count.
+        const VkDeviceSize* sizes =
+            A(5) ? (const VkDeviceSize*)m.inArrayAt(A(5), U32A(2),
+                                                    sizeof(VkDeviceSize))
+                 : nullptr;
+        const VkDeviceSize* strides =
+            A(6) ? (const VkDeviceSize*)m.inArrayAt(A(6), U32A(2),
+                                                    sizeof(VkDeviceSize))
+                 : nullptr;
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBindVertexBuffers2)raw)((VkCommandBuffer)H(0), U32A(1),
+                                           U32A(2), buffers, offsets, sizes,
+                                           strides);
+        return 0;
+    }
+    case VKB_CmdPushConstants: {
+        // `size` bytes of opaque data, which is exactly what the driver reads.
+        const void* values = m.inArrayAt(A(5), A(4), 1);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPushConstants)raw)((VkCommandBuffer)H(0),
+                                      (VkPipelineLayout)A(1),
+                                      (VkShaderStageFlags)U32A(2), U32A(3),
+                                      U32A(4), values);
+        return 0;
+    }
+
+    // ---- Recording: dynamic state ------------------------------------------
+
+    case VKB_CmdSetViewport: {
+        const VkViewport* viewports =
+            (const VkViewport*)m.inArrayAt(A(3), U32A(2), sizeof(VkViewport));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetViewport)raw)((VkCommandBuffer)H(0), U32A(1), U32A(2),
+                                    viewports);
+        return 0;
+    }
+    case VKB_CmdSetScissor: {
+        const VkRect2D* scissors =
+            (const VkRect2D*)m.inArrayAt(A(3), U32A(2), sizeof(VkRect2D));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetScissor)raw)((VkCommandBuffer)H(0), U32A(1), U32A(2),
+                                   scissors);
+        return 0;
+    }
+    case VKB_CmdSetLineWidth:
+        ((PFN_vkCmdSetLineWidth)raw)((VkCommandBuffer)H(0), F32A(1));
+        return 0;
+    case VKB_CmdSetDepthBias:
+        ((PFN_vkCmdSetDepthBias)raw)((VkCommandBuffer)H(0), F32A(1), F32A(2),
+                                     F32A(3));
+        return 0;
+    case VKB_CmdSetBlendConstants: {
+        // A four-float array, not four float parameters.
+        const float* constants =
+            (const float*)m.inArrayAt(A(1), 4, sizeof(float));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetBlendConstants)raw)((VkCommandBuffer)H(0), constants);
+        return 0;
+    }
+    case VKB_CmdSetDepthBounds:
+        ((PFN_vkCmdSetDepthBounds)raw)((VkCommandBuffer)H(0), F32A(1), F32A(2));
+        return 0;
+    case VKB_CmdSetStencilCompareMask:
+        ((PFN_vkCmdSetStencilCompareMask)raw)(
+            (VkCommandBuffer)H(0), (VkStencilFaceFlags)U32A(1), U32A(2));
+        return 0;
+    case VKB_CmdSetStencilWriteMask:
+        ((PFN_vkCmdSetStencilWriteMask)raw)(
+            (VkCommandBuffer)H(0), (VkStencilFaceFlags)U32A(1), U32A(2));
+        return 0;
+    case VKB_CmdSetStencilReference:
+        ((PFN_vkCmdSetStencilReference)raw)(
+            (VkCommandBuffer)H(0), (VkStencilFaceFlags)U32A(1), U32A(2));
+        return 0;
+    case VKB_CmdSetViewportWithCount: {
+        const VkViewport* viewports =
+            (const VkViewport*)m.inArrayAt(A(2), U32A(1), sizeof(VkViewport));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetViewportWithCount)raw)((VkCommandBuffer)H(0), U32A(1),
+                                             viewports);
+        return 0;
+    }
+    case VKB_CmdSetScissorWithCount: {
+        const VkRect2D* scissors =
+            (const VkRect2D*)m.inArrayAt(A(2), U32A(1), sizeof(VkRect2D));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetScissorWithCount)raw)((VkCommandBuffer)H(0), U32A(1),
+                                            scissors);
+        return 0;
+    }
+    case VKB_CmdSetCullMode:
+        ((PFN_vkCmdSetCullMode)raw)((VkCommandBuffer)H(0),
+                                    (VkCullModeFlags)U32A(1));
+        return 0;
+    case VKB_CmdSetFrontFace:
+        ((PFN_vkCmdSetFrontFace)raw)((VkCommandBuffer)H(0),
+                                     (VkFrontFace)U32A(1));
+        return 0;
+    case VKB_CmdSetPrimitiveTopology:
+        ((PFN_vkCmdSetPrimitiveTopology)raw)((VkCommandBuffer)H(0),
+                                             (VkPrimitiveTopology)U32A(1));
+        return 0;
+    case VKB_CmdSetDepthTestEnable:
+        ((PFN_vkCmdSetDepthTestEnable)raw)((VkCommandBuffer)H(0),
+                                           (VkBool32)U32A(1));
+        return 0;
+    case VKB_CmdSetDepthWriteEnable:
+        ((PFN_vkCmdSetDepthWriteEnable)raw)((VkCommandBuffer)H(0),
+                                            (VkBool32)U32A(1));
+        return 0;
+    case VKB_CmdSetDepthCompareOp:
+        ((PFN_vkCmdSetDepthCompareOp)raw)((VkCommandBuffer)H(0),
+                                          (VkCompareOp)U32A(1));
+        return 0;
+    case VKB_CmdSetDepthBoundsTestEnable:
+        ((PFN_vkCmdSetDepthBoundsTestEnable)raw)((VkCommandBuffer)H(0),
+                                                 (VkBool32)U32A(1));
+        return 0;
+    case VKB_CmdSetStencilTestEnable:
+        ((PFN_vkCmdSetStencilTestEnable)raw)((VkCommandBuffer)H(0),
+                                             (VkBool32)U32A(1));
+        return 0;
+    case VKB_CmdSetStencilOp:
+        ((PFN_vkCmdSetStencilOp)raw)(
+            (VkCommandBuffer)H(0), (VkStencilFaceFlags)U32A(1),
+            (VkStencilOp)U32A(2), (VkStencilOp)U32A(3), (VkStencilOp)U32A(4),
+            (VkCompareOp)U32A(5));
+        return 0;
+    case VKB_CmdSetRasterizerDiscardEnable:
+        ((PFN_vkCmdSetRasterizerDiscardEnable)raw)((VkCommandBuffer)H(0),
+                                                   (VkBool32)U32A(1));
+        return 0;
+    case VKB_CmdSetDepthBiasEnable:
+        ((PFN_vkCmdSetDepthBiasEnable)raw)((VkCommandBuffer)H(0),
+                                           (VkBool32)U32A(1));
+        return 0;
+    case VKB_CmdSetPrimitiveRestartEnable:
+        ((PFN_vkCmdSetPrimitiveRestartEnable)raw)((VkCommandBuffer)H(0),
+                                                  (VkBool32)U32A(1));
+        return 0;
+
+    // ---- Recording: draw and dispatch --------------------------------------
+
+    case VKB_CmdDraw:
+        ((PFN_vkCmdDraw)raw)((VkCommandBuffer)H(0), U32A(1), U32A(2), U32A(3),
+                             U32A(4));
+        return 0;
+    case VKB_CmdDrawIndexed:
+        ((PFN_vkCmdDrawIndexed)raw)((VkCommandBuffer)H(0), U32A(1), U32A(2),
+                                    U32A(3), (int32_t)U32A(4), U32A(5));
+        return 0;
+    case VKB_CmdDrawIndirect:
+        ((PFN_vkCmdDrawIndirect)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                     (VkDeviceSize)A(2), U32A(3), U32A(4));
+        return 0;
+    case VKB_CmdDrawIndexedIndirect:
+        ((PFN_vkCmdDrawIndexedIndirect)raw)((VkCommandBuffer)H(0),
+                                            (VkBuffer)A(1), (VkDeviceSize)A(2),
+                                            U32A(3), U32A(4));
+        return 0;
+    case VKB_CmdDispatch:
+        ((PFN_vkCmdDispatch)raw)((VkCommandBuffer)H(0), U32A(1), U32A(2),
+                                 U32A(3));
+        return 0;
+    case VKB_CmdDispatchIndirect:
+        ((PFN_vkCmdDispatchIndirect)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                         (VkDeviceSize)A(2));
+        return 0;
+    case VKB_CmdDispatchBase:
+        ((PFN_vkCmdDispatchBase)raw)((VkCommandBuffer)H(0), U32A(1), U32A(2),
+                                     U32A(3), U32A(4), U32A(5), U32A(6));
+        return 0;
+
+    // ---- Recording: transfer -----------------------------------------------
+
+    case VKB_CmdCopyBuffer: {
+        const VkBufferCopy* regions = (const VkBufferCopy*)m.inArrayAt(
+            A(4), U32A(3), sizeof(VkBufferCopy));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyBuffer)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                   (VkBuffer)A(2), U32A(3), regions);
+        return 0;
+    }
+    case VKB_CmdCopyImage: {
+        const VkImageCopy* regions =
+            (const VkImageCopy*)m.inArrayAt(A(6), U32A(5), sizeof(VkImageCopy));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyImage)raw)((VkCommandBuffer)H(0), (VkImage)A(1),
+                                  (VkImageLayout)U32A(2), (VkImage)A(3),
+                                  (VkImageLayout)U32A(4), U32A(5), regions);
+        return 0;
+    }
+    case VKB_CmdBlitImage: {
+        const VkImageBlit* regions =
+            (const VkImageBlit*)m.inArrayAt(A(6), U32A(5), sizeof(VkImageBlit));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBlitImage)raw)((VkCommandBuffer)H(0), (VkImage)A(1),
+                                  (VkImageLayout)U32A(2), (VkImage)A(3),
+                                  (VkImageLayout)U32A(4), U32A(5), regions,
+                                  (VkFilter)U32A(7));
+        return 0;
+    }
+    case VKB_CmdCopyBufferToImage: {
+        const VkBufferImageCopy* regions =
+            (const VkBufferImageCopy*)m.inArrayAt(A(5), U32A(4),
+                                                  sizeof(VkBufferImageCopy));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyBufferToImage)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                          (VkImage)A(2),
+                                          (VkImageLayout)U32A(3), U32A(4),
+                                          regions);
+        return 0;
+    }
+    case VKB_CmdCopyImageToBuffer: {
+        const VkBufferImageCopy* regions =
+            (const VkBufferImageCopy*)m.inArrayAt(A(5), U32A(4),
+                                                  sizeof(VkBufferImageCopy));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyImageToBuffer)raw)((VkCommandBuffer)H(0), (VkImage)A(1),
+                                          (VkImageLayout)U32A(2),
+                                          (VkBuffer)A(3), U32A(4), regions);
+        return 0;
+    }
+    case VKB_CmdUpdateBuffer: {
+        // dataSize bytes of opaque data inlined into the command buffer.
+        const void* data = m.inArrayAt(A(4), A(3), 1);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdUpdateBuffer)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                     (VkDeviceSize)A(2), (VkDeviceSize)A(3),
+                                     data);
+        return 0;
+    }
+    case VKB_CmdFillBuffer:
+        ((PFN_vkCmdFillBuffer)raw)((VkCommandBuffer)H(0), (VkBuffer)A(1),
+                                   (VkDeviceSize)A(2), (VkDeviceSize)A(3),
+                                   U32A(4));
+        return 0;
+    case VKB_CmdResolveImage: {
+        const VkImageResolve* regions = (const VkImageResolve*)m.inArrayAt(
+            A(6), U32A(5), sizeof(VkImageResolve));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdResolveImage)raw)((VkCommandBuffer)H(0), (VkImage)A(1),
+                                     (VkImageLayout)U32A(2), (VkImage)A(3),
+                                     (VkImageLayout)U32A(4), U32A(5), regions);
+        return 0;
+    }
+    case VKB_CmdCopyBuffer2: {
+        const VkCopyBufferInfo2* info =
+            (const VkCopyBufferInfo2*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyBuffer2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdCopyImage2: {
+        const VkCopyImageInfo2* info =
+            (const VkCopyImageInfo2*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyImage2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdBlitImage2: {
+        const VkBlitImageInfo2* info =
+            (const VkBlitImageInfo2*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdBlitImage2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdCopyBufferToImage2: {
+        const VkCopyBufferToImageInfo2* info =
+            (const VkCopyBufferToImageInfo2*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyBufferToImage2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdCopyImageToBuffer2: {
+        const VkCopyImageToBufferInfo2* info =
+            (const VkCopyImageToBufferInfo2*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdCopyImageToBuffer2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdResolveImage2: {
+        const VkResolveImageInfo2* info =
+            (const VkResolveImageInfo2*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdResolveImage2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+
+    // ---- Recording: clears --------------------------------------------------
+
+    case VKB_CmdClearColorImage: {
+        const VkClearColorValue* colour =
+            (const VkClearColorValue*)m.inRequired(A(3),
+                                                   sizeof(VkClearColorValue));
+        const VkImageSubresourceRange* ranges =
+            (const VkImageSubresourceRange*)m.inArrayAt(
+                A(5), U32A(4), sizeof(VkImageSubresourceRange));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdClearColorImage)raw)((VkCommandBuffer)H(0), (VkImage)A(1),
+                                        (VkImageLayout)U32A(2), colour,
+                                        U32A(4), ranges);
+        return 0;
+    }
+    case VKB_CmdClearDepthStencilImage: {
+        const VkClearDepthStencilValue* value =
+            (const VkClearDepthStencilValue*)m.inRequired(
+                A(3), sizeof(VkClearDepthStencilValue));
+        const VkImageSubresourceRange* ranges =
+            (const VkImageSubresourceRange*)m.inArrayAt(
+                A(5), U32A(4), sizeof(VkImageSubresourceRange));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdClearDepthStencilImage)raw)(
+            (VkCommandBuffer)H(0), (VkImage)A(1), (VkImageLayout)U32A(2), value,
+            U32A(4), ranges);
+        return 0;
+    }
+    case VKB_CmdClearAttachments: {
+        const VkClearAttachment* attachments =
+            (const VkClearAttachment*)m.inArrayAt(A(2), U32A(1),
+                                                  sizeof(VkClearAttachment));
+        const VkClearRect* rects =
+            (const VkClearRect*)m.inArrayAt(A(4), U32A(3), sizeof(VkClearRect));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdClearAttachments)raw)((VkCommandBuffer)H(0), U32A(1),
+                                         attachments, U32A(3), rects);
+        return 0;
+    }
+
+    // ---- Recording: synchronisation ----------------------------------------
+
+    case VKB_CmdPipelineBarrier: {
+        const VkMemoryBarrier* memory =
+            m.structArrayTyped<VkMemoryBarrier>(A(5), U32A(4), false);
+        const VkBufferMemoryBarrier* buffers =
+            m.structArrayTyped<VkBufferMemoryBarrier>(A(7), U32A(6), false);
+        const VkImageMemoryBarrier* images =
+            m.structArrayTyped<VkImageMemoryBarrier>(A(9), U32A(8), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPipelineBarrier)raw)(
+            (VkCommandBuffer)H(0), (VkPipelineStageFlags)U32A(1),
+            (VkPipelineStageFlags)U32A(2), (VkDependencyFlags)U32A(3), U32A(4),
+            memory, U32A(6), buffers, U32A(8), images);
+        return 0;
+    }
+    case VKB_CmdPipelineBarrier2: {
+        const VkDependencyInfo* info =
+            (const VkDependencyInfo*)m.chain(A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdPipelineBarrier2)raw)((VkCommandBuffer)H(0), info);
+        return 0;
+    }
+    case VKB_CmdSetEvent:
+        ((PFN_vkCmdSetEvent)raw)((VkCommandBuffer)H(0), (VkEvent)A(1),
+                                 (VkPipelineStageFlags)U32A(2));
+        return 0;
+    case VKB_CmdResetEvent:
+        ((PFN_vkCmdResetEvent)raw)((VkCommandBuffer)H(0), (VkEvent)A(1),
+                                   (VkPipelineStageFlags)U32A(2));
+        return 0;
+    case VKB_CmdWaitEvents: {
+        const VkEvent* events =
+            (const VkEvent*)m.inArrayAt(A(2), U32A(1), sizeof(VkEvent));
+        const VkMemoryBarrier* memory =
+            m.structArrayTyped<VkMemoryBarrier>(A(6), U32A(5), false);
+        const VkBufferMemoryBarrier* buffers =
+            m.structArrayTyped<VkBufferMemoryBarrier>(A(8), U32A(7), false);
+        const VkImageMemoryBarrier* images =
+            m.structArrayTyped<VkImageMemoryBarrier>(A(10), U32A(9), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdWaitEvents)raw)(
+            (VkCommandBuffer)H(0), U32A(1), events,
+            (VkPipelineStageFlags)U32A(3), (VkPipelineStageFlags)U32A(4),
+            U32A(5), memory, U32A(7), buffers, U32A(9), images);
+        return 0;
+    }
+    case VKB_CmdSetEvent2: {
+        const VkDependencyInfo* info =
+            (const VkDependencyInfo*)m.chain(A(2), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdSetEvent2)raw)((VkCommandBuffer)H(0), (VkEvent)A(1), info);
+        return 0;
+    }
+    case VKB_CmdResetEvent2:
+        // VkPipelineStageFlags2 is 64 bits wide, so the whole argument word
+        // is the mask rather than its low half.
+        ((PFN_vkCmdResetEvent2)raw)((VkCommandBuffer)H(0), (VkEvent)A(1),
+                                    (VkPipelineStageFlags2)A(2));
+        return 0;
+    case VKB_CmdWaitEvents2: {
+        const VkEvent* events =
+            (const VkEvent*)m.inArrayAt(A(2), U32A(1), sizeof(VkEvent));
+        const VkDependencyInfo* infos =
+            m.structArrayTyped<VkDependencyInfo>(A(3), U32A(1), false);
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdWaitEvents2)raw)((VkCommandBuffer)H(0), U32A(1), events,
+                                    infos);
+        return 0;
+    }
+
+    // ---- Recording: queries and secondary command buffers ------------------
+
+    case VKB_CmdBeginQuery:
+        ((PFN_vkCmdBeginQuery)raw)((VkCommandBuffer)H(0), (VkQueryPool)A(1),
+                                   U32A(2), (VkQueryControlFlags)U32A(3));
+        return 0;
+    case VKB_CmdEndQuery:
+        ((PFN_vkCmdEndQuery)raw)((VkCommandBuffer)H(0), (VkQueryPool)A(1),
+                                 U32A(2));
+        return 0;
+    case VKB_CmdResetQueryPool:
+        ((PFN_vkCmdResetQueryPool)raw)((VkCommandBuffer)H(0),
+                                       (VkQueryPool)A(1), U32A(2), U32A(3));
+        return 0;
+    case VKB_CmdWriteTimestamp:
+        ((PFN_vkCmdWriteTimestamp)raw)((VkCommandBuffer)H(0),
+                                       (VkPipelineStageFlagBits)U32A(1),
+                                       (VkQueryPool)A(2), U32A(3));
+        return 0;
+    case VKB_CmdWriteTimestamp2:
+        ((PFN_vkCmdWriteTimestamp2)raw)((VkCommandBuffer)H(0),
+                                        (VkPipelineStageFlags2)A(1),
+                                        (VkQueryPool)A(2), U32A(3));
+        return 0;
+    case VKB_CmdCopyQueryPoolResults:
+        ((PFN_vkCmdCopyQueryPoolResults)raw)(
+            (VkCommandBuffer)H(0), (VkQueryPool)A(1), U32A(2), U32A(3),
+            (VkBuffer)A(4), (VkDeviceSize)A(5), (VkDeviceSize)A(6),
+            (VkQueryResultFlags)U32A(7));
+        return 0;
+    case VKB_CmdExecuteCommands: {
+        const VkCommandBuffer* buffers = (const VkCommandBuffer*)m.inArrayAt(
+            A(2), U32A(1), sizeof(VkCommandBuffer));
+        if (!m.ok()) {
+            return m.error(false);
+        }
+        ((PFN_vkCmdExecuteCommands)raw)((VkCommandBuffer)H(0), U32A(1),
+                                        buffers);
+        return 0;
+    }
+
     case VKB_CreateXlibSurfaceKHR:
         // Handled before dispatch; unreachable.
         return BOXEDWINE_X64_VK_E_UNIMPL;
@@ -1938,6 +4088,7 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count) {
 #undef A
 #undef H
 #undef U32A
+#undef F32A
 
 // ---- vkGetInstanceProcAddr / vkGetDeviceProcAddr ----------------------------
 
@@ -1974,9 +4125,9 @@ S64 procAddr(KMemory64* memory, U64 handle, U64 nameAddress, U64 inShimTable) {
         const U32 refusals = gRefusals.fetch_add(1, std::memory_order_relaxed);
         if (refusals < kRefusalBudget) {
             klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkGetProcAddr "
-                     "missing=%s handle=0x%llx status=%d",
+                     "missing=%s handle=0x%llx status=%lld",
                      name, (unsigned long long)handle,
-                     BOXEDWINE_X64_VK_E_BADOP);
+                     (long long)BOXEDWINE_X64_VK_E_BADOP);
         }
         return 0;
     }
@@ -1998,9 +4149,9 @@ S64 procAddr(KMemory64* memory, U64 handle, U64 nameAddress, U64 inShimTable) {
         const U32 refusals = gRefusals.fetch_add(1, std::memory_order_relaxed);
         if (refusals < kRefusalBudget) {
             klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=vkGetProcAddr "
-                     "unsupported=%s handle=0x%llx status=%d",
+                     "unsupported=%s handle=0x%llx status=%lld",
                      name, (unsigned long long)handle,
-                     BOXEDWINE_X64_VK_E_NOPROC);
+                     (long long)BOXEDWINE_X64_VK_E_NOPROC);
         }
         return 0;
     }
@@ -2095,8 +4246,9 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
         const int index = commandIndexForOp(op);
         if (index < 0) {
             klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE pid=%u op=%llu name=? "
-                     "status=%d",
-                     pid, (unsigned long long)op, BOXEDWINE_X64_VK_E_BADOP);
+                     "status=%lld",
+                     pid, (unsigned long long)op,
+                     (long long)BOXEDWINE_X64_VK_E_BADOP);
             return (U64)(S64)BOXEDWINE_X64_VK_E_BADOP;
         }
         name = kCommandName[index];
@@ -2108,8 +4260,8 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
                 gRefusals.fetch_add(1, std::memory_order_relaxed);
             if (refusals < kRefusalBudget) {
                 klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=%s pid=%u "
-                         "status=%d reason=native-memory",
-                         name, pid, BOXEDWINE_X64_VK_E_MEMORY);
+                         "status=%lld reason=native-memory",
+                         name, pid, (long long)BOXEDWINE_X64_VK_E_MEMORY);
             }
             return (U64)(S64)BOXEDWINE_X64_VK_E_MEMORY;
         }
@@ -2135,8 +4287,10 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
         }
         writeBack = false; // the marshal wrote the results back itself
 #else
-        klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE pid=%u op=%llu name=? status=%d",
-                 pid, (unsigned long long)op, BOXEDWINE_X64_VK_E_NOHOST);
+        klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE pid=%u op=%llu name=? "
+                 "status=%lld",
+                 pid, (unsigned long long)op,
+                 (long long)BOXEDWINE_X64_VK_E_NOHOST);
         return (U64)(S64)BOXEDWINE_X64_VK_E_NOHOST;
 #endif
     } else {

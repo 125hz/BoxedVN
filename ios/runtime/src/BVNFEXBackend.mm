@@ -2307,6 +2307,22 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     static_cast<unsigned long long>(snapshot.lastSignal),
                     static_cast<unsigned long long>(snapshot.lastFaultAddress),
                     history);
+            // A stalled thread is very often parked in FUTEX_WAIT, and the
+            // register dump says which word it is waiting on but nothing about
+            // whether that wait can ever end: who else is parked, whether the
+            // word still holds what the waiter expects, whether any wake has
+            // named it. The guest futex table answers all three and is
+            // otherwise printed only by the Vulkan first-frame watchdog, which
+            // never arms for a program that wedges before it presents. Bounded
+            // so a thread that stalls repeatedly cannot fill a device's disk.
+            // Safe from here: every sampled thread has been resumed by now, so
+            // this cannot block on a lock held by a suspended thread.
+            {
+                static std::atomic<unsigned> futexSnapshots {0};
+                if (futexSnapshots.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    KThread::logFutexSnapshot();
+                }
+            }
             const auto& gpr = snapshot.guestGPRs;
             reportf("BOXEDWINE_FEX64_STALL_GPRS_A pid=%u tid=%u live_mask=0x%x syscall_info=0x%llx rax=0x%llx rcx=0x%llx rdx=0x%llx rbx=0x%llx rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx",
                     snapshot.processId, snapshot.threadId,

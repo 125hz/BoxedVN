@@ -38,6 +38,7 @@ BRIDGE_HEADER = REPO / "include" / "boxedwine_x64_vulkan_bridge.h"
 VKDEF = REPO / "source" / "vulkan" / "vkdef.h"
 DISPATCHER = REPO / "source" / "vulkan" / "vulkanbridge64.cpp"
 VULKAN_CORE = REPO / "source" / "vulkan" / "vk" / "vulkan_core.h"
+IA32_LANE = REPO / "source" / "vulkan" / "vulkancommon.cpp"
 BUILD_SCRIPT = REPO / "scripts" / "build-boxedwine-x64-vulkan.sh"
 
 _spec = importlib.util.spec_from_file_location(
@@ -93,6 +94,57 @@ def vulkan_struct_names() -> set[str]:
     names = set(re.findall(r"\}\s*(Vk\w+);", text))
     names |= set(re.findall(r"^typedef\s+Vk\w+\s+(Vk\w+);", text, re.MULTILINE))
     return names
+
+def bridge_error_codes() -> dict[str, int]:
+    """Parse BOXEDWINE_X64_VK_E_* out of the ABI header, resolving the base.
+
+    Both spellings are accepted -- base-relative, which is how they are
+    written, and a plain literal, which is how they used to be. Parsing the
+    old form too is the point: a code edited back into a literal has to be
+    judged against the 32-bit floor and reported as too high, not quietly
+    dropped from the table.
+    """
+    text = BRIDGE_HEADER.read_text(encoding="utf-8")
+    base = int(re.search(
+        r"#define BOXEDWINE_X64_VK_E_BASE\s+\((-0x[0-9a-fA-F]+)LL\)",
+        text).group(1), 16)
+    codes = {"BASE": base}
+    for name, offset in re.findall(
+            r"#define BOXEDWINE_X64_VK_E_(\w+)\s+"
+            r"\(BOXEDWINE_X64_VK_E_BASE - (\d+)\)", text):
+        codes[name] = base - int(offset)
+    for name, literal in re.findall(
+            r"#define BOXEDWINE_X64_VK_E_(\w+)\s+\((-(?:0x)?[0-9a-fA-F]+)L*\)",
+            text):
+        if name == "BASE":
+            continue
+        codes[name] = int(literal, 16 if literal.startswith("-0x") else 10)
+    return codes
+
+
+def vulkan_result_values() -> set[int]:
+    """Every VkResult vulkan_core.h defines, successes and errors alike."""
+    text = VULKAN_CORE.read_text(encoding="utf-8")
+    block = text[text.index("typedef enum VkResult {"):]
+    block = block[:block.index("} VkResult;")]
+    return {int(v) for v in re.findall(r"=\s*(-?\d+)", block)}
+
+
+def klog_calls(source: str) -> list[str]:
+    """Every klog_fmt(...) statement in `source`, parens balanced."""
+    calls = []
+    for start in (m.end() - 1 for m in re.finditer(r"klog_fmt\s*\(", source)):
+        depth = 0
+        for i in range(start, len(source)):
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    calls.append(source[start:i + 1])
+                    break
+    return calls
+
 
 
 class CommandTableContract(unittest.TestCase):
@@ -161,6 +213,33 @@ class GuestShimContract(unittest.TestCase):
             with self.subTest(alias=alias):
                 self.assertIn("vk" + core, self.defined)
                 self.assertIn(core, self.commands)
+
+    def test_no_entry_point_packs_more_words_than_the_bridge_accepts(self) -> None:
+        # The host refuses a count above BOXEDWINE_X64_VK_MAX_ARGS outright, so
+        # an entry point that packs one word too many is a command that always
+        # answers BOXEDWINE_X64_VK_E_ARGS -- and nothing but a device run would
+        # say so. vkCmdWaitEvents is the widest at eleven.
+        header = BRIDGE_HEADER.read_text(encoding="utf-8")
+        limit = int(re.search(r"#define BOXEDWINE_X64_VK_MAX_ARGS\s+(\d+)U",
+                              header).group(1))
+        source = SHIM_SOURCE.read_text(encoding="utf-8")
+        for match in re.finditer(r"\bBW_[RVB]\s*\(", source):
+            start = match.end() - 1
+            depth = 0
+            fields = 1
+            for i in range(start, len(source)):
+                if source[i] in "([":
+                    depth += 1
+                elif source[i] in ")]":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif source[i] == "," and depth == 1:
+                    fields += 1
+            # The first field is the operation name, not an argument word.
+            words = fields - 1
+            with self.subTest(call=source[match.start():start + 40]):
+                self.assertLessEqual(words, limit)
 
     def test_the_shim_traps_with_the_syscall_instruction(self) -> None:
         header = BRIDGE_HEADER.read_text(encoding="utf-8")
@@ -337,6 +416,289 @@ class MarshalContract(unittest.TestCase):
         self.assertNotIn("VkAllocationCallbacks", self.source)
 
 
+class SurfaceExtensionContract(unittest.TestCase):
+    """The platform surface extension is translated in both directions.
+
+    Wine's winevulkan asks winex11.drv which host surface extension to use and
+    substitutes that name for the application's VK_KHR_win32_surface before the
+    call reaches this bridge. winex11.drv is an X11 driver, so the name that
+    arrives is VK_KHR_xlib_surface -- which MoltenVK does not have. A device run
+    showed the consequence precisely: Wine's own adapter probe succeeded (it
+    enables no surface extension), and DXVK's vkCreateInstance came back
+    VK_ERROR_EXTENSION_NOT_PRESENT the moment it asked for a surface. The IA-32
+    lane has always translated; these tests hold the 64-bit lane to the same
+    contract, and to the same spellings.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+        self.ia32 = IA32_LANE.read_text(encoding="utf-8")
+
+    def enumerate_case(self) -> str:
+        start = self.source.index("case VKB_EnumerateInstanceExtensionProperties:")
+        return self.source[start:self.source.index("case VKB_CreateInstance:", start)]
+
+    def create_instance_case(self) -> str:
+        start = self.source.index("case VKB_CreateInstance:")
+        return self.source[start:self.source.index("case VKB_DestroyInstance:", start)]
+
+    def test_both_directions_exist(self) -> None:
+        self.assertIn("renameHostSurfaceExtension", self.enumerate_case())
+        self.assertIn("substituteHostSurfaceExtension", self.create_instance_case())
+
+    def test_the_guest_facing_name_matches_the_ia32_lane(self) -> None:
+        # Both lanes report the same name to Wine, because both are serving
+        # the same winex11.drv.
+        self.assertIn('kGuestSurfaceExtension = "VK_KHR_xlib_surface"', self.source)
+        self.assertIn('"VK_KHR_xlib_surface"', self.ia32)
+
+    def ia32_create_instance(self) -> str:
+        start = self.ia32.index("void vk_CreateInstance(")
+        return self.ia32[start:self.ia32.index("void vk_DestroyInstance2(", start)]
+
+    def test_the_ios_host_name_matches_the_ia32_lane(self) -> None:
+        # SDL's UIKit Vulkan backend is a CAMetalLayer, so both lanes hand
+        # MoltenVK VK_EXT_metal_surface and not VK_MVK_macos_surface.
+        block = self.source[self.source.index("#if defined(BOXEDWINE_IOS)"):]
+        block = block[:block.index("#elif")]
+        self.assertIn('"VK_EXT_metal_surface"', block)
+        ia32 = self.ia32_create_instance()
+        ios = ia32[ia32.index("#ifdef BOXEDWINE_IOS"):]
+        ios = ios[:ios.index("#elif")]
+        self.assertIn('"VK_EXT_metal_surface"', ios)
+
+    def test_every_name_the_ia32_lane_recognises_is_recognised_here(self) -> None:
+        # vulkancommon.cpp's enumeration accepts these three as "the host's
+        # platform surface"; a name it would have translated and this lane
+        # would not is a device that works on one lane and not the other.
+        aliases = self.source[self.source.index("kHostSurfaceAliases[] = {"):]
+        aliases = aliases[:aliases.index("};")]
+        for name in ("VK_EXT_metal_surface", "VK_MVK_macos_surface",
+                     "VK_KHR_win32_surface"):
+            with self.subTest(name=name):
+                self.assertIn(name, aliases)
+
+    def test_moltenvks_second_surface_spelling_is_recognised(self) -> None:
+        # MoltenVK reports VK_EXT_metal_surface AND VK_MVK_ios_surface. Both
+        # have to be recognised, and exactly one entry may ever be renamed, or
+        # the reported list carries VK_KHR_xlib_surface twice.
+        aliases = self.source[self.source.index("kHostSurfaceAliases[] = {"):]
+        aliases = aliases[:aliases.index("};")]
+        self.assertIn("VK_MVK_ios_surface", aliases)
+        body = self.source[self.source.index("U32 renameHostSurfaceExtension("):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("return 1;", body)
+        self.assertNotIn("++renamed", body)
+
+    def test_the_rename_cannot_change_the_property_count(self) -> None:
+        # The two-call idiom: the first call passes a null array and only the
+        # count comes back, so a rename that added a name would make the two
+        # calls disagree and overrun the caller's array.
+        body = self.source[self.source.index("U32 renameHostSurfaceExtension("):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("if (!properties || !count)", body)
+        case = self.enumerate_case()
+        after = case[case.index("PFN_vkEnumerateInstanceExtensionProperties)raw"):]
+        self.assertNotIn("*countSlot =", after,
+                         "the count the driver reported must reach the guest "
+                         "unchanged")
+
+    def test_the_rename_is_bounded_by_what_the_driver_wrote(self) -> None:
+        # The shadow array is sized from the caller's capacity; the driver may
+        # write fewer and return VK_INCOMPLETE.
+        case = self.enumerate_case()
+        self.assertIn("const U32 capacity", case)
+        self.assertIn("VK_INCOMPLETE", case)
+        self.assertIn("written", case)
+
+    def test_the_substitution_happens_before_the_driver_call(self) -> None:
+        case = self.create_instance_case()
+        self.assertLess(case.index("substituteHostSurfaceExtension"),
+                        case.index("PFN_vkCreateInstance)raw"))
+
+    def test_there_is_no_device_level_translation(self) -> None:
+        # Every platform surface extension is instance-level. A rewrite in a
+        # device-level call would corrupt a device extension list, and the
+        # IA-32 lane does not do one either: both of its rewrites live in
+        # vk_CreateInstance and vk_EnumerateInstanceExtensionProperties.
+        for marker in ("case VKB_CreateDevice:",
+                       "case VKB_EnumerateDeviceExtensionProperties:"):
+            with self.subTest(case=marker):
+                start = self.source.index(marker)
+                body = self.source[start:start + 900]
+                self.assertNotIn("SurfaceExtension", body)
+        instance_only = (self.ia32_create_instance()
+                         + self.ia32[self.ia32.index(
+                             "void vk_EnumerateInstanceExtensionProperties("):][:2500])
+        self.assertEqual(self.ia32.count('"VK_KHR_xlib_surface"'),
+                         instance_only.count('"VK_KHR_xlib_surface"'))
+
+    def test_a_driver_with_no_platform_surface_is_named_not_ignored(self) -> None:
+        # DXVK only asks for extensions the enumeration claimed, so a missing
+        # platform surface surfaces as an unexplained failure much later.
+        self.assertIn("status=no-platform-surface", self.source)
+
+
+class InstanceLifetimeContract(unittest.TestCase):
+    """vkDestroyInstance must not answer BOXEDWINE_X64_VK_E_NOPROC.
+
+    MoltenVK is the driver directly, with no Khronos loader, so
+    vkGetInstanceProcAddr(VK_NULL_HANDLE, name) answers only for the four
+    global commands. An earlier revision resolved every command through a
+    single "current instance" that vkDestroyInstance cleared, so a second
+    vkDestroyInstance -- which Wine's adapter probe issues -- had nothing left
+    to resolve through and came back -8 for a command that returns void.
+    """
+
+    def setUp(self) -> None:
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+
+    def test_the_bridge_tracks_live_instances(self) -> None:
+        for symbol in ("gLiveInstances", "instanceIsLive", "noteInstanceCreated",
+                       "forgetInstance"):
+            with self.subTest(symbol=symbol):
+                self.assertIn(symbol, self.source)
+
+    def test_resolution_can_use_the_instance_a_command_carries(self) -> None:
+        # vkDestroyInstance has to resolve while the instance it is about to
+        # destroy is still the only live one.
+        self.assertIn("PFN_vkVoidFunction hostProc(int index, VkInstance resolveWith)",
+                      self.source)
+        self.assertIn("resolutionInstance", self.source)
+        body = self.source[self.source.index("VkInstance resolutionInstance("):]
+        body = body[:body.index("\n}\n")]
+        for command in ("VKB_DestroyInstance", "VKB_EnumeratePhysicalDevices",
+                        "VKB_DestroySurfaceKHR"):
+            with self.subTest(command=command):
+                self.assertIn(command, body)
+
+    def test_a_destroy_of_a_dead_instance_is_settled_before_resolution(self) -> None:
+        # Both because resolution would dereference the stale handle, and
+        # because the NOPROC guard sits between the two.
+        body = self.source[self.source.index("S64 dispatchCommand("):]
+        body = body[:body.index("switch (index) {")]
+        self.assertIn("instanceIsLive", body)
+        self.assertLess(body.index("instanceIsLive"),
+                        body.index("BOXEDWINE_X64_VK_E_NOPROC"),
+                        "the liveness check must come before the NOPROC guard, "
+                        "or a second vkDestroyInstance is still answered -8")
+        self.assertIn("status=not-live", body)
+
+    def test_a_destroy_of_a_dead_instance_reports_success(self) -> None:
+        # vkDestroyInstance returns void; there is no error to report and none
+        # may be invented, because the guest reads the word back as a VkResult
+        # for the commands that do have one.
+        body = self.source[self.source.index("S64 dispatchCommand("):]
+        body = body[:body.index("switch (index) {")]
+        tail = body[body.index("status=not-live"):]
+        self.assertIn("return 0;", tail)
+
+    def test_destroying_an_instance_repoints_rather_than_clears(self) -> None:
+        # A second live instance must keep resolving after the first goes.
+        body = self.source[self.source.index("bool forgetInstance("):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("gInstance = gLiveInstances[i]", body)
+        # The dispatch switch's own case, not resolutionInstance's.
+        switch = self.source[self.source.index("S64 dispatchCommand("):]
+        switch = switch[switch.index("switch (index) {"):]
+        case = switch[switch.index("case VKB_DestroyInstance:"):]
+        case = case[:case.index("case VKB_EnumeratePhysicalDevices:")]
+        self.assertIn("forgetInstance", case)
+        self.assertNotIn("gInstance = VK_NULL_HANDLE", case,
+                         "clearing the current instance inline is what stranded "
+                         "every instance-level command")
+
+
+class BridgeErrorCodeContract(unittest.TestCase):
+    """A bridge refusal must never be readable as a VkResult.
+
+    The codes were -1 through -8, on a comment's claim that the Vulkan errors
+    were "far from these". The core VkResult errors are -1 to -13, so every
+    bridge code had a VkResult sitting on top of it. A device log is the only
+    diagnostic channel this lane has, and two investigations began by reading
+    `status=-7` as VK_ERROR_EXTENSION_NOT_PRESENT and `status=-8` as
+    VK_ERROR_FEATURE_NOT_PRESENT when both were bridge refusals. These tests
+    make that class of confusion unrepresentable rather than merely unlikely.
+    """
+
+    def setUp(self) -> None:
+        self.codes = bridge_error_codes()
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+
+    def test_every_code_is_below_the_32_bit_floor(self) -> None:
+        # VkResult is a 32-bit signed enum and this hostcall returns a 64-bit
+        # word, so "does not fit in an int32" is an exact test that no future
+        # Vulkan header can invalidate -- unlike "is not currently used".
+        int32_min = -(2 ** 31)
+        for name, value in sorted(self.codes.items()):
+            with self.subTest(code=name):
+                self.assertLess(value, int32_min,
+                                f"BOXEDWINE_X64_VK_E_{name} ({value}) is "
+                                "inside the range a VkResult can hold")
+
+    def test_no_code_collides_with_a_vkresult(self) -> None:
+        results = vulkan_result_values()
+        self.assertIn(-7, results)   # the collision that started this
+        self.assertIn(-8, results)
+        for name, value in sorted(self.codes.items()):
+            with self.subTest(code=name):
+                self.assertNotIn(value, results)
+
+    def test_the_codes_are_distinct(self) -> None:
+        values = sorted(self.codes.values())
+        self.assertEqual(len(values), len(set(values)))
+
+    def test_the_table_is_complete(self) -> None:
+        for name in ("BADOP", "BUFFER", "FAULT", "ARGS", "UNIMPL", "NOHOST",
+                     "MEMORY", "NOPROC"):
+            with self.subTest(code=name):
+                self.assertIn(name, self.codes)
+
+    def test_the_historical_ordinal_is_recoverable(self) -> None:
+        # An old log printed -7; the base minus the new code still gives 7, so
+        # a pre-existing log stays readable against the current header.
+        base = self.codes["BASE"]
+        for name, value in sorted(self.codes.items()):
+            if name == "BASE":
+                continue
+            with self.subTest(code=name):
+                self.assertIn(base - value, range(1, 9))
+
+    def test_a_predicate_exists_for_telling_the_two_apart(self) -> None:
+        header = BRIDGE_HEADER.read_text(encoding="utf-8")
+        self.assertIn("#define BOXEDWINE_X64_VK_IS_ERROR(result)", header)
+        self.assertIn("BOXEDWINE_X64_VK_E_BASE", header)
+
+    def test_the_guest_shim_never_hands_a_refusal_to_the_application(self) -> None:
+        # Every entry point narrows the 64-bit word to a 32-bit VkResult. A
+        # refusal reaching that cast arrives at the application as whatever
+        # falls out of the truncation.
+        shim = SHIM_SOURCE.read_text(encoding="utf-8")
+        call = shim[shim.index("static int64_t bw_call("):]
+        call = call[:call.index("\n}\n")]
+        self.assertIn("BOXEDWINE_X64_VK_IS_ERROR", call)
+        self.assertIn("VK_ERROR_INITIALIZATION_FAILED", call)
+
+    def test_every_logged_code_uses_a_64_bit_conversion(self) -> None:
+        # The codes are long long now. Passing one to %d reads the wrong
+        # number of bytes off the varargs list, which would corrupt the very
+        # log line the renumbering exists to make readable.
+        for call in klog_calls(self.source):
+            if "BOXEDWINE_X64_VK_E_" not in call:
+                continue
+            with self.subTest(call=call.split(",")[0][:60]):
+                self.assertIn("(long long)BOXEDWINE_X64_VK_E_", call,
+                              "a bridge code must be widened explicitly")
+                self.assertNotIn("status=%d", call,
+                                 "a bridge code needs %lld, not %d")
+
+    def test_the_abi_version_was_bumped_for_the_new_range(self) -> None:
+        header = BRIDGE_HEADER.read_text(encoding="utf-8")
+        version = int(re.search(
+            r"#define BOXEDWINE_X64_VK_ABI_VERSION\s+(\d+)U", header).group(1))
+        self.assertGreaterEqual(version, 4)
+
+
 class NewCommandContract(unittest.TestCase):
     """The commands the marshal work added, and the ABI bump that names them."""
 
@@ -389,6 +751,385 @@ class NewCommandContract(unittest.TestCase):
         version = int(re.search(
             r"#define BOXEDWINE_X64_VK_ABI_VERSION\s+(\d+)U", text).group(1))
         self.assertGreaterEqual(version, 3)
+
+
+class RecordingHalfContract(unittest.TestCase):
+    """The command-recording half: everything DXVK needs between a device and a
+    presented frame.
+
+    Device logs had DXVK reaching instance creation and then a device, at which
+    point it records command buffers -- and the bridge carried not one vkCmd*,
+    no command pool, no pipeline and no descriptor. Every command below is on
+    that path. The tests are shaped like the rest of this file: they hold the
+    four files together, and they pin the handful of marshalling decisions that
+    are not mechanical.
+    """
+
+    def setUp(self) -> None:
+        self.commands = bridge_commands()
+        self.source = DISPATCHER.read_text(encoding="utf-8")
+        self.shim = SHIM_SOURCE.read_text(encoding="utf-8")
+        self.pairs = chain_structs()
+
+    def case_body(self, name: str) -> str:
+        """The dispatcher's case for one command, up to the next case label."""
+        start = self.source.index(f"case VKB_{name}:")
+        rest = self.source[start + 1:]
+        end = re.search(r"^\s*case VKB_\w+:", rest, re.MULTILINE)
+        return rest[:end.start()] if end else rest
+
+    def test_the_command_buffer_lifecycle_is_present(self) -> None:
+        for name in ("CreateCommandPool", "DestroyCommandPool",
+                     "ResetCommandPool", "AllocateCommandBuffers",
+                     "FreeCommandBuffers", "BeginCommandBuffer",
+                     "EndCommandBuffer", "ResetCommandBuffer", "QueueSubmit",
+                     "QueueSubmit2", "QueueWaitIdle", "DeviceWaitIdle"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_the_synchronisation_objects_are_present(self) -> None:
+        for name in ("CreateFence", "DestroyFence", "ResetFences",
+                     "GetFenceStatus", "WaitForFences", "CreateSemaphore",
+                     "DestroySemaphore", "GetSemaphoreCounterValue",
+                     "WaitSemaphores", "SignalSemaphore", "CreateEvent",
+                     "DestroyEvent", "GetEventStatus", "SetEvent",
+                     "ResetEvent"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_the_resource_and_descriptor_objects_are_present(self) -> None:
+        for name in ("CreateBufferView", "DestroyBufferView", "CreateSampler",
+                     "DestroySampler", "CreateShaderModule",
+                     "DestroyShaderModule", "CreatePipelineCache",
+                     "DestroyPipelineCache", "GetPipelineCacheData",
+                     "MergePipelineCaches", "CreatePipelineLayout",
+                     "DestroyPipelineLayout", "CreateDescriptorSetLayout",
+                     "DestroyDescriptorSetLayout",
+                     "GetDescriptorSetLayoutSupport", "CreateDescriptorPool",
+                     "DestroyDescriptorPool", "ResetDescriptorPool",
+                     "AllocateDescriptorSets", "FreeDescriptorSets",
+                     "UpdateDescriptorSets", "CreateDescriptorUpdateTemplate",
+                     "DestroyDescriptorUpdateTemplate",
+                     "UpdateDescriptorSetWithTemplate", "CreateRenderPass",
+                     "CreateRenderPass2", "DestroyRenderPass",
+                     "CreateFramebuffer", "DestroyFramebuffer",
+                     "CreateQueryPool", "DestroyQueryPool",
+                     "GetQueryPoolResults", "ResetQueryPool"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_both_pipeline_constructors_are_present(self) -> None:
+        for name in ("CreateGraphicsPipelines", "CreateComputePipelines",
+                     "DestroyPipeline"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_the_frame_recording_commands_are_present(self) -> None:
+        # A frame: begin a scope, bind, set the dynamic state, draw, barrier,
+        # end. Every one of these appears in a DXVK frame.
+        for name in ("CmdBeginRenderPass", "CmdEndRenderPass",
+                     "CmdBeginRenderPass2", "CmdEndRenderPass2",
+                     "CmdBeginRendering", "CmdEndRendering", "CmdBindPipeline",
+                     "CmdBindDescriptorSets", "CmdBindIndexBuffer",
+                     "CmdBindVertexBuffers", "CmdBindVertexBuffers2",
+                     "CmdSetViewport", "CmdSetScissor", "CmdSetBlendConstants",
+                     "CmdSetStencilReference", "CmdSetViewportWithCount",
+                     "CmdSetScissorWithCount", "CmdSetCullMode",
+                     "CmdSetFrontFace", "CmdSetPrimitiveTopology",
+                     "CmdSetDepthTestEnable", "CmdSetStencilOp", "CmdDraw",
+                     "CmdDrawIndexed", "CmdDrawIndirect",
+                     "CmdDrawIndexedIndirect", "CmdDispatch",
+                     "CmdDispatchIndirect", "CmdCopyBuffer", "CmdCopyImage",
+                     "CmdBlitImage", "CmdCopyBufferToImage",
+                     "CmdCopyImageToBuffer", "CmdCopyBuffer2", "CmdCopyImage2",
+                     "CmdBlitImage2", "CmdResolveImage", "CmdResolveImage2",
+                     "CmdClearAttachments", "CmdClearColorImage",
+                     "CmdClearDepthStencilImage", "CmdPipelineBarrier",
+                     "CmdPipelineBarrier2", "CmdPushConstants",
+                     "CmdBeginQuery", "CmdEndQuery", "CmdResetQueryPool",
+                     "CmdWriteTimestamp", "CmdCopyQueryPoolResults",
+                     "CmdExecuteCommands"):
+            with self.subTest(command=name):
+                self.assertIn(name, self.commands)
+
+    def test_the_deliberate_omissions_stay_omitted(self) -> None:
+        # Each of these is named in the header with the reason it is absent. A
+        # half-marshalled version of any of them would be worse than none: the
+        # first three need an entry list or a feature bit this bridge cannot
+        # see, and the last is a D3D11/12 path.
+        for name in ("CmdPushDescriptorSet", "CmdPushDescriptorSetWithTemplate",
+                     "CmdSetVertexInputEXT", "CmdSetColorBlendEnableEXT",
+                     "CmdDrawIndirectCount", "CmdDrawIndexedIndirectCount",
+                     "QueueBindSparse"):
+            with self.subTest(command=name):
+                self.assertNotIn(name, self.commands)
+        header = BRIDGE_HEADER.read_text(encoding="utf-8")
+        for reason in ("VK_KHR_push_descriptor", "vkCmdSetVertexInputEXT",
+                       "VK_KHR_draw_indirect_count", "vkQueueBindSparse"):
+            with self.subTest(reason=reason):
+                self.assertIn(reason, header,
+                              "an omission has to be recorded with its reason")
+
+    def test_the_recording_structures_are_all_in_the_chain_table(self) -> None:
+        # A structure absent from the table is dropped from its chain, which
+        # for a create-info the command NAMES means the command is handed
+        # nothing at all.
+        listed = {stype for stype, _struct in self.pairs}
+        for stype in (
+                "VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO",
+                "VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO",
+                "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO",
+                "VK_STRUCTURE_TYPE_SUBMIT_INFO_2",
+                "VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO",
+                "VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO",
+                "VK_STRUCTURE_TYPE_EVENT_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO",
+                "VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET",
+                "VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET",
+                "VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2",
+                "VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2",
+                "VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2",
+                "VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO",
+                "VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO",
+                "VK_STRUCTURE_TYPE_RENDERING_INFO",
+                "VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO",
+                "VK_STRUCTURE_TYPE_MEMORY_BARRIER",
+                "VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER",
+                "VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER",
+                "VK_STRUCTURE_TYPE_DEPENDENCY_INFO",
+                "VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2",
+                "VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2",
+                "VK_STRUCTURE_TYPE_BUFFER_COPY_2"):
+            with self.subTest(stype=stype):
+                self.assertIn(stype, listed)
+
+    def test_dxvk_2x_dynamic_rendering_and_library_nodes_are_carried(self) -> None:
+        # DXVK 2.x builds pipelines with dynamic rendering and, where the
+        # driver has it, graphics pipeline libraries. Dropping either node
+        # would hand MoltenVK a pipeline that describes a different frame.
+        listed = {stype for stype, _struct in self.pairs}
+        for stype in ("VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO",
+                      "VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT",
+                      "VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR",
+                      "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO"):
+            with self.subTest(stype=stype):
+                self.assertIn(stype, listed)
+
+    def test_a_write_descriptor_set_selects_one_array_and_nulls_the_rest(self) -> None:
+        # VkWriteDescriptorSet's three payload pointers are read one at a time,
+        # chosen by descriptorType; the other two are ignored and hold whatever
+        # the caller left there. Forwarding an ignored one would hand MoltenVK
+        # a guest address.
+        body = self.source[
+            self.source.index("case (U32)VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET:"):]
+        body = body[:body.index(
+            "case (U32)VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK:")]
+        for member in ("pImageInfo", "pBufferInfo", "pTexelBufferView"):
+            with self.subTest(member=member):
+                self.assertIn(f"info->{member} =", body)
+        for descriptor_type in ("VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER",
+                                "VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER",
+                                "VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC",
+                                "VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER",
+                                "VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK"):
+            with self.subTest(descriptor_type=descriptor_type):
+                self.assertIn(descriptor_type, body)
+        # And a type it cannot size is a refusal, not a guess.
+        self.assertIn("unsized-descriptor-type", body)
+
+    def test_an_immutable_sampler_array_is_read_only_where_it_is_defined(self) -> None:
+        # pImmutableSamplers is ignored -- and therefore uninitialised -- for
+        # every descriptor type but the two sampler ones.
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO:"):]
+        body = body[:body.index("break;\n    }") + 12]
+        self.assertIn("VK_DESCRIPTOR_TYPE_SAMPLER", body)
+        self.assertIn("VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER", body)
+        self.assertIn("pImmutableSamplers = nullptr", body)
+
+    def test_the_update_template_span_is_recorded_and_then_required(self) -> None:
+        # vkUpdateDescriptorSetWithTemplate's pData has no length in the call:
+        # it is described by the entries the template was created with. So the
+        # span is measured at creation and an update through a template the
+        # bridge has no span for is refused by name.
+        for symbol in ("templateDataSpan", "noteTemplateCreated",
+                       "templateDataBytes", "forgetTemplate",
+                       "descriptorElementSize"):
+            with self.subTest(symbol=symbol):
+                self.assertIn(symbol, self.source)
+        create = self.case_body("CreateDescriptorUpdateTemplate")
+        self.assertIn("noteTemplateCreated", create)
+        update = self.case_body("UpdateDescriptorSetWithTemplate")
+        self.assertIn("templateDataBytes", update)
+        self.assertIn("status=no-span", update)
+        self.assertLess(update.index("templateDataBytes"),
+                        update.index("PFN_vkUpdateDescriptorSetWithTemplate"),
+                        "the span has to be known before the copy")
+        destroy = self.case_body("DestroyDescriptorUpdateTemplate")
+        self.assertIn("forgetTemplate", destroy)
+
+    def test_an_extensible_array_never_goes_through_the_flat_copy(self) -> None:
+        # A barrier, a submit info and a pipeline create info are all
+        # extensible: copying an array of them with the flat inArray/inArrayAt
+        # would leave every element's pNext pointing at guest memory.
+        # structArrayTyped is the one that mirrors each element's own chain.
+        for command in ("CmdPipelineBarrier", "CmdWaitEvents",
+                        "CmdWaitEvents2", "UpdateDescriptorSets",
+                        "QueueSubmit2", "CreateGraphicsPipelines",
+                        "CreateComputePipelines"):
+            with self.subTest(command=command):
+                self.assertIn("structArrayTyped", self.case_body(command))
+        # And the general form of the rule, over the whole dispatcher: nothing
+        # the chain table calls extensible may be the element type of a flat
+        # copy. This catches the next one as well as these.
+        extensible = {struct for _stype, struct in self.pairs}
+        for call in re.findall(
+                r"\(const (Vk\w+)\*\)\s*m\.inArray(?:At)?\(", self.source):
+            with self.subTest(element=call):
+                self.assertNotIn(
+                    call, extensible,
+                    f"{call} is an extensible structure; an array of them has "
+                    "to go through structArrayTyped so each element's pNext "
+                    "is mirrored")
+
+    def test_a_specialization_constant_block_is_sized_by_its_own_field(self) -> None:
+        # VkSpecializationInfo::pData is opaque bytes whose only length is
+        # dataSize, and VkSpecializationInfo has no sType, so it cannot go
+        # through the chain walker.
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO:"):]
+        body = body[:body.index("case (U32)VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT")]
+        self.assertIn("VkSpecializationInfo", body)
+        self.assertIn("mapEntryCount", body)
+        self.assertIn("dataSize", body)
+        self.assertIn("info->pName = string(", body)
+
+    def test_a_sample_mask_is_sized_from_the_sample_count(self) -> None:
+        # ceil(rasterizationSamples / 32) words. A fixed size would either read
+        # past the caller's array or short the driver.
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO:")]
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO:"):]
+        body = body[:body.index("case (U32)VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND")]
+        self.assertIn("rasterizationSamples", body)
+        self.assertIn("+ 31u) / 32u", body)
+
+    def test_an_optional_array_is_distinguished_from_a_required_one(self) -> None:
+        # pViewports is null whenever the viewport is dynamic, which is how
+        # DXVK builds every pipeline; treating that as a bad pointer would
+        # refuse every pipeline creation.
+        self.assertIn("inArrayOptional", self.source)
+        for marker in ("VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO",
+                       "VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO"):
+            with self.subTest(structure=marker):
+                body = self.source[self.source.index(f"case (U32){marker}:"):]
+                body = body[:body.index("break;")]
+                self.assertIn("inArrayOptional", body)
+
+    def test_the_compute_stage_is_marshalled_as_an_embedded_structure(self) -> None:
+        # VkComputePipelineCreateInfo::stage is a whole
+        # VkPipelineShaderStageCreateInfo by value; its pNext and its pName and
+        # pSpecializationInfo still have to be marshalled.
+        self.assertIn("void embedded(void* host, U32 sType)", self.source)
+        body = self.source[self.source.index(
+            "case (U32)VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO:"):]
+        body = body[:body.index("break;")]
+        self.assertIn("embedded(&info->stage", body)
+
+    def test_a_float_parameter_crosses_as_its_bit_pattern(self) -> None:
+        # Casting a float to uint64_t rounds it: a line width of 1.5 would
+        # arrive as 1. Both halves reinterpret the object representation
+        # instead, and both have to, or the two disagree silently.
+        self.assertIn("static uint64_t bw_f32(float value)", self.shim)
+        self.assertIn("memcpy(&bits, &value, sizeof bits)", self.shim)
+        self.assertIn("float f32(U64 word)", self.source)
+        self.assertIn("::memcpy(&value, &bits, sizeof(value))", self.source)
+        for command in ("CmdSetLineWidth", "CmdSetDepthBias",
+                        "CmdSetDepthBounds"):
+            with self.subTest(command=command):
+                self.assertIn("F32A(", self.case_body(command))
+        # vkCmdSetBlendConstants takes an ARRAY of four floats, which is a
+        # pointer and therefore a marshalled block rather than four words.
+        blend = self.case_body("CmdSetBlendConstants")
+        self.assertNotIn("F32A(", blend)
+        self.assertIn("inArrayAt(A(1), 4, sizeof(float))", blend)
+
+    def test_every_new_create_command_forces_a_null_allocator(self) -> None:
+        for command in ("PFN_vkCreateCommandPool", "PFN_vkCreateShaderModule",
+                        "PFN_vkCreateGraphicsPipelines",
+                        "PFN_vkCreateComputePipelines",
+                        "PFN_vkCreateDescriptorPool", "PFN_vkCreateRenderPass2",
+                        "PFN_vkCreateFramebuffer", "PFN_vkCreateSampler",
+                        "PFN_vkCreateDescriptorUpdateTemplate"):
+            with self.subTest(command=command):
+                index = self.source.index(command)
+                self.assertIn("nullptr", self.source[index:index + 400])
+
+    def test_an_output_array_sized_by_its_create_info_is_sized_after_the_copy(self) -> None:
+        # vkAllocateCommandBuffers and vkAllocateDescriptorSets take the length
+        # of their output array from a field of the create info, which is only
+        # readable once the info has been copied into the shadow.
+        for command in ("AllocateCommandBuffers", "AllocateDescriptorSets"):
+            with self.subTest(command=command):
+                body = self.case_body(command)
+                self.assertLess(body.index("m.chain(A(1), false)"),
+                                body.index("m.outRequired("))
+                self.assertIn("A(2),", body)
+
+    def test_the_abi_was_bumped_for_the_recording_half(self) -> None:
+        # A container holding a shim built for 4 has no entry point for any of
+        # these, and answering NULL for vkCmdDraw reads as a driver that cannot
+        # record rather than as a stale container.
+        header = BRIDGE_HEADER.read_text(encoding="utf-8")
+        version = int(re.search(
+            r"#define BOXEDWINE_X64_VK_ABI_VERSION\s+(\d+)U", header).group(1))
+        self.assertGreaterEqual(version, 5)
+
+    def test_every_recording_alias_resolves_to_a_command(self) -> None:
+        # DXVK asks for the KHR/EXT spelling whenever it enabled the extension
+        # rather than the core version, which on a 1.0 or 1.1 instance is most
+        # of them.
+        aliases = validator.read_bridge_aliases(BRIDGE_HEADER)
+        for alias, core in (
+                ("CmdBeginRenderingKHR", "CmdBeginRendering"),
+                ("CmdEndRenderingKHR", "CmdEndRendering"),
+                ("CmdPipelineBarrier2KHR", "CmdPipelineBarrier2"),
+                ("QueueSubmit2KHR", "QueueSubmit2"),
+                ("CmdCopyBuffer2KHR", "CmdCopyBuffer2"),
+                ("CmdBlitImage2KHR", "CmdBlitImage2"),
+                ("CmdSetCullModeEXT", "CmdSetCullMode"),
+                ("CmdSetViewportWithCountEXT", "CmdSetViewportWithCount"),
+                ("CmdBindVertexBuffers2EXT", "CmdBindVertexBuffers2"),
+                ("CreateRenderPass2KHR", "CreateRenderPass2"),
+                ("CmdBeginRenderPass2KHR", "CmdBeginRenderPass2"),
+                ("UpdateDescriptorSetWithTemplateKHR",
+                 "UpdateDescriptorSetWithTemplate"),
+                ("ResetQueryPoolEXT", "ResetQueryPool")):
+            with self.subTest(alias=alias):
+                self.assertEqual(aliases.get(alias), core)
 
 
 class ImportContract(unittest.TestCase):
