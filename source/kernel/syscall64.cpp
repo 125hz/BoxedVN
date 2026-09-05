@@ -4464,9 +4464,6 @@ static const char* dxmtUnixCallName64(U64 callIndex) {
 // line", and they used to be the same answer.
 static bool dxmtUnixCallAlwaysLogged64(U64 callIndex) {
     switch (callIndex) {
-        case 47: // MTLCommandBuffer_presentDrawable
-        case 48: // MTLCommandBuffer_presentDrawableAfterMinimumDuration
-        case 67: // MetalLayer_nextDrawable
         case 70: // MetalLayer_setProps
         case 71: // MetalLayer_getProps
         case 72: // CreateMetalViewFromHWND
@@ -4509,6 +4506,32 @@ extern "C" void boxedwineDxmtReportRecentCalls(void) {
 // covers device creation and the first swap chain, and then stops: the ring
 // above carries the steady state.
 static const U32 kDxmtOpeningCallLogBudget = 128;
+
+// Per-thread timing avoids a render-thread mutex. Report once per five seconds
+// per frame operation instead of formatting several log lines for every frame.
+// Guest/FEX work lies in the gaps; native/limiter waits lie inside call_us.
+static void dxmtFrameTiming64(U32 pid, U64 index, U64 begin, U64 end) {
+    struct Sample { U32 pid = 0; U64 since = 0, last = 0, count = 0,
+        total = 0, longest = 0, gap = 0; };
+    static thread_local Sample samples[3];
+    Sample& s = samples[index == 67 ? 2 : index == 48 ? 1 : 0];
+    if (s.pid != pid || !s.since) { s = Sample{}; s.pid = pid; s.since = begin; }
+    const U64 elapsed = end - begin;
+    ++s.count;
+    s.total += elapsed;
+    if (elapsed > s.longest) s.longest = elapsed;
+    if (s.last && begin - s.last > s.gap) s.gap = begin - s.last;
+    s.last = end;
+    if (end - s.since >= 5000000) {
+        klog_fmt("BOXEDWINE_DXMT_CADENCE pid=%u index=%llu calls=%llu elapsed_us=%llu "
+                 "average_call_us=%llu maximum_call_us=%llu maximum_gap_us=%llu",
+                 pid, (unsigned long long)index, (unsigned long long)s.count,
+                 (unsigned long long)(end - s.since),
+                 (unsigned long long)(s.total / s.count),
+                 (unsigned long long)s.longest, (unsigned long long)s.gap);
+        s.since = end; s.count = s.total = s.longest = s.gap = 0;
+    }
+}
 
 #if defined(BOXEDWINE_DXMT_NATIVE)
 // ---- The Metal shader cache path --------------------------------------------
@@ -4810,6 +4833,8 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         return (U64)(S64)(S32)BOXEDWINE_X64_HOSTCALL_STATUS_NOT_IMPLEMENTED;
     }
     const auto entry = reinterpret_cast<DxmtUnixEntry>(const_cast<void*>(raw));
+    const bool frameCall = callIndex == 47 || callIndex == 48 || callIndex == 67;
+    const U64 frameBegin = frameCall ? KSystem::getMicroCounter() : 0;
     if (callIndex == 47 || callIndex == 48) {
         if (callIndex == 47) {
             BVNGuestFrameLimiterWait();
@@ -4837,6 +4862,7 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
         boxedwineDxmtBeginShaderCachePath64(cpu, args, cachePath);
     }
     const S32 status = entry(reinterpret_cast<void*>(static_cast<uintptr_t>(args)));
+    if (frameCall) dxmtFrameTiming64(processId, callIndex, frameBegin, KSystem::getMicroCounter());
     if (isShaderCachePath) {
         boxedwineDxmtEndShaderCachePath64(cpu, args, cachePath, status);
     }

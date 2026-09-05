@@ -21,6 +21,7 @@
 
 #include "guest_wine_prefix.h"
 #include "guest_wine64_layout.h"
+#include "guest_wine_audio_registration.h"
 
 #include "devtty.h"
 #include "devurandom.h"
@@ -582,7 +583,41 @@ static bool setGuestWineRegistryValue(std::string& contents,
 // that can. Set it, but only when the driver is actually packaged: forcing a
 // driver that is not there leaves the process with no audio backend at all
 // rather than falling back.
+static void configureX64AudioRegistration(const BString& winePrefix) {
+    const auto packaged = [](const char* path) {
+        auto node = Fs::getNodeFromLocalPath(B(""), BString::copy(path), true);
+        return node && !node->isDirectory();
+    };
+    const bool pe64 = packaged(K_X64_WINE_PE_DIR "/mmdevapi.dll");
+    const bool pe32 = packaged(K_X64_WINE_PE32_DIR "/mmdevapi.dll");
+    auto node = Fs::getNodeFromLocalPath(B(""), winePrefix + "/system.reg", true);
+    const char* status = "no-system-reg";
+    if (node && !node->isDirectory() && !node->nativePath.isEmpty()) {
+        std::ifstream in(node->nativePath.c_str(), std::ios::binary);
+        if (in) {
+            std::string contents((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+            const bool readable = !in.bad();
+            in.close();
+            status = readable ? "present" : "unreadable";
+            if (readable && boxedvn::registerWineAudioEnumerator(contents, pe64, pe32)) {
+                const BString temp = node->nativePath + ".boxedvn-audio";
+                std::ofstream out(temp.c_str(), std::ios::binary | std::ios::trunc);
+                out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+                out.close();
+                std::error_code ec;
+                if (out) std::filesystem::rename(temp.c_str(), node->nativePath.c_str(), ec);
+                status = out && !ec ? "repaired" : "unwritable";
+                if (!out || ec) std::filesystem::remove(temp.c_str(), ec);
+            }
+        } else status = "unreadable";
+    }
+    klog_fmt("BOXEDWINE_X64_AUDIO_COM status=%s pe64=%d pe32=%d prefix=%s",
+             status, pe64 ? 1 : 0, pe32 ? 1 : 0, winePrefix.c_str());
+}
+
 static void configureX64AudioDriver(const BString& winePrefix) {
+    configureX64AudioRegistration(winePrefix);
     bool unixHalf = false;
     bool peHalf = false;
     const bool packaged = x64WineOssDriverPackaged(unixHalf, peHalf);

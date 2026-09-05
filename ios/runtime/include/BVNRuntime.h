@@ -549,6 +549,7 @@ void BVNGuestControlsToggleKeyboard(void);
 int BVNGuestControlsPointerMode(void);
 void BVNGuestControlsSetPointerMode(int mode);
 void BVNGuestControlsTapKeyNamed(const char* sdlScancodeName);
+void BVNGuestControlsSetKeyNamed(const char* sdlScancodeName, bool down);
 
 // Mouse settings for the drawn trackpad cursor, reached from the control
 // bar's pointer button by a long press. This is the same store the in-guest

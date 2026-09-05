@@ -131,11 +131,14 @@ build_runner() (
     "${fex_build}/boxedvn-dual-map-check"
 
     host_stubs_object="${fex_build}/boxedvn-probe-host-stubs.o"
+    softfloat_namespace="${fex_build}/boxedvn-fex-softfloat.h"
+    python3 "${root}/scripts/fex-softfloat-namespace.py" "${fex_source}" "${softfloat_namespace}"
     "${cxx}" -std=c++20 -c "${host_stubs_source}" -o "${host_stubs_object}"
     cmake -S "${fex_source}" -B "${fex_build}" -G Ninja \
         -DCMAKE_C_COMPILER="${cc}" \
         -DCMAKE_CXX_COMPILER="${cxx}" \
-        -DCMAKE_CXX_FLAGS="-include${allocator_declaration_header}" \
+        -DCMAKE_C_FLAGS="-include${softfloat_namespace}" \
+        -DCMAKE_CXX_FLAGS="-include${allocator_declaration_header} -include${softfloat_namespace}" \
         -DCMAKE_EXE_LINKER_FLAGS="${host_stubs_object}" \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DENABLE_LTO=OFF \

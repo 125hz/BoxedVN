@@ -429,9 +429,12 @@ struct GuestControlBar: View {
     private var running: Bool { active }
 
     var body: some View {
-        HStack(spacing: 22) {
+        HStack(spacing: 0) {
             control("keyboard", "Keyboard") { BVNGuestControlsToggleKeyboard() }
             pointerControl
+            GuestJoystick(active: running)
+                .frame(maxWidth: .infinity)
+                .frame(height: 44)
             control("return", "Enter") { BVNGuestControlsTapKeyNamed("Return") }
             control("space", "Space") { BVNGuestControlsTapKeyNamed("Space") }
             textControl("esc", "Esc") { BVNGuestControlsTapKeyNamed("Escape") }
@@ -488,6 +491,7 @@ struct GuestControlBar: View {
         .tint(.accentColor)
         .foregroundStyle(Color.accentColor)
         .accessibilityLabel(label)
+        .frame(maxWidth: .infinity, minHeight: 44)
     }
 
     private func control(_ glyph: String, _ label: String,
@@ -502,6 +506,7 @@ struct GuestControlBar: View {
         .tint(tint)
         .foregroundStyle(tint)
         .accessibilityLabel(label)
+        .frame(maxWidth: .infinity, minHeight: 44)
     }
 }
 
@@ -685,6 +690,7 @@ struct ContainerDetailView: View {
     // live view was, because a program that exits before it opens a window
     // otherwise leaves nothing at all behind.
     @State private var exitNote: String?
+    @State private var customResolution = false
     private let sessionTick = Timer.publish(every: 0.5, on: .main, in: .common)
         .autoconnect()
 
@@ -746,8 +752,6 @@ struct ContainerDetailView: View {
                         .listRowBackground(Color.clear)
                         .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 6, trailing: 8))
                 }
-            } header: {
-                Text("Live view")
             }
             .onChange(of: model.runtimeState) { state in
                 if state == .stopped || state == .idle || state == .failed {
@@ -756,39 +760,6 @@ struct ContainerDetailView: View {
             }
             .onReceive(sessionTick) { _ in refreshSession() }
             Section("Desktop") {
-                Button {
-                    save(); launched = true
-                    model.launchDesktop(container)
-                } label: {
-                    Label("Open 32-bit desktop", systemImage: "macwindow")
-                }
-                .disabled(model.rootFilesystem == nil || sessionIsBusy)
-                Button {
-                    save(); launched = true
-                    model.launchX64Desktop(container)
-                } label: {
-                    Label("Open 64-bit desktop", systemImage: "macwindow.on.rectangle")
-                }
-                .disabled(model.rootFilesystem == nil || sessionIsBusy)
-                Button {
-                    save(); launched = true
-                    model.launchGraphicsProbe(container)
-                } label: {
-                    Label("Run 32-bit cube on 64-bit Wine", systemImage: "cube.fill")
-                }
-                .disabled(model.rootFilesystem == nil || sessionIsBusy)
-                Button {
-                    save(); launched = true
-                    model.launchX64GraphicsProbe(container)
-                } label: {
-                    Label("Run 64-bit DXMT cube", systemImage: "cube.fill")
-                }
-                .disabled(model.rootFilesystem == nil || sessionIsBusy)
-                // The same launch as the cube above, for a program of the
-                // user's own. Started here it is the session's one translated
-                // process, with DXMT; started by double-clicking it in the
-                // file manager it would be a guest-created child, which runs
-                // on the interpreter without DXMT.
                 Button {
                     showingProgramPicker = true
                 } label: {
@@ -816,22 +787,44 @@ struct ContainerDetailView: View {
                         },
                         onCancel: { showingProgramPicker = false })
                 }
+                Button {
+                    save(); launched = true
+                    model.launchX64Desktop(container)
+                } label: {
+                    Label("Open 64-bit desktop", systemImage: "macwindow.on.rectangle")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Button {
+                    save(); launched = true
+                    model.launchGraphicsProbe(container)
+                } label: {
+                    Label("Run 32-bit cube on 64-bit Wine", systemImage: "cube.fill")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
+                Button {
+                    save(); launched = true
+                    model.launchX64GraphicsProbe(container)
+                } label: {
+                    Label("Run 64-bit DXMT cube", systemImage: "cube.fill")
+                }
+                .disabled(model.rootFilesystem == nil || sessionIsBusy)
                 Picker("Resolution", selection: resolutionBinding) {
                     ForEach(resolutions, id: \.self) { Text($0) }
-                    if !resolutions.contains(resolutionBinding.wrappedValue) {
-                        Text(resolutionBinding.wrappedValue)
-                            .tag(resolutionBinding.wrappedValue)
+                    Text("Custom").tag("custom")
+                }
+                .disabled(launched || sessionIsBusy)
+                if resolutionBinding.wrappedValue == "custom" {
+                    HStack {
+                        TextField("Width", value: $container.width, format: .number)
+                            .keyboardType(.numberPad)
+                            .accessibilityLabel("Horizontal resolution")
+                        Text("×").foregroundStyle(.secondary)
+                        TextField("Height", value: $container.height, format: .number)
+                            .keyboardType(.numberPad)
+                            .accessibilityLabel("Vertical resolution")
                     }
+                    .disabled(launched || sessionIsBusy)
                 }
-                .disabled(launched || sessionIsBusy)
-                HStack {
-                    TextField("Width", value: $container.width, format: .number)
-                        .keyboardType(.numberPad)
-                    Text("×").foregroundStyle(.secondary)
-                    TextField("Height", value: $container.height, format: .number)
-                        .keyboardType(.numberPad)
-                }
-                .disabled(launched || sessionIsBusy)
                 if launched || sessionIsBusy {
                     Text("The resolution is fixed while a guest is running.")
                         .font(.footnote)
@@ -982,8 +975,13 @@ struct ContainerDetailView: View {
 
     private var resolutionBinding: Binding<String> {
         Binding(
-            get: { "\(container.width)x\(container.height)" },
+            get: {
+                let value = "\(container.width)x\(container.height)"
+                return customResolution || !resolutions.contains(value) ? "custom" : value
+            },
             set: { value in
+                customResolution = value == "custom"
+                guard !customResolution else { return }
                 let pieces = value.split(separator: "x")
                 if pieces.count == 2,
                    let width = UInt32(pieces[0]), let height = UInt32(pieces[1]) {

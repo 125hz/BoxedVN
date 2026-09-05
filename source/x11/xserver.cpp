@@ -276,6 +276,10 @@ const XWindowPtr& XServer::getRoot() {
 		KNativeScreenPtr screen = KNativeSystem::getScreen();
 
 		root = createNewWindow(0, nullptr, screen->screenWidth(), screen->screenHeight(), screen->screenBpp(), 0, 0, InputOutput, 0, visual);
+		// X11's initial focus is PointerRoot, not None. With None, an
+		// unmanaged Wine window can receive mouse events but every key is lost.
+		inputFocus = root;
+		inputFocusIsPointerRoot = true;
 
 		U32 rect[] = { 0, 0, (U32)screen->screenWidth(), (U32)screen->screenHeight() };
 		U32 atom = server->internAtom(B("_GTK_WORKAREAS_D0"), false);
@@ -1254,7 +1258,17 @@ void XServer::key(U32 key, bool pressed) {
 		KNativeSystem::getCurrentInput()->getMousePos(&x, &y);
 		XWindowPtr wnd = inputFocus;
 		if (inputFocusIsPointerRoot && root) {
-			wnd = root->getWindowFromPoint(x, y);
+			if (fakeFullScreenWnd) {
+				fakeFullScreenWnd->windowToScreen(x, y);
+				wnd = fakeFullScreenWnd;
+			} else {
+				wnd = root->getWindowFromPoint(x, y);
+			}
+		}
+		static std::atomic<U32> keyReports {0};
+		if (keyReports.fetch_add(1, std::memory_order_relaxed) < 48) {
+			klog_fmt("BOXEDWINE_X11_KEY key=%u down=%d focus=0x%x target=0x%x pointer_root=%d",
+				key, pressed, inputFocus->id, wnd ? wnd->id : 0, inputFocusIsPointerRoot);
 		}
 		while (wnd && !wnd->keyScreenCoords(key, x, y, pressed)) {
 			wnd = wnd->getParent();

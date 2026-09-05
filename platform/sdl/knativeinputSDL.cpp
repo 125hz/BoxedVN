@@ -747,6 +747,17 @@ void KNativeInputSDL::processCustomEvents(std::function<bool(bool isKeyDown, int
 }
 
 bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
+#ifdef BOXEDWINE_IOS
+    // UIKit's guest overlay supplies touch input in guest coordinates. SDL's
+    // synthetic touch mouse can also escape a reparented view with negative
+    // coordinates when the user operates frontend controls. Do not inject it
+    // a second time or let it replace the overlay's pointer position.
+    if ((e->type == SDL_MOUSEMOTION && e->motion.which == SDL_TOUCH_MOUSEID) ||
+        ((e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP) &&
+         e->button.which == SDL_TOUCH_MOUSEID)) {
+        return true;
+    }
+#endif
 #ifdef BOXEDWINE_RECORDER
     if (Player::instance) {
         if (e->type == SDL_QUIT) {

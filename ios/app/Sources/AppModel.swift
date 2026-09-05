@@ -675,13 +675,8 @@ final class AppModel: ObservableObject {
             // DXMT's own logging. It is not wined3d, so no WINEDEBUG channel
             // reaches it: `+d3d11` and `+dxgi` name Wine's implementations,
             // which these overrides replace. DXMT reads DXMT_LOG_LEVEL
-            // instead and defaults to info, which is why a device run carried
-            // one line ("Failed to set Metal cache path") and nothing else -
-            // everything below info was discarded before it was written.
-            // trace is affordable here: the pinned source has eleven TRACE
-            // and three DEBUG call sites in total, so this adds lines at the
-            // rate of a program's D3D entry points, not its frames.
-            "DXMT_LOG_LEVEL=trace",
+            // instead. Trace follows the user's verbose toggle.
+            "DXMT_LOG_LEVEL=info",
             // Send it to Wine's debug output only. DXMT writes to a file as
             // well unless told otherwise, and the file it picks is relative
             // to the working directory - which on this lane is a read-only
@@ -742,7 +737,8 @@ final class AppModel: ObservableObject {
                                      enabled: Bool) -> [String] {
             guard enabled else { return base }
             return base.map {
-                $0.hasPrefix(wineDebugAssignmentPrefix)
+                if $0.hasPrefix("DXMT_LOG_LEVEL=") { return "DXMT_LOG_LEVEL=trace" }
+                return $0.hasPrefix(wineDebugAssignmentPrefix)
                     ? $0 + "," + verboseTraceChannels : $0
             } + [verboseTraceAssignment]
         }

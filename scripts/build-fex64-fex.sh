@@ -243,7 +243,12 @@ apply_patch fex-boxedwine-harness-alias.patch
 # archives that Xcode is about to link again; ccache is off because CI caches
 # the build directory instead; BUILD_TESTING pulls in Catch2 and unit tests
 # that cannot run from here.
+softfloat_namespace="${BUILD}/boxedvn-fex-softfloat.h"
+python3 "${BOXEDVN_ROOT}/scripts/fex-softfloat-namespace.py" \
+    "${SOURCE}" "${softfloat_namespace}"
 cmake -S "${SOURCE}" -B "${BUILD}" -G Ninja \
+    -DCMAKE_C_FLAGS="-include ${softfloat_namespace}" \
+    -DCMAKE_CXX_FLAGS="-include ${softfloat_namespace}" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -299,6 +304,9 @@ while IFS= read -r archive; do
     cp "${archive}" "${STAGING}/lib/"
     found=$((found + 1))
 done < <(find "${BUILD}" -name '*.a' -type f)
+
+python3 "${BOXEDVN_ROOT}/scripts/fex-softfloat-namespace.py" \
+    "${SOURCE}" "${softfloat_namespace}" --verify "${STAGING}/lib/"*.a
 
 [[ "${found}" -gt 0 ]] || die "FEX: the build produced no static libraries.
 Something configured but built nothing; check the ninja output above."

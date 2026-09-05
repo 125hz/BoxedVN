@@ -405,6 +405,14 @@ void writeEvent64(const XEvent& event, U64 display, U8* out) {
     switch (event.type) {
     case KeyPress:
     case KeyRelease:
+        {
+            static std::atomic<U32> reported {0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 48) {
+                klog_fmt("BOXEDWINE_X64_X11_KEY type=%d window=0x%x key=%u state=0x%x time=%u",
+                         event.type, event.xkey.window, event.xkey.keycode,
+                         event.xkey.state, event.xkey.time);
+            }
+        }
         L::put64(out, any::window, event.xkey.window);
         L::put64(out, key::root, event.xkey.root);
         L::put64(out, key::subwindow, event.xkey.subwindow);

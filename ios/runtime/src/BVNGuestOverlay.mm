@@ -171,18 +171,20 @@ static NSArray<NSArray<BVNOverlayKey*>*>* BVNKeyboardRows(void) {
             BVNKey(@",", @",", BVNOverlayKeyKindNormal, 1),
             BVNKey(@".", @".", BVNOverlayKeyKindNormal, 1),
             BVNKey(@"/", @"/", BVNOverlayKeyKindNormal, 1),
-            BVNKey(@"↑", @"Up", BVNOverlayKeyKindNormal, 1),
-            BVNKey(@"pgup", @"PageUp", BVNOverlayKeyKindNormal, 1.3),
         ],
         @[
             BVNKey(@"ctrl", @"Left Ctrl", BVNOverlayKeyKindModifier, 1.6),
             BVNKey(@"alt", @"Left Alt", BVNOverlayKeyKindModifier, 1.4),
             BVNKey(@"space", @"Space", BVNOverlayKeyKindNormal, 5),
+            BVNKey(@"close", nil, BVNOverlayKeyKindHide, 1.6),
+        ],
+        @[
+            BVNKey(@"pgup", @"PageUp", BVNOverlayKeyKindNormal, 1.4),
             BVNKey(@"←", @"Left", BVNOverlayKeyKindNormal, 1),
+            BVNKey(@"↑", @"Up", BVNOverlayKeyKindNormal, 1),
             BVNKey(@"↓", @"Down", BVNOverlayKeyKindNormal, 1),
             BVNKey(@"→", @"Right", BVNOverlayKeyKindNormal, 1),
-            BVNKey(@"pgdn", @"PageDown", BVNOverlayKeyKindNormal, 1.3),
-            BVNKey(@"close", nil, BVNOverlayKeyKindHide, 1.6),
+            BVNKey(@"pgdn", @"PageDown", BVNOverlayKeyKindNormal, 1.4),
         ],
     ];
 }
@@ -195,11 +197,11 @@ static const CGFloat kBVNMenuRowHeight = 46.0;
 static const CGFloat kBVNMenuWidth = 268.0;
 static const CGFloat kBVNKeyGap = 4.0;
 // A row below this is not a key any more, it is a target a fingertip misses;
-// above the upper bound the six rows start eating a landscape screen.
+// above the upper bound the keyboard rows start eating a landscape screen.
 static const CGFloat kBVNKeyRowMinimumHeight = 28.0;
-static const CGFloat kBVNKeyRowMaximumHeight = 46.0;
+static const CGFloat kBVNKeyRowMaximumHeight = 40.0;
 // What a container has to measure before the keyboard is drawn *inside* it
-// rather than as a sheet over the page. Six rows at the minimum row height
+// rather than as a sheet over the page. The rows at the minimum row height
 // plus the gaps come to just under 200pt, so a container has to be well past
 // that or the keyboard is the whole of it and the guest picture is gone. The
 // live view's portrait host on a phone is about 350x260pt and fails this; the
@@ -1495,7 +1497,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
             button.backgroundColor = [UIColor colorWithWhite:0.19 alpha:1.0];
             button.layer.cornerRadius = 6.0;
             button.titleLabel.adjustsFontSizeToFitWidth = YES;
-            button.titleLabel.minimumScaleFactor = 0.6;
+            button.titleLabel.minimumScaleFactor = 0.75;
+            button.contentEdgeInsets = UIEdgeInsetsMake(2, 2, 2, 2);
             if (key.kind == BVNOverlayKeyKindNormal) {
                 // Down on touch-down and up on release, so holding a key
                 // really holds it - a visual novel advances text by holding
@@ -2526,8 +2529,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.keyboardPanel.layer.maskedCorners =
         kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
 
-    const CGFloat left = insets.left + kBVNKeyGap;
-    const CGFloat right = width - insets.right - kBVNKeyGap;
+    const CGFloat left = insets.left + 8.0;
+    const CGFloat right = width - insets.right - 8.0;
     CGFloat rowY = kBVNKeyGap;
     for (NSArray<BVNOverlayKey*>* row in self.keyRows) {
         CGFloat totalWeight = 0.0;
@@ -2546,7 +2549,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                 (CGFloat)index * kBVNKeyGap;
             key.button.frame = CGRectMake(keyX, rowY, nextX - keyX, rowHeight);
             key.button.titleLabel.font =
-                [UIFont systemFontOfSize:MIN(17.0, rowHeight * 0.42)
+                [UIFont systemFontOfSize:MIN(14.0, MIN(rowHeight * 0.38, (nextX - keyX) * 0.55))
                                   weight:UIFontWeightMedium];
             keyX = nextX + kBVNKeyGap;
         }
@@ -3246,6 +3249,12 @@ extern "C" void BVNGuestPerformanceSnapshot(double* framesPerSecond,
     }
 }
 
+extern "C" void BVNGuestControlsSetKeyNamed(const char* name, bool down) {
+    if (name) {
+        BVNGuestControlsSendKey(BVNGuestControlsScancodeForName(name), down);
+    }
+}
+
 extern "C" void BVNGuestControlsTapKeyNamed(const char* name) {
     if (name == NULL) {
         return;
@@ -3255,7 +3264,12 @@ extern "C" void BVNGuestControlsTapKeyNamed(const char* name) {
         return;
     }
     BVNGuestControlsSendKey(scancode, true);
-    BVNGuestControlsSendKey(scancode, false);
+    // Give a polling game a real press interval, rather than down/up in the
+    // same main-loop iteration. The overlay keyboard already holds on touch.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        BVNGuestControlsSendKey(scancode, false);
+    });
 }
 
 extern "C" int BVNGuestControlsPointerMode(void) {
