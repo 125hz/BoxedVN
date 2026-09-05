@@ -1,0 +1,42 @@
+diff --git a/src/util/thread.cpp b/src/util/thread.cpp
+index 5c91241..1bffe95 100644
+--- a/src/util/thread.cpp
++++ b/src/util/thread.cpp
+@@ -1,0 +2,3 @@
++#include <cstdio>
++#include <new>
++#include <system_error>
+@@ -9,0 +13,16 @@ namespace dxvk {
++  // A worker exception otherwise disappears into threadProc's catch-all and
++  // the thread returns 1, leaving its consumers waiting forever. Avoid the
++  // allocating logger here so std::bad_alloc itself can still be reported.
++  static void reportWorkerEvent(const char* kind, const char* detail, int code = 0) noexcept {
++    char buffer[1024];
++    int length = std::snprintf(buffer, sizeof(buffer),
++      "BOXEDWINE_DXVK_WORKER tid=%lu kind=%s code=%d detail=%.768s\n",
++      static_cast<unsigned long>(GetCurrentThreadId()), kind, code, detail);
++    if (length <= 0)
++      return;
++    DWORD written = 0;
++    WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer,
++      static_cast<DWORD>(length < int(sizeof(buffer)) ? length : sizeof(buffer) - 1),
++      &written, nullptr);
++  }
++
+@@ -67,0 +87 @@ namespace dxvk {
++      reportWorkerEvent("start", "worker exception reporting active");
+@@ -68,0 +89,12 @@ namespace dxvk {
++    } catch (const DxvkError& error) {
++      reportWorkerEvent("dxvk_error", error.message().c_str());
++      exitCode = 1;
++    } catch (const std::system_error& error) {
++      reportWorkerEvent("system_error", error.what(), error.code().value());
++      exitCode = 1;
++    } catch (const std::bad_alloc& error) {
++      reportWorkerEvent("bad_alloc", error.what());
++      exitCode = 1;
++    } catch (const std::exception& error) {
++      reportWorkerEvent("exception", error.what());
++      exitCode = 1;
+@@ -69,0 +102 @@ namespace dxvk {
++      reportWorkerEvent("unknown_exception", "non-std exception escaped worker");

@@ -282,7 +282,7 @@
 // Unrestricted it answers nothing, because it buries the answer: relay over a
 // whole process writes tens of thousands of lines a second. Wine restricts it
 // from the registry and from nowhere else -- HKCU\Software\Wine\Debug values
-// RelayInclude and RelayExclude, each a ';'-separated list of "module" or
+// RelayInclude and RelayExclude, each a ';'-separated list of "module.*" or
 // "module.function" entries, read once when the first traced call is made and
 // with no environment variable of their own. So a launch that asks for the
 // trace writes them into the 64-bit prefix, the way the audio driver and the
@@ -296,8 +296,11 @@
 // (the message box itself -- its relay line carries the caller's return
 // address, which is what names the module that raised the dialog), version
 // (file version probing) and ws2_32 (what a client library does when it
-// cannot reach the service it expects). Only two thread-exit functions from
-// ntdll are included; tracing its heap and locking calls would flood the log.
+// cannot reach the service it expects). Only RtlExitUserThread from ntdll is
+// included. NtTerminateThread relay loops in the WoW64 device capture; the
+// server-request witness already records its handle and status without relay.
+// Wine 9 relay.c:check_list treats a bare module name as a FUNCTION name, so
+// omitting .* silently suppresses every API call in that module.
 //
 // The exclude list removes what those modules are called for per loop
 // iteration rather than per decision, and the message loop a modal box runs
@@ -322,8 +325,8 @@
 #define K_X64_WINE_RELAY_INCLUDE_NAME "RelayInclude"
 #define K_X64_WINE_RELAY_EXCLUDE_NAME "RelayExclude"
 #define K_X64_WINE_RELAY_INCLUDE \
-    "advapi32;kernel32;kernelbase;user32;version;ws2_32;" \
-    "ntdll.NtTerminateThread;ntdll.RtlExitUserThread"
+    "advapi32.*;kernel32.*;kernelbase.*;user32.*;version.*;ws2_32.*;" \
+    "ntdll.RtlExitUserThread"
 #define K_X64_WINE_RELAY_EXCLUDE \
     "kernel32.GetLastError;kernel32.SetLastError;" \
     "kernelbase.GetLastError;kernelbase.SetLastError;" \

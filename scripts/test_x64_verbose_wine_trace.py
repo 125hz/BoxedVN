@@ -72,6 +72,22 @@ def unescape(value: str) -> str:
     return value.replace("\\\\", "\\")
 
 
+def wine_relay_matches(entries: list[str], module: str, function: str) -> bool:
+    """Named-export subset of Wine 9 ntdll/relay.c:check_list.
+
+    Bare entries match function names; only module.* selects a module.
+    Module comparison is case insensitive, function comparison is exact.
+    """
+    for entry in entries:
+        if "." in entry:
+            name, export = entry.rsplit(".", 1)
+            if name.lower() == module.lower() and export in ("*", function):
+                return True
+        elif entry == function:
+            return True
+    return False
+
+
 class TheTwoHalvesAgree(unittest.TestCase):
     """The app builds the environment; the emulator writes the registry."""
 
@@ -123,24 +139,50 @@ class TheIncludeListStaysSmall(unittest.TestCase):
                              "this is no longer a restriction")
 
     def test_only_thread_exit_calls_are_traced_in_ntdll(self) -> None:
-        self.assertEqual({entry for entry in self.include if "." in entry},
-                         {"ntdll.NtTerminateThread", "ntdll.RtlExitUserThread"})
+        self.assertEqual({entry for entry in self.include if entry.startswith("ntdll.")},
+                         {"ntdll.RtlExitUserThread"})
 
     def test_the_modules_a_startup_check_actually_calls_are_there(self) -> None:
         for module in ("advapi32", "kernel32", "kernelbase", "user32"):
-            self.assertIn(module, self.include)
+            self.assertIn(module + ".*", self.include)
 
     def test_ntdll_is_not_traced(self) -> None:
         # Every heap allocation and every critical section enters through it,
         # so including it is indistinguishable from tracing everything.
-        self.assertNotIn("ntdll", self.include)
+        self.assertNotIn("ntdll.*", self.include)
 
     def test_every_exclusion_belongs_to_an_included_module(self) -> None:
         for entry in self.exclude:
             self.assertIn(".", entry, f"{entry} would exclude a whole module")
             module = entry.split(".", 1)[0]
-            self.assertIn(module, self.include,
+            self.assertIn(module + ".*", self.include,
                           f"{entry} excludes from a module nothing traces")
+
+    def test_real_startup_calls_survive_wines_filter(self) -> None:
+        for module, function in (
+            ("advapi32", "RegOpenKeyExW"), ("kernel32", "GetProcAddress"),
+            ("kernelbase", "RaiseException"), ("user32", "MessageBoxA"),
+            ("user32", "CreateWindowExW"), ("version", "GetFileVersionInfoW"),
+            ("ws2_32", "connect"), ("ntdll", "RtlExitUserThread"),
+        ):
+            with self.subTest(module=module, function=function):
+                self.assertTrue(wine_relay_matches(self.include, module, function))
+                self.assertFalse(wine_relay_matches(self.exclude, module, function))
+
+    def test_old_bare_module_filter_does_not_trace_module_calls(self) -> None:
+        self.assertFalse(wine_relay_matches(["kernel32"], "kernel32", "GetProcAddress"))
+        self.assertTrue(wine_relay_matches(["GetProcAddress"], "kernel32", "GetProcAddress"))
+        self.assertTrue(wine_relay_matches(["KERNEL32.*"], "kernel32", "GetProcAddress"))
+
+    def test_hot_calls_and_nt_syscall_stubs_are_not_traced(self) -> None:
+        for module, function in (
+            ("ntdll", "NtTerminateThread"), ("ntdll", "RtlAllocateHeap"),
+            ("kernel32", "GetLastError"), ("user32", "PeekMessageW"),
+        ):
+            with self.subTest(module=module, function=function):
+                traced = wine_relay_matches(self.include, module, function)
+                excluded = wine_relay_matches(self.exclude, module, function)
+                self.assertFalse(traced and not excluded)
 
     def test_the_modal_message_loop_is_excluded(self) -> None:
         # The dialog this exists to explain is modal: once it is up its own

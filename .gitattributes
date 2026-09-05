@@ -12,6 +12,7 @@ scripts/*.sh text eol=lf
 # carriage return and reads as a corrupt fragment.
 scripts/fex64-patches/*.patch text eol=lf
 scripts/dxmt-patches/*.patch text eol=lf
+third_party/patches/*.patch text eol=lf
 .github/workflows/*.yml text eol=lf
 
 ###############################################################################

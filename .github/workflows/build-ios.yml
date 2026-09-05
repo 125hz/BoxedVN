@@ -32,6 +32,7 @@ on:
       - lib/**
       - platform/**
       - scripts/**
+      - third_party/patches/dxvk-*.patch
       - source/**
       - THIRD_PARTY_NOTICES.md
   pull_request:
@@ -53,6 +54,35 @@ env:
   REQUESTED_XCODE: ${{ inputs.xcode_version || vars.BOXEDVN_XCODE_VERSION || '' }}
 
 jobs:
+  dxvk-i386:
+    name: Build pinned 32-bit DXVK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Restore rebuilt DXVK modules
+        id: dxvk-cache
+        uses: actions/cache@v4
+        with:
+          path: build/dxvk-i386
+          key: dxvk-i386-${{ runner.os }}-${{ hashFiles('scripts/dependencies.dxvk.lock.sh', 'scripts/build-dxvk-i386.sh', 'scripts/validate-dxvk-i386.py', 'third_party/patches/dxvk-*.patch') }}
+      - name: Build DXVK with worker exception reports
+        if: steps.dxvk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            g++-mingw-w64-i686-posix meson ninja-build glslang-tools python3-mako
+          bash scripts/build-dxvk-i386.sh
+      - name: Validate DXVK modules
+        run: python3 scripts/validate-dxvk-i386.py build/dxvk-i386
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dxvk-i386
+          path: build/dxvk-i386
+          if-no-files-found: error
+          retention-days: 14
+
   guest-probe:
     name: Build IA-32 graphics probe
     runs-on: ubuntu-24.04
@@ -87,6 +117,7 @@ jobs:
 
   wine64-runtime:
     name: Build x86-64 Wine runtime layers
+    needs: dxvk-i386
     runs-on: ubuntu-24.04
     # The i386 Wine package is 100 MB from the runner's Ubuntu mirror, which
     # served it at 110 kB/s on one run (15 minutes); the package is cached
@@ -97,6 +128,12 @@ jobs:
     steps:
       - name: Check out BoxedVN
         uses: actions/checkout@v6
+
+      - name: Download rebuilt 32-bit DXVK
+        uses: actions/download-artifact@v7
+        with:
+          name: dxvk-i386
+          path: build/dxvk-i386
 
       - name: Install Wine64 and X11 runtime packages
         shell: bash
@@ -295,7 +332,7 @@ jobs:
             --dxmt-unixlib build/winemetal.so \
             --x11-shim-dir build/x64-x11 \
             --vulkan-shim build/x64-vulkan/libvulkan.so.1 \
-            --dxvk-i386-dir ios/app/Dxvk \
+            --dxvk-i386-dir build/dxvk-i386 \
             --i386-pe-dir build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows \
             "${oss_args[@]+"${oss_args[@]}"}"
           bash scripts/validate-wine64-runtime.sh \
@@ -450,6 +487,9 @@ jobs:
       - name: Test Wine guest arena contract
         run: python3 -m unittest scripts/test_x64_wine_arena.py
 
+      - name: Test Wine relay filter behavior
+        run: python3 -m unittest scripts/test_x64_verbose_wine_trace.py
+
   fex-translator-probe:
     name: FEX translator conformance probes
     runs-on: ubuntu-24.04
@@ -575,6 +615,13 @@ jobs:
         with:
           name: wine64-runtime
           path: build/wine64-runtime
+
+      # Keep the legacy app resource copy in step with the WoW64 overlay.
+      - name: Download rebuilt DXVK app resources
+        uses: actions/download-artifact@v7
+        with:
+          name: dxvk-i386
+          path: ios/app/Dxvk
 
       - name: Download x86-64 graphics resources
         uses: actions/download-artifact@v7
