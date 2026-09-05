@@ -34,10 +34,12 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-arm64-addsub-immediate-range.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-masked-memory-alias.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-null-exit-target.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-call-return-witness.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-inline-call-return.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-longmode-segment-base.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-x87-context-slot-access.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-harness-alias.patch"
 )
 

@@ -708,6 +708,10 @@ jobs:
           # map of the shipped binary resolves those offsets after the fact,
           # so a spin inside the runtime can be read without a debugger.
           nm -n -arch arm64 "${app}/BoxedVN" | gzip -9 > build/artifacts/BoxedVN.symbols.txt.gz
+          # A symbol offset alone cannot distinguish a fault-report read from
+          # register reconstruction. Keep just this routine's instructions.
+          xcrun llvm-objdump --macho --disassemble --dis-symname=_BVNFEXCPU64AdapterHandleHostFault "${app}/BoxedVN" \
+            | gzip -9 > build/artifacts/BoxedVN.fault-handler.txt.gz
           symbol_count="$(gzip -dc build/artifacts/BoxedVN.symbols.txt.gz | grep -c ' [tT] ' || true)"
           {
             echo "## Bundle sizes"
@@ -723,7 +727,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: host-symbols-${{ inputs.configuration || 'Release' }}
-          path: build/artifacts/BoxedVN.symbols.txt.gz
+          path: |
+            build/artifacts/BoxedVN.symbols.txt.gz
+            build/artifacts/BoxedVN.fault-handler.txt.gz
           if-no-files-found: error
           retention-days: 14
 

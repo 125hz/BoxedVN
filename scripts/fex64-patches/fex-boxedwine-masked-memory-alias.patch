@@ -1,0 +1,25 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -923,6 +923,10 @@
+       LOGMAN_MSG_A_FMT("Complex addressing requested and not supported!");
+     }
+ 
++    // NEON scalar lanes bypass GenerateMemOperand; translate the completed
++    // canonical address here too. Keep guest registers and NZCV unchanged.
++    TempMemReg = AliasGuestAddress(TempMemReg);
++
+     const uint64_t ElementSizeInBits = IR::OpSizeAsBits(IROp->ElementSize);
+     for (size_t i = 0; i < NumElements; ++i) {
+       // Extract the mask element.
+@@ -1023,6 +1027,10 @@
+     } else {
+       LOGMAN_MSG_A_FMT("Complex addressing requested and not supported!");
+     }
++
++    // NEON scalar lanes bypass GenerateMemOperand; translate the completed
++    // canonical address here too. Keep guest registers and NZCV unchanged.
++    TempMemReg = AliasGuestAddress(TempMemReg);
+ 
+     const uint64_t ElementSizeInBits = IR::OpSizeAsBits(IROp->ElementSize);
+     for (size_t i = 0; i < NumElements; ++i) {

@@ -28,6 +28,7 @@
 %ifdef CONFIG
 {
   "Match": "None",
+  "Env": { "FEX_HOSTFEATURES": "disablesve" },
   "RegData": {
     "RAX": "0x4645585f50415353"
   },
@@ -245,6 +246,62 @@ seed_back:
     cmp rbx, rdx
     jne fail_now
 
+    ; Match iOS's split-NEON masked loads/stores with translation enabled.
+    ; Both halves of a YMM value, low and top addresses, and inactive lanes.
+    mov rsi, ARENA_SRC
+    mov rdi, LOW_BUF
+    mov rdx, PATTERN_A
+    mov [rsi], rdx
+    mov [rsi + 8], rdx
+    mov [rsi + 16], rdx
+    mov [rsi + 24], rdx
+    mov [rsi + 32], rdx
+    vpcmpeqd ymm2, ymm2, ymm2
+    vpmaskmovd ymm0, ymm2, [rsi + 3]
+    vmovdqu ymm3, [rsi + 3]
+    vpxor ymm1, ymm0, ymm3
+    vptest ymm1, ymm1
+    jnz fail_now
+    vpmaskmovq [rdi + 5], ymm2, ymm0
+    vmovdqu ymm1, [rdi + 5]
+    vpxor ymm1, ymm1, ymm3
+    vptest ymm1, ymm1
+    jnz fail_now
+
+    ; Alternating active dwords must zero masked load lanes and preserve
+    ; masked store lanes. Check the upper 128-bit half independently too.
+    mov rdx, 0x00000000ffffffff
+    mov [rdi + 0x80], rdx
+    mov [rdi + 0x88], rdx
+    mov [rdi + 0x90], rdx
+    mov [rdi + 0x98], rdx
+    vmovdqu ymm2, [rdi + 0x80]
+    vpmaskmovd ymm0, ymm2, [rsi]
+    vmovdqu [rdi + 0x40], ymm0
+    mov rdx, 0x55667788
+    cmp [rdi + 0x40], rdx
+    jne fail_now
+    cmp [rdi + 0x58], rdx
+    jne fail_now
+    mov rdx, PATTERN_B
+    mov [rsi], rdx
+    mov [rsi + 8], rdx
+    mov [rsi + 16], rdx
+    mov [rsi + 24], rdx
+    vpmaskmovd [rsi], ymm2, ymm0
+    mov rdx, 0x99aabbcc55667788
+    cmp [rsi], rdx
+    jne fail_now
+    cmp [rsi + 24], rdx
+    jne fail_now
+
+    ; An all-zero mask must not touch even an inaccessible address.
+    vpxor ymm2, ymm2, ymm2
+    xor ecx, ecx
+    vpmaskmovd ymm0, ymm2, [rcx]
+    vptest ymm0, ymm0
+    jnz fail_now
+    vpmaskmovd [rcx], ymm2, ymm0
     mov rax, PASS
     hlt
 

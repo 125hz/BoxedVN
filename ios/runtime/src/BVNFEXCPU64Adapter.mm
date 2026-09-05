@@ -1488,34 +1488,20 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         static std::atomic<uint32_t> reported {0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
             const uint64_t rip = frame->State.rip;
-            // The alias reader answers for the identity window only. A guest
-            // address below 4 GiB -- where the WoW64 layer maps the 32-bit
-            // modules and their stack -- is not in that window, so the first
-            // fault taken in 32-bit code printed sixteen zero bytes and an
-            // empty return slot: no instruction, no caller. The kernel's own
-            // page table covers every mapped guest page and is the fallback.
-            KMemory64* const faultMemory = adapter->cpu->memory;
+            // Read through Mach rather than dereferencing a possibly exhausted
+            // guest stack inside its signal handler. A reserved/mapped range
+            // does not imply that its host pages are currently readable.
             auto readGuestBytes = [&](uint64_t address, uint8_t* out,
                                       size_t length) -> bool {
-                if (faultMemory == nullptr) return false;
-                bool any = false;
-                for (size_t i = 0; i < length; ++i) {
-                    const uint64_t at = address + i;
-                    if (!faultMemory->isPageMapped(at >> 12)) break;
-                    out[i] = faultMemory->readb(at);
-                    any = true;
-                }
-                return any;
+                if (!address || !length || address > UINT64_MAX - length) return false;
+                const uint64_t host = k64GuestToHostAddress(address);
+                vm_size_t copied = 0;
+                return vm_read_overwrite(mach_task_self(), host, length,
+                    reinterpret_cast<vm_address_t>(out), &copied) == KERN_SUCCESS &&
+                    copied == length;
             };
-            uint8_t bytes[16] = {0};
-            const uint64_t hostRip =
-                adapter->process->memory64->nativeAliasForGuest(rip);
-            if (hostRip != 0 &&
-                adapter->cpu->memory->nativeRangeCoversForPlan(hostRip, hostRip + 16)) {
-                std::memcpy(bytes, reinterpret_cast<const void*>(hostRip), sizeof(bytes));
-            } else {
-                readGuestBytes(rip, bytes, sizeof(bytes));
-            }
+            uint8_t bytes[16] = {};
+            const bool codeRead = readGuestBytes(rip, bytes, sizeof(bytes));
             char hex[40];
             for (size_t i = 0; i < sizeof(bytes); ++i) {
                 snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02x", bytes[i]);
@@ -1532,40 +1518,18 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             // not show the argument itself.
             uint64_t returnSlot[4] = {0, 0, 0, 0};
             const uint64_t guestRsp = frame->State.gregs[4];
-            // The translator dereferences guest addresses through the
-            // deterministic alias; the kuser alias helper answers zero for a
-            // stack address, which used to print an empty return slot.
-            const uint64_t hostRsp =
-                adapter->cpu->memory->nativeIdentityMode()
-                    ? k64GuestToHostAddress(guestRsp) : 0;
-            if (hostRsp != 0 &&
-                adapter->cpu->memory->nativeRangeCoversForPlan(hostRsp,
-                                                              hostRsp + sizeof(returnSlot))) {
-                std::memcpy(returnSlot, reinterpret_cast<const void*>(hostRsp),
-                            sizeof(returnSlot));
-            } else {
-                uint8_t slotBytes[sizeof(returnSlot)] = {0};
-                if (readGuestBytes(guestRsp, slotBytes, sizeof(slotBytes))) {
-                    std::memcpy(returnSlot, slotBytes, sizeof(returnSlot));
-                }
-            }
+            const bool stackRead = readGuestBytes(guestRsp,
+                reinterpret_cast<uint8_t*>(returnSlot), sizeof(returnSlot));
             const auto& g = frame->State.gregs;
             // A callee can reserve a large local frame below its saved caller
             // and arguments. RSP alone then cannot explain a bad argument.
             // Only inspect a nearby i386 frame on readable guest pages; never
             // walk an arbitrary chain or fault while reporting the first fault.
-            if (frame->State.cs_idx == 0x23 && faultMemory != nullptr &&
+            if (frame->State.cs_idx == 0x23 &&
                 g[5] >= guestRsp && g[5] - guestRsp <= 4096 &&
                 g[5] <= UINT32_MAX - 44) {
                 U32 words[11] = {};
-                bool readable = true;
-                for (size_t i = 0; i < sizeof(words); ++i) {
-                    if (!(faultMemory->getPageFlags((g[5] + i) >> 12) & K64_PAGE_READ)) {
-                        readable = false;
-                        break;
-                    }
-                }
-                if (readable && readGuestBytes(g[5], reinterpret_cast<uint8_t*>(words), sizeof(words))) {
+                if (readGuestBytes(g[5], reinterpret_cast<uint8_t*>(words), sizeof(words))) {
                     klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_FRAME32 ebp=0x%x saved=0x%x caller=0x%x "
                              "args=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
                              static_cast<U32>(g[5]), words[0], words[1],
@@ -1574,12 +1538,12 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                 }
             }
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_STACK rsp=0x%llx slot0=0x%llx slot1=0x%llx "
-                     "slot2=0x%llx slot3=0x%llx",
+                     "slot2=0x%llx slot3=0x%llx code_read=%d stack_read=%d",
                      static_cast<unsigned long long>(guestRsp),
                      static_cast<unsigned long long>(returnSlot[0]),
                      static_cast<unsigned long long>(returnSlot[1]),
                      static_cast<unsigned long long>(returnSlot[2]),
-                     static_cast<unsigned long long>(returnSlot[3]));
+                     static_cast<unsigned long long>(returnSlot[3]), codeRead, stackRead);
             // cs and ss say which code segment the faulting instruction was
             // decoded for, and `decode` says what the translator made of it:
             // the L bit of the descriptor cs names, which is the same bit the
@@ -1652,6 +1616,15 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      (unsigned long long)g[10], (unsigned long long)g[11],
                      (unsigned long long)g[12], (unsigned long long)g[13],
                      (unsigned long long)g[14], (unsigned long long)g[15]);
+            uint64_t maskLow[2] = {}, maskHigh[2] = {};
+            std::memcpy(maskLow, &adapter->cpu->xmm[2], sizeof(maskLow));
+            std::memcpy(maskHigh, &adapter->cpu->ymmHigh[2], sizeof(maskHigh));
+            klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_FP cw=0x%x sw=0x%x mxcsr=0x%x "
+                     "ymm2=%016llx,%016llx,%016llx,%016llx",
+                     frame->State.FCW, boxedvn::fexX87Status(frame->State.flags),
+                     frame->State.mxcsr, (unsigned long long)maskLow[0],
+                     (unsigned long long)maskLow[1], (unsigned long long)maskHigh[0],
+                     (unsigned long long)maskHigh[1]);
             if (faultDecodeWidth == 32) {
                 // The segmented half of a 32-bit fault, which the line above
                 // carries only two selectors of. A 32-bit block adds

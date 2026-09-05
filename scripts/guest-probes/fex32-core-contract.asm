@@ -88,8 +88,39 @@ start:
     cmp     dword [DATA], 0xdeadbeef
     jne     fail
 
+    ; The C runtime scales a nonzero subnormal by 2^64 before recurring
+    ; in frexp. It must become normal in one step, and zero compares equal.
+    fninit
+    mov dword [DATA + 0x200], 0
+    mov dword [DATA + 0x204], 0
+    fldz
+    fld qword [DATA + 0x200]
+    fucomip st0, st1
+    fstp st0
+    jp fail
+    jne fail
+    mov dword [DATA + 0x200], 1
+    fldz
+    fld qword [DATA + 0x200]
+    fucomip st0, st1
+    fstp st0
+    jp fail
+    je fail
+    mov dword [DATA + 0x208], 0x5f800000 ; float 2^64
+    fld qword [DATA + 0x200]
+    ; A call forces the x87 value to survive a block boundary.
+    call x87_scale
+    fstp qword [DATA + 0x210]
+    cmp dword [DATA + 0x210], 0
+    jne fail
+    cmp dword [DATA + 0x214], 0x00d00000 ; double 2^-1010
+    jne fail
     mov     eax, PASS
     hlt
+
+x87_scale:
+    fmul dword [DATA + 0x208]
+    ret
 
 call_probe:
     push    ebp
