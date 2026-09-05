@@ -33,7 +33,7 @@ struct GuestPressButton: UIViewRepresentable {
 final class GuestPressControl: UIButton {
     var onPress: () -> Void = {}
     var onRelease: () -> Void = {}
-    private var held = false
+    private var guestPressActive = false
     override init(frame: CGRect) {
         super.init(frame: frame)
         titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
@@ -44,13 +44,13 @@ final class GuestPressControl: UIButton {
     deinit { NotificationCenter.default.removeObserver(self) }
     override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
         guard isEnabled else { return false }
-        held = true
+        guestPressActive = true
         isHighlighted = true
         onPress()
         return true
     }
     override func endTracking(_ touch: UITouch?, with event: UIEvent?) { releasePress() }
-    override func continueTracking(_ touch: UITouch, with event: UIEvent?) -> Bool { held }
+    override func continueTracking(_ touch: UITouch, with event: UIEvent?) -> Bool { guestPressActive }
     override func cancelTracking(with event: UIEvent?) { releasePress() }
     override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -63,8 +63,8 @@ final class GuestPressControl: UIButton {
         return true
     }
     @objc func releasePress() {
-        guard held else { return }
-        held = false
+        guard guestPressActive else { return }
+        guestPressActive = false
         isHighlighted = false
         onRelease()
     }
