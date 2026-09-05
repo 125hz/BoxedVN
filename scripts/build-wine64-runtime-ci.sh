@@ -820,6 +820,9 @@ if [[ -n "${OSS_DRIVER_DIR}" ]]; then
         [[ -s "${oss_pe32_src}" ]] || die "WoW64 runtime requires the i386 OSS PE driver."
         require_pe_machine "${oss_pe32_src}" 332 "32-bit Wine OSS user driver"
         cp "${oss_pe32_src}" "${PE32_STAGE}${I386_PE_GUEST_DIR}/${OSS_DRIVER_PE_NAME}"
+        # The initial census preceded this supplemental driver. The manifest
+        # must describe the final archive, including a newly added module.
+        I386_PE_MODULE_COUNT="$(find "${PE32_STAGE}${I386_PE_GUEST_DIR}" -type f | wc -l | tr -d ' ')"
     fi
     log "Wine OSS audio driver packaged: ${OSS_DRIVER_PE_NAME} + ${OSS_DRIVER_UNIX_NAME}"
 else
