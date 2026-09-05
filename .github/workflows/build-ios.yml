@@ -712,9 +712,14 @@ jobs:
           # register reconstruction. Keep just this routine's instructions.
           # Apple's objdump omits upstream's --dis-symname option. Filter its
           # ordinary Mach-O disassembly without exiting early (pipefail/SIGPIPE).
-          xcrun llvm-objdump --macho --disassemble "${app}/BoxedVN" \
-            | awk '/^[^[:space:]]+:$/ { keep = ($0 == "_BVNFEXCPU64AdapterHandleHostFault:"); found = found || keep } keep { print } END { if (!found) exit 1 }' \
-            | gzip -9 > build/artifacts/BoxedVN.fault-handler.txt.gz
+          # Symbol/string annotations can contain arbitrary bytes. Keep the
+          # optional disassembly from blocking an otherwise validated IPA.
+          if ! xcrun llvm-objdump --macho --disassemble "${app}/BoxedVN" \
+            | LC_ALL=C awk '/^[^[:space:]]+:$/ { keep = ($0 == "_BVNFEXCPU64AdapterHandleHostFault:"); found = found || keep } keep { print } END { if (!found) exit 1 }' \
+            | gzip -9 > build/artifacts/BoxedVN.fault-handler.txt.gz; then
+            echo '::warning::Fault-handler disassembly unavailable; the host symbol map is still provided.'
+            rm -f build/artifacts/BoxedVN.fault-handler.txt.gz
+          fi
           symbol_count="$(gzip -dc build/artifacts/BoxedVN.symbols.txt.gz | grep -c ' [tT] ' || true)"
           {
             echo "## Bundle sizes"
