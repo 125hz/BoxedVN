@@ -680,27 +680,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Package unsigned IPA
-        shell: bash
-        run: |
-          set -euo pipefail
-          app="build/ci/DerivedData/Build/Products/${BUILD_CONFIGURATION}-iphoneos/BoxedVN.app"
-          scripts/package-ipa.sh \
-            --app "${app}" \
-            --output-dir build/artifacts \
-            --name BoxedVN-unsigned.ipa
-
-      - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v7
-        with:
-          name: BoxedVN-unsigned-${{ inputs.configuration || 'Release' }}
-          path: |
-            build/artifacts/BoxedVN-unsigned.ipa
-            build/artifacts/BoxedVN-unsigned.ipa.sha256
-            ios/app/BoxedVN.entitlements
-          if-no-files-found: error
-          retention-days: 14
-
       - name: Package increased-memory entitlement template
         shell: bash
         run: |
@@ -736,11 +715,11 @@ jobs:
           release_tag="ios-latest"
           notes_file="${RUNNER_TEMP}/boxedvn-ios-release.md"
           printf '%s\n' \
-            'Rolling iOS builds from GitHub Actions.' \
+            'Rolling iOS build from GitHub Actions.' \
             '' \
             "Commit: ${GITHUB_SHA}" \
             "Configuration: ${BUILD_CONFIGURATION}" \
-            'BoxedVN-unsigned.ipa has no signature. BoxedVN.ipa is the ad-hoc increased-memory entitlement template. Both require signing by your sideloader.' \
+            'BoxedVN.ipa is the increased-memory entitlement template and requires signing by your sideloader.' \
             > "${notes_file}"
 
           if ! gh release view "${release_tag}" >/dev/null 2>&1; then
@@ -758,8 +737,6 @@ jobs:
           fi
 
           gh release upload "${release_tag}" \
-            build/artifacts/BoxedVN-unsigned.ipa \
-            build/artifacts/BoxedVN-unsigned.ipa.sha256 \
             build/artifacts/BoxedVN.ipa \
             build/artifacts/BoxedVN.ipa.sha256 \
             build/wine64-runtime/wine64-pe32.zip \
