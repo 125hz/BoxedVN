@@ -1,0 +1,79 @@
+diff --git a/src/dxmt/dxmt_mem_census.cpp b/src/dxmt/dxmt_mem_census.cpp
+--- a/src/dxmt/dxmt_mem_census.cpp
++++ b/src/dxmt/dxmt_mem_census.cpp
+@@ -158,6 +158,9 @@
+ 
+ void
+ mem_census_report(const char *why) {
++  // Census output can scan thousands of allocations and query Metal while
++  // the dynamic-buffer lock is held. Keep that work in verbose runs only.
++  if (Logger::logLevel() > LogLevel::Debug) return;
+   uint64_t tl = 0, tp = 0, tr = 0;
+   for (int i = 0; i < MEMOWN_COUNT; i++) {
+     tl += g_mem_census.live[i].load(std::memory_order_relaxed);
+diff --git a/src/dxmt/dxmt_dynamic.cpp b/src/dxmt/dxmt_dynamic.cpp
+--- a/src/dxmt/dxmt_dynamic.cpp
++++ b/src/dxmt/dxmt_dynamic.cpp
+@@ -1,6 +1,7 @@
+ #include "dxmt_dynamic.hpp"
+ #include "dxmt_texture.hpp"
+ #include "dxmt_mem_census.hpp"
++#include "log/log.hpp"
+ 
+ namespace dxmt {
+ DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) :
+@@ -62,11 +63,18 @@
+    * The walk and the trim now run for EVERY instance; only the statistics are
+    * gated. Behaviour must never depend on diagnostic capacity. */
+   {
+-    const bool stats = census_id_ < DYN_CENSUS_SLOTS;
++    const bool stats = Logger::logLevel() <= LogLevel::Debug && census_id_ < DYN_CENSUS_SLOTS;
+     uint64_t en = 0, eb = 0, in_n = 0, in_b = 0, lo = ~0ull, hi = 0, dup = 0;
+     const void *prev_seen[8] = {nullptr};
+     unsigned pi = 0;
+     for (const auto &e : fifo) {
++      if (!stats) {
++        // The FIFO is ordered by completion sequence. Only the eligible
++        // prefix is needed for safe trimming; skip diagnostic tail scans.
++        if (e.will_free_at > coherent_seq_id) break;
++        en++;
++        continue;
++      }
+       uint64_t bytes = e.allocation.ptr() ? e.allocation->census_bytes_ : 0;
+       if (e.will_free_at <= coherent_seq_id) { en++; eb += bytes; }
+       else                                   { in_n++; in_b += bytes; }
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -748,13 +748,19 @@
+       mythic_gap_last_entry_ = now;
+       mythic_gap_sync_min_ = std::min(mythic_gap_sync_min_, SyncInterval);
+       mythic_gap_sync_max_ = std::max(mythic_gap_sync_max_, SyncInterval);
+-      if ((++mythic_gap_count_ % 64) == 0) {
++      ++mythic_gap_count_;
++      ++boxedvn_gap_samples_;
++      if (boxedvn_gap_report_.time_since_epoch().count() == 0)
++        boxedvn_gap_report_ = now;
++      if (now - boxedvn_gap_report_ >= std::chrono::seconds(5)) {
+         Logger::info(std::format(
+             "[PRESENT_GAP] #{} gap_avg={:.1f}ms gap_max={:.1f}ms inside_avg={:.1f}ms "
+             "inside_max={:.1f}ms sync_interval={}..{}",
+-            mythic_gap_count_, mythic_gap_sum_ms_ / 64.0, mythic_gap_max_ms_,
+-            mythic_inside_sum_ms_ / 64.0, mythic_inside_max_ms_,
++            mythic_gap_count_, mythic_gap_sum_ms_ / boxedvn_gap_samples_, mythic_gap_max_ms_,
++            mythic_inside_sum_ms_ / boxedvn_gap_samples_, mythic_inside_max_ms_,
+             mythic_gap_sync_min_, mythic_gap_sync_max_));
++        boxedvn_gap_report_ = now;
++        boxedvn_gap_samples_ = 0;
+         mythic_gap_sum_ms_ = 0; mythic_gap_max_ms_ = 0;
+         mythic_inside_sum_ms_ = 0; mythic_inside_max_ms_ = 0;
+         mythic_gap_sync_min_ = ~0u; mythic_gap_sync_max_ = 0;
+@@ -1111,6 +1117,8 @@
+    * thread, so plain members are fine. */
+   std::chrono::steady_clock::time_point mythic_gap_last_entry_{};
+   uint64_t mythic_gap_count_ = 0;
++  uint64_t boxedvn_gap_samples_ = 0;
++  std::chrono::steady_clock::time_point boxedvn_gap_report_{};
+   double mythic_gap_sum_ms_ = 0, mythic_gap_max_ms_ = 0;
+   double mythic_inside_sum_ms_ = 0, mythic_inside_max_ms_ = 0;
+   UINT mythic_gap_sync_min_ = ~0u, mythic_gap_sync_max_ = 0;

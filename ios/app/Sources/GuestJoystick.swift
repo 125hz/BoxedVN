@@ -17,8 +17,8 @@ struct GuestJoystick: UIViewRepresentable {
 
 final class GuestJoystickControl: UIControl {
     private let icon = UIImageView(image: UIImage(systemName: "gamecontroller"))
-    private let pad = UIView(frame: CGRect(x: 0, y: 0, width: 120, height: 120))
-    private let knob = UIView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
+    private let pad = UIView(frame: CGRect(x: 0, y: 0, width: 88, height: 88))
+    private let knob = UIView(frame: CGRect(x: 0, y: 0, width: 34, height: 34))
     private var held = Set<String>()
     private var origin = CGPoint.zero
 
@@ -32,12 +32,12 @@ final class GuestJoystickControl: UIControl {
         icon.isUserInteractionEnabled = false
         addSubview(icon)
         pad.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.94)
-        pad.layer.cornerRadius = 60
+        pad.layer.cornerRadius = 44
         pad.layer.borderWidth = 2
         pad.layer.borderColor = UIColor.systemBlue.cgColor
         pad.isUserInteractionEnabled = false
         knob.backgroundColor = .systemBlue
-        knob.layer.cornerRadius = 22
+        knob.layer.cornerRadius = 17
         pad.addSubview(knob)
         NotificationCenter.default.addObserver(self, selector: #selector(releaseKeys),
             name: UIApplication.willResignActiveNotification, object: nil)
@@ -53,7 +53,7 @@ final class GuestJoystickControl: UIControl {
         guard isEnabled, let window else { return false }
         origin = touch.location(in: window)
         pad.center = origin
-        knob.center = CGPoint(x: 60, y: 60)
+        knob.center = CGPoint(x: 44, y: 44)
         window.addSubview(pad)
         return true
     }
@@ -62,14 +62,14 @@ final class GuestJoystickControl: UIControl {
         let point = touch.location(in: window)
         let dx = point.x - origin.x, dy = point.y - origin.y
         let distance = hypot(dx, dy)
-        let scale = distance > 40 ? 40 / distance : 1
-        knob.center = CGPoint(x: 60 + dx * scale, y: 60 + dy * scale)
+        let scale = distance > 24 ? 24 / distance : 1
+        knob.center = CGPoint(x: 44 + dx * scale, y: 44 + dy * scale)
         var next = Set<String>()
-        if distance > 12 {
-            if dx > max(12, abs(dy) * 0.45) { next.insert("D") }
-            if dx < -max(12, abs(dy) * 0.45) { next.insert("A") }
-            if dy > max(12, abs(dx) * 0.45) { next.insert("S") }
-            if dy < -max(12, abs(dx) * 0.45) { next.insert("W") }
+        if distance > 6 {
+            if dx > max(6, abs(dy) * 0.45) { next.insert("D") }
+            if dx < -max(6, abs(dy) * 0.45) { next.insert("A") }
+            if dy > max(6, abs(dx) * 0.45) { next.insert("S") }
+            if dy < -max(6, abs(dx) * 0.45) { next.insert("W") }
         }
         for key in held.subtracting(next) { BVNGuestControlsSetKeyNamed(key, false) }
         for key in next.subtracting(held) { BVNGuestControlsSetKeyNamed(key, true) }

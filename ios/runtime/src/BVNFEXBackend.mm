@@ -1952,10 +1952,33 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
             auto* process = static_cast<KProcess*>(processEntry.first);
             LiveProcessState* processState = processEntry.second.get();
             if (!process || !processState) continue;
-            for (const auto& threadEntry : processState->threads) {
+            // Hash-map order used to hide the main/render thread once a
+            // process had more than eight workers. Always sample its oldest
+            // live thread, then rotate the remaining slots across workers.
+            std::vector<std::pair<KThread*, LiveThreadState*>> candidates;
+            for (const auto& entry : processState->threads) {
+                auto* candidate = static_cast<KThread*>(entry.first);
+                auto* state = entry.second.get();
+                if (candidate && state && state->active &&
+                    state->hostMachThread != MACH_PORT_NULL &&
+                    state->hostMachThread != pollingThread &&
+                    state->fexThread && state->fexThread->CurrentFrame) {
+                    candidates.emplace_back(candidate, state);
+                }
+            }
+            std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+                return a.first->id < b.first->id;
+            });
+            if (candidates.size() > kMaximumSnapshots) {
+                const size_t offset = ((poll - 1) * (kMaximumSnapshots - 1)) %
+                                      (candidates.size() - 1);
+                std::rotate(candidates.begin() + 1,
+                            candidates.begin() + 1 + offset, candidates.end());
+            }
+            for (const auto& threadEntry : candidates) {
                 if (snapshotCount == snapshots.size()) break;
                 auto* thread = static_cast<KThread*>(threadEntry.first);
-                LiveThreadState* threadState = threadEntry.second.get();
+                LiveThreadState* threadState = threadEntry.second;
                 if (!thread || !threadState || !threadState->active ||
                     threadState->hostMachThread == MACH_PORT_NULL ||
                     threadState->hostMachThread == pollingThread ||

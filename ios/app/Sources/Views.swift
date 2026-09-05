@@ -422,9 +422,6 @@ struct GuestControlBar: View {
     /// runtime state cannot run while the guest still owns the main thread.
     let onStop: () -> Void
     @State private var pointerMode = Int(BVNGuestControlsPointerMode())
-    /// Set by the long press, consumed by the touch-up that ends it, so the
-    /// release cannot be read as the tap that closes what the press opened.
-    @State private var pressOpenedSettings = false
 
     private var running: Bool { active }
 
@@ -435,10 +432,10 @@ struct GuestControlBar: View {
             GuestJoystick(active: running)
                 .frame(maxWidth: .infinity)
                 .frame(height: 44)
-            control("return", "Enter") { BVNGuestControlsTapKeyNamed("Return") }
-            control("space", "Space") { BVNGuestControlsTapKeyNamed("Space") }
-            textControl("esc", "Esc") { BVNGuestControlsTapKeyNamed("Escape") }
-            textControl("tab", "Tab") { BVNGuestControlsTapKeyNamed("Tab") }
+            keyControl("return", "Enter", key: "Return")
+            keyControl("space", "Space", key: "Space")
+            keyControl(nil, "esc", key: "Escape")
+            keyControl(nil, "tab", key: "Tab")
             control("stop.circle", "Stop", tint: .red) { onStop() }
         }
         .frame(maxWidth: .infinity)
@@ -456,13 +453,6 @@ struct GuestControlBar: View {
     private var pointerControl: some View {
         control(pointerMode == 0 ? "hand.point.up.left" : "cursorarrow",
                 "Pointer") {
-            // The long press has already opened the panel by the time the
-            // finger lifts; that release must neither change the mode nor
-            // close what the press just opened.
-            if pressOpenedSettings {
-                pressOpenedSettings = false
-                return
-            }
             if showingPointerSettings {
                 showingPointerSettings = false
                 return
@@ -472,7 +462,6 @@ struct GuestControlBar: View {
         }
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                pressOpenedSettings = true
                 showingPointerSettings = true
             }
         )
@@ -480,34 +469,21 @@ struct GuestControlBar: View {
                            + "Touch and hold for mouse settings.")
     }
 
-    private func textControl(_ title: String, _ label: String,
-                             action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .frame(width: 34, height: 30)
-        }
-        .buttonStyle(.plain)
-        .tint(.accentColor)
-        .foregroundStyle(Color.accentColor)
-        .accessibilityLabel(label)
-        .frame(maxWidth: .infinity, minHeight: 44)
+    private func keyControl(_ glyph: String?, _ label: String, key: String) -> some View {
+        GuestPressButton(glyph: glyph, label: label, active: running,
+            onPress: { BVNGuestControlsSetKeyNamed(key, true) },
+            onRelease: { BVNGuestControlsSetKeyNamed(key, false) })
+            .frame(maxWidth: .infinity, minHeight: 44)
     }
 
     private func control(_ glyph: String, _ label: String,
                          tint: Color = .accentColor,
                          action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: glyph)
-                .font(.title3)
-                .frame(width: 34, height: 30)
-        }
-        .buttonStyle(.plain)
-        .tint(tint)
-        .foregroundStyle(tint)
-        .accessibilityLabel(label)
-        .frame(maxWidth: .infinity, minHeight: 44)
+        GuestPressButton(glyph: glyph, label: label, active: running,
+            tint: UIColor(tint), onPress: action)
+            .frame(maxWidth: .infinity, minHeight: 44)
     }
+
 }
 
 /// The mouse settings behind the control bar's pointer button.

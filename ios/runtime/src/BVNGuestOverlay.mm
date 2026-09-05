@@ -487,8 +487,10 @@ static NSString* BVNStartupMessageAfter(NSString* line, NSString* marker) {
 }
 
 extern "C" void BVNGuestPointerPositionChanged(int x, int y) {
-    gGuestPointerX.store(x, std::memory_order_relaxed);
-    gGuestPointerY.store(y, std::memory_order_relaxed);
+    const int previousX = gGuestPointerX.exchange(x, std::memory_order_relaxed);
+    const int previousY = gGuestPointerY.exchange(y, std::memory_order_relaxed);
+    if (previousX == x && previousY == y &&
+        gGuestPointerRevision.load(std::memory_order_relaxed) != 0) return;
     gGuestPointerRevision.fetch_add(1, std::memory_order_release);
     if (NSThread.isMainThread) {
         BVNGuestOverlayApplyPendingState();
@@ -518,9 +520,14 @@ extern "C" void BVNGuestCursorDefine(uint32_t id,
 }
 
 extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
-    gSelectedGuestCursorId.store(id, std::memory_order_relaxed);
-    gSelectedGuestCursorShape.store(shape, std::memory_order_relaxed);
-    gSelectedGuestCursorVisible.store(visible, std::memory_order_relaxed);
+    const auto previousId = gSelectedGuestCursorId.exchange(id, std::memory_order_relaxed);
+    const auto previousShape = gSelectedGuestCursorShape.exchange(shape, std::memory_order_relaxed);
+    const auto previousVisible = gSelectedGuestCursorVisible.exchange(visible, std::memory_order_relaxed);
+    // Wine repeats SetCursor during pointer motion. Re-selecting the same
+    // cursor must not rebuild NSData/CGImage/UIImage on every mouse sample.
+    // Defining new bitmap contents still publishes its own revision above.
+    if (previousId == id && previousShape == shape && previousVisible == visible &&
+        gGuestCursorRevision.load(std::memory_order_relaxed) != 0) return;
     gGuestCursorRevision.fetch_add(1, std::memory_order_release);
     if (NSThread.isMainThread) {
         BVNGuestOverlayApplyPendingState();

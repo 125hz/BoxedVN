@@ -1,0 +1,40 @@
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -5577,9 +5577,13 @@
+ 
+         m_cmd->track(m_state.vi.vertexBuffers[binding].buffer(), DxvkAccess::Read);
+       } else {
+-        buffers[i] = VK_NULL_HANDLE;
++        // MoltenVK has no nullDescriptor. Bind the device-owned zero
++        // buffer with zero stride so every vertex fetch reads zeroes.
++        const bool nullDescriptor = m_device->features().extRobustness2.nullDescriptor;
++        buffers[i] = nullDescriptor ? VK_NULL_HANDLE
++          : m_common->dummyResources().bufferHandle();
+         offsets[i] = 0;
+-        lengths[i] = 0;
++        lengths[i] = nullDescriptor ? 0 : MaxUniformBufferSize;
+         strides[i] = 0;
+       }
+     }
+diff --git a/src/dxvk/dxvk_unbound.cpp b/src/dxvk/dxvk_unbound.cpp
+--- a/src/dxvk/dxvk_unbound.cpp
++++ b/src/dxvk/dxvk_unbound.cpp
+@@ -76,11 +76,15 @@
+                     | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                     | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                     | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
+-                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
+-                    | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
++                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
++    if (m_device->features().extTransformFeedback.transformFeedback)
++      info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+     info.stages     = VK_PIPELINE_STAGE_TRANSFER_BIT
++                    | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT
+                     | m_device->getShaderPipelineStages();
+     info.access     = VK_ACCESS_UNIFORM_READ_BIT
++                    | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
++                    | VK_ACCESS_INDEX_READ_BIT
+                     | VK_ACCESS_SHADER_READ_BIT
+                     | VK_ACCESS_SHADER_WRITE_BIT;
+     
