@@ -710,7 +710,10 @@ jobs:
           nm -n -arch arm64 "${app}/BoxedVN" | gzip -9 > build/artifacts/BoxedVN.symbols.txt.gz
           # A symbol offset alone cannot distinguish a fault-report read from
           # register reconstruction. Keep just this routine's instructions.
-          xcrun llvm-objdump --macho --disassemble --dis-symname=_BVNFEXCPU64AdapterHandleHostFault "${app}/BoxedVN" \
+          # Apple's objdump omits upstream's --dis-symname option. Filter its
+          # ordinary Mach-O disassembly without exiting early (pipefail/SIGPIPE).
+          xcrun llvm-objdump --macho --disassemble "${app}/BoxedVN" \
+            | awk '/^[^[:space:]]+:$/ { keep = ($0 == "_BVNFEXCPU64AdapterHandleHostFault:"); found = found || keep } keep { print } END { if (!found) exit 1 }' \
             | gzip -9 > build/artifacts/BoxedVN.fault-handler.txt.gz
           symbol_count="$(gzip -dc build/artifacts/BoxedVN.symbols.txt.gz | grep -c ' [tT] ' || true)"
           {
