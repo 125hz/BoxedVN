@@ -405,6 +405,11 @@ bool BVNRuntimeRequestShutdown(void);
 
 BVNRuntimeState BVNRuntimeGetState(void);
 
+// Main-thread phase names must be string literals. The log reader polls this
+// independently of UIKit so a blocked event loop can report its host PC.
+void BVNRuntimeNoteMainPhase(const char* phase);
+void BVNRuntimePollMainThread(void);
+
 // Exit code of the last finished session, or INT32_MIN when none has run.
 int32_t BVNRuntimeLastExitCode(void);
 

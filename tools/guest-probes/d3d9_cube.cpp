@@ -11,6 +11,8 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <math.h>
+#include <cstdio>
+#include "x87_probe.h"
 
 namespace {
 
@@ -203,6 +205,16 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message,
 }  // namespace
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
+    const auto math = runX87Probe();
+    char mathReport[240];
+    const int mathLength = std::snprintf(mathReport, sizeof(mathReport),
+        "BOXEDWINE_PE32_X87_PROBE integer=%016llx minimum=%016llx subnormal=%016llx restored=%u pass=%u\n",
+        (unsigned long long)math.integerLoad, (unsigned long long)math.minimum,
+        (unsigned long long)math.scaledSubnormal, unsigned(math.restored), unsigned(math.passed()));
+    if (mathLength > 0 && mathLength < int(sizeof(mathReport))) {
+        DWORD written;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), mathReport, DWORD(mathLength), &written, nullptr);
+    }
     WNDCLASSEXW windowClass = {};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.style = CS_HREDRAW | CS_VREDRAW;

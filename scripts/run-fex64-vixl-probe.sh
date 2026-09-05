@@ -41,6 +41,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-boxedwine-inline-call-return.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-longmode-segment-base.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-x87-context-slot-access.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-x87-restore-stack-order.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-harness-alias.patch"
 )
 
@@ -86,6 +87,10 @@ for runtime_patch in "${runtime_patches[@]}"; do
 done
 
 build_runner() (
+    mkdir -p "${fex_build}"
+    "${cxx}" -std=c++17 -O2 -Wall -Wextra -Werror \
+        "${root}/scripts/guest-probes/x87-native-check.cpp" -o "${fex_build}/boxedvn-x87-native"
+    "${fex_build}/boxedvn-x87-native"
     applied_patches=()
     restore_source() {
         local index

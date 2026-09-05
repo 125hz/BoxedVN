@@ -223,6 +223,7 @@ apply_patch fex-boxedwine-call-return-push-width.patch
 # rest of FEX already uses for it, which are lowered off the STATE register
 # and are never translated.
 apply_patch fex-boxedwine-x87-context-slot-access.patch
+apply_patch fex-boxedwine-x87-restore-stack-order.patch
 # Test-only: an env-gated alias configuration for TestHarnessRunner. It
 # changes no library code, and is applied here too so every checkout of
 # the pin carries the same maintained set.

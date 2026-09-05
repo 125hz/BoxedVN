@@ -112,6 +112,7 @@ void startBootHeartbeatWatch() {
             // boxedmain owns the main thread. Sample translated execution even
             // when FEX is reusing linked blocks and emits no compile messages.
             BVNFEXBackendPollExecutionTrace();
+            BVNRuntimePollMainThread();
             const uint64_t sequence =
                 gBootHeartbeatSequence.load(std::memory_order_acquire);
             if (sequence == 0 || sequence ==

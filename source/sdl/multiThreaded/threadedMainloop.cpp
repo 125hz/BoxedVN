@@ -35,6 +35,12 @@ extern U32 dynamicCodeExceptionCount;
 static U32 lastTitleUpdate = 0;
 
 static thread_local bool isMainThread;
+#ifdef BOXEDWINE_IOS
+extern "C" void BVNRuntimeNoteMainPhase(const char* phase);
+#define BVN_MAIN_PHASE(name) BVNRuntimeNoteMainPhase(name)
+#else
+#define BVN_MAIN_PHASE(name) ((void)0)
+#endif
 
 static BString getSize(int pages)
 {
@@ -55,6 +61,7 @@ bool isMainthread() {
 bool doMainLoop() {
     isMainThread = true;
     while (platformThreadCount) {
+        BVN_MAIN_PHASE("loop-begin");
         U32 timeout = 5000;
         U32 t = KSystem::getMilliesSinceStart();
 
@@ -78,11 +85,13 @@ bool doMainLoop() {
             }
         }
         XServer* server = XServer::getServer(true);
+        BVN_MAIN_PHASE("x11-draw");
         if (server) {
             server->isDisplayDirty = true; // a bit of a hack, sometimes popups in Basstour get missed and don't draw
             server->draw();
             timeout = 17;
         } 
+        BVN_MAIN_PHASE("framebuffer");
         if (flipFB()) {
             timeout = 17;
         }
@@ -91,13 +100,16 @@ bool doMainLoop() {
             timeout = 33;
         }
 #endif
+        BVN_MAIN_PHASE("timers");
         U32 nextTimer = getNextTimer();
         if (nextTimer == 0) {
             runTimers();
         } else if (nextTimer < timeout) {
             timeout = nextTimer;
         }
+        BVN_MAIN_PHASE("native-tick");
         KNativeSystem::tick();
+        BVN_MAIN_PHASE("wait-event");
 #ifdef BOXEDWINE_RECORDER
         if (Player::instance || Recorder::instance) {
             KNativeSystem::getCurrentInput()->waitForEvent(10);
@@ -129,6 +141,7 @@ bool doMainLoop() {
 
             KNativeSystem::getScreen()->setTitle(title);
         }
+        BVN_MAIN_PHASE("process-events");
         if (!KNativeSystem::getCurrentInput()->processEvents()) {
             return true;
         }

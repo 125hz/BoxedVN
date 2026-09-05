@@ -131,6 +131,54 @@ start:
     call rehash_minimum
     cmp eax, 6
     jne fail
+    ; A Windows context uses 53-bit precision. Exercise both that control
+    ; word and non-empty FXSAVE/FXRSTOR state, at every physical TOP.
+    fninit
+    mov word [DATA+0x320], 0x027f
+    fldcw [DATA+0x320]
+    mov dword [DATA+0x308], 0x3f800000
+    call rehash_minimum
+    cmp eax, 12
+    jne fail
+    xor ecx, ecx
+.restore_top:
+    fninit
+    mov edx, ecx
+.rotate_top:
+    test edx, edx
+    jz .push_values
+    fincstp
+    dec edx
+    jmp .rotate_top
+.push_values:
+    mov dword [DATA+0x328], 11
+    fild dword [DATA+0x328]
+    mov dword [DATA+0x328], 22
+    fild dword [DATA+0x328]
+    mov dword [DATA+0x328], 33
+    fild dword [DATA+0x328]
+    fxsave [DATA+0x400]
+    fninit
+    fxrstor [DATA+0x400]
+    fxsave [DATA+0x600]
+    mov eax, [DATA+0x400] ; control/status and TOP must survive
+    cmp eax, [DATA+0x600]
+    jne fail
+    mov al, [DATA+0x404] ; physical tag bits must survive too
+    cmp al, [DATA+0x604]
+    jne fail
+    fistp dword [DATA+0x328]
+    cmp dword [DATA+0x328], 33
+    jne fail
+    fistp dword [DATA+0x328]
+    cmp dword [DATA+0x328], 22
+    jne fail
+    fistp dword [DATA+0x328]
+    cmp dword [DATA+0x328], 11
+    jne fail
+    inc ecx
+    cmp ecx, 8
+    jb .restore_top
     mov     eax, PASS
     hlt
 

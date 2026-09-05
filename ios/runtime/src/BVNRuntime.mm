@@ -57,6 +57,7 @@
 #include "boxedvn/launch_preflight.h"
 #include "boxedvn/wine_prefix.h"
 #include "BVNRuntime.h"
+#include "BVNRunLoopSession.h"
 
 // Boxedwine's own entry point, from source/sdl/main.cpp.  Declared with C++
 // linkage to match its definition there, exactly as platform/sdl/
@@ -115,11 +116,14 @@ dispatch_queue_t preflightQueue() {
     return queue;
 }
 
-// Capture where the main thread actually is when it fails to service a queued
-// block promptly. Bounded to the launch diagnostic window: a stall that is
-// never explained is the reason this exists.
+// Capture the main thread when preflight or a running session stops
+// servicing events. Bound stack reports to four per session.
 std::atomic<uint32_t> gMainStallReports {0};
 pthread_t gMainPthread {};
+std::atomic<const char*> gMainLoopPhase {"idle"};
+std::atomic<uint64_t> gMainLoopPhaseSince {0};
+std::atomic<uint64_t> gMainQueueSentAt {0};
+std::atomic<bool> gMainQueueProbePending {false};
 
 void reportMainThreadStall(uint64_t latencyMilliseconds) {
     if (gMainStallReports.fetch_add(1, std::memory_order_relaxed) >= 4) {
@@ -997,6 +1001,39 @@ void runSession(const BVNLaunchConfiguration& launch) {
 
 }  // namespace
 
+extern "C" void BVNRuntimeNoteMainPhase(const char* phase) {
+    gMainLoopPhase.store(phase, std::memory_order_relaxed);
+    gMainLoopPhaseSince.store(monotonicMilliseconds(), std::memory_order_release);
+}
+
+extern "C" void BVNRuntimePollMainThread(void) {
+    // Called only by the existing background log watcher, once a second.
+    static uint64_t lastReport = 0;
+    const auto state = BVNRuntimeGetState();
+    if (state != BVNRuntimeStateRunning && state != BVNRuntimeStateStopping) return;
+    const uint64_t now = monotonicMilliseconds();
+    const uint64_t since = gMainLoopPhaseSince.load(std::memory_order_acquire);
+    const uint64_t age = since && now >= since ? now - since : 0;
+    if (!gMainQueueProbePending.exchange(true, std::memory_order_acq_rel)) {
+        gMainQueueSentAt.store(now, std::memory_order_release);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gMainQueueProbePending.store(false, std::memory_order_release);
+        });
+    }
+    const uint64_t sent = gMainQueueSentAt.load(std::memory_order_acquire);
+    const uint64_t queueAge = now >= sent ? now - sent : 0;
+    if (now - lastReport >= 5000) {
+        lastReport = now;
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "BOXEDWINE_MAIN_LOOP phase=%s phase_age_ms=%llu queue_age_ms=%llu",
+                 gMainLoopPhase.load(std::memory_order_relaxed),
+                 (unsigned long long)age, (unsigned long long)queueAge);
+        BVNLogWrite(BVNLogLevelInfo, "runtime", line);
+    }
+    if (std::max(age, queueAge) >= 2000) reportMainThreadStall(std::max(age, queueAge));
+}
+
 extern "C" const char* BVNRuntimeStateName(BVNRuntimeState state) {
     switch (state) {
         case BVNRuntimeStateIdle:     return "idle";
@@ -1205,31 +1242,52 @@ extern "C" bool BVNRuntimeRequestLaunch(const BVNLaunchRequest* request,
                 // flight produced a portrait first drawable that was then
                 // replaced underneath Boxedwine's blocking main-thread loop.
                 BVNPrepareGuestPresentation(^{
-                    // SDL disables its UIKit event pump when the function it
-                    // was given (BVNGuestMain) returns - see
-                    // -[SDLUIKitDelegate postFinishLaunch]. BVNGuestMain now
-                    // returns immediately so the real run loop can service the
-                    // library, so the pump has to be turned back on here.
-                    SDL_iPhoneSetEventPump(SDL_TRUE);
-                    const auto releaseGuestPresentation = [preflight]() {
-                        if (!preflight->claimCleanup()) return;
-                        SDL_iPhoneSetEventPump(SDL_FALSE);
-                        BVNFinishGuestPresentation();
-                    };
-                    if (launch.useDXMT &&
-                        !BVNDXMTDisplayPrepare(
-                            launch.width ? launch.width : 1280,
-                            launch.height ? launch.height : 720)) {
-                        setLastError("The DXMT Metal presentation layer could "
-                                     "not be prepared.");
-                        setState(BVNRuntimeStateFailed);
+                    // Return from the presentation/GCD completion before the
+                    // guest enters its blocking SDL loop. This leaves main-
+                    // queue SwiftUI and input work available to SDL's pump.
+                    BVNEnqueueRunLoopSession(^{
+                        if (generation != gLaunchGeneration.load(std::memory_order_acquire)) {
+                            if (preflight->claimCleanup()) BVNFinishGuestPresentation();
+                            return;
+                        }
+                        // SDL disables its UIKit event pump when the function it
+                        // was given (BVNGuestMain) returns - see
+                        // -[SDLUIKitDelegate postFinishLaunch]. BVNGuestMain now
+                        // returns immediately so the real run loop can service the
+                        // library, so the pump has to be turned back on here.
+                        SDL_iPhoneSetEventPump(SDL_TRUE);
+                        const auto releaseGuestPresentation = [preflight]() {
+                            if (!preflight->claimCleanup()) return;
+                            SDL_iPhoneSetEventPump(SDL_FALSE);
+                            BVNFinishGuestPresentation();
+                        };
+                        if (launch.useDXMT &&
+                            !BVNDXMTDisplayPrepare(
+                                launch.width ? launch.width : 1280,
+                                launch.height ? launch.height : 720)) {
+                            setLastError("The DXMT Metal presentation layer could "
+                                         "not be prepared.");
+                            setState(BVNRuntimeStateFailed);
+                            releaseGuestPresentation();
+                            return;
+                        }
+                        // boxedmain owns the main thread, which SDL's UIKit
+                        // backend requires.
+                        const uint64_t sessionEntry = monotonicMilliseconds();
+                        gMainStallReports.store(0, std::memory_order_relaxed);
+                        BVNRuntimeNoteMainPhase("session-entry");
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            char message[160];
+                            snprintf(message, sizeof(message),
+                                     "BOXEDWINE_SESSION_MAIN_SENTINEL generation=%llu latency_ms=%llu",
+                                     (unsigned long long)generation,
+                                     (unsigned long long)(monotonicMilliseconds() - sessionEntry));
+                            BVNLogWrite(BVNLogLevelInfo, "runtime", message);
+                        });
+                        runSession(launch);
+                        BVNRuntimeNoteMainPhase("idle");
                         releaseGuestPresentation();
-                        return;
-                    }
-                    // boxedmain owns the main thread, which SDL's UIKit
-                    // backend requires.
-                    runSession(launch);
-                    releaseGuestPresentation();
+                    });
                 });
             });
         });
