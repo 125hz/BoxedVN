@@ -49,6 +49,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include "fex_x87_state.h"
 #include "guest_segment_table.h"
 #include "fex64loaderhandoff.h"
+#include "fex_callret_guard.h"
 #include "kmemory64.h"
 #include "kprocess.h"
 #include "ksignal.h"   // K_SIGSEGV / K_SEGV_* / K_BUS_ADRALN
@@ -1297,6 +1298,34 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     const uint64_t faultAddress = reinterpret_cast<uint64_t>(siginfo->si_addr);
     const bool inCodeBuffer =
         adapter->context->IsAddressInCodeBuffer(adapter->fexThread, hostPC);
+    // FEX's call/return predictor can drift after non-local guest exits.
+    // Its guard fault belongs to the host runtime (as in FEX's Windows
+    // CallRetStack::HandleAccessViolation), not to Wine's exception dispatcher.
+    // Darwin can report this aligned STP as BUS_ADRALN: handle it BEFORE the
+    // generic unaligned-access path, which cannot repair an inaccessible page.
+    if (inCodeBuffer && (signal == SIGBUS || signal == SIGSEGV)) {
+        const auto oldSP = machine->__ss.__x[boxedvn::fexCallRetHostRegister];
+        const auto resetSP = boxedvn::recoverFexCallRetGuard(
+            reinterpret_cast<uint64_t>(adapter->fexThread->CallRetStackBase),
+            FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE,
+            oldSP, faultAddress, *reinterpret_cast<const uint32_t*>(hostPC));
+        if (resetSP) {
+            machine->__ss.__x[boxedvn::fexCallRetHostRegister] = resetSP;
+            adapter->fexThread->CurrentFrame->State.callret_sp = resetSP;
+            static std::atomic<uint32_t> reports {0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+                klog_fmt("BOXEDWINE_FEX64_CALLRET_GUARD pid=%d tid=%d "
+                         "old_sp=0x%llx reset_sp=0x%llx fault=0x%llx",
+                         adapter->process ? adapter->process->id : -1,
+                         adapter->thread ? adapter->thread->id : -1,
+                         (unsigned long long)oldSP, (unsigned long long)resetSP,
+                         (unsigned long long)faultAddress);
+            }
+            // Retry exactly the faulting host instruction. No guest register,
+            // guest stack or guest instruction pointer has been changed.
+            return true;
+        }
+    }
     // An x86 atomic on an unaligned address (and, with strict memory
     // ordering, any unaligned load-acquire/store-release) raises SIGBUS
     // BUS_ADRALN inside translated code. FEX emulates the atomic in place or

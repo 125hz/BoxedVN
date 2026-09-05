@@ -47,6 +47,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "boxedvn/fex_guest_mode_policy.h"
 #include "guest_low_alias.h"
 #include "guest_segment_table.h"
+#include "fex_callret_guard.h"
 #include "boxedvn/guest_address_space.h"
 #include "boxedvn/elf_inspector.h"
 
@@ -121,6 +122,7 @@ int rpm_cas_snapshot_take(void* snapshot) {
 namespace {
 
 constexpr size_t kPageBytes = 0x4000;
+static_assert(kPageBytes == boxedvn::fexCallRetHostGuardBytes);
 constexpr size_t kFEXPageBytes = 0x1000;
 static_assert(FEXCore::Utils::FEX_PAGE_SIZE == kFEXPageBytes,
               "executable layout must match FEX's guard-page size");

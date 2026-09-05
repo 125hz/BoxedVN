@@ -163,3 +163,61 @@ References:
 - https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 - https://github.com/wine-mirror/wine/blob/wine-9.0/dlls/wined3d/context_vk.c
 - https://docs.vulkan.org/refpages/latest/refpages/source/VkGraphicsPipelineCreateInfo.html
+
+## Device revision e15f23df, afternoon retest
+
+All five logs (142640, 145559, 165124, 165455, 165804) identify
+e15f23df+dirty, build 137. They are device evidence, not task instructions.
+
+The long cube and visual-novel logs contain faults on host prediction-stack
+guards: the first cube access is `stp xzr,xzr,[x25,#-16]!` (0xa9bf7f3f),
+faulting at 0x7029c13ff0. This is outside guest memory. Darwin reports SIGBUS,
+and the unaligned handler declines it; we then incorrectly send it to Wine,
+which enters recursive exception handling and eventually consumes CPU in
+signal delivery. The native AArch64 ABI reserves x25 for FEX's call/return
+predictor. The pinned FEX Windows CallRetStack::HandleAccessViolation resets
+this nonarchitectural cache to base + size/4 on guard faults. Our allocator
+already provides two 16 KB host guards but lacked that recovery.
+
+Recover only the current thread's guard and the exact STP-pre/LDP-post
+instruction forms through x25, corroborated by the live register and fault
+address. Reset x25 and its saved cache pointer, retry at unchanged host PC,
+and leave guest RSP/RIP/registers untouched. Reject foreign addresses and
+opcodes. Share the guard-size contract with the allocator. Host tests cover
+both boundaries and refusal cases; the macOS build also executes real
+guarded STP/LDP instructions through Darwin's signal handler.
+
+The 64-bit mouse slowdown is independent: at 16:52:33 the main game thread
+waits in X11 hostcall 6 (FLUSH), while repeated present intervals average
+258-260 ms and native Metal present calls average essentially zero. The
+bridge's Flush and Sync call draw(true), synchronously waiting for a main
+thread SDL callback. Requests have already executed inside this X11 server;
+XFlush sends buffered requests and XSync waits for server processing, neither
+requires physical display refresh. Leave redraws to the existing main loop,
+which still consumes software dirty windows and GDI patches over Metal.
+
+The cube's completion waits also total zero milliseconds in the measured
+intervals. Its frozen orientation is not proven fixed by either change.
+Add at most 16 animation witnesses with GetTickCount elapsed time, QPC,
+wall time and the first generated vertex's exact float bits. Keep its
+existing animation and rendering path, so the retest distinguishes clock,
+math and vertex-upload faults instead of masking them with another clock.
+
+The 64-bit Resume fault remains the read at image offset 0xdb6c5. Its new
+stack-argument header proves count=capacity=0 and data=null in an otherwise
+recognizable container. Read-only inspection traces its population through
+a virtual count function, but the origin of the empty data is unresolved.
+No executable was run or modified; no instruction is skipped. The visual
+novel also still supplies stageCount=0 graphics pipelines, correctly refused
+by the earlier guard; CPU recovery alone does not supply the missing shader.
+
+Local validation: 524 host support cases pass; 290 Python cases pass with
+51 platform skips; the IA-32 probe compiles and passes PE validation. Native
+Darwin recovery and iPhoneOS compilation are checked by the dispatched CI.
+Device acceptance remains outstanding, especially Resume and game-scene
+rendering. Wine/FEX/graphics still run inside the BoxedWine runtime.
+
+References:
+- Pinned FEX: Source/Windows/Common/CallRetStack.h and
+  FEXCore/Source/Interface/Core/JIT/BranchOps.cpp (read-only inspection).
+- https://xorg.freedesktop.org/X11R7.0/doc/PDF/xlib.pdf (section 11.2).

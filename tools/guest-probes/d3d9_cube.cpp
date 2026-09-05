@@ -12,6 +12,7 @@
 #include <d3d9.h>
 #include <math.h>
 #include <cstdio>
+#include <cstring>
 #include "x87_probe.h"
 
 namespace {
@@ -146,7 +147,8 @@ bool updateVertices() {
         return false;
     }
 
-    const float seconds = static_cast<float>(GetTickCount() - gStartedAt) / 1000.0f;
+    const DWORD tick = GetTickCount();
+    const float seconds = static_cast<float>(tick - gStartedAt) / 1000.0f;
     const float scale = static_cast<float>(gHeight) * 0.72f;
     for (unsigned int triangleVertex = 0; triangleVertex < 36; ++triangleVertex) {
         const Vec3 rotated = rotate(kCorners[kTriangles[triangleVertex]],
@@ -159,8 +161,42 @@ bool updateVertices() {
         output.rhw = 1.0f / cameraZ;
         output.color = kFaceColors[triangleVertex / 6];
     }
-    gVertexBuffer->Unlock();
-    return true;
+    // A successful Present is not proof that the clock, x87 math and dynamic
+    // vertex upload all advanced. Keep independent clock/vertex witnesses in
+    // the probe, bounded even when one of those clocks stops progressing.
+    static unsigned frames = 0;
+    static unsigned reports = 0;
+    static unsigned long long lastWall = 0;
+    ++frames;
+    if (reports < 16 && (frames <= 2 || (frames & 63) == 0)) {
+        FILETIME fileTime;
+        GetSystemTimeAsFileTime(&fileTime);
+        const unsigned long long wall =
+            (static_cast<unsigned long long>(fileTime.dwHighDateTime) << 32) |
+            fileTime.dwLowDateTime;
+        if (frames <= 2 || wall - lastWall >= 50000000ULL) {
+            lastWall = wall;
+            ++reports;
+            LARGE_INTEGER qpc = {}, frequency = {};
+            QueryPerformanceCounter(&qpc);
+            QueryPerformanceFrequency(&frequency);
+            unsigned bits[4];
+            std::memcpy(bits, vertices, sizeof(bits));
+            char report[320];
+            const int length = std::snprintf(report, sizeof(report),
+                "BOXEDWINE_PE32_ANIMATION frame=%u tick=%lu elapsed=%lu "
+                "qpc=%lld frequency=%lld wall=%llu vertex=%08x,%08x,%08x,%08x\n",
+                frames, static_cast<unsigned long>(tick),
+                static_cast<unsigned long>(tick - gStartedAt),
+                qpc.QuadPart, frequency.QuadPart, wall,
+                bits[0], bits[1], bits[2], bits[3]);
+            if (length > 0 && length < int(sizeof(report))) {
+                DWORD written;
+                WriteFile(GetStdHandle(STD_ERROR_HANDLE), report, DWORD(length), &written, nullptr);
+            }
+        }
+    }
+    return SUCCEEDED(gVertexBuffer->Unlock());
 }
 
 bool renderFrame() {

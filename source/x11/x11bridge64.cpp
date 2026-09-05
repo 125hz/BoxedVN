@@ -1056,13 +1056,16 @@ S64 op_UNGRAB_SERVER(Call& call) {
 }
 
 S64 op_SYNC(Call& call) {
-    // Everything is synchronous already; a sync still presents what was drawn.
-    XServer::getServer()->draw(true);
+    // Requests already execute synchronously in this bridge. XSync waits for
+    // server processing, not physical display refresh. The regular main loop
+    // consumes dirty windows; waiting for its UI callback here stalls Wine's
+    // event pump (device traces showed ~258 ms per XFlush during mouse input).
     return Success;
 }
 
 S64 op_FLUSH(Call& call) {
-    XServer::getServer()->draw(true);
+    // There is no buffered protocol to send. Leave presentation to the main
+    // loop, including GDI patches composited over a Metal client window.
     return Success;
 }
 

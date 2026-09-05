@@ -597,6 +597,14 @@ jobs:
             -framework Foundation -framework CoreFoundation -o build/run-loop-test/session
           build/run-loop-test/session
 
+      - name: Verify native FEX prediction-stack guard recovery
+        shell: bash
+        run: |
+          mkdir -p build/callret-guard-test
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -Iinclude \
+            ios/tests/test_fex_callret_guard_native.cpp -o build/callret-guard-test/test
+          build/callret-guard-test/test
+
       - name: Restore pinned third-party dependencies
         uses: actions/cache@v5
         with:
