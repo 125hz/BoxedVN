@@ -13,6 +13,7 @@ for module in ("d3d9", "d3d11", "dxgi", "d3d10core"):
     assert struct.unpack_from("<H", data, pe + 24)[0] == 0x10B, module
     if module in ("d3d9", "d3d11"):
         assert b"BOXEDWINE_DXVK_WORKER" in data, f"{module}: missing worker report"
+        assert b"BOXEDWINE_DXVK_ALLOCATION_FAILED" in data, f"{module}: missing allocation report"
         assert b"non-std exception escaped worker" in data, module
     print(f"{module}.dll: PE32 i386 validated")
 assert (root / "build-manifest.txt").is_file(), "missing source provenance"

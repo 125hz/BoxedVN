@@ -328,6 +328,11 @@
     "advapi32.*;kernel32.*;kernelbase.*;user32.*;version.*;ws2_32.*;" \
     "ntdll.RtlExitUserThread"
 #define K_X64_WINE_RELAY_EXCLUDE \
+    "kernel32.HeapFree;kernelbase.HeapFree;" \
+    "kernel32.FlsGetValue;kernelbase.FlsGetValue;" \
+    "kernel32.FlsSetValue;kernelbase.FlsSetValue;" \
+    "kernel32.GetStringTypeW;kernelbase.GetStringTypeW;" \
+    "kernel32.GetStringTypeA;kernelbase.GetStringTypeA;" \
     "kernel32.GetLastError;kernel32.SetLastError;" \
     "kernelbase.GetLastError;kernelbase.SetLastError;" \
     "kernel32.GetTickCount;kernel32.GetTickCount64;" \

@@ -1,0 +1,62 @@
+diff --git a/meson.build b/meson.build
+index 29101e7..1e8be1c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -85,0 +86,2 @@ if platform == 'windows'
++        '-Wl,--wrap=_Znwj',
++        '-Wl,--wrap=_Znaj',
+diff --git a/src/util/meson.build b/src/util/meson.build
+index b064fee..6056596 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -1,0 +2 @@ util_src = files([
++  'util_allocation.cpp',
+diff --git a/src/util/util_allocation.cpp b/src/util/util_allocation.cpp
+new file mode 100644
+index 0000000..e98b566
+--- /dev/null
++++ b/src/util/util_allocation.cpp
+@@ -0,0 +1,43 @@
++// BoxedVN: observe failed allocations without replacing allocator semantics.
++#if defined(_WIN32) && defined(__i386__) && defined(__GNUC__)
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <cstddef>
++#include <cstdio>
++#include <new>
++
++extern "C" IMAGE_DOS_HEADER __ImageBase;
++extern "C" void* __real__Znwj(std::size_t);
++extern "C" void* __real__Znaj(std::size_t);
++
++static void reportAllocationFailure(std::size_t size, void* caller, const char* kind) noexcept {
++  static LONG reports = 0;
++  if (InterlockedIncrement(&reports) > 8) return;
++  char buffer[384];
++  int length = std::snprintf(buffer, sizeof(buffer),
++    "BOXEDWINE_DXVK_ALLOCATION_FAILED tid=%lu kind=%s bytes=%lu caller=%p image=%p\n",
++    static_cast<unsigned long>(GetCurrentThreadId()), kind,
++    static_cast<unsigned long>(size), caller, &__ImageBase);
++  if (length <= 0) return;
++  DWORD written = 0;
++  WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer,
++    static_cast<DWORD>(length < int(sizeof(buffer)) ? length : sizeof(buffer) - 1),
++    &written, nullptr);
++}
++
++extern "C" void* __wrap__Znwj(std::size_t size) {
++  try { return __real__Znwj(size); }
++  catch (const std::bad_alloc&) {
++    reportAllocationFailure(size, __builtin_return_address(0), "new");
++    throw;
++  }
++}
++
++extern "C" void* __wrap__Znaj(std::size_t size) {
++  try { return __real__Znaj(size); }
++  catch (const std::bad_alloc&) {
++    reportAllocationFailure(size, __builtin_return_address(0), "new_array");
++    throw;
++  }
++}
++#endif

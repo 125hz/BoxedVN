@@ -1861,6 +1861,21 @@ bool StartUpArgs::apply() {
         }
     }
     if (requestedFEX64) {
+        // This lane can start with a projected prefix before wineboot has
+        // populated its public shell folders. Wine 9 resolves Common Documents
+        // to %PUBLIC%\Documents and, without CSIDL_FLAG_CREATE, fails if that
+        // directory is absent. Complete the standard public profile before
+        // any startup check runs. Existing files and symlinks remain owned by
+        // the prefix; do not replace them or introduce application save paths.
+        for (const char* folder : {"Documents", "Desktop", "Downloads",
+                                   "Music", "Pictures", "Videos"}) {
+            const BString path = wineDriveC + "/users/Public/" + folder;
+            if (!Fs::getNodeFromLocalPath(B(""), path, false)) {
+                const S32 result = static_cast<S32>(Fs::makeLocalDirs(path));
+                klog_fmt("BOXEDWINE_X64_PUBLIC_FOLDER path=%s result=%d",
+                         path.c_str(), result);
+            }
+        }
         aliasX64WineLoader(K_X64_WINE_LOADER, K_X64_WINE_LOADER64_NAME);
         aliasX64WineLoader(K_X64_WINE_PRELOADER, K_X64_WINE_PRELOADER64_NAME);
         projectX64WineSystemModules(winePrefix);

@@ -1550,6 +1550,29 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                 }
             }
             const auto& g = frame->State.gregs;
+            // A callee can reserve a large local frame below its saved caller
+            // and arguments. RSP alone then cannot explain a bad argument.
+            // Only inspect a nearby i386 frame on readable guest pages; never
+            // walk an arbitrary chain or fault while reporting the first fault.
+            if (frame->State.cs_idx == 0x23 && faultMemory != nullptr &&
+                g[5] >= guestRsp && g[5] - guestRsp <= 4096 &&
+                g[5] <= UINT32_MAX - 44) {
+                U32 words[11] = {};
+                bool readable = true;
+                for (size_t i = 0; i < sizeof(words); ++i) {
+                    if (!(faultMemory->getPageFlags((g[5] + i) >> 12) & K64_PAGE_READ)) {
+                        readable = false;
+                        break;
+                    }
+                }
+                if (readable && readGuestBytes(g[5], reinterpret_cast<uint8_t*>(words), sizeof(words))) {
+                    klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_FRAME32 ebp=0x%x saved=0x%x caller=0x%x "
+                             "args=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                             static_cast<U32>(g[5]), words[0], words[1],
+                             words[2], words[3], words[4], words[5], words[6],
+                             words[7], words[8], words[9], words[10]);
+                }
+            }
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_STACK rsp=0x%llx slot0=0x%llx slot1=0x%llx "
                      "slot2=0x%llx slot3=0x%llx",
                      static_cast<unsigned long long>(guestRsp),
