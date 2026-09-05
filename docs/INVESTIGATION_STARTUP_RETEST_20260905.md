@@ -108,3 +108,58 @@ Primary references:
 - https://developer.apple.com/documentation/uikit/uiscrollview/delayscontenttouches
 - https://docs.vulkan.org/refpages/latest/refpages/source/vkWaitForPresentKHR.html
 - https://github.com/wine-mirror/wine/blob/wine-9.0/dlls/wineoss.drv/oss.c
+
+## Device revision e070cb97, morning retest
+
+All three new logs identify e070cb97+dirty, build 137. The D3D9 cube
+completes dozens of presents and vkWaitForPresentKHR now returns success.
+Its reported rate is about two presents per second, with little host CPU
+use and short acquire/queue-present calls. The final interval contains a
+54-second gap in both sampler and main-loop progress; the log alone does
+not distinguish an event-pump stall from application suspension. Add
+separate cumulative timing for present completion, which releases DXVK's
+frame-latency signal and was missing from the existing counters.
+
+SDL 2.32.10's UIKit_PumpEvents drains each CFRunLoop mode until no ready
+sources remain. A source that keeps becoming ready can monopolize that
+pass, delaying SDL callbacks and guest work despite processing UIKit
+events. Bound each mode to 32 sources or two milliseconds, preserving both
+default and tracking modes. This bounds draining, not the execution time
+of an individual UIKit callback. A compiled harness exercises the actual
+patched function with continuously ready, timed, slow, idle and disabled
+sources. The dependency cache and per-prefix SDL build stamp include the
+patch, and the harness runs before the dependency build.
+
+The 32-bit visual novel loads the new i386 OSS driver, completes its first
+640x360 present, then faults at host address 0x20 during another graphics
+pipeline creation. MoltenVK 1.4.2's symbol offset +0xbc decodes to a load
+from pVertexSS->pName with pVertexSS null. Wine 9's pipeline creation error
+path can reject the draw, but cannot run if the native driver crashes.
+Port the existing IA-32 structural guard to the x64 Vulkan bridge and
+extend both callers to reject complete fragment-only pipelines. Preserve
+mesh stages, partial libraries and pipelines linking libraries. Clear all
+output handles on refusal and bound repeated error logging. This contains
+the demonstrated native crash; it does not synthesize a missing shader or
+prove that the subsequent game scene renders.
+
+Read-only inspection of the locally supplied 64-bit executable confirms
+the same null array read at image offset 0xdb6c5. The array is supplied as
+a stack argument through the caller at 0xdb6f0; its data field at +0x10 is
+zero. The surrounding code uses an eight-byte-element container with
+count/capacity at +8/+12. The user confirms copying the complete replacement
+folder, including cache. No executable was launched or modified. Do not
+skip this instruction or claim a graphics fix for this guest exception.
+Capture bounded 256-byte fault stacks and safely copied operand/argument
+headers to distinguish an empty container from corrupted state next run.
+The origin of that empty array remains unresolved in this build.
+
+Pre-CI validation: 259 Python cases, with 51 platform skips; host support
+suite passes, including vertex/fragment/mesh/library guard cases. The SDL
+patch applies to the exact pinned source and its five behavior checks pass.
+All execution remains inside BoxedWine with FEX for CPU translation.
+
+References:
+- https://github.com/libsdl-org/SDL/blob/release-2.32.10/src/video/uikit/SDL_uikitevents.m
+- https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+- https://github.com/wine-mirror/wine/blob/wine-9.0/dlls/wined3d/context_vk.c
+- https://docs.vulkan.org/refpages/latest/refpages/source/VkGraphicsPipelineCreateInfo.html

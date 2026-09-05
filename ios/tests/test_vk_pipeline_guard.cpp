@@ -12,7 +12,7 @@ BOXEDVN_TEST(vk_pipeline_guard_allows_a_normal_pipeline) {
 }
 
 BOXEDVN_TEST(vk_pipeline_guard_refuses_a_stageless_pipeline) {
-    // Saya's call #5. MoltenVK segfaults on this rather than returning an
+    // A stageless draw. MoltenVK segfaults on this rather than returning an
     // error, and on iOS that wedges the emulation thread instead of crashing.
     const VkGraphicsPipelineGuardDecision decision =
         vkInspectGraphicsPipeline(0, false, 0);
@@ -33,4 +33,16 @@ BOXEDVN_TEST(vk_pipeline_guard_allows_a_stageless_pipeline_library) {
     const VkGraphicsPipelineGuardDecision decision =
         vkInspectGraphicsPipeline(0, false, kVkPipelineCreateLibraryBitKHR);
     CHECK(decision.submittable);
+}
+
+BOXEDVN_TEST(vk_pipeline_guard_refuses_fragment_only_complete_pipeline) {
+    CHECK(!vkInspectGraphicsPipeline(1, true, 0, 0x10).submittable);
+    CHECK(vkInspectGraphicsPipeline(2, true, 0, 0x11).submittable);
+    CHECK(vkInspectGraphicsPipeline(2, true, 0, 0x90).submittable);
+}
+
+BOXEDVN_TEST(vk_pipeline_guard_preserves_valid_partial_libraries) {
+    CHECK(vkInspectGraphicsPipeline(1, true, kVkPipelineCreateLibraryBitKHR, 0x10).submittable);
+    CHECK(!vkInspectGraphicsPipeline(1, false, kVkPipelineCreateLibraryBitKHR, 0x10).submittable);
+    CHECK(vkInspectGraphicsPipeline(0, false, 0, 0, true).submittable);
 }

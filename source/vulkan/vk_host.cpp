@@ -1959,9 +1959,17 @@ void vk_CreateGraphicsPipelines(CPU* cpu) {
     // Boxedwine's guest fault handler forever.
     for (U32 i = 0; i < createInfoCount && pCreateInfos; ++i) {
         const VkGraphicsPipelineCreateInfo& info = pCreateInfos[i];
+        U32 stageMask = 0;
+        for (U32 stage = 0; info.pStages && stage < info.stageCount; ++stage)
+            stageMask |= info.pStages[stage].stage;
+        bool linkedLibraries = false;
+        for (auto* next = (const VkBaseInStructure*)info.pNext; next; next = next->pNext) {
+            if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
+                linkedLibraries |= ((const VkPipelineLibraryCreateInfoKHR*)next)->libraryCount != 0;
+        }
         const VkGraphicsPipelineGuardDecision decision =
             vkInspectGraphicsPipeline(info.stageCount, info.pStages != nullptr,
-                                      (U32)info.flags);
+                                      (U32)info.flags, stageMask, linkedLibraries);
         if (decision.submittable) {
             continue;
         }

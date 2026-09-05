@@ -84,6 +84,18 @@ fi
 require_file "${SDL2_SOURCE}/CMakeLists.txt" \
     "The extracted SDL2 tree looks wrong; delete ${SOURCES} and retry."
 
+# Restore only the patched file from the verified archive before applying our
+# UIKit change. This also handles a cached tree carrying an older patch.
+SDL2_PATCH="${BOXEDVN_SCRIPT_DIR}/sdl-patches/sdl2-bounded-uikit-pump.patch"
+require_file "${SDL2_PATCH}" "The SDL UIKit event-pump patch is missing."
+SDL2_PATCH_KEY="$(shasum -a 256 "${SDL2_PATCH}" | awk '{print $1}')"
+tar -xzf "${SDL2_TARBALL}" -C "${SOURCES}" \
+    "SDL2-${BOXEDVN_SDL2_VERSION}/src/video/uikit/SDL_uikitevents.m"
+patch --batch --forward -d "${SDL2_SOURCE}" -p1 < "${SDL2_PATCH}" \
+    || die "The SDL UIKit patch does not match the pinned source."
+python3 "${BOXEDVN_SCRIPT_DIR}/test-sdl-uikit-pump.py" \
+    --source "${SDL2_SOURCE}/src/video/uikit/SDL_uikitevents.m"
+
 # build_sdl2 <platform>
 build_sdl2() {
     local platform="$1"
@@ -95,7 +107,9 @@ build_sdl2() {
         rm -rf "${build_dir}" "${prefix}"
     fi
 
-    if [[ -f "${prefix}/lib/libSDL2.a" && ${FORCE} -eq 0 ]]; then
+    if [[ -f "${prefix}/lib/libSDL2.a" && ${FORCE} -eq 0 &&
+          -f "${prefix}/share/boxedvn/sdl2-patch-key" &&
+          "$(cat "${prefix}/share/boxedvn/sdl2-patch-key")" == "${SDL2_PATCH_KEY}" ]]; then
         ok "SDL2 for ${platform} already built at ${prefix}"
         return 0
     fi
@@ -161,6 +175,8 @@ build_sdl2() {
 
     require_file "${prefix}/lib/libSDL2.a" \
         "SDL2 installed but libSDL2.a is missing; the install layout changed."
+    mkdir -p "${prefix}/share/boxedvn"
+    printf '%s\n' "${SDL2_PATCH_KEY}" > "${prefix}/share/boxedvn/sdl2-patch-key"
     ok "SDL2 for ${platform} -> ${prefix}"
 }
 

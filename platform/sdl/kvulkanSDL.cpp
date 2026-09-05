@@ -619,6 +619,8 @@ void bvnReportPresentRate(void) {
     static U64 lastPresentUs = 0;
     static U64 lastPresentCalls = 0;
     static U64 lastAcquireUs = 0;
+    static U64 lastWaitUs = 0;
+    static U64 lastWaitCalls = 0;
     const U64 presentUs =
         bvnHostPresent::presentMicroseconds.load(std::memory_order_relaxed);
     const U64 presentCalls =
@@ -643,6 +645,16 @@ void bvnReportPresentRate(void) {
     lastPresentUs = presentUs;
     lastPresentCalls = presentCalls;
     lastAcquireUs = acquireUs;
+    const U64 waitUs = bvnHostPresent::waitMicroseconds.load(std::memory_order_relaxed);
+    const U64 waitCalls = bvnHostPresent::waitCalls.load(std::memory_order_relaxed);
+    const U64 worstWaitUs = bvnHostPresent::waitWorstMicroseconds.exchange(0, std::memory_order_relaxed);
+    klog_fmt("iOS guest present completion: vkWaitForPresentKHR %llu ms across "
+             "%llu call(s), worst %llu ms over %u ms",
+             (unsigned long long)((waitUs - lastWaitUs) / 1000),
+             (unsigned long long)(waitCalls - lastWaitCalls),
+             (unsigned long long)(worstWaitUs / 1000), elapsed);
+    lastWaitUs = waitUs;
+    lastWaitCalls = waitCalls;
 
     // Do not take a full guest thread snapshot merely because Vulkan is idle.
     // Mixed-rendered visual novels intentionally advance static text through

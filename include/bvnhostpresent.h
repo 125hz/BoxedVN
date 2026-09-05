@@ -10,7 +10,7 @@
 #include <cstdint>
 
 // Build 72's automatic thread snapshot answered the question that four builds
-// of guessing had not: during a Grisaia stall every other guest thread is
+// of guessing had not: during a graphics stall every other guest thread is
 // parked on KUnixSocketObject::lockCond - the X11 socket - behind one thread
 // that is inside host Vulkan call 170, vkQueuePresentKHR, in a Mach trap,
 // burning 73-143 microseconds of CPU per *second*.
@@ -30,9 +30,13 @@ extern std::atomic<std::uint64_t> presentWorstMicroseconds;
 extern std::atomic<std::uint64_t> acquireCalls;
 extern std::atomic<std::uint64_t> acquireMicroseconds;
 extern std::atomic<std::uint64_t> acquireWorstMicroseconds;
+extern std::atomic<std::uint64_t> waitCalls;
+extern std::atomic<std::uint64_t> waitMicroseconds;
+extern std::atomic<std::uint64_t> waitWorstMicroseconds;
 
 void recordPresent(std::uint64_t microseconds);
 void recordAcquire(std::uint64_t microseconds);
+void recordWait(std::uint64_t microseconds);
 }
 
 #endif

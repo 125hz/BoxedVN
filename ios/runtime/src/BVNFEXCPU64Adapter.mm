@@ -1537,6 +1537,46 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             const bool stackRead = readGuestBytes(guestRsp,
                 reinterpret_cast<uint8_t*>(returnSlot), sizeof(returnSlot));
             const auto& g = frame->State.gregs;
+            // Preserve the caller's outgoing arguments even when the fault
+            // happens after a large local stack allocation. Read-only Mach
+            // copies keep this safe on guard pages. No per-frame tracing.
+            if (frame->State.cs_idx != 0x23) {
+                for (unsigned row = 0; row < 8; ++row) {
+                    uint64_t words[4] = {};
+                    const uint64_t address = guestRsp + row * sizeof(words);
+                    if (address < guestRsp || !readGuestBytes(address,
+                        reinterpret_cast<uint8_t*>(words), sizeof(words))) break;
+                    klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_STACK64 address=0x%llx "
+                             "words=%llx,%llx,%llx,%llx",
+                             (unsigned long long)address, (unsigned long long)words[0],
+                             (unsigned long long)words[1], (unsigned long long)words[2],
+                             (unsigned long long)words[3]);
+                    for (unsigned slot = 0; slot < 4; ++slot) {
+                        uint64_t header[4] = {};
+                        if (!readGuestBytes(words[slot], reinterpret_cast<uint8_t*>(header),
+                                            sizeof(header))) continue;
+                        klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_ARG64 slot=0x%llx pointer=0x%llx "
+                                 "words=%llx,%llx,%llx,%llx",
+                                 (unsigned long long)(address + slot * 8),
+                                 (unsigned long long)words[slot],
+                                 (unsigned long long)header[0], (unsigned long long)header[1],
+                                 (unsigned long long)header[2], (unsigned long long)header[3]);
+                    }
+                }
+                // Object headers distinguish an empty container from a
+                // damaged pointer. Limit this to register operands; never
+                // follow a linked structure from a fault handler.
+                for (unsigned reg = 0; reg < 16; ++reg) {
+                    uint64_t words[4] = {};
+                    if (!readGuestBytes(g[reg], reinterpret_cast<uint8_t*>(words),
+                                        sizeof(words))) continue;
+                    klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_DATA reg=%u address=0x%llx "
+                             "words=%llx,%llx,%llx,%llx",
+                             reg, (unsigned long long)g[reg],
+                             (unsigned long long)words[0], (unsigned long long)words[1],
+                             (unsigned long long)words[2], (unsigned long long)words[3]);
+                }
+            }
             // A callee can reserve a large local frame below its saved caller
             // and arguments. RSP alone then cannot explain a bad argument.
             // Only inspect a nearby i386 frame on readable guest pages; never

@@ -38,6 +38,9 @@ std::atomic<std::uint64_t> presentWorstMicroseconds{0};
 std::atomic<std::uint64_t> acquireCalls{0};
 std::atomic<std::uint64_t> acquireMicroseconds{0};
 std::atomic<std::uint64_t> acquireWorstMicroseconds{0};
+std::atomic<std::uint64_t> waitCalls{0};
+std::atomic<std::uint64_t> waitMicroseconds{0};
+std::atomic<std::uint64_t> waitWorstMicroseconds{0};
 
 static void record(std::atomic<std::uint64_t>& calls,
                    std::atomic<std::uint64_t>& total,
@@ -61,6 +64,9 @@ void recordPresent(std::uint64_t microseconds) {
 void recordAcquire(std::uint64_t microseconds) {
     record(acquireCalls, acquireMicroseconds, acquireWorstMicroseconds,
            microseconds);
+}
+void recordWait(std::uint64_t microseconds) {
+    record(waitCalls, waitMicroseconds, waitWorstMicroseconds, microseconds);
 }
 }
 #endif

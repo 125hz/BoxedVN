@@ -20,7 +20,7 @@
 // Vulkan call is delivered to a handler that cannot map it to guest memory.
 // The emulation thread then wedges: it stays RUNNABLE, executes no further
 // guest dispatches, and no compile timeout can rescue it, because it never
-// reached the shader compiler. That is precisely the signature Saya produced.
+// reached the shader compiler.
 //
 // Refusing the call is therefore strictly better than forwarding it. A
 // rejected pipeline is a visible, recoverable error the guest can handle;
@@ -40,11 +40,18 @@ struct VkGraphicsPipelineGuardDecision {
 
 inline VkGraphicsPipelineGuardDecision vkInspectGraphicsPipeline(
     std::uint32_t stageCount, bool stagesPointerPresent,
-    std::uint32_t flags) {
+    std::uint32_t flags, std::uint32_t stageMask = 1,
+    bool linkedLibraries = false) {
     VkGraphicsPipelineGuardDecision decision;
 
-    if ((flags & kVkPipelineCreateLibraryBitKHR) != 0) {
-        // A pipeline library may legitimately supply no stages.
+    if (stageCount && !stagesPointerPresent) {
+        decision.submittable = false;
+        decision.reason = "pStages is NULL while stageCount is non-zero";
+        return decision;
+    }
+    if ((flags & kVkPipelineCreateLibraryBitKHR) != 0 || linkedLibraries) {
+        // Partial libraries, and complete pipelines linking stages from
+        // libraries, may legitimately supply no stages of their own.
         return decision;
     }
     if (stageCount == 0) {
@@ -53,9 +60,12 @@ inline VkGraphicsPipelineGuardDecision vkInspectGraphicsPipeline(
                           "library must provide at least a vertex stage";
         return decision;
     }
-    if (!stagesPointerPresent) {
+    // A complete pipeline needs a vertex or mesh shader. Fragment-only
+    // pipelines hit the same MoltenVK null pVertexSS dereference as zero
+    // stages. Both EXT and NV mesh stage bits are 0x80.
+    if (!(stageMask & (0x1u | 0x80u))) {
         decision.submittable = false;
-        decision.reason = "pStages is NULL while stageCount is non-zero";
+        decision.reason = "complete graphics pipeline has no vertex or mesh stage";
         return decision;
     }
     return decision;

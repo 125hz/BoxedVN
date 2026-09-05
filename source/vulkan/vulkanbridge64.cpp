@@ -91,6 +91,7 @@
 #include "kvulkan.h"
 #include "../x11/x11.h"
 #include "vk_host.h"
+#include "vkpipelineguard.h"
 #include <SDL_vulkan.h>
 #endif
 
@@ -4027,6 +4028,36 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error();
         }
+        for (U32 i = 0; i < U32A(2); ++i) {
+            const auto& info = infos[i];
+            U32 stageMask = 0;
+            for (U32 stage = 0; info.pStages && stage < info.stageCount; ++stage)
+                stageMask |= info.pStages[stage].stage;
+            bool linkedLibraries = false;
+            for (auto* next = (const VkBaseInStructure*)info.pNext; next; next = next->pNext) {
+                if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
+                    linkedLibraries |= ((const VkPipelineLibraryCreateInfoKHR*)next)->libraryCount != 0;
+            }
+            const auto decision = vkInspectGraphicsPipeline(
+                info.stageCount, info.pStages != nullptr, info.flags, stageMask, linkedLibraries);
+            static std::atomic<U32> reported{0};
+            const U32 seen = reported.fetch_add(1, std::memory_order_relaxed);
+            if (seen < 16 || (!decision.submittable && (seen & (seen - 1)) == 0)) {
+                klog_fmt("BOXEDWINE_X64_VULKAN_PIPELINE tid=%04X index=%u stages=%u "
+                         "mask=0x%x flags=0x%x status=%s reason=%s",
+                         tid, i, info.stageCount, stageMask, info.flags,
+                         decision.submittable ? "submit" : "refused",
+                         decision.reason ? decision.reason : "valid-structure");
+            }
+            if (!decision.submittable) {
+                // Validate the entire batch before invoking the driver. No
+                // handles have been created; clear every output explicitly.
+                // Wine can then reject this draw instead of losing the app.
+                for (U32 output = 0; output < U32A(2); ++output)
+                    out[output] = VK_NULL_HANDLE;
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
         return (S64)((PFN_vkCreateGraphicsPipelines)raw)(
             (VkDevice)H(0), (VkPipelineCache)A(1), U32A(2), infos, nullptr,
             out);
@@ -5421,10 +5452,11 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
             // The IA-32 lane has timed these two since build 72; this lane
             // never did, so "iOS guest present path: N ms inside
             // vkQueuePresentKHR" reported zero for every 64-bit run no matter
-            // how long the compositor held the drawable. Two clock reads on
-            // two commands, exactly as the other lane does it.
+            // how long the compositor held the drawable. Also time present
+            // completion: DXVK waits there before releasing frame latency.
             const bool timed = (index == VKB_QueuePresentKHR ||
-                                index == VKB_AcquireNextImageKHR);
+                                index == VKB_AcquireNextImageKHR ||
+                                index == VKB_WaitForPresentKHR);
             const auto started = timed
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point();
@@ -5441,6 +5473,8 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
                         std::chrono::steady_clock::now() - started).count();
                 if (index == VKB_QueuePresentKHR) {
                     bvnHostPresent::recordPresent(us);
+                } else if (index == VKB_WaitForPresentKHR) {
+                    bvnHostPresent::recordWait(us);
                 } else {
                     bvnHostPresent::recordAcquire(us);
                 }
@@ -5450,7 +5484,7 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
         const U32 seen =
             gCommandCalls[index].fetch_add(1, std::memory_order_relaxed);
         const U32 named = gNamedCalls.fetch_add(1, std::memory_order_relaxed);
-        if (result < 0 ||
+        if ((result < 0 && (seen < 16 || (seen & (seen - 1)) == 0)) ||
             (seen < kPerCommandBudget && named < kNamedCallCeiling)) {
             klog_fmt("BOXEDWINE_X64_VULKAN_BRIDGE call=%s pid=%u tid=%04X "
                      "args=%llu status=%lld seen=%u",
