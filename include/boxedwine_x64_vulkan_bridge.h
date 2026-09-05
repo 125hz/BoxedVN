@@ -309,6 +309,7 @@
     X(GetDeviceQueue2,                           279) \
     X(DeviceWaitIdle,                             22) \
     X(QueueWaitIdle,                              21) \
+    X(WaitForPresentKHR,                         570) \
     X(QueueSubmit,                                20) \
     /* memory */ \
     X(AllocateMemory,                             23) \

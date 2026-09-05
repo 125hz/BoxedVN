@@ -1506,6 +1506,22 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             for (size_t i = 0; i < sizeof(bytes); ++i) {
                 snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02x", bytes[i]);
             }
+            // A game-side null read needs the instructions that produced its
+            // base/index registers. The fault instruction alone cannot show
+            // whether they came from an API return, object field, or decoder.
+            // Bounded, fault-only and guarded by the same safe reader.
+            if (rip >= 96) {
+                for (unsigned row = 0; row < 4; ++row) {
+                    uint8_t context[32] = {};
+                    const uint64_t address = rip - 96 + row * sizeof(context);
+                    if (!readGuestBytes(address, context, sizeof(context))) continue;
+                    char text[65] = {};
+                    for (unsigned n = 0; n < sizeof(context); ++n)
+                        snprintf(text + n * 2, sizeof(text) - n * 2, "%02x", context[n]);
+                    klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_CODE address=0x%llx bytes=%s",
+                             static_cast<unsigned long long>(address), text);
+                }
+            }
             // A jump to 0 says nothing about who jumped; the return slot at
             // the top of the guest stack usually does (the desktop's explorer
             // took one 16 s in, from unix-side code, and carried on).

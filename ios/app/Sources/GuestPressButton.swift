@@ -55,6 +55,15 @@ final class GuestPressControl: UIButton {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         if window == nil { releasePress() }
+        // Form's scroll view otherwise holds touch-down while deciding whether
+        // to scroll, then delivers a short tap's down and up together.
+        var ancestor = superview
+        while let view = ancestor {
+            if let scroll = view as? UIScrollView {
+                scroll.delaysContentTouches = false
+            }
+            ancestor = view.superview
+        }
     }
     override func accessibilityActivate() -> Bool {
         guard isEnabled else { return false }

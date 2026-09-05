@@ -294,6 +294,9 @@ VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice device, const void* pQueue
 VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice device)
 { BW_R(DeviceWaitIdle, U(device)); }
 
+VKAPI_ATTR VkResult VKAPI_CALL vkWaitForPresentKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t presentId, uint64_t timeout)
+{ BW_R(WaitForPresentKHR, U(device), swapchain, presentId, timeout); }
+
 VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue queue)
 { BW_R(QueueWaitIdle, U(queue)); }
 

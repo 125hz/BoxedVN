@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BoxedVN - build Wine's x86-64 OSS audio driver (wineoss.drv + wineoss.so).
+# BoxedVN - build Wine's WoW64 OSS driver (both PE architectures, one ELF64).
 #
 # Ubuntu does not build this driver. Wine's configure gates dlls/wineoss.drv
 # on an OSSv4 <sys/soundcard.h>, which Ubuntu does not ship by default, so the
@@ -64,6 +64,7 @@ require_command tar
 # Wine 9.0 builds its PE modules with a mingw cross compiler. Without one,
 # configure still succeeds but produces a fake PE module built from the unix
 # object, which is not what the guest's loader can map.
+require_command i686-w64-mingw32-gcc
 require_command x86_64-w64-mingw32-gcc \
     "Install it with 'sudo apt-get install -y gcc-mingw-w64-x86-64'; Wine builds its PE modules with a mingw cross compiler and silently degrades without one."
 
@@ -214,10 +215,10 @@ WINE_SOURCE="$(cd "${WINE_SOURCE}" && pwd)"
 # Only the one driver is built. Wine's make will build the tools it needs
 # (winebuild, widl, ...) and the generated headers on the way, which is a few
 # minutes rather than the half hour a full tree takes.
-BUILD="${WORK}/build-${WINE_VERSION:-source}"
+BUILD="${WORK}/build-wow64-${WINE_VERSION:-source}"
 mkdir -p "${BUILD}"
 if [[ ! -s "${BUILD}/Makefile" ]]; then
-    log "Configuring Wine (x86_64 only)"
+    log "Configuring Wine (x86_64 and i386 PE, x86_64 Unix)"
     (
         cd "${BUILD}"
         # CPPFLAGS, not OSS4_CFLAGS: configure AC_SUBSTs OSS4_CFLAGS itself
@@ -226,7 +227,7 @@ if [[ ! -s "${BUILD}/Makefile" ]]; then
         # on every compile line, unix and PE alike, so the shim stays
         # reachable for the whole build and not just for configure's probe.
         CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${OSS_INCLUDE}" "${WINE_SOURCE}/configure" \
-            --enable-archs=x86_64 \
+            --enable-archs=x86_64,i386 \
             --disable-tests \
             --without-x \
             --without-freetype
@@ -270,8 +271,9 @@ done
 if [[ -z "${pe_target}" ]]; then
     die "Wine ${WINE_VERSION} builds no wineoss.drv at either layout this script knows. Check the module layout in ${BUILD}/Makefile."
 fi
-log "Building ${unix_target} and ${pe_target}"
-if ! make -C "${BUILD}" -j"${JOBS}" "${unix_target}" "${pe_target}"; then
+pe32_target="dlls/wineoss.drv/i386-windows/wineoss.drv"
+log "Building ${unix_target}, ${pe_target}, and ${pe32_target}"
+if ! make -C "${BUILD}" -j"${JOBS}" "${unix_target}" "${pe_target}" "${pe32_target}"; then
     die "Building dlls/wineoss.drv failed."
 fi
 
@@ -287,6 +289,12 @@ file "${unix_half}" | grep -Eqi 'ELF 64-bit.*x86-64' \
 [[ "$(head -c 2 "${pe_half}")" == "MZ" ]] \
     || die "'${pe_half}' is not a PE image. Wine builds a fake PE module when no mingw cross compiler is available, and the guest loader cannot map one."
 
+file "${BUILD}/${pe32_target}" | grep -Eqi 'PE32 executable.*Intel 80386' \
+    || die "The WoW64 OSS driver is missing or is not an i386 PE image."
+nm -D "${unix_half}" | grep -q '__wine_unix_call_wow64_funcs' \
+    || die "The ELF64 OSS driver has no WoW64 Unix-call table."
+mkdir -p "${OUTPUT_DIR}/i386-windows"
+cp "${BUILD}/${pe32_target}" "${OUTPUT_DIR}/i386-windows/wineoss.drv"
 cp "${unix_half}" "${OUTPUT_DIR}/wineoss.so"
 cp "${pe_half}" "${OUTPUT_DIR}/wineoss.drv"
 ok "wineoss.so  -> ${OUTPUT_DIR}/wineoss.so"

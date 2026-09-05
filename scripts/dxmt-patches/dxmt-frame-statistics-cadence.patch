@@ -1,0 +1,35 @@
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -925,7 +925,11 @@
+      * pulled device log alone. Averages are per-frame, in ms. */
+     {
+       static uint64_t mythic_stats_frame = 0;
+-      if ((++mythic_stats_frame % 64) == 0) {
++      ++mythic_stats_frame;
++      static auto boxedvn_stats_report = std::chrono::steady_clock::now();
++      const auto boxedvn_stats_now = std::chrono::steady_clock::now();
++      if (boxedvn_stats_now - boxedvn_stats_report >= std::chrono::seconds(5)) {
++        boxedvn_stats_report = boxedvn_stats_now;
+         Logger::info(std::format(
+             "[FRAME_STATS] #{} cmdbufs={} commit_avg={:.2f}ms sync_cnt={} sync_avg={:.2f}ms "
+             "event_stall_max={} latency_avg={:.2f}ms enc_prep={:.2f}ms enc_flush={:.2f}ms "
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1470,9 +1470,12 @@
+    * `after` min-duration arg — measures the black-phase ~1 FPS pacing
+    * directly from the log (game-phase log lines carry no timestamps under
+    * the WINEDEBUG perf default). */
+-  if (n == 1 || (n % 16) == 0) {
+-    struct timespec ts;
+-    clock_gettime(CLOCK_MONOTONIC, &ts);
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  static uint64_t boxedvn_last_present_log_ms;
++  uint64_t boxedvn_now_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++  if (n == 1 || boxedvn_now_ms - boxedvn_last_present_log_ms >= 5000) {
++    boxedvn_last_present_log_ms = boxedvn_now_ms;
+     /* Sample + reset draw counter delta since last log line. */
+     uint64_t cur_draws = atomic_load_explicit(&g_mythic_draw_calls, memory_order_relaxed);
+     uint64_t last_draws = atomic_exchange_explicit(&g_mythic_draw_calls_at_last_log, cur_draws, memory_order_relaxed);

@@ -3000,6 +3000,9 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
     }
     case VKB_DeviceWaitIdle:
         return (S64)((PFN_vkDeviceWaitIdle)raw)((VkDevice)H(0));
+    case VKB_WaitForPresentKHR:
+        return (S64)((PFN_vkWaitForPresentKHR)raw)((VkDevice)H(0),
+            (VkSwapchainKHR)A(1), (uint64_t)A(2), (uint64_t)A(3));
     case VKB_QueueWaitIdle:
         return (S64)((PFN_vkQueueWaitIdle)raw)((VkQueue)H(0));
     case VKB_QueueSubmit: {

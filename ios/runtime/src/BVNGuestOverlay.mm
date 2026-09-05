@@ -352,6 +352,8 @@ static NSString* const kBVNPerformanceBatteryKey =
 @property (nonatomic, strong) UIView* performanceView;
 @property (nonatomic, strong) UILabel* performanceLabel;
 @property (nonatomic, strong) NSTimer* performanceTimer;
+@property (nonatomic, strong) NSTimer* pointerMotionTimer;
+@property (nonatomic) CFTimeInterval lastPointerMotionTime;
 @property (nonatomic, assign) uint64_t performanceLastFrameCount;
 @property (nonatomic, assign) NSTimeInterval performanceLastSampleTime;
 @property (nonatomic, assign) CGPoint performanceFraction;
@@ -1767,7 +1769,31 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.trackpadTapReleaseTimer = nil;
 }
 
+// Keep UIKit's local cursor responsive, but feed at most 60 motion samples/s
+// into Wine's message pump. Button edges flush the latest point immediately.
+- (void)flushPointerMotion {
+    [self.pointerMotionTimer invalidate];
+    self.pointerMotionTimer = nil;
+    self.lastPointerMotionTime = CACurrentMediaTime();
+    BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
+                                (int)lround(self.cursorGuestPoint.y), 0);
+}
+
+- (void)queuePointerMotion {
+    if (self.pointerMotionTimer != nil) return;
+    const double delay = 1.0 / 60.0 - (CACurrentMediaTime() - self.lastPointerMotionTime);
+    if (delay <= 0) {
+        [self flushPointerMotion];
+        return;
+    }
+    __weak BVNGuestOverlayView* weakSelf = self;
+    self.pointerMotionTimer = [NSTimer timerWithTimeInterval:delay repeats:NO
+        block:^(NSTimer* timer) { [weakSelf flushPointerMotion]; }];
+    [[NSRunLoop mainRunLoop] addTimer:self.pointerMotionTimer forMode:NSRunLoopCommonModes];
+}
+
 - (void)cancelTrackpadGesture {
+    if (self.pointerMotionTimer != nil) [self flushPointerMotion];
     [self cancelTrackpadHoldTimer];
     [self cancelTrackpadTapReleaseTimer];
     if (self.trackpadButtonHeld) {
@@ -1915,8 +1941,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     const CGFloat sensitivity = BVNPointerSensitivity();
     [self moveCursorBy:CGPointMake(dx * sensitivity,
                                    dy * sensitivity)];
-    BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
-                                (int)lround(self.cursorGuestPoint.y), 0);
+    [self queuePointerMotion];
     if (self.trackpadButtonHeld) {
         self.trackpadButtonGuestPoint = self.cursorGuestPoint;
     }
@@ -1928,6 +1953,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         return;
     }
     self.guestTouch = nil;
+    if (self.pointerMotionTimer != nil) [self flushPointerMotion];
 
     if (!self.trackpadMode) {
         if (self.directButtonHeld) {

@@ -587,6 +587,8 @@ if [[ "${BOXEDVN_REQUIRE_WINE64_OSS:-0}" == "1" ]]; then
     check_zip_path "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-windows/wineoss.drv"
     check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" \
         "${WINE_MODULE_ROOT}/x86_64-windows/wineoss.drv"
+    check_zip_path "${PE32_ARCHIVE}" "${WINE_MODULE_ROOT}/i386-windows/wineoss.drv"
+    check_zip_entry_pe32_i386 "${PE32_ARCHIVE}" "${WINE_MODULE_ROOT}/i386-windows/wineoss.drv"
 elif [[ ",${audio_drivers_ok}," != *",oss,"* ]]; then
     warn "wineoss.so + wineoss.drv are not in '$(basename "${WINE_ARCHIVE}")'. A 64-bit guest has no audio backend it can reach: winepulse needs a PulseAudio daemon and winealsa needs /dev/snd, and BoxedWine emulates neither. Build the pair with scripts/build-wine64-oss-driver.sh, pass it to the runtime builder with --oss-driver-dir, then set BOXEDVN_REQUIRE_WINE64_OSS=1 here."
 fi

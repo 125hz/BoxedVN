@@ -64,3 +64,47 @@ Sources: [Vulkan vertex-buffer binding requirements](https://docs.vulkan.org/ref
 [MoltenVK 1.4.2 vertex binding implementation](https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm),
 DXVK 2.5.2 `dxvk_context.cpp`/`dxvk_unbound.cpp`, and pinned DXMT
 `d6bd546dc685189f4434f87fd15ea7b21009e64f` allocation/census/present sources.
+
+
+## Device revision c83e2ea7, 02:09-02:15 retest
+
+The five device logs identify c83e2ea7+dirty. The cube now completes three
+vkQueuePresentKHR calls. Its subsequent null branch originates in DXVK
+Presenter::runFrameThread: the exact CI d3d9.dll disassembly at preferred VA
+0x6252e587 calls the function slot for vkWaitForPresentKHR, returning to
+0x6252e58d (device 0x7b2ee58d). The worker caller also matches
+thread::threadProc at preferred VA 0x6256e6fa. The 64-bit guest ICD advertised
+present-wait features but had no entry point for that command. Add the real
+host dispatch with full-width swapchain, present ID and timeout. The existing
+null-target diagnostic assumes an eight-byte stack slot even in 32-bit code;
+its `rsp_before_pop` must not be treated as proof of a bad RET.
+
+The 32-bit visual novel reaches its launcher, then requests wineoss.drv;
+all syswow64 searches fail with c0000135. Build both OSS PE architectures
+from the same Wine 9.0 tree, retaining one ELF64 Unix library and its upstream
+WoW64 call table. Stage the i386 driver into wine64-pe32.zip and require it
+in CI validation. This repairs a demonstrated missing dependency; black-screen
+resolution still requires device testing.
+
+Some toolbar taps have key-down and key-up with identical X11 timestamps
+(for example 58694 in the 02:11 log). Disable delaysContentTouches on ancestor
+scroll views so UIKit does not postpone control touch-down until the tap ends.
+Actual lift/cancel still releases the guest key. Coalesce trackpad motion to
+60 samples/s before Wine's message pump while updating the local pointer on
+every touch. Flush the last point before releasing a drag. Reduce the remaining
+DXMT native-present and frame-stat logs to a five-second cadence.
+
+The 64-bit game fails a read at 0x1400db6c5, instruction `mov r8d,[rcx+r8*8]`,
+with both base and index zero. New-game behavior has not been tested. This is
+not evidence that the graphics driver crashed, nor enough to justify skipping
+the instruction or changing game state. Add bounded, safely read instruction
+context around guest faults to identify how those operands were produced.
+
+Validation before CI: 259 Python checks (51 platform skips); host support suite
+passes; guest ICD compiles with GCC syntax validation; shell syntax and DXMT
+patch application checks pass. CI and device acceptance are separate.
+
+Primary references:
+- https://developer.apple.com/documentation/uikit/uiscrollview/delayscontenttouches
+- https://docs.vulkan.org/refpages/latest/refpages/source/vkWaitForPresentKHR.html
+- https://github.com/wine-mirror/wine/blob/wine-9.0/dlls/wineoss.drv/oss.c

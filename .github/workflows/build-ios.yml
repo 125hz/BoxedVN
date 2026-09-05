@@ -284,7 +284,7 @@ jobs:
           # preinst, so the two packages coexist and no other build on this
           # runner loses a header it was using.
           sudo apt-get install --yes --no-install-recommends \
-            gcc-mingw-w64-x86-64 flex bison linux-libc-dev oss4-dev
+            gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 flex bison linux-libc-dev oss4-dev
           # Ubuntu's package version carries an epoch and a packaging suffix;
           # Wine's own release tarball is named for the upstream version
           # alone. "1:9.0~repack-4build3" is upstream "9.0".
@@ -335,7 +335,7 @@ jobs:
             --dxvk-i386-dir build/dxvk-i386 \
             --i386-pe-dir build/wine-i386/root/usr/lib/i386-linux-gnu/wine/i386-windows \
             "${oss_args[@]+"${oss_args[@]}"}"
-          bash scripts/validate-wine64-runtime.sh \
+          BOXEDVN_REQUIRE_WINE64_OSS=1 bash scripts/validate-wine64-runtime.sh \
             --input build/wine64-runtime \
             --manifest build/wine64-runtime/wine64-runtime.manifest
 
@@ -650,7 +650,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/validate-wine64-runtime.sh \
+          BOXEDVN_REQUIRE_WINE64_OSS=1 bash scripts/validate-wine64-runtime.sh \
             --input build/wine64-runtime \
             --manifest build/wine64-runtime/wine64-runtime.manifest
           python3 scripts/validate-dxmt-guest-abi.py \

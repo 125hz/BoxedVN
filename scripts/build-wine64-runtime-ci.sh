@@ -815,6 +815,12 @@ if [[ -n "${OSS_DRIVER_DIR}" ]]; then
     require_pe_machine "${oss_pe_src}" 34404 "64-bit Wine OSS user driver"
     cp "${oss_unix_src}" "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/${OSS_DRIVER_UNIX_NAME}"
     cp "${oss_pe_src}" "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${OSS_DRIVER_PE_NAME}"
+    if [[ -n "${I386_PE_DIR}" ]]; then
+        oss_pe32_src="${OSS_DRIVER_DIR}/i386-windows/${OSS_DRIVER_PE_NAME}"
+        [[ -s "${oss_pe32_src}" ]] || die "WoW64 runtime requires the i386 OSS PE driver."
+        require_pe_machine "${oss_pe32_src}" 332 "32-bit Wine OSS user driver"
+        cp "${oss_pe32_src}" "${STAGE}${I386_PE_GUEST_DIR}/${OSS_DRIVER_PE_NAME}"
+    fi
     log "Wine OSS audio driver packaged: ${OSS_DRIVER_PE_NAME} + ${OSS_DRIVER_UNIX_NAME}"
 else
     warn "No --oss-driver-dir: the runtime carries no wineoss pair, so a 64-bit guest has no audio backend it can reach. See docs/PLAN_X64_AUDIO.md section 5.2."

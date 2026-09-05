@@ -1393,7 +1393,7 @@ class SignallingPathContract(unittest.TestCase):
         # value DXVK passes -- truncates to 32 bits as 0xffffffff, which is
         # about four seconds rather than forever.
         for command, slot in (("WaitForFences", 4), ("WaitSemaphores", 2),
-                              ("AcquireNextImageKHR", 2)):
+                              ("AcquireNextImageKHR", 2), ("WaitForPresentKHR", 3)):
             with self.subTest(command=command):
                 body = self.case_body(command)
                 self.assertIn(f"(uint64_t)A({slot})", body,
