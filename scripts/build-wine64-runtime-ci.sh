@@ -819,7 +819,7 @@ if [[ -n "${OSS_DRIVER_DIR}" ]]; then
         oss_pe32_src="${OSS_DRIVER_DIR}/i386-windows/${OSS_DRIVER_PE_NAME}"
         [[ -s "${oss_pe32_src}" ]] || die "WoW64 runtime requires the i386 OSS PE driver."
         require_pe_machine "${oss_pe32_src}" 332 "32-bit Wine OSS user driver"
-        cp "${oss_pe32_src}" "${STAGE}${I386_PE_GUEST_DIR}/${OSS_DRIVER_PE_NAME}"
+        cp "${oss_pe32_src}" "${PE32_STAGE}${I386_PE_GUEST_DIR}/${OSS_DRIVER_PE_NAME}"
     fi
     log "Wine OSS audio driver packaged: ${OSS_DRIVER_PE_NAME} + ${OSS_DRIVER_UNIX_NAME}"
 else
