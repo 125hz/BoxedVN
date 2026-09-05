@@ -725,7 +725,7 @@ final class AppModel: ObservableObject {
         /// lives beside them in include/guest_wine64_layout.h
         /// (K_X64_WINE_TRACE_CHANNELS, K_X64_WINE_RELAY_INCLUDE) so the two
         /// halves can be compared by a test rather than by memory.
-        static let verboseTraceChannels = "+relay,+loaddll,+debugstr,+seh"
+        static let verboseTraceChannels = "+relay,+loaddll,+debugstr,+seh,+uniscribe"
         static let verboseTraceAssignment = "BOXEDVN_X64_WINE_TRACE=relay"
         static let wineDebugAssignmentPrefix = "WINEDEBUG="
 

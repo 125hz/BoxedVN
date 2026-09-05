@@ -115,6 +115,22 @@ start:
     jne fail
     cmp dword [DATA + 0x214], 0x00d00000 ; double 2^-1010
     jne fail
+    ; The i386 standard-library hash policy computes floor(11/load)+1
+    ; using x87, control-word changes, and a 64-bit integer conversion.
+    mov dword [DATA + 0x300], 0x41300000 ; 11.0f
+    mov dword [DATA + 0x304], 0x3f800000 ; 1.0f
+    mov dword [DATA + 0x308], 0x3f800000 ; load factor
+    call rehash_minimum
+    cmp eax, 12
+    jne fail
+    mov dword [DATA + 0x308], 0x3f000000 ; 0.5f
+    call rehash_minimum
+    cmp eax, 23
+    jne fail
+    mov dword [DATA + 0x308], 0x40000000 ; 2.0f
+    call rehash_minimum
+    cmp eax, 6
+    jne fail
     mov     eax, PASS
     hlt
 
@@ -137,3 +153,37 @@ call_probe:
 fail:
     mov     eax, FAIL
     hlt
+
+rehash_minimum:
+    sub esp, 0x1c
+    fld dword [DATA + 0x300]
+    fld dword [DATA + 0x308]
+    fdiv st1, st0
+    mov dword [esp+8], 1
+    mov dword [esp+12], 0
+    fild qword [esp+8]
+    fxch st2
+    fcomi st0, st2
+    jb fail
+    fstp st1
+    fstp st1
+    fnstcw [esp+0x16]
+    movzx eax, word [esp+0x16]
+    and ah, 0xf3
+    or ah, 4
+    mov [esp+0x14], ax
+    movzx eax, word [esp+0x16]
+    fldcw [esp+0x14]
+    frndint
+    fldcw [esp+0x16]
+    fadd dword [DATA+0x304]
+    or ah, 0xc
+    mov [esp+0x12], ax
+    fldcw [esp+0x12]
+    fistp qword [esp+8]
+    fldcw [esp+0x16]
+    mov eax, [esp+8]
+    cmp dword [esp+12], 0
+    jne fail
+    add esp, 0x1c
+    ret

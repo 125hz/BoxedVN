@@ -16,6 +16,7 @@ for module in ("d3d9", "d3d11", "dxgi", "d3d10core"):
         assert b"BOXEDWINE_DXVK_ALLOCATION_FAILED" in data, f"{module}: missing allocation report"
         assert b"new_aligned" in data, f"{module}: missing aligned allocation report"
         assert b"allocator_reject_size_unknown" in data, f"{module}: missing allocator rejection report"
+        assert b"BOXEDWINE_DXVK_REHASH" in data, f"{module}: missing hash-policy report"
         assert b"non-std exception escaped worker" in data, module
     print(f"{module}.dll: PE32 i386 validated")
 assert (root / "build-manifest.txt").is_file(), "missing source provenance"

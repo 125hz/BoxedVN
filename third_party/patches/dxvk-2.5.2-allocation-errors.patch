@@ -2,12 +2,13 @@ diff --git a/meson.build b/meson.build
 index 29101e7..a171fe5 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -85,0 +86,5 @@ if platform == 'windows'
+@@ -85,0 +86,6 @@ if platform == 'windows'
 +        '-Wl,--wrap=_Znwj',
 +        '-Wl,--wrap=_Znaj',
 +        '-Wl,--wrap=_ZnwjSt11align_val_t',
 +        '-Wl,--wrap=_ZnajSt11align_val_t',
 +        '-Wl,--wrap=_ZSt17__throw_bad_allocv',
++        '-Wl,--wrap=_ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEjjj',
 diff --git a/src/util/meson.build b/src/util/meson.build
 index b064fee..6056596 100644
 --- a/src/util/meson.build
@@ -19,7 +20,7 @@ new file mode 100644
 index 0000000..312a753
 --- /dev/null
 +++ b/src/util/util_allocation.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,99 @@
 +// BoxedVN: observe failed allocations without replacing allocator semantics.
 +#if defined(_WIN32) && defined(__i386__) && defined(__GNUC__)
 +#define WIN32_LEAN_AND_MEAN
@@ -27,6 +28,9 @@ index 0000000..312a753
 +#include <cstddef>
 +#include <cstdio>
 +#include <new>
++#include <cstdint>
++#include <cstring>
++#include <utility>
 +
 +extern "C" IMAGE_DOS_HEADER __ImageBase;
 +extern "C" void* __real__Znwj(std::size_t);
@@ -85,5 +89,34 @@ index 0000000..312a753
 +  // Allocator max-size checks may reject a request before operator new.
 +  reportAllocationFailure(0, __builtin_return_address(0), "allocator_reject_size_unknown");
 +  __real__ZSt17__throw_bad_allocv();
++}
++
++using RehashResult = std::pair<bool, std::size_t>;
++extern "C" RehashResult __attribute__((thiscall))
++__real__ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEjjj(const void*, std::size_t, std::size_t, std::size_t);
++
++extern "C" RehashResult __attribute__((thiscall))
++__wrap__ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEjjj(
++    const void* policy, std::size_t buckets, std::size_t elements, std::size_t inserted) {
++  std::uint32_t before[2];
++  std::memcpy(before, policy, sizeof(before));
++  const auto result = __real__ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEjjj(
++    policy, buckets, elements, inserted);
++  static LONG reports = 0;
++  if (InterlockedIncrement(&reports) <= 16 || (result.first && result.second > 0x1fffffff)) {
++    char buffer[384];
++    int length = std::snprintf(buffer, sizeof(buffer),
++      "BOXEDWINE_DXVK_REHASH tid=%lu buckets=%lu elements=%lu insert=%lu load_bits=%08lx resize=%lu grow=%u next=%lu caller=%p\n",
++      static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long>(buckets),
++      static_cast<unsigned long>(elements), static_cast<unsigned long>(inserted),
++      static_cast<unsigned long>(before[0]), static_cast<unsigned long>(before[1]),
++      unsigned(result.first), static_cast<unsigned long>(result.second), __builtin_return_address(0));
++    if (length > 0) {
++      DWORD written = 0;
++      WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer,
++        static_cast<DWORD>(length < int(sizeof(buffer)) ? length : sizeof(buffer) - 1), &written, nullptr);
++    }
++  }
++  return result;
 +}
 +#endif

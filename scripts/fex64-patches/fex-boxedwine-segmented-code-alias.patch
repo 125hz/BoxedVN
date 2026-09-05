@@ -1,0 +1,99 @@
+diff --git a/FEXCore/include/FEXCore/Utils/DualMap.h b/FEXCore/include/FEXCore/Utils/DualMap.h
+--- a/FEXCore/include/FEXCore/Utils/DualMap.h
++++ b/FEXCore/include/FEXCore/Utils/DualMap.h
+@@ -16,17 +16,28 @@
+ // Source/Windows/ARM64EC/Module.cpp and is set early in ProcessInit
+ // (before InitCore, so dispatcher emit picks it up).
+ extern int64_t WriteOffset;
++#if defined(__APPLE__)
++// Installed once before translation; each published RX segment has its own RW alias.
++extern int64_t (*WriteOffsetLookup)(const void*);
++#endif
++inline int64_t OffsetFor(const void* Address) {
++#if defined(__APPLE__)
++  if (WriteOffsetLookup) return WriteOffsetLookup(Address);
++#endif
++  return WriteOffset;
++}
+ 
+ inline void* WriteAddr(void* RXAddr) {
+-  return reinterpret_cast<uint8_t*>(RXAddr) + WriteOffset;
++  return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(RXAddr) + OffsetFor(RXAddr));
+ }
+ 
+ template<typename T>
+ inline T* WriteAddr(T* RXAddr) {
+-  return reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(RXAddr) + WriteOffset);
++  return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(RXAddr) + OffsetFor(RXAddr));
+ }
+ #else
+ static constexpr int64_t WriteOffset = 0;
++inline int64_t OffsetFor(const void*) { return 0; }
+ 
+ inline void* WriteAddr(void* Addr) { return Addr; }
+ 
+diff --git a/FEXCore/Source/Utils/Allocator.cpp b/FEXCore/Source/Utils/Allocator.cpp
+--- a/FEXCore/Source/Utils/Allocator.cpp
++++ b/FEXCore/Source/Utils/Allocator.cpp
+@@ -311,6 +311,7 @@
+ #elif defined(__APPLE__)
+ namespace FEXCore::DualMap {
+ int64_t WriteOffset = 0;
++int64_t (*WriteOffsetLookup)(const void*) = nullptr;
+ } // namespace FEXCore::DualMap
+ 
+ namespace FEXCore::Allocator {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -709,7 +709,7 @@
+   , CTX {ctx}
+   , TempAllocator(ctx->CPUBackendAllocator, 0) {
+ 
+-  SetWriteOffset(FEXCore::DualMap::WriteOffset);
++  SetWriteOffset(FEXCore::DualMap::OffsetFor(reinterpret_cast<const void*>(GetBufferBase())));
+ 
+   RAPass = Thread->PassManager->GetPass<IR::RegisterAllocationPass>("RA");
+ 
+@@ -798,6 +798,7 @@
+ 
+   auto CodeBuffer = GetEmptyCodeBuffer();
+   SetBuffer(CodeBuffer->Ptr, CodeBuffer->AllocatedSize);
++  SetWriteOffset(FEXCore::DualMap::OffsetFor(CodeBuffer->Ptr));
+   EmitDetectionString();
+ 
+   ThreadState->LookupCache->ChangeGuestToHostMapping(*PrevCodeBuffer, *CurrentCodeBuffer->LookupCache, lk);
+@@ -1310,7 +1311,7 @@
+ #if defined(__APPLE__) || defined(FEX_IOS_HOST)
+       // Restore WriteOffset for dual-mapped JIT pool (CodeBuffer is RX, writes go to RW mirror).
+       // (FEX_IOS_HOST: same logic for ARM64EC PE build — CodeBuffer is iOS-allocated dual-mapped.)
+-      SetWriteOffset(FEXCore::DualMap::WriteOffset);
++      SetWriteOffset(FEXCore::DualMap::OffsetFor(CurrentCodeBuffer->Ptr));
+ #endif
+       SetCursorOffset(CodeBuffers.LatestOffset);
+       Align16B();
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -50,7 +50,7 @@
+ Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
+   : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
+   , CTX {ctx} {
+-  SetWriteOffset(FEXCore::DualMap::WriteOffset);
++  SetWriteOffset(FEXCore::DualMap::OffsetFor(reinterpret_cast<const void*>(GetBufferBase())));
+   EmitDispatcher();
+ 
+   FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.cpp b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+--- a/FEXCore/Source/Interface/Core/CPUBackend.cpp
++++ b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+@@ -20,7 +20,8 @@
+ namespace CPU {
+ 
+   static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
+-#ifdef FEX_IOS_HOST
++// Apple host segments are 64 MiB; a buffer also needs aligned guard padding.
++#if defined(FEX_IOS_HOST) || defined(__APPLE__)
+   // iOS-Mythic ml437 (#74): the shared 896MB JIT pool's tail budget is ~188MB
+   // for ALL threads' code buffers; hot threads doubling 16->32->64->128MB
+   // exhausted it in ml436 (head 708MB of DLL copies + tail collided; 10 honest

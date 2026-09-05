@@ -318,7 +318,7 @@
 // loaddll names each module as it is attached and debugstr carries whatever
 // the program passes to OutputDebugString -- which for a wrapper layer is
 // frequently the reason itself. Both are one line per event, not per call.
-#define K_X64_WINE_TRACE_CHANNELS "+relay,+loaddll,+debugstr,+seh"
+#define K_X64_WINE_TRACE_CHANNELS "+relay,+loaddll,+debugstr,+seh,+uniscribe"
 // The doubled backslashes are the registry file's own escaping: user.reg
 // spells this section "[Software\\Wine\\Debug]" on disk.
 #define K_X64_WINE_DEBUG_REGISTRY_SECTION "Software\\\\Wine\\\\Debug"

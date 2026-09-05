@@ -143,6 +143,7 @@ apply_patch fex-arm64-addsub-immediate-range.patch
 apply_patch fex-boxedwine-ir-capture-arm.patch
 apply_patch fex-boxedwine-low-address-alias.patch
 apply_patch fex-boxedwine-masked-memory-alias.patch
+apply_patch fex-boxedwine-segmented-code-alias.patch
 # Depends on the alias patch above: its witness reports the host address a
 # canonical guest stack slot resolves to, which only exists once the alias is
 # published. Restores the missing null-host-target guard in the emitted L1

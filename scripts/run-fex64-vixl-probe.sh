@@ -35,6 +35,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-masked-memory-alias.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-segmented-code-alias.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-null-exit-target.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-call-return-witness.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-inline-call-return.patch"
@@ -119,6 +120,11 @@ build_runner() (
     # Preinclude that declaration for this host-only conformance build; keep
     # the pinned third-party checkout untouched.
     mkdir -p "${fex_build}"
+    "${cxx}" -std=c++20 -O2 -I"${fex_source}/FEXCore/include" \
+        "${root}/scripts/guest-probes/fex64-dual-map-check.cpp" \
+        -o "${fex_build}/boxedvn-dual-map-check"
+    "${fex_build}/boxedvn-dual-map-check"
+
     host_stubs_object="${fex_build}/boxedvn-probe-host-stubs.o"
     "${cxx}" -std=c++20 -c "${host_stubs_source}" -o "${host_stubs_object}"
     cmake -S "${fex_source}" -B "${fex_build}" -G Ninja \

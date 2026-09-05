@@ -41,6 +41,8 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 
 #include "boxedvn/fex64_kernel.h"
 #include "boxedvn/fex_code_buffer_layout.h"
+#include "boxedvn/fex_code_segments.h"
+#include <new>
 #include "boxedvn/fex_exit_dispatch_contract.h"
 #include "boxedvn/fex_guest_mode_policy.h"
 #include "guest_low_alias.h"
@@ -158,11 +160,9 @@ std::mutex gPoolMutex;
 std::atomic<BVNFEXBackendStage> gStage {BVNFEXBackendStageIdle};
 std::string gReport;
 
-void* gPoolRX = nullptr;
-void* gPoolRW = nullptr;
-size_t gPoolSize = 0;
+boxedvn::FexCodeSegments gCodeSegments;
+std::array<boxedvn::FexCodeBufferPool, boxedvn::FexCodeSegments::maximum> gCodePools;
 std::atomic<size_t> gPoolUsed {0};
-boxedvn::FexCodeBufferPool gCodeBufferPool;
 
 void* gGuestCode = nullptr;
 void* gGuestStack = nullptr;
@@ -441,30 +441,56 @@ size_t alignUp(size_t value, size_t alignment) {
 }
 
 bool poolOwns(const void* pointer) {
-    const uintptr_t base = reinterpret_cast<uintptr_t>(gPoolRX);
-    const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
-    return gPoolRX != nullptr && address >= base && address < base + gPoolSize;
+    return gCodeSegments.find(reinterpret_cast<uintptr_t>(pointer)) != boxedvn::FexCodeSegments::maximum;
+}
+
+int64_t codeWriteOffset(const void* pointer) {
+    const uintptr_t rx = reinterpret_cast<uintptr_t>(pointer);
+    const uintptr_t rw = gCodeSegments.writable(rx);
+    return rw ? static_cast<int64_t>(rw) - static_cast<int64_t>(rx) : 0;
+}
+
+// Called under gPoolMutex. Published mappings remain immutable, including
+// while signal handlers translate RX addresses without acquiring a lock.
+bool addCodeSegment(size_t minimumRequest) {
+    if (gCodeSegments.size() == boxedvn::FexCodeSegments::maximum) return false;
+    for (size_t candidate = kPoolBytes; candidate >= kMinimumPoolBytes; candidate /= 2) {
+        if (!boxedvn::planFexCodeBufferLayout(0, minimumRequest, candidate, kPageBytes, kFEXPageBytes)) continue;
+        void* rx = BVNExecMemAlloc(candidate);
+        if (!rx) continue;
+        void* rw = BVNExecMemWritableAddress(rx, candidate);
+        if (!rw || !gCodeSegments.append({reinterpret_cast<uintptr_t>(rx), reinterpret_cast<uintptr_t>(rw), candidate})) {
+            BVNExecMemReleaseIfOwned(rx, candidate);
+            return false;
+        }
+        reportf("BOXEDWINE_FEX64_CODE_SEGMENT index=%zu bytes=%zu rx=%p rw=%p",
+                gCodeSegments.size() - 1, candidate, rx, rw);
+        return true;
+    }
+    return false;
 }
 
 void* allocateTranslatedCode(size_t length) {
     std::lock_guard<std::mutex> guard(gPoolMutex);
-    const auto allocation = gCodeBufferPool.allocate(
-        length, gPoolSize, kPageBytes, kFEXPageBytes);
-    if (allocation.has_value()) {
-        const auto& layout = allocation->layout;
-        gPoolUsed.store(gCodeBufferPool.cursor(), std::memory_order_relaxed);
+    for (size_t i = 0;; ++i) {
+        if (i == gCodeSegments.size() && !addCodeSegment(length)) break;
+        const auto& segment = gCodeSegments.at(i);
+        const auto before = gCodePools[i].cursor();
+        const auto allocation = gCodePools[i].allocate(length, segment.size, kPageBytes, kFEXPageBytes);
+        if (!allocation) continue;
+        gPoolUsed.fetch_add(gCodePools[i].cursor() - before, std::memory_order_relaxed);
         static std::atomic<uint32_t> reported {0};
-        if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-            reportf("FEX executable %s request=0x%zx rx_offset=0x%zx "
-                    "guard_offset=0x%zx next_offset=0x%zx host_page=0x%zx",
-                    allocation->reused ? "reuse" : "carve", length,
-                    layout.allocationOffset, layout.guardOffset,
-                    layout.nextOffset, kPageBytes);
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+            reportf("FEX executable %s segment=%zu request=0x%zx rx_offset=0x%zx guard_offset=0x%zx next_offset=0x%zx",
+                    allocation->reused ? "reuse" : "carve", i, length,
+                    allocation->layout.allocationOffset, allocation->layout.guardOffset, allocation->layout.nextOffset);
         }
-        return static_cast<uint8_t*>(gPoolRX) + layout.allocationOffset;
+        return reinterpret_cast<void*>(segment.rx + allocation->layout.allocationOffset);
     }
-    reportf("translator executable pool exhausted by a %zu-byte request", length);
-    return MAP_FAILED;
+    reportf("translator executable pool exhausted request=%zu segments=%zu used=%zu",
+            length, gCodeSegments.size(), gPoolUsed.load());
+    // MAP_FAILED is non-null and FEX would emit through it. Propagate failure.
+    throw std::bad_alloc();
 }
 
 void* fexMmap(void* address, size_t length, int protection, int flags,
@@ -476,15 +502,13 @@ void* fexMmap(void* address, size_t length, int protection, int flags,
 }
 
 int fexMunmap(void* address, size_t length) {
-    if (!poolOwns(address)) {
-        return munmap(address, length);
-    }
+    if (!poolOwns(address)) return munmap(address, length);
     std::lock_guard<std::mutex> guard(gPoolMutex);
-    const size_t offset = static_cast<uint8_t*>(address) -
-                          static_cast<uint8_t*>(gPoolRX);
-    if (!gCodeBufferPool.release(offset, length)) {
-        reportf("FEX executable release did not match a live carve "
-                "request=0x%zx rx_offset=0x%zx", length, offset);
+    const auto index = gCodeSegments.find(reinterpret_cast<uintptr_t>(address));
+    const size_t offset = reinterpret_cast<uintptr_t>(address) - gCodeSegments.at(index).rx;
+    if (!gCodePools[index].release(offset, length)) {
+        reportf("FEX executable release did not match a live carve request=0x%zx segment=%zu offset=0x%zx",
+                length, index, offset);
     }
     return 0;
 }
@@ -994,9 +1018,7 @@ bool installFEXHostSignalHandlers() {
 
 bool preparePool() {
     std::lock_guard<std::mutex> guard(gPoolMutex);
-    if (gPoolRX != nullptr) {
-        return true;
-    }
+    if (gCodeSegments.size() != 0) return true;
     if (!BVNExecMemArenaPrepared() && !BVNExecMemPrepareArena()) {
         reportf("StikDebug did not prepare the shared executable arena");
         return false;
@@ -1009,28 +1031,11 @@ bool preparePool() {
             return false;
         }
     }
-    for (size_t candidate = kPoolBytes; candidate >= kMinimumPoolBytes;
-         candidate /= 2) {
-        gPoolRX = BVNExecMemAlloc(candidate);
-        if (gPoolRX != nullptr) {
-            gPoolSize = candidate;
-            break;
-        }
-    }
-    if (gPoolRX == nullptr) {
+    if (!addCodeSegment(kPageBytes)) {
         reportf("the shared executable arena has no segment for FEX");
         return false;
     }
-    gPoolRW = BVNExecMemWritableAddress(gPoolRX, gPoolSize);
-    if (gPoolRW == nullptr) {
-        reportf("the FEX executable pool has no writable alias");
-        return false;
-    }
-    FEXCore::DualMap::WriteOffset =
-        static_cast<int64_t>(static_cast<uint8_t*>(gPoolRW) -
-                             static_cast<uint8_t*>(gPoolRX));
-    reportf("shared arena assigned %zu MiB to FEX (rx=%p rw=%p)",
-            gPoolSize / (1024 * 1024), gPoolRX, gPoolRW);
+    FEXCore::DualMap::WriteOffsetLookup = &codeWriteOffset;
     return true;
 }
 
@@ -1894,13 +1899,7 @@ extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address) {
 }
 
 extern "C" uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t address) {
-    if (!poolOwns(reinterpret_cast<const void*>(
-            static_cast<uintptr_t>(address))) || gPoolRW == nullptr) {
-        return 0;
-    }
-    const uintptr_t offset = static_cast<uintptr_t>(address) -
-        reinterpret_cast<uintptr_t>(gPoolRX);
-    return reinterpret_cast<uintptr_t>(gPoolRW) + offset;
+    return gCodeSegments.writable(static_cast<uintptr_t>(address));
 }
 
 extern "C" bool BVNFEXBackendBuilt(void) { return true; }
@@ -2031,20 +2030,14 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                             hostReturnCodeBytes ==
                                 sizeof(snapshot.hostReturnCode);
 
-                        const uintptr_t poolBase =
-                            reinterpret_cast<uintptr_t>(gPoolRX);
                         const uintptr_t returnAddress =
                             static_cast<uintptr_t>(snapshot.hostLR - 4);
                         snapshot.hostReturnInPool =
                             poolOwns(reinterpret_cast<const void*>(returnAddress));
                         if (snapshot.hostReturnInPool) {
-                            snapshot.hostReturnPoolOffset =
-                                returnAddress - poolBase;
-                            if (gPoolRW != nullptr) {
-                                snapshot.hostReturnWritableAlias =
-                                    reinterpret_cast<uintptr_t>(gPoolRW) +
-                                    snapshot.hostReturnPoolOffset;
-                            }
+                            const auto index = gCodeSegments.find(returnAddress);
+                            snapshot.hostReturnPoolOffset = returnAddress - gCodeSegments.at(index).rx;
+                            snapshot.hostReturnWritableAlias = gCodeSegments.writable(returnAddress);
                         }
                     }
                     // Never call FEX's code-buffer queries while suspended.

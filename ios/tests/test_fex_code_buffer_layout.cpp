@@ -1,5 +1,6 @@
 #include "boxedvn_test.h"
 #include "boxedvn/fex_code_buffer_layout.h"
+#include "boxedvn/fex_code_segments.h"
 
 #include <cstddef>
 
@@ -66,4 +67,39 @@ BOXEDVN_TEST(fex_code_buffer_pool_reuses_only_matching_retired_layouts) {
     CHECK_EQ(reused->layout.allocationOffset,
              large->layout.allocationOffset);
     CHECK_EQ(pool.cursor(), beforeReuse);
+}
+
+BOXEDVN_TEST(fex_code_segments_translate_independent_aliases_and_boundaries) {
+    FexCodeSegments segments;
+    CHECK_EQ(segments.writable(0x100000), std::uintptr_t{0});
+    CHECK(segments.append({0x100000, 0x500000, 0x10000}));
+    CHECK(segments.append({0x900000, 0x200000, 0x20000}));
+    CHECK_EQ(segments.writable(0x100123), std::uintptr_t{0x500123});
+    CHECK_EQ(segments.writable(0x90ffff), std::uintptr_t{0x20ffff});
+    CHECK_EQ(segments.writable(0x91ffff), std::uintptr_t{0x21ffff});
+    CHECK_EQ(segments.writable(0x920000), std::uintptr_t{0});
+    CHECK_EQ(segments.writable(0xfffff), std::uintptr_t{0});
+    CHECK_EQ(segments.writable(0x110000), std::uintptr_t{0});
+    CHECK(!segments.append({0x108000, 0x600000, 0x10000}));
+    CHECK_EQ(segments.size(), std::size_t{2});
+    CHECK(!segments.append({~std::uintptr_t{0} - 0xff, 0x600000, 0x1000}));
+    CHECK_EQ(segments.writable(0x100123), std::uintptr_t{0x500123});
+}
+
+BOXEDVN_TEST(fex_code_cache_growth_can_move_to_another_segment) {
+    constexpr std::size_t mib = 1024 * 1024;
+    FexCodeBufferPool first, second;
+    // The observed probe, loader and replacement contexts consume three
+    // 16 MiB buffers. A 32 MiB generation must use another 64 MiB segment.
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(first.allocate(0x4000, 64 * mib, 0x4000, 0x1000).has_value());
+        CHECK(first.allocate(16 * mib, 64 * mib, 0x4000, 0x1000).has_value());
+    }
+    CHECK(!first.allocate(32 * mib, 64 * mib, 0x4000, 0x1000).has_value());
+    const auto grown = second.allocate(32 * mib, 64 * mib, 0x4000, 0x1000);
+    CHECK(grown.has_value());
+    CHECK(second.release(grown->layout.allocationOffset, 32 * mib));
+    const auto reused = second.allocate(32 * mib, 64 * mib, 0x4000, 0x1000);
+    CHECK(reused.has_value());
+    CHECK(reused->reused);
 }
