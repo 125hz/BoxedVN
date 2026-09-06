@@ -1,0 +1,44 @@
+// Run the production guest frame scheduler without UIKit/Metal.
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
+static std::atomic<int> gGuestFrameRateLimitHz{0}, gGuestVulkanFrameRateLimitHz{0};
+static std::mutex gGuestFramePacerMutex;
+static std::chrono::steady_clock::time_point gGuestNextFrameDeadline[2];
+static void BVNApplyDXMTPresentMode(int) {}
+@BOXEDVN_FRAME_MODE_BODY@
+@BOXEDVN_FRAME_PACER_BODY@
+static void check(bool ok,const char* message) {
+    if (!ok) { std::fprintf(stderr,"FAIL: %s\n",message); std::exit(1); }
+}
+int main() {
+    for (int mode : {3,1,2}) {
+        BVNResetGuestFramePacer(mode);
+        const int hz=mode==3 ? 30 : mode==1 ? 60 : 120;
+        check(gGuestVulkanFrameRateLimitHz==hz,"Vulkan receives every selected cap");
+        check(gGuestFrameRateLimitHz==(mode==3 ? 30 : 0),"DXMT retains its native pacing except 30 Hz");
+        const auto begin=std::chrono::steady_clock::now();
+        for(int frame=0;frame<4;++frame) BVNGuestVulkanFrameLimiterWait();
+        const auto elapsed=std::chrono::steady_clock::now()-begin;
+        check(elapsed>=std::chrono::nanoseconds(2900000000ll/hz),"present cadence respects cap");
+    }
+    BVNResetGuestFramePacer(0);
+    BVNGuestVulkanFrameLimiterWait();
+    check(gGuestNextFrameDeadline[1].time_since_epoch().count()==0,"uncapped bypasses scheduler");
+    // The settings mutex must remain available while a render thread sleeps.
+    BVNResetGuestFramePacer(3);
+    {
+        std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
+        gGuestNextFrameDeadline[1]=std::chrono::steady_clock::now()+std::chrono::milliseconds(100);
+    }
+    std::thread render([] { BVNGuestVulkanFrameLimiterWait(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool acquired=gGuestFramePacerMutex.try_lock();
+    if(acquired) gGuestFramePacerMutex.unlock();
+    render.join();
+    check(acquired,"render sleep does not hold settings mutex");
+    std::puts("guest frame pacing passed");
+}

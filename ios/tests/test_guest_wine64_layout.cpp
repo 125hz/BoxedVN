@@ -12,6 +12,16 @@
 #include <string>
 #include <vector>
 
+BOXEDVN_TEST(wow64_dxvk_load_order_keeps_dxmt_and_explicit_builtin_overrides) {
+    const std::string dxmt="d3d11,dxgi,d3d10core,winemetal=n,b";
+    CHECK_EQ(boxedvn::wineDllOverridesWithDxvkPe32(dxmt),dxmt+";d3d9=n");
+    const auto defaults=boxedvn::wineDllOverridesWithDxvkPe32("");
+    CHECK_EQ(defaults,std::string("d3d9=n;d3d11=n,b;dxgi=n,b;d3d10core=n,b"));
+    CHECK_EQ(boxedvn::wineDllOverridesWithDxvkPe32(defaults),defaults);
+    CHECK_EQ(boxedvn::wineDllOverridesWithDxvkPe32("d3d11,dxgi,d3d10core=b;d3d9=b"),
+             std::string("d3d11,dxgi,d3d10core=b;d3d9=b"));
+}
+
 BOXEDVN_TEST(wine64_layout_keeps_loader_and_modules_under_one_root) {
     CHECK_EQ(std::string(K_X64_WINE_MODULE_ROOT),
              std::string("/usr/lib/x86_64-linux-gnu/wine"));

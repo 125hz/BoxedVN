@@ -1,4 +1,4 @@
-// Wine 9 MMDeviceEnumerator registration for projected builtin DLLs.
+// Wine 9 COM registration repairs for projected builtin DLLs.
 // GPLv2; see license.txt.
 #pragma once
 #include <string>
@@ -55,6 +55,26 @@ inline bool registerWineAudioEnumerator(std::string& contents, bool pe64, bool p
         // threading model when this repair supplies the missing server path.
         if (added) insertMissingWineRegistryValue(contents, section,
             "\"ThreadingModel\"", "\"Both\"");
+        changed |= added;
+    }
+    return changed;
+}
+
+// Wine 9 dlls/dxdiagn/dxdiagn.idl declares an apartment-threaded provider.
+// Projecting a builtin PE does not run its registration resource on an
+// already-created prefix. Supply missing registrations, never replace one.
+inline bool registerWineDxDiagProvider(std::string& contents, bool pe64, bool pe32) {
+    bool changed = false;
+    for (int bitness : {64, 32}) {
+        if (!(bitness == 64 ? pe64 : pe32)) continue;
+        const std::string section = std::string("Software\\\\Classes\\\\") +
+            (bitness == 32 ? "Wow6432Node\\\\" : "") +
+            "CLSID\\\\{a65b8071-3bfe-4213-9a5b-491da4461ca7}\\\\InprocServer32";
+        const bool added = insertMissingWineRegistryValue(contents, section, "@",
+            bitness == 64 ? "\"C:\\\\windows\\\\system32\\\\dxdiagn.dll\"" :
+                            "\"C:\\\\windows\\\\syswow64\\\\dxdiagn.dll\"");
+        if (added) insertMissingWineRegistryValue(contents, section,
+            "\"ThreadingModel\"", "\"Apartment\"");
         changed |= added;
     }
     return changed;

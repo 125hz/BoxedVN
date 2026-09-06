@@ -924,8 +924,9 @@ static BVNRefreshRateHold* gRefreshRateHold = nil;
 static NSString* const kBVNFrameRateModeKey =
     @"BoxedVN.presentation.frameRateMode";
 static std::atomic<int> gGuestFrameRateLimitHz{0};
+static std::atomic<int> gGuestVulkanFrameRateLimitHz{0};
 static std::mutex gGuestFramePacerMutex;
-static std::chrono::steady_clock::time_point gGuestNextFrameDeadline;
+static std::chrono::steady_clock::time_point gGuestNextFrameDeadline[2];
 
 // 0 = unlocked (no software pacing, the panel's fastest cadence),
 // 1 = 60, 2 = 120, 3 = 30.
@@ -958,28 +959,37 @@ static void BVNResetGuestFramePacer(int mode) {
     // Only the 30 Hz cap needs the host pacer; DXMT locks 60 itself and the
     // panel bounds 120 and unlocked.
     gGuestFrameRateLimitHz.store(mode == 3 ? 30 : 0, std::memory_order_release);
+    gGuestVulkanFrameRateLimitHz.store(BVNGuestFrameRateLimitForMode(mode), std::memory_order_release);
     BVNApplyDXMTPresentMode(mode);
     std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
-    gGuestNextFrameDeadline = {};
+    gGuestNextFrameDeadline[0] = {};
+    gGuestNextFrameDeadline[1] = {};
+}
+
+static void BVNWaitForGuestFrame(int limit, unsigned backend) {
+    if (limit <= 0) return;
+    const auto interval = std::chrono::nanoseconds(1000000000ll / limit);
+    std::chrono::steady_clock::time_point deadline;
+    {
+        std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
+        auto& next = gGuestNextFrameDeadline[backend];
+        const auto now = std::chrono::steady_clock::now();
+        if (next.time_since_epoch().count() == 0 || now > next + interval * 2)
+            next = now;
+        else
+            next += interval;
+        deadline = next;
+    }
+    // The UI can change the cap while a render thread waits.
+    std::this_thread::sleep_until(deadline);
 }
 
 extern "C" void BVNGuestFrameLimiterWait(void) {
-    const int limit = gGuestFrameRateLimitHz.load(std::memory_order_acquire);
-    if (limit <= 0) {
-        return;
-    }
-    const auto interval = std::chrono::nanoseconds(1000000000ll / limit);
-    std::lock_guard<std::mutex> lock(gGuestFramePacerMutex);
-    const auto now = std::chrono::steady_clock::now();
-    if (gGuestNextFrameDeadline.time_since_epoch().count() == 0 ||
-        now > gGuestNextFrameDeadline + interval * 2) {
-        gGuestNextFrameDeadline = now;
-        return;
-    }
-    gGuestNextFrameDeadline += interval;
-    if (gGuestNextFrameDeadline > now) {
-        std::this_thread::sleep_until(gGuestNextFrameDeadline);
-    }
+    BVNWaitForGuestFrame(gGuestFrameRateLimitHz.load(std::memory_order_acquire), 0);
+}
+
+extern "C" void BVNGuestVulkanFrameLimiterWait(void) {
+    BVNWaitForGuestFrame(gGuestVulkanFrameRateLimitHz.load(std::memory_order_acquire), 1);
 }
 
 static void BVNApplyGuestFrameRateMode(void) {

@@ -562,6 +562,25 @@ static void reportDllSearch(KProcess* process, const char* op, const char* path,
                  : "");
 }
 
+// Metadata only: paths/results/offsets, never save or asset contents. Each
+// process has independent fixed budgets, protected across guest threads.
+static void reportDataFile(KProcess* process, const char* op, unsigned operation,
+        const char* path, S64 result, U64 offset, U64 requested) {
+    if (!process || !boxedvn::guestDataPath(path)) return;
+    static std::mutex mutex;
+    boxedvn::BoundedSyscallReportLimiter::Outcome report;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        report = process->dataFileTrace.record(path, operation, result);
+    }
+    if (report.decision == boxedvn::BoundedSyscallReportLimiter::Decision::Silent) return;
+    klog_fmt("BOXEDWINE_X64_DATA_FILE pid=%u op=%s path='%s' result=%lld "
+             "offset=%llu requested=%llu seen=%llu",
+             (unsigned)process->id, op, path, (long long)result,
+             (unsigned long long)offset, (unsigned long long)requested,
+             (unsigned long long)report.occurrences);
+}
+
 namespace {
 
 // One line per process, the first time it asks where it is. getcwd's raw
@@ -1985,10 +2004,12 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     // ONLY lock for real files (KFile): a blocking socket/pipe read must NOT hold
     // this global lock or it stalls every other process's file reads (deadlock).
     U32 got;
+    S64 dataOffset = -1;
+    std::shared_ptr<KFile> rkfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
     {
-        std::shared_ptr<KFile> rkfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
         if (rkfile) {
             std::lock_guard<std::mutex> lk(g_fileReadMutex);
+            dataOffset = fdesc->kobject->getPos();
             // Loop to satisfy the full request: a single zip-backed readNative
             // (unzReadCurrentFile) may return fewer bytes than asked, and the PE
             // loader that issues a whole-section read() does not loop itself.
@@ -2016,6 +2037,9 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
                 0, std::memory_order_relaxed);
         }
     }
+    if (rkfile && rkfile->openFile && rkfile->openFile->node)
+        reportDataFile(cpu->thread->process.get(), "read", 2,
+            rkfile->openFile->node->path.c_str(), (S32)got, (U64)dataOffset, count);
     // Both outcomes of the read land in the socket ring, not just a success.
     // The device's open question is precisely whether Wine's 16-byte reply
     // header read returned 16, 0 or an error, and a recorder that only fires
@@ -2084,6 +2108,7 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
 #ifndef K_AT_FDCWD
 #define K_AT_FDCWD (-100)
 #endif
+static S32 directoryBase64(CPU64* cpu, U64 dirfd, const char* path, BString& base);
 static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     if (!pathAddr) return (U64)-K_EFAULT;
@@ -2112,6 +2137,13 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 mode
     }
     U32 rc = process->openat((FD)(S32)dirfd, BString::copy(path),
                              (U32)flags, (U32)mode);
+    {
+        BString base;
+        if (!directoryBase64(cpu, dirfd, path, base)) {
+            const BString full = Fs::getFullPath(base, BString::copy(path));
+            reportDataFile(process, "open", 0, full.c_str(), (S32)rc, flags, mode);
+        }
+    }
     {
         // O_DIRECTORY is what the loader uses to enumerate a candidate module
         // directory, and it is the operation whose result the packaged listing
@@ -2301,6 +2333,8 @@ static U64 sys_getdents64_real(CPU64* cpu, U64 fd, U64 dirp, U64 count) {
     if (!openNode->node->isDirectory()) { if (dt) klog_fmt("DIRTRACE pid=%d getdents64 path='%s' -> ENOTDIR (not a directory)", dtpid, openNode->node->path.c_str()); return (U64)-K_ENOTDIR; }
 
     U32 entries = openNode->getDirectoryEntryCount();
+    reportDataFile(cpu->thread->process.get(), "getdents", 3,
+        openNode->node->path.c_str(), entries, openNode->getFilePointer(), count);
     U64 len = 0;
     U64 pos = dirp;
     // The question the packaged archive cannot answer: when the loader
@@ -2436,6 +2470,9 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     } else {
         got = readFully();
     }
+    if (pkfile && pkfile->openFile && pkfile->openFile->node)
+        reportDataFile(cpu->thread->process.get(), "pread", 2,
+            pkfile->openFile->node->path.c_str(), got, offset, count);
     if (got < 0) return (U64)got;
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), (U64)got);
@@ -2502,16 +2539,41 @@ static void writeStatBuf64(KMemory64* mem, U64 addr, U64 size, U32 mode,
 // Forward decl — sys_newfstatat64 may delegate to sys_fstat64 for AT_EMPTY_PATH.
 static U64 sys_fstat64(CPU64* cpu, U64 fd, U64 statbuf);
 
+// Resolve Linux *at paths in the guest namespace. Absolute paths ignore dirfd.
+static S32 directoryBase64(CPU64* cpu, U64 dirfd, const char* path, BString& base) {
+    if (path[0] == '/') { base = B(""); return 0; }
+    auto process = cpu->thread->process;
+    if ((S32)dirfd == K_AT_FDCWD) { base = process->currentDirectory; return 0; }
+    auto descriptor = process->getFileDescriptor((FD)(S32)dirfd);
+    if (!descriptor) return -K_EBADF;
+    auto file = std::dynamic_pointer_cast<KFile>(descriptor->kobject);
+    if (!file || !file->openFile || !file->openFile->node ||
+        !file->openFile->node->isDirectory()) return -K_ENOTDIR;
+    base = file->openFile->node->path;
+    return 0;
+}
+
 // Path-based stat shared by stat/lstat/newfstatat. followSymlink controls
-// the lstat vs stat distinction (Fs::getNodeFromLocalPath's third arg).
-static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSymlink) {
+// whether the shared resolver follows the final symlink.
+static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSymlink,
+                           U64 dirfd = (U64)(S64)K_AT_FDCWD) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     if (!pathAddr || !statbuf) return (U64)-K_EFAULT;
     char path[1024] = {0};
     cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    if (!path[0]) return (U64)-K_ENOENT;
+    BString base;
+    const S32 baseError = directoryBase64(cpu, dirfd, path, base);
+    if (baseError) return (U64)(S64)baseError;
     BString bpath = BString::copy(path);
-    std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(
-        cpu->thread->process->currentDirectory, bpath, followSymlink);
+    FsPathLookupOptions options;
+    options.followFinalSymlink = followSymlink;
+    const FsPathResult lookup = Fs::resolvePath(base, bpath, options);
+    std::shared_ptr<FsNode> node = lookup.node;
+    const BString full = Fs::getFullPath(base, bpath);
+    reportDataFile(cpu->thread->process.get(), "stat", 1, full.c_str(),
+        lookup.error ? lookup.error : node ? 0 : -K_ENOENT, dirfd,
+        node ? node->length() : 0);
     if (getenv("BW64_SYSTRACE")) {
         klog_fmt("sys_stat_path64: '%s' (cwd='%s') -> %s", path,
                  cpu->thread->process->currentDirectory.c_str(),
@@ -2537,9 +2599,10 @@ static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSym
                      node ? 1 : 0, node ? node->getMode() : 0);
         }
     }
-    if (!node) return (U64)-2; // -ENOENT
-    U64 size  = node->length();
-    U32 mode  = node->getMode();
+    if (lookup.error) return (U64)(S64)(S32)lookup.error;
+    if (!node) return (U64)-K_ENOENT;
+    U64 size = node->isLink() ? node->getLink().length() : node->length();
+    U32 mode = node->isLink() ? K__S_IFLNK | (node->getMode() & 0xfff) : node->getMode();
     U64 ino   = node->id;
     U64 mtime = node->lastModified() / 1000; // ms → seconds
     if (!strcmp(path, "/dev/null")) {
@@ -2562,22 +2625,14 @@ static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSym
 static U64 sys_newfstatat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 statbuf, U64 flags) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     if (!statbuf) return (U64)-K_EFAULT;
+    if (flags & ~(U64)(K_AT_EMPTY_PATH | K_AT_SYMLINK_NOFOLLOW | 0x800))
+        return (U64)-K_EINVAL; // AT_NO_AUTOMOUNT (0x800) is an allowed no-op.
     // AT_EMPTY_PATH with NULL/"" path means stat the fd.
     if ((flags & K_AT_EMPTY_PATH) && (!pathAddr || cpu->memory->readb(pathAddr) == 0)) {
         return sys_fstat64(cpu, dirfd, statbuf);
     }
-    // We only honour AT_FDCWD or absolute paths for now (matches openat).
-    char path[1024] = {0};
-    cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
-    bool isAbs = (path[0] == '/');
-    if (getenv("BW64_SYSTRACE")) {
-        klog_fmt("sys_newfstatat64: dirfd=%d path='%s' flags=0x%llx",
-                 (int)(S32)dirfd, path, (unsigned long long)flags);
-    }
-    if (!isAbs && (S32)dirfd != K_AT_FDCWD) {
-        return (U64)-2;
-    }
-    return sys_stat_path64(cpu, pathAddr, statbuf, !(flags & K_AT_SYMLINK_NOFOLLOW));
+    return sys_stat_path64(cpu, pathAddr, statbuf,
+                          !(flags & K_AT_SYMLINK_NOFOLLOW), dirfd);
 }
 
 static U64 sys_fstat64(CPU64* cpu, U64 fd, U64 statbuf) {
@@ -5370,7 +5425,7 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_open:
         case X64_SYS_openat:
             // open(path, flags, mode) — same arg layout once we shift one.
-            if (nr == X64_SYS_open) ret = sys_openat64(cpu, ~0ULL, a1, a2, a3);
+            if (nr == X64_SYS_open) ret = sys_openat64(cpu, (U64)(S64)K_AT_FDCWD, a1, a2, a3);
             else                    ret = sys_openat64(cpu, a1,    a2, a3, a4);
             break;
         case X64_SYS_close:
@@ -5473,7 +5528,15 @@ void ksyscall64(CPU64* cpu) {
             BString full = Fs::getFullPath(cpu->thread->process->currentDirectory,
                                            BString::copy(path));
             U32 mode = (U32)((nr == X64_SYS_mkdir) ? a2 : a3);
-            ret = (U64)(S64)(S32)cpu->thread->process->mkdir(full, mode);
+            ret = (U64)(S64)(S32)(nr == X64_SYS_mkdir
+                ? cpu->thread->process->mkdir(full, mode)
+                : cpu->thread->process->mkdirat((U32)a1, BString::copy(path), mode));
+            BString base;
+            if (!directoryBase64(cpu, nr == X64_SYS_mkdir ? (U64)(S64)K_AT_FDCWD : a1, path, base)) {
+                const BString resolved = Fs::getFullPath(base, BString::copy(path));
+                reportDataFile(cpu->thread->process.get(), "mkdir", 4,
+                    resolved.c_str(), (S64)ret, 0, mode);
+            }
             if (getenv("BW64_SYSTRACE")) {
                 klog_fmt("sys_mkdir64: '%s' full='%s' -> %d", path, full.c_str(),
                          (int)(S32)ret);

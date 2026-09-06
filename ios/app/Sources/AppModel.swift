@@ -670,7 +670,7 @@ final class AppModel: ObservableObject {
             // sys_execve64 now prints WINEDEBUG beside WINELOADER for every
             // exec in the chain, so the next capture says whether the value
             // below reached the process that was supposed to honour it.
-            "WINEDEBUG=warn+module,warn+seh,+winedevice,+mountmgr,+msgbox",
+            "WINEDEBUG=warn+module,warn+seh,warn+gdiplus,warn+wincodecs,+winedevice,+mountmgr,+msgbox",
             "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
             // DXMT's own logging. It is not wined3d, so no WINEDEBUG channel
             // reaches it: `+d3d11` and `+dxgi` name Wine's implementations,

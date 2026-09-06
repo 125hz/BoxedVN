@@ -1,6 +1,25 @@
 #include "boxedvn_test.h"
 #include "guest_wine_audio_registration.h"
 
+BOXEDVN_TEST(dxdiag_registration_preserves_overrides_and_uses_apartment) {
+    std::string text = "WINE REGISTRY Version 2\n#arch=win64\n";
+    CHECK(!boxedvn::registerWineDxDiagProvider(text, false, false));
+    CHECK(boxedvn::registerWineDxDiagProvider(text, false, true));
+    CHECK(text.find("Wow6432Node") != std::string::npos);
+    CHECK(text.find("syswow64\\\\dxdiagn.dll") != std::string::npos);
+    CHECK(text.find("system32") == std::string::npos);
+    CHECK(text.find("\"ThreadingModel\"=\"Apartment\"") != std::string::npos);
+    CHECK(boxedvn::registerWineDxDiagProvider(text, true, true));
+    auto saved = text;
+    CHECK(!boxedvn::registerWineDxDiagProvider(text, true, true));
+    CHECK_EQ(text, saved);
+    const auto path = text.find("syswow64\\\\dxdiagn.dll");
+    text.replace(path, std::string("syswow64\\\\dxdiagn.dll").size(), "custom\\\\provider.dll");
+    saved = text;
+    CHECK(!boxedvn::registerWineDxDiagProvider(text, true, true));
+    CHECK_EQ(text, saved);
+}
+
 BOXEDVN_TEST(audio_registration_repairs_only_packaged_architectures) {
     std::string text = "WINE REGISTRY Version 2\n#arch=win64\n";
     CHECK(!boxedvn::registerWineAudioEnumerator(text, false, false));

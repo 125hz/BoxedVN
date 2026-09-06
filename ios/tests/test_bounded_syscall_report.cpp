@@ -151,3 +151,20 @@ BOXEDVN_TEST(bounded_syscall_report_limits_are_small_enough_to_matter) {
     CHECK(BoundedSyscallReportLimiter::kTotalReports <= 1024);
     CHECK(BoundedSyscallReportLimiter::kSlots >= 8);
 }
+#include "guest_data_file_trace.h"
+
+BOXEDVN_TEST(data_file_trace_reserves_failure_budget_after_successful_reads) {
+    boxedvn::GuestDataFileTrace trace;
+    using Decision=boxedvn::BoundedSyscallReportLimiter::Decision;
+    CHECK(!boxedvn::guestDataPath("/mnt/drive_d/application/MODULE.DLL"));
+    CHECK(!boxedvn::guestDataPath("/usr/lib/libc.so"));
+    CHECK(boxedvn::guestDataPath("/home/user/.wine64/drive_c/users/user/AppData/Local/settings.sav"));
+    unsigned emitted=0;
+    for (unsigned i=0; i<10000; ++i) {
+        const auto path=std::string("/mnt/drive_d/application/data/")+std::to_string(i);
+        if (trace.record(path.c_str(),2,1024).decision!=Decision::Silent) ++emitted;
+    }
+    CHECK(emitted<=boxedvn::BoundedSyscallReportLimiter::kTotalReports);
+    CHECK(trace.record("/mnt/drive_d/application/savedata/file",0,-2).decision==Decision::Detailed);
+    CHECK(trace.record("/mnt/drive_d/application/savedata",3,4).decision==Decision::Detailed);
+}

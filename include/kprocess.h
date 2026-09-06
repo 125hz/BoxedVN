@@ -21,6 +21,7 @@
 
 #include "syscall_tail_ring.h"
 #include "dll_search_trace.h"
+#include "guest_data_file_trace.h"
 #include <unordered_set>
 #include <map>
 
@@ -413,6 +414,7 @@ public:
     // the archive -- is answered by a few dozen lines, and an unbounded
     // version of the same switch once wrote 468,768 of them.
     boxedvn::DllSearchTrace dllSearch;
+    boxedvn::GuestDataFileTrace dataFileTrace;
 #endif
     BString exe;
     BString name; // mainly used for logging

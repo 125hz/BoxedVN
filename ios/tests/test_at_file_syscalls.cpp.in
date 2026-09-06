@@ -1,0 +1,120 @@
+// Execute the shipping stat syscall against deterministic guest FS/FD backends.
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <string>
+using U64=uint64_t; using S64=int64_t; using U32=uint32_t; using S32=int32_t; using FD=int;
+constexpr int K_AT_FDCWD=-100, K_ENOSYS=38, K_EFAULT=14, K_ENOENT=2,
+    K_EBADF=9, K_ENOTDIR=20, K_EINVAL=22, K__S_IFLNK=0120000;
+struct BString : std::string {
+    using std::string::string;
+    BString()=default;
+    BString(const std::string& s):std::string(s) {}
+    static BString copy(const char* s) { return BString(s); }
+};
+#define B(x) BString(x)
+struct FsNode {
+    BString path, link;
+    U64 id=5, rdev=0, bytes=123;
+    U32 mode=0100644;
+    bool isDirectory() { return (mode & 0170000)==0040000; }
+    bool isLink() { return (mode & 0170000)==K__S_IFLNK; }
+    BString getLink() { return link; }
+    U64 length() { return bytes; }
+    U32 getMode() { return mode; }
+    U64 lastModified() { return 100000; }
+};
+struct Object { virtual ~Object()=default; };
+struct OpenFile { std::shared_ptr<FsNode> node; };
+struct KFile : Object { std::shared_ptr<OpenFile> openFile; };
+struct Descriptor { std::shared_ptr<Object> kobject; };
+struct Process {
+    int id=10;
+    BString currentDirectory="/working";
+    std::map<int,std::shared_ptr<Descriptor>> descriptors;
+    std::shared_ptr<Descriptor> getFileDescriptor(FD fd) {
+        const auto i=descriptors.find(fd);
+        return i==descriptors.end() ? nullptr : i->second;
+    }
+};
+struct Thread { std::shared_ptr<Process> process=std::make_shared<Process>(); };
+struct Memory {
+    char path[1024]{};
+    U64 size=0; U32 mode=0;
+    void memcpyFromGuest(void* out,U64,size_t n) { std::memcpy(out,path,n); }
+    unsigned char readb(U64) { return path[0]; }
+};
+struct CPU64 { Thread* thread; Memory* memory; };
+struct FsPathLookupOptions { bool followFinalSymlink=true; };
+struct FsPathResult { std::shared_ptr<FsNode> node; S32 error=0; };
+namespace Fs {
+std::map<std::string,std::shared_ptr<FsNode>> nodes;
+BString getFullPath(const BString& base,const BString& name) {
+    return name[0]=='/' ? name : BString(base+"/"+name);
+}
+FsPathResult resolvePath(const BString& base,const BString& name,FsPathLookupOptions options) {
+    const std::string full=name[0]=='/' ? std::string(name) : base+"/"+name;
+    const auto i=nodes.find(full);
+    if(i==nodes.end()) return {nullptr,-K_ENOENT};
+    auto n=i->second;
+    if(n->isLink() && options.followFinalSymlink) {
+        const auto target=nodes.find(n->link);
+        return target==nodes.end() ? FsPathResult{nullptr,-K_ENOENT} : FsPathResult{target->second,0};
+    }
+    return {n,0};
+}
+}
+static void klog_fmt(const char*,...) {}
+static void reportDllSearch(Process*,const char*,const char*,long long,const char*) {}
+static void reportDataFile(Process*,const char*,unsigned,const char*,S64,U64,U64) {}
+static void reportWineDebugStderrIdentity(Process*,const char*,int,U32,U64) {}
+static void writeStatBuf64(Memory* m,U64,U64 size,U32 mode,U64,U32,U32,U64,U64) {
+    m->size=size; m->mode=mode;
+}
+static U64 sys_fstat64(CPU64* cpu,U64 fd,U64) {
+    return cpu->thread->process->getFileDescriptor((int)fd) ? 0 : (U64)-K_EBADF;
+}
+
+@BOXEDVN_AT_SYSCALL_BODY@
+
+static void check(bool ok,const char* message) {
+    if(!ok) { std::fprintf(stderr,"FAIL: %s\n",message); std::exit(1); }
+}
+int main() {
+    Thread thread; Memory memory; CPU64 cpu{&thread,&memory};
+    auto add=[](const char* path,U32 mode,U64 size) {
+        auto n=std::make_shared<FsNode>(); n->path=path; n->mode=mode; n->bytes=size;
+        Fs::nodes[path]=n; return n;
+    };
+    auto directory=add("/data",0040755,0);
+    auto data=add("/data/item",0100644,456);
+    add("/working/item",0100644,789);
+    auto link=add("/data/link",0120777,0); link->link="/data/item";
+    auto fd=[&](int number,std::shared_ptr<FsNode> node) {
+        auto f=std::make_shared<KFile>(); f->openFile=std::make_shared<OpenFile>(); f->openFile->node=node;
+        auto d=std::make_shared<Descriptor>(); d->kobject=f; thread.process->descriptors[number]=d;
+    };
+    fd(7,directory); fd(8,data);
+    auto stat=[&](S64 dir,const char* path,U64 flags=0) -> S64 {
+        std::memset(memory.path,0,sizeof(memory.path)); std::strcpy(memory.path,path);
+        return (S64)sys_newfstatat64(&cpu,(U64)dir,1,2048,flags);
+    };
+    check(stat(7,"item")==0 && memory.size==456,"relative stat uses directory FD, not cwd");
+    check(stat(K_AT_FDCWD,"item")==0 && memory.size==789,"AT_FDCWD uses cwd");
+    check(stat(999,"/data/item")==0 && memory.size==456,"absolute ignores invalid dirfd");
+    check(stat(999,"item")==-K_EBADF,"invalid dirfd is EBADF");
+    check(stat(8,"item")==-K_ENOTDIR,"regular-file dirfd is ENOTDIR");
+    check(stat(7,"absent")==-K_ENOENT,"missing relative file is ENOENT");
+    check(stat(7,"link")==0 && memory.size==456,"stat follows terminal symlink");
+    check(stat(7,"link",K_AT_SYMLINK_NOFOLLOW)==0 && memory.size==10 &&
+          (memory.mode & 0170000)==K__S_IFLNK,"lstat reports link mode and target length");
+    check(stat(7,"item",0x800)==0,"AT_NO_AUTOMOUNT accepted");
+    check(stat(8,"",K_AT_EMPTY_PATH)==0,"empty path stats descriptor");
+    check(stat(8,"")==-K_ENOENT,"empty path requires flag");
+    check(stat(8,"",K_AT_EMPTY_PATH|0x4000)==-K_EINVAL,"unknown flags rejected even for empty path");
+    std::puts("directory-relative stat regression passed");
+}

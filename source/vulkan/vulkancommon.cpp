@@ -810,7 +810,7 @@ void callVulkan(CPU* cpu, U32 index) {
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point();
             if (index == QueuePresentKHR) {
-                BVNGuestFrameLimiterWait();
+                BVNGuestVulkanFrameLimiterWait();
             }
 #endif
             int9ACallback[index](cpu);

@@ -62,11 +62,9 @@
 // opt-in: a launch that does not ask for it never sees these files, so a
 // broken Vulkan path cannot regress the lane's current behaviour.
 #define K_X64_WINE_DXVK_PE32_DIR K_X64_WINE_MODULE_ROOT "/dxvk-i386"
-// The one module the WoW64 Direct3D 9 lane needs, and the ones that ride
-// along when the layer carries them. d3d9 is projected on its own by default
-// because Direct3D 11 already has a route (DXMT) and mixing the two renderers
-// in one prefix has never been tried.
-#define K_X64_DXVK_PE32_MODULE_NAMES {"d3d9.dll"}
+// DXMT supplies PE32+ modules for system32. It cannot serve PE32 applications.
+// Keep the complete DXVK D3D10/11 pair in syswow64, alongside its D3D9 module.
+#define K_X64_DXVK_PE32_MODULE_NAMES {"d3d9.dll", "d3d11.dll", "dxgi.dll", "d3d10core.dll"}
 // The launch environment variable that turns the projection on, read by
 // source/sdl/startupArgs.cpp and set by the iOS launcher for a 32-bit
 // program. "dxvk" is the only value that enables it; anything else, including
@@ -767,6 +765,17 @@ inline std::string wineDllOverridesWithDxvkD3d9(const std::string& existing) {
     }
     return existing + K_WINE_DLL_OVERRIDES_SEPARATOR +
            K_X64_WOW64_D3D9_NATIVE_OVERRIDE;
+}
+
+inline std::string wineDllOverridesWithDxvkPe32(const std::string& existing) {
+    std::string result = wineDllOverridesWithDxvkD3d9(existing);
+    for (const char* module : {"d3d11", "dxgi", "d3d10core"}) {
+        if (wineDllOverridesNameModule(result, module)) continue;
+        // A missing DXVK pair keeps Wine's builtin fallback. Explicit caller
+        // load orders, including the shared DXMT overrides, remain intact.
+        result += std::string(";") + module + "=n,b";
+    }
+    return result;
 }
 
 } // namespace boxedvn

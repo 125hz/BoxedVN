@@ -211,7 +211,7 @@ static void addGuestGlibcTunables(std::vector<BString>& envValues) {
 //
 // Only the last assignment is what the guest would see, so that is the one
 // this reads and the one it rewrites.
-static void mergeWow64DxvkD3d9Override(std::vector<BString>& envValues) {
+static void mergeWow64DxvkOverride(std::vector<BString>& envValues) {
     const BString prefix = B(K_WINE_DLL_OVERRIDES_NAME "=");
     BString existing;
     int replaceAt = -1;
@@ -222,9 +222,9 @@ static void mergeWow64DxvkD3d9Override(std::vector<BString>& envValues) {
         }
     }
     const std::string previous(existing.c_str());
-    const std::string merged = boxedvn::wineDllOverridesWithDxvkD3d9(previous);
+    const std::string merged = boxedvn::wineDllOverridesWithDxvkPe32(previous);
     const bool alreadyNamed =
-        replaceAt >= 0 && boxedvn::wineDllOverridesNameModule(previous, "d3d9");
+        previous == merged;
     const BString assignment = prefix + BString::copy(merged.c_str());
     if (replaceAt >= 0) {
         envValues[replaceAt] = assignment;
@@ -407,18 +407,16 @@ static void projectX64WinePe32Modules(const BString& winePrefix) {
 // The 32-bit DXVK override, projected over the syswow64 entry the i386
 // projection just made.
 //
-// A 32-bit Direct3D 9 program on this lane resolves d3d9.dll out of syswow64
-// and gets Wine's own, which is wined3d over OpenGL or Vulkan. A device run
-// showed both dlopens failing -- there is no OpenGL on iOS and the 64-bit
-// lane had no Vulkan client library at all -- and Direct3DCreate9 returning
-// E_FAIL into a message box. DXVK's d3d9 needs Vulkan only, and now that the
-// lane has a Vulkan ICD it is the renderer worth trying.
+// The Vulkan bridge now runs DXVK D3D9. Use the packaged D3D10/11 modules
+// for PE32 applications too: DXMT supplies only PE32+, and WineD3D's Vulkan
+// route currently reaches invalid zero-stage pipelines. Pair D3D11 and DXGI
+// from the same package; never overlay system32's 64-bit DXMT modules here.
 //
 // The files are staged apart, in K_X64_WINE_DXVK_PE32_DIR, and this runs only
 // when the launch set BOXEDVN_WOW64_D3D9=dxvk. Everything about the default
 // path is therefore unchanged: a runtime carrying DXVK and a launch that does
 // not ask for it behave identically to one that carries none.
-static void projectX64WineDxvkD3d9(const BString& winePrefix) {
+static void projectX64WineDxvkPe32(const BString& winePrefix) {
     const BString syswow64 = winePrefix + "/" K_GUEST_WINE_DRIVE_C "/" +
                              K_GUEST_WINE_WINDOWS "/syswow64";
     std::shared_ptr<FsNode> dxvkDirectory =
@@ -436,8 +434,14 @@ static void projectX64WineDxvkD3d9(const BString& winePrefix) {
         return;
     }
     const std::vector<std::string> modules = boxedvn::x64DxvkPe32ModuleNames();
+    bool hasD3d11Pair = true;
+    for (const char* name : {"d3d11.dll", "dxgi.dll", "d3d10core.dll"}) {
+        auto node = Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_DXVK_PE32_DIR) + "/" + name, true);
+        hasD3d11Pair &= node && !node->isDirectory();
+    }
     U32 projected = 0;
     for (const std::string& name : modules) {
+        if (name != "d3d9.dll" && !hasD3d11Pair) continue;
         const BString sourcePath =
             B(K_X64_WINE_DXVK_PE32_DIR) + "/" + name.c_str();
         std::shared_ptr<FsNode> source =
@@ -451,7 +455,7 @@ static void projectX64WineDxvkD3d9(const BString& winePrefix) {
         const bool replaced =
             Fs::getNodeFromLocalPath(B(""), overlay, false) != nullptr;
         // Destructive on purpose, unlike the i386 projection: the whole point
-        // is to replace Wine's d3d9 with DXVK's, and the entry already there
+        // is to replace Wine's PE32 renderer with DXVK's, and the entry already there
         // is the one that projection made a moment ago. FsNode::addChild sets
         // by name, so adding over it is the replacement.
         Fs::addFileNode(overlay, sourcePath, source->nativePath, false,
@@ -465,6 +469,8 @@ static void projectX64WineDxvkD3d9(const BString& winePrefix) {
     klog_fmt("BOXEDWINE_X64_MODULE_OVERLAY tree=dxvk-i386 status=projected "
              "destination=%s required=%u projected=%u",
              syswow64.c_str(), (U32)modules.size(), projected);
+    klog_fmt("BOXEDWINE_X64_D3D11_ROUTE pe32=%s pe64=dxmt",
+             hasD3d11Pair ? "dxvk" : "wine-builtin-missing-dxvk-pair");
 }
 
 // ---------------------------------------------------------------------------
@@ -583,13 +589,15 @@ static bool setGuestWineRegistryValue(std::string& contents,
 // that can. Set it, but only when the driver is actually packaged: forcing a
 // driver that is not there leaves the process with no audio backend at all
 // rather than falling back.
-static void configureX64AudioRegistration(const BString& winePrefix) {
+static void configureX64BuiltinRegistration(const BString& winePrefix) {
     const auto packaged = [](const char* path) {
         auto node = Fs::getNodeFromLocalPath(B(""), BString::copy(path), true);
         return node && !node->isDirectory();
     };
     const bool pe64 = packaged(K_X64_WINE_PE_DIR "/mmdevapi.dll");
     const bool pe32 = packaged(K_X64_WINE_PE32_DIR "/mmdevapi.dll");
+    const bool diag64 = packaged(K_X64_WINE_PE_DIR "/dxdiagn.dll");
+    const bool diag32 = packaged(K_X64_WINE_PE32_DIR "/dxdiagn.dll");
     auto node = Fs::getNodeFromLocalPath(B(""), winePrefix + "/system.reg", true);
     const char* status = "no-system-reg";
     if (node && !node->isDirectory() && !node->nativePath.isEmpty()) {
@@ -600,8 +608,13 @@ static void configureX64AudioRegistration(const BString& winePrefix) {
             const bool readable = !in.bad();
             in.close();
             status = readable ? "present" : "unreadable";
-            if (readable && boxedvn::registerWineAudioEnumerator(contents, pe64, pe32)) {
-                const BString temp = node->nativePath + ".boxedvn-audio";
+            bool changed = false;
+            if (readable) {
+                changed = boxedvn::registerWineAudioEnumerator(contents, pe64, pe32);
+                changed |= boxedvn::registerWineDxDiagProvider(contents, diag64, diag32);
+            }
+            if (changed) {
+                const BString temp = node->nativePath + ".boxedvn-com";
                 std::ofstream out(temp.c_str(), std::ios::binary | std::ios::trunc);
                 out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
                 out.close();
@@ -614,10 +627,12 @@ static void configureX64AudioRegistration(const BString& winePrefix) {
     }
     klog_fmt("BOXEDWINE_X64_AUDIO_COM status=%s pe64=%d pe32=%d prefix=%s",
              status, pe64 ? 1 : 0, pe32 ? 1 : 0, winePrefix.c_str());
+    klog_fmt("BOXEDWINE_X64_DXDIAG_COM status=%s pe64=%d pe32=%d prefix=%s",
+             status, diag64 ? 1 : 0, diag32 ? 1 : 0, winePrefix.c_str());
 }
 
 static void configureX64AudioDriver(const BString& winePrefix) {
-    configureX64AudioRegistration(winePrefix);
+    configureX64BuiltinRegistration(winePrefix);
     bool unixHalf = false;
     bool peHalf = false;
     const bool packaged = x64WineOssDriverPackaged(unixHalf, peHalf);
@@ -1928,14 +1943,14 @@ bool StartUpArgs::apply() {
         // environment the launched process starts with, because that is the
         // environment every descendant inherits.
         addGuestGlibcTunables(envValues);
-        // The 32-bit Direct3D 9 renderer, when the launch asked for DXVK's.
+        // The 32-bit Direct3D renderer, when the launch asked for DXVK's.
         // This has to run after projectX64WinePe32Modules, which is what puts
         // Wine's own d3d9 into syswow64 in the first place.
         if (guestWantsWow64Dxvk(envValues)) {
-            projectX64WineDxvkD3d9(winePrefix);
+            projectX64WineDxvkPe32(winePrefix);
             // Native, not builtin: the projected file is a real PE32 DXVK
             // image and Wine has to load it rather than fall back to its own.
-            mergeWow64DxvkD3d9Override(envValues);
+            mergeWow64DxvkOverride(envValues);
         }
         // Audio, after the module projections so the packaged-driver test sees
         // the tree the guest will actually search. See docs/PLAN_X64_AUDIO.md.

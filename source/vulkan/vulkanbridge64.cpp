@@ -97,6 +97,7 @@
 
 #ifdef BOXEDWINE_IOS
 #include "bvnhostpresent.h"
+#include "BVNFrameRate.h"
 #include <chrono>
 #endif
 #include <atomic>
@@ -5457,6 +5458,9 @@ U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count) {
             const bool timed = (index == VKB_QueuePresentKHR ||
                                 index == VKB_AcquireNextImageKHR ||
                                 index == VKB_WaitForPresentKHR);
+            if (index == VKB_QueuePresentKHR) {
+                BVNGuestVulkanFrameLimiterWait();
+            }
             const auto started = timed
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point();
