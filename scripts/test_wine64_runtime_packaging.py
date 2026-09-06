@@ -1106,6 +1106,26 @@ class Wow64ArchiveValidation(WineserverArchiveValidation):
     detached below, as they are for the other derived suites.
     """
 
+    def test_audio_repair_manifest_requires_both_architectures(self) -> None:
+        for case in ("complete", "missing-i386", "unknown-revision"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw:
+                directory = Path(raw)
+                glibc, wine, _ = self.build_archives(directory, elf(body=b"wineserver64 payload"))
+                for archive, prefix, machine in ((wine, PE_DIR, PE32PLUS_MACHINE),
+                                                  (self._pe32_archive, PE32_DIR, PE32_MACHINE)):
+                    with zipfile.ZipFile(archive) as z:
+                        names = set(z.namelist())
+                    audio = {prefix + f"/xaudio2_{v}.dll": pe(machine=machine) for v in range(10)}
+                    self.rewrite_wine_archive(archive, replace=audio,
+                        add={n: b for n, b in audio.items() if n not in names})
+                if case == "missing-i386":
+                    self.rewrite_wine_archive(self._pe32_archive, drop=PE32_DIR + "/xaudio2_8.dll")
+                revision = "bad" if case == "unknown-revision" else "c2ef8d3104401a79a7886062c4a5871db0b7b6f6"
+                code, output = self.run_validator(directory, glibc, wine,
+                    manifest_overrides={"faudio_callback_fix": revision})
+                self.assertEqual(code == 0, case == "complete", output)
+                self.assertNotIn("Unsupported Wine64 manifest key", output)
+
     def test_a_complete_wow64_layer_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)

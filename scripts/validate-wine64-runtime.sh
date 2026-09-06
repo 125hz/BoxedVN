@@ -146,6 +146,7 @@ MANIFEST_WOW64CPU_DLL_SHA256=""
 # modules rode along in the PE32 layer.
 MANIFEST_VULKAN_SHIM_SHA256=""
 MANIFEST_DXVK_I386_MODULES=""
+MANIFEST_FAUDIO_CALLBACK_FIX=""
 if [[ -n "${MANIFEST}" ]]; then
     require_file "${MANIFEST}" \
         "Copy scripts/wine64-runtime-manifest.example and fill in both layer SHA-256 values."
@@ -170,6 +171,7 @@ if [[ -n "${MANIFEST}" ]]; then
             x11_shim_libx11_sha256) MANIFEST_X11_SHIM_LIBX11_SHA256="${value}" ;;
             vulkan_shim_sha256) MANIFEST_VULKAN_SHIM_SHA256="${value}" ;;
             dxvk_i386_modules) MANIFEST_DXVK_I386_MODULES="${value}" ;;
+            faudio_callback_fix) MANIFEST_FAUDIO_CALLBACK_FIX="${value}" ;;
             # How many side-by-side manifests each architecture registered.
             # Recorded rather than gated on here: the archive checks below
             # name the assembly that has to be present, which a count cannot.
@@ -644,6 +646,15 @@ if zip_has "${WINE_ARCHIVE}" "${PE32_DIR}"; then
     die "'$(basename "${WINE_ARCHIVE}")' carries an i386-windows tree; the 32-bit builtins belong in wine64-pe32.zip until the app mounts them."
 fi
 check_zip_path "${PE32_ARCHIVE}" "${PE32_DIR}"
+if [[ -n "${MANIFEST_FAUDIO_CALLBACK_FIX}" ]]; then
+    [[ "${MANIFEST_FAUDIO_CALLBACK_FIX}" == c2ef8d3104401a79a7886062c4a5871db0b7b6f6 ]] \
+        || die "Unsupported FAudio callback repair revision."
+    for audio_version in {0..9}; do
+        check_zip_entry_pe32plus_amd64 "${WINE_ARCHIVE}" "${WINE_MODULE_ROOT}/x86_64-windows/xaudio2_${audio_version}.dll"
+        check_zip_entry_pe32_i386 "${PE32_ARCHIVE}" "${PE32_DIR}/xaudio2_${audio_version}.dll"
+    done
+    ok "FAudio callback repair modules present in both guest architectures"
+fi
 # The whole import chain a 32-bit Windows program walks before its own entry
 # point runs, taken from a device run of a 32-bit Direct3D 9 probe. The run
 # resolved all of these but zlib1.dll, which 32-bit wined3d imports and which
@@ -866,6 +877,9 @@ if [[ -n "${RECORD_MANIFEST}" ]]; then
                     "${WINE_MODULE_ROOT}/x86_64-windows/${recorded_wow64}.dll")"
         done
     } > "${RECORD_MANIFEST}"
+    if [[ -n "${MANIFEST_FAUDIO_CALLBACK_FIX}" ]]; then
+        printf 'faudio_callback_fix=%s\n' "${MANIFEST_FAUDIO_CALLBACK_FIX}" >> "${RECORD_MANIFEST}"
+    fi
     ok "recorded manifest: ${RECORD_MANIFEST}"
 fi
 
