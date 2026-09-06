@@ -160,3 +160,15 @@ if(UNIX)
     add_test(NAME boxedvn_dependency_pins
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test-pins.sh")
 endif()
+
+# Exercise production precision conversions against the actual SoftFloat library.
+add_library(boxedvn_precision_softfloat STATIC ${BOXEDWINE_SOFTFLOAT})
+target_include_directories(boxedvn_precision_softfloat PRIVATE ${BOXEDWINE_SOFTFLOAT_INCLUDE_DIRS})
+add_executable(boxedvn_x87_precision_test test_fex_x87_precision.cpp)
+target_include_directories(boxedvn_x87_precision_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+target_link_libraries(boxedvn_x87_precision_test PRIVATE boxedvn_precision_softfloat)
+if(MSVC)
+    target_compile_definitions(boxedvn_precision_softfloat PRIVATE BOXEDWINE_MSVC)
+    target_compile_definitions(boxedvn_x87_precision_test PRIVATE BOXEDWINE_MSVC)
+endif()
+add_test(NAME boxedvn_x87_precision COMMAND boxedvn_x87_precision_test)

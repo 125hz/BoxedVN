@@ -1048,6 +1048,8 @@ bool preparePool() {
 std::once_flag gFEXGlobalsOnce;
 bool gFEXGlobalsReady = false;
 
+bool gReducedX87Precision = false;
+
 bool initializeFEXGlobals() {
     if (!preparePool()) return false;
     std::call_once(gFEXGlobalsOnce, [] {
@@ -1067,6 +1069,12 @@ bool initializeFEXGlobals() {
         LogMan::Throw::InstallHandler(fexThrow);
         FEXCore::Config::Initialize();
         FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE, "1");
+        gReducedX87Precision = [NSUserDefaults.standardUserDefaults
+            boolForKey:@"BoxedVN.fex64.reducedX87Precision"];
+        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_X87REDUCEDPRECISION,
+                            gReducedX87Precision ? "1" : "0");
+        reportf("BOXEDWINE_FEX64_X87 precision=%s",
+                gReducedX87Precision ? "64-fast" : "80-full");
         // The bundled ELF loader exercises dense, cyclic control flow before
         // Wine reaches its first process boundary.  Keep each compiled unit to
         // one basic block while the BoxedWine backend is being brought up.  It
@@ -1907,6 +1915,8 @@ extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address) {
 extern "C" uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t address) {
     return gCodeSegments.writable(static_cast<uintptr_t>(address));
 }
+
+extern "C" bool BVNFEXBackendReducedX87Precision(void) { return gReducedX87Precision; }
 
 extern "C" bool BVNFEXBackendBuilt(void) { return true; }
 

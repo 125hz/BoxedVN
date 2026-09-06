@@ -132,6 +132,15 @@ extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
     }
 }
 
+// Relative deltas bypass absolute cursor clamping. X11 raw-motion clients
+// receive the delta; legacy clients receive a point around the screen center.
+extern "C" void BVNGuestControlsSendRelativePointer(int dx, int dy) {
+    if (!gIOSActiveScreen || (!dx && !dy)) return;
+    if (!gIOSActiveScreen->input->mouseMoveGuest(dx, dy, true)) {
+        onMouseMove(dx, dy, true);
+    }
+}
+
 // A right click, from the overlay's two-finger tap. The coordinates are guest
 // pixels for the same reason as BVNGuestControlsSendPointer above.
 //

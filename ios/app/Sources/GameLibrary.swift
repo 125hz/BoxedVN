@@ -16,7 +16,7 @@ import Foundation
 struct Game: Identifiable, Hashable {
     var id: String
     var title: String
-    var directory: URL          // <Documents>/Games/<id>
+    var directory: URL          // <Documents>/Shortcuts/<id>
     var contentDirectory: URL   // <directory>/content
     var manifestURL: URL        // <directory>/manifest.json
     var selectedExecutable: String
@@ -117,7 +117,7 @@ enum GameLibraryError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noGamesDirectory:
-            return "BoxedVN could not create its Games directory in Documents."
+            return "BoxedVN could not create its Shortcuts directory in Documents."
         case .noWinePrefixDirectory:
             return "BoxedVN could not create its Wine prefix directory."
         case .importFailed(let detail):
@@ -129,14 +129,17 @@ enum GameLibraryError: LocalizedError {
 }
 
 enum GameLibrary {
-    /// Reads every manifest under <Documents>/Games.  A manifest that cannot
+    /// Reads every manifest under <Documents>/Shortcuts.  A manifest that cannot
     /// be read is skipped and the reason is logged, rather than silently
     /// dropping the game.
     static func load() -> [Game] {
         guard let gamesRoot = Storage.games else { return [] }
 
-        let entries = (try? FileManager.default.contentsOfDirectory(
-            at: gamesRoot, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        let roots = [gamesRoot, gamesRoot.appendingPathComponent("Previous shortcuts")]
+        let entries = roots.flatMap { root in
+            (try? FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        }
 
         var games: [Game] = []
         for entry in entries {

@@ -600,6 +600,8 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
     const bool diag32 = packaged(K_X64_WINE_PE32_DIR "/dxdiagn.dll");
     const bool shell64 = packaged(K_X64_WINE_PE_DIR "/shell32.dll");
     const bool shell32 = packaged(K_X64_WINE_PE32_DIR "/shell32.dll");
+    const bool media64 = packaged(K_X64_WINE_PE_DIR "/devenum.dll");
+    const bool media32 = packaged(K_X64_WINE_PE32_DIR "/devenum.dll");
     const bool wbem64 = packaged(K_X64_WINE_PE_DIR "/wbemprox.dll");
     const bool wbem32 = packaged(K_X64_WINE_PE32_DIR "/wbemprox.dll");
     auto node = Fs::getNodeFromLocalPath(B(""), winePrefix + "/system.reg", true);
@@ -618,6 +620,7 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
                 changed |= boxedvn::registerWineDxDiagProvider(contents, diag64, diag32);
                 changed |= boxedvn::registerWineDocumentsFolder(contents, shell64, shell32);
                 changed |= boxedvn::registerWineWbemLocator(contents, wbem64, wbem32);
+                changed |= boxedvn::registerWineMediaDeviceEnumerator(contents, media64, media32);
             }
             if (changed) {
                 const BString temp = node->nativePath + ".boxedvn-com";

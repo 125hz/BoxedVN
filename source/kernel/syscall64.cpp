@@ -1311,7 +1311,16 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
 
 static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64 fd, U64 offset) {
     if (!(flags & K_MAP_ANONYMOUS)) {
-        return sys_mmap64_file(cpu, addr, length, prot, flags, fd, offset);
+        const U64 result = sys_mmap64_file(cpu, addr, length, prot, flags, fd, offset);
+        if (cpu->thread && cpu->thread->process) {
+            auto descriptor = cpu->thread->process->getFileDescriptor((FD)fd);
+            auto file = descriptor ? std::dynamic_pointer_cast<KFile>(descriptor->kobject) : nullptr;
+            if (file && file->openFile && file->openFile->node) {
+                reportDataFile(cpu->thread->process.get(), "mmap", 8,
+                    file->openFile->node->path.c_str(), (S64)result, offset, length);
+            }
+        }
+        return result;
     }
     if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
         klog_fmt("MMAP [pid=%d] BIG anon enter addr=0x%llx len=0x%llx prot=0x%x",
@@ -5055,6 +5064,9 @@ void ksyscall64(CPU64* cpu) {
     // SYSTRACE masks). Useful to see exactly which syscall precedes a process's
     // exit_group(1).
     {
+        // Host diagnostic environment is fixed for this app process. Avoid
+        // libc getenv's lock and scan on every clock/yield/graphics syscall.
+        static const bool traceAll = getenv("BW64_SYSTRACE") != nullptr;
         static const char* tracePidEnv = getenv("BW64_TRACEPID");
         static int tracePid = tracePidEnv ? atoi(tracePidEnv) : -1;
         // BW64_TRACE_EXE=<substr> traces every process whose commandLine contains
@@ -5068,7 +5080,7 @@ void ksyscall64(CPU64* cpu) {
             cpu->thread->process->commandLine.contains(traceExe)) {
             exeMatch = true;
         }
-        if (getenv("BW64_SYSTRACE") || (tracePid >= 0 && myPid == tracePid) || exeMatch) {
+        if (traceAll || (tracePid >= 0 && myPid == tracePid) || exeMatch) {
             klog_fmt("SYS64 [pid=%d] #%llu %s (a1=0x%llx a2=0x%llx a3=0x%llx)",
                      myPid, (unsigned long long)nr, x64SyscallName(nr),
                      (unsigned long long)a1, (unsigned long long)a2,

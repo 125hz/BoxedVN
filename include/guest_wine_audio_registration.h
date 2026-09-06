@@ -125,4 +125,25 @@ inline bool registerWineWbemLocator(std::string& contents, bool pe64, bool pe32)
     return changed;
 }
 
+// Wine 9 devenum_classes.idl: device enumeration and device monikers.
+inline bool registerWineMediaDeviceEnumerator(std::string& contents, bool pe64, bool pe32) {
+    bool changed = false;
+    for (int bits : {64, 32}) {
+        if (!(bits == 64 ? pe64 : pe32)) continue;
+        for (const char* clsid : {"62be5d10-60eb-11d0-bd3b-00a0c911ce86",
+                                  "4315d437-5b8c-11d0-bd3b-00a0c911ce86"}) {
+            const std::string key = std::string("Software\\\\Classes\\\\") +
+                (bits == 32 ? "Wow6432Node\\\\" : "") + "CLSID\\\\{" + clsid +
+                "}\\\\InprocServer32";
+            const bool added = insertMissingWineRegistryValue(contents, key, "@",
+                bits == 64 ? "\"C:\\\\windows\\\\system32\\\\devenum.dll\"" :
+                             "\"C:\\\\windows\\\\syswow64\\\\devenum.dll\"");
+            if (added) insertMissingWineRegistryValue(contents, key,
+                "\"ThreadingModel\"", "\"Both\"");
+            changed |= added;
+        }
+    }
+    return changed;
+}
+
 }

@@ -1134,14 +1134,21 @@ int XServer::unmapWindow(const DisplayDataPtr& data, const XWindowPtr& window) {
 	return result;
 }
 
-void XServer::mouseMove(S32 x, S32 y, bool relative) {	
+void XServer::mouseMove(S32 x, S32 y, bool relative) {
+    const S32 deltaX = x, deltaY = y;
+    if (relative) {
+        auto input = KNativeSystem::getCurrentInput();
+        x += input->screenWidth() / 2;
+        y += input->screenHeight() / 2;
+    }
+
 	if (isGrabbed) {
 		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(grabbedMutex);
 		XWindowPtr grabbed = getWindow(grabbedId);
 		DisplayDataPtr grabbedDisplay = getDisplayDataById(grabbedDisplayId);
 
 		if (grabbed && grabbedDisplay) {
-			if ((grabbedDisplay->getInput2Mask(root->id) & XI_RawMotionMask) && KSystem::forceRelativeMouse) {
+			if ((grabbedDisplay->getInput2Mask(root->id) & XI_RawMotionMask) && (relative || KSystem::forceRelativeMouse)) {
 				KNativeInputPtr input = KNativeSystem::getCurrentInput();
 				S32 midX = input->screenWidth() / 2;
 				S32 midY = input->screenHeight() / 2;
@@ -1149,7 +1156,7 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 				y = y - midY;
 				KNativeSystem::warpMouse(midX, midY);
 				// :TODO: I'm not really sure how realitive mouse is supposed to work, it was just trial and error with vkQuake
-				grabbed->input2Notify(grabbedDisplay, x, y, XI_RawMotion);
+				grabbed->input2Notify(grabbedDisplay, relative ? deltaX : x, relative ? deltaY : y, XI_RawMotion);
 				return;
 			}
 			if (!(grabbedMask & PointerMotionMask)) {

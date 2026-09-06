@@ -50,6 +50,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include "guest_segment_table.h"
 #include "fex64loaderhandoff.h"
 #include "fex_callret_guard.h"
+#include "fex_x87_precision.h"
 #include "kmemory64.h"
 #include "kprocess.h"
 #include "ksignal.h"   // K_SIGSEGV / K_SEGV_* / K_BUS_ADRALN
@@ -75,6 +76,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #endif
 
 extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address);
+extern "C" bool BVNFEXBackendReducedX87Precision(void);
 
 struct BVNFEXCPU64Adapter {
     KProcess* process = nullptr;
@@ -107,11 +109,11 @@ static void syncFPUFromFEX(CPU64* cpu, const FEXCore::Core::CPUState& state) {
 
     for (uint32_t stackIndex = 0; stackIndex < 8; ++stackIndex) {
         const uint32_t physical = stackIndex;
-        cpu->fpu.regs[physical].signif = state.mm[physical][0];
-        cpu->fpu.regs[physical].signExp =
-            static_cast<uint16_t>(state.mm[physical][1]);
-        cpu->fpu.tags[physical] = boxedvn::guestX87Tag(state.mm[physical][0],
-            static_cast<uint16_t>(state.mm[physical][1]),
+        cpu->fpu.regs[physical] = boxedvn::fexX87ToExtended(
+            state.mm[physical][0], static_cast<uint16_t>(state.mm[physical][1]),
+            BVNFEXBackendReducedX87Precision());
+        cpu->fpu.tags[physical] = boxedvn::guestX87Tag(cpu->fpu.regs[physical].signif,
+            cpu->fpu.regs[physical].signExp,
             (state.AbridgedFTW & (1u << physical)) != 0);
         cpu->fpu.isRegCached[physical] = false;
     }
@@ -137,8 +139,10 @@ static void syncFEXFromFPU(FEXCore::Core::CPUState& state, CPU64* cpu) {
     for (uint32_t stackIndex = 0; stackIndex < 8; ++stackIndex) {
         const uint32_t physical = stackIndex;
         const auto& value = cpu->fpu.getReg(physical);
-        state.mm[physical][0] = value.signif;
-        state.mm[physical][1] = value.signExp;
+        const auto stored = boxedvn::fexX87FromExtended(value,
+            BVNFEXBackendReducedX87Precision(), state.FCW);
+        state.mm[physical][0] = stored[0];
+        state.mm[physical][1] = stored[1];
         if (cpu->fpu.tags[physical] != TAG_Empty)
             state.AbridgedFTW |= static_cast<uint8_t>(1u << stackIndex);
     }
@@ -1690,6 +1694,15 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      static_cast<unsigned>(frame->State.cs_idx),
                      static_cast<unsigned>(frame->State.ss_idx),
                      faultDecodeWidth, hex);
+            klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_HOST instruction=0x%08x "
+                     "x25=0x%llx predictor_base=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx",
+                     inOwnedFexCode ? *reinterpret_cast<const uint32_t*>(hostPC) : 0,
+                     (unsigned long long)machine->__ss.__x[25],
+                     (unsigned long long)adapter->fexThread->CallRetStackBase,
+                     (unsigned long long)machine->__ss.__x[0],
+                     (unsigned long long)machine->__ss.__x[1],
+                     (unsigned long long)machine->__ss.__x[2],
+                     (unsigned long long)machine->__ss.__x[3]);
             // A fault whose address, taken back through the alias, lands
             // inside FEX's own CPU state is not a guest fault at all: it is
             // translated code dereferencing a HOST context address as if it

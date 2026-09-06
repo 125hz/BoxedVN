@@ -17,7 +17,7 @@
  *      prefixes/<id>/   one Wine prefix per game
  *
  *  Documents            (visible in Files, included in backup)
- *      Games/<id>/      imported game content and its manifest
+ *      Shortcuts/<id>/      imported game content and its manifest
  *      Logs/            session logs, exportable through the share sheet
  *      Fonts/           font files the user supplies, copied into every
  *                       prefix at launch
@@ -169,7 +169,24 @@ extern "C" const char* BVNPathWinePrefixes(void) {
 }
 
 extern "C" const char* BVNPathGames(void) {
-    return cachedSubdirectory(gGames, NSDocumentDirectory, @"Games",
+    if (!gGames.resolved) {
+        NSString* documents = firstDirectory(NSDocumentDirectory);
+        NSString* oldPath = [documents stringByAppendingPathComponent:@"Games"];
+        NSString* newPath = [documents stringByAppendingPathComponent:@"Shortcuts"];
+        NSFileManager* files = NSFileManager.defaultManager;
+        if (documents && [files fileExistsAtPath:oldPath]) {
+            if ([files fileExistsAtPath:newPath]) {
+                newPath = [newPath stringByAppendingPathComponent:@"Previous shortcuts"];
+            }
+            NSError* error = nil;
+            if (![files moveItemAtPath:oldPath toPath:newPath error:&error]) {
+                BVNLogWrite(BVNLogLevelWarning, "paths", error.localizedDescription.UTF8String);
+                // Keep existing shortcuts accessible if migration cannot finish.
+                return cachedSubdirectory(gGames, NSDocumentDirectory, @"Games", false);
+            }
+        }
+    }
+    return cachedSubdirectory(gGames, NSDocumentDirectory, @"Shortcuts",
                               /*excludeFromBackup=*/false);
 }
 

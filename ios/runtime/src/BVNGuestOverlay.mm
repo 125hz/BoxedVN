@@ -69,6 +69,8 @@ typedef NS_ENUM(NSInteger, BVNOverlayKeyKind) {
     BVNOverlayKeyKindHide = 2,
 };
 
+extern "C" void BVNGuestControlsSendRelativePointer(int dx, int dy);
+
 @interface BVNOverlayKey : NSObject
 @property (nonatomic, copy) NSString* label;
 @property (nonatomic, copy) NSString* scancodeName;
@@ -290,6 +292,7 @@ static NSString* const kBVNPerformanceBatteryKey =
 // Called from the live-view control bar's pointer toggle (extern C below).
 - (void)setPointerMode:(NSInteger)mode;
 
+@property(nonatomic) CGPoint pendingRelativeMotion;
 @property (nonatomic, strong) UIButton* menuButton;
 @property (nonatomic, strong) UIView* scrim;
 @property (nonatomic, strong) UIView* menuPanel;
@@ -1776,8 +1779,17 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     [self.pointerMotionTimer invalidate];
     self.pointerMotionTimer = nil;
     self.lastPointerMotionTime = CACurrentMediaTime();
-    BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
-                                (int)lround(self.cursorGuestPoint.y), 0);
+    if (self.trackpadMode && [NSUserDefaults.standardUserDefaults boolForKey:@"BoxedVN.pointer.centerLock"]) {
+        const int dx = (int)lround(self.pendingRelativeMotion.x);
+        const int dy = (int)lround(self.pendingRelativeMotion.y);
+        self.pendingRelativeMotion = CGPointMake(self.pendingRelativeMotion.x - dx,
+                                                self.pendingRelativeMotion.y - dy);
+        BVNGuestControlsSendRelativePointer(dx, dy);
+    } else {
+        self.pendingRelativeMotion = CGPointZero;
+        BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
+                                    (int)lround(self.cursorGuestPoint.y), 0);
+    }
 }
 
 - (void)queuePointerMotion {
@@ -1940,8 +1952,14 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     // One scale, both axes: dx and dy are multiplied by the identical factor,
     // which is what keeps the cursor's motion 1:1 in aspect with the finger's.
     const CGFloat sensitivity = BVNPointerSensitivity();
-    [self moveCursorBy:CGPointMake(dx * sensitivity,
-                                   dy * sensitivity)];
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"BoxedVN.pointer.centerLock"]) {
+        self.pendingRelativeMotion = CGPointMake(self.pendingRelativeMotion.x + dx * sensitivity,
+                                                self.pendingRelativeMotion.y + dy * sensitivity);
+        self.cursorGuestPoint = CGPointMake(guestWidth / 2, guestHeight / 2);
+        [self positionCursor];
+    } else {
+        [self moveCursorBy:CGPointMake(dx * sensitivity, dy * sensitivity)];
+    }
     [self queuePointerMotion];
     if (self.trackpadButtonHeld) {
         self.trackpadButtonGuestPoint = self.cursorGuestPoint;
@@ -2432,8 +2450,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                  self.pointerSettingsItem, self.displayItem,
                                  self.frameRateItem,
                                  self.performanceItem,
-                                 self.performanceSettingsItem,
-                                 self.quitItem]) {
+                                 self.performanceSettingsItem]) {
             item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
                                     kBVNMenuRowHeight);
             cursor += kBVNMenuRowHeight;
@@ -2844,7 +2861,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.frameRateItem.hidden = confirming;
     self.performanceItem.hidden = confirming;
     self.performanceSettingsItem.hidden = confirming;
-    self.quitItem.hidden = confirming;
+    self.quitItem.hidden = YES;
     self.quitPrompt.hidden = !confirming;
     self.quitCancelItem.hidden = !confirming;
     self.quitConfirmItem.hidden = !confirming;

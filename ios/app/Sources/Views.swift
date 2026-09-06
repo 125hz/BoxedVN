@@ -223,7 +223,7 @@ struct LibraryView: View {
 
             Section {
                 if model.games.isEmpty {
-                    Text("No games imported yet.")
+                    Text("No shortcuts created yet")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(model.games, id: \.id) { game in
@@ -248,7 +248,7 @@ struct LibraryView: View {
                     }
                 }
             } header: {
-                Text("Games")
+                Text("Shortcuts")
             } footer: {
                 if model.isImporting {
                     HStack {
@@ -267,11 +267,7 @@ struct LibraryView: View {
             Section {
                 NavigationLink("Settings") { SettingsView() }
                 NavigationLink("Logs") { LogView() }
-                if model.runtimeState == .running {
-                    Button("Quit running session", role: .destructive) {
-                        model.requestShutdown()
-                    }
-                }
+
             }
         }
         .alert("New container", isPresented: $showingContainerPrompt) {
@@ -374,10 +370,22 @@ struct GuestLiveLog: View {
     private let tick = Timer.publish(every: 0.5, on: .main, in: .common)
         .autoconnect()
 
+    private func logColor(_ line: String) -> Color {
+        let text = line.lowercased()
+        if text.contains("[error") || text.contains(":err:") ||
+            text.contains("guest_fault") || text.contains("fatal") { return .red }
+        if text.contains("[warn") || text.contains(":warn:") { return .orange }
+        if text.contains(":fixme:") { return .yellow }
+        if text.contains("[debug") || text.contains(":trace:") { return .cyan }
+        return .secondary
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                Text(line).lineLimit(1)
+                Text(line)
+                    .foregroundStyle(logColor(line))
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .font(.system(size: 11, design: .monospaced))
@@ -398,7 +406,7 @@ struct GuestLiveLog: View {
                     }
                     return line
                 }
-            lines = Array(all.suffix(4))
+            lines = Array(all.suffix(3)).map { String($0.prefix(900)) }
         }
     }
 }
@@ -417,10 +425,6 @@ struct GuestControlBar: View {
     /// session. Only the page's own hierarchy updates reliably, so that is
     /// where these controls live.
     @Binding var showingPointerSettings: Bool
-    /// Stopping is the page's business, not just the runtime's: the page has
-    /// to leave the running state at once, because the poll that publishes the
-    /// runtime state cannot run while the guest still owns the main thread.
-    let onStop: () -> Void
     @State private var pointerMode = Int(BVNGuestControlsPointerMode())
 
     private var running: Bool { active }
@@ -436,7 +440,7 @@ struct GuestControlBar: View {
             keyControl("space", "Space", key: "Space")
             keyControl(nil, "esc", key: "Escape")
             keyControl(nil, "tab", key: "Tab")
-            control("stop.circle", "Stop", tint: .red) { onStop() }
+
         }
         .frame(maxWidth: .infinity)
         .disabled(!running)
@@ -501,6 +505,7 @@ struct GuestControlBar: View {
 struct GuestPointerSettingsPanel: View {
     let onDone: () -> Void
     @State private var settings = BVNGuestPointerSettingsGet()
+    @AppStorage("BoxedVN.pointer.centerLock") private var centerLock = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -512,6 +517,9 @@ struct GuestPointerSettingsPanel: View {
                     .font(.subheadline.weight(.semibold))
                     .buttonStyle(.borderless)
             }
+            Toggle("Lock mouse to center", isOn: $centerLock)
+            Text("Use Wine cursor mode for continuous drag-to-look. Turn this off to select menus.")
+                .font(.caption).foregroundStyle(.secondary)
             slider("Size", field(\.size), 12...64,
                    String(format: "%.0f pt", settings.size))
             slider("Thickness", field(\.thickness), 0.5...6,
@@ -589,7 +597,9 @@ struct GuestLiveView: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: GuestLiveHostView, context: Context) {}
+    func updateUIView(_ uiView: GuestLiveHostView, context: Context) {
+        BVNGuestPresentationSetHostView(Unmanaged.passUnretained(uiView).toOpaque())
+    }
 
     static func dismantleUIView(_ uiView: GuestLiveHostView, coordinator: ()) {
         BVNGuestPresentationSetHostView(nil)
@@ -704,16 +714,8 @@ struct ContainerDetailView: View {
                 .background(Color.black)
                 .listRowInsets(EdgeInsets())
                 GuestControlBar(active: launched,
-                                showingPointerSettings: $showingPointerSettings,
-                                onStop: {
-                    // The page returns to its idle state on the tap. The guest
-                    // can take seconds to unwind on the main thread, and the
-                    // runtime-state poll is stuck behind it, so waiting for
-                    // the state to change left the whole page looking frozen.
-                    launched = false
-                    showingPointerSettings = false
-                    model.requestShutdown()
-                })
+                                showingPointerSettings: $showingPointerSettings)
+
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 6, leading: 4, bottom: 6, trailing: 4))
                 if showingPointerSettings {
@@ -1505,16 +1507,33 @@ struct SettingsView: View {
     private var orientationLock = true
     @AppStorage("BoxedVN.fex64.strictMemoryOrdering")
     private var strictMemoryOrdering = false
+    @AppStorage("BoxedVN.fex64.reducedX87Precision")
+    private var reducedX87Precision = false
     @AppStorage(Preferences.verboseWineTraceKey)
     private var verboseWineTrace = false
     @AppStorage(Preferences.soundEnabledKey)
     private var soundEnabled = true
     @AppStorage("BoxedVN.presentation.fillCropPercent")
     private var fillCropPercent = 5.0
+    @AppStorage("BoxedVN.joystick.arrowKeys") private var joystickArrowKeys = false
     @State private var showingRootFilesystemImporter = false
 
     var body: some View {
         List {
+            Section("Controls") {
+                Picker("Joystick keys", selection: $joystickArrowKeys) {
+                    Text("WASD").tag(false)
+                    Text("Arrow keys").tag(true)
+                }
+            }
+
+            Section {
+                Toggle("Fast x87 math (experimental)", isOn: $reducedX87Precision)
+            } footer: {
+                Text("Uses 64-bit floating point instead of full x87 precision. "
+                     + "Can speed up older CPU-heavy programs, but may change results or compatibility. "
+                     + "Restart BoxedVN after changing this setting.")
+            }
             Section {
                 Toggle("Strict memory ordering", isOn: $strictMemoryOrdering)
             } footer: {
@@ -1602,7 +1621,7 @@ struct SettingsView: View {
 
             Section {
                 if let games = Storage.games {
-                    LabeledContent("Games", value: games.path)
+                    LabeledContent("Shortcuts", value: games.path)
                         .font(.caption)
                 }
                 if let prefixes = Storage.winePrefixes {

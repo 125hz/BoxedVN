@@ -9,6 +9,8 @@ inline bool guestDataPath(const char* path) {
     if (!path) return false;
     if (!std::strstr(path, "/mnt/") && !std::strstr(path, "/drive_c/users/") &&
         !std::strstr(path, "/dosdevices/")) return false;
+    // Managed assemblies are data mappings to Mono, not native loader DLLs.
+    if (std::strstr(path, "/Managed/")) return true;
     // Loader traffic must not consume the data/save budget.
     const char* extension = std::strrchr(path, '.');
     if (extension) {

@@ -173,7 +173,9 @@ static BOOL BVNOrientationMatchesPreference(UIInterfaceOrientation orientation) 
 static NSMutableDictionary<NSValue*, UIView*>* gGuestVulkanSurfaceViews = nil;
 // The live view host (see BVNGuestPresentationSetHostView below). Declared
 // here because the class methods above the setter consult it.
-static __weak UIView* gGuestPresentationHost = nil;
+// Keep the embedded host while SwiftUI recycles an offscreen List row.
+// It is replaced by the next host and released after a detached session ends.
+static UIView* gGuestPresentationHost = nil;
 static __weak UIView* gActivePresentationHost = nil;
 static UIView* gFullscreenPresentationHost = nil;
 extern std::atomic<bool> gLiveKeyboardVisible;
@@ -1132,6 +1134,11 @@ extern "C" void BVNGuestPresentationSetHostView(void* pointer) {
         return;
     }
     UIView* host = (__bridge UIView*)pointer;
+    if (host == nil && (BVNRuntimeGetState() == BVNRuntimeStateRunning ||
+                        BVNRuntimeGetState() == BVNRuntimeStateStarting ||
+                        BVNRuntimeGetState() == BVNRuntimeStateStopping)) return;
+    if (host != nil && host == gGuestPresentationHost &&
+        (gAppDelegate.liveViewFullscreen || gActivePresentationHost == host)) return;
     gGuestPresentationHost = host;
     if (host != nil) {
         if (!gAppDelegate.liveViewFullscreen) {

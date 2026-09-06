@@ -83,3 +83,18 @@ BOXEDVN_TEST(wbem_registration_is_architecture_scoped_and_preserves_existing_val
     CHECK(!boxedvn::registerWineWbemLocator(text, true, true));
     CHECK_EQ(text, saved);
 }
+
+BOXEDVN_TEST(media_device_registration_is_architecture_scoped_and_preserves_existing_values) {
+    std::string text = "WINE REGISTRY Version 2\n";
+    CHECK(!boxedvn::registerWineMediaDeviceEnumerator(text, false, false));
+    CHECK(boxedvn::registerWineMediaDeviceEnumerator(text, true, false));
+    CHECK(text.find("Wow6432Node") == std::string::npos);
+    CHECK(text.find("\"ThreadingModel\"=\"Both\"") != std::string::npos);
+    CHECK(boxedvn::registerWineMediaDeviceEnumerator(text, true, true));
+    const auto path = text.find("syswow64\\\\devenum.dll");
+    CHECK(path != std::string::npos);
+    text.replace(path, std::string("syswow64\\\\devenum.dll").size(), "custom\\\\wmi.dll");
+    auto saved = text;
+    CHECK(!boxedvn::registerWineMediaDeviceEnumerator(text, true, true));
+    CHECK_EQ(text, saved);
+}
