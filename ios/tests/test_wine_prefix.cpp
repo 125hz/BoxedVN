@@ -422,6 +422,31 @@ BOXEDVN_TEST(guest_fonts_already_present_are_not_recopied) {
     fs::remove_all(temporary, ec);
 }
 
+BOXEDVN_TEST(guest_fonts_follow_wine64_and_mounted_drive_c) {
+    const fs::path temporary = fs::temp_directory_path() /
+        ("boxedvn-font-lanes-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(temporary, ec);
+    const auto source = temporary / "Fonts";
+    const auto root = temporary / "root";
+    const auto mounted = temporary / "Drive C (64-bit)";
+    fs::create_directories(source);
+    std::ofstream(source / "custom.TTF") << "user-font";
+    auto result = installGuestFonts(source.string(), root.string(), {}, true);
+    CHECK(result.ok);
+    CHECK(fs::exists(root / "home/username/.wine64/drive_c/windows/Fonts/custom.TTF"));
+    CHECK(!fs::exists(root / "home/username/.wine/drive_c/windows/Fonts/custom.TTF"));
+    result = installGuestFonts(source.string(), root.string(), mounted.string(), true);
+    CHECK(result.ok);
+    CHECK_EQ(result.installed, std::size_t(1));
+    CHECK(fs::exists(mounted / "windows/Fonts/custom.TTF"));
+    std::ofstream(mounted / "windows/Fonts/custom.TTF") << "keep-installed";
+    result = installGuestFonts(source.string(), root.string(), mounted.string(), true);
+    CHECK_EQ(result.installed, std::size_t(0));
+    CHECK_EQ(fs::file_size(mounted / "windows/Fonts/custom.TTF"), std::uintmax_t(14));
+    fs::remove_all(temporary, ec);
+}
+
 BOXEDVN_TEST(guest_fonts_tolerate_a_user_who_supplied_none) {
     const fs::path temporary = fs::temp_directory_path() /
         ("boxedvn-fonts-none-" + std::to_string(::getpid()));

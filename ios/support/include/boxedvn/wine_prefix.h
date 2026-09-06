@@ -108,7 +108,9 @@ struct GuestFontInstallResult {
 // has no newer version of them, and recopying every face on every launch
 // would be slow for a large CJK font.
 GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
-                                         const std::string& writableRootPath);
+                                         const std::string& writableRootPath,
+                                         const std::string& driveCHostPath = {},
+                                         bool wine64 = false);
 
 struct GuestFontCensus {
     bool ok = false;

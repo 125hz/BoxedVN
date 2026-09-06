@@ -783,6 +783,21 @@ void runSession(const BVNLaunchConfiguration& launch) {
     // future controllers.
     // Setting a service to disabled alone is insufficient because Wine 10
     // auto-starts associated root PnP services regardless of Start.
+    if (launch.runThroughWine && launch.useFEX64) {
+        if (const char* directory = BVNPathFonts()) {
+            const auto fonts = boxedvn::installGuestFonts(directory,
+                launch.writableRootPath, launch.winePrefixDriveCHostPath, true);
+            if (!fonts.ok) {
+                BVNLogWrite(BVNLogLevelError, "fonts", fonts.error.c_str());
+            } else {
+                char message[192];
+                snprintf(message, sizeof(message),
+                    "Wine64 user fonts: %zu supplied, %zu installed in the active C:/windows/Fonts.",
+                    fonts.available, fonts.installed);
+                BVNLogWrite(BVNLogLevelInfo, "fonts", message);
+            }
+        }
+    }
     if (launch.runThroughWine && !launch.useFEX64) {
         const boxedvn::WineRenderer renderer =
             launch.useWineD3DVulkanRenderer
@@ -845,7 +860,8 @@ void runSession(const BVNLaunchConfiguration& launch) {
         if (const char* fontsDirectory = BVNPathFonts()) {
             const boxedvn::GuestFontInstallResult fonts =
                 boxedvn::installGuestFonts(fontsDirectory,
-                                           launch.writableRootPath);
+                                           launch.writableRootPath,
+                                           launch.winePrefixDriveCHostPath);
             if (!fonts.ok) {
                 BVNLogWrite(BVNLogLevelError, "fonts", fonts.error.c_str());
             } else if (fonts.available == 0) {

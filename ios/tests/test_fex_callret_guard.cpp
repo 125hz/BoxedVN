@@ -15,6 +15,12 @@ BOXEDVN_TEST(fex_callret_guard_recovers_device_stp_without_skipping_instruction)
         base - 8, 0xa9bf0f22U), reset);
 }
 
+BOXEDVN_TEST(fex_callret_guard_recovers_runtime_helper_prediction_push) {
+    // Runtime helper fault from a later device log; guest RSP is independent.
+    CHECK_EQ(boxedvn::recoverFexCallRetGuard(0x15dc10000ULL, size,
+        0x15dc10000ULL, 0x15dc0fff0ULL, 0xa9bf7f3fU), 0x15e010000ULL);
+}
+
 BOXEDVN_TEST(fex_callret_guard_recovers_pop_into_upper_guard) {
     CHECK_EQ(boxedvn::recoverFexCallRetGuard(base, size, base + size,
         base + size + 8, 0xa8c10f22U), reset);

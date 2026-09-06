@@ -16,13 +16,15 @@ git -C "${SOURCE}" fetch --depth 1 origin refs/tags/v2.5.2:refs/tags/v2.5.2
 git -C "${SOURCE}" checkout --detach "${BOXEDVN_DXVK_REVISION}"
 test "$(git -C "${SOURCE}" rev-parse HEAD)" = "${BOXEDVN_DXVK_REVISION}"
 git -C "${SOURCE}" submodule update --init --recursive --depth 1
-for patch in dxvk-2.5.2-moltenvk.patch dxvk-2.5.2-worker-errors.patch dxvk-2.5.2-allocation-errors.patch dxvk-2.5.2-null-vertex-buffer.patch; do
+for patch in dxvk-2.5.2-moltenvk.patch dxvk-2.5.2-worker-errors.patch dxvk-2.5.2-allocation-errors.patch dxvk-2.5.2-null-vertex-buffer.patch dxvk-2.5.2-sampler-variants.patch; do
     path="${REPO_ROOT}/third_party/patches/${patch}"
     if ! git -C "${SOURCE}" apply --reverse --check --unidiff-zero "${path}" 2>/dev/null; then
         git -C "${SOURCE}" apply --check --unidiff-zero "${path}"
         git -C "${SOURCE}" apply --unidiff-zero "${path}"
     fi
 done
+
+python3 "${SCRIPT_DIR}/test_dxvk_sampler_variants.py" "${SOURCE}"
 
 # Explicit POSIX compiler: the win32 GCC flavour does not implement the C++
 # mutex/condition_variable interfaces used by DXVK. Runtime libraries remain

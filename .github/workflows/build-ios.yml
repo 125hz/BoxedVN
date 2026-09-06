@@ -65,7 +65,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/dxvk-i386
-          key: dxvk-i386-${{ runner.os }}-${{ hashFiles('scripts/dependencies.dxvk.lock.sh', 'scripts/build-dxvk-i386.sh', 'scripts/validate-dxvk-i386.py', 'third_party/patches/dxvk-*.patch') }}
+          key: dxvk-i386-${{ runner.os }}-${{ hashFiles('scripts/dependencies.dxvk.lock.sh', 'scripts/build-dxvk-i386.sh', 'scripts/validate-dxvk-i386.py', 'scripts/test_dxvk_sampler_variants.py', 'third_party/patches/dxvk-*.patch') }}
       - name: Build DXVK with worker exception reports
         if: steps.dxvk-cache.outputs.cache-hit != 'true'
         shell: bash

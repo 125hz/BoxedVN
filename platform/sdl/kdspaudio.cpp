@@ -21,6 +21,7 @@
 #include "kdspaudio_math.h"
 #include <SDL.h>
 #include <algorithm>
+#include <cmath>
 #include "../../source/kernel/devs/oss.h"
 
 #define DSP_BUFFER_SIZE (1024*32)
@@ -196,6 +197,9 @@ public:
 #ifdef __EMSCRIPTEN__
 	std::vector<U8> streamBuffer;
 #endif
+	U32 signalLastMs = 0;
+	float guestPeak = 0, hostPeak = 0;
+	U32 invalidSamples = 0;
 	bool sameFormat = false;
 	U32 dspFragSize = 4096;
 	bool open = false;
@@ -535,6 +539,25 @@ U32 KDspAudioSdl::writeAudio(U8* data, U32 len) {
 	}
 #endif
 
+	// Measure a bounded subset of samples, never dump audio payloads.
+	auto peak = [this](const U8* samples, U32 bytes, U32 format) {
+		float result = 0;
+		const U32 width = SDL_AUDIO_BITSIZE(format) / 8;
+		if (!width) return result;
+		const U32 count = bytes / width;
+		for (U32 i = 0; i < count; i += std::max(1u, count / 128)) {
+			float value = 0;
+			if (format == AUDIO_F32LSB) memcpy(&value, samples + i * width, 4);
+			else if (format == AUDIO_S16LSB) {
+				S16 pcm; memcpy(&pcm, samples + i * width, 2); value = pcm / 32768.0f;
+			}
+			if (!std::isfinite(value)) this->invalidSamples++;
+			else result = std::max(result, std::abs(value));
+		}
+		return result;
+	};
+	this->guestPeak = std::max(this->guestPeak, peak(data, len, want.format));
+
 #ifdef __EMSCRIPTEN__
 	if (!this->sameFormat && this->stream) {
 		if (SDL_AudioStreamPut(this->stream, data, (int)len) < 0) {
@@ -547,6 +570,7 @@ U32 KDspAudioSdl::writeAudio(U8* data, U32 len) {
 			}
 			int got = SDL_AudioStreamGet(this->stream, this->streamBuffer.data(), available);
 			if (got > 0) {
+				this->hostPeak = std::max(this->hostPeak, peak(this->streamBuffer.data(), got, this->got.format));
 				SDL_QueueAudio(this->deviceId, this->streamBuffer.data(), got);
 			}
 		}
@@ -567,10 +591,26 @@ U32 KDspAudioSdl::writeAudio(U8* data, U32 len) {
 		this->cvt.len = (int)len;
 		this->cvt.buf = this->cvtBuf;
 		memcpy(this->cvt.buf, data, len);
-		SDL_ConvertAudio(&this->cvt);
+		if (SDL_ConvertAudio(&this->cvt) < 0) {
+			klog_fmt("BOXEDWINE_AUDIO_CONVERSION_ERROR: %s", SDL_GetError());
+			return -K_EIO;
+		}
+		this->hostPeak = std::max(this->hostPeak, peak(this->cvt.buf, this->cvt.len_cvt, got.format));
 		SDL_QueueAudio(this->deviceId, this->cvt.buf, this->cvt.len_cvt);
 	} else {
+		this->hostPeak = std::max(this->hostPeak, this->guestPeak);
 		SDL_QueueAudio(this->deviceId, data, len);
+	}
+	const U32 now = KSystem::getMilliesSinceStart();
+	if (now - this->signalLastMs >= 5000) {
+		klog_fmt("BOXEDWINE_AUDIO_SIGNAL id=%u guest_fmt=0x%x host_fmt=0x%x "
+			"guest_peak=%.6f host_peak=%.6f invalid=%u queued=%u",
+			this->id, want.format, got.format, this->guestPeak, this->hostPeak,
+			this->invalidSamples,
+			SDL_GetQueuedAudioSize(this->deviceId));
+		this->signalLastMs = now;
+		this->guestPeak = this->hostPeak = 0;
+		this->invalidSamples = 0;
 	}
 #ifdef __EMSCRIPTEN__
 	addRealQueuedWant(len);

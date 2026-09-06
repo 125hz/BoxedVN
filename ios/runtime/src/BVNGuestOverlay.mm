@@ -753,6 +753,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.cursorView.layer.shadowOpacity =
         (float)[defaults doubleForKey:kBVNPointerShadowOpacityKey];
     self.cursorView.alpha = [defaults doubleForKey:kBVNPointerOpacityKey];
+    self.guestCursorView.alpha = self.cursorView.alpha;
 
     // Wine cursor bitmaps keep their native dimensions and hotspot. When Wine
     // only supplies a cursor shape, BoxedVN draws the fallback and applies the
@@ -2207,6 +2208,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         }
     }
     self.guestCursorView.image = image;
+    self.guestCursorView.alpha = [[NSUserDefaults standardUserDefaults]
+        doubleForKey:kBVNPointerOpacityKey];
     self.guestCursorVisible =
         gSelectedGuestCursorVisible.load(std::memory_order_relaxed);
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];

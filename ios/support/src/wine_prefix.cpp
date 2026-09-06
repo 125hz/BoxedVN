@@ -545,7 +545,9 @@ GuestFontCensus censusGuestFonts(const std::string& rootFilesystemZipPath,
 }
 
 GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
-                                         const std::string& writableRootPath) {
+                                         const std::string& writableRootPath,
+                                         const std::string& driveCHostPath,
+                                         bool wine64) {
     GuestFontInstallResult result;
     if (sourceDirectory.empty()) {
         return result;
@@ -556,8 +558,12 @@ GuestFontInstallResult installGuestFonts(const std::string& sourceDirectory,
         return result;
     }
 
-    const fs::path destination = fs::path(writableRootPath) / "home" /
-        "username" / ".wine" / "drive_c" / "windows" / "Fonts";
+    // A mounted C: hides the overlay's drive_c, so copy into the actual mount.
+    const fs::path driveC = driveCHostPath.empty()
+        ? fs::path(writableRootPath) / "home" / "username" /
+            (wine64 ? ".wine64" : ".wine") / "drive_c"
+        : fs::path(driveCHostPath);
+    const fs::path destination = driveC / "windows" / "Fonts";
 
     bool createdDestination = false;
     for (const fs::directory_entry& entry : fs::directory_iterator(source, ec)) {

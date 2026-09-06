@@ -1306,7 +1306,11 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     // CallRetStack::HandleAccessViolation), not to Wine's exception dispatcher.
     // Darwin can report this aligned STP as BUS_ADRALN: handle it BEFORE the
     // generic unaligned-access path, which cannot repair an inaccessible page.
-    if (inCodeBuffer && (signal == SIGBUS || signal == SIGSEGV)) {
+    // Entry/link helpers also push predictions. They live in our executable
+    // pool but outside IsAddressInCodeBuffer's translated-block ranges.
+    // Still require this thread's exact guard address and x25 push/pop opcode.
+    const bool inOwnedFexCode = inCodeBuffer || BVNFEXBackendOwnsHostCodeAddress(hostPC);
+    if (inOwnedFexCode && (signal == SIGBUS || signal == SIGSEGV)) {
         const auto oldSP = machine->__ss.__x[boxedvn::fexCallRetHostRegister];
         const auto resetSP = boxedvn::recoverFexCallRetGuard(
             reinterpret_cast<uint64_t>(adapter->fexThread->CallRetStackBase),

@@ -11,6 +11,8 @@ for module in ("d3d9", "d3d11", "dxgi", "d3d10core"):
     assert data[pe:pe + 4] == b"PE\0\0", module
     assert struct.unpack_from("<H", data, pe + 4)[0] == 0x14C, module
     assert struct.unpack_from("<H", data, pe + 24)[0] == 0x10B, module
+    if module == "d3d9":
+        assert b"D3D9: distinct texture variant bindings enabled" in data, "missing sampler variant repair"
     if module in ("d3d9", "d3d11"):
         assert b"BOXEDWINE_DXVK_WORKER" in data, f"{module}: missing worker report"
         assert b"BOXEDWINE_DXVK_ALLOCATION_FAILED" in data, f"{module}: missing allocation report"
