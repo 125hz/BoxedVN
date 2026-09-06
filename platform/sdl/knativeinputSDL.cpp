@@ -111,12 +111,12 @@ bool KNativeInputSDL::mouseMoveGuest(int x, int y, bool relative) {
     // Remember where the pointer now is, so getMousePos can answer with it.
     // See the field declaration in knativeinputSDL.h: SDL_GetMouseState is
     // blind to the overlay's injected touches.
-    if (!relative) {
-        injectedX = x;
-        injectedY = y;
-        hasInjectedPointer = true;
-        BVNGuestPointerPositionChanged(x, y);
-    }
+    // Relative look still needs a meaningful GetCursorPos result for clients
+    // that poll position instead of consuming XInput raw-motion events.
+    injectedX = relative ? (int)screenWidth() / 2 + x : x;
+    injectedY = relative ? (int)screenHeight() / 2 + y : y;
+    hasInjectedPointer = true;
+    BVNGuestPointerPositionChanged(injectedX, injectedY);
 #endif
 
 #ifdef BOXEDWINE_RECORDER

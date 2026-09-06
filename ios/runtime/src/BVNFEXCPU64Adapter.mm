@@ -1694,9 +1694,15 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      static_cast<unsigned>(frame->State.cs_idx),
                      static_cast<unsigned>(frame->State.ss_idx),
                      faultDecodeWidth, hex);
+            const uint32_t hostInstruction = inOwnedFexCode
+                ? *reinterpret_cast<const uint32_t*>(hostPC) : 0;
+            const unsigned baseRegister = (hostInstruction >> 5) & 31;
+            const uint64_t baseValue = baseRegister < 29 ? machine->__ss.__x[baseRegister]
+                : baseRegister == 29 ? machine->__ss.__fp
+                : baseRegister == 30 ? machine->__ss.__lr : machine->__ss.__sp;
             klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_HOST instruction=0x%08x "
-                     "x25=0x%llx predictor_base=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx",
-                     inOwnedFexCode ? *reinterpret_cast<const uint32_t*>(hostPC) : 0,
+                     "rn=%u base=0x%llx x25=0x%llx predictor_base=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx",
+                     hostInstruction, baseRegister, (unsigned long long)baseValue,
                      (unsigned long long)machine->__ss.__x[25],
                      (unsigned long long)adapter->fexThread->CallRetStackBase,
                      (unsigned long long)machine->__ss.__x[0],

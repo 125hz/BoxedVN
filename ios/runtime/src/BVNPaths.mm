@@ -35,6 +35,7 @@
 #import <Foundation/Foundation.h>
 
 #include <string>
+#include <mutex>
 
 #include "BVNRuntime.h"
 
@@ -169,6 +170,8 @@ extern "C" const char* BVNPathWinePrefixes(void) {
 }
 
 extern "C" const char* BVNPathGames(void) {
+    static std::mutex migrationMutex;
+    std::lock_guard<std::mutex> lock(migrationMutex);
     if (!gGames.resolved) {
         NSString* documents = firstDirectory(NSDocumentDirectory);
         NSString* oldPath = [documents stringByAppendingPathComponent:@"Games"];
