@@ -13,6 +13,14 @@ No audible-audio acceptance is claimed. A replacement streaming converter was
 tested locally and excluded because it did not preserve duration across packet
 boundaries with the shipping SDL version.
 
+Audio lifecycle review also found that the once-per-process playback-category
+setter survives `KNativeSystem::cleanup`, while [SDL_Quit clears all hints](https://github.com/libsdl-org/SDL/blob/release-2.32.10/src/SDL.c).
+Reapply the normal-priority category before each device open. The regression
+runs the production setter through three real SDL init/quit cycles and checks
+that explicit higher-priority overrides still win. This fixes later sessions
+falling back to the silent-switch-sensitive category; whether it explains this
+particular silent capture remains unverified.
+
 ## Descriptor aliasing
 
 The 32-bit D3D9 capture no longer contains the earlier localization-buffer

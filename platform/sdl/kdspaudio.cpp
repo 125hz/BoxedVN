@@ -39,11 +39,8 @@
 // update_audio_session() when the device is opened, so it has to be in place
 // before SDL_OpenAudioDevice and not merely before SDL_Init.
 static void ensureAudioSessionCategory() {
-	static bool applied = false;
-	if (applied) {
-		return;
-	}
-	applied = true;
+	// KNativeSystem::cleanup calls SDL_Quit, which clears all hints. Reapply
+	// before every open, including later guest sessions in the same iOS app.
 	SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 }
 

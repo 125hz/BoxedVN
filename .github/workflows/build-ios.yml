@@ -454,6 +454,12 @@ jobs:
       - name: Run tests
         run: ctest --preset tests-only
 
+      - name: Test audio category across SDL sessions
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libsdl2-dev
+          python3 scripts/test_sdl_audio_category.py
+
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
 
