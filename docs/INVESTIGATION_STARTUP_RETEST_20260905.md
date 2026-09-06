@@ -221,3 +221,49 @@ References:
 - Pinned FEX: Source/Windows/Common/CallRetStack.h and
   FEXCore/Source/Interface/Core/JIT/BranchOps.cpp (read-only inspection).
 - https://xorg.freedesktop.org/X11R7.0/doc/PDF/xlib.pdf (section 11.2).
+
+## Device revision e15642c9, evening retest
+
+Logs 192701 (cube), 192944 (64-bit game), and 193146 (32-bit visual novel)
+identify e15642c9+dirty, build 137. The user reports improved mouse frame
+pacing. The cube presents thousands of frames, but every animation witness
+has tick=0 and elapsed=0 while QPC and wall time advance. Its generated
+vertex bits remain unchanged. This is a stopped input clock, not evidence
+of a stalled Vulkan present loop.
+
+In the cube log, FILEMAP ordinal 42 maps wineserver's tmpmap file at an
+automatically selected 0x700001000, prot=2, flags=1; FILEMAP_RETURN says
+shared=0. Ordinal 43 maps the same file at client address 0x7ffe0000,
+prot=1, flags=0x11, shared=1. The visual-novel log has the same mismatch.
+Wine 9's server creates its user-data page with mmap(NULL, PROT_WRITE,
+MAP_SHARED), initializes SystemCall, and updates TickCount at offset 0x320.
+The shipped 32-bit kernelbase GetTickCount reads 0x7ffe0320 directly.
+
+sys_mmap64_file incorrectly excluded already-reserved mappings from its
+Wine server shared-file branch. Automatic placement first reserves an
+anonymous range, so the server received a private file snapshot while the
+clients attached to a separate, initially zero shared backing. Remove that
+exclusion: reservation chooses the address; it must not change sharing.
+The existing mmapSharedFile implementation replaces the fresh reservation
+with canonical shared backing. Keep PE image relocation copies isolated.
+
+The regression fixture compiles the complete production syscall body with
+deterministic file/memory backends. It checks server initialization before
+client attachment, advancing clock values, late readers without reseeding,
+relocated native hints, file offsets, MAP_PRIVATE, and image isolation.
+Restoring the old condition in a scratch copy fails the cross-process clock
+assertion. With the fix, both CTest targets pass (including 524 existing
+support cases); 365 Python cases pass with 51 platform skips. This tests
+syscall routing, not physical Darwin alias mappings or iPhone acceptance.
+
+The expected device result is advancing cube ticks and changing vertices,
+with the server FILEMAP_RETURN now shared=1. The 64-bit game still faults
+at image offset 0xdb6c5 reading an empty container, and the visual novel
+still submits stageCount=0 pipelines. The clock fix may affect their
+startup/timer behavior but neither remaining failure is proven resolved.
+No game executable was run or changed. Wine ZIP contents are unchanged.
+
+References:
+- https://github.com/wine-mirror/wine/blob/wine-9.0/server/mapping.c
+- https://github.com/wine-mirror/wine/blob/wine-9.0/server/fd.c
+- https://man7.org/linux/man-pages/man2/mmap.2.html

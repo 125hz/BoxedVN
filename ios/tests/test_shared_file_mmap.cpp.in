@@ -1,0 +1,150 @@
+// Execute the production mmap syscall with deterministic file/memory backends.
+// This tests syscall routing and cross-process visibility, not Darwin VM APIs.
+#include "guest_mmap_diagnostics.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+using U8 = uint8_t; using U32 = uint32_t; using U64 = uint64_t; using S64 = int64_t;
+using FD = int;
+constexpr U64 K_MAP_SHARED=1, K_MAP_FIXED=0x10, K_MAP_FIXED_NOREPLACE=0x100000;
+constexpr int K_ENOSYS=38, K_EINVAL=22, K_ENOMEM=12, K_EEXIST=17;
+static void klog_fmt(const char*, ...) {}
+static std::mutex g_fileReadMutex, gGuestMmapDiagnosticsMutex;
+static boxedvn::GuestMmapRepeatTracker gGuestMmapRepeats;
+static struct {
+    std::atomic<U64> rejectedWithoutAllocating{0}, lowIneligibleHints{0},
+        highWindowRelocations{0}, highWindowFailures{0};
+} gGuestMmapCounters;
+
+struct Node { std::string path; };
+struct File {
+    std::shared_ptr<Node> node;
+    std::vector<U8> bytes = std::vector<U8>(8192);
+    S64 position = 0;
+    S64 getFilePointer() { return position; }
+    void seek(S64 p) { position = p; }
+    U32 readNative(U8* out, U32 n) {
+        if (position < 0 || U64(position) >= bytes.size()) return 0;
+        n = std::min(n, U32(bytes.size() - position));
+        std::memcpy(out, bytes.data() + position, n); position += n; return n;
+    }
+};
+struct Object { virtual ~Object() = default; };
+struct KFile : Object { std::shared_ptr<File> openFile; };
+struct Descriptor { std::shared_ptr<Object> kobject; };
+using KFileDescriptorPtr = std::shared_ptr<Descriptor>;
+struct Process {
+    int id=14;
+    KFileDescriptorPtr descriptor;
+    KFileDescriptorPtr getFileDescriptor(FD) { return descriptor; }
+};
+struct Thread { int id=15; std::shared_ptr<Process> process; };
+
+using Page = std::shared_ptr<std::vector<U8>>;
+static std::map<std::pair<std::string,U64>, Page> sharedPages;
+struct Memory {
+    bool native=false;
+    U64 next=0x700001000ULL;
+    unsigned sharedMaps=0;
+    std::map<U64,Page> pages;
+    bool nativeIdentityMode() { return native; }
+    bool nativeGuestRangeAllowed(U64 a, U64) { return a >= 0x700000000ULL; }
+    bool rangeCompletelyUnmapped(U64 a, U64) { return !pages.count(a >> 12); }
+    bool sparseReservationOverlaps(U64, U64) { return false; }
+    U64 addressSpaceGeneration() { return 1; }
+    bool isPageMapped(U64 p) { return pages.count(p) != 0; }
+    U64 mmapAnonymousFixed(U64 a, U64 n, U32) {
+        for (U64 i=0;i<n;i+=4096) pages[(a+i)>>12]=std::make_shared<std::vector<U8>>(4096);
+        return a;
+    }
+    U64 mmapReserveAndMap(U64 n, U32 prot) {
+        U64 a=next; next+=(n+4095)&~4095ULL; return mmapAnonymousFixed(a,n,prot);
+    }
+    U64 mmapSharedFile(U64 a,U64 n,U32,const char* path,U64 off,const U8* seed,U64 seedLen) {
+        ++sharedMaps;
+        for (U64 i=0;i<n;i+=4096) {
+            auto& p=sharedPages[{path,(off+i)>>12}];
+            if (!p) {
+                p=std::make_shared<std::vector<U8>>(4096);
+                if (seed && seedLen>i) std::memcpy(p->data(),seed+i,size_t(std::min(U64(4096),seedLen-i)));
+            }
+            pages[(a+i)>>12]=p;
+        }
+        return a;
+    }
+    U64 mprotect(U64 a,U64,U32) { return a; }
+    void memcpyToGuest(U64 a,const void* bytes,U64 n) {
+        const auto* src=static_cast<const U8*>(bytes);
+        for (U64 i=0;i<n;++i) pages.at((a+i)>>12)->at((a+i)&4095)=src[i];
+    }
+    void memcpyFromGuest(void* bytes,U64 a,U64 n) {
+        auto* dst=static_cast<U8*>(bytes);
+        for (U64 i=0;i<n;++i) dst[i]=pages.at((a+i)>>12)->at((a+i)&4095);
+    }
+    void write(U64 a,U32 value) { memcpyToGuest(a,&value,4); }
+    U32 read(U64 a) { U32 value; memcpyFromGuest(&value,a,4); return value; }
+};
+struct CPU64 { Thread* thread; Memory* memory; U64 rip=0; };
+
+@BOXEDVN_MMAP_SYSCALL_BODY@
+
+static void check(bool value, const char* message) {
+    if (!value) { std::fprintf(stderr,"FAIL: %s\n",message); std::exit(1); }
+}
+int main() {
+    auto file=std::make_shared<File>();
+    file->node=std::make_shared<Node>(Node{"/run/user/1000/wine/server-1-81b/tmpmap-clock"});
+    auto object=std::make_shared<KFile>(); object->openFile=file;
+    auto process=std::make_shared<Process>();
+    process->descriptor=std::make_shared<Descriptor>(Descriptor{object});
+    Thread thread{15,process};
+    Memory server,client,lateClient;
+    CPU64 writer{&thread,&server},reader{&thread,&client},late{&thread,&lateClient};
+
+    // Exact device sequence: automatic writable server mapping, fixed reader.
+    U64 w=sys_mmap64_file(&writer,0,4096,2,1,3,0);
+    server.write(w+0x308,1); // Wine initializes SystemCall before clients map it.
+    U64 r=sys_mmap64_file(&reader,0x7ffe0000,4096,1,0x11,3,0);
+    check(w==0x700001000ULL && r==0x7ffe0000,"mapping addresses");
+    check(client.read(r+0x308)==1,"reader must see server initialization before attach");
+    server.write(w+0x320,1234);
+    check(client.read(r+0x320)==1234,"fixed reader must see automatic writer's clock");
+    U64 l=sys_mmap64_file(&late,0,4096,1,1,3,0);
+    check(lateClient.read(l+0x320)==1234,"late automatic map must retain shared writes");
+    server.write(w+0x320,1250);
+    check(client.read(r+0x320)==1250 && lateClient.read(l+0x320)==1250,"clock keeps advancing");
+
+    Memory relocated; relocated.native=true;
+    CPU64 hinted{&thread,&relocated};
+    U64 h=sys_mmap64_file(&hinted,0x10000,4096,3,1,3,0);
+    check(h==0x700001000ULL && relocated.read(h+0x320)==1250,"relocated shared hint retains alias");
+    relocated.write(h+0x320,1266);
+    check(server.read(w+0x320)==1266,"shared writes work in either direction");
+
+    Memory otherOffset; CPU64 offsetCPU{&thread,&otherOffset};
+    U64 o=sys_mmap64_file(&offsetCPU,0,4096,3,1,3,4096);
+    check(otherOffset.read(o+0x320)==0,"different file page must not alias");
+    otherOffset.write(o+0x320,999);
+    check(server.read(w+0x320)==1266,"different file page cannot change clock");
+
+    Memory privateMap; CPU64 privateCPU{&thread,&privateMap};
+    U64 p=sys_mmap64_file(&privateCPU,0,4096,3,2,3,0);
+    privateMap.write(p+0x320,42);
+    check(privateMap.sharedMaps==0 && server.read(w+0x320)==1266,"MAP_PRIVATE remains isolated");
+    file->node->path="/usr/lib/wine/x86_64-windows/example.dll";
+    Memory dll1,dll2; CPU64 d1{&thread,&dll1},d2{&thread,&dll2};
+    U64 a1=sys_mmap64_file(&d1,0,4096,3,1,3,0);
+    U64 a2=sys_mmap64_file(&d2,0x140000000,4096,3,0x11,3,0);
+    dll1.write(a1+0x320,99);
+    check(dll1.sharedMaps==0 && dll2.sharedMaps==0 && dll2.read(a2+0x320)==0,
+          "PE relocation copies must stay per-process");
+    std::puts("mmap syscall: shared clock, late reader, relocated hint, offsets and private image isolation passed");
+}

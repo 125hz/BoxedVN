@@ -2784,7 +2784,13 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
             serverSection = true;
         }
     }
-    if (serverSection && (flags & K_MAP_SHARED) && kfile->openFile->node && !reserved) {
+    // `reserved` only means the address allocator already placed anonymous
+    // backing. It must not change MAP_SHARED into a private file snapshot.
+    // In particular wineserver uses mmap(NULL, ..., MAP_SHARED) for its clock
+    // page while clients use MAP_FIXED: skipping this branch for the server
+    // disconnected the writer from every reader and froze GetTickCount at 0.
+    // Adopt the shared backing even when replacing our fresh reservation.
+    if (serverSection && (flags & K_MAP_SHARED) && kfile->openFile->node) {
         // Seed bytes for any page of this file not yet in the registry.
         std::vector<U8> seedBuf((size_t)mapLen, 0);
         U64 fileBase = offset & ~0xFFFULL;

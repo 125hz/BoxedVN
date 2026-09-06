@@ -83,6 +83,23 @@ set_tests_properties(boxedvn_support PROPERTIES
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
+# Keep the complete production syscall body in this focused backend fixture.
+# Reconfigure on edits so the tested function cannot lag behind the shipping one.
+set(mmap_source "${CMAKE_CURRENT_SOURCE_DIR}/../../source/kernel/syscall64.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mmap_source}")
+file(READ "${mmap_source}" syscall_source)
+string(FIND "${syscall_source}" "static U64 sys_mmap64_file(CPU64*" mmap_begin REVERSE)
+string(FIND "${syscall_source}" "// writev — iterate the iovec array" mmap_end)
+if(mmap_begin LESS 0 OR mmap_end LESS mmap_begin)
+    message(FATAL_ERROR "Cannot locate production file-mmap syscall for regression fixture")
+endif()
+math(EXPR mmap_length "${mmap_end} - ${mmap_begin}")
+string(SUBSTRING "${syscall_source}" ${mmap_begin} ${mmap_length} BOXEDVN_MMAP_SYSCALL_BODY)
+configure_file(test_shared_file_mmap.cpp.in test_shared_file_mmap.cpp @ONLY)
+add_executable(boxedvn_shared_file_mmap_test "${CMAKE_CURRENT_BINARY_DIR}/test_shared_file_mmap.cpp")
+target_include_directories(boxedvn_shared_file_mmap_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+add_test(NAME boxedvn_shared_file_mmap COMMAND boxedvn_shared_file_mmap_test)
+
 # Dependency pinning: verifies every pin is well formed and that a mismatched
 # checksum is actually refused.  Needs no network access.
 if(UNIX)
