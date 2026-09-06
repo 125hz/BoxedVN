@@ -243,7 +243,7 @@ static const double kBVNPointerSizeMinimum = 12.0;
 static const double kBVNPointerSizeMaximum = 64.0;
 static const double kBVNPointerThicknessMinimum = 0.5;
 static const double kBVNPointerThicknessMaximum = 6.0;
-static const double kBVNPointerOpacityMinimum = 0.1;
+static const double kBVNPointerOpacityMinimum = 0.0;
 static const double kBVNPointerOpacityMaximum = 1.0;
 
 static double BVNPointerClamp(double value, double minimum, double maximum) {

@@ -516,7 +516,7 @@ struct GuestPointerSettingsPanel: View {
                    String(format: "%.0f pt", settings.size))
             slider("Thickness", field(\.thickness), 0.5...6,
                    String(format: "%.1f pt", settings.thickness))
-            slider("Opacity", field(\.opacity), 0.1...1,
+            slider("Opacity", field(\.opacity), 0...1,
                    String(format: "%.0f%%", settings.opacity * 100))
             slider("Sensitivity", field(\.sensitivity), 0.25...3,
                    String(format: "%.2f×", settings.sensitivity))
