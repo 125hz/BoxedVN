@@ -388,6 +388,20 @@ verify_or_report "${GLIBC_ARCHIVE}" glibc_sha256
 verify_or_report "${WINE_ARCHIVE}" wine_sha256
 verify_or_report "${PE32_ARCHIVE}" pe32_sha256
 
+if [[ "${MANIFEST_SOURCE_IMAGE}" == "wine-11.0-source-on-ubuntu-24.04" ]]; then
+    root_entry=usr/lib/x86_64-linux-gnu/wine
+    [[ "$(unzip -p "${WINE_ARCHIVE}" "${root_entry}/boxedvn-wine-version.txt")" == 11.0 ]] \
+        || die "Wine archive has no Wine 11.0 version stamp"
+    [[ "$(unzip -p "${PE32_ARCHIVE}" "${root_entry}/boxedvn-pe32-11.0.stamp")" == 11.0 ]] \
+        || die "PE32 archive has no matching Wine 11.0 version stamp"
+    check_zip_entry_elf64_x86_64 "${WINE_ARCHIVE}" "${root_entry}/x86_64-unix/wine"
+    check_zip_guest_link "${WINE_ARCHIVE}" "${root_entry}/ntdll.so" \
+        "/${root_entry}/x86_64-unix/ntdll.so"
+    if zip_has "${WINE_ARCHIVE}" "${root_entry}/x86_64-unix/wine-preloader"; then
+        die "Wine 11 runtime must preserve BoxedWine's ntdll reservation path without a preloader"
+    fi
+fi
+
 # These are the paths emitted by the audited build-wine64-zip.sh and consumed
 # by run_wine64.sh's -root/-zip launch sequence.
 check_zip_path "${GLIBC_ARCHIVE}" lib64/ld-linux-x86-64.so.2

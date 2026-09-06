@@ -392,8 +392,19 @@ trim_source_runtime_tree() {
     require_command "${stripper}"
     find "${directory}" -maxdepth 1 -type f -name '*.a' -delete
     while IFS= read -r -d '' module; do
-        if is_elf64_x86_64 "${module}" || [[ "$(head -c 2 "${module}")" == MZ ]]; then
+        if is_elf64_x86_64 "${module}"; then
             "${stripper}" --strip-debug "${module}"
+        elif [[ "$(head -c 2 "${module}")" == MZ ]]; then
+            if dd if="${module}" bs=1 skip=64 count=16 status=none | grep -aq '^Wine builtin DLL'; then
+                # Like Wine's install rules, restore its DOS-stub signature
+                # after binutils rewrites the PE. Native compiler DLLs keep
+                # their native identity and do not acquire a builtin marker.
+                require_file "${WINE_INSTALL}/usr/bin/winebuild"
+                "${WINE_INSTALL}/usr/bin/winebuild" --builtin \
+                    "--strip-cmd=${stripper} --strip-debug" "${module}"
+            else
+                "${stripper}" --strip-debug "${module}"
+            fi
         fi
     done < <(find "${directory}" -maxdepth 1 -type f -print0)
 }
@@ -559,6 +570,12 @@ copy_as "${WINE64}" "${WINE_MODULE_ROOT}/wine64"
 copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver64"
 copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver"
 cp -aL "${WINE_UNIX}" "${STAGE}${WINE_MODULE_ROOT}/"
+if [[ -n "${WINE_INSTALL}" ]]; then
+    # BoxedWine owns the guest address space. Preserve the established ntdll
+    # mmap_init fallback rather than introducing the source install's extra
+    # preloader ELF and its independent ELF mapping path into child launches.
+    rm -f "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/wine-preloader"
+fi
 cp -aL "${WINE_WINDOWS}" "${STAGE}${WINE_MODULE_ROOT}/"
 trim_source_runtime_tree "${STAGE}${WINE_MODULE_ROOT}" strip
 trim_source_runtime_tree "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix" strip

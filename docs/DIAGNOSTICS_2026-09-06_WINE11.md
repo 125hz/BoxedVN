@@ -11,6 +11,8 @@ version. The packaging script accommodates Wine 11's loader beside Unix ntdll.
 Developer import archives and DWARF sections are excluded from staged runtime
 modules; the original build cache retains them. The process-start diagnostic
 also handles Wine 11's reply layout, which no longer carries an entry address.
+The source install's optional preloader is not staged: ntdll retains its
+existing reservation fallback inside the BoxedWine-owned guest address space.
 
 Wine still runs as a Linux guest inside BoxedWine. FEX supplies CPU translation;
 DXMT supplies the existing 64-bit graphics path. The 32-bit D3D9 path remains

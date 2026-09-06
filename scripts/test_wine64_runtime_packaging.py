@@ -464,6 +464,35 @@ class WineserverArchiveValidation(unittest.TestCase):
             self.assertEqual(code, 0, output)
             self.assertIn("wineserver matches wineserver64", output)
 
+    def test_wine11_requires_matched_layers_and_the_reserved_address_path(self) -> None:
+        for defect in (None, "pe32-version", "loader", "preloader"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as raw:
+                directory = Path(raw)
+                glibc, wine, _ = self.build_archives(directory, elf(body=b"wineserver64 payload"))
+                with zipfile.ZipFile(wine, "a") as archive:
+                    archive.writestr(ROOT + "/boxedvn-wine-version.txt", b"11.0\n")
+                    archive.writestr(ROOT + "/x86_64-unix/ntdll.so", elf())
+                    archive.writestr(ROOT + "/ntdll.so.link",
+                                     guest_link("/" + ROOT + "/x86_64-unix/ntdll.so"))
+                    if defect != "loader":
+                        archive.writestr(ROOT + "/x86_64-unix/wine", elf())
+                    if defect == "preloader":
+                        archive.writestr(ROOT + "/x86_64-unix/wine-preloader", elf())
+                with zipfile.ZipFile(self._pe32_archive, "a") as archive:
+                    if defect != "pe32-version":
+                        archive.writestr(ROOT + "/boxedvn-pe32-11.0.stamp", b"11.0\n")
+                code, output = self.run_validator(directory, glibc, wine, {
+                    "source_image": "wine-11.0-source-on-ubuntu-24.04",
+                    "wine_version": "11.0",
+                })
+                if defect is None:
+                    self.assertEqual(code, 0, output)
+                else:
+                    self.assertNotEqual(code, 0, output)
+                    expected = {"pe32-version": "version stamp", "loader": "x86_64-unix/wine",
+                                "preloader": "without a preloader"}[defect]
+                    self.assertIn(expected, output)
+
     def test_the_old_shell_wrapper_shape_is_rejected(self) -> None:
         # Exactly the artifact that shipped: a 382-byte /bin/sh wrapper at
         # usr/lib/wine/wineserver beside a valid ELF64 wineserver64.

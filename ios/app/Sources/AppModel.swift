@@ -618,20 +618,8 @@ final class AppModel: ObservableObject {
         /// include/guest_wine64_layout.h, which is where the list came from:
         /// every name was observed being resolved by a device run.
         ///
-        /// The archive carries no version stamp of its own - the build writes
-        /// its manifest beside the archive, not inside it - so this list *is*
-        /// the version check. A copy made before a packaging fix is exactly a
-        /// copy that does not carry all fifteen, and the device log of one
-        /// said so: `BOXEDWINE_X64_PE32_GAP tree=i386-windows required=14
-        /// missing=1`, followed by a process that exited 0xC0000135 with no
-        /// window and no message.
-        ///
-        /// libgcc_s_dw2-1.dll is the fifteenth and the newest. It is a mingw
-        /// runtime DLL that Wine's mingw-built i386 modules import and that
-        /// neither Wine tree builds; an archive predating that fix loses
-        /// whichever builtin imports it - Direct3D disappears while the
-        /// program keeps running - so the miss never reaches a status code
-        /// and this list is the only thing that can name it.
+        /// The embedded Wine-version stamp prevents mixing runtime versions;
+        /// this module list separately detects incomplete PE32 archives.
         static let pe32RequiredModules = [
             "ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll",
             "sechost.dll", "msvcrt.dll", "ucrtbase.dll", "gdi32.dll",
@@ -761,6 +749,7 @@ final class AppModel: ObservableObject {
                          + "and DXMT resources."
             return nil
         }
+        Log.write("Wine runtime: 11.0 (BoxedWine guest, FEX CPU)", category: "container")
         let files = ContainerLibrary.filesDirectory(for: container)
         let containerFolder = files.deletingLastPathComponent()
         let pe32Candidates = [
