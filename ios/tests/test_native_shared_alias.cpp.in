@@ -15,7 +15,7 @@ using U8=uint8_t; using U16=uint16_t; using U32=uint32_t; using U64=uint64_t;
 constexpr U64 K64_PAGE_SIZE=4096, K64_PAGE_MASK=4095, K64_PAGE_SHIFT=12;
 constexpr int K_EINVAL=22, K_EBUSY=16, K_ENOMEM=12;
 constexpr U32 K64_PAGE_MAPPED=1,K64_PAGE_SHARED=2,K64_PAGE_READ=4,
-    K64_PAGE_WRITE=8,K64_PAGE_EXEC=16,K64_PAGE_PINNED=64,K64_WRITER_MMAP_FILE=1,MMAP_ANON=1;
+    K64_PAGE_WRITE=8,K64_PAGE_EXEC=16,K64_PAGE_PINNED=64,K64_WRITER_MMAP_FILE=1,K64_WRITER_MMAP_ANON=2,MMAP_ANON=1;
 #define BOXEDWINE_KMEMORY64_NATIVE_IDENTITY 1
 #define BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(m) std::lock_guard<std::recursive_mutex> guard(m)
 static void klog_fmt(const char*,...) {}
@@ -33,10 +33,12 @@ static void k64ReportGuestLaneRefusal(void*,const char*,U64,U64,int) {}
 @REGISTRY@
 struct K64Page {
     U32 flags=0;
+    U32 lastWriter=0;
     bool permanentRamPin=false;
     std::shared_ptr<std::atomic<U8*>> shared;
     void writeFlags(U32 f,U32,U16) { flags=f; }
     void demoteNativeShared() {}
+    bool committed() const { return shared != nullptr; }
     void adoptShared(const std::shared_ptr<std::atomic<U8*>>& s,bool,U8*) { shared=s; }
 };
 struct Process { unsigned id=1; };
@@ -66,8 +68,17 @@ static void check(bool ok,const char* why) {
     if(!ok) { std::fprintf(stderr,"FAIL: %s\n",why); std::exit(1); }
 }
 int main() {
-    const size_t size=boxedvn::NativeSharedAlias::pageSize()*2;
-    auto reserve=[&] { return static_cast<U8*>(mmap(nullptr,size,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0)); };
+    const size_t size=boxedvn::NativeSharedAlias::pageSize()*8;
+    auto reserve=[&] {
+        const size_t granule=boxedvn::NativeSharedAlias::pageSize();
+        auto raw=static_cast<U8*>(mmap(nullptr,size+granule,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0));
+        if(raw==MAP_FAILED) return raw;
+        auto aligned=reinterpret_cast<U8*>((reinterpret_cast<uintptr_t>(raw)+granule-1)&~(granule-1));
+        if(aligned!=raw) ::munmap(raw,aligned-raw);
+        const size_t suffix=size+granule-(aligned-raw)-size;
+        if(suffix) ::munmap(aligned+size,suffix);
+        return aligned;
+    };
     U8* a=reserve(); U8* b=reserve();
     check(a!=MAP_FAILED && b!=MAP_FAILED,"owned target ranges");
     KMemory64 memory;
@@ -88,5 +99,24 @@ int main() {
     bool created=false;
     auto late=getSharedFilePage("buffer",1,conflictingSeed.data(),4096,created);
     check(!created && late->data->load()[0]==0x99,"late mapping cannot reseed existing data");
+    // Model iOS's 16 KiB granule even when this CI host has 4 KiB pages.
+    if (boxedvn::NativeSharedAlias::pageSize()>4096) {
+        KMemory64 tailMemory;
+        U8* c=reserve();
+        check(c!=MAP_FAILED,"partial target reservation");
+        const U64 length=boxedvn::NativeSharedAlias::pageSize()*4+3*4096;
+        const U64 neighbour=((U64)c+length)>>12;
+        auto* tail=tailMemory.getOrAllocPage(neighbour,0,0);
+        tail->flags=K64_PAGE_MAPPED|K64_PAGE_READ;
+        check(tailMemory.mmapSharedFile((U64)c,length,3,"buffer",0,nullptr,0)==(U64)-K_EBUSY,"live tail neighbour must be preserved");
+        tail->flags=K64_PAGE_MAPPED; tail->lastWriter=K64_WRITER_MMAP_ANON;
+        tail->shared=shared->data;
+        check(tailMemory.mmapSharedFile((U64)c,length,3,"buffer",0,nullptr,0)==(U64)-K_EBUSY,"no-access neighbour with retained data must be preserved");
+        tail->shared.reset();
+        check(tailMemory.mmapSharedFile((U64)c,length,3,"buffer",0,nullptr,0)==(U64)c,"partial final host page over unused reservation");
+        check(c[4096]==0x99,"partial view retains existing file data");
+        check(tail->flags==K64_PAGE_MAPPED,"tail reservation does not acquire guest access");
+        ::munmap(c,size);
+    }
     std::puts("native shared-map regression passed (production mapper and Darwin VM)");
 }

@@ -2032,13 +2032,33 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
     const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);
     bool stableAliases = false;
 #if defined(__APPLE__)
-    // Full host pages can share physical backing at multiple guest addresses.
-    // Retain the existing subpage/KUSER path; never overwrite adjacent pages
-    // merely to make a 4 KiB request fit a 16 KiB host mapping.
+    // Starts and file offsets must agree with host-page boundaries. A final
+    // partial host page is safe only when its unrequested neighbours are free
+    // or untouched reservations; check them before changing any host mapping.
     const U64 aliasSize = boxedvn::NativeSharedAlias::pageSize();
     stableAliases = nativeIdentityMode() && !kuserRange && aliasSize &&
-        !(addr % aliasSize) && !(fileOffset % aliasSize) &&
-        !((pageCount << K64_PAGE_SHIFT) % aliasSize);
+        !(addr % aliasSize) && !(fileOffset % aliasSize);
+    if (stableAliases) {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        const U64 hostPages = (pageCount + aliasSize / K64_PAGE_SIZE - 1) /
+                              (aliasSize / K64_PAGE_SIZE) * (aliasSize / K64_PAGE_SIZE);
+        for (U64 i=pageCount;i<hostPages;++i) {
+            auto it=pages.find(pageStart+i);
+            if (it==pages.end()) continue;
+            const K64Page& neighbour=*it->second;
+            const bool empty = !(neighbour.flags & (K64_PAGE_MAPPED | K64_PAGE_PINNED));
+            const bool reservation = neighbour.flags==K64_PAGE_MAPPED &&
+                neighbour.lastWriter==K64_WRITER_MMAP_ANON && !neighbour.committed();
+            if (!empty && !reservation) {
+                static std::atomic<U32> tailReports{0};
+                if (tailReports.fetch_add(1,std::memory_order_relaxed)<16)
+                    klog_fmt("BOXEDWINE_X64_SHARED_ALIAS_TAIL_BUSY addr=0x%llx page=0x%llx flags=0x%x writer=%u",
+                        (unsigned long long)addr,(unsigned long long)((pageStart+i)<<K64_PAGE_SHIFT),
+                        neighbour.flags,neighbour.lastWriter);
+                return (U64)-K_EBUSY;
+            }
+        }
+    }
 #endif
     if (nativeIdentityMode()) {
         // Legacy subpage mappings promote one direct pointer. They cannot be

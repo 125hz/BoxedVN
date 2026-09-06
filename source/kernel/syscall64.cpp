@@ -770,6 +770,20 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
                 if (valid) for (unsigned i=0;i<stack.count;++i)
                     klog_fmt("BOXEDWINE_X64_WOW64_LOCK_CODE pid=%u tid=%u index=%u candidate=0x%x",
                         wpid,cpu->thread ? cpu->thread->id : 0,i,stack.codeCandidates[i]);
+                if (valid) {
+                    for (unsigned i=0;i<stack.frameCount;++i)
+                        klog_fmt("BOXEDWINE_X64_WOW64_LOCK_FRAME pid=%u tid=%u index=%u return=0x%x",
+                            wpid,cpu->thread ? cpu->thread->id : 0,i,stack.frameReturns[i]);
+                    boxedvn::visitWow64Modules(stack.teb32,read,[&](uint32_t base,uint32_t size,const char* name) {
+                        auto contains=[&](uint32_t a) { return a>=base && uint64_t(a)-base<size; };
+                        bool relevant=contains(stack.eip);
+                        for (unsigned i=0;i<stack.count;++i) relevant|=contains(stack.codeCandidates[i]);
+                        for (unsigned i=0;i<stack.frameCount;++i) relevant|=contains(stack.frameReturns[i]);
+                        if (relevant)
+                            klog_fmt("BOXEDWINE_X64_WOW64_LOCK_MODULE pid=%u tid=%u base=0x%x size=0x%x name=%s",
+                                wpid,cpu->thread ? cpu->thread->id : 0,base,size,name);
+                    });
+                }
             }
         }
         if (fd == 2 && strstr((const char*)buffer.data(), "Fontconfig error")) {

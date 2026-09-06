@@ -12,8 +12,12 @@ namespace boxedvn {
 class NativeSharedAlias {
 public:
     static size_t pageSize() {
+#ifdef BOXEDVN_NATIVE_ALIAS_TEST_GRANULE
+        return BOXEDVN_NATIVE_ALIAS_TEST_GRANULE;
+#else
         static const size_t value = static_cast<size_t>(sysconf(_SC_PAGESIZE));
         return value;
+#endif
     }
     NativeSharedAlias() {
         void* p = mmap(nullptr, pageSize(), PROT_READ | PROT_WRITE,

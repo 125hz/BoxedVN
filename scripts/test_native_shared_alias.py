@@ -14,6 +14,8 @@ fixture = fixture.replace("@REGISTRY@", registry).replace("@MAP_BODY@", body)
 with tempfile.TemporaryDirectory(prefix="boxedvn-shared-alias-") as tmp:
     cpp, exe = Path(tmp) / "test.cpp", Path(tmp) / "test"
     cpp.write_text(fixture, encoding="utf-8")
-    subprocess.run(["xcrun", "clang++", "-std=c++17", "-Wall", "-Wextra",
-                    "-I" + str(root / "include"), str(cpp), "-o", str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    for granule in [None, 16384]:
+        defines=[] if granule is None else [f"-DBOXEDVN_NATIVE_ALIAS_TEST_GRANULE={granule}"]
+        subprocess.run(["xcrun", "clang++", "-std=c++17", "-Wall", "-Wextra", *defines,
+                        "-I" + str(root / "include"), str(cpp), "-o", str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
