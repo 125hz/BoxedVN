@@ -29,6 +29,7 @@ WINE_VERSION=""
 WINE_SOURCE=""
 JOBS=""
 OSS_INCLUDE_DIR=""
+RUNTIME_INSTALL=""
 usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
                         WINE_VERSION="$2"; shift 2 ;;
         --wine-source)  [[ $# -ge 2 ]] || die "--wine-source needs a value"
                         WINE_SOURCE="$2"; shift 2 ;;
+        --runtime-install) RUNTIME_INSTALL="$2"; shift 2 ;;
         --jobs)         [[ $# -ge 2 ]] || die "--jobs needs a value"
                         JOBS="$2"; shift 2 ;;
         --oss-include-dir)
@@ -217,7 +219,9 @@ if patch --dry-run --silent --forward -d "${WINE_SOURCE}" -p1 < "${audio_patch}"
     python3 "${BOXEDVN_ROOT}/scripts/test_faudio_callback_locks.py" "${WINE_SOURCE}/libs/faudio/src/FAudio_internal.c" --expect-lock-cycle
     patch --forward -d "${WINE_SOURCE}" -p1 < "${audio_patch}"
 elif ! patch --dry-run --silent --reverse -d "${WINE_SOURCE}" -p1 < "${audio_patch}"; then
-    die "The FAudio callback-lock backport does not match this Wine source."
+    # New Wine releases already carry the upstream repair. Verify the actual
+    # callback lock transitions below instead of requiring an obsolete diff.
+    log "Checking upstream FAudio callback locking"
 fi
 python3 "${BOXEDVN_ROOT}/scripts/test_faudio_callback_locks.py" "${WINE_SOURCE}/libs/faudio/src/FAudio_internal.c"
 
@@ -226,7 +230,7 @@ python3 "${BOXEDVN_ROOT}/scripts/test_faudio_callback_locks.py" "${WINE_SOURCE}/
 # Only the one driver is built. Wine's make will build the tools it needs
 # (winebuild, widl, ...) and the generated headers on the way, which is a few
 # minutes rather than the half hour a full tree takes.
-BUILD="${WORK}/build-wow64-${WINE_VERSION:-source}"
+BUILD="${WORK}/build-wow64-${WINE_VERSION:-source}${RUNTIME_INSTALL:+-full}"
 mkdir -p "${BUILD}"
 if [[ ! -s "${BUILD}/Makefile" ]]; then
     log "Configuring Wine (x86_64 and i386 PE, x86_64 Unix)"
@@ -237,11 +241,17 @@ if [[ ! -s "${BUILD}/Makefile" ]]; then
         # CPPFLAGS is recorded in the generated Makefile and makedep emits it
         # on every compile line, unix and PE alike, so the shim stays
         # reachable for the whole build and not just for configure's probe.
+        configure_args=(--without-x --without-freetype)
+        if [[ -n "${RUNTIME_INSTALL}" ]]; then
+            configure_args=(--prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu
+                --without-alsa --without-pulse --without-wayland --without-udev
+                --without-usb --without-cups --without-sane --without-gphoto
+                --without-pcap --without-v4l2 --without-sdl)
+        fi
         CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${OSS_INCLUDE}" "${WINE_SOURCE}/configure" \
             --enable-archs=x86_64,i386 \
             --disable-tests \
-            --without-x \
-            --without-freetype
+            "${configure_args[@]}"
     ) || die "Wine's configure failed. Its config.log is at ${BUILD}/config.log."
 fi
 
@@ -328,3 +338,11 @@ cp "${pe_half}" "${OUTPUT_DIR}/wineoss.drv"
 ok "wineoss.so  -> ${OUTPUT_DIR}/wineoss.so"
 ok "wineoss.drv -> ${OUTPUT_DIR}/wineoss.drv"
 log "Pass this directory to scripts/build-wine64-runtime-ci.sh with --oss-driver-dir"
+
+if [[ -n "${RUNTIME_INSTALL}" ]]; then
+    mkdir -p "${RUNTIME_INSTALL}"
+    RUNTIME_INSTALL="$(cd "${RUNTIME_INSTALL}" && pwd)"
+    make -C "${BUILD}" -j"${JOBS}"
+    make -C "${BUILD}" DESTDIR="${RUNTIME_INSTALL}" install
+    printf '%s\n' "${WINE_VERSION}" > "${RUNTIME_INSTALL}/wine-version.txt"
+fi

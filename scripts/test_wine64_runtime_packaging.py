@@ -228,7 +228,8 @@ class WineserverPackagingContract(unittest.TestCase):
             self.assertIn(link, self.builder)
 
     def test_builder_links_wines_derived_data_root_to_packaged_nls(self) -> None:
-        self.assertIn("cp -aL /usr/share/wine", self.builder)
+        self.assertIn('WINE_SHARE="${WINE_INSTALL}/usr/share/wine"', self.builder)
+        self.assertIn('cp -aL "${WINE_SHARE}"', self.builder)
         self.assertIn(
             "guest_link /usr/share/wine /usr/lib/share/wine",
             self.builder,

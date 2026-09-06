@@ -199,7 +199,8 @@ fi
     || die "Manifest source must be the audited builder or the pinned Ubuntu CI builder."
 [[ -z "${MANIFEST}" || \
    "${MANIFEST_SOURCE_IMAGE}" == "boxedwine64/wine64-debian:bookworm" || \
-   "${MANIFEST_SOURCE_IMAGE}" == "ubuntu-24.04-apt" ]] \
+   "${MANIFEST_SOURCE_IMAGE}" == "ubuntu-24.04-apt" || \
+   "${MANIFEST_SOURCE_IMAGE}" == "wine-11.0-source-on-ubuntu-24.04" ]] \
     || die "Manifest source_image must identify the audited container or Ubuntu 24.04 package builder."
 if [[ "${MANIFEST_SOURCE}" == "scripts/build-wine64-runtime-ci.sh" ]]; then
     [[ "${MANIFEST_WINE_ADDRESS_CONTRACT}" == "stock-low-teb-hint-fixed-kuser-v1" ]] \

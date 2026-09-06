@@ -16,6 +16,7 @@
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 OUTPUT_DIR=""
+WINE_INSTALL=""
 DXMT_UNIXLIB=""
 # The x86-64 X11 client libraries built by scripts/build-boxedwine-x64-x11.sh.
 # Packaged under a directory of their own that a 64-bit launch places first
@@ -166,6 +167,7 @@ AUDIO_UNIX_DRIVERS=(winealsa winepulse wineoss)
 AUDIO_PE_MODULES=(mmdevapi.dll dsound.dll xaudio2_9.dll winmm.dll)
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --wine-install) WINE_INSTALL="$2"; shift 2 ;;
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir needs a value"
                        OUTPUT_DIR="$2"; shift 2 ;;
         --dxmt-unixlib) [[ $# -ge 2 ]] || die "--dxmt-unixlib needs a value"
@@ -309,6 +311,15 @@ find_first_elf64_x86_64() {
     return 1
 }
 
+if [[ -n "${WINE_INSTALL}" ]]; then
+    WINE_INSTALL="$(cd "${WINE_INSTALL}" && pwd)"
+    WINE_ROOT="${WINE_INSTALL}${WINE_MODULE_ROOT}"
+    WINE_UNIX="${WINE_ROOT}/x86_64-unix"
+    WINE_WINDOWS="${WINE_ROOT}/x86_64-windows"
+    WINE64="${WINE_UNIX}/wine"
+    WINE_SERVER="${WINE_INSTALL}/usr/bin/wineserver"
+    [[ "$(cat "${WINE_INSTALL}/wine-version.txt")" == "11.0" ]] || die "Expected pinned Wine 11.0"
+else
 WINE64="$(find_first \
     /usr/lib/wine/wine64 \
     /usr/lib/x86_64-linux-gnu/wine/wine64 \
@@ -342,6 +353,7 @@ WINE_SERVER="$(find_first_elf64_x86_64 \
     /usr/lib/wine/wineserver \
     /usr/lib/x86_64-linux-gnu/wine/wineserver)" \
     || die "The Ubuntu Wine package exposes no x86-64 ELF wineserver binary."
+fi
 is_elf64_x86_64 "${WINE64}" \
     || die "'${WINE64}' is not an x86-64 ELF executable."
 
@@ -968,9 +980,10 @@ fi
 # lookup re-scans and re-fails.
 mkdir -p "${STAGE}/home/username/.cache/fontconfig" "${STAGE}/var/cache/fontconfig"
 
-if [[ -d /usr/share/wine ]]; then
+WINE_SHARE="${WINE_INSTALL}/usr/share/wine"
+if [[ -d "${WINE_SHARE}" ]]; then
     mkdir -p "${STAGE}/usr/share"
-    cp -aL /usr/share/wine "${STAGE}/usr/share/"
+    cp -aL "${WINE_SHARE}" "${STAGE}/usr/share/"
 fi
 if [[ -d /usr/share/X11/locale ]]; then
     mkdir -p "${STAGE}/usr/share/X11"
@@ -1040,6 +1053,14 @@ pe32_guest_link() {
 # Compatibility for anything that still names the relocated layout. Nothing in
 # a launch resolves through these; they exist so that naming them is not a
 # silent failure.
+if [[ -n "${WINE_INSTALL}" ]]; then
+    # Wine 11 opens ntdll beside its loader; ntdll resolves its canonical Unix
+    # directory before deriving the PE trees and child-process loader path.
+    guest_link "${WINE_MODULE_ROOT}/x86_64-unix/ntdll.so" "${WINE_MODULE_ROOT}/ntdll.so"
+    printf '%s\n' '11.0' > "${STAGE}${WINE_MODULE_ROOT}/boxedvn-wine-version.txt"
+    mkdir -p "${PE32_STAGE}${WINE_MODULE_ROOT}"
+    printf '%s\n' '11.0' > "${PE32_STAGE}${WINE_MODULE_ROOT}/boxedvn-pe32-version.txt"
+fi
 guest_link "${WINE_MODULE_ROOT}/wine64" /usr/lib/wine/wine64
 guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/lib/wine/wineserver
 guest_link "${WINE_MODULE_ROOT}/wineserver64" /usr/lib/wine/wineserver64
@@ -1090,7 +1111,12 @@ sha256_file() {
     printf '%s\n' '# BoxedVN Wine64 runtime manifest v1.'
     printf '%s\n' 'format=boxedvn-wine64-v1'
     printf '%s\n' 'source=scripts/build-wine64-runtime-ci.sh'
-    printf '%s\n' 'source_image=ubuntu-24.04-apt'
+    if [[ -n "${WINE_INSTALL}" ]]; then
+        printf '%s\n' 'source_image=wine-11.0-source-on-ubuntu-24.04'
+    else
+        printf '%s\n' 'source_image=ubuntu-24.04-apt'
+    fi
+    [[ -z "${WINE_INSTALL}" ]] || printf '%s\n' 'wine_version=11.0'
     # Ubuntu's Wine64 is not being presented as an iOS-native Wine build.
     # Upstream Wine deliberately starts its 64-bit TEB allocation below 2 GiB
     # and publishes KUSER_SHARED_DATA at 0x7ffe0000.  The BoxedWine native
