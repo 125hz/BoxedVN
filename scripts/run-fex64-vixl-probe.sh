@@ -206,6 +206,7 @@ run_one() {
     FEX_BOXEDWINE_IRCAP_TARGET="${ircap_target}" \
     FEX_BOXEDWINE_ALIAS="${boxedwine_alias}" \
     FEX_SILENTLOG=0 \
+    FEX_DUMPGPRS=1 \
     FEX_MAXINST="${maxinst}" \
     FEX_MULTIBLOCK="${multiblock}" \
     FEX_TSOENABLED=0 \
