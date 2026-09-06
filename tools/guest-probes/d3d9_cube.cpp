@@ -199,11 +199,23 @@ bool updateVertices() {
     return SUCCEEDED(gVertexBuffer->Unlock());
 }
 
+struct FrameTiming {
+    unsigned frame = 0;
+    LONGLONG begin = 0, messages = 0;
+    bool active() const { return frame <= 16; }
+    LONGLONG stamp() const {
+        LARGE_INTEGER value = {};
+        if (active()) QueryPerformanceCounter(&value);
+        return value.QuadPart;
+    }
+} gFrameTiming;
+
 bool renderFrame() {
     if (!updateVertices()) {
         return false;
     }
 
+    const auto uploaded = gFrameTiming.stamp();
     gDevice->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
                    D3DCOLOR_XRGB(23, 28, 42), 1.0f, 0);
     if (SUCCEEDED(gDevice->BeginScene())) {
@@ -211,7 +223,27 @@ bool renderFrame() {
         gDevice->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 12);
         gDevice->EndScene();
     }
-    return SUCCEEDED(gDevice->Present(nullptr, nullptr, nullptr, nullptr));
+    const auto drawn = gFrameTiming.stamp();
+    const HRESULT result = gDevice->Present(nullptr, nullptr, nullptr, nullptr);
+    const auto presented = gFrameTiming.stamp();
+    if (gFrameTiming.active()) {
+        LARGE_INTEGER frequency = {};
+        QueryPerformanceFrequency(&frequency);
+        auto micros = [&](LONGLONG from, LONGLONG to) {
+            return frequency.QuadPart > 0 ? (to - from) * 1000000 / frequency.QuadPart : -1;
+        };
+        char report[256];
+        const int length = std::snprintf(report, sizeof(report),
+            "BOXEDWINE_PE32_FRAME_TIMING frame=%u message_us=%lld upload_us=%lld draw_us=%lld present_us=%lld result=0x%08lx\n",
+            gFrameTiming.frame, micros(gFrameTiming.begin, gFrameTiming.messages),
+            micros(gFrameTiming.messages, uploaded), micros(uploaded, drawn),
+            micros(drawn, presented), static_cast<unsigned long>(result));
+        if (length > 0 && length < int(sizeof(report))) {
+            DWORD written;
+            WriteFile(GetStdHandle(STD_ERROR_HANDLE), report, DWORD(length), &written, nullptr);
+        }
+    }
+    return SUCCEEDED(result);
 }
 
 LRESULT CALLBACK windowProcedure(HWND window, UINT message,
@@ -284,6 +316,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
     MSG message = {};
     bool running = true;
     while (running) {
+        if (gFrameTiming.frame <= 16) ++gFrameTiming.frame;
+        gFrameTiming.begin = gFrameTiming.stamp();
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) {
                 running = false;
@@ -292,6 +326,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        gFrameTiming.messages = gFrameTiming.stamp();
         if (running && !renderFrame()) {
             Sleep(16);
         }

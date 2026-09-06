@@ -848,6 +848,9 @@ static bool emulateLegacySyscall(BVNFEXCPU64Adapter* adapter,
         segment->S = 1;
         segment->DPL = 3;
         segment->Type = 0x3; // data, read/write, accessed
+        if (legacy.descriptor.entry < std::size(frame->State.private_gdt)) {
+            frame->State.private_gdt[legacy.descriptor.entry] = *segment;
+        }
     }
     cpu->rip += legacy.instructionLength;
     return true;

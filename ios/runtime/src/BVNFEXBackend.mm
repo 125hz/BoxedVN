@@ -308,6 +308,10 @@ inline void publishGuestDescriptorTable(
     FEXCore::Core::CPUState& state,
     FEXCore::Core::CPUState::gdt_segment* table) {
     initialiseGuestDescriptorTable(table, guestWow64ModeSwitchEnabled());
+    // The translator reads common TLS descriptors through host context loads.
+    // Keep this bounded mirror separate from the full GDT/LDT fallback table.
+    static_assert(sizeof(state.private_gdt) / sizeof(state.private_gdt[0]) == 32);
+    std::copy_n(table, std::size(state.private_gdt), state.private_gdt);
     state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] =
         table;
     // The LDT was left null. A selector with its table indicator set would

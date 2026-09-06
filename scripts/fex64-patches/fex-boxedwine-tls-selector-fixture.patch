@@ -1,0 +1,22 @@
+diff --git a/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp b/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp
+--- a/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp
++++ b/Source/Tools/TestHarnessRunner/TestHarnessRunner.cpp
+@@ -403,6 +403,18 @@
+       return 1;
+     }
+ 
++    if (const char* TLSFixture = std::getenv("FEX_BOXEDWINE_TLS_GDT"); TLSFixture && TLSFixture[0] == '1') {
++      auto& State = ParentThread->Thread->CurrentFrame->State;
++      for (unsigned i = 12; i <= 13; ++i) {
++        auto& Descriptor = State.private_gdt[i];
++        Descriptor = {};
++        FEXCore::Core::CPUState::SetGDTBase(&Descriptor, 0x200000 + (i - 12) * 0x10000);
++        FEXCore::Core::CPUState::SetGDTLimit(&Descriptor, 0xfffff);
++        Descriptor.P = 1; Descriptor.S = 1; Descriptor.DPL = 3;
++        Descriptor.Type = 3; Descriptor.G = 1; Descriptor.D = 1;
++      }
++    }
++
+     int LongJumpVal = setjmp(LongJumpHandler::LongJump);
+     if (!LongJumpVal) {
+       CTX->ExecuteThread(ParentThread->Thread);

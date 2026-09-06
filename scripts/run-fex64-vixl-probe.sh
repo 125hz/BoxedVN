@@ -40,9 +40,15 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-boxedwine-call-return-witness.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-inline-call-return.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-longmode-segment-base.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-longmode-segment-selector-write.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-far-transfer-witness.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-per-block-decode-mode.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-host-served-segment-base.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-inline-tls-selector.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-x87-context-slot-access.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-x87-restore-stack-order.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-harness-alias.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-tls-selector-fixture.patch"
 )
 
 die() {
@@ -250,6 +256,7 @@ prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov
 prepare_fixture "${fixture_top_alias_stack}" fex64-top-alias-stack
 prepare_fixture "${fixture_dispatcher_return}" fex64-dispatcher-return
 prepare_fixture "${fixture_highstack_callret}" fex64-highstack-callret
+prepare_fixture "${root}/scripts/guest-probes/fex64-tls-selector.asm" fex64-tls-selector
 
 # Single-block and multiblock modes catch both the scalar dispatcher path and
 # the optimized cyclic control-flow path implicated by the loader stall.
@@ -424,4 +431,13 @@ run_one x64-dispatcher-return-alias "${tmp_dir}/fex64-dispatcher-return.bin" \
 run_one x64-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin"     "${tmp_dir}/fex64-highstack-callret.config.bin" 1 0 "" 1
 run_one x64-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin"     "${tmp_dir}/fex64-highstack-callret.config.bin" 500 0 "" 1
 run_one x64-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin"     "${tmp_dir}/fex64-highstack-callret.config.bin" 500 1 "" 1
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, dispatcher-return and high-stack call/ret fixtures completed in all modes"
+
+# Context-based TLS reloads, with aliasing on: a guest memory load of the
+# descriptor table would address the wrong lane and fail this fixture.
+for block_size in 1 500; do
+    FEX_BOXEDWINE_TLS_GDT=1 run_one x64-tls-selector "${tmp_dir}/fex64-tls-selector.bin" \
+        "${tmp_dir}/fex64-tls-selector.config.bin" "${block_size}" 0 "" 1
+done
+FEX_BOXEDWINE_TLS_GDT=1 run_one x64-tls-selector "${tmp_dir}/fex64-tls-selector.bin" \
+    "${tmp_dir}/fex64-tls-selector.config.bin" 500 1 "" 1
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, dispatcher-return and high-stack call/ret and TLS-selector fixtures completed in all modes"

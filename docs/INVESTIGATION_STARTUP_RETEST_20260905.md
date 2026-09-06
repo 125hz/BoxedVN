@@ -267,3 +267,57 @@ References:
 - https://github.com/wine-mirror/wine/blob/wine-9.0/server/mapping.c
 - https://github.com/wine-mirror/wine/blob/wine-9.0/server/fd.c
 - https://man7.org/linux/man-pages/man2/mmap.2.html
+
+## Device revision 82819d59, rotating-cube retest
+
+Logs 201224 (64-bit game), 201820 (cube), and 202049 (32-bit visual novel)
+identify 82819d59+dirty. The shared-clock fix is now accepted on device:
+the cube rotates and its elapsed time and vertex bits advance. The cube
+then presents about 2 frames/sec. Native present/acquire calls account for
+only a small part of each interval, with about 0.1 host cores busy; sampled
+application threads mostly wait in Wine's thread-alert futex path. The log
+ends while those threads and presents still make progress, so it does not
+identify a terminal crash or prove the cause of the reported UI freeze.
+
+The visual novel still submits graphics pipelines without shader stages,
+and the 64-bit game still reads a null data pointer at image offset 0xdb6c5.
+These failures are not established as consequences of Wine's version.
+
+Read-only disassembly of the bundled Unix ntdll identifies the frequently
+sampled instructions at offsets 0x3ba73 and 0x3bc39 as
+`mov fs,word ptr gs:[0x338]`, in the syscall and Unix-call return paths.
+The visual-novel log accumulates over 1.2 million handled host exceptions;
+the earlier bounded SEGMENT_WRITE witnesses identify this ordinary TLS
+reload. Our maintained translator patch deliberately served every such
+reload through a GP trap and Darwin signal round-trip.
+
+Mirror the first 32 descriptors into the existing CPUState private_gdt at
+initialization and update the corresponding slot after legacy descriptor
+installation. A maintained FEX patch now uses indexed host CONTEXT loads
+for MOV FS/GS with a present ring-3 data descriptor in that GDT range.
+It checks the selector and access bits before accepting the result, replaces
+the full 64-bit cached base, and preserves guest flags. Other selectors,
+including LDT/null selectors, and POP FS/GS retain the existing host path.
+The vendor checkout is unchanged. The patch participates in both native
+and VIXL build cache keys.
+
+A VIXL fixture executes Wine's exact memory-source instruction, a second
+selector, GS reload, nonzero old upper base bits, segment-relative reads,
+and flag preservation with guest aliasing enabled. CI runs small/large
+blocks and optimized code. Local host tests, exit-dispatch contracts, and
+34 graphics-probe checks pass; the IA-32 probe compiles and validates.
+The cube also emits at most 16 per-frame timing lines for message handling,
+vertex updates, drawing, and Present. Removing TLS signal overhead is not
+proof that the 2 FPS wait or either application failure is resolved.
+
+Wine version decision: current runtime packaging uses Ubuntu's Wine 9.0.
+Wine 11 makes new WoW64 fully supported and improves Vulkan/wined3d,
+but removes the wine64 loader and adds interfaces our custom bridges must
+support. NTSync's Linux kernel acceleration is not automatically available
+inside BoxedWine. Keep Wine 9 for this isolated runtime correction; treat
+Wine 11 as a separately validated runtime migration, including loader,
+matching PE/Unix modules, Vulkan/X11 interfaces, audio, and synchronization.
+
+References:
+- https://github.com/wine-mirror/wine/blob/wine-11.0/ANNOUNCE.md
+- https://github.com/wine-mirror/wine/blob/wine-9.0/dlls/ntdll/unix/signal_x86_64.c

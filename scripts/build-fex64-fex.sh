@@ -193,6 +193,9 @@ apply_patch fex-boxedwine-per-block-decode-mode.patch
 # the alias is armed, so the base a 32-bit block reads out of fs_cached is
 # always the one the host published.
 apply_patch fex-boxedwine-host-served-segment-base.patch
+# Use the bounded host-context GDT mirror for ordinary ring-3 TLS reloads.
+# Other selectors retain the signal-based fallback above.
+apply_patch fex-boxedwine-inline-tls-selector.patch
 # Depends on the per-block decode mode patch above, whose decode-mode witness
 # it extends, and on the block-diagnostics patch, whose iretq witness it takes
 # off the block trace's credit. Wine's wow64cpu enters 32-bit code with

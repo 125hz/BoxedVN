@@ -1,0 +1,103 @@
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -1297,6 +1297,51 @@
+   // We don't currently support FS/GS selector modifying, so this needs to be asserted out
+   // The loads here also load the selector, NOT the base
+ 
++  // BoxedWine mirrors the small GDT in CPUState so ordinary TLS selector
++  // reloads can use host context loads instead of a signal and guest restart.
++  // Only present ring-3 data descriptors in that mirror qualify. Everything
++  // else keeps the existing host-served path, including LDT and null selectors.
++  auto WriteHostedSelector = [&](Ref Selector, bool FS) {
++    const auto SelectorOffset = FS ? offsetof(Core::CPUState, fs_idx) : offsetof(Core::CPUState, gs_idx);
++    const auto BaseOffset = FS ? offsetof(Core::CPUState, fs_cached) : offsetof(Core::CPUState, gs_cached);
++    _StoreContextGPR(OpSize::i16Bit, Selector, SelectorOffset);
++    Ref Descriptor {};
++    Ref FastBlock {};
++    if (CTX->GetGuestLowAliasBase() != 0) {
++      auto Index = _Bfe(OpSize::i32Bit, 5, 3, Selector);
++      Descriptor = _LoadContextGPRIndexed(Index, OpSize::i64Bit, offsetof(Core::CPUState, private_gdt), 8);
++      auto Access = _Bfe(OpSize::i64Bit, 8, 40, Descriptor);
++      auto ValidSelector = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ,
++          _And(OpSize::i32Bit, Selector, Constant(0xff07)), Constant(3), Constant(1), Constant(0));
++      auto ValidDescriptor = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ,
++          _And(OpSize::i32Bit, Access, Constant(0xf8)), Constant(0xf0), Constant(1), Constant(0));
++      auto Valid = _And(OpSize::i32Bit, ValidSelector, ValidDescriptor);
++      FastBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++      auto SlowBlock = CreateNewCodeBlockAtEnd();
++      CondJump(Valid, Constant(0), FastBlock, SlowBlock, CondClass::NEQ, OpSize::i32Bit);
++      SetCurrentCodeBlock(SlowBlock);
++      StartNewBlock();
++    }
++    _StoreContextGPR(GetGPROpSize(), GetRelocatedPC(Op, -Op->InstSize), offsetof(Core::CPUState, rip));
++    Break(IR::BreakDefinition {
++      .ErrorRegister = 0, .Signal = Core::FAULT_SIGSEGV,
++      .TrapNumber = X86State::X86_TRAPNO_GP, .si_code = 0x80,
++    });
++    if (FastBlock) {
++      // Complete the fallback CFG block; Break transfers control to the host.
++      ExitRelocatedPC(Op, -Op->InstSize);
++      SetCurrentCodeBlock(FastBlock);
++      StartNewBlock();
++      auto Upper = _Lshr(OpSize::i64Bit, Descriptor, Constant(32));
++      auto HighBase = _And(OpSize::i32Bit, Upper, Constant(0xff000000));
++      auto Merged = _Orlshr(OpSize::i32Bit, HighBase, Descriptor, 16);
++      auto Base = _Bfi(OpSize::i32Bit, 8, 16, Merged, Upper);
++      // A selector reload replaces the entire base, including an old 64-bit
++      // arch_prctl/WRFSBASE value. It does not alter guest arithmetic flags.
++      _StoreContextGPR(OpSize::i64Bit, _Bfe(OpSize::i64Bit, 32, 0, Base), BaseOffset);
++    }
++  };
++
+   if (ToSeg) {
+     Ref Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], OpSize::i16Bit, Op->Flags);
+ 
+@@ -1337,22 +1382,7 @@
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
+       } else {
+-        // BoxedWine: a long-mode selector write is served by the host. The
+-        // selector is stored first, then the instruction traps as a GP fault
+-        // (trap 13, si_code 0x80, the way an unhandled int traps in long
+-        // mode); the host fault handler reads the descriptor the selector
+-        // names, sets the segment base, and resumes after the instruction.
+-        // Wine's WoW64 layer writes FS this way right after set_thread_area.
+-        // Left as a decode failure, the block compiled empty and the thread
+-        // re-entered the same RIP forever.
+-        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+-        _StoreContextGPR(GetGPROpSize(), GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
+-        Break(FEXCore::IR::BreakDefinition {
+-          .ErrorRegister = 0,
+-          .Signal = Core::FAULT_SIGSEGV,
+-          .TrapNumber = X86State::X86_TRAPNO_GP,
+-          .si_code = 0x80,
+-        });
++        WriteHostedSelector(Src, false);
+       }
+       break;
+     case FEXCore::X86State::REG_RSP: // FS
+@@ -1364,22 +1394,7 @@
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
+       } else {
+-        // BoxedWine: a long-mode selector write is served by the host. The
+-        // selector is stored first, then the instruction traps as a GP fault
+-        // (trap 13, si_code 0x80, the way an unhandled int traps in long
+-        // mode); the host fault handler reads the descriptor the selector
+-        // names, sets the segment base, and resumes after the instruction.
+-        // Wine's WoW64 layer writes FS this way right after set_thread_area.
+-        // Left as a decode failure, the block compiled empty and the thread
+-        // re-entered the same RIP forever.
+-        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+-        _StoreContextGPR(GetGPROpSize(), GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
+-        Break(FEXCore::IR::BreakDefinition {
+-          .ErrorRegister = 0,
+-          .Signal = Core::FAULT_SIGSEGV,
+-          .TrapNumber = X86State::X86_TRAPNO_GP,
+-          .si_code = 0x80,
+-        });
++        WriteHostedSelector(Src, true);
+       }
+       break;
+     default: UnimplementedOp(Op); return;
