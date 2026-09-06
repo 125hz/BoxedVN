@@ -157,7 +157,7 @@ diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
 +      auto sampler = m_dxvkDevice->createSampler(key);
 +      const uint32_t count = m_d3d9Options.deAliasedSamplers ? SamplerVariantCount : 1u;
 +      for (uint32_t v = 0; v < count; v++)
-+        ctx->bindResourceSampler(stage, cSlot + v, sampler);
++        ctx->bindResourceSampler(stage, cSlot + v, Rc<DxvkSampler>(sampler));
  
        // Let the main thread know about current sampler stats
        uint64_t liveCount = m_dxvkDevice->getSamplerStats().liveCount;
