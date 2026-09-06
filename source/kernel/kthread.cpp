@@ -1085,7 +1085,20 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
         return -K_ENOSYS;
     }
     const U32 command = op & FUTEX_CMD_MASK;
-    U8* ram = guestMemory->getRamPtr(addr, sizeof(U32));
+    // Native multithreaded waits block inside this syscall, so its return is
+    // the end of the raw pointer's lifetime. Cooperative waits return while
+    // parked and retain their existing lifetime rule.
+    bool scopedPin = false;
+#ifdef BOXEDWINE_MULTI_THREADED
+    scopedPin = guestMemory->nativeIdentityMode();
+#endif
+    U8* ram = guestMemory->getRamPtr(addr, sizeof(U32), scopedPin);
+    struct RamLease {
+        KMemory64* memory;
+        U64 address;
+        bool active;
+        ~RamLease() { if (active) memory->releaseRamPtr(address); }
+    } ramLease {guestMemory, addr, scopedPin && ram != nullptr};
     if (!ram) {
         // The one error the guest never sees. Wine's futex_wake_one and
         // glibc's lll_futex_wake both discard the return value, so a wake that

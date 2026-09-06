@@ -1076,7 +1076,9 @@ void KMemory64::cloneFrom(const KMemory64* from) {
     pages.reserve(from->pages.size());
     for (const auto& kv : from->pages) {
         auto copy = std::make_unique<K64Page>();
-        copy->writeFlags(kv.second->flags, K64_WRITER_CLONE,
+        // The child inherits contents and guest rights, not host pointers or
+        // active leases belonging to threads in the parent's address space.
+        copy->writeFlags(kv.second->flags & ~K64_PAGE_PINNED, K64_WRITER_CLONE,
                          k64NextPageWriteStamp());
         // Only copy backing store for committed pages; an uncommitted page in
         // the parent (reserved but never touched) stays uncommitted in the child.
@@ -1878,6 +1880,12 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
                 if (it != pages.end() && (it->second->flags & K64_PAGE_PINNED)) {
                     // A host pointer handed to a futex/atomic caller cannot be
                     // invalidated by MAP_FIXED while that caller may use it.
+                    static std::atomic<U32> reports {0};
+                    if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+                        klog_fmt("BOXEDWINE_X64_PINNED_MAP addr=0x%llx page=0x%llx leases=%u permanent=%d",
+                            (unsigned long long)addr,
+                            (unsigned long long)((pageStart + i) << K64_PAGE_SHIFT),
+                            it->second->ramPointerLeases, it->second->permanentRamPin ? 1 : 0);
                     return (U64)-K_EBUSY;
                 }
                 if (it != pages.end()) it->second->demoteNativeShared();
@@ -2089,6 +2097,7 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
                 // A sparse wineserver can retain this alias after the FEX client
                 // logically unmaps it. Keep the host page until the identity
                 // address space itself is destroyed.
+                page->permanentRamPin = true;
                 page->writeFlags(page->flags | K64_PAGE_PINNED,
                                  K64_WRITER_MMAP_FILE, stamp);
             }
@@ -2892,20 +2901,16 @@ void KMemory64::writeb(U64 addr, U8 value) {
     data[addr & K64_PAGE_MASK] = value; // commit-on-write (MT-safe)
 }
 
-U8* KMemory64::getRamPtr(U64 addr, U32 len) {
+U8* KMemory64::getRamPtr(U64 addr, U32 len, bool scoped) {
     U64 offsetInPage = addr & K64_PAGE_MASK;
     if (offsetInPage + len > K64_PAGE_SIZE) {
         // Would span two pages — host pointer wouldn't be contiguous.
         return nullptr;
     }
-    // Commit + PIN atomically under pagesMutex. Callers (the 64-bit futex table,
-    // atomic RMW in common_lock) keep this raw host pointer across a blocking
-    // wait. If a concurrent munmap decommitted the buffer, a re-commit would move
-    // it and the futex wake would target a stale address. The pin flag tells
-    // munmap/mprotect to free the address space but LEAVE this page's buffer in
-    // place. Once allocated, the buffer is never reallocated, so the returned
-    // pointer stays valid. The commit must be locked (see commitPageLocked) so a
-    // sibling thread's first-touch of the same page can't orphan our buffer.
+    // Commit and pin atomically. Scoped callers release after their last raw
+    // pointer use; the legacy handout retains a permanent pin. Munmap keeps
+    // backing while either kind is live, so a blocking waiter cannot retain a
+    // dangling pointer. Concurrent waits on the same page each own a lease.
     // Conservative for the block cache: a raw host pointer can be written
     // through at any later time (futex words, LOCK RMW), so treat the handout
     // itself as a write to the page.
@@ -2922,11 +2927,28 @@ U8* KMemory64::getRamPtr(U64 addr, U32 len) {
             return nullptr;
         }
 #endif
+        if (scoped) ++page->ramPointerLeases;
+        else page->permanentRamPin = true;
         page->writeFlags(page->flags | K64_PAGE_PINNED, K64_WRITER_PIN,
                          k64NextPageWriteStamp());
         data = page->commit();
     }
     return data + offsetInPage;
+}
+
+void KMemory64::releaseRamPtr(U64 addr) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+    auto it = pages.find(addr >> K64_PAGE_SHIFT);
+    if (it == pages.end() || !it->second->ramPointerLeases) return;
+    K64Page* page = it->second.get();
+    --page->ramPointerLeases;
+    if (!page->ramPointerLeases && !page->permanentRamPin) {
+        page->writeFlags(page->flags & ~K64_PAGE_PINNED,
+                         K64_WRITER_PIN, k64NextPageWriteStamp());
+    }
+    // A concurrent munmap may have removed guest rights while retaining the
+    // pinned backing. Leave that storage intact here; the next mapping can
+    // now replace it safely, and address-space destruction still owns it.
 }
 
 void KMemory64::writew(U64 addr, U16 value) { memcpyToGuest(addr, &value, 2); }

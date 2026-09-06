@@ -433,6 +433,10 @@ struct K64Page {
     // When set, `data` points into an OS mmap at the guest address and is not
     // owned by this slot. The KMemory64 owner unmaps native ranges first.
     bool dataNative = false;
+    // Protected by KMemory64::pagesMutex. A transient syscall lease must not
+    // turn an ordinary anonymous page into a process-lifetime reservation.
+    U32 ramPointerLeases = 0;
+    bool permanentRamPin = false;
     ~K64Page() { if (!dataShared && !dataNative) delete[] data; }
     // The ONLY way `flags` is written. Going through one function is what makes
     // "which operation last changed this page's rights" answerable at all, and
@@ -831,8 +835,12 @@ public:
     // allocated on demand if not yet present. Returns nullptr only if the
     // range would cross a page boundary (callers — futex words — are always
     // 4-byte aligned within a 4096-byte page, so this never happens in
-    // practice; the check guards against a misaligned caller).
-    U8* getRamPtr(U64 addr, U32 len);
+    // practice; the check guards against a misaligned caller). Scoped handouts
+    // hold one lease until releaseRamPtr; unscoped handouts pin permanently.
+    U8* getRamPtr(U64 addr, U32 len, bool scoped = false);
+    // Pair only with a successful scoped getRamPtr; the caller must have
+    // stopped dereferencing the pointer before releasing its lease.
+    void releaseRamPtr(U64 addr);
 
     // Deep-copy every mapped page from `from` into this (empty) address space.
     // Used by fork (KProcess::clone64 non-thread): the child gets an independent

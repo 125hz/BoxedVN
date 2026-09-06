@@ -1,0 +1,72 @@
+// Exercise the shipping pointer acquisition/release and futex scope guard.
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <map>
+#include <mutex>
+#include <thread>
+using U64=uint64_t; using U32=uint32_t; using U8=uint8_t;
+constexpr U64 K64_PAGE_SIZE=4096, K64_PAGE_MASK=4095, K64_PAGE_SHIFT=12;
+constexpr U32 K64_PAGE_MAPPED=1, K64_PAGE_READ=2, K64_PAGE_WRITE=4, K64_PAGE_PINNED=0x40, K64_WRITER_PIN=6;
+#define BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(m) std::lock_guard<std::mutex> lock(m)
+#define BOXEDWINE_MULTI_THREADED 1
+static unsigned k64NextPageWriteStamp() { return 1; }
+struct K64Page {
+    U32 ramPointerLeases=0, flags=0;
+    bool permanentRamPin=false;
+    U8 data[4096]{};
+    U8* commit() { return data; }
+    void writeFlags(U32 f,U32,unsigned) { flags=f; }
+};
+struct KMemory64 {
+    std::mutex pagesMutex;
+    std::map<U64,std::unique_ptr<K64Page>> pages;
+    bool nativeIdentityMode() { return true; }
+    void noteGuestWrite(U64) {}
+    K64Page* getOrAllocPage(U64 p,U32 flags,U32) {
+        auto& page=pages[p];
+        if(!page) { page=std::make_unique<K64Page>(); page->flags=flags; }
+        return page.get();
+    }
+    U8* getRamPtr(U64,U32,bool=false);
+    void releaseRamPtr(U64);
+};
+@BOXEDVN_RAM_LEASE_BODY@
+
+static void syscallScope(KMemory64* guestMemory,U64 addr,bool fail) {
+@BOXEDVN_FUTEX_RAM_GUARD@
+    if(!ram) return;
+    if(fail) throw 1;
+    *ram=7;
+}
+static void check(bool ok,const char* why) {
+    if(!ok) { std::fprintf(stderr,"FAIL: %s\n",why); std::exit(1); }
+}
+int main() {
+    KMemory64 memory;
+    constexpr U64 address=0x101700004;
+    syscallScope(&memory,address,false);
+    auto& page=*memory.pages[address>>12];
+    check(page.ramPointerLeases==0 && !(page.flags & K64_PAGE_PINNED),"normal futex return releases pin");
+    try { syscallScope(&memory,address,true); } catch(int) {}
+    check(page.ramPointerLeases==0 && !(page.flags & K64_PAGE_PINNED),"exception exit releases pin");
+    auto* first=memory.getRamPtr(address,4,true);
+    auto* second=memory.getRamPtr(address+8,4,true);
+    check(second==first+8 && page.ramPointerLeases==2,"overlapping users own independent leases");
+    memory.releaseRamPtr(address);
+    check(page.flags & K64_PAGE_PINNED,"remaining waiter keeps backing pinned");
+    // Model the guest rights cleared by munmap while a waiter retains backing.
+    page.flags=K64_PAGE_PINNED;
+    memory.releaseRamPtr(address+8);
+    check(page.flags==0,"released mapping has no stale pin after final waiter returns");
+    std::thread one([&] { for(int i=0;i<10000;++i) syscallScope(&memory,address,false); });
+    std::thread two([&] { for(int i=0;i<10000;++i) syscallScope(&memory,address+8,false); });
+    one.join(); two.join();
+    check(!page.ramPointerLeases && !(page.flags & K64_PAGE_PINNED),"concurrent repeated waits leave no permanent pin");
+    memory.getRamPtr(address,4);
+    syscallScope(&memory,address,false);
+    check(page.permanentRamPin && (page.flags & K64_PAGE_PINNED),"legacy persistent pin survives transient release");
+    check(memory.getRamPtr(address|4095,4,true)==nullptr,"cross-page failure acquires no lease");
+    std::puts("guest pointer lease regression passed");
+}

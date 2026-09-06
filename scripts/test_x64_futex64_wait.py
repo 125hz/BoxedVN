@@ -617,7 +617,7 @@ class AWakeThatCannotResolveItsWordSaysSo(unittest.TestCase):
     def test_the_command_is_known_before_the_word_is_resolved(self) -> None:
         command = self.body.index("const U32 command = op & FUTEX_CMD_MASK;")
         ram = self.body.index(
-            "U8* ram = guestMemory->getRamPtr(addr, sizeof(U32));")
+            "U8* ram = guestMemory->getRamPtr(addr, sizeof(U32), scopedPin);")
         self.assertLess(command, ram)
 
     def test_the_fault_is_reported_before_it_is_returned(self) -> None:
