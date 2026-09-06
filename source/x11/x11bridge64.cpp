@@ -36,6 +36,7 @@
 #include "x11bridge64.h"
 #include "x11.h"
 #include "x11layout64.h"
+#include "xinput2.h"
 #include "xpixmapformats.h"
 #include "cpu64.h"
 #include "kmemory64.h"
@@ -656,7 +657,13 @@ void writeEvent64(const XEvent& event, U64 display, U8* out) {
     case GenericEvent:
         L::put32(out, generic::extension, (U32)event.xgeneric.extension);
         L::put32(out, generic::evtype, (U32)event.xgeneric.evtype);
-        L::put32(out, generic::cookie, event.xcookie.cookie);
+        L::put32(out, generic::cookie, event.xcookie.data); // event time
+        if (event.xcookie.evtype == XI_RawMotion) {
+            XIRawEvent raw = {};
+            raw.unserialize((U32*)&event.pad[8]);
+            L::put64(out, generic::data, (U64)raw.valuators.maskAddress |
+                ((U64)raw.valuators.valuesAddress << 32)); // signed dx, dy
+        }
         break;
     default:
         L::put64(out, any::window, event.xany.window);
@@ -718,6 +725,18 @@ void readEvent64(const U8* in, XEvent& event) {
         event.xselection.property = (U32)L::get64(in, selection::property);
         event.xselection.time = (U32)L::get64(in, selection::time);
         break;
+    case GenericEvent: {
+        event.xcookie.extension = (S32)L::get32(in, generic::extension);
+        event.xcookie.evtype = (S32)L::get32(in, generic::evtype);
+        event.xcookie.data = L::get32(in, generic::cookie);
+        event.xcookie.cookie = 3;
+        XIRawEvent raw = {};
+        const U64 payload = L::get64(in, generic::data);
+        raw.valuators.maskAddress = (U32)payload;
+        raw.valuators.valuesAddress = (U32)(payload >> 32);
+        raw.serialize((U32*)&event.pad[8]);
+        break;
+    }
     default:
         event.xany.window = (U32)L::get64(in, any::window);
         break;
@@ -2607,13 +2626,25 @@ S64 op_QUERY_EXTENSION(Call& call) {
     if (call.faulted) {
         return BOXEDWINE_X64_X11_E_FAULT;
     }
-    // No extension is offered to the 64-bit driver yet: XInput2, RENDER,
-    // MIT-SHM and the rest all report absent so Wine takes its core paths.
+    if (name == "XInputExtension") {
+        if (call.arg(2)) call.write32(call.arg(2), XServer::getServer()->getExtensionInput2());
+        if (call.arg(3)) call.write32(call.arg(3), 0);
+        if (call.arg(4)) call.write32(call.arg(4), 0);
+        return call.faulted ? BOXEDWINE_X64_X11_E_FAULT : 1;
+    }
+    // Other extensions report absent so Wine takes its core fallback paths.
     if (firstTime(call.pid, std::string("ext:") + name.c_str())) {
         klog_fmt("BOXEDWINE_X64_X11_BRIDGE pid=%u op=query-extension name='%s' result=absent",
                  call.pid, name.c_str());
     }
     return 0;
+}
+
+S64 op_XI_SELECT_EVENTS(Call& call) {
+    REQUIRE_ARGS(3);
+    REQUIRE_DISPLAY(data, 0);
+    if (!XServer::getServer()->getWindow((U32)call.arg(1))) return BadWindow;
+    return data->setInput2Mask((U32)call.arg(1), (U32)call.arg(2));
 }
 
 S64 op_SET_SELECTION_OWNER(Call& call) {

@@ -179,6 +179,7 @@ if [[ -n "${MANIFEST}" ]]; then
             winsxs_manifests_x86) MANIFEST_WINSXS_MANIFESTS_X86="${value}" ;;
             source)         MANIFEST_SOURCE="${value}" ;;
             source_image)   MANIFEST_SOURCE_IMAGE="${value}" ;;
+            wine_version)   MANIFEST_WINE_VERSION="${value}" ;;
             wine_address_contract) MANIFEST_WINE_ADDRESS_CONTRACT="${value}" ;;
             boxedwine_bridge_required) MANIFEST_BOXEDWINE_BRIDGE_REQUIRED="${value}" ;;
             *)              die "Unsupported Wine64 manifest key '${key}'." ;;
@@ -202,6 +203,9 @@ fi
    "${MANIFEST_SOURCE_IMAGE}" == "ubuntu-24.04-apt" || \
    "${MANIFEST_SOURCE_IMAGE}" == "wine-11.0-source-on-ubuntu-24.04" ]] \
     || die "Manifest source_image must identify the audited container or Ubuntu 24.04 package builder."
+if [[ "${MANIFEST_SOURCE_IMAGE}" == "wine-11.0-source-on-ubuntu-24.04" ]]; then
+    [[ "${MANIFEST_WINE_VERSION:-}" == "11.0" ]] || die "Wine 11 source runtime has no matching version"
+fi
 if [[ "${MANIFEST_SOURCE}" == "scripts/build-wine64-runtime-ci.sh" ]]; then
     [[ "${MANIFEST_WINE_ADDRESS_CONTRACT}" == "stock-low-teb-hint-fixed-kuser-v1" ]] \
         || die "Ubuntu CI Wine64 manifest must record Wine's low-TEB/fixed-KUSER address contract."

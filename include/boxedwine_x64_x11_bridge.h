@@ -149,7 +149,8 @@
     X(REPORT_UNIMPLEMENTED, "report-unimplemented") \
     X(TRACE, "trace") \
     X(RANDR_GET_STATE, "randr-get-state") \
-    X(RANDR_SET_MODE, "randr-set-mode")
+    X(RANDR_SET_MODE, "randr-set-mode") \
+    X(XI_SELECT_EVENTS, "xi-select-events")
 
 enum boxedwine_x64_x11_op {
 #define BOXEDWINE_X64_X11_OP_ENUM(name, text) BOXEDWINE_X64_X11_OP_##name,

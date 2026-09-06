@@ -1069,8 +1069,9 @@ bool initializeFEXGlobals() {
         LogMan::Throw::InstallHandler(fexThrow);
         FEXCore::Config::Initialize();
         FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_IS64BIT_MODE, "1");
-        gReducedX87Precision = [NSUserDefaults.standardUserDefaults
-            boolForKey:@"BoxedVN.fex64.reducedX87Precision"];
+        // Keep persisted experimental preferences from re-enabling a mode
+        // that failed the device compatibility run.
+        gReducedX87Precision = false;
         FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_X87REDUCEDPRECISION,
                             gReducedX87Precision ? "1" : "0");
         reportf("BOXEDWINE_FEX64_X87 precision=%s",
@@ -1203,8 +1204,9 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     // that leaves lock-free traffic between Wine and DXMT threads weakly
     // ordered. Strict ordering makes FEX emit acquire/release accesses
     // instead; unaligned ones then trap once and are backpatched.
-    const bool strictOrdering = [[NSUserDefaults standardUserDefaults]
-        boolForKey:@"BoxedVN.fex64.strictMemoryOrdering"];
+    NSNumber* orderingPreference = [NSUserDefaults.standardUserDefaults
+        objectForKey:@"BoxedVN.fex64.strictMemoryOrdering"];
+    const bool strictOrdering = orderingPreference == nil || orderingPreference.boolValue;
     bundle->context->SetHardwareTSOSupport(!strictOrdering);
     reportf("FEX memory ordering: %s",
             strictOrdering ? "emulated TSO (strict)" : "hardware TSO assumed");

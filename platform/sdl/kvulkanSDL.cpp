@@ -677,6 +677,7 @@ void KVulkdanSDLImpl::presentVulkanSwapchain(void* swapchain, int result) {
     void* surface = nullptr;
     U64 attempt = 0;
     bool firstSuccessfulPresent = false;
+    XWindowPtr presentedWindow;
     bool presentation = false;
     {
         std::lock_guard<std::mutex> lock(surfacesMutex);
@@ -699,9 +700,18 @@ void KVulkdanSDLImpl::presentVulkanSwapchain(void* swapchain, int result) {
                 found->firstFrameWatch->firstPresentObserved.store(
                     true, std::memory_order_release);
             }
+            presentedWindow = found->window;
             firstSuccessfulPresent = true;
         }
     }
+
+#ifdef BOXEDWINE_IOS
+    if (firstSuccessfulPresent && presentedWindow) {
+        // A real first frame supersedes any GDI fallback shown while a hidden
+        // setup surface existed. Input and partial presents use this client.
+        XServer::getServer()->setFakeFullScreenWindow(presentedWindow);
+    }
+#endif
 
     if (attempt == 1 || result < 0) {
         klog_fmt("Vulkan %s surface %p queue-present attempt %llu returned %d",

@@ -1059,7 +1059,7 @@ if [[ -n "${WINE_INSTALL}" ]]; then
     guest_link "${WINE_MODULE_ROOT}/x86_64-unix/ntdll.so" "${WINE_MODULE_ROOT}/ntdll.so"
     printf '%s\n' '11.0' > "${STAGE}${WINE_MODULE_ROOT}/boxedvn-wine-version.txt"
     mkdir -p "${PE32_STAGE}${WINE_MODULE_ROOT}"
-    printf '%s\n' '11.0' > "${PE32_STAGE}${WINE_MODULE_ROOT}/boxedvn-pe32-version.txt"
+    printf '%s\n' '11.0' > "${PE32_STAGE}${WINE_MODULE_ROOT}/boxedvn-pe32-11.0.stamp"
 fi
 guest_link "${WINE_MODULE_ROOT}/wine64" /usr/lib/wine/wine64
 guest_link "${WINE_MODULE_ROOT}/wineserver" /usr/lib/wine/wineserver

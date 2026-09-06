@@ -768,6 +768,10 @@ final class AppModel: ObservableObject {
             Storage.documents?.appendingPathComponent(X64Runtime.pe32ArchiveName),
         ].compactMap { $0 }
         let pe32 = pe32Candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+        if let pe32, let problem = pe32LayerProblem(at: pe32) {
+            alertMessage = problem
+            return nil
+        }
         Log.write(pe32.map { "32-bit PE layer found at \($0.path)" }
                       ?? "No 32-bit PE layer: looked for \(X64Runtime.pe32ArchiveName) in "
                          + pe32Candidates.map(\.path).joined(separator: ", "),
@@ -789,6 +793,7 @@ final class AppModel: ObservableObject {
             try FileManager.default.createDirectory(
                 at: runtime.driveC, withIntermediateDirectories: true)
             try migrateX64DriveC(from: runtime.writableRoot, to: runtime.driveC)
+            try preserveRegistryBeforeWine11(at: runtime.writableRoot)
             for name in X64Runtime.dxmtModules {
                 let source = runtime.dxmt.appendingPathComponent(name)
                 let target = runtime.diagnostics.appendingPathComponent(name)
@@ -822,6 +827,7 @@ final class AppModel: ObservableObject {
         var missingModules: [String]
         /// False when the file could not be read as a ZIP at all.
         var readable: Bool
+        var matchesWineVersion: Bool = false
     }
 
     private var pe32Inspections: [String: Pe32Inspection] = [:]
@@ -863,6 +869,10 @@ final class AppModel: ObservableObject {
                 + "read as a ZIP archive, so a 32-bit program cannot be "
                 + "started. " + replace
         }
+        if !inspection.matchesWineVersion {
+            return "This build uses Wine 11.0. The 32-bit runtime ZIP belongs to "
+                + "an older build. " + replace
+        }
         guard !inspection.missingModules.isEmpty else { return nil }
         let names = inspection.missingModules.joined(separator: ", ")
         return "The 32-bit runtime layer in this container is out of date: "
@@ -903,7 +913,10 @@ final class AppModel: ObservableObject {
                   level: missing.isEmpty ? BVNLogLevelInfo
                                          : BVNLogLevelWarning)
         return Pe32Inspection(identity: identity, missingModules: missing,
-                              readable: true)
+                              readable: true, matchesWineVersion: entries.contains {
+                                  $0.name == "usr/lib/x86_64-linux-gnu/wine/boxedvn-pe32-11.0.stamp"
+                                      && $0.uncompressedSize > 0
+                              })
     }
 
     /// The guard both WoW64 launches share: the layer has to be there, and it
@@ -922,6 +935,25 @@ final class AppModel: ObservableObject {
             return false
         }
         return true
+    }
+
+    /// Preserve registry files once before Wine updates the existing prefix.
+    private func preserveRegistryBeforeWine11(at root: URL) throws {
+        let manager = FileManager.default
+        let prefix = root.appendingPathComponent("home/username/.wine64", isDirectory: true)
+        let backup = prefix.appendingPathComponent(".boxedvn-before-wine11", isDirectory: true)
+        let marker = backup.appendingPathComponent("complete")
+        guard !manager.fileExists(atPath: marker.path) else { return }
+        try manager.createDirectory(at: backup, withIntermediateDirectories: true)
+        for name in ["system.reg", "user.reg", "userdef.reg"] {
+            let source = prefix.appendingPathComponent(name)
+            let target = backup.appendingPathComponent(name)
+            if manager.fileExists(atPath: source.path) && !manager.fileExists(atPath: target.path) {
+                try manager.copyItem(at: source, to: target)
+            }
+        }
+        try Data("Wine 11.0 registry migration\n".utf8).write(to: marker, options: .atomic)
+        Log.write("Wine 11.0: preserved existing registry before prefix update", category: "container")
     }
 
     /// Moves an existing prefix's drive_c out of the private writable root

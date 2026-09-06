@@ -71,6 +71,8 @@ typedef NS_ENUM(NSInteger, BVNOverlayKeyKind) {
 
 extern "C" void BVNGuestControlsSendRelativePointer(int dx, int dy);
 
+extern "C" void BVNGuestControlsSendRelativeButton(int phase, int button);
+
 @interface BVNOverlayKey : NSObject
 @property (nonatomic, copy) NSString* label;
 @property (nonatomic, copy) NSString* scancodeName;
@@ -1729,6 +1731,14 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     BVNLogWrite(BVNLogLevelInfo, "input", line.UTF8String);
 }
 
+- (void)sendTrackpadButton:(int)phase atPoint:(CGPoint)point {
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"BoxedVN.pointer.centerLock"]) {
+        BVNGuestControlsSendRelativeButton(phase, 0);
+    } else {
+        BVNGuestControlsSendPointer((int)lround(point.x), (int)lround(point.y), phase);
+    }
+}
+
 - (void)trackpadHoldTimerFired:(NSTimer*)timer {
     if (timer != self.trackpadHoldTimer) {
         return;
@@ -1743,8 +1753,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     // the cursor does not move and the guest may not redraw, and the next
     // movement will drag rather than hover.
     [self playTrackpadHoldFeedback];
-    BVNGuestControlsSendPointer((int)lround(self.cursorGuestPoint.x),
-                                (int)lround(self.cursorGuestPoint.y), 1);
+    [self sendTrackpadButton:1 atPoint:self.cursorGuestPoint];
     self.trackpadButtonGuestPoint = self.cursorGuestPoint;
     self.trackpadButtonHeld = YES;
 }
@@ -1757,9 +1766,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     if (!self.trackpadButtonHeld) {
         return;
     }
-    BVNGuestControlsSendPointer(
-        (int)lround(self.trackpadButtonGuestPoint.x),
-        (int)lround(self.trackpadButtonGuestPoint.y), 2);
+    [self sendTrackpadButton:2 atPoint:self.trackpadButtonGuestPoint];
     self.trackpadButtonHeld = NO;
 }
 
@@ -1810,9 +1817,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     [self cancelTrackpadHoldTimer];
     [self cancelTrackpadTapReleaseTimer];
     if (self.trackpadButtonHeld) {
-        BVNGuestControlsSendPointer(
-            (int)lround(self.trackpadButtonGuestPoint.x),
-            (int)lround(self.trackpadButtonGuestPoint.y), 2);
+        [self sendTrackpadButton:2 atPoint:self.trackpadButtonGuestPoint];
     }
     self.trackpadButtonHeld = NO;
     self.trackpadHasMotionBaseline = NO;
@@ -1845,7 +1850,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         self.trackpadTouchStart = [touch locationInView:self];
         self.trackpadTouchMoved = NO;
         self.trackpadLastPoint = [touch locationInView:self];
-        self.trackpadHasMotionBaseline = NO;
+        self.trackpadHasMotionBaseline = [NSUserDefaults.standardUserDefaults
+            boolForKey:@"BoxedVN.pointer.centerLock"];
         self.trackpadButtonHeld = NO;
         [self cancelTrackpadHoldTimer];
         // Warm the Taptic engine now, while the 0.35s threshold runs: an
@@ -1955,8 +1961,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"BoxedVN.pointer.centerLock"]) {
         self.pendingRelativeMotion = CGPointMake(self.pendingRelativeMotion.x + dx * sensitivity,
                                                 self.pendingRelativeMotion.y + dy * sensitivity);
-        self.cursorGuestPoint = CGPointMake(guestWidth / 2, guestHeight / 2);
-        [self positionCursor];
+        // The injected-position callback updates the local cursor. Raw deltas
+        // remain unclamped even when the visible pointer reaches its radius.
     } else {
         [self moveCursorBy:CGPointMake(dx * sensitivity, dy * sensitivity)];
     }
@@ -1987,14 +1993,14 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     const int x = (int)lround(self.cursorGuestPoint.x);
     const int y = (int)lround(self.cursorGuestPoint.y);
     if (self.trackpadButtonHeld) {
-        BVNGuestControlsSendPointer(x, y, 2);
+        [self sendTrackpadButton:2 atPoint:CGPointMake(x, y)];
         self.trackpadButtonHeld = NO;
     } else if (!self.trackpadTouchMoved) {
         // A touchpad tap is recognized only at finger-up, but sending down and
         // up back-to-back makes the injected button mask disappear before a
         // polling Windows engine gets scheduled. Hold it for one short input
         // quantum while keeping both halves at the same guest pixel.
-        BVNGuestControlsSendPointer(x, y, 1);
+        [self sendTrackpadButton:1 atPoint:CGPointMake(x, y)];
         self.trackpadButtonGuestPoint = CGPointMake(x, y);
         self.trackpadButtonHeld = YES;
         [self cancelTrackpadTapReleaseTimer];
@@ -2694,7 +2700,12 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
         point.x >= guestWidth || point.y >= guestHeight) {
         return;
     }
-    BVNGuestControlsSendRightClick((int)lround(point.x), (int)lround(point.y));
+    if (self.trackpadMode && [NSUserDefaults.standardUserDefaults boolForKey:@"BoxedVN.pointer.centerLock"]) {
+        BVNGuestControlsSendRelativeButton(1, 1);
+        BVNGuestControlsSendRelativeButton(2, 1);
+    } else {
+        BVNGuestControlsSendRightClick((int)lround(point.x), (int)lround(point.y));
+    }
 }
 
 // ---------------------------------------------------------------------------

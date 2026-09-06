@@ -204,10 +204,10 @@ class RandrContract(unittest.TestCase):
 
     def test_the_operation_table_grew_by_appending(self) -> None:
         names = re.findall(r"^\s+X\((\w+), \"[a-z0-9-]+\"\)", self.header, re.MULTILINE)
-        self.assertEqual(names[-2:], ["RANDR_GET_STATE", "RANDR_SET_MODE"])
+        self.assertEqual(names[88:90], ["RANDR_GET_STATE", "RANDR_SET_MODE"])
         # Everything before the new pair keeps the index it had.
         self.assertEqual(names.index("OPEN_DISPLAY"), 1)
-        self.assertEqual(names.index("TRACE"), len(names) - 3)
+        self.assertEqual(names.index("TRACE"), 87)
 
     def test_the_host_serves_both_randr_operations(self) -> None:
         for name in ("op_RANDR_GET_STATE", "op_RANDR_SET_MODE"):

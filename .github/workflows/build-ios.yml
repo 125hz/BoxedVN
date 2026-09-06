@@ -152,7 +152,7 @@ jobs:
 
       - name: Restore matching Wine 11 runtime and audio modules
         id: wine11-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             build/wine11-install
@@ -164,6 +164,15 @@ jobs:
         timeout-minutes: 100
         shell: bash
         run: bash scripts/build-wine11-runtime.sh
+
+      - name: Cache completed Wine 11 compilation
+        if: steps.wine11-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/wine11-install
+            build/wine64-oss
+          key: ${{ steps.wine11-cache.outputs.cache-primary-key }}
 
       - name: Build and validate Wine64 layers
         shell: bash
@@ -180,6 +189,7 @@ jobs:
           bash scripts/build-boxedwine-x64-x11.sh \
             --output-dir build/x64-x11 \
             --winex11 "${winex11}"
+          python3 scripts/test_x64_xinput.py build/x64-x11
           # The guest Vulkan ICD, validated against the same winex11.so: that
           # driver is what dlopens libvulkan.so.1 and binds sixteen symbols out
           # of it by name, so a Wine update that adds a seventeenth fails here
@@ -352,6 +362,9 @@ jobs:
 
       - name: Test Wine64 runtime packaging contract
         run: python3 -m unittest scripts/test_wine64_runtime_packaging.py
+
+      - name: Test guest file timestamp units
+        run: python3 scripts/test_x64_stat_timestamp.py
 
       - name: Test x86-64 X11 shim contract
         run: python3 -m unittest scripts/test_x64_x11_shim.py

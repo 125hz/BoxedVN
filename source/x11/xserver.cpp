@@ -1086,6 +1086,18 @@ int XServer::mapWindow(const DisplayDataPtr& data, const XWindowPtr& window) {
 	}
 	int result = window->mapWindow();
 
+#ifdef BOXEDWINE_IOS
+    // Capability checks can leave a full-sized Vulkan child under an unmapped
+    // parent. It must not hide the visible GDI launcher that is mapped later.
+    if (result == Success && fakeFullScreenWnd &&
+        !fakeFullScreenWnd->isThisAndAncestorsMapped() &&
+        window->isThisAndAncestorsMapped() && window->c_class != InputOnly &&
+        window->width() >= 32 && window->height() >= 32) {
+        klog_fmt("BOXEDWINE_X11_PRESENTATION_FALLBACK hidden=0x%x visible=0x%x",
+                 fakeFullScreenWnd->id, window->id);
+        setFakeFullScreenWindow(window);
+    }
+#endif
 	if (result == Success) {
 		int x = 0;
 		int y = 0;
@@ -1136,10 +1148,18 @@ int XServer::unmapWindow(const DisplayDataPtr& data, const XWindowPtr& window) {
 
 void XServer::mouseMove(S32 x, S32 y, bool relative) {
     const S32 deltaX = x, deltaY = y;
-    if (relative) {
-        auto input = KNativeSystem::getCurrentInput();
-        x += input->screenWidth() / 2;
-        y += input->screenHeight() / 2;
+    if (relative && root) {
+        // XI2 raw motion belongs to each selecting client's root subscription;
+        // it does not require a core XGrabPointer on the same display.
+        bool delivered = false;
+        iterateInput2Mask(root->id, XI_RawMotionMask, [&](const DisplayDataPtr& display) {
+            root->input2Notify(display, deltaX, deltaY, XI_RawMotion);
+            delivered = true;
+        });
+        if (delivered) return;
+        // Polling clients consume accumulated position and can warp it back
+        // themselves. Never replace every sample by center + last delta.
+        KNativeSystem::getCurrentInput()->getMousePos(&x, &y);
     }
 
 	if (isGrabbed) {

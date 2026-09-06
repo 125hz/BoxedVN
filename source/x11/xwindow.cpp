@@ -1395,6 +1395,7 @@ bool XWindow::mouseMoveScreenCoords(S32 x, S32 y) {
 	bool found = false;
 
 	XServer::getServer()->iterateInput2Mask(id, XI_RawMotionMask, [&found, this, x, y](const DisplayDataPtr& data) {
+		if (data->displayAddress64) return; // LP64 raw deltas are dispatched by XServer.
 		input2Notify(data, x, y, XI_RawMotionMask);
 		found = true;
 		});

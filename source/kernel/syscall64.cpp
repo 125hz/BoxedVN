@@ -2703,7 +2703,7 @@ static U64 sys_fstat64(CPU64* cpu, U64 fd, U64 statbuf) {
         if (kfile->openFile->node) {
             mode  = kfile->openFile->node->getMode();
             ino   = kfile->openFile->node->id;
-            mtime = (U64)kfile->openFile->node->lastModified();
+            mtime = (U64)kfile->openFile->node->lastModified() / 1000;
             rdev  = kfile->openFile->node->rdev;
         }
     } else {

@@ -40,7 +40,7 @@ require_command python3
 
 SOURCE_DIR="${BOXEDVN_ROOT}/tools/x11-64"
 INCLUDE_DIR="${BOXEDVN_ROOT}/include"
-for required in X11.c X11ext.c extension_stub.c xrandr.c layout_check.c winex11-imports.txt; do
+for required in X11.c X11ext.c extension_stub.c xrandr.c xinput2.c layout_check.c winex11-imports.txt; do
     require_file "${SOURCE_DIR}/${required}"
 done
 require_file "${INCLUDE_DIR}/boxedwine_x64_x11_bridge.h"
@@ -82,7 +82,7 @@ build_library libXrender.so.1 libXrender.so.1 -DBW_STUB_LIBRARY=1 "${SOURCE_DIR}
 # or a list. See tools/x11-64/xrandr.c.
 build_library libXrandr.so.2 libXrandr.so.2 "${SOURCE_DIR}/xrandr.c" -lpthread
 build_library libXinerama.so.1 libXinerama.so.1 -DBW_STUB_LIBRARY=3 "${SOURCE_DIR}/extension_stub.c"
-build_library libXi.so.6 libXi.so.6 -DBW_STUB_LIBRARY=4 "${SOURCE_DIR}/extension_stub.c"
+build_library libXi.so.6 libXi.so.6 "${SOURCE_DIR}/xinput2.c"
 build_library libXcursor.so.1 libXcursor.so.1 -DBW_STUB_LIBRARY=5 "${SOURCE_DIR}/extension_stub.c"
 build_library libXfixes.so.3 libXfixes.so.3 -DBW_STUB_LIBRARY=6 "${SOURCE_DIR}/extension_stub.c"
 build_library libXcomposite.so.1 libXcomposite.so.1 -DBW_STUB_LIBRARY=7 "${SOURCE_DIR}/extension_stub.c"

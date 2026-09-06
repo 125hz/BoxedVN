@@ -39,6 +39,7 @@
 #include <X11/Xatom.h>
 #include <X11/Xresource.h>
 #include <X11/XKBlib.h>
+#include <X11/extensions/XInput2.h>
 
 #include <poll.h>
 #include <pthread.h>
@@ -1428,17 +1429,30 @@ BW_EXPORT int XPutBackEvent(Display *dpy, XEvent *event)
     return (int)BW(PUT_BACK_EVENT, P(dpy), P(event));
 }
 
+/* The bridge carries signed deltas as an opaque cookie payload. Allocate the
+ * public LP64 event here; neither host nor client guesses pointer layouts. */
+struct BWRawMotion { XIRawEvent event; unsigned char mask; double values[2]; };
 BW_EXPORT Bool XGetEventData(Display *dpy, XGenericEventCookie *cookie)
 {
-    (void)dpy;
-    (void)cookie;
-    return False;
+    if (!cookie || cookie->type != GenericEvent || cookie->evtype != XI_RawMotion) return False;
+    struct BWRawMotion *raw = calloc(1, sizeof(*raw));
+    if (!raw) return False;
+    uint64_t payload=(uintptr_t)cookie->data;
+    raw->values[0]=(int32_t)payload; raw->values[1]=(int32_t)(payload >> 32);
+    raw->mask=3;
+    raw->event.type=GenericEvent; raw->event.serial=cookie->serial;
+    raw->event.display=dpy; raw->event.extension=cookie->extension;
+    raw->event.evtype=XI_RawMotion; raw->event.time=cookie->cookie;
+    raw->event.deviceid=2; raw->event.sourceid=2;
+    raw->event.valuators.mask_len=1; raw->event.valuators.mask=&raw->mask;
+    raw->event.valuators.values=raw->values; raw->event.raw_values=raw->values;
+    cookie->data=raw; return True;
 }
-
 BW_EXPORT void XFreeEventData(Display *dpy, XGenericEventCookie *cookie)
 {
-    (void)dpy;
-    (void)cookie;
+    if (cookie && cookie->type == GenericEvent && cookie->evtype == XI_RawMotion) {
+        free(cookie->data); cookie->data=NULL;
+    }
 }
 
 /* ---- Pointer ---------------------------------------------------------------- */

@@ -377,18 +377,26 @@ struct GuestLiveLog: View {
         if text.contains("[warn") || text.contains(":warn:") { return .orange }
         if text.contains(":fixme:") { return .yellow }
         if text.contains("[debug") || text.contains(":trace:") { return .cyan }
-        return .secondary
+        return .mint
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                Text(line)
-                    .foregroundStyle(logColor(line))
-                    .fixedSize(horizontal: false, vertical: true)
+        ScrollView(.horizontal, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(0..<5, id: \.self) { index in
+                    let line = index < lines.count ? lines[index] : " "
+                    Text(line)
+                        .foregroundStyle(logColor(line))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(height: 12, alignment: .leading)
+                }
             }
+            .font(.system(size: 9, design: .monospaced))
         }
-        .font(.system(size: 11, design: .monospaced))
+        .frame(height: 60, alignment: .topLeading)
+        .clipped()
+        .transaction { $0.animation = nil }
         .foregroundStyle(.secondary)
         .frame(maxWidth: .infinity, alignment: .leading)
         .onReceive(tick) { _ in
@@ -406,7 +414,7 @@ struct GuestLiveLog: View {
                     }
                     return line
                 }
-            lines = Array(all.suffix(3)).map { String($0.prefix(900)) }
+            lines = Array(all.suffix(5)).map { String($0.prefix(900)) }
         }
     }
 }
@@ -1507,9 +1515,7 @@ struct SettingsView: View {
     @AppStorage("BoxedVN.orientationLock")
     private var orientationLock = true
     @AppStorage("BoxedVN.fex64.strictMemoryOrdering")
-    private var strictMemoryOrdering = false
-    @AppStorage("BoxedVN.fex64.reducedX87Precision")
-    private var reducedX87Precision = false
+    private var strictMemoryOrdering = true
     @AppStorage(Preferences.verboseWineTraceKey)
     private var verboseWineTrace = false
     @AppStorage(Preferences.soundEnabledKey)
@@ -1529,18 +1535,11 @@ struct SettingsView: View {
             }
 
             Section {
-                Toggle("Fast x87 math (experimental)", isOn: $reducedX87Precision)
-            } footer: {
-                Text("Uses 64-bit floating point instead of full x87 precision. "
-                     + "Can speed up older CPU-heavy programs, but may change results or compatibility. "
-                     + "Restart BoxedVN after changing this setting.")
-            }
-            Section {
                 Toggle("Strict memory ordering", isOn: $strictMemoryOrdering)
             } footer: {
                 Text("Emulates x86 memory ordering in the 64-bit translator "
                      + "instead of assuming the hardware provides it. Slower, "
-                     + "but the fix for crashes where a pointer reads as zero. "
+                     + "but preserves ordering between guest threads. "
                      + "Takes effect on the next launch.")
             }
             Section {

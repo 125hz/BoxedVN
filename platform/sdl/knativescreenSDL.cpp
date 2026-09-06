@@ -132,6 +132,15 @@ extern "C" void BVNGuestControlsSendPointer(int x, int y, int phase) {
     }
 }
 
+// Button edges during relative look do not synthesize a second absolute move.
+extern "C" void BVNGuestControlsSendRelativeButton(int phase, int button) {
+    if (!gIOSActiveScreen) return;
+    const auto& input = gIOSActiveScreen->input;
+    S32 x=0, y=0;
+    input->getMousePos(&x, &y);
+    input->mouseButtonGuest(phase == 1, button, x, y);
+}
+
 // Relative deltas bypass absolute cursor clamping. X11 raw-motion clients
 // receive the delta; legacy clients receive a point around the screen center.
 extern "C" void BVNGuestControlsSendRelativePointer(int dx, int dy) {
