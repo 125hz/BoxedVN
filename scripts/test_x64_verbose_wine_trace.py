@@ -235,7 +235,11 @@ class TheSettingIsOffUntilItIsAskedFor(unittest.TestCase):
         body = read(APP_MODEL).split("static func withVerboseTrace(", 1)[1]
         self.assertIn("hasPrefix(wineDebugAssignmentPrefix)", body)
         self.assertIn('$0 + "," + verboseTraceChannels : $0', body)
-        self.assertIn("+ [verboseTraceAssignment]", body)
+        self.assertRegex(body, r"\+\s*\[verboseTraceAssignment(?:,|\])")
+        self.assertIn('"MONO_LOG_LEVEL=debug"', body)
+        self.assertIn('"MONO_LOG_MASK=asm"', body)
+        self.assertLess(body.index("guard enabled else { return base }"),
+                        body.index('"MONO_LOG_LEVEL=debug"'))
 
 
 class AllWine64LaunchesHonorTheSetting(unittest.TestCase):

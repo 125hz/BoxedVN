@@ -539,6 +539,7 @@ struct GuestPointerSettingsPanel: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Button("Reset") {
+                centerLock = false
                 settings = BVNPointerSettings(size: 22, thickness: 2,
                                               opacity: 1, sensitivity: 1,
                                               outline: true)
