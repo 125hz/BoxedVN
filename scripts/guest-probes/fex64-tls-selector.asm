@@ -34,7 +34,14 @@ cmp dword [fs:0], 0x12345678
 jne fail
 ; A second descriptor proves this is not a hardcoded TEB base.
 mov eax, 0x6b
+push 0xa93
+popfq
 mov fs, ax
+pushfq
+pop rdx
+mov r10d, 8
+cmp edx, 0xa93
+jne fail
 rdfsbase rdx
 mov r10d, 4
 cmp rdx, 0x210000

@@ -311,6 +311,13 @@ vertex updates, drawing, and Present. Removing TLS signal overhead is not
 proof that the 2 FPS wait or either application failure is resolved.
 
 Wine version decision: current runtime packaging uses Ubuntu's Wine 9.0.
+The first simulator run rejected the new path before IPA packaging: the
+descriptor temporary crossed a basic-block boundary, but FEX allocates its
+temporary registers per block. The fast block now reloads the descriptor
+from the stored selector. Validation also uses flag-preserving bitwise
+mismatch checks rather than host comparisons. The fixture reports failure
+stages and checks a second arithmetic-flag pattern as well as both bases.
+
 Wine 11 makes new WoW64 fully supported and improves Vulkan/wined3d,
 but removes the wine64 loader and adds interfaces our custom bridges must
 support. NTSync's Linux kernel acceleration is not automatically available

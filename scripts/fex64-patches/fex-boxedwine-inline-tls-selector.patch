@@ -1,7 +1,7 @@
 diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
 --- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
 +++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
-@@ -1297,6 +1297,51 @@
+@@ -1297,6 +1297,57 @@
    // We don't currently support FS/GS selector modifying, so this needs to be asserted out
    // The loads here also load the selector, NOT the base
  
@@ -13,20 +13,21 @@ diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source
 +    const auto SelectorOffset = FS ? offsetof(Core::CPUState, fs_idx) : offsetof(Core::CPUState, gs_idx);
 +    const auto BaseOffset = FS ? offsetof(Core::CPUState, fs_cached) : offsetof(Core::CPUState, gs_cached);
 +    _StoreContextGPR(OpSize::i16Bit, Selector, SelectorOffset);
-+    Ref Descriptor {};
 +    Ref FastBlock {};
 +    if (CTX->GetGuestLowAliasBase() != 0) {
 +      auto Index = _Bfe(OpSize::i32Bit, 5, 3, Selector);
-+      Descriptor = _LoadContextGPRIndexed(Index, OpSize::i64Bit, offsetof(Core::CPUState, private_gdt), 8);
++      auto Descriptor = _LoadContextGPRIndexed(Index, OpSize::i64Bit, offsetof(Core::CPUState, private_gdt), 8);
 +      auto Access = _Bfe(OpSize::i64Bit, 8, 40, Descriptor);
-+      auto ValidSelector = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ,
-+          _And(OpSize::i32Bit, Selector, Constant(0xff07)), Constant(3), Constant(1), Constant(0));
-+      auto ValidDescriptor = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ,
-+          _And(OpSize::i32Bit, Access, Constant(0xf8)), Constant(0xf0), Constant(1), Constant(0));
-+      auto Valid = _And(OpSize::i32Bit, ValidSelector, ValidDescriptor);
++      // Select lowers to a host CMP and clobbers guest NZCV. Zero-test an
++      // OR of mismatches instead: AND/XOR/OR and CBZ preserve those flags.
++      auto SelectorMismatch = _Xor(OpSize::i32Bit,
++          _And(OpSize::i32Bit, Selector, Constant(0xff07)), Constant(3));
++      auto DescriptorMismatch = _Xor(OpSize::i32Bit,
++          _And(OpSize::i32Bit, Access, Constant(0xf8)), Constant(0xf0));
++      auto Invalid = _Or(OpSize::i32Bit, SelectorMismatch, DescriptorMismatch);
 +      FastBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
 +      auto SlowBlock = CreateNewCodeBlockAtEnd();
-+      CondJump(Valid, Constant(0), FastBlock, SlowBlock, CondClass::NEQ, OpSize::i32Bit);
++      CondJump(Invalid, Constant(0), FastBlock, SlowBlock, CondClass::EQ, OpSize::i32Bit);
 +      SetCurrentCodeBlock(SlowBlock);
 +      StartNewBlock();
 +    }
@@ -40,6 +41,11 @@ diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source
 +      ExitRelocatedPC(Op, -Op->InstSize);
 +      SetCurrentCodeBlock(FastBlock);
 +      StartNewBlock();
++      // FEX allocates SSA temporaries within each block. Reload from the
++      // stored selector instead of carrying Descriptor across this branch.
++      auto StoredSelector = _LoadContextGPR(OpSize::i16Bit, SelectorOffset);
++      auto Index = _Bfe(OpSize::i32Bit, 5, 3, StoredSelector);
++      auto Descriptor = _LoadContextGPRIndexed(Index, OpSize::i64Bit, offsetof(Core::CPUState, private_gdt), 8);
 +      auto Upper = _Lshr(OpSize::i64Bit, Descriptor, Constant(32));
 +      auto HighBase = _And(OpSize::i32Bit, Upper, Constant(0xff000000));
 +      auto Merged = _Orlshr(OpSize::i32Bit, HighBase, Descriptor, 16);
@@ -53,7 +59,7 @@ diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source
    if (ToSeg) {
      Ref Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], OpSize::i16Bit, Op->Flags);
  
-@@ -1337,22 +1382,7 @@
+@@ -1337,22 +1388,7 @@
          _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
          UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
        } else {
@@ -77,7 +83,7 @@ diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source
        }
        break;
      case FEXCore::X86State::REG_RSP: // FS
-@@ -1364,22 +1394,7 @@
+@@ -1364,22 +1400,7 @@
          _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
          UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
        } else {
