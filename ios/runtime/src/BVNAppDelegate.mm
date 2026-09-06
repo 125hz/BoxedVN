@@ -2341,6 +2341,14 @@ static bool BVNGuestPresentationFitOwnsView(UIView* view) {
     return gGuestVulkanSurfaceViews[key] == view;
 }
 
+// SDL's keyboard controller otherwise assigns the full UIWindow frame to a
+// transformed Metal view, changing bounds through the inverse letterbox scale.
+// The application already presents its own keyboard and owns this view's fit.
+// Called only on the main thread by the pinned SDL UIKit integration.
+extern "C" int BVNGuestPresentationOwnsSDLView(void* view) {
+    return BVNGuestPresentationFitOwnsView((__bridge UIView*)view) ? 1 : 0;
+}
+
 // Re-applies the recorded fit against whatever the Metal view's superview is
 // now, in the caller's own main-thread turn. The attach uses this so the layer
 // is never left describing a container it has already left; the 200 ms poll in
@@ -2534,7 +2542,15 @@ extern "C" bool BVNSyncGuestPresentationGeometry(void) {
     if (view == nil || container == nil || view.window == nil) {
         return false;
     }
-    if (CGRectEqualToRect(container.bounds, gLastFittedBounds) &&
+    const bool pixelGeometryIntact =
+        lround(view.bounds.size.width) == (long)gGuestPresentationGuestWidth &&
+        lround(view.bounds.size.height) == (long)gGuestPresentationGuestHeight &&
+        view.layer.contentsScale == 1.0 &&
+        (![view.layer isKindOfClass:CAMetalLayer.class] ||
+         CGSizeEqualToSize(((CAMetalLayer*)view.layer).drawableSize,
+             CGSizeMake(gGuestPresentationGuestWidth, gGuestPresentationGuestHeight)));
+    if (pixelGeometryIntact &&
+        CGRectEqualToRect(container.bounds, gLastFittedBounds) &&
         UIEdgeInsetsEqualToEdgeInsets(container.safeAreaInsets,
                                       gLastFittedInsets)) {
         return false;

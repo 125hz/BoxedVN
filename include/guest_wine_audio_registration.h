@@ -79,4 +79,50 @@ inline bool registerWineDxDiagProvider(std::string& contents, bool pe64, bool pe
     }
     return changed;
 }
+// Wine 9's desktop folder returns ::{CLSID} for parsing unless the filesystem
+// backed namespace has WantsForParsing. A projected shell32 alone does not
+// register that metadata in an existing WoW64 prefix. Keep native overrides.
+inline bool registerWineDocumentsFolder(std::string& contents, bool pe64, bool pe32) {
+    bool changed = false;
+    for (int bits : {64, 32}) {
+        if (!(bits == 64 ? pe64 : pe32)) continue;
+        const std::string key = std::string("Software\\\\Classes\\\\") +
+            (bits == 32 ? "Wow6432Node\\\\" : "") +
+            "CLSID\\\\{450d8fba-ad25-11d0-98a8-0800361b1103}";
+        const bool added = insertMissingWineRegistryValue(contents,
+            key + "\\\\InprocServer32", "@", bits == 64 ?
+            "\"C:\\\\windows\\\\system32\\\\shell32.dll\"" :
+            "\"C:\\\\windows\\\\syswow64\\\\shell32.dll\"");
+        if (added) insertMissingWineRegistryValue(contents,
+            key + "\\\\InprocServer32", "\"ThreadingModel\"", "\"Apartment\"");
+        changed |= added;
+        changed |= insertMissingWineRegistryValue(contents,
+            key + "\\\\ShellFolder", "\"WantsForParsing\"", "\"\"");
+    }
+    return changed;
+}
+
+// WMI's locator is used by system-information queries, including DXDiag.
+// These class IDs and threading models come from Wine 9 wbemprox.idl.
+inline bool registerWineWbemLocator(std::string& contents, bool pe64, bool pe32) {
+    bool changed = false;
+    for (int bits : {64, 32}) {
+        if (!(bits == 64 ? pe64 : pe32)) continue;
+        for (const char* clsid : {"4590f811-1d3a-11d0-891f-00aa004b2e24",
+                                  "674b6698-ee92-11d0-ad71-00c04fd8fdff",
+                                  "cb8555cc-9128-11d1-ad9b-00c04fd8fdff"}) {
+            const std::string key = std::string("Software\\\\Classes\\\\") +
+                (bits == 32 ? "Wow6432Node\\\\" : "") + "CLSID\\\\{" + clsid +
+                "}\\\\InprocServer32";
+            const bool added = insertMissingWineRegistryValue(contents, key, "@",
+                bits == 64 ? "\"C:\\\\windows\\\\system32\\\\wbemprox.dll\"" :
+                             "\"C:\\\\windows\\\\syswow64\\\\wbemprox.dll\"");
+            if (added) insertMissingWineRegistryValue(contents, key,
+                "\"ThreadingModel\"", "\"Both\"");
+            changed |= added;
+        }
+    }
+    return changed;
+}
+
 }

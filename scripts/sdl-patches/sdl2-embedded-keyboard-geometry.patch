@@ -1,0 +1,19 @@
+--- a/src/video/uikit/SDL_uikitviewcontroller.m
++++ b/src/video/uikit/SDL_uikitviewcontroller.m
+@@ -525,8 +525,16 @@
+     }
+ }
+ 
++/* Optional embedding hook. BoxedVN owns the geometry of fitted Vulkan views;
++   SDL must not turn a keyboard notification into a new swapchain extent. */
++extern int BVNGuestPresentationOwnsSDLView(void *view) __attribute__((weak_import));
++
+ - (void)updateKeyboard
+ {
++    if (BVNGuestPresentationOwnsSDLView &&
++        BVNGuestPresentationOwnsSDLView((__bridge void *)self.view)) {
++        return;
++    }
+     SDL_WindowData *data = (__bridge SDL_WindowData *)window->driverdata;
+ 
+     CGAffineTransform t = self.view.transform;

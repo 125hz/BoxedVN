@@ -598,6 +598,10 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
     const bool pe32 = packaged(K_X64_WINE_PE32_DIR "/mmdevapi.dll");
     const bool diag64 = packaged(K_X64_WINE_PE_DIR "/dxdiagn.dll");
     const bool diag32 = packaged(K_X64_WINE_PE32_DIR "/dxdiagn.dll");
+    const bool shell64 = packaged(K_X64_WINE_PE_DIR "/shell32.dll");
+    const bool shell32 = packaged(K_X64_WINE_PE32_DIR "/shell32.dll");
+    const bool wbem64 = packaged(K_X64_WINE_PE_DIR "/wbemprox.dll");
+    const bool wbem32 = packaged(K_X64_WINE_PE32_DIR "/wbemprox.dll");
     auto node = Fs::getNodeFromLocalPath(B(""), winePrefix + "/system.reg", true);
     const char* status = "no-system-reg";
     if (node && !node->isDirectory() && !node->nativePath.isEmpty()) {
@@ -612,6 +616,8 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
             if (readable) {
                 changed = boxedvn::registerWineAudioEnumerator(contents, pe64, pe32);
                 changed |= boxedvn::registerWineDxDiagProvider(contents, diag64, diag32);
+                changed |= boxedvn::registerWineDocumentsFolder(contents, shell64, shell32);
+                changed |= boxedvn::registerWineWbemLocator(contents, wbem64, wbem32);
             }
             if (changed) {
                 const BString temp = node->nativePath + ".boxedvn-com";
@@ -627,6 +633,10 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
     }
     klog_fmt("BOXEDWINE_X64_AUDIO_COM status=%s pe64=%d pe32=%d prefix=%s",
              status, pe64 ? 1 : 0, pe32 ? 1 : 0, winePrefix.c_str());
+    klog_fmt("BOXEDWINE_X64_SHELL_COM status=%s pe64=%d pe32=%d prefix=%s",
+             status, shell64 ? 1 : 0, shell32 ? 1 : 0, winePrefix.c_str());
+    klog_fmt("BOXEDWINE_X64_WBEM_COM status=%s pe64=%d pe32=%d prefix=%s",
+             status, wbem64 ? 1 : 0, wbem32 ? 1 : 0, winePrefix.c_str());
     klog_fmt("BOXEDWINE_X64_DXDIAG_COM status=%s pe64=%d pe32=%d prefix=%s",
              status, diag64 ? 1 : 0, diag32 ? 1 : 0, winePrefix.c_str());
 }
@@ -1923,6 +1933,18 @@ bool StartUpArgs::apply() {
             if (!Fs::getNodeFromLocalPath(B(""), path, false)) {
                 const S32 result = static_cast<S32>(Fs::makeLocalDirs(path));
                 klog_fmt("BOXEDWINE_X64_PUBLIC_FOLDER path=%s result=%d",
+                         path.c_str(), result);
+            }
+        }
+        // Filesystem-backed shell namespace objects require a real target.
+        // Leave existing folders/symlinks (including user redirections) intact.
+        for (const char* folder : {"Documents", "Desktop", "Downloads", "Music",
+                                   "Pictures", "Videos", "Saved Games",
+                                   "AppData/Roaming", "AppData/Local"}) {
+            const BString path = wineDriveC + "/users/username/" + folder;
+            if (!Fs::getNodeFromLocalPath(B(""), path, false)) {
+                const S32 result = static_cast<S32>(Fs::makeLocalDirs(path));
+                klog_fmt("BOXEDWINE_X64_USER_FOLDER path=%s result=%d",
                          path.c_str(), result);
             }
         }
