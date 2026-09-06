@@ -35,11 +35,16 @@ struct K64Page {
     U32 flags=0;
     U32 lastWriter=0;
     bool permanentRamPin=false;
+    bool dataShared=false;
+    U8* sharedCanonical=nullptr;
     std::shared_ptr<std::atomic<U8*>> shared;
     void writeFlags(U32 f,U32,U16) { flags=f; }
     void demoteNativeShared() {}
     bool committed() const { return shared != nullptr; }
-    void adoptShared(const std::shared_ptr<std::atomic<U8*>>& s,bool,U8*) { shared=s; }
+    U8* hostData() const { return shared ? shared->load() : nullptr; }
+    void adoptShared(const std::shared_ptr<std::atomic<U8*>>& s,bool,U8* canonical) {
+        shared=s; dataShared=true; sharedCanonical=canonical;
+    }
 };
 struct Process { unsigned id=1; };
 struct KMemory64 {
@@ -51,8 +56,14 @@ struct KMemory64 {
     bool sparseReservationOverlaps(U64,U64) { return false; }
     bool nativeMapKuserAlias(U64,U64,bool&) { return false; }
     bool nativeMapAnonymous(U64 a,U64 n,U32,bool& fresh) {
-        fresh=false; return mprotect(reinterpret_cast<void*>(a),n,PROT_READ|PROT_WRITE)==0;
+        fresh=false;
+        if(!nativeDetachSharedViews(a,n)) return false;
+        if(mprotect(reinterpret_cast<void*>(a),n,PROT_READ|PROT_WRITE)) return false;
+        std::memset(reinterpret_cast<void*>(a),0,n);
+        return true;
     }
+    bool nativeRangeCovers(U64,U64) { return true; }
+    bool nativeDetachSharedViews(U64,U64);
     K64Page* getOrAllocPage(U64 p,U32,U32) {
         auto& page=pages[p]; if(!page) page=std::make_unique<K64Page>(); return page.get();
     }
@@ -64,6 +75,7 @@ struct KMemory64 {
     U64 mmapSharedFile(U64,U64,U32,const char*,U64,const U8*,U64);
 };
 @MAP_BODY@
+@DETACH_BODY@
 static void check(bool ok,const char* why) {
     if(!ok) { std::fprintf(stderr,"FAIL: %s\n",why); std::exit(1); }
 }
@@ -91,9 +103,17 @@ int main() {
     auto shared=findSharedFilePage("buffer",1);
     check(a[4096]==0x99 && shared->data->load()[0]==0x99,"native and sparse writes share physical storage");
     check(!(memory.pages[(U64)a>>12]->flags & K64_PAGE_PINNED),"guest view needs no permanent pin");
-    check(mmap(a,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0)==a,"replace owned first view");
+    check(memory.mmapSharedFile((U64)b,size,3,"buffer",0,conflictingSeed.data(),size)==(U64)b,"remap existing shared view");
+    check(a[4096]==0x99 && b[4096]==0x99,"preparing an existing view must not clear its canonical backing");
+    if (boxedvn::NativeSharedAlias::pageSize()>4096)
+        check(!memory.nativeDetachSharedViews((U64)a,4096),"partial private replacement cannot detach a live shared neighbour");
+    bool fresh=false;
+    check(memory.nativeMapAnonymous((U64)a,size,3,fresh),"replace shared view through production detach helper");
+    check(a[4096]==0 && b[4096]==0x99,"anonymous zeroing leaves canonical shared data intact");
     a[4096]=0x12;
     check(b[4096]==0x99 && shared->data->load()[0]==0x99,"reusing one guest address leaves other views intact");
+    b[0]=0x45;
+    check(a[0]==0,"writes through old shared views cannot modify replacement anonymous memory");
     munmap(a,size); munmap(b,size);
     check(shared->data->load()[0]==0x99,"backing survives all guest views");
     bool created=false;

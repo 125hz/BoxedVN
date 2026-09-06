@@ -815,6 +815,17 @@ if [[ -n "${OSS_DRIVER_DIR}" ]]; then
     require_pe_machine "${oss_pe_src}" 34404 "64-bit Wine OSS user driver"
     cp "${oss_unix_src}" "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/${OSS_DRIVER_UNIX_NAME}"
     cp "${oss_pe_src}" "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${OSS_DRIVER_PE_NAME}"
+    [[ "$(cat "${OSS_DRIVER_DIR}/faudio-callback-fix.txt" 2>/dev/null)" == c2ef8d3104401a79a7886062c4a5871db0b7b6f6 ]] \
+        || die "The audio build is missing the upstream FAudio callback-lock repair."
+    for audio_version in {0..9}; do
+        audio_name="xaudio2_${audio_version}.dll"
+        require_pe_machine "${OSS_DRIVER_DIR}/x86_64-windows/${audio_name}" 34404 "patched XAudio2 x86-64"
+        cp "${OSS_DRIVER_DIR}/x86_64-windows/${audio_name}" "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows/${audio_name}"
+        if [[ -n "${I386_PE_DIR}" ]]; then
+            require_pe_machine "${OSS_DRIVER_DIR}/i386-windows/${audio_name}" 332 "patched XAudio2 i386"
+            cp "${OSS_DRIVER_DIR}/i386-windows/${audio_name}" "${PE32_STAGE}${I386_PE_GUEST_DIR}/${audio_name}"
+        fi
+    done
     if [[ -n "${I386_PE_DIR}" ]]; then
         oss_pe32_src="${OSS_DRIVER_DIR}/i386-windows/${OSS_DRIVER_PE_NAME}"
         [[ -s "${oss_pe32_src}" ]] || die "WoW64 runtime requires the i386 OSS PE driver."
@@ -1101,6 +1112,9 @@ sha256_file() {
     # archive it is given is the one this build produced rather than a 64-bit
     # runtime with the same paths.
     printf 'i386_windows_module_count=%s\n' "${I386_PE_MODULE_COUNT}"
+    if [[ -n "${OSS_DRIVER_DIR}" ]]; then
+        printf '%s\n' 'faudio_callback_fix=c2ef8d3104401a79a7886062c4a5871db0b7b6f6'
+    fi
     if (( I386_PE_MODULE_COUNT > 0 )); then
         printf 'i386_windows_ntdll_sha256=%s\n' \
             "$(sha256_file "${PE32_STAGE}${I386_PE_GUEST_DIR}/ntdll.dll")"

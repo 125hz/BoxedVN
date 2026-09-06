@@ -1470,6 +1470,56 @@ bool KMemory64::nativeRangeCoversForPlan(U64 start, U64 end) const {
     return nativeRangeCovers(start, end);
 }
 
+bool KMemory64::nativeDetachSharedViews(U64 addr, U64 len) {
+#if defined(__APPLE__)
+    const U64 granule=boxedvn::NativeSharedAlias::pageSize();
+    if (!granule || addr>UINT64_MAX-len || addr+len>UINT64_MAX-(granule-1)) return false;
+    struct View { U64 host; const U8* source; };
+    std::vector<View> views;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        for (U64 base=k64NativeAlignDown(addr,granule);base<addr+len;base+=granule) {
+            const U64 host=k64GuestToHostAddress(base);
+            if (!nativeRangeCovers(host,host+granule)) continue;
+            const U8* source=nullptr;
+            for (U64 i=0;i<granule/K64_PAGE_SIZE;++i) {
+                const U64 guest=base+i*K64_PAGE_SIZE;
+                auto it=pages.find(guest>>K64_PAGE_SHIFT);
+                if (it==pages.end()) continue;
+                const K64Page& page=*it->second;
+                if (!page.dataShared || !page.sharedCanonical || page.hostData()!=page.sharedCanonical) continue;
+                // A partial replacement cannot sever a neighbouring live
+                // shared view. KUSER/legacy pinned aliases use another path.
+                if ((guest<addr || guest>=addr+len) &&
+                    (page.flags&(K64_PAGE_MAPPED|K64_PAGE_PINNED))) {
+                    static std::atomic<U32> reports{0};
+                    if (reports.fetch_add(1,std::memory_order_relaxed)<16)
+                        klog_fmt("BOXEDWINE_X64_SHARED_DETACH_BUSY addr=0x%llx len=0x%llx neighbour=0x%llx",
+                            (unsigned long long)addr,(unsigned long long)len,(unsigned long long)guest);
+                    return false;
+                }
+                const U8* backing=page.sharedCanonical-i*K64_PAGE_SIZE;
+                if (source && source!=backing) return false;
+                source=backing;
+            }
+            if (source) views.push_back({host,source});
+        }
+    }
+    for (const View& view : views) {
+        if (!boxedvn::NativeSharedAlias::copyAt(view.source,(uintptr_t)view.host)) return false;
+    }
+    if (!views.empty()) {
+        static std::atomic<U32> reports{0};
+        if (reports.fetch_add(1,std::memory_order_relaxed)<16)
+            klog_fmt("BOXEDWINE_X64_SHARED_DETACH addr=0x%llx len=0x%llx host_pages=%u",
+                (unsigned long long)addr,(unsigned long long)len,(unsigned)views.size());
+    }
+#else
+    (void)addr; (void)len;
+#endif
+    return true;
+}
+
 bool KMemory64::nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh) {
     if (!nativeGuestRangeAllowed(addr, len)) {
         klog_fmt("KMemory64: native host MAP_FIXED refused outside guest "
@@ -1552,6 +1602,12 @@ bool KMemory64::nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh) {
         ::memset(mapped, 0, (size_t)run.length);
     }
 
+    // Reused host ranges may still be physical aliases of a shared file.
+    // mprotect plus memset alone would clear every other view of that file.
+    if (!nativeDetachSharedViews(addr,len)) {
+        rollback();
+        return false;
+    }
     // MAP_FIXED|MAP_ANONYMOUS replaces the requested guest bytes with zeroes,
     // even when the requested protection is PROT_NONE. Make the whole interval
     // writable so that stays true across a reused host page whose other guest

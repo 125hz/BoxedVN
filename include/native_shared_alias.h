@@ -29,16 +29,24 @@ public:
     NativeSharedAlias& operator=(const NativeSharedAlias&) = delete;
     uint8_t* data() const { return backing; }
     bool mapAt(uintptr_t destination) const {
-        if (!backing || !pageSize() || destination % pageSize()) return false;
+        return remapAt(backing,destination,false);
+    }
+    // A replacement anonymous view must stop sharing before it is cleared.
+    // Copy-on-write also preserves untouched bytes in its enclosing host page.
+    static bool copyAt(const uint8_t* source, uintptr_t destination) {
+        return remapAt(source,destination,true);
+    }
+private:
+    static bool remapAt(const uint8_t* source, uintptr_t destination, bool copy) {
+        if (!source || !pageSize() || destination % pageSize()) return false;
         vm_address_t target = static_cast<vm_address_t>(destination);
         vm_prot_t current = 0, maximum = 0;
         const auto result = vm_remap(mach_task_self(), &target, pageSize(), 0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
-            reinterpret_cast<vm_address_t>(backing), FALSE,
+            reinterpret_cast<vm_address_t>(source), copy ? TRUE : FALSE,
             &current, &maximum, VM_INHERIT_SHARE);
         return result == KERN_SUCCESS && target == destination;
     }
-private:
     uint8_t* backing = nullptr;
 };
 }

@@ -1569,6 +1569,27 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
             const bool stackRead = readGuestBytes(guestRsp,
                 reinterpret_cast<uint8_t*>(returnSlot), sizeof(returnSlot));
             const auto& g = frame->State.gregs;
+            if (frame->State.cs_idx == 0x23) {
+                // First i386 fault only: distinguish a bad pointer from
+                // overwritten source data without tracing every file read.
+                static thread_local bool dataReported=false;
+                if (!dataReported) {
+                    dataReported=true;
+                    const uint64_t addresses[] = {g[1],g[3],g[6],g[7],
+                        guestFaultAddress>=64 ? guestFaultAddress-64 : 0};
+                    for (unsigned index=0;index<5;++index) {
+                        uint32_t words[16]={};
+                        const uint64_t address=addresses[index];
+                        if (address<0x10000 || address>UINT32_MAX-sizeof(words) ||
+                            !readGuestBytes(address,reinterpret_cast<uint8_t*>(words),sizeof(words))) continue;
+                        klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_DATA32 index=%u address=0x%llx "
+                                 "words=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                            index,(unsigned long long)address,words[0],words[1],words[2],words[3],
+                            words[4],words[5],words[6],words[7],words[8],words[9],words[10],words[11],
+                            words[12],words[13],words[14],words[15]);
+                    }
+                }
+            }
             // Preserve the caller's outgoing arguments even when the fault
             // happens after a large local stack allocation. Read-only Mach
             // copies keep this safe on guard pages. No per-frame tracing.

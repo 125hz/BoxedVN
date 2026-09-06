@@ -11,6 +11,14 @@ body = source[source.index("U64 KMemory64::mmapSharedFile("):
               source.index("// Record a reservation in the ordered")]
 fixture = (root / "ios/tests/test_native_shared_alias.cpp.in").read_text(encoding="utf-8")
 fixture = fixture.replace("@REGISTRY@", registry).replace("@MAP_BODY@", body)
+detach = source[source.index("bool KMemory64::nativeDetachSharedViews("):
+                source.index("bool KMemory64::nativeMapAnonymous(")]
+fixture = fixture.replace("@DETACH_BODY@", detach)
+# The executable exercises the actual detachment helper. Ensure the shipping
+# mapper invokes it before the first write to reused guest storage as well.
+native = source[source.index("bool KMemory64::nativeMapAnonymous("):
+                source.index("fresh = plan.mappedPages")]
+assert native.index("nativeDetachSharedViews(addr,len)") < native.index("::memset((void*)(uintptr_t)hostAddr")
 with tempfile.TemporaryDirectory(prefix="boxedvn-shared-alias-") as tmp:
     cpp, exe = Path(tmp) / "test.cpp", Path(tmp) / "test"
     cpp.write_text(fixture, encoding="utf-8")

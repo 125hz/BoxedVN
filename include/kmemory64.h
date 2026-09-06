@@ -958,6 +958,7 @@ private:
     struct NativeRange { U64 hostStart; U64 hostLength; U32 prot; };
     std::map<U64, NativeRange> nativeRanges;
     bool nativeMapAnonymous(U64 addr, U64 len, U32 prot, bool& fresh);
+    bool nativeDetachSharedViews(U64 addr, U64 len);
     bool nativeRangeCovers(U64 start, U64 end) const;
     void nativeForgetRange(U64 start, U64 length);
     // Record [start, start+length) as tracked with `prot`, coalescing with an

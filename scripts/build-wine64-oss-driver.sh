@@ -210,6 +210,17 @@ WINE_SOURCE="$(cd "${WINE_SOURCE}" && pwd)"
 [[ -d "${WINE_SOURCE}/dlls/wineoss.drv" ]] \
     || die "'${WINE_SOURCE}' has no dlls/wineoss.drv. That directory is where Wine's OSS driver lives; this is not a Wine source tree, or it is a version that moved the driver."
 
+# Backport the upstream callback-lock repair to the bundled FAudio. Build all
+# XAudio2 versions for both guest architectures from this same Wine tree.
+audio_patch="${BOXEDVN_ROOT}/scripts/wine-patches/faudio-voice-callback-locks.patch"
+if patch --dry-run --silent --forward -d "${WINE_SOURCE}" -p1 < "${audio_patch}"; then
+    python3 "${BOXEDVN_ROOT}/scripts/test_faudio_callback_locks.py" "${WINE_SOURCE}/libs/faudio/src/FAudio_internal.c" --expect-lock-cycle
+    patch --forward -d "${WINE_SOURCE}" -p1 < "${audio_patch}"
+elif ! patch --dry-run --silent --reverse -d "${WINE_SOURCE}" -p1 < "${audio_patch}"; then
+    die "The FAudio callback-lock backport does not match this Wine source."
+fi
+python3 "${BOXEDVN_ROOT}/scripts/test_faudio_callback_locks.py" "${WINE_SOURCE}/libs/faudio/src/FAudio_internal.c"
+
 # --- configure and build ----------------------------------------------------
 #
 # Only the one driver is built. Wine's make will build the tools it needs
@@ -276,6 +287,23 @@ log "Building ${unix_target}, ${pe_target}, and ${pe32_target}"
 if ! make -C "${BUILD}" -j"${JOBS}" "${unix_target}" "${pe_target}" "${pe32_target}"; then
     die "Building dlls/wineoss.drv failed."
 fi
+
+audio_targets=()
+for arch in x86_64 i386; do
+    for version in {0..9}; do
+        audio_targets+=("dlls/xaudio2_${version}/${arch}-windows/xaudio2_${version}.dll")
+    done
+done
+make -C "${BUILD}" -j"${JOBS}" "${audio_targets[@]}" \
+    || die "Building the patched XAudio2 modules failed."
+for arch in x86_64 i386; do
+    mkdir -p "${OUTPUT_DIR}/${arch}-windows"
+    for version in {0..9}; do
+        cp "${BUILD}/dlls/xaudio2_${version}/${arch}-windows/xaudio2_${version}.dll" \
+            "${OUTPUT_DIR}/${arch}-windows/"
+    done
+done
+printf '%s\n' c2ef8d3104401a79a7886062c4a5871db0b7b6f6 > "${OUTPUT_DIR}/faudio-callback-fix.txt"
 
 # --- verify and stage -------------------------------------------------------
 unix_half="${BUILD}/${unix_target}"

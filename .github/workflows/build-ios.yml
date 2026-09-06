@@ -249,26 +249,11 @@ jobs:
       # BoxedWine, which emulates /dev/dsp and /dev/mixer but no PulseAudio
       # socket and no /dev/snd. See docs/PLAN_X64_AUDIO.md.
       #
-      # Non-fatal on purpose. This builds Wine from source against the same
-      # upstream version as the installed amd64 package, and that build has
-      # never run in this workflow before: a failure here must report itself
-      # and leave every other lane shippable, not stop the pipeline. The
-      # runtime builder is told about the driver only when both halves exist,
-      # and scripts/validate-wine64-runtime.sh names the absence either way.
-      # Arm the hard gate (BOXEDVN_REQUIRE_WINE64_OSS=1 on the validate step)
-      # once a run here has been seen to succeed. It is still DISARMED: the
-      # two reasons the step could never have succeeded are fixed (the OSSv4
-      # header is now installed, and the post-configure check no longer greps
-      # for a HAVE_SYS_SOUNDCARD_H that Wine 9.0 never defines), but a Wine
-      # build from source has still never completed in this workflow, so the
-      # gate stays off until one has.
-      - name: Build Wine's OSS audio driver
+      # Required: both OSS architectures and the upstream XAudio2 callback
+      # lock repair must be present. Never publish a fallback without them.
+      - name: Build Wine audio driver and patched XAudio2 modules
         id: wineoss
-        continue-on-error: true
-        # Bounded so a Wine build that goes wrong cannot eat the job's budget
-        # and take the runtime layers down with it. A step timeout counts as a
-        # step failure, which continue-on-error absorbs; a job timeout would
-        # not be absorbed by anything.
+        # Bound source compilation independently of the remaining packaging.
         timeout-minutes: 25
         shell: bash
         run: |
