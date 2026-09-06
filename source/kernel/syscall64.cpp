@@ -18,6 +18,7 @@
 #include "knativesystem.h"
 #include "guest_mmap_diagnostics.h"
 #include "guest_mmap_placement.h"
+#include "guest_wow64_diagnostics.h"
 #include "wine_server_reply.h"
 #include "dll_search_trace.h"
 #ifdef BOXEDWINE_FEX64_BACKEND
@@ -744,6 +745,33 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         U32 wpid = (cpu->thread && cpu->thread->process) ? cpu->thread->process->id : 0;
         const char* wexe = (cpu->thread && cpu->thread->process) ? cpu->thread->process->name.c_str() : "?";
         klog_fmt("[guest fd=%llu pid=%u %s] %s", (unsigned long long)fd, (unsigned)wpid, wexe, (const char*)buffer.data());
+        if (fd == 2 && strstr((const char*)buffer.data(), "RtlpWaitForCriticalSection")) {
+            // Capture only the reporting thread's saved WoW64 context. Reading
+            // live sibling CPU state would race the translator. Each side of
+            // a lock cycle reports independently when Wine's wait times out.
+            static thread_local unsigned waitReports = 0;
+            if (waitReports++ < 2) {
+                auto read = [&](uint64_t address, void* out, size_t size) {
+                    if (!size || address > UINT64_MAX - size) return false;
+                    for (U64 p=address>>K64_PAGE_SHIFT;
+                         p<=((address+size-1)>>K64_PAGE_SHIFT);++p)
+                        if (!(cpu->memory->getPageFlags(p)&K64_PAGE_READ)) return false;
+                    cpu->memory->memcpyFromGuest(out,address,size);
+                    return true;
+                };
+                auto executable = [&](uint32_t address) {
+                    return (cpu->memory->getPageFlags(address>>K64_PAGE_SHIFT)&K64_PAGE_EXEC)!=0;
+                };
+                boxedvn::Wow64WaitStack stack;
+                const bool valid = boxedvn::captureWow64WaitStack(cpu->gsbase,read,executable,stack);
+                klog_fmt("BOXEDWINE_X64_WOW64_LOCK_WAIT pid=%u tid=%u valid=%d teb=0x%llx eip=0x%x esp=0x%x ebp=0x%x candidates=%u",
+                    wpid,cpu->thread ? cpu->thread->id : 0,valid ? 1 : 0,
+                    (unsigned long long)cpu->gsbase,stack.eip,stack.esp,stack.ebp,stack.count);
+                if (valid) for (unsigned i=0;i<stack.count;++i)
+                    klog_fmt("BOXEDWINE_X64_WOW64_LOCK_CODE pid=%u tid=%u index=%u candidate=0x%x",
+                        wpid,cpu->thread ? cpu->thread->id : 0,i,stack.codeCandidates[i]);
+            }
+        }
         if (fd == 2 && strstr((const char*)buffer.data(), "Fontconfig error")) {
             reportFontconfigFailure(
                 (cpu->thread && cpu->thread->process) ? cpu->thread->process.get()

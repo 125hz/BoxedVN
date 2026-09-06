@@ -1,0 +1,92 @@
+#include "native_shared_alias.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+using U8=uint8_t; using U16=uint16_t; using U32=uint32_t; using U64=uint64_t;
+constexpr U64 K64_PAGE_SIZE=4096, K64_PAGE_MASK=4095, K64_PAGE_SHIFT=12;
+constexpr int K_EINVAL=22, K_EBUSY=16, K_ENOMEM=12;
+constexpr U32 K64_PAGE_MAPPED=1,K64_PAGE_SHARED=2,K64_PAGE_READ=4,
+    K64_PAGE_WRITE=8,K64_PAGE_EXEC=16,K64_PAGE_PINNED=64,K64_WRITER_MMAP_FILE=1,MMAP_ANON=1;
+#define BOXEDWINE_KMEMORY64_NATIVE_IDENTITY 1
+#define BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(m) std::lock_guard<std::recursive_mutex> guard(m)
+static void klog_fmt(const char*,...) {}
+static void k64DTlbInvalidateAll() {}
+static void k64InvalidateProcessFetchCaches(void*) {}
+static U16 k64NextPageWriteStamp() { return 0; }
+static U64 k64GuestToHostAddress(U64 a) { return a; }
+static U64 k64NativeHostPageSize() { return boxedvn::NativeSharedAlias::pageSize(); }
+static U64 k64NativeAlignDown(U64 a,U64 n) { return a & ~(n-1); }
+static U64 k64NativeAlignUp(U64 a,U64 n) { return (a+n-1)&~(n-1); }
+static bool k64IsKuserRange(U64,U64) { return false; }
+static U8* k64KuserAliasFor(U64 a) { return reinterpret_cast<U8*>(a); }
+static U64 k64MmapBasePage(void*) { return 0; }
+static void k64ReportGuestLaneRefusal(void*,const char*,U64,U64,int) {}
+@REGISTRY@
+struct K64Page {
+    U32 flags=0;
+    bool permanentRamPin=false;
+    std::shared_ptr<std::atomic<U8*>> shared;
+    void writeFlags(U32 f,U32,U16) { flags=f; }
+    void demoteNativeShared() {}
+    void adoptShared(const std::shared_ptr<std::atomic<U8*>>& s,bool,U8*) { shared=s; }
+};
+struct Process { unsigned id=1; };
+struct KMemory64 {
+    Process* process=nullptr;
+    std::recursive_mutex mmapMutex,pagesMutex;
+    std::map<U64,std::unique_ptr<K64Page>> pages;
+    bool nativeIdentityMode() { return true; }
+    bool nativeGuestRangeAllowed(U64,U64) { return true; }
+    bool sparseReservationOverlaps(U64,U64) { return false; }
+    bool nativeMapKuserAlias(U64,U64,bool&) { return false; }
+    bool nativeMapAnonymous(U64 a,U64 n,U32,bool& fresh) {
+        fresh=false; return mprotect(reinterpret_cast<void*>(a),n,PROT_READ|PROT_WRITE)==0;
+    }
+    K64Page* getOrAllocPage(U64 p,U32,U32) {
+        auto& page=pages[p]; if(!page) page=std::make_unique<K64Page>(); return page.get();
+    }
+    void noteGuestWrite(U64) {}
+    void queueTranslatedCodeInvalidation(U64,U64) {}
+    void nativeReconcileHostProt(U64,U64) {}
+    void rangeInsertLocked(U64,U64,U32,U8) {}
+    U64 munmap(U64 a,U64 n) { return ::munmap(reinterpret_cast<void*>(a),n); }
+    U64 mmapSharedFile(U64,U64,U32,const char*,U64,const U8*,U64);
+};
+@MAP_BODY@
+static void check(bool ok,const char* why) {
+    if(!ok) { std::fprintf(stderr,"FAIL: %s\n",why); std::exit(1); }
+}
+int main() {
+    const size_t size=boxedvn::NativeSharedAlias::pageSize()*2;
+    auto reserve=[&] { return static_cast<U8*>(mmap(nullptr,size,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0)); };
+    U8* a=reserve(); U8* b=reserve();
+    check(a!=MAP_FAILED && b!=MAP_FAILED,"owned target ranges");
+    KMemory64 memory;
+    std::vector<U8> seed(size,0x31), conflictingSeed(size,0xee);
+    check(memory.mmapSharedFile((U64)a,size,3,"buffer",0,seed.data(),size)==(U64)a,"first view");
+    a[0]=0x77; a[size-1]=0x55;
+    check(memory.mmapSharedFile((U64)b,size,3,"buffer",0,conflictingSeed.data(),size)==(U64)b,"second native view");
+    check(b[0]==0x77 && b[size-1]==0x55,"second view preserves first view writes");
+    b[4096]=0x99;
+    auto shared=findSharedFilePage("buffer",1);
+    check(a[4096]==0x99 && shared->data->load()[0]==0x99,"native and sparse writes share physical storage");
+    check(!(memory.pages[(U64)a>>12]->flags & K64_PAGE_PINNED),"guest view needs no permanent pin");
+    check(mmap(a,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0)==a,"replace owned first view");
+    a[4096]=0x12;
+    check(b[4096]==0x99 && shared->data->load()[0]==0x99,"reusing one guest address leaves other views intact");
+    munmap(a,size); munmap(b,size);
+    check(shared->data->load()[0]==0x99,"backing survives all guest views");
+    bool created=false;
+    auto late=getSharedFilePage("buffer",1,conflictingSeed.data(),4096,created);
+    check(!created && late->data->load()[0]==0x99,"late mapping cannot reseed existing data");
+    std::puts("native shared-map regression passed (production mapper and Darwin VM)");
+}

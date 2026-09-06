@@ -605,6 +605,9 @@ jobs:
             ios/tests/test_fex_callret_guard_native.cpp -o build/callret-guard-test/test
           build/callret-guard-test/test
 
+      - name: Verify native shared mapping aliases
+        run: python3 scripts/test_native_shared_alias.py
+
       - name: Restore pinned third-party dependencies
         uses: actions/cache@v5
         with:

@@ -10,6 +10,7 @@
 #include "boxedwine.h"
 #include "kmemory64.h"
 #include "native_map_plan.h"
+#include "native_shared_alias.h"
 #include "cpu64.h"   // CPU64 full def — BW64_MEMRING reads the running thread's rip
 
 #ifdef BOXEDWINE_GUEST_X64
@@ -48,13 +49,21 @@
 // ---------------------------------------------------------------------------
 namespace {
 struct SharedFilePage {
-    U8 localData[K64_PAGE_SIZE];
+    U8 heapData[K64_PAGE_SIZE];
+    U8* localData = heapData;
+#if defined(__APPLE__)
+    std::shared_ptr<boxedvn::NativeSharedAlias> nativeBacking;
+    bool nativeAliased = false;
+#endif
     std::shared_ptr<std::atomic<U8*>> data;
     SharedFilePage() : data(std::make_shared<std::atomic<U8*>>(localData)) {}
 };
 std::mutex g_sharedFileMutex;
 // key: path + "\0" + decimal page-aligned file offset -> one shared page buffer.
 std::unordered_map<std::string, std::shared_ptr<SharedFilePage>> g_sharedFileRegistry;
+#if defined(__APPLE__)
+std::unordered_map<std::string, std::shared_ptr<boxedvn::NativeSharedAlias>> g_sharedFileChunks;
+#endif
 
 std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 offsetPage,
                                                   const U8* seed, U64 seedLen, bool& created) {
@@ -65,6 +74,22 @@ std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 o
     auto it = g_sharedFileRegistry.find(key);
     if (it != g_sharedFileRegistry.end()) { created = false; return it->second; }
     auto page = std::make_shared<SharedFilePage>();
+#if defined(__APPLE__)
+    const U64 hostSize = boxedvn::NativeSharedAlias::pageSize();
+    if (hostSize >= K64_PAGE_SIZE && hostSize % K64_PAGE_SIZE == 0) {
+        const U64 byteOffset = offsetPage * K64_PAGE_SIZE;
+        std::string chunkKey = path;
+        chunkKey.push_back('\0');
+        chunkKey += std::to_string(byteOffset / hostSize);
+        auto& chunk = g_sharedFileChunks[chunkKey];
+        if (!chunk) chunk = std::make_shared<boxedvn::NativeSharedAlias>();
+        if (chunk->data()) {
+            page->nativeBacking = chunk;
+            page->localData = chunk->data() + byteOffset % hostSize;
+            page->data->store(page->localData, std::memory_order_release);
+        }
+    }
+#endif
     ::memset(page->localData, 0, K64_PAGE_SIZE);
     if (seed && seedLen) {
         U64 n = seedLen < K64_PAGE_SIZE ? seedLen : K64_PAGE_SIZE;
@@ -1981,6 +2006,7 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
 
 U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
                               U64 fileOffset, const U8* fileBytes, U64 fileBytesLen) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
     if (len == 0) return (U64)-K_EINVAL;
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
     if (!path) return (U64)-K_EINVAL;
@@ -2004,16 +2030,28 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
 
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
     const bool kuserRange = k64IsKuserRange(addr, pageCount << K64_PAGE_SHIFT);
+    bool stableAliases = false;
+#if defined(__APPLE__)
+    // Full host pages can share physical backing at multiple guest addresses.
+    // Retain the existing subpage/KUSER path; never overwrite adjacent pages
+    // merely to make a 4 KiB request fit a 16 KiB host mapping.
+    const U64 aliasSize = boxedvn::NativeSharedAlias::pageSize();
+    stableAliases = nativeIdentityMode() && !kuserRange && aliasSize &&
+        !(addr % aliasSize) && !(fileOffset % aliasSize) &&
+        !((pageCount << K64_PAGE_SHIFT) % aliasSize);
+#endif
     if (nativeIdentityMode()) {
-        // One registry page can have only one direct host pointer. Refuse a
-        // second identity mapping at a different guest address rather than
-        // retargeting the pointer and silently redirecting the first mapping.
-        // Sparse aliases continue to use the canonical shared page.
+        // Legacy subpage mappings promote one direct pointer. They cannot be
+        // retargeted while in use. Stable aliases leave the canonical pointer
+        // in place, so multiple full-host-page views pass this check.
         const std::string requestedPath(path);
         for (U64 i = 0; i < pageCount && !kuserRange; i++) {
             const U64 fpage = (fileOffset >> K64_PAGE_SHIFT) + i;
             std::shared_ptr<SharedFilePage> shared = findSharedFilePage(requestedPath, fpage);
             if (!shared) continue;
+#if defined(__APPLE__)
+            if (!stableAliases && shared->nativeAliased) return (U64)-K_EINVAL;
+#endif
             const U8* current = shared->data->load(std::memory_order_acquire);
             const U8* fixed = (const U8*)(uintptr_t)k64GuestToHostAddress(
                 (pageStart + i) << K64_PAGE_SHIFT);
@@ -2032,6 +2070,25 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
             }
         }
     }
+#if defined(__APPLE__)
+    std::vector<std::shared_ptr<SharedFilePage>> aliasPages;
+    if (stableAliases) {
+        // Resolve every page before changing any host mapping. Existing data
+        // must never be re-seeded by a second view of the same file.
+        for (U64 i = 0; i < pageCount; ++i) {
+            const U64 start = i * K64_PAGE_SIZE;
+            const U64 seedLen = fileBytes && fileBytesLen > start
+                ? std::min<U64>(K64_PAGE_SIZE, fileBytesLen - start) : 0;
+            bool created = false;
+            auto shared = getSharedFilePage(path, (fileOffset >> K64_PAGE_SHIFT) + i,
+                seedLen ? fileBytes + start : nullptr, seedLen, created);
+            if (!shared->nativeBacking ||
+                shared->data->load(std::memory_order_acquire) != shared->localData)
+                return (U64)-K_EBUSY;
+            aliasPages.push_back(shared);
+        }
+    }
+#endif
     bool nativeFresh = false;
     if (nativeIdentityMode()) {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
@@ -2043,6 +2100,24 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
             return (U64)-K_ENOMEM;
         }
     }
+#if defined(__APPLE__)
+    if (stableAliases) {
+        for (U64 i = 0; i < pageCount; i += aliasSize / K64_PAGE_SIZE) {
+            const U64 destination = k64GuestToHostAddress(addr + i * K64_PAGE_SIZE);
+            if (!aliasPages[i]->nativeBacking->mapAt((uintptr_t)destination)) {
+                klog_fmt("BOXEDWINE_X64_SHARED_ALIAS failed addr=0x%llx len=0x%llx",
+                    (unsigned long long)addr, (unsigned long long)len);
+                munmap(addr, pageCount << K64_PAGE_SHIFT);
+                return (U64)-K_ENOMEM;
+            }
+        }
+        static std::atomic<U32> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 24)
+            klog_fmt("BOXEDWINE_X64_SHARED_ALIAS addr=0x%llx len=0x%llx offset=0x%llx status=shared-backing",
+                (unsigned long long)addr, (unsigned long long)len,
+                (unsigned long long)fileOffset);
+    }
+#endif
 #endif
 
     U32 flags = K64_PAGE_MAPPED | K64_PAGE_SHARED;
@@ -2080,6 +2155,16 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
             bool nativeShared = false;
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
             if (nativeIdentityMode()) {
+#if defined(__APPLE__)
+                if (stableAliases) {
+                    shared->nativeAliased = true;
+                    // Sparse and native views both reference stable backing.
+                    // Guest unmapping can release its address without moving
+                    // the pointer retained by a sparse wineserver or futex.
+                    nativeShared = true;
+                } else
+#endif
+                {
                 U8* fixed = kuserRange
                     ? k64KuserAliasFor((pageStart + i) << K64_PAGE_SHIFT)
                     : (U8*)(uintptr_t)k64GuestToHostAddress(
@@ -2100,6 +2185,7 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
                 page->permanentRamPin = true;
                 page->writeFlags(page->flags | K64_PAGE_PINNED,
                                  K64_WRITER_MMAP_FILE, stamp);
+                }
             }
 #endif
             page->adoptShared(shared->data, nativeShared, shared->localData);

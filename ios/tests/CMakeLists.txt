@@ -150,6 +150,10 @@ configure_file(test_guest_ram_lease.cpp.in test_guest_ram_lease.cpp @ONLY)
 add_executable(boxedvn_guest_ram_lease_test "${CMAKE_CURRENT_BINARY_DIR}/test_guest_ram_lease.cpp")
 add_test(NAME boxedvn_guest_ram_lease COMMAND boxedvn_guest_ram_lease_test)
 
+add_executable(boxedvn_wow64_diagnostics_test test_guest_wow64_diagnostics.cpp)
+target_include_directories(boxedvn_wow64_diagnostics_test PRIVATE ../../include)
+add_test(NAME boxedvn_wow64_diagnostics COMMAND boxedvn_wow64_diagnostics_test)
+
 # Dependency pinning: verifies every pin is well formed and that a mismatched
 # checksum is actually refused.  Needs no network access.
 if(UNIX)
