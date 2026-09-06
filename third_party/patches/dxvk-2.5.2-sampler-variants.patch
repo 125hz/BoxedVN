@@ -81,7 +81,7 @@ diff --git a/src/d3d9/d3d9_options.cpp b/src/d3d9/d3d9_options.cpp
 +    this->deAliasedSamplers = deAlias == Tristate::True ||
 +      (deAlias == Tristate::Auto && adapter != nullptr && adapter->matchesDriver(VK_DRIVER_ID_MOLTENVK));
 +    if (this->deAliasedSamplers)
-+      Logger::info("D3D9: distinct texture variant bindings enabled");
++      Logger::info(str::format("BOXEDWINE_DXVK_SAMPLER_VARIANTS enabled=", this->deAliasedSamplers));
  
      // Fetch these as a string representing a hexadecimal number and parse it.
      this->customVendorId        = parsePciId(config.getOption<std::string>("d3d9.customVendorId"));
