@@ -23,6 +23,7 @@ static void k64DTlbInvalidateAll() {}
 static void k64InvalidateProcessFetchCaches(void*) {}
 static U16 k64NextPageWriteStamp() { return 0; }
 static U64 k64GuestToHostAddress(U64 a) { return a; }
+static U64 k64HostToGuestAddress(U64 a) { return a; }
 static U64 k64NativeHostPageSize() { return boxedvn::NativeSharedAlias::pageSize(); }
 static U64 k64NativeAlignDown(U64 a,U64 n) { return a & ~(n-1); }
 static U64 k64NativeAlignUp(U64 a,U64 n) { return (a+n-1)&~(n-1); }

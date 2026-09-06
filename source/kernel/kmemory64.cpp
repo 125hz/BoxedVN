@@ -1478,8 +1478,9 @@ bool KMemory64::nativeDetachSharedViews(U64 addr, U64 len) {
     std::vector<View> views;
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
-        for (U64 base=k64NativeAlignDown(addr,granule);base<addr+len;base+=granule) {
-            const U64 host=k64GuestToHostAddress(base);
+        const U64 hostEnd=k64GuestToHostAddress(addr)+len;
+        for (U64 host=k64NativeAlignDown(k64GuestToHostAddress(addr),granule);host<hostEnd;host+=granule) {
+            const U64 base=k64HostToGuestAddress(host);
             if (!nativeRangeCovers(host,host+granule)) continue;
             const U8* source=nullptr;
             for (U64 i=0;i<granule/K64_PAGE_SIZE;++i) {
