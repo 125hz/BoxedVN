@@ -2116,15 +2116,16 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
                 K_WINE_REQ_INIT_PROCESS_DONE &&
             got == K_WINE_SERVER_MESSAGE_BYTES) {
             const boxedvn::WineInitProcessDoneReply reply =
-                boxedvn::decodeWineInitProcessDoneReply(tmp.data(), got);
+                boxedvn::decodeWineInitProcessDoneReply(tmp.data(), got,
+                    boxedvn::WineServerProtocol::Wine11);
             if (boxedvn::wineInitProcessDoneAdmitted(reply)) {
                 replyProcess->initProcessDoneReported = true;
                 klog_fmt("BOXEDWINE_X64_INIT_DONE_REPLY pid=%u error=%u "
-                         "reply_size=%u entry=0x%llx suspend=%d "
+                         "reply_size=%u entry=0x%llx entry_provided=%d suspend=%d "
                          "request_fd=%u reply_fd=%u",
                          (unsigned)replyProcess->id, (unsigned)reply.error,
                          (unsigned)reply.replySize,
-                         (unsigned long long)reply.entry, (int)reply.suspend,
+                         (unsigned long long)reply.entry, (int)reply.entryProvided, (int)reply.suspend,
                          (unsigned)replyProcess->lastServerRequestFd,
                          (unsigned)fd);
                 // Everything after this point is the loader-to-Windows

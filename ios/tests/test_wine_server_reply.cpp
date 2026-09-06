@@ -158,3 +158,23 @@ BOXEDVN_TEST(wine_server_exchange_is_recognised_without_a_pid_or_an_entry) {
     CHECK(wineServerRequestOpcode(request.data(), request.size()) !=
           K_WINE_REQ_INIT_PROCESS_DONE);
 }
+
+BOXEDVN_TEST(wine11_init_done_decodes_suspend_without_an_entry) {
+    auto message = emptyMessage();
+    putDword(message.data(), 8, 1);
+    // Padding is not an entry address or a second suspend field.
+    putDword(message.data(), 12, 0xabcdef01);
+    putDword(message.data(), 16, 0xffffffff);
+    auto reply = decodeWineInitProcessDoneReply(message.data(), message.size(),
+                                                WineServerProtocol::Wine11);
+    CHECK(reply.valid);
+    CHECK(!reply.entryProvided);
+    CHECK_EQ(reply.entry, 0u);
+    CHECK_EQ(reply.suspend, 1);
+    CHECK(wineInitProcessDoneAdmitted(reply));
+    CHECK(!decodeWineInitProcessDoneReply(message.data(), 11,
+                                          WineServerProtocol::Wine11).valid);
+    putDword(message.data(), 0, 0xc0000022u);
+    CHECK(!wineInitProcessDoneAdmitted(decodeWineInitProcessDoneReply(
+        message.data(), message.size(), WineServerProtocol::Wine11)));
+}

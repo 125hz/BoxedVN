@@ -379,6 +379,25 @@ copy_as() {
     cp -aL "${real}" "${STAGE}${destination}"
 }
 
+# A source install contains developer import archives and DWARF sections that
+# distro runtime packages split out. Keep those in the build cache, not in the
+# on-device ZIP. Only operate on this invocation's freshly copied stage.
+trim_source_runtime_tree() {
+    local directory="$1" stripper="$2" module
+    [[ -n "${WINE_INSTALL}" ]] || return 0
+    case "${directory}" in
+        "${STAGE}/"*|"${PE32_STAGE}/"*) ;;
+        *) die "Refusing to trim a directory outside the runtime stage" ;;
+    esac
+    require_command "${stripper}"
+    find "${directory}" -maxdepth 1 -type f -name '*.a' -delete
+    while IFS= read -r -d '' module; do
+        if is_elf64_x86_64 "${module}" || [[ "$(head -c 2 "${module}")" == MZ ]]; then
+            "${stripper}" --strip-debug "${module}"
+        fi
+    done < <(find "${directory}" -maxdepth 1 -type f -print0)
+}
+
 # Resolve the complete native dependency closure of Wine's ELF entry points.
 # This keeps the layer independent of the host filesystem after it is mounted
 # into BoxedWine and catches both /lib and /usr/lib layouts used by Ubuntu.
@@ -541,6 +560,9 @@ copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver64"
 copy_as "${WINE_SERVER}" "${WINE_MODULE_ROOT}/wineserver"
 cp -aL "${WINE_UNIX}" "${STAGE}${WINE_MODULE_ROOT}/"
 cp -aL "${WINE_WINDOWS}" "${STAGE}${WINE_MODULE_ROOT}/"
+trim_source_runtime_tree "${STAGE}${WINE_MODULE_ROOT}" strip
+trim_source_runtime_tree "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix" strip
+trim_source_runtime_tree "${STAGE}${WINE_MODULE_ROOT}/x86_64-windows" x86_64-w64-mingw32-strip
 if [[ -n "${DXMT_UNIXLIB}" ]]; then
     cp "${DXMT_UNIXLIB}" \
        "${STAGE}${WINE_MODULE_ROOT}/x86_64-unix/winemetal.so"
@@ -559,6 +581,7 @@ I386_PE_MODULE_COUNT=0
 if [[ -n "${I386_PE_DIR}" ]]; then
     mkdir -p "${PE32_STAGE}${I386_PE_GUEST_DIR}"
     cp -aL "${I386_PE_DIR}/." "${PE32_STAGE}${I386_PE_GUEST_DIR}/"
+    trim_source_runtime_tree "${PE32_STAGE}${I386_PE_GUEST_DIR}" i686-w64-mingw32-strip
     # Every module the lane binds to, reported together. One name at a time
     # would hide the shape of the gap: a tree missing only zlib1.dll came from
     # the right package and lost one module, while a tree missing ten of these

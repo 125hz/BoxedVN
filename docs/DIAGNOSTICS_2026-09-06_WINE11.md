@@ -8,6 +8,9 @@ and the ELF64 Unix runtime. Source SHA-256:
 `c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701`.
 The loader, ntdll, wineserver, builtins, OSS and XAudio modules share that source
 version. The packaging script accommodates Wine 11's loader beside Unix ntdll.
+Developer import archives and DWARF sections are excluded from staged runtime
+modules; the original build cache retains them. The process-start diagnostic
+also handles Wine 11's reply layout, which no longer carries an entry address.
 
 Wine still runs as a Linux guest inside BoxedWine. FEX supplies CPU translation;
 DXMT supplies the existing 64-bit graphics path. The 32-bit D3D9 path remains
