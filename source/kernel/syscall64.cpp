@@ -1310,6 +1310,18 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
                            U64 flags, U64 fd, U64 offset);
 
 static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64 fd, U64 offset) {
+    if (length == 0) return (U64)-K_EINVAL;
+    // Validate the guest VA before page rounding, scanning page metadata or
+    // branching into file/anonymous mappings. Wine probes this boundary to
+    // size its page-protection table; accepting bit 63 overflows that probe.
+    if (length > boxedvn::kGuestUserMapLimit) return (U64)-K_ENOMEM;
+    const U64 roundedLength = (length + 0xfffULL) & ~0xfffULL;
+    if (flags & (K_MAP_FIXED | K_MAP_FIXED_NOREPLACE)) {
+        if (addr & 0xfffULL) return (U64)-K_EINVAL;
+        if (!boxedvn::guestUserMapRangeValid(addr, roundedLength)) {
+            return (U64)-K_ENOMEM;
+        }
+    }
     if (!(flags & K_MAP_ANONYMOUS)) {
         const U64 result = sys_mmap64_file(cpu, addr, length, prot, flags, fd, offset);
         if (cpu->thread && cpu->thread->process) {

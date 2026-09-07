@@ -28,6 +28,16 @@
 
 namespace boxedvn {
 
+// The emulated Linux x86-64 process uses the lower canonical 48-bit half,
+// with Linux's final-page guard. Sparse metadata is still a guest mapping:
+// PROT_NONE must not make kernel or noncanonical addresses allocatable.
+constexpr std::uint64_t kGuestUserMapLimit = (1ULL << 47) - 0x1000;
+inline bool guestUserMapRangeValid(std::uint64_t address,
+                                   std::uint64_t length) noexcept {
+    return length != 0 && address < kGuestUserMapLimit &&
+           length <= kGuestUserMapLimit - address;
+}
+
 enum class GuestMmapPlacement : std::uint8_t {
     // Map at exactly the requested address, replacing any existing mapping.
     MapExact = 0,
@@ -79,6 +89,16 @@ struct GuestMmapRequest {
 // Decide where one anonymous or file-backed guest mmap request belongs.
 inline GuestMmapPlacement chooseGuestMmapPlacement(
     const GuestMmapRequest& request) noexcept {
+    if (request.length == 0 || request.length > kGuestUserMapLimit) {
+        return GuestMmapPlacement::FailNoMemory;
+    }
+    if (!guestUserMapRangeValid(request.address, request.length)) {
+        // An invalid ordinary hint may be ignored. Exact mappings must fail
+        // before occupancy checks, including inaccessible reservations.
+        return (request.fixed || request.fixedNoReplace)
+            ? GuestMmapPlacement::FailNoMemory
+            : GuestMmapPlacement::RelocateHighWindow;
+    }
     if (request.address == 0) {
         // No preference: the bounded allocator owns the choice.
         return GuestMmapPlacement::RelocateHighWindow;

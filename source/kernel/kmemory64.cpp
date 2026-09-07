@@ -9,6 +9,7 @@
 
 #include "boxedwine.h"
 #include "kmemory64.h"
+#include "guest_mmap_placement.h"
 #include "native_map_plan.h"
 #include "native_shared_alias.h"
 #include "cpu64.h"   // CPU64 full def — BW64_MEMRING reads the running thread's rip
@@ -1925,6 +1926,7 @@ bool KMemory64::nativeRepairHostFault(U64 hostFaultAddress, U32 requiredProt,
 
 U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
     if (len == 0) return (U64)-K_EINVAL;
+    if (!boxedvn::guestUserMapRangeValid(addr, len)) return (U64)-K_ENOMEM;
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
     if (len > (U64)-1 - K64_PAGE_MASK ||
         addr > (U64)-1 - len) return (U64)-K_EINVAL;
@@ -2362,6 +2364,7 @@ bool KMemory64::rangeCompletelyUnmapped(U64 addr, U64 len) const {
 // one interval and nothing is mapped.
 U64 KMemory64::reserveSparseNoReplace(U64 addr, U64 len) {
     if (len == 0) return (U64)-K_EINVAL;
+    if (!boxedvn::guestUserMapRangeValid(addr, len)) return (U64)-K_ENOMEM;
     if (addr == 0 || (addr & K64_PAGE_MASK)) return (U64)-K_EINVAL;
     if (len > (U64)-1 - K64_PAGE_MASK || addr > (U64)-1 - len) {
         return (U64)-K_EINVAL;
@@ -2478,6 +2481,7 @@ U64 KMemory64::sparseReservationPages() const {
 
 U64 KMemory64::mmapAnonymousNoReplace(U64 addr, U64 len, U32 prot) {
     if (len == 0) return (U64)-K_EINVAL;
+    if (!boxedvn::guestUserMapRangeValid(addr, len)) return (U64)-K_ENOMEM;
     if (addr == 0 || (addr & K64_PAGE_MASK)) return (U64)-K_EINVAL;
     if (len > (U64)-1 - K64_PAGE_MASK || addr > (U64)-1 - len) {
         return (U64)-K_EINVAL;

@@ -305,3 +305,55 @@ BOXEDVN_TEST(guest_mmap_destructive_fixed_placement_is_preserved) {
                     /*anyAccessiblePage*/ true, /*anyMappedPage*/ true);
     CHECK(chooseGuestMmapPlacement(both) == GuestMmapPlacement::FailExists);
 }
+
+BOXEDVN_TEST(guest_mmap_rejects_noncanonical_and_kernel_exact_ranges) {
+    for (bool native : {false, true}) {
+        for (bool occupied : {false, true}) {
+            for (std::uint64_t address : {1ULL << 63, 1ULL << 56, 1ULL << 47,
+                                         0xffff800000000000ULL}) {
+                auto request = makeRequest(address, 0x1000, kProtNone, false,
+                    true, native, false, occupied, true);
+                CHECK(chooseGuestMmapPlacement(request) == GuestMmapPlacement::FailNoMemory);
+                request.fixedNoReplace = false;
+                request.fixed = true;
+                CHECK(chooseGuestMmapPlacement(request) == GuestMmapPlacement::FailNoMemory);
+                request.fixed = false;
+                CHECK(chooseGuestMmapPlacement(request) == GuestMmapPlacement::RelocateHighWindow);
+            }
+        }
+    }
+    CHECK(guestUserMapRangeValid(kGuestUserMapLimit - 0x1000, 0x1000));
+    CHECK(!guestUserMapRangeValid(kGuestUserMapLimit - 0x1000, 0x2000));
+    CHECK(!guestUserMapRangeValid(0xfffffffffffff000ULL, 0x2000));
+    CHECK(!guestUserMapRangeValid(0, 0xffffffffffffffffULL));
+    CHECK(!guestUserMapRangeValid(0x10000, 0));
+}
+
+BOXEDVN_TEST(guest_mmap_address_probe_sizes_wine_heap_without_overflow) {
+    // Wine 11 get_host_addr_space_limit starts at bit 63, halves until an
+    // exact PROT_NONE mapping succeeds, then derives its page-table size.
+    std::uint64_t address = 1ULL << 63;
+    unsigned refusals = 0;
+    while (address >> 32) {
+        auto request = makeRequest(address, 0x1000, kProtNone, false, true,
+                                   true, false, false, true);
+        auto placement = chooseGuestMmapPlacement(request);
+        if (!guestMmapPlacementIsFailure(placement)) {
+            CHECK(placement == GuestMmapPlacement::ReserveSparse);
+            break;
+        }
+        CHECK(placement == GuestMmapPlacement::FailNoMemory);
+        address >>= 1;
+        ++refusals;
+    }
+    CHECK(refusals == 17);
+    CHECK(address == (1ULL << 46));
+    const std::uint64_t hostLimit = (address << 1) - 0x10000;
+    const std::uint64_t tableBytes = 0x200000 + ((hostLimit >> 12 >> 20) + 1) * 8;
+    CHECK(hostLimit == 0x7fffffff0000ULL);
+    CHECK(tableBytes == 0x240000);
+    // Existing valid high reservations must remain cheap sparse intervals.
+    auto top = makeRequest(0x7ffffe000000ULL, 0x1ff0000, kProtNone, false,
+                           true, true, false, false, true);
+    CHECK(chooseGuestMmapPlacement(top) == GuestMmapPlacement::ReserveSparse);
+}
