@@ -21,6 +21,7 @@
 #include "x11bridge64.h"
 #include "knativesystem.h"
 #include "ksocket.h"
+#include "kvulkan.h"
 
 #ifdef BOXEDWINE_OPENGL_OSMESA
 #include "../../source/opengl/osmesa/osmesa.h"
@@ -1087,14 +1088,20 @@ int XServer::mapWindow(const DisplayDataPtr& data, const XWindowPtr& window) {
 	int result = window->mapWindow();
 
 #ifdef BOXEDWINE_IOS
-    // Capability checks can leave a full-sized Vulkan child under an unmapped
-    // parent. It must not hide the visible GDI launcher that is mapped later.
+    // A capability probe need not unmap its window. Until its first Vulkan
+    // present, let a later visible GDI window from the same client take over.
+    // The first real Vulkan present restores its own window as the target.
+    KVulkanPtr vulkan = fakeFullScreenWnd ? KNativeSystem::getVulkan() : nullptr;
+    const bool pendingSurface = fakeFullScreenWnd && vulkan &&
+        fakeFullScreenWnd->displayId == window->displayId &&
+        vulkan->isPendingPresentationWindow(fakeFullScreenWnd);
     if (result == Success && fakeFullScreenWnd &&
-        !fakeFullScreenWnd->isThisAndAncestorsMapped() &&
+        window != fakeFullScreenWnd &&
+        (!fakeFullScreenWnd->isThisAndAncestorsMapped() || pendingSurface) &&
         window->isThisAndAncestorsMapped() && window->c_class != InputOnly &&
         window->width() >= 32 && window->height() >= 32) {
-        klog_fmt("BOXEDWINE_X11_PRESENTATION_FALLBACK hidden=0x%x visible=0x%x",
-                 fakeFullScreenWnd->id, window->id);
+        klog_fmt("BOXEDWINE_X11_PRESENTATION_FALLBACK previous=0x%x visible=0x%x pending_surface=%d",
+                 fakeFullScreenWnd->id, window->id, pendingSurface ? 1 : 0);
         setFakeFullScreenWindow(window);
     }
 #endif
@@ -1157,12 +1164,13 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
             delivered = true;
         });
         if (delivered) return;
-        // A client without XI2 receives a core motion relative to the anchor.
-        // The virtual pointer remains centered and no inverse synthetic motion
-        // is injected. Raw subscribers above receive each physical delta once.
+        // The input backend has already advanced its queried position.
+        // A non-XI2 client receives that position, not the delta a second time.
         KNativeSystem::getCurrentInput()->getMousePos(&x, &y);
+#ifndef BOXEDWINE_IOS
         x += deltaX;
         y += deltaY;
+#endif
     }
 
 	if (isGrabbed) {
@@ -1171,7 +1179,11 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 		DisplayDataPtr grabbedDisplay = getDisplayDataById(grabbedDisplayId);
 
 		if (grabbed && grabbedDisplay) {
-			if ((grabbedDisplay->getInput2Mask(root->id) & XI_RawMotionMask) && (relative || KSystem::forceRelativeMouse)) {
+			if ((grabbedDisplay->getInput2Mask(root->id) & XI_RawMotionMask) && (relative
+#ifndef BOXEDWINE_IOS
+                || KSystem::forceRelativeMouse
+#endif
+                )) {
 				KNativeInputPtr input = KNativeSystem::getCurrentInput();
 				S32 midX = input->screenWidth() / 2;
 				S32 midY = input->screenHeight() / 2;

@@ -1,5 +1,37 @@
 #include "boxedvn_test.h"
 #include "guest_wine_audio_registration.h"
+#include "guest_wine_timezone_registration.h"
+
+BOXEDVN_TEST(timezone_database_preserves_existing_rules_and_is_idempotent) {
+    std::string text = "WINE REGISTRY Version 2\n#arch=win64\n"
+        "[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Time Zones\\\\UTC] 123\n"
+        "\"Std\"=\"Custom UTC\"\n";
+    CHECK(boxedvn::registerWineTimezones(text));
+    CHECK(text.find("\"Std\"=\"Custom UTC\"") != std::string::npos);
+    CHECK(text.find("\"Std\"=\"Coordinated Universal Time\"") == std::string::npos);
+    CHECK(text.find("Pacific Standard Time") != std::string::npos);
+    CHECK(text.find("Dynamic DST") != std::string::npos);
+    const auto saved = text;
+    CHECK(!boxedvn::registerWineTimezones(text));
+    CHECK_EQ(text, saved);
+    std::string fresh;
+    CHECK(boxedvn::registerWineTimezones(fresh));
+    CHECK(fresh.find("\"Std\"=\"Coordinated Universal Time\"") != std::string::npos);
+}
+
+BOXEDVN_TEST(shell_service_proxy_repairs_both_architectures_without_replacing_overrides) {
+    std::string text;
+    CHECK(!boxedvn::registerWineServiceProviderProxy(text, false, false));
+    CHECK(boxedvn::registerWineServiceProviderProxy(text, true, true));
+    CHECK(text.find("syswow64\\\\actxprxy.dll") != std::string::npos);
+    CHECK(text.find("system32\\\\actxprxy.dll") != std::string::npos);
+    CHECK(text.find("6d5140c1-7436-11ce-8034-00aa006009fa") != std::string::npos);
+    auto path = text.find("system32\\\\actxprxy.dll");
+    text.replace(path, std::string("system32\\\\actxprxy.dll").size(), "custom.dll");
+    const auto saved = text;
+    CHECK(!boxedvn::registerWineServiceProviderProxy(text, true, true));
+    CHECK_EQ(text, saved);
+}
 
 BOXEDVN_TEST(dxdiag_registration_preserves_overrides_and_uses_apartment) {
     std::string text = "WINE REGISTRY Version 2\n#arch=win64\n";

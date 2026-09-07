@@ -113,9 +113,13 @@ int main(){
  input.setMousePos(330,242); assert(server->moves==2 && warps==0 && input.injectedX==330);
  for(int i=0;i<100;++i) {
    assert(input.mouseMoveGuest(123,-87,true));
-   assert(input.injectedX==400 && input.injectedY==300);
+   assert(input.injectedX==453 && input.injectedY==155);
    assert(server->relative && server->x==123 && server->y==-87);
+   input.setMousePos(330,242); // application recenters before the next frame
  }
+ input.mouseMoveGuest(10000,-10000,true);
+ assert(input.injectedX==799 && input.injectedY==0);
+ assert(server->x==10000 && server->y==-10000); // raw motion has no edge limit
  input.mouseMoveGuest(12,34,false);assert(input.injectedX==12 && input.injectedY==34);
  XWindow child;child.moveResize(40,60,200,150);
  assert(child.left==40 && child.top==60 && child.w==200 && child.h==150 && child.configured==1);

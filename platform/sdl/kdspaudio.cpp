@@ -214,6 +214,7 @@ public:
 	U32 invalidSamples = 0;
 	bool sameFormat = false;
 	U32 dspFragSize = 4096;
+    bool fragmentSizeRequested = false;
 	bool open = false;
 	std::deque<U8> audioBuffer; // only used when KSystem::soundEnabled is false
 	U32 lastNoSoundDrainTime = 0;
@@ -441,6 +442,12 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
 		return;
 	}
 	this->deviceId = newId;
+#ifndef __EMSCRIPTEN__
+    if (!this->fragmentSizeRequested) {
+        this->dspFragSize = KDspAudioMath::getDefaultFragmentSize(
+            bytesPerSecondWant(), this->got.freq, this->got.samples);
+    }
+#endif
 
 	if (this->want.freq != this->got.freq || this->want.channels != this->got.channels || this->want.format != this->got.format) {
 		this->sameFormat = false;
@@ -498,6 +505,7 @@ void KDspAudioSdl::closeAudio() {
 }
 
 void KDspAudioSdl::setFragmentSize(U32 size) {
+    this->fragmentSizeRequested = true;
 #ifdef __EMSCRIPTEN__
 	size = std::clamp(size, (U32)256, (U32)4096);
 #else

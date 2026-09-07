@@ -1710,6 +1710,31 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
                      (unsigned long long)machine->__ss.__x[1],
                      (unsigned long long)machine->__ss.__x[2],
                      (unsigned long long)machine->__ss.__x[3]);
+            if (inOwnedFexCode) {
+                // Stay within the faulting instruction's readable host page.
+                // Indexed x87 context stores use x28 + index*16; record both
+                // the actual STATE register and instructions forming the base.
+                const unsigned preceding = std::min<unsigned>(8, (hostPC & 4095) / 4);
+                char words[9 * 9] {};
+                for (unsigned i = 0; i <= preceding; ++i) {
+                    snprintf(words + i * 9, sizeof(words) - i * 9, "%08x%s",
+                        reinterpret_cast<const uint32_t*>(hostPC)[(int)i - (int)preceding],
+                        i == preceding ? "" : ",");
+                }
+                klog_fmt("BOXEDWINE_FEX64_GUEST_FAULT_CONTEXT frame=0x%llx state=0x%llx x28=0x%llx "
+                         "x4=0x%llx x5=0x%llx x6=0x%llx x7=0x%llx x8=0x%llx "
+                         "x9=0x%llx x10=0x%llx x11=0x%llx x12=0x%llx x13=0x%llx x14=0x%llx x15=0x%llx "
+                         "host_start=0x%llx words=%s",
+                    (unsigned long long)frame, (unsigned long long)&frame->State,
+                    (unsigned long long)machine->__ss.__x[28],
+                    (unsigned long long)machine->__ss.__x[4], (unsigned long long)machine->__ss.__x[5],
+                    (unsigned long long)machine->__ss.__x[6], (unsigned long long)machine->__ss.__x[7],
+                    (unsigned long long)machine->__ss.__x[8], (unsigned long long)machine->__ss.__x[9],
+                    (unsigned long long)machine->__ss.__x[10], (unsigned long long)machine->__ss.__x[11],
+                    (unsigned long long)machine->__ss.__x[12], (unsigned long long)machine->__ss.__x[13],
+                    (unsigned long long)machine->__ss.__x[14], (unsigned long long)machine->__ss.__x[15],
+                    (unsigned long long)(hostPC - preceding * 4), words);
+            }
             // A fault whose address, taken back through the alias, lands
             // inside FEX's own CPU state is not a guest fault at all: it is
             // translated code dereferencing a HOST context address as if it
@@ -1858,17 +1883,28 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
 // sched_yield changes no vector/x87 state and touches no guest memory. The
 // Linux ELF lane is disjoint from Wine's PE NT syscall thunks. Preserve FEX's
 // spilled SIMD state in place instead of reconstructing/copying it twice on
-// every spin-wait yield. Any pending signal takes the complete state path.
-static bool handleScalarYield(BVNFEXCPU64Adapter* adapter,
-                              FEXCore::Core::CpuStateFrame* frame, U64 number) {
+// spin-wait yields and segment-base changes. Any pending signal takes the
+// complete state path. libc and ntdll.so live near IMAGE_BASE, well below the
+// ELF interpreter; starting this guard at INTERP_BASE missed the hot callers.
+static bool handleScalarSyscall(BVNFEXCPU64Adapter* adapter,
+                              FEXCore::Core::CpuStateFrame* frame, U64 number,
+                              U64 first, U64 second) {
 #ifdef BOXEDWINE_MULTI_THREADED
-    if (number != 24 || frame != adapter->fexThread->CurrentFrame ||
+    const bool setSegment = number == 158 && (first == 0x1001 || first == 0x1002);
+    if ((number != 24 && !setSegment) || frame != adapter->fexThread->CurrentFrame ||
         frame->Thread != adapter->fexThread ||
-        frame->State.rip < K64_NATIVE_GUEST_INTERP_BASE ||
+        frame->State.rip < K64_NATIVE_GUEST_IMAGE_BASE ||
         frame->State.rip >= K64_NATIVE_GUEST_HIGH_END ||
         adapter->thread->terminating || adapter->cpu->hasDeliverableSignal()) return false;
-    std::this_thread::yield();
+    if (number == 24) std::this_thread::yield();
     if (adapter->cpu->hasDeliverableSignal()) return false;
+    // Wine 11 switches FS on entry/exit of every NT call. Changing a segment
+    // base does not modify any SIMD/x87 register or selector. Keep the frame
+    // authoritative; the complete path will copy these bases on its next use.
+    if (setSegment) {
+        if (first == 0x1002) frame->State.fs_cached = second;
+        else frame->State.gs_cached = second;
+    }
     frame->State.gregs[X64_RAX] = 0;
     frame->State.gregs[X64_RCX] = frame->State.rip + 2;
     frame->State.rip += 2;
@@ -1886,8 +1922,8 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
         if (adapter) adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
         return static_cast<uint64_t>(-K_ENOSYS);
     }
-    if (handleScalarYield(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
-                          arguments[0])) return 0;
+    if (handleScalarSyscall(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
+                          arguments[0], arguments[1], arguments[2])) return 0;
     if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, framePointer)) {
         adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
         return static_cast<uint64_t>(-K_EFAULT);

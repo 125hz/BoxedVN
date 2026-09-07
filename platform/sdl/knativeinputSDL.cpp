@@ -111,13 +111,18 @@ bool KNativeInputSDL::mouseMoveGuest(int x, int y, bool relative) {
     // Remember where the pointer now is, so getMousePos can answer with it.
     // See the field declaration in knativeinputSDL.h: SDL_GetMouseState is
     // blind to the overlay's injected touches.
-    // Relative motion and absolute position are separate channels. Keep the
-    // virtual cursor centered; pass the entire swipe delta to XI2 below.
-    // Never accumulate/clamp it into a small box or send the recenter as raw
-    // movement (which would cancel the player's camera movement).
+    // Keep QueryPointer coherent with raw movement. Games using cursor
+    // polling subtract their last SetCursorPos anchor; answering the center
+    // after every delta made those games see zero movement. Their explicit
+    // warps below reset this position without generating inverse raw input.
+    // XI2 always receives the complete delta, even at a screen edge.
     if (relative) {
-        injectedX = (int)screenWidth() / 2;
-        injectedY = (int)screenHeight() / 2;
+        if (!hasInjectedPointer) {
+            injectedX = (int)screenWidth() / 2;
+            injectedY = (int)screenHeight() / 2;
+        }
+        injectedX = (int)std::max(0LL, std::min((long long)screenWidth() - 1, (long long)injectedX + x));
+        injectedY = (int)std::max(0LL, std::min((long long)screenHeight() - 1, (long long)injectedY + y));
     } else {
         injectedX = x; injectedY = y;
     }

@@ -11,6 +11,16 @@
 #define __KDSPAUDIO_MATH_H__
 
 namespace KDspAudioMath {
+    // OSS fragments must cover at least one host callback period. Wine queues
+    // three fragments ahead; using 4096 bytes for float stereo only covered
+    // half of a 1024-frame callback and gave the producer very little slack.
+    inline U32 getDefaultFragmentSize(U32 guestBytesPerSecond, U32 hostRate, U32 hostFrames) {
+        if (!hostRate) return 4096;
+        U64 needed = ((U64)guestBytesPerSecond * hostFrames + hostRate - 1) / hostRate;
+        U32 size = 4096;
+        while (size < needed && size < 16384) size *= 2;
+        return size;
+    }
 	inline U32 getRequestedSdlPeriodFrames() {
 #ifdef __EMSCRIPTEN__
 		return 4096;

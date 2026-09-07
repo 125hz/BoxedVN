@@ -26,6 +26,7 @@ code = r'''
 #include <unordered_map>
 #include <cstring>
 #include <array>
+#include <vector>
 #include <chrono>
 using U64=unsigned long long; using U32=unsigned;
 #define BOXEDWINE_GUEST_X64
@@ -70,13 +71,19 @@ const char* kCommandName[]={"vkGetPhysicalDeviceSurfaceSupportKHR","vkCreateDevi
  "vkEnumerateDeviceExtensionProperties","vkEnumerateDeviceLayerProperties",
  "vkDestroyInstance","vkEnumeratePhysicalDevices","vkEnumeratePhysicalDeviceGroups","vkDestroySurfaceKHR"};
 namespace FEXCore::Core {
- struct CpuStateFrame {void* Thread=nullptr;struct {U64 rip=0;U64 gregs[16]{};
+ struct CpuStateFrame {void* Thread=nullptr;struct {U64 rip=0,fs_cached=0,gs_cached=0;U64 gregs[16]{};
   std::array<unsigned char,1024> vectors{};} State;};
 }
 struct FexThread {FEXCore::Core::CpuStateFrame* CurrentFrame=nullptr;};
-constexpr U64 K64_NATIVE_GUEST_INTERP_BASE=0x7a00000000ULL,K64_NATIVE_GUEST_HIGH_END=0x7a80000000ULL;
+constexpr U64 K64_NATIVE_GUEST_IMAGE_BASE=0x7a00000000ULL;
+constexpr U64 K64_NATIVE_GUEST_INTERP_BASE=0x7f00000000ULL,K64_NATIVE_GUEST_HIGH_END=0x7f80000000ULL;
 constexpr int BVNFEXCPU64AdapterActionContinue=0;
 struct BVNFEXCPU64Adapter {FexThread* fexThread;KThread* thread;CPU64* cpu;int lastAction=99;};
+struct XWindow {};
+using XWindowPtr=std::shared_ptr<XWindow>;
+struct Surface {XWindowPtr window;bool presentation=true,presentationVisible=true,firstPresentObserved=false;};
+std::mutex surfacesMutex;std::vector<Surface> surfaces;
+struct KVulkdanSDLImpl {bool isPendingPresentationWindow(const XWindowPtr&);};
 '''
 for signature in ["bool CPU64::hasDeliverableSignal(", "bool CPU64::deliverPendingSignals("]:
     code += method("source/kernel/syscall64.cpp", signature)
@@ -85,7 +92,8 @@ code += method("source/util/synchronization.cpp", "bool setThreadWaitingConditio
 for signature in ["void rememberPhysicalDevices(", "VkInstance physicalDeviceInstance(",
                   "void forgetPhysicalDevices(", "VkInstance resolutionInstance("]:
     code += method("source/vulkan/vulkanbridge64.cpp", signature)
-code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleScalarYield(")
+code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleScalarSyscall(")
+code += method("platform/sdl/kvulkanSDL.cpp", "bool KVulkdanSDLImpl::isPendingPresentationWindow(")
 code += (repo / "include/kdspaudio_math.h").read_text()
 code += r'''
 constexpr int K_EINVAL=22;
@@ -104,6 +112,18 @@ code += dsp[dsp.index("case 0x500C:"):dsp.index("case 0x500D:")]
 code += r'''
  }return result ? result : value;}
 int main() {
+ auto window=std::make_shared<XWindow>(); KVulkdanSDLImpl presentation;
+ assert(!presentation.isPendingPresentationWindow(window));
+ surfaces.push_back({window,true,true,false});
+ assert(presentation.isPendingPresentationWindow(window)); // capability probe
+ surfaces.push_back({window,true,true,true});
+ assert(!presentation.isPendingPresentationWindow(window)); // rendered surface wins
+ surfaces.clear();surfaces.push_back({window,false,true,false});
+ assert(!presentation.isPendingPresentationWindow(window)); // offscreen helper
+ assert(KDspAudioMath::getDefaultFragmentSize(44100*8,48000,1024)==8192);
+ assert(KDspAudioMath::getDefaultFragmentSize(44100*4,48000,1024)==4096);
+ assert(KDspAudioMath::getDefaultFragmentSize(192000*32,48000,4096)==16384);
+ assert(KDspAudioMath::getDefaultFragmentSize(352800,0,1024)==4096);
  DevDsp dsp;
  assert(dsp.space()==12480); // capacity is 5 fragments; free bytes include the remainder
  assert(dsp.arg.words[0]==3 && dsp.arg.words[1]==5 && dsp.arg.words[3]==12480);
@@ -158,13 +178,26 @@ int main() {
  FEXCore::Core::CpuStateFrame frame;FexThread ft{&frame};frame.Thread=&ft;
  BVNFEXCPU64Adapter adapter{&ft,&t,&c};frame.State.rip=K64_NATIVE_GUEST_INTERP_BASE+0x100;
  frame.State.vectors.fill(0xa5);auto before=frame.State.vectors;
- assert(handleScalarYield(&adapter,&frame,24));assert(frame.State.vectors==before);
- assert(frame.State.rip==K64_NATIVE_GUEST_INTERP_BASE+0x102);
+ frame.State.rip=0x7a4011a909ULL; // actual libc lane, below the ELF interpreter
+ assert(handleScalarSyscall(&adapter,&frame,24,0,0));assert(frame.State.vectors==before);
+ assert(frame.State.rip==0x7a4011a90bULL);
  assert(frame.State.gregs[0]==0 && frame.State.gregs[1]==frame.State.rip);
- t.queuePendingSignal(10,true);assert(!handleScalarYield(&adapter,&frame,24));t.pendingSignals=0;
- frame.State.rip=0x140001000;assert(!handleScalarYield(&adapter,&frame,24)); // PE thunk
- frame.State.rip=K64_NATIVE_GUEST_INTERP_BASE+0x100;assert(!handleScalarYield(&adapter,&frame,0));
- t.terminating=true;assert(!handleScalarYield(&adapter,&frame,24));
+ t.queuePendingSignal(10,true);assert(!handleScalarSyscall(&adapter,&frame,24,0,0));t.pendingSignals=0;
+ frame.State.rip=0x140001000;assert(!handleScalarSyscall(&adapter,&frame,24,0,0)); // PE thunk
+ frame.State.rip=K64_NATIVE_GUEST_INTERP_BASE+0x100;assert(!handleScalarSyscall(&adapter,&frame,0,0,0));
+ frame.State.rip=0x7a4026164bULL;frame.State.fs_cached=11;frame.State.gs_cached=22;
+ assert(handleScalarSyscall(&adapter,&frame,158,0x1002,0x1008ff6c0ULL));
+ assert(frame.State.fs_cached==0x1008ff6c0ULL && frame.State.gs_cached==22);
+ assert(frame.State.rip==0x7a4026164dULL && frame.State.vectors==before);
+ assert(handleScalarSyscall(&adapter,&frame,158,0x1001,0x7ff00000));
+ assert(frame.State.gs_cached==0x7ff00000 && frame.State.vectors==before);
+ assert(!handleScalarSyscall(&adapter,&frame,158,0x1003,0x1000)); // GET_FS writes memory
+ t.queuePendingSignal(10,true);
+ assert(!handleScalarSyscall(&adapter,&frame,158,0x1002,1));
+ assert(frame.State.fs_cached==0x1008ff6c0ULL);t.pendingSignals=0;
+ frame.State.rip=0x7fff80001000ULL;
+ assert(!handleScalarSyscall(&adapter,&frame,158,0x1002,1)); // PE top-down arena
+ t.terminating=true;assert(!handleScalarSyscall(&adapter,&frame,24,0,0));
 }
 '''
 

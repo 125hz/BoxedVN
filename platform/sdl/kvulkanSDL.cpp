@@ -132,6 +132,7 @@ public:
     void* createVulkanSurface(const XWindowPtr& wnd, void* instance) override;
     void destroyVulkanSurface(void* surface) override;
     bool isPresentationSurface(void* surface) override;
+    bool isPendingPresentationWindow(const XWindowPtr& wnd) override;
     void syncVulkanSurface(void* surface) override;
     void registerVulkanSwapchain(void* swapchain, void* surface) override;
     void destroyVulkanSwapchain(void* swapchain) override;
@@ -163,6 +164,17 @@ KVulkdanSDLImpl::~KVulkdanSDLImpl() {
         }
     }
 #endif
+}
+
+bool KVulkdanSDLImpl::isPendingPresentationWindow(const XWindowPtr& wnd) {
+    std::lock_guard<std::mutex> lock(surfacesMutex);
+    bool pending = false;
+    for (const auto& record : surfaces) {
+        if (record.window != wnd || !record.presentation || !record.presentationVisible) continue;
+        if (record.firstPresentObserved) return false;
+        pending = true;
+    }
+    return pending;
 }
 
 void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,

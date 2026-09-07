@@ -27,6 +27,8 @@ public:
     virtual void* createVulkanSurface(const std::shared_ptr<XWindow>& wnd, void* instance) = 0;
     virtual void destroyVulkanSurface(void* surface) = 0;
     virtual bool isPresentationSurface(void* surface) = 0;
+    // A capability probe can own a full-sized surface without presenting it.
+    virtual bool isPendingPresentationWindow(const std::shared_ptr<XWindow>& wnd) { return false; }
     // Refresh a resized guest window before querying or creating its swapchain.
     virtual void syncVulkanSurface(void* surface) {}
     // VkSurfaceKHR and VkSwapchainKHR are created by separate generated

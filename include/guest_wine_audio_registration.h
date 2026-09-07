@@ -41,6 +41,28 @@ inline bool insertMissingWineRegistryValue(std::string& contents,
     return true;
 }
 
+// Wine 11 actxprxy_servprov.idl registers this proxy factory for
+// IServiceProvider. Shell services marshal it between processes.
+inline bool registerWineServiceProviderProxy(std::string& contents, bool pe64, bool pe32) {
+    bool changed = false;
+    for (int bits : {64, 32}) {
+        if (!(bits == 64 ? pe64 : pe32)) continue;
+        const std::string root = std::string("Software\\\\Classes\\\\") +
+            (bits == 32 ? "Wow6432Node\\\\" : "");
+        const std::string factory = root + "CLSID\\\\{b8da6310-e19b-11d0-933c-00a0c90dcaa9}\\\\InprocServer32";
+        const bool added = insertMissingWineRegistryValue(contents, factory, "@", bits == 64 ?
+            "\"C:\\\\windows\\\\system32\\\\actxprxy.dll\"" : "\"C:\\\\windows\\\\syswow64\\\\actxprxy.dll\"");
+        if (added) insertMissingWineRegistryValue(contents, factory, "\"ThreadingModel\"", "\"Both\"");
+        changed |= added;
+        const std::string iface = root + "Interface\\\\{6d5140c1-7436-11ce-8034-00aa006009fa}";
+        changed |= insertMissingWineRegistryValue(contents, iface, "@", "\"IServiceProvider\"");
+        changed |= insertMissingWineRegistryValue(contents, iface + "\\\\ProxyStubClsid32", "@",
+            "\"{b8da6310-e19b-11d0-933c-00a0c90dcaa9}\"");
+        changed |= insertMissingWineRegistryValue(contents, iface + "\\\\NumMethods", "@", "\"4\"");
+    }
+    return changed;
+}
+
 inline bool registerWineAudioEnumerator(std::string& contents, bool pe64, bool pe32) {
     bool changed = false;
     for (int bitness : {64, 32}) {
