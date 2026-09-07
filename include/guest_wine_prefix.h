@@ -10,7 +10,7 @@
  * that path still resolved to the bundled 32-bit installation.
  *
  * So an x86-64 launch is given WINEPREFIX=/home/username/.wine64 and
- * WINEARCH=win64, and everything in the emulator that used to assume the one
+ * WINEARCH=wow64, and everything in the emulator that used to assume the one
  * fixed prefix -- the dosdevices drive links, the T: mount, the ddraw and
  * DXVK overlays -- resolves it from the guest environment instead.
  *
@@ -29,7 +29,10 @@
 // 32-bit prefix on purpose: Wine records the architecture in the prefix, and
 // the two cannot share one.
 #define K_X64_GUEST_WINE_PREFIX "/home/username/.wine64"
-#define K_X64_GUEST_WINE_ARCH "win64"
+// Wine 11 win64 prefers a separate i386 Unix loader. Force unified WoW64
+// so the selected program stays in the FEX owner; the on-disk prefix is
+// still win64, including prefixes created by Wine 9.
+#define K_X64_GUEST_WINE_ARCH "wow64"
 
 // The two directories every Wine prefix has, and the DOS drive link that makes
 // C: reachable. wineboot exits 0 without creating the link in a prefix it did

@@ -85,7 +85,7 @@ BOXEDVN_TEST(guest_wine_prefix_constants_keep_the_two_prefixes_apart) {
     // Wine records the architecture in the prefix, so the 32-bit and 64-bit
     // prefixes cannot be the same directory.
     CHECK(std::string(K_X64_GUEST_WINE_PREFIX) == "/home/username/.wine64");
-    CHECK(std::string(K_X64_GUEST_WINE_ARCH) == "win64");
+    CHECK(std::string(K_X64_GUEST_WINE_ARCH) == "wow64");
     CHECK(std::string(K_X64_GUEST_WINE_PREFIX) !=
           std::string(K_DEFAULT_GUEST_WINE_PREFIX));
     // The 64-bit prefix must not sit inside the 32-bit one, or Wine64 would

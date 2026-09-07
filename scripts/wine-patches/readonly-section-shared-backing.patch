@@ -1,0 +1,25 @@
+Subject: Use portable shared backing for read-only section views
+
+BoxedWine does not implement Linux page-cache-backed private views. Preserve
+server updates through the existing non-Linux path; keep WRITECOPY private.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2351,14 +2351,11 @@
+     else if (vprot & VPROT_WRITECOPY) flags |= MAP_PRIVATE;
+     else
+     {
+-        /* changes to the file are not guaranteed to be visible in read-only MAP_PRIVATE mappings,
+-         * but they are on Linux so we take advantage of it */
+-#ifdef __linux__
+-        flags |= MAP_PRIVATE;
+-#else
++        /* BoxedWine copies MAP_PRIVATE file data eagerly. Use the portable
++         * shared read-only path so updates from the server remain visible.
++         * VPROT_WRITECOPY above still requires private image relocation data. */
+         flags |= MAP_SHARED;
+         prot &= ~PROT_WRITE;
+-#endif
+     }
+ 
+     map_size = ROUND_SIZE( start, size, page_mask );

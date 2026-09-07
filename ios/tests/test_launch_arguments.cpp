@@ -106,7 +106,7 @@ BOXEDVN_TEST(fex64_launch_mounts_runtime_layers_and_enters_wine64) {
         "-zip", "/runtime/wine64.zip",
         "-nozip", "-env", "BOXEDWINE_CPU64=fex",
         "-env", "WINEPREFIX=/home/username/.wine64",
-        "-env", "WINEARCH=win64",
+        "-env", "WINEARCH=wow64",
         "-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine",
         "-env", "LD_LIBRARY_PATH=/usr/lib/boxedwine64-x11",
         "/usr/lib/x86_64-linux-gnu/wine/wine", "d:\\probe.exe",
@@ -489,7 +489,7 @@ BOXEDVN_TEST(interpret_range_sentinel_rejects_what_it_cannot_parse) {
 // writable host root was not enough, because the guest path is what Wine
 // reads and that path still resolved to the bundled 32-bit prefix.
 
-BOXEDVN_TEST(fex64_launch_gets_its_own_prefix_and_win64_arch) {
+BOXEDVN_TEST(fex64_launch_gets_its_own_prefix_and_unified_wow64_arch) {
     BVNLaunchConfiguration launch;
     launch.rootFilesystemZipPath = "/rootfs.zip";
     launch.rootFilesystemOverlayZipPaths = {"/glibc.zip", "/wine64.zip"};
@@ -501,7 +501,7 @@ BOXEDVN_TEST(fex64_launch_gets_its_own_prefix_and_win64_arch) {
     const std::vector<std::string> actual = BVNBuildLaunchArguments(launch);
     CHECK(std::count(actual.begin(), actual.end(),
                      "WINEPREFIX=/home/username/.wine64") == 1);
-    CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=win64") == 1);
+    CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=wow64") == 1);
     CHECK(std::count(actual.begin(), actual.end(),
                      "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine") == 1);
     // The BoxedWine X11 client libraries come first on the guest's library
@@ -537,7 +537,7 @@ BOXEDVN_TEST(fex64_launch_keeps_a_caller_supplied_prefix_and_arch) {
     // the guest would then see two assignments for the same variable.
     CHECK(std::find(actual.begin(), actual.end(),
                     "WINEPREFIX=/home/username/.wine64") == actual.end());
-    CHECK(std::find(actual.begin(), actual.end(), "WINEARCH=win64") ==
+    CHECK(std::find(actual.begin(), actual.end(), "WINEARCH=wow64") ==
           actual.end());
 }
 
@@ -746,7 +746,7 @@ BOXEDVN_TEST(fex64_launch_keeps_one_default_when_only_the_other_is_given) {
     CHECK(std::find(actual.begin(), actual.end(),
                     "WINEPREFIX=/home/username/.wine64") == actual.end());
     // WINEARCH was not supplied, so the 64-bit default still applies.
-    CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=win64") == 1);
+    CHECK(std::count(actual.begin(), actual.end(), "WINEARCH=wow64") == 1);
 }
 
 BOXEDVN_TEST(ia32_launch_is_left_on_the_default_prefix) {
@@ -762,7 +762,7 @@ BOXEDVN_TEST(ia32_launch_is_left_on_the_default_prefix) {
     // told it is win64.
     CHECK(std::find(actual.begin(), actual.end(),
                     "WINEPREFIX=/home/username/.wine64") == actual.end());
-    CHECK(std::find(actual.begin(), actual.end(), "WINEARCH=win64") ==
+    CHECK(std::find(actual.begin(), actual.end(), "WINEARCH=wow64") ==
           actual.end());
     for (const std::string& entry : actual) {
         CHECK(entry.rfind("WINEPREFIX=", 0) != 0);

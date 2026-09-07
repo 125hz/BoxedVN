@@ -11,6 +11,10 @@ curl --fail --location --retry 3 \
     "https://dl.winehq.org/wine/source/11.0/wine-${version}.tar.xz" -o "${archive}"
 printf '%s  %s\n' "${source_sha}" "${archive}" | sha256sum --check --strict
 tar -xf "${archive}" -C "${work}"
+# Use Wine's portable read-only shared-section path. Linux MAP_PRIVATE
+# visibility depends on a page cache that BoxedWine does not currently model.
+patch --forward -d "${work}/wine-${version}" -p1 < scripts/wine-patches/readonly-section-shared-backing.patch
+python3 scripts/test_wine_readonly_sections.py "${work}/wine-${version}"
 bash scripts/build-wine64-oss-driver.sh --wine-version "${version}" \
     --wine-source "${work}/wine-${version}" --output-dir build/wine64-oss \
     --runtime-install build/wine11-install

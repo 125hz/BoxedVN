@@ -135,6 +135,14 @@ int main() {
     otherOffset.write(o+0x320,999);
     check(server.read(w+0x320)==1266,"different file page cannot change clock");
 
+    // Wine 11 window-session objects: a late read-only MAP_SHARED view
+    // sees object IDs and their subsequent sequence changes at a file offset.
+    Memory sessionReader; CPU64 sessionCPU{&thread,&sessionReader};
+    U64 session=sys_mmap64_file(&sessionCPU,0x300000,4096,1,0x11,3,4096);
+    check(sessionReader.read(session+0x320)==999,"read-only session sees existing object");
+    otherOffset.write(o+0x320,1001);
+    check(sessionReader.read(session+0x320)==1001,"read-only session sees later update");
+
     Memory privateMap; CPU64 privateCPU{&thread,&privateMap};
     U64 p=sys_mmap64_file(&privateCPU,0,4096,3,2,3,0);
     privateMap.write(p+0x320,42);

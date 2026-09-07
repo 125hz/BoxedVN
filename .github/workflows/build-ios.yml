@@ -157,7 +157,7 @@ jobs:
           path: |
             build/wine11-install
             build/wine64-oss
-          key: wine11-wow64-${{ runner.os }}-${{ hashFiles('scripts/build-wine11-runtime.sh', 'scripts/build-wine64-oss-driver.sh', 'scripts/wine-patches/**', 'scripts/test_faudio_callback_locks.py') }}
+          key: wine11-wow64-${{ runner.os }}-${{ hashFiles('scripts/build-wine11-runtime.sh', 'scripts/build-wine64-oss-driver.sh', 'scripts/wine-patches/**', 'scripts/test_faudio_callback_locks.py', 'scripts/test_wine_readonly_sections.py') }}
 
       - name: Build complete pinned Wine 11 WoW64 runtime
         if: steps.wine11-cache.outputs.cache-hit != 'true'
