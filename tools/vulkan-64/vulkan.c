@@ -1102,7 +1102,30 @@ static PFN_vkVoidFunction bw_proc_addr(uint64_t handle, const char* pName)
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName)
-{ return bw_proc_addr(U(instance), pName); }
+{
+    if (!pName) return 0;
+    /* Global loader commands exist before a usable driver or native guest
+     * mapping does. Wine 11's win32u calls the extension enumerator during
+     * desktop initialization, including in interpreter-only helpers. Return
+     * our callable entry points here; bw_call reports initialization failure
+     * if this process cannot use Vulkan. Returning NULL instead crashes Wine
+     * inside pthread_once and leaves subsequent window creation waiting.
+     * https://docs.vulkan.org/refpages/latest/refpages/source/vkGetInstanceProcAddr.html
+     */
+    if (!strcmp(pName, "vkCreateInstance")) {
+        return (PFN_vkVoidFunction)vkCreateInstance;
+    }
+    if (!strcmp(pName, "vkEnumerateInstanceExtensionProperties")) {
+        return (PFN_vkVoidFunction)vkEnumerateInstanceExtensionProperties;
+    }
+    if (!strcmp(pName, "vkEnumerateInstanceLayerProperties")) {
+        return (PFN_vkVoidFunction)vkEnumerateInstanceLayerProperties;
+    }
+    if (!strcmp(pName, "vkEnumerateInstanceVersion")) {
+        return (PFN_vkVoidFunction)vkEnumerateInstanceVersion;
+    }
+    return bw_proc_addr(U(instance), pName);
+}
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* pName)
 { return bw_proc_addr(U(device), pName); }

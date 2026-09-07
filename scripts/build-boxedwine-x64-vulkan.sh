@@ -64,6 +64,11 @@ COMMON_FLAGS=(-std=gnu11 -O2 -fPIC -fvisibility=hidden -Wall -Wextra -Werror
 LINK_FLAGS=(-shared -Wl,--no-undefined -Wl,-z,defs -Wl,-soname,"${SONAME}")
 
 log "Building ${SONAME} (x86-64 guest Vulkan ICD)"
+"${CC}" "${COMMON_FLAGS[@]}" "${SOURCE_DIR}/test_global_lookup.c" \
+    -o "${OUTPUT_DIR}/test-global-lookup" \
+    || die "Failed to build the Vulkan global lookup regression test."
+"${OUTPUT_DIR}/test-global-lookup" \
+    || die "Vulkan global entry points are not safe during Wine initialization."
 "${CC}" "${COMMON_FLAGS[@]}" "${LINK_FLAGS[@]}" "${SOURCE_DIR}/vulkan.c" \
     -o "${OUTPUT_DIR}/${SONAME}" \
     || die "Failed to build ${SONAME}."
