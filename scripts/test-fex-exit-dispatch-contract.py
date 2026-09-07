@@ -1700,7 +1700,7 @@ def main() -> None:
         [
             '#define K_DEFAULT_GUEST_WINE_PREFIX "/home/username/.wine"',
             '#define K_X64_GUEST_WINE_PREFIX "/home/username/.wine64"',
-            '#define K_X64_GUEST_WINE_ARCH "win64"',
+            '#define K_X64_GUEST_WINE_ARCH "wow64"',
             "inline bool isUsableGuestWinePrefix(",
             "inline std::string resolveGuestWinePrefix(",
             "inline const char* guestWinePrefixAssignment(",
