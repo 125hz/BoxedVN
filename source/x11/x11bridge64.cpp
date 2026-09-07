@@ -660,7 +660,7 @@ void writeEvent64(const XEvent& event, U64 display, U8* out) {
         L::put32(out, generic::cookie, event.xcookie.data); // event time
         if (event.xcookie.evtype == XI_RawMotion) {
             XIRawEvent raw = {};
-            raw.unserialize((U32*)&event.pad[8]);
+            raw.unserialize((const U32*)&event.pad[8]);
             L::put64(out, generic::data, (U64)raw.valuators.maskAddress |
                 ((U64)raw.valuators.valuesAddress << 32)); // signed dx, dy
         }

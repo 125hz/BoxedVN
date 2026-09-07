@@ -365,6 +365,9 @@ jobs:
       - name: Test Wine64 runtime packaging contract
         run: python3 -m unittest scripts/test_wine64_runtime_packaging.py
 
+      - name: Test raw mouse event codec
+        run: python3 scripts/test_x11_raw_event.py
+
       - name: Test guest file timestamp units
         run: python3 scripts/test_x64_stat_timestamp.py
 

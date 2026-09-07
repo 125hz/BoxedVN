@@ -70,3 +70,20 @@ void XIRawEvent::serialize(U32* data) {
 	data[13] = valuators.valuesAddress;
 	data[14] = raw_values;
 }
+void XIRawEvent::unserialize(const U32* data) {
+    type = (S32)data[0];
+    serial = data[1];
+    send_event = (S32)data[2];
+    displayAddress = data[3];
+    extension = (S32)data[4];
+    evtype = (S32)data[5];
+    time = data[6];
+    deviceid = (S32)data[7];
+    sourceid = (S32)data[8];
+    detail = (S32)data[9];
+    flags = (S32)data[10];
+    valuators.mask_len = (S32)data[11];
+    valuators.maskAddress = data[12];
+    valuators.valuesAddress = data[13];
+    raw_values = data[14];
+}

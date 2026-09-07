@@ -367,7 +367,7 @@ struct XIRawEvent {
     U32 raw_values; // double*
 
     void serialize(U32* data);
-    void unserialize(U32* data);
+    void unserialize(const U32* data);
 };
 
 #endif
