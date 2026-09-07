@@ -40,7 +40,7 @@ struct KThread {
  U64 pendingSignals=0; std::mutex pendingSignalsMutex,waitingCondSync;
  CPU64* cpu64=nullptr; bool terminating=false,interruptibleWait64=false;
  BOXEDWINE_CONDITION waitingCond;
- void queuePendingSignal(U32);
+ void queuePendingSignal(U32, bool wakeWaiter=false);
 };
 constexpr U32 K_SA_RESTART=0x10000000;
 constexpr int X64_RAX=0,X64_RCX=1;
@@ -125,13 +125,13 @@ int main() {
 
  KThread t;CPU64 c;t.cpu64=&c;c.thread=&t;c.sigActions[10]={true,0x8000,K_SA_RESTART};
  c.rip=0x1002;c.syscallRip=0x1000;c.reg[0].setU64(-4ULL);
- t.queuePendingSignal(10);assert(c.hasDeliverableSignal());
+ t.queuePendingSignal(10,true);assert(c.hasDeliverableSignal());
  c.sigMask=1ULL<<9;assert(!c.hasDeliverableSignal());assert(!c.deliverPendingSignals());
  c.sigMask=0;assert(c.deliverPendingSignals(0));
  assert(capturedRip==0x1000 && capturedResult==0 && t.pendingSignals==0);
- c.rip=0x1002;c.reg[0].setU64(-4ULL);t.queuePendingSignal(10);
+ c.rip=0x1002;c.reg[0].setU64(-4ULL);t.queuePendingSignal(10,true);
  assert(c.deliverPendingSignals(202));assert(capturedRip==0x1000 && capturedResult==202);
- c.sigActions[10].flags=0;c.rip=0x1002;c.reg[0].setU64(-4ULL);t.queuePendingSignal(10);
+ c.sigActions[10].flags=0;c.rip=0x1002;c.reg[0].setU64(-4ULL);t.queuePendingSignal(10,true);
  assert(c.deliverPendingSignals(0));assert(capturedRip==0x1002 && capturedResult==-4ULL);
  c.sigActions[11]={true,1,K_SA_RESTART};t.queuePendingSignal(11);
  c.rip=0x1002;c.reg[0].setU64(-4ULL);assert(!c.hasDeliverableSignal());
@@ -139,15 +139,19 @@ int main() {
  t.pendingSignals=0;
 
  auto condition=std::make_shared<Condition>();t.interruptibleWait64=true;
- t.queuePendingSignal(10); // signal before the waiter registers: must not park
+ t.queuePendingSignal(10,true); // signal before the waiter registers: must not park
  assert(!setThreadWaitingCondition(&t,condition));assert(!t.waitingCond);
  t.pendingSignals=0;
+ // A legacy caller already holding the condition must queue without relocking.
+ {std::unique_lock held(condition->mutex);t.waitingCond=condition;
+  t.queuePendingSignal(10);assert(c.hasDeliverableSignal());}
+ t.pendingSignals=0;t.waitingCond=nullptr;
  std::unique_lock lock(condition->mutex);
  assert(setThreadWaitingCondition(&t,condition));
- std::thread sender([&]{t.queuePendingSignal(10);}); // signal after registration
+ std::thread sender([&]{t.queuePendingSignal(10,true);}); // signal after registration
  assert(condition->cv.wait_for(lock,std::chrono::seconds(1),[&]{return c.hasDeliverableSignal();}));
  lock.unlock();sender.join();t.waitingCond=nullptr;t.pendingSignals=0;
- c.sigMask=1ULL<<9;t.queuePendingSignal(10);
+ c.sigMask=1ULL<<9;t.queuePendingSignal(10,true);
  assert(setThreadWaitingCondition(&t,condition)); // masked signals do not interrupt
  t.waitingCond=nullptr;t.pendingSignals=0;c.sigMask=0;
 
@@ -157,7 +161,7 @@ int main() {
  assert(handleScalarYield(&adapter,&frame,24));assert(frame.State.vectors==before);
  assert(frame.State.rip==K64_NATIVE_GUEST_INTERP_BASE+0x102);
  assert(frame.State.gregs[0]==0 && frame.State.gregs[1]==frame.State.rip);
- t.queuePendingSignal(10);assert(!handleScalarYield(&adapter,&frame,24));t.pendingSignals=0;
+ t.queuePendingSignal(10,true);assert(!handleScalarYield(&adapter,&frame,24));t.pendingSignals=0;
  frame.State.rip=0x140001000;assert(!handleScalarYield(&adapter,&frame,24)); // PE thunk
  frame.State.rip=K64_NATIVE_GUEST_INTERP_BASE+0x100;assert(!handleScalarYield(&adapter,&frame,0));
  t.terminating=true;assert(!handleScalarYield(&adapter,&frame,24));

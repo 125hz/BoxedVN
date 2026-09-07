@@ -220,7 +220,7 @@ bool KThread::readyForSignal(U32 signal) {
     return ((1ULL << (signal - 1)) & ~(this->inSignal ? this->inSigMask : this->sigMask)) != 0;
 }
 
-void KThread::queuePendingSignal(U32 signal) {
+void KThread::queuePendingSignal(U32 signal, bool wakeWaiter) {
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(this->pendingSignalsMutex);
         this->pendingSignals |= (1ULL << (signal - 1));
@@ -229,7 +229,9 @@ void KThread::queuePendingSignal(U32 signal) {
     this->cpu->jitSignalPending.store(1, std::memory_order_release);
 #endif
 #if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_MULTI_THREADED)
-    if (cpu64) {
+    if (wakeWaiter && cpu64) {
+        // Existing signal() callers may already hold the condition lock;
+        // only the standalone 64-bit tgkill path requests a wake here.
         // A pending bit cannot wake a host condition by itself. Take the
         // condition after releasing pendingSignalsMutex: readers check pending
         // signals under the condition before parking, closing the lost-wakeup

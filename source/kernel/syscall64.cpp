@@ -12,6 +12,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include "syscall64.h"
+#include "ksignal.h"
 #include "cpu64.h"
 #include "guest_signal_frame64.h"
 #include "kmemory64.h"
@@ -3885,6 +3886,7 @@ bool CPU64::hasDeliverableSignal() {
     if (!thread) return false;
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(thread->pendingSignalsMutex);
     const U64 pending = thread->pendingSignals & ~sigMask;
+    if (!pending) return false;
     for (U32 sig = 1; sig <= 64; ++sig) {
         const auto& action = sigActions[sig];
         if ((pending & (1ULL << (sig - 1))) && action.installed && action.handler > 1)
@@ -5458,7 +5460,7 @@ void ksyscall64(CPU64* cpu) {
                 // target's next slice, before it runs guest code. We can't build
                 // a signal frame here because the target may be executing on a
                 // different host thread.
-                target->queuePendingSignal(sig);
+                target->queuePendingSignal(sig, true);
                 ret = 0;
                 break;
             }

@@ -78,7 +78,7 @@ public:
     struct user_desc* getLDT(U32 index);
     bool isLdtEmpty(struct user_desc* desc);
     U32 signal(U32 signal, bool wait);
-    void queuePendingSignal(U32 signal);
+    void queuePendingSignal(U32 signal, bool wakeWaiter = false);
     bool readyForSignal(U32 signal);
     void cleanup();
 
