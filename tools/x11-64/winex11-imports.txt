@@ -1,5 +1,5 @@
 # Undefined X* symbols of Wine's x86_64-unix/winex11.so, measured from the
-# packaged Ubuntu 24.04 Wine build (see scripts/validate-x64-x11-shim.py
+# packaged Wine 11.0 source build (see scripts/validate-x64-x11-shim.py
 # --winex11 to re-measure). Every name here must be exported by the guest
 # shim: libX11.so.6 for most, libXext.so.6 for XShape* and XShm*.
 XAllocClassHint
@@ -72,6 +72,8 @@ XGetModifierMapping
 XGetScreenSaver
 XGetSelectionOwner
 XGetVisualInfo
+XGetWMHints
+XGetWMNormalHints
 XGetWindowAttributes
 XGetWindowProperty
 XGrabPointer
@@ -94,6 +96,7 @@ XMoveResizeWindow
 XNoOp
 XOpenDisplay
 XOpenIM
+XPutBackEvent
 XPutImage
 XQueryColor
 XQueryColors
