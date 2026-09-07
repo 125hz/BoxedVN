@@ -3462,7 +3462,7 @@ static U64 sys_sched_getaffinity64(CPU64* cpu, U64 pid, U64 cpusetsize, U64 mask
     if (KSystem::cpuAffinityCountForApp && KSystem::cpuAffinityCountForApp < count)
         count = KSystem::cpuAffinityCountForApp;
     if (!count) count = 1;
-    U64 maskBytes = ((U64(count) + 63) / 64) * 8;
+    U64 maskBytes = ((static_cast<U64>(count) + 63) / 64) * 8;
     if (cpusetsize < maskBytes || (cpusetsize & 7)) return (U64)-K_EINVAL;
     if (!maskPtr) return (U64)-K_EFAULT;
     if (!cpu->memory) return (U64)-K_EFAULT;

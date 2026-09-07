@@ -13,7 +13,8 @@ code = r'''
 #include <array>
 #include <cassert>
 #include <cstdint>
-using U64=uint64_t;using U32=uint32_t;
+#define U64 unsigned long long int
+using U32=uint32_t;
 constexpr U64 K_EFAULT=14,K_EINVAL=22;
 namespace Platform {U32 count=6;U32 getCpuCount(){return count;}}
 namespace KSystem {U32 cpuAffinityCountForApp=0;}
@@ -31,7 +32,7 @@ struct Vulkan {void destroyVulkanSurface(void* surface){assert(surface==(void*)4
 namespace KNativeSystem {Vulkan vk;Vulkan* getVulkan(){return &vk;}}
 int teardown() {
  auto raw=nativeDestroy;
- auto H=[](int){return (void*)7;};auto A=[](int){return U64(42);};
+ auto H=[](int){return (void*)7;};auto A=[](int){return static_cast<U64>(42);};
 ''' + destroy + r'''
 }
 int main(){
@@ -41,13 +42,13 @@ int main(){
  KSystem::cpuAffinityCountForApp=2;
  assert(sys_sched_getaffinity64(&cpu,0,8,8)==8 && m.words[1]==3);
  KSystem::cpuAffinityCountForApp=0;Platform::count=65;
- assert(sys_sched_getaffinity64(&cpu,0,8,8)==U64(-K_EINVAL));
+ assert(sys_sched_getaffinity64(&cpu,0,8,8)==static_cast<U64>(-K_EINVAL));
  assert(sys_sched_getaffinity64(&cpu,0,16,8)==16);
- assert(m.words[1]==~U64(0) && m.words[2]==1 && m.words[3]==0xcccc);
+ assert(m.words[1]==~static_cast<U64>(0) && m.words[2]==1 && m.words[3]==0xcccc);
  Platform::count=0;
  assert(sys_sched_getaffinity64(&cpu,0,8,8)==8 && m.words[1]==1);
- assert(sys_sched_getaffinity64(&cpu,0,7,8)==U64(-K_EINVAL));
- assert(sys_sched_getaffinity64(&cpu,0,8,0)==U64(-K_EFAULT));
+ assert(sys_sched_getaffinity64(&cpu,0,7,8)==static_cast<U64>(-K_EINVAL));
+ assert(sys_sched_getaffinity64(&cpu,0,8,0)==static_cast<U64>(-K_EFAULT));
  assert(teardown()==0 && stage==2);
 }
 '''
