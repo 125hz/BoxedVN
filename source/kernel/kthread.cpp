@@ -122,6 +122,8 @@ void KThread::reset() {
     this->getrusageFairness.reset();
     this->schedYieldFairness.reset();
     this->voluntaryYieldCount64 = 0;
+    this->hasCachedThreadRusage = false;
+    this->cachedThreadRusageAt = 0;
 #endif
 #ifdef BOXEDWINE_GUEST_X64
     // A 64-bit process never runs on the legacy stack: ElfLoader64 builds its

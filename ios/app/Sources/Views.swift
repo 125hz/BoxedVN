@@ -434,6 +434,8 @@ struct GuestControlBar: View {
     /// where these controls live.
     @Binding var showingPointerSettings: Bool
     @State private var pointerMode = Int(BVNGuestControlsPointerMode())
+    @State private var presentationMode = Int(BVNGuestPresentationMode())
+    @AppStorage("BoxedVN.controls.opacity") private var controlsOpacity = 0.7
 
     private var running: Bool { active }
 
@@ -448,11 +450,14 @@ struct GuestControlBar: View {
             keyControl("space", "Space", key: "Space")
             keyControl(nil, "esc", key: "Escape")
             keyControl(nil, "tab", key: "Tab")
-
+            control("aspectratio", "Display: " + ["fit aspect", "fill aspect", "stretch to display"][presentationMode]) {
+                presentationMode = (Int(BVNGuestPresentationMode()) + 1) % 3
+                BVNGuestSetPresentationMode(Int32(presentationMode))
+            }
         }
         .frame(maxWidth: .infinity)
         .disabled(!running)
-        .opacity(running ? 1 : 0.4)
+        .opacity((running ? 1 : 0.4) * max(0.1, min(1, controlsOpacity)))
     }
 
     /// A short tap keeps toggling direct tap against the Wine cursor. A long

@@ -464,6 +464,7 @@ BVNGuestExitReport BVNRuntimeLastGuestExit(void);
 // helper processes exactly as the stop button does.  Idempotent within a
 // session: only the first call is recorded and only the first one stops the
 // emulator.  Any thread.
+void BVNRuntimeNoteChildProcessExited(uint32_t pid, uint32_t status, const char* missingModule);
 void BVNRuntimeNoteLaunchedProcessExited(uint32_t pid, uint32_t status,
                                          const char* missingModule);
 
@@ -550,6 +551,8 @@ int BVNGuestControlsPointerMode(void);
 void BVNGuestControlsSetPointerMode(int mode);
 void BVNGuestControlsTapKeyNamed(const char* sdlScancodeName);
 void BVNGuestControlsSetKeyNamed(const char* sdlScancodeName, bool down);
+int BVNGuestPresentationMode(void);
+void BVNGuestSetPresentationMode(int mode);
 
 // Mouse settings for the drawn trackpad cursor, reached from the control
 // bar's pointer button by a long press. This is the same store the in-guest

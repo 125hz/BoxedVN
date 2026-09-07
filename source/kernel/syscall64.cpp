@@ -1707,12 +1707,14 @@ static void noteLaunchedProcessExit64(CPU64* cpu, U64 status, bool group) {
         return;
     }
     KProcess* launched = cpu->thread->process.get();
-    if (launched->parentId > 1) {
-        return;
-    }
     char module[BVN_MAX_MODULE_NAME];
     module[0] = '\0';
     launched->dllSearch.lastUnresolvedModule(module, sizeof(module));
+    if (launched->parentId > 1) {
+        if (!launched->isSystemProcess())
+            BVNRuntimeNoteChildProcessExited((uint32_t)launched->id, (uint32_t)status, module);
+        return;
+    }
     BVNRuntimeNoteLaunchedProcessExited((uint32_t)launched->id,
                                         (uint32_t)status, module);
 #else
@@ -2099,14 +2101,33 @@ static U64 sys_getrusage64(CPU64* cpu, S64 who, U64 address) {
     bvnFairness::getrusageCalls.fetch_add(1, std::memory_order_relaxed);
 #endif
 #if defined(__APPLE__)
+    // Mach thread_info is a kernel RPC. Engines can poll this hundreds of
+    // thousands of times a second; refresh cumulative CPU times at 1 ms,
+    // but always report scheduling counters from the current thread below.
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    const U64 usageNow = KSystem::getMicroCounter();
+    if (!cpu->thread->hasCachedThreadRusage ||
+        usageNow - cpu->thread->cachedThreadRusageAt >= 1000) {
+#endif
     thread_basic_info_data_t info{};
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
     if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
                     (thread_info_t)&info, &count) != KERN_SUCCESS) return (U64)-K_EIO;
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+        auto& cached = cpu->thread->cachedThreadRusage;
+        cached[0] = info.user_time.seconds; cached[1] = info.user_time.microseconds;
+        cached[2] = info.system_time.seconds; cached[3] = info.system_time.microseconds;
+        cpu->thread->cachedThreadRusageAt = usageNow;
+        cpu->thread->hasCachedThreadRusage = true;
+    }
+    for (unsigned i = 0; i != 4; ++i)
+        cpu->memory->writeq(address + i * 8, cpu->thread->cachedThreadRusage[i]);
+#else
     cpu->memory->writeq(address, info.user_time.seconds);
     cpu->memory->writeq(address + 8, info.user_time.microseconds);
     cpu->memory->writeq(address + 16, info.system_time.seconds);
     cpu->memory->writeq(address + 24, info.system_time.microseconds);
+#endif
     // Mach exposes CPU time but not per-thread context switch counters.
     // Count the real scheduling points performed by our guest scheduler.
 #if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)

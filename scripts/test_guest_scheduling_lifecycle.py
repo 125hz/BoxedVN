@@ -52,7 +52,8 @@ namespace bvnFairness {
 }
 namespace KSystem {uint64_t ticks=100;uint64_t getMicroCounter(){return ticks++;}
  uint64_t getSystemTimeAsMicroSeconds(){return 1234567;}}
-struct KThread {unsigned id=11;GetrusageFairness schedYieldFairness;U64 voluntaryYieldCount64=0;};
+struct KThread {unsigned id=11;GetrusageFairness schedYieldFairness;U64 voluntaryYieldCount64=0;
+ U64 cachedThreadRusageAt=0,cachedThreadRusage[4]={};bool hasCachedThreadRusage=false;};
 constexpr int K64_PAGE_SHIFT=12,K64_PAGE_WRITE=2,X64_SYS_getrusage=98,X64_SYS_clock_gettime=228;
 struct Memory {std::array<U64,1024> words{};unsigned permissions[2]={3,3};bool committed[2]={true,true};
  U32 getPageFlags(U64 page){return page<2 ? permissions[page] : 0;}
@@ -72,8 +73,9 @@ struct thread_basic_info_data_t {time_value_t user_time,system_time;};
 using mach_msg_type_number_t=unsigned;using thread_info_t=thread_basic_info_data_t*;
 constexpr int THREAD_BASIC_INFO_COUNT=10,THREAD_BASIC_INFO=3,KERN_SUCCESS=0;
 int pthread_mach_thread_np(pthread_t){return 7;}
-int machResult=0;
+int machResult=0,machCalls=0;
 int thread_info(int port,int flavor,thread_info_t info,mach_msg_type_number_t* count){
+ ++machCalls;
  assert(port==7 && flavor==THREAD_BASIC_INFO && *count==THREAD_BASIC_INFO_COUNT);
  *info={{12,3456},{2,7890}};return machResult;
 }
@@ -89,7 +91,11 @@ int main(){
 #ifdef __APPLE__
  assert(m.words[1]==12 && m.words[2]==3456 && m.words[3]==2 && m.words[4]==7890);
  assert(m.words[17]==0 && m.words[18]==0);
- machResult=1;assert(sys_getrusage64(&cpu,1,8)==static_cast<U64>(-K_EIO));machResult=0;
+ assert(machCalls==1);
+ for(int i=0;i<100;i++)assert(sys_getrusage64(&cpu,1,8)==0);
+ assert(machCalls==1); // burst polling performs only one Mach RPC
+ KSystem::ticks+=1000;machResult=1;
+ assert(sys_getrusage64(&cpu,1,8)==static_cast<U64>(-K_EIO));machResult=0;
 #else
  volatile uint64_t busy=0;auto until=std::chrono::steady_clock::now()+std::chrono::milliseconds(25);
  while(std::chrono::steady_clock::now()<until)++busy;
@@ -161,6 +167,7 @@ enum {BVNRuntimeStateRunning,BVNRuntimeStateStarting,BVNRuntimeStateStopping,BVN
 enum {BVNLogLevelInfo,QOS_CLASS_UTILITY,DISPATCH_TIME_NOW,NSEC_PER_MSEC=1000000,NSEC_PER_SEC=1000000000};
 struct BVNGuestExitReport {bool valid=false;uint32_t pid=0,status=0;char missingModule[256]{};};
 BVNGuestExitReport gLastGuestExit;int gState=BVNRuntimeStateRunning;
+BVNGuestExitReport gLastChildExit;uint64_t gLastChildExitGeneration=0;
 pthread_mutex_t gMutex=PTHREAD_MUTEX_INITIALIZER;
 std::atomic<uint64_t> gLaunchGeneration{1},gExitWatchGeneration{UINT64_MAX};
 int BVNRuntimeGetState(){return gState;}
@@ -185,7 +192,7 @@ namespace KSystem {
 }
 '''
 lifecycle += method("source/kernel/syscall64.cpp", 'extern "C" uint32_t BVNRuntimeLiveUserProcess(')
-for signature in ["static void finishLaunchedProcessExit(", 'extern "C" void BVNRuntimeNoteLaunchedProcessExited(']:
+for signature in ['extern "C" void BVNRuntimeNoteChildProcessExited(', "static void finishLaunchedProcessExit(", 'extern "C" void BVNRuntimeNoteLaunchedProcessExited(']:
     lifecycle += method("ios/runtime/src/BVNRuntime.mm", signature).replace("^{", "[=]{")
 lifecycle += r'''
 int main(){
@@ -196,7 +203,9 @@ int main(){
  BVNRuntimeNoteLaunchedProcessExited(0,0,"");BVNRuntimeNoteLaunchedProcessExited(0,0,"");
  assert(tasks.size()==1);next();assert(shutdowns==0 && !gLastGuestExit.valid && tasks.size()==1);
  next();assert(shutdowns==0); // child still loading: keep input and presentation alive
+ BVNRuntimeNoteChildProcessExited(1,0xc000001d,"child.dll");
  processes[1]->terminated=true;next();assert(shutdowns==1 && gLastGuestExit.valid);
+ assert(gLastGuestExit.pid==1 && gLastGuestExit.status==0xc000001d);
  // Scheduled quit retries from the old generation cannot stop another session.
  ++gLaunchGeneration;gState=BVNRuntimeStateRunning;gLastGuestExit={};
  while(!tasks.empty())next();assert(shutdowns==1);
@@ -236,11 +245,27 @@ int main(){
 }
 '''
 
+playback = r'''
+#include "ossplaybackposition.h"
+#include <cassert>
+int main() {
+ OssPlaybackPosition p;
+ auto r=p.query(8192,4096,1024,4096);
+ assert(r.bytes==4096 && r.blocks==4 && r.pointer==0);
+ r=p.query(8192,2048,1024,4096);assert(r.bytes==6144 && r.blocks==2 && r.pointer==2048);
+ r=p.query(8192,2048,1024,4096);assert(r.blocks==0);
+ r=p.query(8192,3000,1024,4096);assert(r.bytes==6144 && r.blocks==0);
+ r=p.query((1ull<<32)+100,0,1024,4096);assert(r.bytes==100 && r.pointer==100);
+ p.reset();r=p.query(100,200,1024,4096);assert(!r.bytes && !r.blocks && !r.pointer);
+ r=p.query(100,0,0,0);assert(r.bytes==100 && !r.blocks && !r.pointer);
+}
+'''
+
 with tempfile.TemporaryDirectory() as tmp:
     for name, code in [("rusage_linux", common+scheduling+rusage+polling+scheduling_tests),
                        ("rusage_apple", common+apple+scheduling+rusage+polling+scheduling_tests),
                        ("fault", fault_code), ("lifecycle", lifecycle),
-                       ("audio_queue", audio_queue)]:
+                       ("audio_queue", audio_queue), ("oss_position", playback)]:
         src = Path(tmp) / (name + ".cpp")
         exe = Path(tmp) / name
         src.write_text(code)

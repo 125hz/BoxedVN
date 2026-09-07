@@ -86,6 +86,8 @@ bool gShutdownRequested = false;
 // How the session's launched program ended, and whether that ending has
 // already been acted on.  Both live under gMutex with the state they explain.
 BVNGuestExitReport gLastGuestExit = {};
+BVNGuestExitReport gLastChildExit = {};
+uint64_t gLastChildExitGeneration = 0;
 
 // Set for the lifetime of an outstanding call to BVNJITProbeExecute() and
 // never cleared if that call never returns.  See probeJitWithTimeout() below
@@ -1358,6 +1360,18 @@ extern "C" uint32_t BVNRuntimeLiveUserProcess(uint32_t excludedPid);
 static uint32_t BVNRuntimeLiveUserProcess(uint32_t) { return 0; }
 #endif
 
+extern "C" void BVNRuntimeNoteChildProcessExited(uint32_t pid, uint32_t status,
+                                                const char* missingModule) {
+    if (!status) return;
+    pthread_mutex_lock(&gMutex);
+    gLastChildExit = BVNGuestExitReport();
+    gLastChildExit.valid = true;
+    gLastChildExit.pid = pid; gLastChildExit.status = status;
+    copyString(gLastChildExit.missingModule, sizeof(gLastChildExit.missingModule), missingModule ? missingModule : "");
+    gLastChildExitGeneration = gLaunchGeneration.load(std::memory_order_acquire);
+    pthread_mutex_unlock(&gMutex);
+}
+
 static void finishLaunchedProcessExit(uint32_t pid, uint32_t status,
                                      std::string missingModule, uint64_t generation,
                                      bool reportedHandoff) {
@@ -1384,7 +1398,11 @@ static void finishLaunchedProcessExit(uint32_t pid, uint32_t status,
     const bool alreadyRecorded = gLastGuestExit.valid ||
         gLaunchGeneration.load(std::memory_order_acquire) != generation ||
         (gState != BVNRuntimeStateRunning && gState != BVNRuntimeStateStarting);
-    if (!alreadyRecorded) gLastGuestExit = report;
+    if (!alreadyRecorded) {
+        if (reportedHandoff && status == 0 && gLastChildExit.valid &&
+            gLastChildExitGeneration == generation) report = gLastChildExit;
+        gLastGuestExit = report;
+    }
     pthread_mutex_unlock(&gMutex);
     if (alreadyRecorded) return;
     BVNLogWrite(BVNLogLevelInfo, "runtime", "all user programs have ended; stopping the session");

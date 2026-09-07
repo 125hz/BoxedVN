@@ -73,6 +73,8 @@ extern "C" void BVNGuestControlsSendRelativePointer(int dx, int dy);
 
 extern "C" void BVNGuestControlsSendRelativeButton(int phase, int button);
 
+#import "BVNTouchLayout.h"
+
 @interface BVNOverlayKey : NSObject
 @property (nonatomic, copy) NSString* label;
 @property (nonatomic, copy) NSString* scancodeName;
@@ -290,6 +292,8 @@ static NSString* const kBVNPerformanceBatteryKey =
     @"BoxedVN.performance.battery";
 
 @interface BVNGuestOverlayView : UIView
+@property(nonatomic, strong) BVNTouchLayout* touchLayout;
+@property(nonatomic, strong) UIButton* touchLayoutItem;
 
 // Called from the live-view control bar's pointer toggle (extern C below).
 - (void)setPointerMode:(NSInteger)mode;
@@ -1440,6 +1444,17 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     [self addSubview:panel];
     self.menuPanel = panel;
 
+    self.touchLayout = [[BVNTouchLayout alloc] initWithFrame:self.bounds];
+    self.touchLayout.hidden = YES;
+    __weak BVNGuestOverlayView* weakOverlay = self;
+    self.touchLayout.opacityChanged = ^(CGFloat opacity) {
+        [weakOverlay setNeedsLayout];
+    };
+    [self addSubview:self.touchLayout];
+    self.touchLayoutItem = [self makePanelItemWithTitle:@"Edit on-screen controls"
+        action:@selector(editTouchLayout) destructive:NO];
+    [panel addSubview:self.touchLayoutItem];
+
     self.keyboardItem = [self makePanelItemWithTitle:@"Show keyboard"
                                               action:@selector(toggleKeyboard)
                                          destructive:NO];
@@ -2395,8 +2410,17 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     // in-guest menu button and performance panel are hidden there. They come
     // back for the full-screen presentation.
     const BOOL hosted = BVNGuestPresentationHostView() != nil;
-    self.menuButton.hidden = hosted;
-    self.performanceView.hidden = hosted;
+    const BOOL landscapeFullscreen = BVNGuestLiveViewIsFullscreen() && self.bounds.size.width > self.bounds.size.height;
+    self.touchLayout.hidden = !landscapeFullscreen;
+    self.touchLayout.frame = self.bounds;
+    CGFloat controlOpacity = self.touchLayout.controlOpacity;
+    self.menuButton.alpha = controlOpacity;
+    self.keyboardPanel.alpha = controlOpacity;
+    self.performanceView.alpha = controlOpacity;
+    self.menuPanel.alpha = controlOpacity;
+    self.touchLayoutItem.enabled = landscapeFullscreen;
+    self.menuButton.hidden = hosted && !landscapeFullscreen;
+    self.performanceView.hidden = hosted && !landscapeFullscreen;
 
     const UIEdgeInsets safe = self.safeAreaInsets;
     const CGRect bounds = self.bounds;
@@ -2459,7 +2483,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                                  self.pointerSettingsItem, self.displayItem,
                                  self.frameRateItem,
                                  self.performanceItem,
-                                 self.performanceSettingsItem]) {
+                                 self.performanceSettingsItem, self.touchLayoutItem]) {
             item.frame = CGRectMake(inset, cursor, width - inset * 2.0,
                                     kBVNMenuRowHeight);
             cursor += kBVNMenuRowHeight;
@@ -2872,6 +2896,7 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.pointerItem.hidden = confirming;
     self.pointerSettingsItem.hidden = confirming;
     self.displayItem.hidden = confirming;
+    self.touchLayoutItem.hidden = confirming;
     self.frameRateItem.hidden = confirming;
     self.performanceItem.hidden = confirming;
     self.performanceSettingsItem.hidden = confirming;
@@ -3036,6 +3061,13 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
                     : mode == 1
                     ? "Guest display mode: fill aspect."
                     : "Guest display mode: fit aspect.");
+}
+
+- (void)editTouchLayout {
+    self.menuOpen = NO;
+    [self applyMenuState];
+    [self.touchLayout editLayout];
+    [self bringSubviewToFront:self.touchLayout];
 }
 
 - (void)askToQuit {

@@ -127,7 +127,11 @@ bool KNativeInputSDL::mouseMoveGuest(int x, int y, bool relative) {
         injectedX = x; injectedY = y;
     }
     hasInjectedPointer = true;
-    BVNGuestPointerPositionChanged(injectedX, injectedY);
+    // The overlay's relative-look cursor is only an anchor. QueryPointer
+    // still returns the actual position until the guest warps it, and XI2
+    // carries the complete swipe delta independently of screen boundaries.
+    BVNGuestPointerPositionChanged(relative ? (int)screenWidth()/2 : injectedX,
+                                  relative ? (int)screenHeight()/2 : injectedY);
 #endif
 
 #ifdef BOXEDWINE_RECORDER

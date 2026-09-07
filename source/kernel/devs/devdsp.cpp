@@ -29,6 +29,7 @@
 #include <string.h>
 #include "kdspaudio.h"
 #include "kdspaudio_math.h"
+#include "ossplaybackposition.h"
 
 #ifdef __EMSCRIPTEN__
 static U32 dspMaxOutputFreq = 11025;
@@ -113,6 +114,7 @@ public:
     U32 statsLastMs64 = 0;
     U64 statsBytes64 = 0;
     U64 statsTotalBytes64 = 0;
+    OssPlaybackPosition playbackPosition64;
     U32 statsUnderruns64 = 0;
     bool everWrote64 = false;
 #endif
@@ -584,6 +586,9 @@ U32 DevDsp::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
     case 0x5000: // SNDCTL_DSP_RESET
         op = "SNDCTL_DSP_RESET";
         this->audio->closeAudio();
+        this->playbackPosition64.reset();
+        this->statsTotalBytes64 = 0;
+        this->everWrote64 = false;
         break;
     case 0x5001: // SNDCTL_DSP_SYNC - wait for playback to drain
         // Nothing to wait for: sys_write64 already copied the guest's bytes
@@ -788,11 +793,12 @@ U32 DevDsp::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
         if (!fragSize) {
             fragSize = 4096;
         }
-        const U32 played = (U32)this->statsTotalBytes64;
-        arg.writed(0, played);              // int bytes
-        arg.writed(4, played / fragSize);   // int blocks
-        arg.writed(8, this->audio->getBufferSize()); // int ptr
-        value = played;
+        const auto position = this->playbackPosition64.query(this->statsTotalBytes64,
+            this->audio->getBufferSize(), fragSize, this->audio->getBufferCapacity());
+        arg.writed(0, position.bytes);
+        arg.writed(4, position.blocks);
+        arg.writed(8, position.pointer);
+        value = position.bytes;
         break;
     }
     case 0x5016: // SNDCTL_DSP_SETDUPLEX

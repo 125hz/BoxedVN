@@ -1158,12 +1158,11 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
     if (relative && root) {
         // XI2 raw motion belongs to each selecting client's root subscription;
         // it does not require a core XGrabPointer on the same display.
-        bool delivered = false;
         iterateInput2Mask(root->id, XI_RawMotionMask, [&](const DisplayDataPtr& display) {
             root->input2Notify(display, deltaX, deltaY, XI_RawMotion);
-            delivered = true;
         });
-        if (delivered) return;
+        // Raw input supplements core motion; a selecting helper must not
+        // swallow the active window's MotionNotify (Xorg delivers both).
         // The input backend has already advanced its queried position.
         // A non-XI2 client receives that position, not the delta a second time.
         KNativeSystem::getCurrentInput()->getMousePos(&x, &y);
@@ -1179,11 +1178,8 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 		DisplayDataPtr grabbedDisplay = getDisplayDataById(grabbedDisplayId);
 
 		if (grabbed && grabbedDisplay) {
-			if ((grabbedDisplay->getInput2Mask(root->id) & XI_RawMotionMask) && (relative
 #ifndef BOXEDWINE_IOS
-                || KSystem::forceRelativeMouse
-#endif
-                )) {
+			if (!relative && (grabbedDisplay->getInput2Mask(root->id) & XI_RawMotionMask) && KSystem::forceRelativeMouse) {
 				KNativeInputPtr input = KNativeSystem::getCurrentInput();
 				S32 midX = input->screenWidth() / 2;
 				S32 midY = input->screenHeight() / 2;
@@ -1194,6 +1190,7 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 				grabbed->input2Notify(grabbedDisplay, relative ? deltaX : x, relative ? deltaY : y, XI_RawMotion);
 				return;
 			}
+#endif
 			if (!(grabbedMask & PointerMotionMask)) {
 				return;
 			}
