@@ -1,0 +1,40 @@
+Subject: Allow independent playback AudioQueues on the iOS default output
+
+BoxedVN opens one OSS voice for each Wine audio stream. Keep default device
+enumeration and exclusive capture, but permit CoreAudio playback queues to
+coexist, using the existing per-device buffers and session reference counts.
+
+--- a/src/audio/SDL_sysaudio.h
++++ b/src/audio/SDL_sysaudio.h
+@@ -86,6 +86,7 @@
+     SDL_bool ProvidesOwnCallbackThread;
+     SDL_bool HasCaptureSupport;
+     SDL_bool OnlyHasDefaultOutputDevice;
++    SDL_bool AllowsMultipleDefaultOutputDevices; /* BoxedVN: independent AudioQueues */
+     SDL_bool OnlyHasDefaultCaptureDevice;
+     SDL_bool AllowsArbitraryDeviceNames;
+     SDL_bool SupportsNonPow2Samples;
+--- a/src/audio/SDL_audio.c
++++ b/src/audio/SDL_audio.c
+@@ -1368,7 +1368,8 @@
+ 
+         SDL_LockMutex(current_audio.detectionLock);
+         for (i = 0; i < SDL_arraysize(open_devices); i++) {
+-            if ((open_devices[i]) && (!open_devices[i]->iscapture)) {
++            if (!current_audio.impl.AllowsMultipleDefaultOutputDevices &&
++                (open_devices[i]) && (!open_devices[i]->iscapture)) {
+                 SDL_UnlockMutex(current_audio.detectionLock);
+                 SDL_SetError("Audio device already open");
+                 return 0;
+--- a/src/audio/coreaudio/SDL_coreaudio.m
++++ b/src/audio/coreaudio/SDL_coreaudio.m
+@@ -1331,6 +1331,9 @@
+     AudioObjectAddPropertyListener(kAudioObjectSystemObject, &devlist_address, device_list_changed, NULL);
+ #else
+     impl->OnlyHasDefaultOutputDevice = SDL_TRUE;
++    /* BoxedVN: each playback device owns an AudioQueue; the backend already
++       tracks all queues and keeps the shared session active until the last closes. */
++    impl->AllowsMultipleDefaultOutputDevices = SDL_TRUE;
+     impl->OnlyHasDefaultCaptureDevice = SDL_TRUE;
+ #endif
+ 

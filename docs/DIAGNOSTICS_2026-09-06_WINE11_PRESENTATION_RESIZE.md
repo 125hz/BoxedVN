@@ -42,9 +42,27 @@ Missing optional I18N probing paths alone do not establish a fatal dependency;
 the local installation also omits I18N.dll. There is no basis to alter its files
 or claim its startup wait fixed. New IPC fields will identify the pending request.
 
-The 3D audio stream eventually supplies about 176 kB/s at 44100 Hz, stereo S16,
-with few underruns and roughly 48 ms queued in sampled steady playback. The
-cause of earlier silence is not established by that steady-state evidence.
+The first 3D audio stream eventually supplies about 176 kB/s at 44100 Hz,
+stereo S16, with few underruns and roughly 48 ms queued. A second, float stream
+fails to open 850 times with `Audio device already open`. SDL 2.32.10's default
+output policy rejects it before CoreAudio creates its independent AudioQueue.
+
+The additional SDL patch opts the iOS CoreAudio backend into multiple default
+playback devices. It preserves default-device enumeration, name validation,
+exclusive capture and every other backend's limits. CoreAudio already tracks
+per-device queues and holds AVAudioSession active until the last device closes.
+The patched source files are restored from the verified pinned archive before
+application, and the patch participates in both local and CI dependency keys.
+
+The compiled admission fixture reproduces the original second-output failure,
+then checks successful multi-output admission, unchanged capture/name limits,
+close-one/keep-another admission and balanced locks. Actual simultaneous audible
+playback, interruption recovery and cutscene timing remain device checks.
+
+Primary sources:
+- https://github.com/libsdl-org/SDL/blob/release-2.32.10/src/audio/SDL_audio.c
+- https://github.com/libsdl-org/SDL/blob/release-2.32.10/src/audio/coreaudio/SDL_coreaudio.m
+- https://developer.apple.com/documentation/audiotoolbox/audio-queue-services
 
 The desktop retest `232422.log` identifies b7502096, shows a taskbar strip and
 incomplete file-manager content. The repeated Wine WM_NCPAINT/WM_ERASEBKGND
