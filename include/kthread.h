@@ -182,6 +182,7 @@ public:
 
     GetrusageFairness getrusageFairness;
     GetrusageFairness schedYieldFairness;
+    U64 voluntaryYieldCount64 = 0;
 #endif
     // Cross-thread hang diagnostics read only these atomics, never the live
     // CPU register file. The emulation thread refreshes them at each dispatch

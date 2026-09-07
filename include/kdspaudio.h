@@ -38,6 +38,8 @@ public:
 	virtual U32 getFragmentSize() = 0;
 	virtual void setFragmentSize(U32 size) = 0;
 	virtual U32 getBufferSize() = 0;
+	// Excludes input still waiting for resampling; used only to detect starvation.
+	virtual U32 getPlayableBufferSize() { return getBufferSize(); }
 	virtual U32 getBufferCapacity() = 0;
 	virtual bool isWriteReady() = 0;
 	virtual void waitForEvents(BOXEDWINE_CONDITION& parentCondition, U32 events) = 0;

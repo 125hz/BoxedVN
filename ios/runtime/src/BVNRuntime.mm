@@ -1097,6 +1097,7 @@ extern "C" void BVNRuntimeNotifyFrontendReady(void) {
 // accepted must not start an obsolete session or release a presentation it no
 // longer owns.
 std::atomic<uint64_t> gLaunchGeneration {0};
+std::atomic<uint64_t> gExitWatchGeneration {UINT64_MAX};
 
 // Runs the JIT and translator probes. MUST NOT run on the main thread: both
 // wrappers wait on a semaphore for their timeout, and the main thread is the
@@ -1351,69 +1352,67 @@ extern "C" BVNGuestExitReport BVNRuntimeLastGuestExit(void) {
     return report;
 }
 
+#if defined(BOXEDVN_ENABLE_FEX64) && defined(BOXEDWINE_GUEST_X64)
+extern "C" uint32_t BVNRuntimeLiveUserProcess(uint32_t excludedPid);
+#else
+static uint32_t BVNRuntimeLiveUserProcess(uint32_t) { return 0; }
+#endif
+
+static void finishLaunchedProcessExit(uint32_t pid, uint32_t status,
+                                     std::string missingModule, uint64_t generation,
+                                     bool reportedHandoff) {
+    if (gLaunchGeneration.load(std::memory_order_acquire) != generation) return;
+    const auto state = BVNRuntimeGetState();
+    if (state != BVNRuntimeStateRunning && state != BVNRuntimeStateStarting) return;
+    const uint32_t livePid = BVNRuntimeLiveUserProcess(pid);
+    if (livePid) {
+        if (!reportedHandoff) {
+            char line[160];
+            snprintf(line, sizeof(line), "BOXEDWINE_SESSION_CHILD_CONTINUES parent=%u live_pid=%u", pid, livePid);
+            BVNLogWrite(BVNLogLevelInfo, "runtime", line);
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                finishLaunchedProcessExit(pid, status, missingModule, generation, true);
+            });
+        return;
+    }
+    BVNGuestExitReport report = BVNGuestExitReport();
+    report.valid = true; report.pid = pid; report.status = status;
+    copyString(report.missingModule, sizeof(report.missingModule), missingModule.c_str());
+    pthread_mutex_lock(&gMutex);
+    const bool alreadyRecorded = gLastGuestExit.valid ||
+        gLaunchGeneration.load(std::memory_order_acquire) != generation ||
+        (gState != BVNRuntimeStateRunning && gState != BVNRuntimeStateStarting);
+    if (!alreadyRecorded) gLastGuestExit = report;
+    pthread_mutex_unlock(&gMutex);
+    if (alreadyRecorded) return;
+    BVNLogWrite(BVNLogLevelInfo, "runtime", "all user programs have ended; stopping the session");
+    BVNRuntimeRequestShutdown();
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)attempt * NSEC_PER_SEC),
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                if (gLaunchGeneration.load(std::memory_order_acquire) == generation &&
+                    BVNRuntimeGetState() == BVNRuntimeStateStopping)
+                    BVNRuntimeRequestShutdown();
+            });
+    }
+}
+
 extern "C" void BVNRuntimeNoteLaunchedProcessExited(uint32_t pid,
                                                     uint32_t status,
                                                     const char* missingModule) {
-    BVNGuestExitReport report = BVNGuestExitReport();
-    report.valid = true;
-    report.status = status;
-    report.pid = pid;
-    copyString(report.missingModule, sizeof(report.missingModule),
-               missingModule != nullptr ? missingModule : "");
-
-    pthread_mutex_lock(&gMutex);
-    // A process is retired once, but several of its threads can each be the
-    // one that observes it, so this arrives more than once. The first report
-    // is the one that describes the ending; the rest say nothing new and must
-    // not queue a second shutdown.
-    const bool alreadyRecorded = gLastGuestExit.valid;
-    const bool sessionLive = (gState == BVNRuntimeStateRunning ||
-                              gState == BVNRuntimeStateStarting);
-    if (!alreadyRecorded) {
-        gLastGuestExit = report;
-    }
-    pthread_mutex_unlock(&gMutex);
-
-    if (alreadyRecorded) {
-        return;
-    }
-
-    char line[256];
-    snprintf(line, sizeof(line),
-             "BOXEDWINE_SESSION_PROGRAM_EXIT pid=%u status=0x%08x module=%s "
-             "live=%d",
-             (unsigned)pid, (unsigned)status,
-             report.missingModule[0] != '\0' ? report.missingModule : "(none)",
-             sessionLive ? 1 : 0);
-    BVNLogWrite(status == 0 ? BVNLogLevelInfo : BVNLogLevelWarning, "runtime",
-                line);
-
-    if (!sessionLive) {
-        return;
-    }
-
-    // Off this thread, and off any lock the emulator holds while it retires a
-    // process: this runs on a guest CPU thread inside the translator's unwind,
-    // and SDL_PushEvent takes the event queue's own lock.
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        BVNLogWrite(BVNLogLevelInfo, "runtime",
-                    "the launched program has ended; stopping the session");
-        BVNRuntimeRequestShutdown();
-        // The launched program's helpers - wineserver, services.exe,
-        // winedevice - are what keep boxedmain from returning, and they are
-        // torn down by the same SDL_QUIT the stop button posts. Repeat it a
-        // bounded number of times for a guest that is slow to notice the
-        // first one, exactly as a second tap on the stop button would.
-        for (int attempt = 1; attempt <= 3; ++attempt) {
-            dispatch_after(
-                dispatch_time(DISPATCH_TIME_NOW,
-                              (int64_t)attempt * (int64_t)NSEC_PER_SEC),
-                dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                    if (BVNRuntimeGetState() == BVNRuntimeStateStopping) {
-                        BVNRuntimeRequestShutdown();
-                    }
-                });
-        }
+    const uint64_t generation = gLaunchGeneration.load(std::memory_order_acquire);
+    auto previous = gExitWatchGeneration.load(std::memory_order_acquire);
+    do {
+        if (previous == generation) return;
+    } while (!gExitWatchGeneration.compare_exchange_weak(previous, generation,
+                 std::memory_order_acq_rel, std::memory_order_acquire));
+    const std::string module = missingModule ? missingModule : "";
+    // Retiring threads can hold process locks. Inspect surviving children on
+    // another host thread after releasing those locks, before publishing exit.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        finishLaunchedProcessExit(pid, status, module, generation, false);
     });
 }
 

@@ -1342,15 +1342,17 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     }
     // An x86 atomic on an unaligned address (and, with strict memory
     // ordering, any unaligned load-acquire/store-release) raises SIGBUS
-    // BUS_ADRALN inside translated code. FEX emulates the atomic in place or
+    // BUS_ADRALN inside translated code or generated helpers. FEX emulates the atomic in place or
     // backpatches the access, and returns how far the host PC moves; without
     // this the fault was handed to the guest as SIGBUS and re-taken forever.
-    if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inCodeBuffer) {
+    if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inOwnedFexCode) {
         const uint32_t instruction = *reinterpret_cast<const uint32_t*>(hostPC);
         const auto handled = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
             adapter->fexThread,
             FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier,
-            hostPC, machine->__ss.__x, true);
+            // Generated helpers have no translated block header. FEX's
+            // non-JIT path emulates their atomics without backpatching.
+            hostPC, machine->__ss.__x, inCodeBuffer);
         static std::atomic<uint32_t> reports {0};
         if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
             klog_fmt("BOXEDWINE_FEX64_UNALIGNED pid=%d tid=%d host_pc=0x%llx "
@@ -1898,7 +1900,7 @@ static bool handleScalarSyscall(BVNFEXCPU64Adapter* adapter,
         frame->State.rip < K64_NATIVE_GUEST_IMAGE_BASE ||
         frame->State.rip >= K64_NATIVE_GUEST_HIGH_END ||
         adapter->thread->terminating || adapter->cpu->hasDeliverableSignal()) return false;
-    if (number == 24) std::this_thread::yield();
+    if (number == 24) kschedYield64(adapter->cpu);
     if (adapter->cpu->hasDeliverableSignal()) return false;
     // Wine 11 switches FS on entry/exit of every NT call. Changing a segment
     // base does not modify any SIMD/x87 register or selector. Keep the frame

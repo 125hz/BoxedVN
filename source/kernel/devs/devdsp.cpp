@@ -171,7 +171,7 @@ U32 DevDsp::writeNative(U8* buffer, U32 len) {
     // Sampled before the write, not after: an underrun is the host queue
     // having reached zero while the guest was still meant to be feeding it,
     // and after a successful write the queue is never zero.
-    const U32 queuedBefore = this->lane64 ? this->audio->getBufferSize() : 0;
+    const U32 queuedBefore = this->lane64 ? this->audio->getPlayableBufferSize() : 0;
 #endif
     U32 result = this->audio->writeAudio(buffer, len);
 #ifdef BOXEDWINE_GUEST_X64

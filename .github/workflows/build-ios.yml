@@ -362,6 +362,7 @@ jobs:
           /tmp/test-sdl-audio-converter
           python3 scripts/test_guest_affinity64.py
           python3 scripts/test_guest_runtime_boundaries.py
+          python3 scripts/test_guest_scheduling_lifecycle.py
 
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py

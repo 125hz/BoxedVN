@@ -46,6 +46,13 @@
 #include <thread>   // std::this_thread::yield() for sched_yield
 #include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
 #include <atomic>   // bounded guest mmap placement counters
+#include <chrono>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
+#elif defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include "kunixsocket.h"
 #include "kpoll.h"
 #ifdef BOXEDWINE_OPENGL
@@ -2046,10 +2053,80 @@ static U64 sys_clock_gettime64(CPU64* cpu, U64 /*clk*/, U64 tsAddr) {
     return 0;
 }
 
-// read/write/open/close — wired to the existing 32-bit KProcess FD table via
-// a bounce buffer. The kobject->readNative path is host-pointer, so the
-// 64-bit guest address never has to flow through the 32-bit memory layer.
-// Reads from fd 0 still return 0 (EOF) so apps that probe stdin don't hang.
+// Shared by the interpreter and the FEX scalar fast path. Darwin's yield is
+// only a hint; reuse the existing bounded detector to schedule runnable peers.
+void kschedYield64(CPU64* cpu) {
+    std::this_thread::yield();
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    if (!cpu || !cpu->thread) return;
+    bvnFairness::schedYieldCalls.fetch_add(1, std::memory_order_relaxed);
+    const auto decision = cpu->thread->schedYieldFairness.observe(KSystem::getMicroCounter());
+    if (decision.firstActivation)
+        klog_fmt("BOXEDWINE_X64_YIELD_FAIRNESS tid=%u interval_us=%llu",
+            cpu->thread->id, (unsigned long long)GetrusageFairness::kThrottleIntervalUs);
+    if (decision.throttle) {
+        bvnFairness::throttleCount.fetch_add(1, std::memory_order_relaxed);
+        const U64 start = KSystem::getMicroCounter();
+        std::this_thread::sleep_for(std::chrono::microseconds(GetrusageFairness::kThrottleSleepUs));
+        ++cpu->thread->voluntaryYieldCount64;
+        bvnFairness::throttleMicroseconds.fetch_add(KSystem::getMicroCounter() - start, std::memory_order_relaxed);
+    }
+#else
+    (void)cpu;
+#endif
+}
+
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_FEX64_BACKEND)
+// Called asynchronously, outside process retirement locks. A launcher may
+// have exited while a fork/exec child is still loading its Windows image.
+extern "C" uint32_t BVNRuntimeLiveUserProcess(uint32_t excludedPid) {
+    for (U32 id : KSystem::getProcessIdsWithThreads()) {
+        auto process = KSystem::getProcess(id);
+        if (process && id != excludedPid && !process->terminated &&
+            !process->isSystemProcess() && process->commandLine.contains(".exe", true))
+            return id;
+    }
+    return 0;
+}
+#endif
+
+static U64 sys_getrusage64(CPU64* cpu, S64 who, U64 address) {
+    if (who != 0 && who != 1 && who != -1) return (U64)-K_EINVAL;
+    if (!address || !cpu->memory) return (U64)-K_EFAULT;
+    cpu->memory->memsetGuest(address, 0, 144);
+    if (who != 1 || !cpu->thread) return 0; // process/children accounting unchanged
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    bvnFairness::getrusageCalls.fetch_add(1, std::memory_order_relaxed);
+#endif
+#if defined(__APPLE__)
+    thread_basic_info_data_t info{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
+                    (thread_info_t)&info, &count) != KERN_SUCCESS) return (U64)-K_EIO;
+    cpu->memory->writeq(address, info.user_time.seconds);
+    cpu->memory->writeq(address + 8, info.user_time.microseconds);
+    cpu->memory->writeq(address + 16, info.system_time.seconds);
+    cpu->memory->writeq(address + 24, info.system_time.microseconds);
+    // Mach exposes CPU time but not per-thread context switch counters.
+    // Count the real scheduling points performed by our guest scheduler.
+#if defined(BOXEDWINE_IOS) && defined(BOXEDWINE_MULTI_THREADED)
+    cpu->memory->writeq(address + 128, cpu->thread->voluntaryYieldCount64);
+#endif
+#elif defined(__linux__)
+    struct rusage usage{};
+    if (getrusage(RUSAGE_THREAD, &usage)) return (U64)-K_EIO;
+    cpu->memory->writeq(address, usage.ru_utime.tv_sec);
+    cpu->memory->writeq(address + 8, usage.ru_utime.tv_usec);
+    cpu->memory->writeq(address + 16, usage.ru_stime.tv_sec);
+    cpu->memory->writeq(address + 24, usage.ru_stime.tv_usec);
+    cpu->memory->writeq(address + 128, usage.ru_nvcsw);
+    cpu->memory->writeq(address + 136, usage.ru_nivcsw);
+#endif
+    return 0;
+}
+
+// read/write/open/close — wired to the existing KProcess FD table via a
+// host bounce buffer, without truncating addresses through 32-bit memory.
 static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (fd == 0) return 0;
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
@@ -6353,7 +6430,7 @@ void ksyscall64(CPU64* cpu) {
 #ifndef BOXEDWINE_MULTI_THREADED
             cpu->yield = true;
 #endif
-            std::this_thread::yield();
+            kschedYield64(cpu);
             ret = 0;
             break;
         case X64_SYS_sched_getaffinity:
@@ -6596,10 +6673,7 @@ void ksyscall64(CPU64* cpu) {
             break;
         }
         case X64_SYS_getrusage:
-            // struct rusage is large; for v1 just zero-fill 144 bytes.
-            // glibc only inspects ru_utime and ru_stime on the startup path.
-            if (a2) cpu->memory->memsetGuest(a2, 0, 144);
-            ret = 0;
+            ret = sys_getrusage64(cpu, (S64)a1, a2);
             break;
         case X64_SYS_sysinfo:
             ret = sys_sysinfo64(cpu, a1);

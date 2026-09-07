@@ -52,6 +52,8 @@ struct CPU64 {
  Register reg[16];
  bool hasDeliverableSignal(); bool deliverPendingSignals(U64 restartSyscall=~0ULL);
 };
+int scalarYieldCalls=0;
+void kschedYield64(CPU64*) {++scalarYieldCalls;}
 U64 capturedRip=0,capturedResult=0;
 bool deliverSignalSync(CPU64* cpu,U32 sig) {
  auto a=cpu->sigActions[sig];if(!a.installed || a.handler<=1)return false;
@@ -187,6 +189,7 @@ int main() {
  frame.State.vectors.fill(0xa5);auto before=frame.State.vectors;
  frame.State.rip=0x7a4011a909ULL; // actual libc lane, below the ELF interpreter
  assert(handleScalarSyscall(&adapter,&frame,24,0,0));assert(frame.State.vectors==before);
+ assert(scalarYieldCalls==1);
  assert(frame.State.rip==0x7a4011a90bULL);
  assert(frame.State.gregs[0]==0 && frame.State.gregs[1]==frame.State.rip);
  t.queuePendingSignal(10,true);assert(!handleScalarSyscall(&adapter,&frame,24,0,0));t.pendingSignals=0;

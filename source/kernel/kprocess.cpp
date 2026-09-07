@@ -1957,6 +1957,9 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     std::vector<BString> cmdLine;
 
     this->systemProcess = false;
+#if defined(BOXEDWINE_FEX64_BACKEND)
+    this->systemProcess = argsNameWineInfrastructure(args);
+#endif
     for (auto& s : args) {
         if (s.endsWith("wineboot.exe", true)) {
             this->systemProcess = true;

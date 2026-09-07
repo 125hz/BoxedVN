@@ -109,6 +109,13 @@ public:
 		return this->getWriteCapacityWant();
 #endif
 	}
+	U32 getPlayableBufferSize() override {
+#ifdef __EMSCRIPTEN__
+		return getBufferSize();
+#else
+		return getQueuedAudioSizeWant(false);
+#endif
+	}
 	bool isWriteReady() override;
 	void waitForEvents(BOXEDWINE_CONDITION& parentCondition, U32 events) override;
 
@@ -132,7 +139,7 @@ public:
 		return KDspAudioMath::getWriteCapacity(bytesPerSecondWant(), getFragmentSize(), DSP_BUFFER_SIZE);
 	}
 
-	U32 getQueuedAudioSizeWant() {
+	U32 getQueuedAudioSizeWant(bool includePendingInput = true) {
 		if (!KSystem::soundEnabled) {
 			this->drainNoSoundAudioBuffer();
 			return (U32)this->audioBuffer.size();
@@ -146,7 +153,7 @@ public:
 		}
 		U64 queued = (U64)SDL_GetQueuedAudioSize(this->deviceId) * bytesPerSecondWant() / gotBytesPerSecond;
 #ifndef __EMSCRIPTEN__
-        if (!this->sameFormat) queued += this->converter.bufferedInputBytes();
+        if (includePendingInput && !this->sameFormat) queued += this->converter.bufferedInputBytes();
 #endif
 		return (U32)std::min<U64>(queued, 0xFFFFFFFFu);
 	}

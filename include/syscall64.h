@@ -25,6 +25,7 @@ class CPU64;
 // to make ld-linux-x86-64.so.2 reach the program entry point; everything
 // else returns -ENOSYS with a klog.
 void ksyscall64(CPU64* cpu);
+void kschedYield64(CPU64* cpu);
 
 // End a 64-bit guest process that cannot continue, through the SAME completion
 // exit_group(2) uses: the terminal status, the lifecycle marker, and
