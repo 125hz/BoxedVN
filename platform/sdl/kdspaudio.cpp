@@ -22,6 +22,7 @@
 #include <SDL.h>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include "../../source/kernel/devs/oss.h"
 
 #define DSP_BUFFER_SIZE (1024*32)
@@ -42,6 +43,20 @@ static void ensureAudioSessionCategory() {
 	// KNativeSystem::cleanup calls SDL_Quit, which clears all hints. Reapply
 	// before every open, including later guest sessions in the same iOS app.
 	SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+}
+
+// CoreAudio keeps a backend-wide list of queues and session reference counts.
+// Serialize open/close across independent guest streams and the drain timer.
+// Queueing and callbacks never take this lock; it is below pendingClosesMutex.
+static std::mutex dspDeviceLifecycleMutex;
+static SDL_AudioDeviceID openDspAudioDevice(const SDL_AudioSpec* requested,
+                                           SDL_AudioSpec* obtained) {
+    std::lock_guard<std::mutex> lock(dspDeviceLifecycleMutex);
+    return SDL_OpenAudioDevice(nullptr, 0, requested, obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+}
+static void closeDspAudioDevice(SDL_AudioDeviceID device) {
+    std::lock_guard<std::mutex> lock(dspDeviceLifecycleMutex);
+    SDL_CloseAudioDevice(device);
 }
 
 class KDspAudioSdl : public KDspAudio, public std::enable_shared_from_this<KDspAudioSdl> {
@@ -67,7 +82,7 @@ public:
 		}
 #endif
 		if (this->deviceId) {
-			SDL_CloseAudioDevice(this->deviceId);
+			closeDspAudioDevice(this->deviceId);
 			this->deviceId = 0;
 		}
 	}
@@ -276,7 +291,7 @@ static Uint32 SDLCALL drainTimerCb(Uint32 interval, void* /*param*/) {
 			std::shared_ptr<KDspAudioSdl> v = *it;
 			if (!v->deviceId || SDL_GetQueuedAudioSize(v->deviceId) == 0) {
 				if (v->deviceId) {
-					SDL_CloseAudioDevice(v->deviceId);
+					closeDspAudioDevice(v->deviceId);
 					v->deviceId = 0;
 				}
 				it = pendingCloses.erase(it);
@@ -398,7 +413,7 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
 		}
 		// Close any prior device on this voice (reopening drops any still-queued audio).
 		if (this->deviceId) {
-			SDL_CloseAudioDevice(this->deviceId);
+			closeDspAudioDevice(this->deviceId);
 			this->deviceId = 0;
 		}
 #ifdef __EMSCRIPTEN__
@@ -416,7 +431,7 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
     }
 #endif
 	ensureAudioSessionCategory();
-	SDL_AudioDeviceID newId = SDL_OpenAudioDevice(nullptr, 0, &requested, &this->got, SDL_AUDIO_ALLOW_ANY_CHANGE);
+	SDL_AudioDeviceID newId = openDspAudioDevice(&requested, &this->got);
 	if (newId == 0) {
 		klog_fmt("Failed to open audio: %s", SDL_GetError());
 		klog_fmt("BOXEDWINE_AUDIO_DEVICE want=0x%x/%uHz/%uch got=none converted=0 "
@@ -477,7 +492,7 @@ void KDspAudioSdl::closeAudio() {
 		ensureDrainTimer();
 		pendingCloses.push_back(shared_from_this());
 	} else {
-		SDL_CloseAudioDevice(this->deviceId);
+		closeDspAudioDevice(this->deviceId);
 		this->deviceId = 0;
 	}
 }
@@ -653,7 +668,7 @@ void KDspAudio::shutdown() {
 	if (KSystem::soundEnabled) {
 		for (auto& v : pendingCloses) {
 			if (v->deviceId) {
-				SDL_CloseAudioDevice(v->deviceId);
+				closeDspAudioDevice(v->deviceId);
 				v->deviceId = 0;
 			}
 		}

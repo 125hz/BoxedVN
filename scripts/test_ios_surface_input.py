@@ -26,6 +26,8 @@ code = r"""
 #include <mutex>
 #include <vector>
 #include <cassert>
+#include <atomic>
+#include <thread>
 using U32 = unsigned; using S32 = int;
 #define BOXEDWINE_IOS
 int dispatches=0, fits=0, warps=0, callbacks=0;
@@ -67,10 +69,23 @@ struct KNativeSystem { static void warpMouse(int,int){++warps;} };
 struct KNativeInputSDL {int injectedX=0,injectedY=0;bool hasInjectedPointer=false;
  void setMousePos(int,int); int xToScreen(int x){return x;} int yToScreen(int y){return y;}
 };
+using SDL_AudioDeviceID=unsigned;
+struct SDL_AudioSpec {};
+const int SDL_AUDIO_ALLOW_ANY_CHANGE=15;
+std::mutex dspDeviceLifecycleMutex;
+std::atomic<int> audioInFlight{0};
+SDL_AudioDeviceID SDL_OpenAudioDevice(const char*,int,const SDL_AudioSpec*,SDL_AudioSpec*,int) {
+ assert(audioInFlight.fetch_add(1)==0);std::this_thread::yield();--audioInFlight;return 2;
+}
+void SDL_CloseAudioDevice(SDL_AudioDeviceID) {
+ assert(audioInFlight.fetch_add(1)==0);std::this_thread::yield();--audioInFlight;
+}
 """
 code += method("platform/sdl/kvulkanSDL.cpp", "void KVulkdanSDLImpl::syncVulkanSurface(")
 code += method("platform/sdl/knativeinputSDL.cpp", "void KNativeInputSDL::setMousePos(")
 code += method("source/x11/xwindow.cpp", "int XWindow::moveResize(")
+code += method("platform/sdl/kdspaudio.cpp", "static SDL_AudioDeviceID openDspAudioDevice(")
+code += method("platform/sdl/kdspaudio.cpp", "static void closeDspAudioDevice(")
 code += r"""
 int main(){
  auto w=std::make_shared<XWindow>(); KVulkdanSDLImpl b;
@@ -98,11 +113,18 @@ int main(){
  assert(child.left==40 && child.top==60 && child.w==200 && child.h==150 && child.configured==1);
  child.moveResize(40,60,200,150);assert(child.configured==1);
  child.moveResize(10,20,200,150);assert(child.left==10 && child.top==20 && child.configured==2);
+ std::vector<std::thread> workers;
+ for(int t=0;t<8;++t) workers.emplace_back([] {
+   SDL_AudioSpec spec;
+   for(int i=0;i<200;++i) closeDspAudioDevice(openDspAudioDevice(&spec,&spec));
+ });
+ for(auto& worker:workers) worker.join();
+ assert(audioInFlight==0);
 }
 """
 with tempfile.TemporaryDirectory() as tmp:
     source=Path(tmp)/"native.cpp";exe=Path(tmp)/"native"
     source.write_text(code)
-    subprocess.run(["g++","-std=c++20",str(source),"-o",str(exe)],check=True)
+    subprocess.run(["g++","-std=c++20","-pthread",str(source),"-o",str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
 print("Production surface resizing, virtual warp delivery and window movement passed")

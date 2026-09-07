@@ -51,6 +51,10 @@ The additional SDL patch opts the iOS CoreAudio backend into multiple default
 playback devices. It preserves default-device enumeration, name validation,
 exclusive capture and every other backend's limits. CoreAudio already tracks
 per-device queues and holds AVAudioSession active until the last device closes.
+Native device opens and closes share a lifecycle mutex so guest audio threads
+and the deferred-close timer cannot race CoreAudio's queue list. Steady playback
+and audio callbacks do not take that mutex. The native fixture exercises eight
+concurrent lifecycle callers against the production wrappers.
 The patched source files are restored from the verified pinned archive before
 application, and the patch participates in both local and CI dependency keys.
 
