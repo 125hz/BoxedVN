@@ -174,8 +174,8 @@ jobs:
             build/wine64-oss
           key: ${{ steps.wine11-cache.outputs.cache-primary-key }}
 
-      - name: Validate Wine server protocol against installed headers
-        run: python3 scripts/test_wine_server_protocol.py --headers build/wine11-install/usr/include
+      - name: Validate Wine server protocol against pinned private headers
+        run: python3 scripts/test_wine_server_protocol.py --fetch-pinned-headers
 
       - name: Build and validate Wine64 layers
         shell: bash
