@@ -50,15 +50,21 @@ void klog_fmt(const char*,...) {}
 namespace bvnFairness {
  std::atomic<uint64_t> throttleCount{0},throttleMicroseconds{0},getrusageCalls{0},schedYieldCalls{0};
 }
-namespace KSystem {uint64_t ticks=100;uint64_t getMicroCounter(){return ticks++;}}
+namespace KSystem {uint64_t ticks=100;uint64_t getMicroCounter(){return ticks++;}
+ uint64_t getSystemTimeAsMicroSeconds(){return 1234567;}}
 struct KThread {unsigned id=11;GetrusageFairness schedYieldFairness;U64 voluntaryYieldCount64=0;};
-struct Memory {std::array<U64,20> words{};
+constexpr int K64_PAGE_SHIFT=12,K64_PAGE_WRITE=2,X64_SYS_getrusage=98,X64_SYS_clock_gettime=228;
+struct Memory {std::array<U64,1024> words{};unsigned permissions[2]={3,3};bool committed[2]={true,true};
+ U32 getPageFlags(U64 page){return page<2 ? permissions[page] : 0;}
+ void* getCommittedPagePtr(U64 page){return page<2 && committed[page] ? words.data()+page*512 : nullptr;}
  void memsetGuest(U64 address,int value,U64 bytes){memset((char*)words.data()+address,value,bytes);}
  void writeq(U64 address,U64 value){words.at(address/8)=value;}};
 struct CPU64 {Memory* memory;KThread* thread;};
 '''
 scheduling = method("source/kernel/syscall64.cpp", "void kschedYield64(")
 rusage = method("source/kernel/syscall64.cpp", "static U64 sys_getrusage64(")
+polling = method("source/kernel/syscall64.cpp", "static U64 sys_clock_gettime64(")
+polling += method("source/kernel/syscall64.cpp", "bool kpollingQuery64(")
 apple = r'''
 #define __APPLE__
 struct time_value_t {int seconds,microseconds;};
@@ -101,6 +107,19 @@ int main(){
  assert(m.words[17]==2 && m.words[18]==0); // Linux ru_nvcsw at byte 128
 #endif
  KSystem::ticks+=10000;kschedYield64(&cpu);assert(thread.voluntaryYieldCount64==2);
+ U64 result=999;
+ assert(kpollingQuery64(&cpu,98,1,8,result) && result==0);
+ assert(kpollingQuery64(&cpu,228,7,8,result) && m.words[1]==1 && m.words[2]==234567000);
+ assert(!kpollingQuery64(&cpu,98,0,8,result)); // process accounting stays on full path
+ assert(!kpollingQuery64(&cpu,228,99,8,result));
+ assert(!kpollingQuery64(&cpu,0,1,8,result));
+ assert(!kpollingQuery64(&cpu,98,1,0,result));
+ assert(!kpollingQuery64(&cpu,98,1,~0ULL-20,result));
+ m.permissions[1]=1;
+ assert(!kpollingQuery64(&cpu,98,1,4088,result)); // straddles a read-only page
+ m.permissions[1]=3;m.committed[1]=false;
+ assert(!kpollingQuery64(&cpu,98,1,4088,result)); // demand commit may need full CPU state
+ m.committed[1]=true;assert(kpollingQuery64(&cpu,98,1,4088,result));
 }
 '''
 
@@ -218,8 +237,8 @@ int main(){
 '''
 
 with tempfile.TemporaryDirectory() as tmp:
-    for name, code in [("rusage_linux", common+scheduling+rusage+scheduling_tests),
-                       ("rusage_apple", common+apple+scheduling+rusage+scheduling_tests),
+    for name, code in [("rusage_linux", common+scheduling+rusage+polling+scheduling_tests),
+                       ("rusage_apple", common+apple+scheduling+rusage+polling+scheduling_tests),
                        ("fault", fault_code), ("lifecycle", lifecycle),
                        ("audio_queue", audio_queue)]:
         src = Path(tmp) / (name + ".cpp")

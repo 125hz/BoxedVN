@@ -1920,6 +1920,25 @@ static bool handleScalarSyscall(BVNFEXCPU64Adapter* adapter,
 #endif
 }
 
+// Clock and thread-accounting reads do not change SIMD/x87 state. They are
+// common in Wine's wait loops; reconstructing those registers for every poll
+// can occupy a core while the worker it is waiting for needs that core.
+static bool handlePollingQuery(BVNFEXCPU64Adapter* adapter,
+                               FEXCore::Core::CpuStateFrame* frame,
+                               const uint64_t* args, U64& result) {
+    if ((args[0] != 98 && args[0] != 228) ||
+        frame != adapter->fexThread->CurrentFrame || frame->Thread != adapter->fexThread ||
+        frame->State.rip < K64_NATIVE_GUEST_IMAGE_BASE ||
+        frame->State.rip >= K64_NATIVE_GUEST_HIGH_END ||
+        adapter->thread->terminating || adapter->cpu->hasDeliverableSignal() ||
+        !kpollingQuery64(adapter->cpu, args[0], args[1], args[2], result)) return false;
+    frame->State.gregs[X64_RAX] = result;
+    frame->State.gregs[X64_RCX] = frame->State.rip + 2;
+    frame->State.rip += 2;
+    adapter->lastAction = BVNFEXCPU64AdapterActionContinue;
+    return true;
+}
+
 // Recording a Vulkan command consumes marshalled guest memory but never changes
 // the emulated CPU state or enters a guest callback. Keep the spilled FEX frame
 // authoritative instead of copying/reconstructing every SIMD and x87 register
@@ -1950,6 +1969,9 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     }
     if (handleScalarSyscall(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
                           arguments[0], arguments[1], arguments[2])) return 0;
+    U64 pollingResult;
+    if (handlePollingQuery(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
+                           arguments, pollingResult)) return pollingResult;
     uint64_t recordingResult;
     if (handleVulkanRecording(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
                               arguments, recordingResult)) return recordingResult;

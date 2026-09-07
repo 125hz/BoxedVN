@@ -54,6 +54,11 @@ struct CPU64 {
 };
 int scalarYieldCalls=0;
 void kschedYield64(CPU64*) {++scalarYieldCalls;}
+int pollingCalls=0;
+bool kpollingQuery64(CPU64*,U64 number,U64 first,U64 address,U64& result) {
+ ++pollingCalls;if(number!=98 || first!=1 || address!=0x4000)return false;
+ result=static_cast<U64>(-5);return true;
+}
 U64 capturedRip=0,capturedResult=0;
 bool deliverSignalSync(CPU64* cpu,U32 sig) {
  auto a=cpu->sigActions[sig];if(!a.installed || a.handler<=1)return false;
@@ -101,6 +106,7 @@ for signature in ["void rememberPhysicalDevices(", "VkInstance physicalDeviceIns
                   "void forgetPhysicalDevices(", "VkInstance resolutionInstance("]:
     code += method("source/vulkan/vulkanbridge64.cpp", signature)
 code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleScalarSyscall(")
+code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handlePollingQuery(")
 code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleVulkanRecording(")
 code += method("platform/sdl/kvulkanSDL.cpp", "bool KVulkdanSDLImpl::isPendingPresentationWindow(")
 code += (repo / "include/kdspaudio_math.h").read_text()
@@ -219,6 +225,21 @@ int main() {
  assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result));t.pendingSignals=0;
  frame.State.rip=0x140001000;assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result));
  assert(recordingCalls==1);
+ frame.State.rip=0x7a40100000ULL;
+ uint64_t queryArgs[3]={98,1,0x4000};U64 queryResult=0;
+ assert(handlePollingQuery(&adapter,&frame,queryArgs,queryResult));
+ assert(queryResult==static_cast<U64>(-5) && frame.State.gregs[0]==queryResult);
+ assert(frame.State.rip==0x7a40100002ULL && frame.State.gregs[1]==frame.State.rip);
+ assert(frame.State.vectors==before && pollingCalls==1);
+ t.queuePendingSignal(10,true);
+ assert(!handlePollingQuery(&adapter,&frame,queryArgs,queryResult));t.pendingSignals=0;
+ frame.State.rip=0x140001000;assert(!handlePollingQuery(&adapter,&frame,queryArgs,queryResult));
+ frame.State.rip=0x7a40100000ULL;t.terminating=true;
+ assert(!handlePollingQuery(&adapter,&frame,queryArgs,queryResult));t.terminating=false;
+ frame.Thread=nullptr;assert(!handlePollingQuery(&adapter,&frame,queryArgs,queryResult));frame.Thread=&ft;
+ assert(pollingCalls==1); // exclusions do not touch guest memory
+ queryArgs[2]=0;assert(!handlePollingQuery(&adapter,&frame,queryArgs,queryResult));
+ assert(frame.State.rip==0x7a40100000ULL && frame.State.vectors==before);
 }
 '''
 

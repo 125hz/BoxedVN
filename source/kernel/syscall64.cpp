@@ -2125,6 +2125,25 @@ static U64 sys_getrusage64(CPU64* cpu, S64 who, U64 address) {
     return 0;
 }
 
+// Queries that only write a small result buffer can keep FEX's register frame
+// authoritative. Faultable/uncommitted buffers retain the complete syscall
+// path, where CPU state is synchronized before guest fault handling.
+bool kpollingQuery64(CPU64* cpu, U64 number, U64 first, U64 address, U64& result) {
+    const bool usage = number == X64_SYS_getrusage && first == 1;
+    const bool clock = number == X64_SYS_clock_gettime &&
+        (first == 0 || first == 1 || first == 4 || first == 5 || first == 6 || first == 7);
+    if ((!usage && !clock) || !cpu || !cpu->memory || !address) return false;
+    const U64 size = usage ? 144 : 16;
+    if (address > ~0ULL - (size - 1)) return false;
+    for (U64 page = address >> K64_PAGE_SHIFT; page <= (address + size - 1) >> K64_PAGE_SHIFT; ++page) {
+        if (!(cpu->memory->getPageFlags(page) & K64_PAGE_WRITE) ||
+            !cpu->memory->getCommittedPagePtr(page)) return false;
+    }
+    result = usage ? sys_getrusage64(cpu, (S64)first, address)
+                   : sys_clock_gettime64(cpu, first, address);
+    return true;
+}
+
 // read/write/open/close — wired to the existing KProcess FD table via a
 // host bounce buffer, without truncating addresses through 32-bit memory.
 static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {

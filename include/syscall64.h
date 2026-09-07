@@ -26,6 +26,7 @@ class CPU64;
 // else returns -ENOSYS with a klog.
 void ksyscall64(CPU64* cpu);
 void kschedYield64(CPU64* cpu);
+bool kpollingQuery64(CPU64* cpu, U64 number, U64 first, U64 address, U64& result);
 
 // End a 64-bit guest process that cannot continue, through the SAME completion
 // exit_group(2) uses: the terminal status, the lifecycle marker, and

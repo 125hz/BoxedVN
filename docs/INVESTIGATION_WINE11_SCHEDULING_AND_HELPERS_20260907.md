@@ -17,6 +17,8 @@ identify `bc0f99a8+dirty`, app build 137, Wine 11 and increased-memory signing.
   path bypasses the bounded scheduling detector used by the older kernel.
   Wine 11's `NtYieldExecution` compares per-thread switch counters before and
   after yielding. A zero-filled response never reports a performed yield.
+  A busy-host sample also lands in `ReconstructXMMRegisters`, called by the
+  full syscall synchronization path while this polling thread occupies a core.
 - A 32-bit launcher starts child pid 50, then exits cleanly. The runtime
   unconditionally requests session shutdown and kills the remaining processes
   while the child is still loading its WoW64 image.
@@ -47,6 +49,11 @@ identify `bc0f99a8+dirty`, app build 137, Wine 11 and increased-memory signing.
    bind delayed polls and shutdown retries to the launch generation.
 4. Count playback starvation independently from retained resampler input.
    OSS position/space accounting continues to include that input.
+5. Keep the FEX frame authoritative for clock and thread-usage queries in the
+   Unix guest lane. Call the same kernel implementations, accepting only
+   committed writable result pages. Invalid buffers, other queries, PE callers,
+   pending signals and terminating threads retain the complete syscall path.
+   This removes the measured SIMD/x87 reconstruction cost from these polls.
 
 No game files, title-specific rules, Wine runtime layers or graphics routing
 are changed. Direct3D 9 continues through DXVK/Vulkan/MoltenVK; DXMT serves
