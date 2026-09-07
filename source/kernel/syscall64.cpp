@@ -739,12 +739,12 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         }
     }
     if (fd == 1 || fd == 2) {
-        // Tee stdout/stderr to host console so ld-linux + glibc diagnostics
-        // surface immediately. Also forward to the kobject so anything
-        // tailing the host FS still sees it.
+        // The descriptor owns output delivery. DevTTY already writes to the
+        // captured host console; teeing here duplicated every Wine/DXMT line
+        // and doubled formatting, locking, and file I/O. Redirected output
+        // must likewise go only to the file or pipe the guest selected.
         U32 wpid = (cpu->thread && cpu->thread->process) ? cpu->thread->process->id : 0;
         const char* wexe = (cpu->thread && cpu->thread->process) ? cpu->thread->process->name.c_str() : "?";
-        klog_fmt("[guest fd=%llu pid=%u %s] %s", (unsigned long long)fd, (unsigned)wpid, wexe, (const char*)buffer.data());
         if (fd == 2 && strstr((const char*)buffer.data(), "RtlpWaitForCriticalSection")) {
             // Capture only the reporting thread's saved WoW64 context. Reading
             // live sibling CPU state would race the translator. Each side of

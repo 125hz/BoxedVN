@@ -1004,9 +1004,11 @@ void XWindow::draw() {
 		colorMap->buildCache();
 		palette = colorMap->nativePixels;
 	}
-	S32 screenX = left;
-	S32 screenY = top;
-	//windowToScreen(screenX, screenY);
+	// Native blits use screen coordinates, while X children store positions
+	// relative to their parent (including Wine desktop/client windows).
+	S32 screenX = 0;
+	S32 screenY = 0;
+	windowToScreen(screenX, screenY);
 	lockData();
 	const bool wasDirty = isDirty;
 #ifdef BOXEDWINE_IOS

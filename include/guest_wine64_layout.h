@@ -325,7 +325,31 @@
 #define K_X64_WINE_RELAY_INCLUDE \
     "advapi32.*;kernel32.*;kernelbase.*;user32.*;version.*;ws2_32.*;" \
     "ntdll.RtlExitUserThread"
+// Keep bulk string/file work and per-frame polling out of API relay. File
+// failures and progress remain available through the shared syscall witnesses.
 #define K_X64_WINE_RELAY_EXCLUDE \
+    "kernel32.lstrcmpA;kernelbase.lstrcmpA;" \
+    "kernel32.lstrcmpW;kernelbase.lstrcmpW;" \
+    "kernel32.lstrcmpiA;kernelbase.lstrcmpiA;" \
+    "kernel32.lstrcmpiW;kernelbase.lstrcmpiW;" \
+    "kernel32.lstrlenA;kernelbase.lstrlenA;" \
+    "kernel32.lstrlenW;kernelbase.lstrlenW;" \
+    "kernel32.Sleep;kernelbase.Sleep;" \
+    "kernel32.SleepEx;kernelbase.SleepEx;" \
+    "kernel32.WaitOnAddress;kernelbase.WaitOnAddress;" \
+    "kernel32.WakeByAddressSingle;kernelbase.WakeByAddressSingle;" \
+    "kernel32.WakeByAddressAll;kernelbase.WakeByAddressAll;" \
+    "kernel32.SleepConditionVariableSRW;kernelbase.SleepConditionVariableSRW;" \
+    "kernel32.SleepConditionVariableCS;kernelbase.SleepConditionVariableCS;" \
+    "kernel32.ReleaseSemaphore;kernelbase.ReleaseSemaphore;" \
+    "kernel32.QueryPerformanceFrequency;kernelbase.QueryPerformanceFrequency;" \
+    "kernel32.GetSystemTimePreciseAsFileTime;kernelbase.GetSystemTimePreciseAsFileTime;" \
+    "kernel32.ReadFile;kernelbase.ReadFile;" \
+    "kernel32.FindNextFileA;kernelbase.FindNextFileA;" \
+    "kernel32.FindNextFileW;kernelbase.FindNextFileW;" \
+    "user32.GetFocus;user32.GetAsyncKeyState;user32.GetKeyState;" \
+    "user32.GetClientRect;user32.GetWindowRect;user32.GetWindowLongPtrW;" \
+    "user32.TranslateMDISysAccel;user32.TranslateAcceleratorA;user32.TranslateAcceleratorW;" \
     "kernel32.HeapFree;kernelbase.HeapFree;" \
     "kernel32.FlsGetValue;kernelbase.FlsGetValue;" \
     "kernel32.FlsSetValue;kernelbase.FlsSetValue;" \

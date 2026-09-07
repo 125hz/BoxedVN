@@ -198,6 +198,20 @@ class TheIncludeListStaysSmall(unittest.TestCase):
                      "kernel32.TlsGetValue", "kernelbase.TlsGetValue"):
             self.assertIn(name, self.exclude)
 
+    def test_bulk_loading_and_frame_polling_do_not_generate_relay(self) -> None:
+        for module, function in (
+            ("kernel32", "lstrcmpiA"), ("kernelbase", "lstrcmpiA"),
+            ("kernel32", "ReadFile"), ("kernelbase", "ReadFile"),
+            ("kernel32", "Sleep"), ("kernelbase", "Sleep"),
+            ("kernelbase", "WaitOnAddress"),
+            ("kernel32", "SleepConditionVariableSRW"),
+            ("kernel32", "QueryPerformanceFrequency"),
+            ("kernelbase", "GetSystemTimePreciseAsFileTime"),
+            ("user32", "GetFocus"), ("user32", "GetAsyncKeyState"),
+        ):
+            with self.subTest(module=module, function=function):
+                self.assertTrue(wine_relay_matches(self.exclude, module, function))
+
 
 class TheSettingIsOffUntilItIsAskedFor(unittest.TestCase):
     def test_the_toggle_and_the_launch_use_one_key(self) -> None:
@@ -392,12 +406,14 @@ class TheLaneAnswersOneNameForItself(unittest.TestCase):
 
 
 class TheRelayOutputReachesTheLog(unittest.TestCase):
-    def test_guest_stderr_is_mirrored_into_the_session_log(self) -> None:
-        # Relay is written to the traced process's stderr and to nothing else,
-        # so the trace is only worth turning on because sys_write64 tees fd 1
-        # and 2 into klog, which the capture thread above reads.
+    def test_guest_output_is_delivered_once_by_its_descriptor(self) -> None:
+        # DevTTY already forwards guest output to the captured host console.
+        # A syscall-level tee duplicates it and leaks redirected output too.
         source = read(REPO / "source" / "kernel" / "syscall64.cpp")
-        self.assertIn('klog_fmt("[guest fd=%llu pid=%u %s] %s"', source)
+        self.assertNotIn('klog_fmt("[guest fd=%llu pid=%u %s] %s"', source)
+        self.assertIn('fdesc->kobject->writeNative(buffer.data(), (U32)count)', source)
+        tty = read(REPO / "source" / "kernel" / "devs" / "devtty.cpp")
+        self.assertIn('::write(1, buffer, len)', tty)
 
 
 if __name__ == "__main__":
