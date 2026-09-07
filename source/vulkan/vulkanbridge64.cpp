@@ -2297,6 +2297,10 @@ bool surfaceWindow(U64 surface, SurfaceWindow* out) {
     for (const SurfaceWindow& record : gSurfaceWindows) {
         if (record.surface == surface) {
             *out = record;
+            if (XWindowPtr window = XServer::getServer()->getWindow(record.windowId)) {
+                out->width = window->width();
+                out->height = window->height();
+            }
             return true;
         }
     }
@@ -3326,6 +3330,9 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error(false);
         }
+        if (KVulkanPtr backend = presentationBackend()) {
+            backend->syncVulkanSurface((void*)A(1));
+        }
         const VkResult result =
             ((PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)raw)(
                 (VkPhysicalDevice)H(0), (VkSurfaceKHR)A(1), capabilities);
@@ -3366,6 +3373,11 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
             (VkSurfaceCapabilities2KHR*)m.chain(A(2), true);
         if (!m.ok()) {
             return m.error(false);
+        }
+        if (info) {
+            if (KVulkanPtr backend = presentationBackend()) {
+                backend->syncVulkanSurface((void*)info->surface);
+            }
         }
         const VkResult result =
             ((PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR)raw)(
@@ -3427,6 +3439,11 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
             (VkSwapchainKHR*)m.outRequired(A(3), sizeof(VkSwapchainKHR));
         if (!m.ok()) {
             return m.error();
+        }
+        if (info) {
+            if (KVulkanPtr backend = presentationBackend()) {
+                backend->syncVulkanSurface((void*)info->surface);
+            }
         }
         const VkResult result = ((PFN_vkCreateSwapchainKHR)raw)(
             (VkDevice)H(0), info, nullptr, out);

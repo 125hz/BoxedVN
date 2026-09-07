@@ -368,6 +368,9 @@ jobs:
       - name: Test raw mouse event codec
         run: python3 scripts/test_x11_raw_event.py
 
+      - name: Test native surface resize and virtual pointer ordering
+        run: python3 scripts/test_ios_surface_input.py
+
       - name: Test guest file timestamp units
         run: python3 scripts/test_x64_stat_timestamp.py
 

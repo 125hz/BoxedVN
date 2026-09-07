@@ -763,6 +763,8 @@ struct ExecutionTraceSnapshot {
     uint64_t lastSignal = 0;
     uint64_t lastFaultAddress = 0;
     uint64_t lastFaultPC = 0;
+    uint32_t socketReadFd = 0, socketReadAge = 0;
+    uint32_t socketWriteFd = 0, socketWriteCode = 0, socketWriteBytes = 0;
     uint32_t stablePolls = 0;
     bool emitSample = false;
     bool emitWarning = false;
@@ -2026,6 +2028,12 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                 snapshot.processId = process->id;
                 snapshot.threadId = thread->id;
                 snapshot.processEntryRIP = process->entry64;
+                snapshot.socketReadFd = thread->diagnosticSocketReadFd.load(std::memory_order_relaxed);
+                snapshot.socketReadAge = KSystem::getMilliesSinceStart() -
+                    thread->diagnosticSocketReadStartMillies.load(std::memory_order_relaxed);
+                snapshot.socketWriteFd = thread->diagnosticSocketWriteFd.load(std::memory_order_relaxed);
+                snapshot.socketWriteCode = thread->diagnosticSocketWriteCode.load(std::memory_order_relaxed);
+                snapshot.socketWriteBytes = thread->diagnosticSocketWriteBytes.load(std::memory_order_relaxed);
                 if (infoResult == KERN_SUCCESS) {
                     snapshot.runState = basic.run_state;
                     snapshot.cpuUsage = basic.cpu_usage;
@@ -2399,6 +2407,12 @@ extern "C" void BVNFEXBackendPollExecutionTrace(void) {
                     static_cast<unsigned long long>(snapshot.hostCallRegisters[7]),
                     static_cast<unsigned long long>(snapshot.hostCallRegisters[8]),
                     static_cast<unsigned long long>(snapshot.hostCallRegisters[9]));
+            if (snapshot.socketReadFd) {
+                reportf("BOXEDWINE_FEX64_STALL_IPC pid=%u tid=%u read_fd=%u age_ms=%u request_fd=%d request=%u bytes=%u",
+                    snapshot.processId, snapshot.threadId, snapshot.socketReadFd - 1,
+                    snapshot.socketReadAge, (int)snapshot.socketWriteFd - 1,
+                    snapshot.socketWriteCode, snapshot.socketWriteBytes);
+            }
             reportf("BOXEDWINE_FEX64_STALL_MEMORY pid=%u tid=%u valid_mask=0x%x chunk_size=0x%llx chunk_user=0x%llx chunk_key=0x%llx arena_lock=0x%llx arena_system=0x%llx tls_address=0x%llx tls_value=0x%llx",
                     snapshot.processId, snapshot.threadId,
                     snapshot.memoryValueMask,

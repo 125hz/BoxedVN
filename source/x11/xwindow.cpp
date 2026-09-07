@@ -1176,24 +1176,15 @@ void XWindow::configureNotify() {
 }
 
 int XWindow::moveResize(S32 x, S32 y, U32 width, U32 height) {
-	if (this->left == x && this->top == y && this->width() == width && this->height() == height) {
-		return Success;
-	}
-	if (width != this->width() || height != this->height()) {
-		setSize(width, height);
-		// setSize hands back a new zero-filled backing store, so a window that
-		// was showing its background is showing black again until the client
-		// repaints. Wine resizes its desktop window right after creating it.
-		backgroundFilled = false;
-		fillWithBackground();
-	}
-
-	KNativeSystem::moveWindow(shared_from_this());
-	
-	configureNotify();
-	// :TODO:
-	// exposeNofity
-	return Success;
+    if (left == x && top == y && this->width() == width && this->height() == height) {
+        return Success;
+    }
+    // XMoveResizeWindow is a ConfigureWindow request with these four fields.
+    // Use the same path so position, exposure and backing-store updates agree.
+    XWindowChanges changes = {};
+    changes.x = x; changes.y = y;
+    changes.width = width; changes.height = height;
+    return configure(CWX | CWY | CWWidth | CWHeight, &changes);
 }
 
 int XWindow::configure(U32 mask, XWindowChanges* changes) {

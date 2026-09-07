@@ -1683,6 +1683,14 @@ class SurfaceExtentContract(unittest.TestCase):
         self.assertIn("rememberSurfaceWindow(handle, (U32)windowId", create)
         self.assertIn("window_size=%ux%u", create)
 
+    def test_window_resize_is_synchronized_before_host_surface_calls(self) -> None:
+        for command in ("GetPhysicalDeviceSurfaceCapabilitiesKHR",
+                        "GetPhysicalDeviceSurfaceCapabilities2KHR",
+                        "CreateSwapchainKHR"):
+            body = self.case_body(command)
+            self.assertLess(body.index("syncVulkanSurface("),
+                            body.index("((PFN_vk" + command + ")raw)"))
+
     def test_both_capability_queries_carry_the_witness(self) -> None:
         # The same rule the map witness follows: reasoning from the absence of
         # a mismatch only works when every path that could report one does.

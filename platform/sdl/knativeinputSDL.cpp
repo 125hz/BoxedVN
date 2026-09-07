@@ -280,12 +280,14 @@ void KNativeInputSDL::setMousePos(int x, int y) {
     injectedY = y;
     hasInjectedPointer = true;
     BVNGuestPointerPositionChanged(x, y);
-#endif
-
-#ifdef BOXEDWINE_IOS
-    // XWarpPointer supplies fake-fullscreen client coordinates on iOS. Keep
-    // them in the same client space used by injectedX/injectedY; getMousePos
-    // performs the single client-to-root conversion when X11 asks for it.
+    // The iOS pointer is virtual. An SDL warp queues a synthetic host motion
+    // event which arrives after newer touch deltas, moves the pointer back,
+    // and makes a recentering camera fight the player's swipe. Deliver the
+    // X11 core warp event now, without a native warp or a raw-motion delta.
+    if (XServer* server = XServer::getServer(true)) {
+        server->mouseMove(x, y, false);
+    }
+    return;
 #else
     if (XServer::getServer(true) && XServer::getServer()->fakeFullScreenWnd) {
         XServer::getServer()->fakeFullScreenWnd->screenToWindow(x, y);

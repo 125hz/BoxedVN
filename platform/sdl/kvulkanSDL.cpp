@@ -87,6 +87,8 @@ struct VulkanSurfaceRecord {
     U64 presentAttempts = 0;
     void* offscreenMetalLayer = nullptr;
     std::shared_ptr<FirstFrameWatch> firstFrameWatch;
+    U32 drawableWidth = 0;
+    U32 drawableHeight = 0;
 };
 
 #ifdef BOXEDWINE_IOS
@@ -130,6 +132,7 @@ public:
     void* createVulkanSurface(const XWindowPtr& wnd, void* instance) override;
     void destroyVulkanSurface(void* surface) override;
     bool isPresentationSurface(void* surface) override;
+    void syncVulkanSurface(void* surface) override;
     void registerVulkanSwapchain(void* swapchain, void* surface) override;
     void destroyVulkanSwapchain(void* swapchain) override;
     void acquireVulkanSwapchain(void* swapchain, int result,
@@ -287,7 +290,8 @@ void* KVulkdanSDLImpl::createVulkanSurface(const XWindowPtr& wnd,
         {
             std::lock_guard<std::mutex> lock(surfacesMutex);
             surfaces.push_back({(void*)result, wnd, presentation, presentation,
-                                false, 0, 0, 0, offscreenMetalLayer, watch});
+                                false, 0, 0, 0, offscreenMetalLayer, watch,
+                                wnd->width(), wnd->height()});
             S32 rootX = 0;
             S32 rootY = 0;
             wnd->windowToScreen(rootX, rootY);
@@ -404,6 +408,46 @@ bool KVulkdanSDLImpl::isPresentationSurface(void* surface) {
     auto found = std::find_if(surfaces.begin(), surfaces.end(),
         [surface](const auto& item) { return item.surface == surface; });
     return found != surfaces.end() && found->presentation;
+}
+
+void KVulkdanSDLImpl::syncVulkanSurface(void* surface) {
+#ifdef BOXEDWINE_IOS
+    {
+        std::lock_guard<std::mutex> lock(surfacesMutex);
+        const auto found = std::find_if(surfaces.begin(), surfaces.end(),
+            [surface](const auto& item) { return item.surface == surface; });
+        if (found == surfaces.end() || !found->presentationVisible ||
+            !found->presentation || !found->window ||
+            (found->drawableWidth == found->window->width() &&
+             found->drawableHeight == found->window->height())) return;
+    }
+    // Never hold the surface table lock across the main-thread rendezvous.
+    // Re-read on the main thread so concurrent queries cannot apply an older
+    // size after a newer one. Unchanged capability queries avoid this dispatch.
+    DISPATCH_MAIN_THREAD_BLOCK_THIS_BEGIN
+    XWindowPtr window;
+    U32 width = 0, height = 0;
+    {
+        std::lock_guard<std::mutex> lock(surfacesMutex);
+        const auto found = std::find_if(surfaces.begin(), surfaces.end(),
+            [surface](const auto& item) { return item.surface == surface; });
+        if (found == surfaces.end() || !found->presentationVisible ||
+            !found->presentation || !found->window) return 0;
+        window = found->window;
+        width = window->width(); height = window->height();
+        if (!width || !height || (found->drawableWidth == width &&
+                                 found->drawableHeight == height)) return 0;
+        found->drawableWidth = width;
+        found->drawableHeight = height;
+    }
+    screen->setScreenSize(width, height);
+    BVNApplyGuestPresentationAspect(surface, width, height,
+                                    BVNGuestPreferredPresentationMode());
+    screen->refreshIOSGuestPointerTransform();
+    klog_fmt("BOXEDWINE_VULKAN_SURFACE_RESIZE surface=%p window=0x%x size=%ux%u",
+             surface, window->id, width, height);
+    DISPATCH_MAIN_THREAD_BLOCK_END
+#endif
 }
 
 void KVulkdanSDLImpl::registerVulkanSwapchain(void* swapchain,
