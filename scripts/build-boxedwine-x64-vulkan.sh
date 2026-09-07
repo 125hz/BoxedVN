@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir needs a value"
                       OUTPUT_DIR="$2"; shift 2 ;;
-        --winex11)    [[ $# -ge 2 ]] || die "--winex11 needs a value"
+        --winex11|--wine-vulkan-loader) [[ $# -ge 2 ]] || die "--winex11 needs a value"
                       WINEX11="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -76,7 +76,7 @@ if [[ -n "${WINEX11}" ]]; then
     validator_args+=(--winex11 "${WINEX11}")
 fi
 python3 "${BOXEDVN_ROOT}/scripts/validate-x64-vulkan-shim.py" "${validator_args[@]}" \
-    || die "The built guest Vulkan ICD does not satisfy the winex11.drv import contract."
+    || die "The built guest Vulkan ICD does not satisfy the Wine Vulkan loader contract."
 
 ok "x86-64 guest Vulkan ICD: ${OUTPUT_DIR}/${SONAME}"
 ls -l "${OUTPUT_DIR}/${SONAME}"

@@ -193,13 +193,12 @@ jobs:
             --output-dir build/x64-x11 \
             --winex11 "${winex11}"
           python3 scripts/test_x64_xinput.py build/x64-x11
-          # The guest Vulkan ICD, validated against the same winex11.so: that
-          # driver is what dlopens libvulkan.so.1 and binds sixteen symbols out
-          # of it by name, so a Wine update that adds a seventeenth fails here
-          # rather than as a silent "no Vulkan adapter" on a device.
+          # Wine 11 moved Vulkan loading and procedure lookup into win32u.
+          # Validate the shared presentation entry points against that exact
+          # packaged module; winex11 now receives function pointers from it.
           bash scripts/build-boxedwine-x64-vulkan.sh \
             --output-dir build/x64-vulkan \
-            --winex11 "${winex11}"
+            --wine-vulkan-loader "${winex11%/winex11.so}/win32u.so"
           # The OSS driver is passed only when both halves are there. Half a
           # pair is a build failure in the runtime builder, by design: the PE
           # half reaches the unix half through Wine's private

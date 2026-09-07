@@ -246,9 +246,9 @@ def validate(shim: pathlib.Path, imports: pathlib.Path,
         if vanished:
             raise ValidationError(
                 f"{winex11}: does not name {len(vanished)} symbol(s) that "
-                f"{imports.name} records as dlsym'd: " + ", ".join(vanished)
+                f"{imports.name} records as presentation entry points: " + ", ".join(vanished)
                 + f". Re-read the LOAD_FUNCPTR list in Wine's "
-                  "dlls/winex11.drv/vulkan.c and update the [required] block.")
+                  "dlls/win32u/vulkan.c (Wine 11) or winex11.drv/vulkan.c and update the contract.")
 
         # Anything else the driver mentions. This cannot be decided from the
         # binary -- a dlsym argument and any other literal are both just
@@ -289,8 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bridge-header", type=pathlib.Path,
                         default=REPO_ROOT / "include" / "boxedwine_x64_vulkan_bridge.h",
                         help="the bridge ABI header holding the command table")
-    parser.add_argument("--winex11", type=pathlib.Path,
-                        help="a winex11.so to re-measure against the recorded contract")
+    parser.add_argument("--winex11", "--wine-vulkan-loader", dest="winex11", type=pathlib.Path,
+                        help="Wine Vulkan loader (winex11.so on Wine 9, win32u.so on Wine 11)")
     args = parser.parse_args(argv)
     try:
         counts = validate(args.shim, args.imports, args.bridge_header, args.winex11)

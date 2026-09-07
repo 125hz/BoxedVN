@@ -1,3 +1,9 @@
+# Wine 11: Vulkan loading moved to dlls/win32u/vulkan.c. It resolves
+# vkGetDeviceProcAddr/vkGetInstanceProcAddr with dlsym and the remaining
+# presentation functions through those procedure tables. These required
+# exports remain the minimum shared presentation contract. Validate Wine 11
+# against win32u.so; the historical Wine 9 binding details follow below.
+#
 # The symbols Wine's winex11.drv looks up in the Vulkan library it dlopens.
 #
 # Wine 9.0, dlls/winex11.drv/vulkan.c: the driver dlopens SONAME_LIBVULKAN and
