@@ -3881,7 +3881,19 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
 // safe). At most one per call — the handler runs, and any further pending
 // signals are taken on subsequent slices (after rt_sigreturn unmasks). Returns
 // true if a signal was delivered.
-bool CPU64::deliverPendingSignals() {
+bool CPU64::hasDeliverableSignal() {
+    if (!thread) return false;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(thread->pendingSignalsMutex);
+    const U64 pending = thread->pendingSignals & ~sigMask;
+    for (U32 sig = 1; sig <= 64; ++sig) {
+        const auto& action = sigActions[sig];
+        if ((pending & (1ULL << (sig - 1))) && action.installed && action.handler > 1)
+            return true;
+    }
+    return false;
+}
+
+bool CPU64::deliverPendingSignals(U64 restartSyscall) {
     if (!this->thread) return false;
     U64 pending;
     {
@@ -3897,11 +3909,21 @@ bool CPU64::deliverPendingSignals() {
         // the wineserver SIGUSR1-APC case the handler is always installed by the
         // time wineserver signals the client; an undeliverable signal shouldn't
         // be silently dropped here.
+        const U64 savedRip = rip;
+        const U64 savedResult = reg[X64_RAX].u64;
+        // Interrupted blocking reads with SA_RESTART resume at SYSCALL after
+        // rt_sigreturn. Without SA_RESTART the handler saves the -EINTR result.
+        if (restartSyscall != ~0ULL && (sigActions[sig].flags & K_SA_RESTART)) {
+            rip = syscallRip;
+            reg[X64_RAX].setU64(restartSyscall);
+        }
         if (deliverSignalSync(this, sig)) {
             BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(this->thread->pendingSignalsMutex);
             this->thread->pendingSignals &= ~bit;
             return true;
         }
+        rip = savedRip;
+        reg[X64_RAX].setU64(savedResult);
     }
     return false;
 }
@@ -5419,6 +5441,7 @@ void ksyscall64(CPU64* cpu) {
             U32 targetTid = (U32)(isTgkill ? a2 : a1);
             U32 sig       = (U32)(isTgkill ? a3 : a2);
             U64 ourTid    = cpu->thread ? (U64)cpu->thread->id : 1;
+            if (sig > 64) { ret = (U64)-K_EINVAL; break; }
             if (targetTid != (U32)ourTid) {
                 KThread* target = KSystem::getThreadById(targetTid);
                 if (!target) { ret = (U64)-K_ESRCH; break; }
@@ -5435,10 +5458,7 @@ void ksyscall64(CPU64* cpu) {
                 // target's next slice, before it runs guest code. We can't build
                 // a signal frame here because the target may be executing on a
                 // different host thread.
-                {
-                    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(target->pendingSignalsMutex);
-                    target->pendingSignals |= (1ULL << (sig - 1));
-                }
+                target->queuePendingSignal(sig);
                 ret = 0;
                 break;
             }
@@ -6697,6 +6717,15 @@ void ksyscall64(CPU64* cpu) {
         cpu->thread->process->syscallTail.complete(tailToken, (S64)ret);
     }
     cpu->reg[X64_RAX].setU64(ret);
+    if (!cpu->yield && cpu->thread && !cpu->thread->terminating &&
+        cpu->thread->process && !cpu->thread->process->terminated) {
+        // Save the completed syscall result before building a signal frame.
+        // Both the interpreter and FEX must deliver here: ExecuteThread can
+        // otherwise stay inside translated code without another scheduler slice.
+        const bool restartable = nr == X64_SYS_read ||
+            (nr == X64_SYS_futex && a4 == 0);
+        cpu->deliverPendingSignals((S64)ret == -K_EINTR && restartable ? nr : ~0ULL);
+    }
 }
 
 #endif // BOXEDWINE_GUEST_X64

@@ -1157,9 +1157,12 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
             delivered = true;
         });
         if (delivered) return;
-        // Polling clients consume accumulated position and can warp it back
-        // themselves. Never replace every sample by center + last delta.
+        // A client without XI2 receives a core motion relative to the anchor.
+        // The virtual pointer remains centered and no inverse synthetic motion
+        // is injected. Raw subscribers above receive each physical delta once.
         KNativeSystem::getCurrentInput()->getMousePos(&x, &y);
+        x += deltaX;
+        y += deltaY;
     }
 
 	if (isGrabbed) {

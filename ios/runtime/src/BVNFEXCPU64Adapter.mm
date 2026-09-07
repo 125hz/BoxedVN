@@ -63,6 +63,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <thread>
 #include <cstddef>
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -1854,12 +1855,39 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
 #endif
 }
 
+// sched_yield changes no vector/x87 state and touches no guest memory. The
+// Linux ELF lane is disjoint from Wine's PE NT syscall thunks. Preserve FEX's
+// spilled SIMD state in place instead of reconstructing/copying it twice on
+// every spin-wait yield. Any pending signal takes the complete state path.
+static bool handleScalarYield(BVNFEXCPU64Adapter* adapter,
+                              FEXCore::Core::CpuStateFrame* frame, U64 number) {
+#ifdef BOXEDWINE_MULTI_THREADED
+    if (number != 24 || frame != adapter->fexThread->CurrentFrame ||
+        frame->Thread != adapter->fexThread ||
+        frame->State.rip < K64_NATIVE_GUEST_INTERP_BASE ||
+        frame->State.rip >= K64_NATIVE_GUEST_HIGH_END ||
+        adapter->thread->terminating || adapter->cpu->hasDeliverableSignal()) return false;
+    std::this_thread::yield();
+    if (adapter->cpu->hasDeliverableSignal()) return false;
+    frame->State.gregs[X64_RAX] = 0;
+    frame->State.gregs[X64_RCX] = frame->State.rip + 2;
+    frame->State.rip += 2;
+    // R11 and flags already carry FEX's architectural SYSCALL clobber.
+    adapter->lastAction = BVNFEXCPU64AdapterActionContinue;
+    return true;
+#else
+    return false;
+#endif
+}
+
 extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     BVNFEXCPU64Adapter* adapter, void* framePointer, const uint64_t* arguments) {
     if (!validAdapter(adapter) || !framePointer || !arguments) {
         if (adapter) adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
         return static_cast<uint64_t>(-K_ENOSYS);
     }
+    if (handleScalarYield(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
+                          arguments[0])) return 0;
     if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, framePointer)) {
         adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
         return static_cast<uint64_t>(-K_EFAULT);

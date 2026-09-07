@@ -721,21 +721,17 @@ U32 DevDsp::ioctl64(U32 request, U64 argAddress, KMemory64* memory) {
         }
         const U32 capacity = this->audio->getBufferCapacity();
         const U32 used = this->audio->getBufferSize();
-        const U32 available =
-            KDspAudioMath::getOutputSpaceAvailable(capacity, used, true);
-        // Self-consistency matters more than precision here. wineoss takes
-        // oss_bufsize_bytes as fragstotal * fragsize and then computes
-        // (oss_bufsize_bytes - bi.bytes) as an unsigned frame count, so a
-        // "bytes" larger than fragstotal * fragsize underflows into a
-        // multi-gigabyte write budget. Reporting whole fragments keeps
-        // bytes <= fragstotal * fragsize by construction.
+        // OSS bytes includes the writable remainder of a fragment. Quantize
+        // total capacity once, then subtract queued bytes without rounding the
+        // free-space report: rounding it made Wine's playback position jump by
+        // an entire fragment instead of advancing with the host audio clock.
         const U32 fragsTotal = capacity / fragSize;
-        const U32 frags = available / fragSize;
-        arg.writed(0, frags);                 // int fragments
-        arg.writed(4, fragsTotal);            // int fragstotal
-        arg.writed(8, fragSize);              // int fragsize
-        arg.writed(12, frags * fragSize);     // int bytes
-        value = frags * fragSize;
+        const U32 available = KDspAudioMath::getAvailableWriteBytes(fragsTotal * fragSize, used);
+        arg.writed(0, available / fragSize);  // complete writable fragments
+        arg.writed(4, fragsTotal);
+        arg.writed(8, fragSize);
+        arg.writed(12, available);            // includes partial fragment
+        value = available;
         break;
     }
     case 0x500D: { // SNDCTL_DSP_GETISPACE

@@ -298,7 +298,8 @@ public:
     // APC nudge). Called by the scheduler at the start of this thread's slice,
     // before it runs guest code, so the frame is built while the thread is
     // parked. Returns true if a signal was delivered (rip now in a handler).
-    bool deliverPendingSignals();
+    bool hasDeliverableSignal();
+    bool deliverPendingSignals(U64 restartSyscall = ~0ULL);
 
     void push64(U64 value);
     U64  pop64();

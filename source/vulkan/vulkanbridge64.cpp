@@ -105,6 +105,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include <unordered_map>
 
 namespace {
 
@@ -276,6 +277,31 @@ VkInstance gLiveInstances[kMaxLiveInstances] = {};
 // one, most recently created first. Commands that carry their own VkInstance
 // resolve through that instead (see resolutionInstance).
 VkInstance gInstance = VK_NULL_HANDLE;
+
+// Physical-device handles belong to the instance that enumerated them. An
+// unrelated adapter probe may have different enabled instance extensions.
+std::mutex gPhysicalDeviceMutex;
+std::unordered_map<VkPhysicalDevice, VkInstance> gPhysicalDeviceInstances;
+
+void rememberPhysicalDevices(VkInstance instance, const VkPhysicalDevice* devices, U32 count) {
+    if (!devices) return;
+    std::lock_guard<std::mutex> lock(gPhysicalDeviceMutex);
+    for (U32 i = 0; i < count; ++i) gPhysicalDeviceInstances[devices[i]] = instance;
+}
+
+VkInstance physicalDeviceInstance(VkPhysicalDevice device) {
+    std::lock_guard<std::mutex> lock(gPhysicalDeviceMutex);
+    auto it = gPhysicalDeviceInstances.find(device);
+    return it == gPhysicalDeviceInstances.end() ? VK_NULL_HANDLE : it->second;
+}
+
+void forgetPhysicalDevices(VkInstance instance) {
+    std::lock_guard<std::mutex> lock(gPhysicalDeviceMutex);
+    for (auto it = gPhysicalDeviceInstances.begin(); it != gPhysicalDeviceInstances.end();) {
+        if (it->second == instance) it = gPhysicalDeviceInstances.erase(it);
+        else ++it;
+    }
+}
 
 bool instanceIsLive(VkInstance instance) {
     if (instance == VK_NULL_HANDLE) {
@@ -2643,9 +2669,15 @@ float f32(U64 word) {
 // the bridge's current instance may be a different one, or none at all when
 // the last instance is in the middle of being destroyed.
 VkInstance resolutionInstance(int index, const U64* args) {
+    if (!strncmp(kCommandName[index], "vkGetPhysicalDevice", 19) ||
+        index == VKB_CreateDevice || index == VKB_EnumerateDeviceExtensionProperties ||
+        index == VKB_EnumerateDeviceLayerProperties) {
+        return physicalDeviceInstance((VkPhysicalDevice)(uintptr_t)args[0]);
+    }
     switch (index) {
     case VKB_DestroyInstance:
     case VKB_EnumeratePhysicalDevices:
+    case VKB_EnumeratePhysicalDeviceGroups:
     case VKB_DestroySurfaceKHR:
         if (args[0]) {
             return (VkInstance)(uintptr_t)args[0];
@@ -2756,6 +2788,7 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         // list first re-points the bridge's current instance at whatever is
         // still alive, so a second live instance keeps working.
         VkInstance instance = (VkInstance)H(0);
+        forgetPhysicalDevices(instance);
         forgetInstance(instance);
         ((PFN_vkDestroyInstance)raw)(instance, nullptr);
         return 0;
@@ -2770,8 +2803,13 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error();
         }
-        return (S64)((PFN_vkEnumeratePhysicalDevices)raw)(
+        const U32 capacity = *countSlot;
+        const VkResult result = ((PFN_vkEnumeratePhysicalDevices)raw)(
             (VkInstance)H(0), countSlot, devices);
+        if (result == VK_SUCCESS || result == VK_INCOMPLETE) {
+            rememberPhysicalDevices((VkInstance)H(0), devices, std::min(capacity, *countSlot));
+        }
+        return (S64)result;
     }
 
     case VKB_GetPhysicalDeviceProperties: {
@@ -4835,8 +4873,16 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
         if (!m.ok()) {
             return m.error();
         }
-        return (S64)((PFN_vkEnumeratePhysicalDeviceGroups)raw)(
+        const U32 capacity = *countSlot;
+        const VkResult result = ((PFN_vkEnumeratePhysicalDeviceGroups)raw)(
             (VkInstance)H(0), countSlot, properties);
+        if (properties && (result == VK_SUCCESS || result == VK_INCOMPLETE)) {
+            for (U32 i = 0; i < std::min(capacity, *countSlot); ++i) {
+                rememberPhysicalDevices((VkInstance)H(0), properties[i].physicalDevices,
+                    std::min(properties[i].physicalDeviceCount, (U32)VK_MAX_DEVICE_GROUP_SIZE));
+            }
+        }
+        return (S64)result;
     }
     case VKB_GetDeviceGroupPeerMemoryFeatures: {
         VkPeerMemoryFeatureFlags* features =

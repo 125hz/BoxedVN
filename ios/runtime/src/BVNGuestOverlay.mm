@@ -1964,8 +1964,8 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"BoxedVN.pointer.centerLock"]) {
         self.pendingRelativeMotion = CGPointMake(self.pendingRelativeMotion.x + dx * sensitivity,
                                                 self.pendingRelativeMotion.y + dy * sensitivity);
-        // The injected-position callback updates the local cursor. Raw deltas
-        // remain unclamped even when the visible pointer reaches its radius.
+        // The injected-position callback keeps the cursor centered. Swipe
+        // deltas are independent of that anchor and have no screen-edge limit.
     } else {
         [self moveCursorBy:CGPointMake(dx * sensitivity, dy * sensitivity)];
     }

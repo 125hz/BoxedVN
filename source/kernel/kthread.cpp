@@ -228,6 +228,23 @@ void KThread::queuePendingSignal(U32 signal) {
 #ifdef BOXEDWINE_JIT
     this->cpu->jitSignalPending.store(1, std::memory_order_release);
 #endif
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_MULTI_THREADED)
+    if (cpu64) {
+        // A pending bit cannot wake a host condition by itself. Take the
+        // condition after releasing pendingSignalsMutex: readers check pending
+        // signals under the condition before parking, closing the lost-wakeup
+        // race without delivering guest code on the sender's host thread.
+        BOXEDWINE_CONDITION condition;
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(waitingCondSync);
+            condition = waitingCond;
+        }
+        if (condition) {
+            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(condition);
+            BOXEDWINE_CONDITION_SIGNAL_ALL(condition);
+        }
+    }
+#endif
 }
 
 U32 KThread::signal(U32 signal, bool wait) {
@@ -1224,14 +1241,22 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddress,
         }
         wait->waiting = true;
 #ifdef BOXEDWINE_MULTI_THREADED
+        struct InterruptibleFutex {
+            KThread* thread;
+            bool previous;
+            explicit InterruptibleFutex(KThread* t) : thread(t), previous(t->interruptibleWait64) {
+                thread->interruptibleWait64 = true;
+            }
+            ~InterruptibleFutex() { thread->interruptibleWait64 = previous; }
+        } interruptible(this);
         while (true) {
-            if (this->pendingSignals) {
-                bool delivered = cpu64 ? cpu64->deliverPendingSignals()
-                                       : runSignals();
-                if (delivered) {
-                    freeFutex(wait);
-                    return -K_EINTR;
-                }
+            // Build 64-bit signal frames at the syscall return boundary, after
+            // RAX contains -EINTR. Building here saved the syscall number as the
+            // interrupted result and then overwrote the handler's RAX.
+            if ((cpu64 && cpu64->hasDeliverableSignal()) ||
+                (!cpu64 && this->pendingSignals && runSignals())) {
+                freeFutex(wait);
+                return -K_EINTR;
             }
             if (wait->wake) {
                 freeFutex(wait);

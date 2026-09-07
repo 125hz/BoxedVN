@@ -235,6 +235,8 @@ public:
     // the wineserver protocol is the request code. Biased by one where zero
     // has to mean "not doing this", written by the thread itself on the
     // syscall path and read by the hang snapshot from another thread.
+    // Owned by the reader; checked after registering a host condition wait.
+    bool interruptibleWait64 = false;
     std::atomic<U32> diagnosticSocketReadFd{0};
     std::atomic<U32> diagnosticSocketReadStartMillies{0};
     std::atomic<U32> diagnosticSocketWriteFd{0};

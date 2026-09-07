@@ -67,6 +67,7 @@ struct XServer { int moves=0,x=0,y=0; bool relative=true;
 };
 struct KNativeSystem { static void warpMouse(int,int){++warps;} };
 struct KNativeInputSDL {int injectedX=0,injectedY=0;bool hasInjectedPointer=false;
+ bool mouseMoveGuest(int,int,bool);unsigned screenWidth(){return 800;}unsigned screenHeight(){return 600;}
  void setMousePos(int,int); int xToScreen(int x){return x;} int yToScreen(int y){return y;}
 };
 using SDL_AudioDeviceID=unsigned;
@@ -83,6 +84,7 @@ void SDL_CloseAudioDevice(SDL_AudioDeviceID) {
 """
 code += method("platform/sdl/kvulkanSDL.cpp", "void KVulkdanSDLImpl::syncVulkanSurface(")
 code += method("platform/sdl/knativeinputSDL.cpp", "void KNativeInputSDL::setMousePos(")
+code += method("platform/sdl/knativeinputSDL.cpp", "bool KNativeInputSDL::mouseMoveGuest(")
 code += method("source/x11/xwindow.cpp", "int XWindow::moveResize(")
 code += method("platform/sdl/kdspaudio.cpp", "static SDL_AudioDeviceID openDspAudioDevice(")
 code += method("platform/sdl/kdspaudio.cpp", "static void closeDspAudioDevice(")
@@ -109,6 +111,12 @@ int main(){
  assert(server->moves==1 && server->x==320 && server->y==240 && !server->relative);
  assert(warps==0 && callbacks==1);
  input.setMousePos(330,242); assert(server->moves==2 && warps==0 && input.injectedX==330);
+ for(int i=0;i<100;++i) {
+   assert(input.mouseMoveGuest(123,-87,true));
+   assert(input.injectedX==400 && input.injectedY==300);
+   assert(server->relative && server->x==123 && server->y==-87);
+ }
+ input.mouseMoveGuest(12,34,false);assert(input.injectedX==12 && input.injectedY==34);
  XWindow child;child.moveResize(40,60,200,150);
  assert(child.left==40 && child.top==60 && child.w==200 && child.h==150 && child.configured==1);
  child.moveResize(40,60,200,150);assert(child.configured==1);

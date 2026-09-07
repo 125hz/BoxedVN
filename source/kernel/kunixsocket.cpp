@@ -22,6 +22,9 @@
 #include "ksocket.h"
 #include "kstat.h"
 #include "ksignal.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#endif
 
 KUnixSocketObject::KUnixSocketObject(U32 domain, U32 type, U32 protocol) : KSocketObject(KTYPE_UNIX_SOCKET, domain, type, protocol), 
     lockCond(std::make_shared<BoxedWineCondition>(B("KUnixSocketObject::lockCond"))), recvBuffer(128)
@@ -285,6 +288,17 @@ U32 KUnixSocketObject::unixsocket_write_native_nowait(const std::shared_ptr<KObj
 }
 
 U32 KUnixSocketObject::readNative(U8* buffer, U32 len) {
+#ifdef BOXEDWINE_GUEST_X64
+    KThread* reader = KThread::currentThread();
+    struct InterruptibleRead {
+        KThread* thread;
+        bool previous;
+        explicit InterruptibleRead(KThread* t) : thread(t), previous(t && t->interruptibleWait64) {
+            if (thread) thread->interruptibleWait64 = true;
+        }
+        ~InterruptibleRead() { if (thread) thread->interruptibleWait64 = previous; }
+    } interruptible(reader);
+#endif
     std::shared_ptr<KUnixSocketObject> con = this->connection.lock();
     if (!this->inClosed && !con)
         return -K_EPIPE;
@@ -297,6 +311,11 @@ U32 KUnixSocketObject::readNative(U8* buffer, U32 len) {
         if (!this->blocking) {
             return -K_EWOULDBLOCK;
         }
+#ifdef BOXEDWINE_GUEST_X64
+        if (reader && reader->cpu64 && reader->cpu64->hasDeliverableSignal()) {
+            return -K_EINTR;
+        }
+#endif
         BOXEDWINE_CONDITION_WAIT(this->lockCond);
 #ifdef BOXEDWINE_MULTI_THREADED
         KThread* thread = KThread::currentThread();

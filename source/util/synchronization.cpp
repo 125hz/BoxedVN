@@ -17,6 +17,9 @@
  */
 
 #include "boxedwine.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#endif
 #ifdef BOXEDWINE_MULTI_THREADED
 
 namespace {
@@ -32,6 +35,15 @@ bool setThreadWaitingCondition(KThread* thread, const BOXEDWINE_CONDITION& cond)
         thread->waitingCond = nullptr;
         return false;
     }
+#ifdef BOXEDWINE_GUEST_X64
+    // Register before checking pending signals. A sender either sees this
+    // condition and wakes it, or queued before registration and is seen here.
+    if (thread->interruptibleWait64 && thread->cpu64 &&
+        thread->cpu64->hasDeliverableSignal()) {
+        thread->waitingCond = nullptr;
+        return false;
+    }
+#endif
     return true;
 }
 
