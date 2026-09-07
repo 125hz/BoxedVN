@@ -3449,28 +3449,29 @@ static U64 sys_sigaltstack64(CPU64* cpu, U64 ssPtr, U64 oldSsPtr) {
 }
 
 // sched_getaffinity(2): glibc + libgomp probe this very early to decide thread
-// pool sizes. We expose exactly one CPU. The Linux signature is unusual:
+// pool sizes. Match the topology exposed by /proc and the 32-bit kernel path.
+// The Linux signature is unusual:
 //   ssize_t sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask)
 // On success returns the number of bytes the kernel actually wrote (clamped
 // to cpusetsize, but must be a multiple of sizeof(long)=8). cpusetsize must
 // be a multiple of sizeof(long) and >= 8.
 //
-// We write 8 bytes (one U64 with bit 0 set) and return 8. Userspace then
-// counts the bits to get nproc, which is exactly what we want it to see.
 static U64 sys_sched_getaffinity64(CPU64* cpu, U64 pid, U64 cpusetsize, U64 maskPtr) {
-    (void)pid; // ignore — we model one process
-    if (cpusetsize == 0 || (cpusetsize & 7)) return (U64)-K_EINVAL;
+    (void)pid; // Guest affinity is an advertised scheduling policy, not host pinning.
+    U32 count = Platform::getCpuCount();
+    if (KSystem::cpuAffinityCountForApp && KSystem::cpuAffinityCountForApp < count)
+        count = KSystem::cpuAffinityCountForApp;
+    if (!count) count = 1;
+    U64 maskBytes = ((U64(count) + 63) / 64) * 8;
+    if (cpusetsize < maskBytes || (cpusetsize & 7)) return (U64)-K_EINVAL;
     if (!maskPtr) return (U64)-K_EFAULT;
     if (!cpu->memory) return (U64)-K_EFAULT;
 
-    // Write 1 in the low qword (CPU 0 is in our affinity set), zero the rest
-    // up to cpusetsize. Userspace inspects only the bytes the kernel wrote
-    // (which is our return value), so 8 bytes is enough.
-    cpu->memory->writeq(maskPtr, 1);
-    for (U64 off = 8; off < cpusetsize && off < 1024; off += 8) {
-        cpu->memory->writeq(maskPtr + off, 0);
+    for (U64 off = 0; off < maskBytes; off += 8) {
+        U32 bits = (U32)std::min<U64>(64, count - off * 8);
+        cpu->memory->writeq(maskPtr + off, bits == 64 ? ~0ULL : (1ULL << bits) - 1);
     }
-    return 8;
+    return maskBytes;
 }
 
 // sysinfo(2). The x86-64 struct is 112 bytes and every field but `procs`,
@@ -5061,6 +5062,44 @@ static_assert(BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE !=
               "the Vulkan bridge must not shadow the X11 bridge");
 static_assert(BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE > 1024,
               "a host bridge number must sit above the Linux syscall table");
+
+// A busy guest wait loop must be distinguishable from a blocked read without
+// enabling Wine relay tracing. Count locally and sample only hot Linux calls;
+// graphics hostcalls are excluded and no lock is added to the syscall path.
+static void reportHotSyscalls64(CPU64* cpu, U64 number, U64 a1, U64 a2, U64 result) {
+    if (number >= 512 || !cpu->thread) return;
+    struct Rates {
+        U32 threadId = 0, calls = 0, started = 0;
+        U32 counts[512]{};
+        U64 first[512]{}, second[512]{}, results[512]{};
+    };
+    static thread_local Rates rates;
+    if (rates.threadId != (U32)cpu->thread->id) {
+        rates = Rates{};
+        rates.threadId = (U32)cpu->thread->id;
+        rates.started = KSystem::getMilliesSinceStart();
+    }
+    ++rates.counts[number];
+    rates.first[number] = a1; rates.second[number] = a2; rates.results[number] = result;
+    if ((++rates.calls & 8191) != 0) return;
+    const U32 now = KSystem::getMilliesSinceStart();
+    const U32 elapsed = now - rates.started;
+    if (elapsed < 5000) return;
+    if (rates.calls / elapsed >= 3) {
+        for (unsigned rank = 0; rank < 3; ++rank) {
+            unsigned top = 0;
+            for (unsigned i = 1; i < 512; ++i) if (rates.counts[i] > rates.counts[top]) top = i;
+            if (!rates.counts[top]) break;
+            klog_fmt("BOXEDWINE_X64_SYSCALL_RATE tid=%u nr=%u (%s) calls=%u elapsed_ms=%u a1=0x%llx a2=0x%llx result=0x%llx",
+                rates.threadId, top, x64SyscallName(top), rates.counts[top], elapsed,
+                (unsigned long long)rates.first[top], (unsigned long long)rates.second[top],
+                (unsigned long long)rates.results[top]);
+            rates.counts[top] = 0;
+        }
+    }
+    std::fill(rates.counts, rates.counts + 512, 0);
+    rates.calls = 0; rates.started = now;
+}
 
 void ksyscall64(CPU64* cpu) {
     if (!cpu) return;
@@ -6718,6 +6757,7 @@ void ksyscall64(CPU64* cpu) {
     if (tailToken && cpu->thread && cpu->thread->process) {
         cpu->thread->process->syscallTail.complete(tailToken, (S64)ret);
     }
+    reportHotSyscalls64(cpu, nr, a1, a2, ret);
     cpu->reg[X64_RAX].setU64(ret);
     if (!cpu->yield && cpu->thread && !cpu->thread->terminating &&
         cpu->thread->process && !cpu->thread->process->terminated) {

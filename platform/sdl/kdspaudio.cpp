@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 #include "kdspaudio.h"
 #include "kdspaudio_math.h"
+#include "sdl_audio_converter.h"
 #include <SDL.h>
 #include <algorithm>
 #include <cmath>
@@ -144,6 +145,9 @@ public:
 			return 0;
 		}
 		U64 queued = (U64)SDL_GetQueuedAudioSize(this->deviceId) * bytesPerSecondWant() / gotBytesPerSecond;
+#ifndef __EMSCRIPTEN__
+        if (!this->sameFormat) queued += this->converter.bufferedInputBytes();
+#endif
 		return (U32)std::min<U64>(queued, 0xFFFFFFFFu);
 	}
 
@@ -200,6 +204,10 @@ public:
 	SDL_AudioSpec want = { 0 };
 	SDL_AudioSpec got = { 0 };
 	SDL_AudioCVT cvt = { 0 };
+#ifndef __EMSCRIPTEN__
+    SdlAudioConverter converter;
+    std::vector<U8> convertedAudio;
+#endif
 #ifdef __EMSCRIPTEN__
 	SDL_AudioStream* stream = nullptr;
 #endif
@@ -388,6 +396,10 @@ void KDspAudioSdl::soundEnabled() {
 }
 
 void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
+    this->open = false;
+#ifndef __EMSCRIPTEN__
+    this->converter.reset();
+#endif
 	this->want.callback = nullptr; // SDL_QueueAudio mode
 	this->want.userdata = nullptr;
 	this->want.format = getSdlFormat(format);
@@ -457,7 +469,12 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
 			SDL_BuildAudioCVT(&this->cvt, this->want.format, this->want.channels, this->want.freq, this->got.format, this->got.channels, this->got.freq);
 		}
 #else
-		SDL_BuildAudioCVT(&this->cvt, this->want.format, this->want.channels, this->want.freq, this->got.format, this->got.channels, this->got.freq);
+        if (!this->converter.open(this->want, this->got)) {
+            klog_fmt("BOXEDWINE_AUDIO_CONVERSION_ERROR: %s", SDL_GetError());
+            closeDspAudioDevice(this->deviceId);
+            this->deviceId = 0;
+            return;
+        }
 #endif
 	} else {
 		this->sameFormat = true;
@@ -494,6 +511,16 @@ void KDspAudioSdl::closeAudio() {
 	if (!this->deviceId) {
 		return;
 	}
+#ifndef __EMSCRIPTEN__
+    // Flush once at end of stream, never after individual writes: SDL documents
+    // gaps when feeding more data after a flush.
+    if (!this->sameFormat && this->converter.finish()) {
+        int bytes = this->converter.get(this->convertedAudio);
+        if (bytes > 0 && SDL_QueueAudio(this->deviceId, this->convertedAudio.data(), bytes) < 0)
+            klog_fmt("BOXEDWINE_AUDIO_QUEUE_ERROR: %s", SDL_GetError());
+    }
+    this->converter.reset();
+#endif
 	if (SDL_GetQueuedAudioSize(this->deviceId) > 0) {
 		// Leave the device open so the queue can drain; the poll timer will finalize.
 		ensureDrainTimer();
@@ -595,9 +622,6 @@ U32 KDspAudioSdl::writeAudio(U8* data, U32 len) {
 			}
 		}
 	} else if (!this->sameFormat) {
-#else
-	if (!this->sameFormat) {
-#endif
 		int needed = (int)len * this->cvt.len_mult;
 		if (this->cvtBufLen && this->cvtBufLen < needed) {
 			SDL_free(this->cvtBuf);
@@ -617,9 +641,22 @@ U32 KDspAudioSdl::writeAudio(U8* data, U32 len) {
 		}
 		this->hostPeak = std::max(this->hostPeak, peak(this->cvt.buf, this->cvt.len_cvt, got.format));
 		SDL_QueueAudio(this->deviceId, this->cvt.buf, this->cvt.len_cvt);
+#else
+    if (!this->sameFormat) {
+        if (!this->converter.put(data, len)) return -K_EIO;
+        int bytes = this->converter.get(this->convertedAudio);
+        if (bytes < 0) return -K_EIO;
+        if (bytes > 0) {
+            this->hostPeak = std::max(this->hostPeak, peak(this->convertedAudio.data(), bytes, got.format));
+            if (SDL_QueueAudio(this->deviceId, this->convertedAudio.data(), bytes) < 0) {
+                klog_fmt("BOXEDWINE_AUDIO_QUEUE_ERROR: %s", SDL_GetError());
+                return -K_EIO;
+            }
+        }
+#endif
 	} else {
 		this->hostPeak = std::max(this->hostPeak, this->guestPeak);
-		SDL_QueueAudio(this->deviceId, data, len);
+		if (SDL_QueueAudio(this->deviceId, data, len) < 0) return -K_EIO;
 	}
 	const U32 now = KSystem::getMilliesSinceStart();
 	if (now - this->signalLastMs >= 5000) {

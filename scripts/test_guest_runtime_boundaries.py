@@ -79,6 +79,12 @@ constexpr U64 K64_NATIVE_GUEST_IMAGE_BASE=0x7a00000000ULL;
 constexpr U64 K64_NATIVE_GUEST_INTERP_BASE=0x7f00000000ULL,K64_NATIVE_GUEST_HIGH_END=0x7f80000000ULL;
 constexpr int BVNFEXCPU64AdapterActionContinue=0;
 struct BVNFEXCPU64Adapter {FexThread* fexThread;KThread* thread;CPU64* cpu;int lastAction=99;};
+constexpr U64 BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE=0x7fff0003;
+int recordingCalls=0;
+bool vulkanBridge64RecordsCommands(U64 op){return op==123;}
+U64 vulkanBridge64(CPU64*,U64 op,U64 address,U64 count) {
+ assert(op==123 && address==0x8000 && count==3);++recordingCalls;return uint64_t(-7);
+}
 struct XWindow {};
 using XWindowPtr=std::shared_ptr<XWindow>;
 struct Surface {XWindowPtr window;bool presentation=true,presentationVisible=true,firstPresentObserved=false;};
@@ -93,6 +99,7 @@ for signature in ["void rememberPhysicalDevices(", "VkInstance physicalDeviceIns
                   "void forgetPhysicalDevices(", "VkInstance resolutionInstance("]:
     code += method("source/vulkan/vulkanbridge64.cpp", signature)
 code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleScalarSyscall(")
+code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleVulkanRecording(")
 code += method("platform/sdl/kvulkanSDL.cpp", "bool KVulkdanSDLImpl::isPendingPresentationWindow(")
 code += (repo / "include/kdspaudio_math.h").read_text()
 code += r'''
@@ -198,6 +205,17 @@ int main() {
  frame.State.rip=0x7fff80001000ULL;
  assert(!handleScalarSyscall(&adapter,&frame,158,0x1002,1)); // PE top-down arena
  t.terminating=true;assert(!handleScalarSyscall(&adapter,&frame,24,0,0));
+ t.terminating=false;frame.State.rip=0x7a40100000ULL;
+ uint64_t recordingArgs[7]={BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE,123,0x8000,3};uint64_t result=0;
+ assert(handleVulkanRecording(&adapter,&frame,recordingArgs,result));
+ assert(result==uint64_t(-7) && frame.State.gregs[0]==result && recordingCalls==1);
+ assert(frame.State.rip==0x7a40100002ULL && frame.State.gregs[1]==frame.State.rip);
+ assert(frame.State.vectors==before);
+ recordingArgs[1]=124;assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result)); // submit/wait
+ recordingArgs[1]=123;t.queuePendingSignal(10,true);
+ assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result));t.pendingSignals=0;
+ frame.State.rip=0x140001000;assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result));
+ assert(recordingCalls==1);
 }
 '''
 

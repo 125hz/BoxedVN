@@ -194,12 +194,14 @@ const U64 kCommandOp[VKB_COUNT] = {
 std::atomic<U32> gCommandCalls[VKB_COUNT];
 
 int commandIndexForOp(U64 op) {
-    for (int i = 0; i < VKB_COUNT; ++i) {
-        if (kCommandOp[i] == op) {
-            return i;
-        }
+    // Ordinals are sparse. Let the compiler build the lookup instead of
+    // scanning hundreds of names for every recorded draw and state change.
+    switch (op) {
+#define VKB_INDEX(name, ordinal) case BOXEDWINE_X64_VK_OP_VK_BASE + (ordinal): return VKB_##name;
+        BOXEDWINE_X64_VK_COMMANDS(VKB_INDEX)
+#undef VKB_INDEX
+    default: return -1;
     }
-    return -1;
 }
 
 // The KHR spelling of each command promoted from an extension into Vulkan 1.1,
@@ -3351,6 +3353,10 @@ S64 dispatchCommand(int index, Marshal& m, const U64* args, U64 count, U32 tid) 
     case VKB_DestroySurfaceKHR:
         ((PFN_vkDestroySurfaceKHR)raw)((VkInstance)H(0), (VkSurfaceKHR)A(1),
                                        nullptr);
+        // Match the 32-bit bridge: Vulkan destroys the VkSurface, but SDL's
+        // installed Metal view and our presentation record have a separate
+        // lifetime. Leaving them behind hides later GDI dialogs indefinitely.
+        KNativeSystem::getVulkan()->destroyVulkanSurface((void*)A(1));
         return 0;
     case VKB_GetPhysicalDeviceSurfaceSupportKHR: {
         VkBool32* supported =
@@ -5403,6 +5409,16 @@ const char* vulkanBridge64CommandName(U32 callPlusOne) {
 #else
     (void)callPlusOne;
     return nullptr;
+#endif
+}
+
+bool vulkanBridge64RecordsCommands(U64 op) {
+#ifdef BOXEDWINE_VULKAN
+    const int index = commandIndexForOp(op);
+    return index >= 0 && strncmp(kCommandName[index], "vkCmd", 5) == 0;
+#else
+    (void)op;
+    return false;
 #endif
 }
 

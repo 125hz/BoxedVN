@@ -57,6 +57,8 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include "kthread.h"
 #include "syscall64.h"
 #include "wine_nt_syscall_memory.h"
+#include "boxedwine_x64_vulkan_bridge.h"
+#include "../../../source/vulkan/vulkanbridge64.h"
 #include "BVNFEXBackend.h"
 
 #include <algorithm>
@@ -1916,6 +1918,28 @@ static bool handleScalarSyscall(BVNFEXCPU64Adapter* adapter,
 #endif
 }
 
+// Recording a Vulkan command consumes marshalled guest memory but never changes
+// the emulated CPU state or enters a guest callback. Keep the spilled FEX frame
+// authoritative instead of copying/reconstructing every SIMD and x87 register
+// twice for every draw, bind and barrier. Queue submission, waits, presentation,
+// allocation and pending signals retain the complete syscall path.
+static bool handleVulkanRecording(BVNFEXCPU64Adapter* adapter,
+                                  FEXCore::Core::CpuStateFrame* frame,
+                                  const uint64_t* args, uint64_t& result) {
+    if (args[0] != BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE ||
+        frame != adapter->fexThread->CurrentFrame || frame->Thread != adapter->fexThread ||
+        frame->State.rip < K64_NATIVE_GUEST_IMAGE_BASE ||
+        frame->State.rip >= K64_NATIVE_GUEST_HIGH_END ||
+        adapter->thread->terminating || adapter->cpu->hasDeliverableSignal() ||
+        !vulkanBridge64RecordsCommands(args[1])) return false;
+    result = vulkanBridge64(adapter->cpu, args[1], args[2], args[3]);
+    frame->State.gregs[X64_RAX] = result;
+    frame->State.gregs[X64_RCX] = frame->State.rip + 2;
+    frame->State.rip += 2;
+    adapter->lastAction = BVNFEXCPU64AdapterActionContinue;
+    return true;
+}
+
 extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     BVNFEXCPU64Adapter* adapter, void* framePointer, const uint64_t* arguments) {
     if (!validAdapter(adapter) || !framePointer || !arguments) {
@@ -1924,6 +1948,9 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     }
     if (handleScalarSyscall(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
                           arguments[0], arguments[1], arguments[2])) return 0;
+    uint64_t recordingResult;
+    if (handleVulkanRecording(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
+                              arguments, recordingResult)) return recordingResult;
     if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, framePointer)) {
         adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
         return static_cast<uint64_t>(-K_EFAULT);

@@ -27,6 +27,7 @@ class CPU64;
 // Returns the signed 64-bit result the guest shim reads back out of RAX: a
 // VkResult for a command that has one, a BOXEDWINE_X64_VK_E_* code otherwise.
 U64 vulkanBridge64(CPU64* cpu, U64 op, U64 argsAddress, U64 count);
+bool vulkanBridge64RecordsCommands(U64 op);
 
 // Capability bitmask reported by BOXEDWINE_X64_VK_OP_PROBE, also printed in
 // the startup witness so a log says on every launch whether the lane could

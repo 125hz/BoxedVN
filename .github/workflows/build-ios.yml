@@ -358,6 +358,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libsdl2-dev
           python3 scripts/test_sdl_audio_category.py
+          c++ -std=c++17 -Iinclude $(sdl2-config --cflags) scripts/test_sdl_audio_converter.cpp $(sdl2-config --libs) -o /tmp/test-sdl-audio-converter
+          /tmp/test-sdl-audio-converter
+          python3 scripts/test_guest_affinity64.py
+          python3 scripts/test_guest_runtime_boundaries.py
 
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
