@@ -1007,11 +1007,11 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     UILabel* title = [[UILabel alloc] initWithFrame:CGRectZero];
     title.text = @"Starting Wine";
     title.textColor = UIColor.labelColor;
-    title.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleTitle1]
-        scaledFontForFont:[UIFont systemFontOfSize:24.0
+    title.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleHeadline]
+        scaledFontForFont:[UIFont monospacedSystemFontOfSize:16.0
                                              weight:UIFontWeightBold]];
     title.adjustsFontForContentSizeCategory = YES;
-    title.textAlignment = NSTextAlignmentLeft;
+    title.textAlignment = NSTextAlignmentCenter;
 
     UILabel* body = [[UILabel alloc] initWithFrame:CGRectZero];
     body.text = @"Keep BoxedVN open. Translation and guest startup activity "
@@ -1031,7 +1031,10 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     UILabel* progress = [[UILabel alloc] initWithFrame:CGRectZero];
     progress.text = @"Preparing executable memory";
     progress.textColor = UIColor.labelColor;
-    progress.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    progress.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleCaption1]
+        scaledFontForFont:[UIFont monospacedSystemFontOfSize:11.0
+                                                    weight:UIFontWeightRegular]];
+    progress.textAlignment = NSTextAlignmentCenter;
     progress.adjustsFontForContentSizeCategory = YES;
     progress.numberOfLines = 2;
 

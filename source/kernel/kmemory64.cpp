@@ -1081,23 +1081,18 @@ void KMemory64::cloneFrom(const KMemory64* from) {
         return;
     }
 #endif
-    // The child inherits the parent's inaccessible reservations: they are part
-    // of the address space's shape even though nothing is mapped in them.
-    {
-        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
-        sparseReservations = from->sparseReservations;
-    }
-
-    // Lock both sides: `from` may be a live address space (the forking parent),
-    // and we're populating `this` (the fresh child). The parent could fault new
-    // pages concurrently in MT mode; take its lock for a consistent snapshot.
-    // recursive_mutex is fine even if from==this (it never is for fork). Use
-    // explicit guards (the CRITICAL_SECTION macro hard-codes the name `lock`, so
-    // it can't be used twice in one scope).
+    if (from == this) return;
+    // Snapshot allocator metadata and pages together, in the same mmap->pages
+    // lock order used by mappings. A copied page is still occupied: omitting
+    // ranges lets the child's first mmap overwrite its inherited libc/code.
 #ifdef BOXEDWINE_MULTI_THREADED
-    std::lock_guard<std::recursive_mutex> lockFrom(from->pagesMutex);
-    std::lock_guard<std::recursive_mutex> lockThis(pagesMutex);
+    std::scoped_lock mmapLocks(from->mmapMutex, mmapMutex);
+    std::scoped_lock pageLocks(from->pagesMutex, pagesMutex);
 #endif
+    ranges = from->ranges;
+    mmapNext = from->mmapNext;
+    sparseReservations = from->sparseReservations;
+
     pages.clear();
     pages.reserve(from->pages.size());
     for (const auto& kv : from->pages) {

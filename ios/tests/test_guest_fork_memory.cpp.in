@@ -1,0 +1,93 @@
+// Production clone + allocator regression, with an in-memory page backend.
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+using U8 = std::uint8_t;
+using U32 = std::uint32_t;
+using U64 = std::uint64_t;
+constexpr U64 K64_PAGE_SIZE=4096, K64_PAGE_MASK=4095, K64_PAGE_SHIFT=12;
+constexpr U32 K64_PAGE_MAPPED=1, K64_PAGE_SHARED=2, K64_PAGE_PINNED=4;
+constexpr int K64_WRITER_CLONE=1, K_EINVAL=22, K_ENOMEM=12;
+constexpr U64 K64_NATIVE_GUEST_HIGH_END=0x7f80000000ULL;
+#define BOXEDWINE_MULTI_THREADED
+#define BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(m) std::lock_guard<std::recursive_mutex> guard(m)
+U64 k64NextPageWriteStamp() { return 1; }
+struct K64Page {
+    U32 flags=0;
+    bool dataNative=false;
+    using Data=std::array<U8,4096>;
+    std::shared_ptr<Data> data, sharedData;
+    U8* sharedCanonical=nullptr;
+    void writeFlags(U32 f, int, U64) { flags=f; }
+    bool committed() const { return bool(data); }
+    U8* commit() { if (!data) data=std::make_shared<Data>(); return data->data(); }
+    U8* hostData() const { return data->data(); }
+    void adoptShared(std::shared_ptr<Data> d, bool, U8* canonical) {
+        data=sharedData=d; sharedCanonical=canonical;
+    }
+};
+struct KMemory64 {
+    mutable std::recursive_mutex mmapMutex, pagesMutex;
+    struct MMapRange { U64 startPage, pageCount; U32 prot; U8 kind; };
+    std::map<U64,MMapRange> ranges;
+    std::map<U64,U64> sparseReservations;
+    std::unordered_map<U64,std::unique_ptr<K64Page>> pages;
+    U64 mmapNext=0;
+    bool nativeIdentityMode() const { return false; }
+    void cloneFrom(const KMemory64*);
+    U64 mmapReserveAndMap(U64,U32);
+    U64 mmapAnonymousFixed(U64 address,U64 length,U32 prot) {
+        ranges[address>>12]={address>>12,length>>12,prot,0};
+        for (U64 at=address; at<address+length; at+=4096) {
+            auto page=std::make_unique<K64Page>();
+            page->flags=K64_PAGE_MAPPED;
+            page->commit();
+            pages[at>>12]=std::move(page);
+        }
+        return address;
+    }
+};
+U64 k64MmapBase(const KMemory64*) { return 0x700000000ULL; }
+void k64ReportGuestLaneExhausted(KMemory64*,U64,U64,U64) { assert(false); }
+@BOXEDVN_FORK_CLONE_BODY@
+@BOXEDVN_FORK_ALLOCATOR_BODY@
+int main() {
+    constexpr U64 libc=0x700005000ULL, libcSize=0x212000;
+    KMemory64 parent, child;
+    parent.mmapAnonymousFixed(libc,libcSize,5);
+    parent.mmapAnonymousFixed(libc+libcSize,0x2000,3);
+    parent.mmapNext=libc+libcSize+0x2000;
+    parent.sparseReservations[0x4000000000ULL>>12]=16;
+    auto* code=parent.pages.at(libc>>12)->commit(); code[0]=0xc3;
+    auto& shared=*parent.pages.at((libc+0x1000)>>12);
+    shared.flags |= K64_PAGE_SHARED;
+    shared.sharedData=shared.data;
+    shared.sharedCanonical=shared.commit();
+    child.cloneFrom(&parent);
+    assert(child.mmapNext==parent.mmapNext);
+    assert(child.sparseReservations==parent.sparseReservations);
+    assert(child.pages.at(libc>>12)->hostData()!=code);
+    assert(child.pages.at((libc+0x1000)>>12)->hostData()==shared.hostData());
+    // Force reuse of the initial hole: copying only the cursor would hide
+    // the missing-range bug until a later reuse/search.
+    child.mmapNext=k64MmapBase(&child);
+    child.mmapReserveAndMap(0x1000,5);
+    child.mmapReserveAndMap(0x1000,2);
+    U64 view=child.mmapReserveAndMap(0x144000,3);
+    assert(view>=libc+libcSize+0x2000);
+    assert(child.pages.at(libc>>12)->hostData()[0]==0xc3);
+    child.pages.at(libc>>12)->commit()[0]=0x90;
+    assert(code[0]==0xc3); // Private fork pages remain isolated.
+    shared.commit()[0]=0x42;
+    assert(child.pages.at((libc+0x1000)>>12)->hostData()[0]==0x42);
+    assert(parent.ranges.size()==2); // Child allocations stay in the child.
+    child.cloneFrom(&child); // No deadlock or destructive self-copy.
+    assert(child.pages.at(libc>>12)->hostData()[0]==0x90);
+    return 0;
+}
