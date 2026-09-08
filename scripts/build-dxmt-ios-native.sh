@@ -316,6 +316,11 @@ miss here means the iOS branch was not taken. Do not package an archive that
 does not export this table."
 fi
 
+for symbol in dxmt_winemetal_unix_call_wow64_funcs mythic_get_present_count mythic_set_vsync_locked; do
+    grep -Eq " [DST] _${symbol}$" "${SYMBOLS}" \
+        || die "dxmt: native runtime is missing required app export ${symbol}"
+done
+
 # ... and that the archive actually carries that object. Written to a file for
 # the same reason.
 MEMBERS="${OUTPUT_DIR}/members.txt"

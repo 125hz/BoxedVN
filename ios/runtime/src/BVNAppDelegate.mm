@@ -939,9 +939,8 @@ static int BVNGuestFrameRateLimitForMode(int mode) {
 // DXMT's native present path (winemetal) paces itself: 1 presents with a
 // minimum duration of 1/60 s (its default, which is what held the cube at
 // 60 whatever the app asked for), 0 presents every frame and free-runs to
-// the panel, 2 is a mailbox: the guest runs unthrottled, a drawable is
-// acquired at most every 18 ms, other frames are dropped, and its present
-// counter counts every guest present so the readout shows the guest rate.
+// the panel. Mode 2 removes the host's 60 Hz lock as well; the renderer
+// submits every acquired drawable and reports real presentation submissions.
 extern "C" void mythic_set_vsync_locked(int mode) __attribute__((weak));
 
 static void BVNApplyDXMTPresentMode(int mode) {

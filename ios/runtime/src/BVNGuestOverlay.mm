@@ -3339,8 +3339,7 @@ extern "C" void BVNGuestOverlayApplyPendingState(void) {
 extern "C" uint64_t mythic_get_present_count(void) __attribute__((weak));
 
 extern "C" uint64_t BVNGuestPresentedFrameCount(void) {
-    // DXMT's counter counts every guest present, including frames its
-    // mailbox mode drops; that is the rate the readout should show.
+    // DXMT counts actual presentation submissions for either guest bitness.
     if (mythic_get_present_count != nullptr) {
         const uint64_t guestPresents = mythic_get_present_count();
         if (guestPresents != 0) {
