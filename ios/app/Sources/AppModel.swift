@@ -637,7 +637,7 @@ final class AppModel: ObservableObject {
 
         static let dxmtModules = ["d3d11.dll", "dxgi.dll", "d3d10core.dll",
                                   "winemetal.dll"]
-        static let environment = [
+        static var environment: [String] { [
             // winedevice and the mount manager trace why the 64-bit
             // desktop's drive links never appear; both are quiet at boot.
             //
@@ -659,7 +659,10 @@ final class AppModel: ObservableObject {
             // exec in the chain, so the next capture says whether the value
             // below reached the process that was supposed to honour it.
             "WINEDEBUG=warn+module,warn+seh,warn+gdiplus,warn+wincodecs,warn+winedevice,warn+mountmgr,warn+winstation,+msgbox",
-            "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
+            Preferences.d3d9Metal
+                ? "WINEDLLOVERRIDES=d3d9,d3d11,dxgi,d3d10core,winemetal=n,b"
+                : "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
+            "BOXEDVN_D3D9_METAL=\(Preferences.d3d9Metal ? "1" : "0")",
             // DXMT's own logging. It is not wined3d, so no WINEDEBUG channel
             // reaches it: `+d3d11` and `+dxgi` name Wine's implementations,
             // which these overrides replace. DXMT reads DXMT_LOG_LEVEL
@@ -671,7 +674,7 @@ final class AppModel: ObservableObject {
             // projection. The capture already carries the guest's stderr as
             // `[guest fd=2 pid=...]`, so the file has no reader anyway.
             "DXMT_LOG_PATH=none",
-        ]
+        ] }
 
         /// The environment for a launch that will enter 32-bit code.
         ///
@@ -684,8 +687,9 @@ final class AppModel: ObservableObject {
         /// emulator reads it in `source/sdl/startupArgs.cpp` and does nothing
         /// unless the value is exactly "dxvk", so a 64-bit launch and a build
         /// whose layer carries no DXVK are both unaffected.
-        static let wow64Environment =
+        static var wow64Environment: [String] {
             environment + ["BOXEDVN_WOW64_D3D9=dxvk"]
+        }
 
         /// The WINEDEBUG channels Settings' "Verbose Wine trace" adds, and
         /// the variable that tells the emulator to write the relay filter
@@ -795,6 +799,22 @@ final class AppModel: ObservableObject {
                 }
                 try FileManager.default.copyItem(at: source, to: target)
             }
+            // Stage both architectures from the same native runtime revision.
+            // The projection below selects D3D9 only; PE32 D3D11 keeps DXVK.
+            let metal32 = runtime.diagnostics.appendingPathComponent("dxmt-x86", isDirectory: true)
+            if FileManager.default.fileExists(atPath: metal32.path) {
+                try FileManager.default.removeItem(at: metal32)
+            }
+            try FileManager.default.copyItem(
+                at: runtime.dxmt.deletingLastPathComponent().appendingPathComponent("dxmt-x86"), to: metal32)
+            let d3d9 = runtime.diagnostics.appendingPathComponent("d3d9.dll")
+            if FileManager.default.fileExists(atPath: d3d9.path) {
+                try FileManager.default.removeItem(at: d3d9)
+            }
+            if Preferences.d3d9Metal {
+                try FileManager.default.copyItem(at: runtime.dxmt.appendingPathComponent("d3d9.dll"), to: d3d9)
+            }
+            Log.write("Direct3D 9 renderer: \(Preferences.d3d9Metal ? "DXMT Metal" : "DXVK Vulkan")", category: "container")
         } catch {
             alertMessage = "The 64-bit runtime could not be staged: "
                          + error.localizedDescription

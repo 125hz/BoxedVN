@@ -253,14 +253,25 @@ def rewrite_source(name: str, text: str) -> str:
     if MACRO in text:
         raise RewriteError(f"{name}: already rewritten")
     rewritten, count = rewrite_ptr_reads(text)
-    expected = EXPECTED_PTR_READS.get(name)
+    d3d9 = "thunk_DXSOInitialize" in text
+    expected = 64 if d3d9 else EXPECTED_PTR_READS.get(name)
     if expected is not None and count != expected:
         raise RewriteError(
             f"{name}: rewrote {count} .ptr reads, expected {expected}; "
             "the pinned DXMT source changed, re-audit the dereference sites")
     rewritten = rewrite_raw_sites(rewritten, RAW_SITES.get(name, []))
     rewritten = rewrite_thunks(rewritten, THUNK_REWRITES.get(name, []))
-    rewritten = rewrite_options(rewritten, OPTION_REWRITES.get(name, []))
+    options = OPTION_REWRITES.get(name, [])
+    if d3d9:
+        # New heap allocation paths use the same options structure.
+        options = [(old, new, rewritten.count(old)) for old, new, _ in options]
+    rewritten = rewrite_options(rewritten, options)
+    if d3d9:
+        # Common Metal parameters use fixed-width fields in both PE ABIs.
+        # Shader thunks are the exception and WoW64 must export that table.
+        rewritten = rewritten.replace("#ifndef DXMT_NATIVE\n\nstatic NTSTATUS\nthunk32_SM50Initialize", "#if !defined(DXMT_NATIVE) || defined(DXMT_IOS)\n\nstatic NTSTATUS\nthunk32_SM50Initialize")
+        rewritten = rewritten.replace("#ifndef DXMT_NATIVE\nconst void *__wine_unix_call_wow64_funcs", "#if !defined(DXMT_NATIVE) || defined(DXMT_IOS)\nconst void *__wine_unix_call_wow64_funcs")
+        rewritten = re.sub(r"UInt32ToPtr\(([^()]+)\)", r"(void *)boxedwine_dxmt_host_pointer((uintptr_t)(\1))", rewritten)
     if name in MAIN_THREAD_HELPER_FILES:
         rewritten = rewrite_main_thread_helper(rewritten)
     return rewritten

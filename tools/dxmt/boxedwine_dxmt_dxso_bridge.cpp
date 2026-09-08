@@ -1,6 +1,6 @@
 /* BoxedWine DXSO host-call bridge. GPL-2.0-or-later.
- * Compiled against the separately pinned D3D9 compiler. Not registered with
- * the shipping D3D11 unix table until matching PE/Metal halves are ported. */
+ * Dispatches native and WoW64 D3D9 shader parameters to the native compiler.
+ * Guest pointers are translated; opaque compiler handles stay host values. */
 #include <cstring>
 #include <cstdint>
 #include <cstddef>

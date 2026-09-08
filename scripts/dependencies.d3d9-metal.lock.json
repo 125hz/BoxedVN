@@ -3,5 +3,5 @@
   "commit": "e8dd4c656dcb74a6d970a30a397d1558b0e3fb2b",
   "reference": "v0.4-d3d9",
   "strategy": "direct-d3d9-metal",
-  "runtime_enabled": false
+  "runtime_enabled": true
 }

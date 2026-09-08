@@ -13,7 +13,7 @@
 #define BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL 0x7fff0001ULL
 
 /* Number of entries in the pinned DXMT winemetal unix-call ABI. */
-#define BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT 127U
+#define BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT 151U
 
 /* NTSTATUS returned when the native table has a NULL entry. */
 #define BOXEDWINE_X64_HOSTCALL_STATUS_NOT_IMPLEMENTED 0xc0000002U

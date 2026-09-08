@@ -19,6 +19,7 @@ expected="$(sed -n 's/^#define BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT \([0-
 [[ -n "${expected}" ]] || die "could not read the host-call count from ${HEADER}"
 
 actual="$(awk '
+    { sub(/\r$/, "") }
     /^const void \*__wine_unix_call_funcs\[\] = \{/ { in_table=1; next }
     /^#ifndef DXMT_NATIVE/ { if (in_table) exit }
     in_table && $0 ~ /^[[:space:]]*(&|NULL)/ { count++ }
@@ -29,6 +30,7 @@ actual="$(awk '
     "host-call count ${expected} does not match native DXMT table ${actual}"
 
 table_entries="$(awk '
+    { sub(/\r$/, "") }
     /^const void \*__wine_unix_call_funcs\[\] = \{/ { in_table=1; next }
     /^#ifndef DXMT_NATIVE/ { if (in_table) exit }
     in_table && $0 ~ /^[[:space:]]*(&[[:alnum:]_]+|NULL),/ {
@@ -59,5 +61,10 @@ check_entry 67 _MetalLayer_nextDrawable
 check_entry 70 _MetalLayer_setProps
 check_entry 71 _MetalLayer_getProps
 check_entry 72 _CreateMetalViewFromHWND
+check_entry 144 _MTLDevice_newLibraryWithSource
+check_entry 145 thunk_DXSOInitialize
+check_entry 147 thunk_DXSOCompile
+check_entry 148 thunk_DXSOGetCompiledBitcode
+check_entry 150 _MTLTexture_usage
 
 printf 'DXMT unix-call ABI count: %s; display and present indices verified\n' "${actual}"

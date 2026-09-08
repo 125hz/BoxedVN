@@ -30,6 +30,9 @@ class GraphicsManifestTests(unittest.TestCase):
             "dxgi_sha256=" + "2" * 64,
             "d3d10core_sha256=" + "3" * 64,
             "winemetal_sha256=" + "4" * 64,
+            "d3d9_32_sha256=" + "7" * 64,
+            "d3d9_64_sha256=" + "8" * 64,
+            "winemetal_32_sha256=" + "9" * 64,
             "native_archive=libdxmt_combined.a",
             "native_archive_sha256=" + "5" * 64,
         ]
@@ -98,7 +101,7 @@ class PeSurfaceTests(unittest.TestCase):
                      "winemetal.dll": set()},
         )
         with mock.patch.object(MODULE, "PEImage", return_value=image):
-            with self.assertRaisesRegex(MODULE.ValidationError, "AMD64"):
+            with self.assertRaisesRegex(MODULE.ValidationError, "0x8664"):
                 MODULE.validate_pe(pathlib.Path("d3d11.dll"), requirements)
 
     def test_surface_rejects_wrong_export_ordinal(self) -> None:

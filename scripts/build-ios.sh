@@ -310,6 +310,8 @@ if [[ -n "${X64_GRAPHICS_RUNTIME_INPUT}" ]]; then
     rm -rf "${WINE64_BUNDLE_DIR}/dxmt-x64"
     cp -R "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x64" \
           "${WINE64_BUNDLE_DIR}/dxmt-x64"
+    rm -rf "${WINE64_BUNDLE_DIR}/dxmt-x86"
+    cp -R "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x86" "${WINE64_BUNDLE_DIR}/dxmt-x86"
     cp "${X64_GRAPHICS_RUNTIME_INPUT}/x64-graphics.manifest" \
        "${WINE64_BUNDLE_DIR}/x64-graphics.manifest"
     log "Staged validated x86-64 graphics probe and DXMT PE resources"

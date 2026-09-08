@@ -59,6 +59,7 @@ FEX64_DIR="${BOXEDVN_THIRD_PARTY}/fex64"
 # of it is reachable from an iOS build.
 #
 # Matched as an extended regular expression against the submodule path.
+SUBMODULE_EXCLUDE_dxmt='^external/(wine|nvapi)$'
 SUBMODULE_EXCLUDE_fex='^External/(fex-.*-bins|fex-.*-tests.*)$'
 
 # Submodule commits the recorded one cannot be fetched for, as "<path>=<commit>".

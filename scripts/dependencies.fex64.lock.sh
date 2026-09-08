@@ -55,9 +55,9 @@ BOXEDVN_WINE_COMMIT="78497aaf2735ae2dbd6b285cdf2b562f333fc8a9"
 # D3D11/D3D10 -> Metal. The fork replaces Cocoa with UIKit, stubs the macOS
 # display APIs that do not exist on iOS, and renames its unix-call table so it
 # does not collide with ntdll's when everything is linked into one binary.
-BOXEDVN_DXMT_REPOSITORY="https://github.com/willfaust/dxmt.git"
-BOXEDVN_DXMT_BRANCH="ios-port"
-BOXEDVN_DXMT_COMMIT="d6bd546dc685189f4434f87fd15ea7b21009e64f"
+BOXEDVN_DXMT_REPOSITORY="https://github.com/dacevedo12/dxmt.git"
+BOXEDVN_DXMT_BRANCH="v0.4-d3d9"
+BOXEDVN_DXMT_COMMIT="e8dd4c656dcb74a6d970a30a397d1558b0e3fb2b"
 
 # --- llvm-mingw -------------------------------------------------------------
 # Builds DXMT's PE side (d3d11.dll, dxgi.dll, winemetal.dll, d3d10core.dll)

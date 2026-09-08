@@ -257,6 +257,7 @@ jobs:
           key: boxedvn-dxmt-toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}-${{ github.run_id }}
           restore-keys: |
             boxedvn-dxmt-toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-toolchains.sh') }}-
+            boxedvn-dxmt-toolchains-${{ runner.os }}-${{ runner.arch }}-
             fex64-toolchains-${{ runner.os }}-
 
       - name: Restore pinned LLVM source cache
@@ -310,29 +311,9 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Build D3D9 Metal shader compiler port
-        shell: bash
-        run: |
-          python3 scripts/prepare-d3d9-metal-port.py --fetch \
-            --source build/d3d9-metal-source --ios-source third_party/fex64/dxmt \
-            --report build/dxso-ios/abi-report.json
-          python3 scripts/test_dxso_guest_bridge.py --source build/d3d9-metal-source
-          bash scripts/build-dxso-ios-compiler.sh build/d3d9-metal-source
+      - name: Validate D3D9 guest shader bridge
+        run: python3 scripts/test_dxso_guest_bridge.py --source third_party/fex64/dxmt
 
-      - name: Upload D3D9 compiler port
-        uses: actions/upload-artifact@v7
-        with:
-          name: d3d9-metal-compiler-port
-          path: |
-            build/dxso-ios/libdxso_compiler.a
-            build/dxso-ios/manifest.txt
-            build/dxso-ios/abi-report.json
-            build/dxso-ios/symbols.txt
-          retention-days: 14
-
-      # LLVM is the long pole in the first DXMT build. Save its partial Ninja
-      # tree even when a later compiler or staging step fails so the next
-      # manually dispatched run resumes instead of discarding completed work.
       - name: Save DXMT cross-toolchain cache
         if: always()
         continue-on-error: true
@@ -545,7 +526,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: third_party
-          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/fetch-dependencies.sh', 'scripts/sdl-patches/**', 'scripts/test-sdl-uikit-pump.py', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex-softfloat-namespace.py', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/build-boxedwine-x64-x11.sh', 'scripts/validate-x64-x11-shim.py', 'tools/x11-64/**', 'include/boxedwine_x64_x11_bridge.h', 'scripts/build-boxedwine-x64-vulkan.sh', 'scripts/validate-x64-vulkan-shim.py', 'tools/vulkan-64/**', 'include/boxedwine_x64_vulkan_bridge.h', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/dxmt-patches/**', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/rewrite-dxmt-guest-pointers.py', 'include/boxedwine_dxmt_guest_pointer.h', 'tools/dxmt/**', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/guest-probes/x64-d3d11-cube-shaders.h', 'scripts/guest-probes/x64-d3d11-cube.hlsl', 'scripts/wine64-runtime-manifest.example') }}
+          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/fetch-dependencies.sh', 'scripts/sdl-patches/**', 'scripts/test-sdl-uikit-pump.py', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex-softfloat-namespace.py', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/build-boxedwine-x64-x11.sh', 'scripts/validate-x64-x11-shim.py', 'tools/x11-64/**', 'include/boxedwine_x64_x11_bridge.h', 'scripts/build-boxedwine-x64-vulkan.sh', 'scripts/validate-x64-vulkan-shim.py', 'tools/vulkan-64/**', 'include/boxedwine_x64_vulkan_bridge.h', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/dxmt-patches/**', 'scripts/d3d9-metal-patches/**', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/rewrite-dxmt-guest-pointers.py', 'include/boxedwine_dxmt_guest_pointer.h', 'tools/dxmt/**', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/guest-probes/x64-d3d11-cube-shaders.h', 'scripts/guest-probes/x64-d3d11-cube.hlsl', 'scripts/wine64-runtime-manifest.example') }}
 
       - name: Fetch pinned dependencies
         shell: bash
@@ -646,7 +627,10 @@ jobs:
             boxedwine64-runtime/dxmt-x64/d3d11.dll \
             boxedwine64-runtime/dxmt-x64/dxgi.dll \
             boxedwine64-runtime/dxmt-x64/d3d10core.dll \
-            boxedwine64-runtime/dxmt-x64/winemetal.dll; do
+            boxedwine64-runtime/dxmt-x64/winemetal.dll \
+            boxedwine64-runtime/dxmt-x64/d3d9.dll \
+            boxedwine64-runtime/dxmt-x86/d3d9.dll \
+            boxedwine64-runtime/dxmt-x86/winemetal.dll; do
             if [[ ! -f "${app}/${relative}" ]]; then
               echo "::error::Missing app resource: ${relative}"
               missing=1

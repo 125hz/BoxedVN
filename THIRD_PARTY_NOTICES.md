@@ -193,8 +193,12 @@ the demo's constant buffer is `D3D11_USAGE_DYNAMIC` and is written through
 address from `Map`, which an emulated 64-bit guest cannot write; the values
 uploaded each frame are identical.
 
-The DXMT Direct3D 11 / DXGI PE modules and the native Metal backend staged
-beside the probe come from the same MIT-licensed project and are built from
+The Direct3D 9 / 11 / DXGI PE modules and native Metal backend use
+[dacevedo12/dxmt v0.4-d3d9](https://github.com/dacevedo12/dxmt/tree/e8dd4c656dcb74a6d970a30a397d1558b0e3fb2b),
+licensed LGPL-2.1-or-later (including DXVK-derived components with their
+original notices). The iOS adaptations are published in
+`scripts/d3d9-metal-patches`. Both guest architectures and the native half
+are built from
 source by `scripts/build-dxmt-x64-pe.sh` and
 `scripts/build-dxmt-ios-native.sh`.
 

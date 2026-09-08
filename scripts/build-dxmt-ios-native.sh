@@ -68,7 +68,8 @@ STAMP="${OUTPUT_DIR}/.stamp"
 # The cache check comes before the input checks deliberately. A restored
 # archive needs neither the DXMT source nor LLVM, and LLVM is the longest build
 # in the project - demanding it here would make a cache hit cost an hour.
-if [[ "${FORCE}" -eq 0 && -f "${STAMP}" && -f "${COMBINED_LIB}" ]]; then
+INPUT_KEY="$(cat "${BOXEDVN_ROOT}"/scripts/d3d9-metal-patches/*.patch "${BASH_SOURCE[0]}" "${BOXEDVN_ROOT}/scripts/rewrite-dxmt-guest-pointers.py" "${BOXEDVN_ROOT}"/tools/dxmt/* "${BOXEDVN_ROOT}/scripts/dependencies.fex64.lock.sh" | shasum -a 256 | awk '{print $1}')"
+if [[ "${FORCE}" -eq 0 && -f "${STAMP}" && -f "${COMBINED_LIB}" && "$(cat "${STAMP}")" == "${INPUT_KEY}" ]]; then
     ok "dxmt: cached ($(wc -c < "${COMBINED_LIB}" | tr -d ' ') bytes)"
     exit 0
 fi
@@ -99,7 +100,7 @@ require_file "${LLVM_SRC}/include/llvm-c/Core.h" \
 apply_dxmt_patches() {
     local tree="$1" patch name
     require_command git
-    for patch in "${BOXEDVN_ROOT}"/scripts/dxmt-patches/*.patch; do
+    for patch in "${BOXEDVN_ROOT}"/scripts/d3d9-metal-patches/*.patch; do
         [[ -f "${patch}" ]] || die "No DXMT patches found in scripts/dxmt-patches."
         name="$(basename "${patch}")"
         if git -C "${tree}" apply --reverse --check "${patch}" 2>/dev/null; then
@@ -251,7 +252,9 @@ compile_one objc "${DXMT_SRC}/winemetal/unix/cache.boxedwine.c" cache
 # C; it includes airconv_public.h for the node layouts).
 compile_one objc "${BOXEDVN_ROOT}/tools/dxmt/boxedwine_dxmt_sm50_arguments.c" boxedwine_dxmt_sm50_arguments
 
-for cpp in airconv_context air_type air_signature air_operations \
+compile_one cxx "${BOXEDVN_ROOT}/tools/dxmt/boxedwine_dxmt_dxso_bridge.cpp" boxedwine_dxmt_dxso_bridge
+
+for cpp in dxso_compile ffp_compile dxbc_binding_sm50 dxbc_binding_rootsig airconv_context air_type air_signature air_operations \
            dxbc_converter dxbc_converter_gs dxbc_converter_ts \
            dxbc_converter_basicblock dxbc_converter_cfg \
            dxbc_instructions dxbc_signature metallib_writer; do
@@ -261,6 +264,8 @@ done
 compile_one cxx "${DXMT_SRC}/airconv/nt/air_builder.cpp" air_builder
 compile_one cxx "${DXMT_SRC}/airconv/nt/dxbc_converter_base.cpp" dxbc_converter_base
 compile_one cxx "${DXMT_SRC}/airconv/transforms/lower_16bit_texread.cpp" lower_16bit_texread
+
+compile_one cxx "${DXMT_SRC}/airconv/transforms/simdgroup_implicit_membarrier.cpp" simdgroup_implicit_membarrier
 
 for cpp in BlobContainer DXBCUtils ShaderBinary; do
     compile_one cxx-exceptions "${DXMT_ROOT}/libs/DXBCParser/${cpp}.cpp" "dxbc_${cpp}"
@@ -323,5 +328,5 @@ it defines cannot reach the link."
 fi
 ok "dxmt: unix-call table present"
 
-date -u +%Y-%m-%dT%H:%M:%SZ > "${STAMP}"
+printf '%s\n' "${INPUT_KEY}" > "${STAMP}"
 ok "dxmt: ${COMBINED_LIB} ($(wc -c < "${COMBINED_LIB}" | tr -d ' ') bytes)"

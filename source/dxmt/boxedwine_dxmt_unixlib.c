@@ -56,7 +56,10 @@ static inline boxedwine_ntstatus boxedwine_dxmt_call(unsigned int code,
     X(96)  X(97)  X(98)  X(99)  X(100) X(101) X(102) X(103) \
     X(104) X(105) X(106) X(107) X(108) X(109) X(110) X(111) \
     X(112) X(113) X(114) X(115) X(116) X(117) X(118) X(119) \
-    X(120) X(121) X(122) X(123) X(124) X(125) X(126)
+    X(120) X(121) X(122) X(123) X(124) X(125) X(126) \
+    X(127) X(128) X(129) X(130) X(131) X(132) X(133) X(134) \
+    X(135) X(136) X(137) X(138) X(139) X(140) X(141) X(142) \
+    X(143) X(144) X(145) X(146) X(147) X(148) X(149) X(150)
 
 #define BOXEDWINE_DXMT_DECLARE(index) \
     static boxedwine_ntstatus boxedwine_dxmt_unix_call_##index(void *args) \
@@ -74,4 +77,19 @@ const boxedwine_unix_entry __wine_unix_call_funcs[
 };
 
 #undef BOXEDWINE_DXMT_ENTRY
+
+/* WoW64 enters the same ELF64 library, but shader parameter blocks retain
+ * their PE32 layout. Mark the call explicitly; CS is already 64-bit here. */
+#define BOXEDWINE_DXMT_DECLARE32(index) \
+    static boxedwine_ntstatus boxedwine_dxmt_wow64_##index(void *args) \
+    { return boxedwine_dxmt_call((index) | 0x80000000U, args); }
+BOXEDWINE_DXMT_CALLS(BOXEDWINE_DXMT_DECLARE32)
+#define BOXEDWINE_DXMT_ENTRY32(index) boxedwine_dxmt_wow64_##index,
+__attribute__((visibility("default"), used))
+const boxedwine_unix_entry __wine_unix_call_wow64_funcs[
+    BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT] = {
+    BOXEDWINE_DXMT_CALLS(BOXEDWINE_DXMT_ENTRY32)
+};
+#undef BOXEDWINE_DXMT_ENTRY32
+#undef BOXEDWINE_DXMT_DECLARE32
 #undef BOXEDWINE_DXMT_CALLS

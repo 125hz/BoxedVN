@@ -62,15 +62,15 @@ class PEImage:
         )
         optional = coff + 20
         (self.magic,) = unpack_from("<H", self.data, optional, f"{path} optional header")
-        if self.magic != 0x20B:
+        if self.magic not in (0x20B, 0x10B):
             fail(f"{path}: expected PE32+ optional header, got 0x{self.magic:04x}")
         (self.size_of_headers,) = unpack_from(
             "<I", self.data, optional + 60, f"{path} optional header"
         )
         (directory_count,) = unpack_from(
-            "<I", self.data, optional + 108, f"{path} optional header"
+            "<I", self.data, optional + (108 if self.magic == 0x20B else 92), f"{path} optional header"
         )
-        directory_offset = optional + 112
+        directory_offset = optional + (112 if self.magic == 0x20B else 96)
         if directory_count > 16:
             directory_count = 16
         if directory_offset + directory_count * 8 > optional + optional_size:
@@ -152,14 +152,15 @@ class PEImage:
             name = c_string(self.data, self.rva_to_offset(name_rva),
                             f"{self.path} import").lower()
             thunk_rva = entry[0] or entry[4]
-            thunk_off = self.rva_to_offset(thunk_rva, 8)
+            thunk_size = 8 if self.magic == 0x20B else 4
+            thunk_off = self.rva_to_offset(thunk_rva, thunk_size)
             symbols: set[str | int] = set()
             for thunk_index in range(1_000_000):
-                (thunk,) = unpack_from("<Q", self.data, thunk_off + thunk_index * 8,
+                (thunk,) = unpack_from("<Q" if thunk_size == 8 else "<I", self.data, thunk_off + thunk_index * thunk_size,
                                        f"{self.path} import thunk")
                 if thunk == 0:
                     break
-                if thunk & (1 << 63):
+                if thunk & (1 << (thunk_size * 8 - 1)):
                     symbols.add(thunk & 0xFFFF)
                 else:
                     symbol_off = self.rva_to_offset(thunk, 3)
@@ -312,6 +313,11 @@ PE_REQUIREMENTS: dict[str, dict[str, object]] = {
     },
 }
 
+# winemetal exports by name; additional APIs may change automatic ordinals.
+PE_REQUIREMENTS["winemetal.dll"]["exports"] = {
+    name: None for name in PE_REQUIREMENTS["winemetal.dll"]["exports"]
+}
+
 PROBE_REQUIREMENTS: dict[str, object] = {
     "exports": {},
     "imports": {"d3d11.dll"},
@@ -325,6 +331,9 @@ GRAPHICS_GUEST_FILES = {
     "dxgi_sha256": "dxmt-x64/dxgi.dll",
     "d3d10core_sha256": "dxmt-x64/d3d10core.dll",
     "winemetal_sha256": "dxmt-x64/winemetal.dll",
+    "d3d9_64_sha256": "dxmt-x64/d3d9.dll",
+    "d3d9_32_sha256": "dxmt-x86/d3d9.dll",
+    "winemetal_32_sha256": "dxmt-x86/winemetal.dll",
 }
 GRAPHICS_MANIFEST_KEYS = {
     "format",
@@ -403,14 +412,21 @@ def validate_graphics_bundle(root: pathlib.Path,
         fail(f"{manifest_path}: malformed native archive SHA-256")
 
     validate_pe_surface(root / "dxmt-x64", paths["probe_sha256"])
+    d3d9_requirements = {"exports": {"Direct3DCreate9": None, "Direct3DCreate9Ex": None},
+                          "imports": {"winemetal.dll"}}
+    validate_pe(root / "dxmt-x64/d3d9.dll", d3d9_requirements)
+    validate_pe(root / "dxmt-x86/d3d9.dll", d3d9_requirements, machine=0x14c)
+    validate_pe(root / "dxmt-x86/winemetal.dll", {
+        "exports": {"DXSOInitialize": None, "DXSOCompile": None, "DXSOGetCompiledBitcode": None},
+        "imports": set()}, machine=0x14c)
     mode = "build artifact" if require_native_archive else "packaged guest assets"
     print(f"x64 graphics manifest ok: {mode}, all checksums and ABIs match")
 
 
-def validate_pe(path: pathlib.Path, requirements: dict[str, object] | None = None) -> None:
+def validate_pe(path: pathlib.Path, requirements: dict[str, object] | None = None, machine: int = 0x8664) -> None:
     image = PEImage(path)
-    if image.machine != 0x8664:
-        fail(f"{path}: expected AMD64 machine 0x8664, got 0x{image.machine:04x}")
+    if image.machine != machine:
+        fail(f"{path}: expected machine 0x{machine:04x}, got 0x{image.machine:04x}")
     exports = image.exports()
     imported_symbols = image.import_symbols()
     imports = set(imported_symbols)
@@ -435,7 +451,7 @@ def validate_pe(path: pathlib.Path, requirements: dict[str, object] | None = Non
                 fail(f"{path}: missing imports from {module}: "
                      f"{', '.join(sorted(missing_names))}")
     print(
-        f"PE ABI ok: {path.name} machine=AMD64 exports={len(exports)} "
+        f"PE ABI ok: {path.name} machine=0x{image.machine:04x} exports={len(exports)} "
         f"imports={','.join(sorted(imports)) or '(none)'}"
     )
 
@@ -494,6 +510,9 @@ def validate_unixlib(path: pathlib.Path, repo_root: pathlib.Path) -> None:
         fail(f"{path}: __wine_unix_call_funcs is undefined")
     if size != expected_size:
         fail(f"{path}: unix-call table size {size}, expected {expected_size}")
+    wow64_table = symbols.get("__wine_unix_call_wow64_funcs")
+    if wow64_table is None or wow64_table[0] == 0 or wow64_table[1] != expected_size:
+        fail(f"{path}: missing or mismatched WoW64 unix-call table")
     if info >> 4 not in (1, 2):
         fail(f"{path}: unix-call table is not a global/weak dynamic symbol")
     undefined = sorted(

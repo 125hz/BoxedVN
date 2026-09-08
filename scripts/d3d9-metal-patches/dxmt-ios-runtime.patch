@@ -1,0 +1,360 @@
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1,13 +1,36 @@
+ #include <stdatomic.h>
++#include <stdlib.h>
+ #include <dlfcn.h>
++#include <TargetConditionals.h>
++#if TARGET_OS_IOS
++#import <UIKit/UIKit.h>
++/* iOS lacks CGDirectDisplay: provide minimal stubs for single-display use. */
++typedef uint32_t CGDirectDisplayID;
++#define kCGNullDirectDisplay ((CGDirectDisplayID)0)
++static inline CGDirectDisplayID CGMainDisplayID(void) { return 1; }
++#else
+ #import <Cocoa/Cocoa.h>
++#endif
++#if !TARGET_OS_IOS
+ #import <ColorSync/ColorSync.h>
++#endif
+ #import <CoreFoundation/CFRunLoop.h>
+ #import <Metal/Metal.h>
+ #import <MetalFX/MetalFX.h>
+ #import <QuartzCore/QuartzCore.h>
++#if TARGET_OS_IOS
++#include <objc/message.h>
++#include <objc/runtime.h>
++#else
+ #include "objc/objc-runtime.h"
++#endif
++#if TARGET_OS_IOS
++/* iOS SDK omits bootstrap.h but the functions exist in libsystem. */
++typedef char name_t[128];
++extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
++#else
+ #include <bootstrap.h>
++#endif
+ #include <mach/mach_port.h>
+ #define WINEMETAL_API
+ #include "../winemetal_thunks.h"
+@@ -160,12 +183,13 @@
+   id<MTLBuffer> buffer;
+   if (info->memory.ptr) {
+     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
+-                                       length:info->length
++                                       length:((info->length + 16383) & ~16383ULL)
+                                       options:(enum MTLResourceOptions)info->options
+                                   deallocator:NULL];
+   } else {
+     buffer = [device newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
+-    info->memory.ptr = [buffer storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
++    /* Native heap pointers are not guest addresses. CPU-visible resources use caller-placed backing. */
++    info->memory.ptr = NULL;
+   }
+   params->ret = (obj_handle_t)buffer;
+   info->gpu_address = [buffer gpuAddress];
+@@ -1313,7 +1337,11 @@
+ static NTSTATUS
+ _MTLBuffer_didModifyRange(void *obj) {
+   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
++#if !TARGET_OS_IOS
+   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
++#else
++  (void)params; /* iOS unified memory — no range invalidation needed. */
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -1615,7 +1643,9 @@
+     layer.opaque = props->opaque;
+     layer.framebufferOnly = props->framebuffer_only;
+     layer.contentsScale = props->contents_scale;
++#if !TARGET_OS_IOS
+     layer.displaySyncEnabled = props->display_sync_enabled;
++#endif
+     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
+     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+   });
+@@ -1631,7 +1661,11 @@
+   props->opaque = layer.opaque;
+   props->framebuffer_only = layer.framebufferOnly;
+   props->contents_scale = layer.contentsScale;
++#if TARGET_OS_IOS
++  props->display_sync_enabled = true; /* iOS always syncs to display refresh. */
++#else
+   props->display_sync_enabled = layer.displaySyncEnabled;
++#endif
+   props->drawable_height = layer.drawableSize.height;
+   props->drawable_width = layer.drawableSize.width;
+   props->pixel_format = layer.pixelFormat;
+@@ -1840,7 +1874,13 @@
+ static NTSTATUS
+ _MTLDevice_setShouldMaximizeConcurrentCompilation(void *args) {
+   struct unixcall_generic_obj_uint64_noret *params = args;
++#if !TARGET_OS_IOS
+   [(id<MTLDevice>)params->handle setShouldMaximizeConcurrentCompilation:(BOOL)params->arg];
++#else
++  /* setShouldMaximizeConcurrentCompilation: is macOS-only — iOS MTLDevice
++   * raises an ObjC exception if we call it. Skip. */
++  (void)params;
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -2276,6 +2316,7 @@
+   struct unixcall_generic_obj_ret *params = obj;
+   params->ret = kCGNullDirectDisplay;
+ 
++#if !TARGET_OS_IOS
+   uint32_t count = 0;
+   CGGetOnlineDisplayList(0, NULL, &count);
+ 
+@@ -2295,10 +2336,12 @@
+     params->ret = id;
+     break;
+   }
+-
+-  return STATUS_SUCCESS;
+-}
+-
++#endif
++
++  return STATUS_SUCCESS;
++}
++
++#if !TARGET_OS_IOS
+ typedef struct icc_XYZ_t {
+   uint32_t sig;      // 0x205a5958
+   uint32_t reserved; // 0
+@@ -2340,7 +2383,9 @@
+              profile, kColorSyncSigBlueColorantTag, &desc_out->blue_primaries[0], &desc_out->blue_primaries[1]
+          );
+ }
+-
++#endif /* !TARGET_OS_IOS — end of ColorSync/NSScreen block */
++
++#if !TARGET_OS_IOS
+ NSScreen *
+ GetNSScreenForDisplayID(CGDirectDisplayID display_id) {
+   for (NSScreen *screen in [NSScreen screens]) {
+@@ -2351,12 +2396,19 @@
+   }
+   return nil;
+ }
++#endif
+ 
+ static NTSTATUS
+ _WMTGetDisplayDescription(void *obj) {
+   struct unixcall_generic_obj_ptr_noret *params = obj;
++  struct WMTDisplayDescription *desc_out = params->arg.ptr;
++#if TARGET_OS_IOS
++  (void)params;
++  desc_out->maximum_edr_color_component_value = 1.0;
++  desc_out->maximum_reference_edr_color_component_value = 0.0;
++  desc_out->maximum_potential_edr_color_component_value = 1.0;
++#else
+   CGDirectDisplayID display_id = params->handle;
+-  struct WMTDisplayDescription *desc_out = params->arg.ptr;
+   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
+   if (!profile || !GetDisplayColorGamut(profile, desc_out))
+     GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
+@@ -2372,6 +2424,7 @@
+     desc_out->maximum_reference_edr_color_component_value = 0.0;
+     desc_out->maximum_potential_edr_color_component_value = 1.0;
+   }
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -2391,6 +2444,7 @@
+   value->maximum_edr_color_component_value = 1.0;
+   value->maximum_potential_edr_color_component_value = 1.0;
+ 
++#if !TARGET_OS_IOS
+   if (![layer.delegate isKindOfClass:NSView.class])
+     return STATUS_SUCCESS;
+ 
+@@ -2406,6 +2460,7 @@
+   value->maximum_edr_color_component_value =
+       layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+   value->maximum_potential_edr_color_component_value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
++#endif
+ 
+   return STATUS_SUCCESS;
+ }
+@@ -2466,6 +2521,10 @@
+   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
+ 
+   params->version = 0;
++#if TARGET_OS_IOS
++  (void)layer;
++  return STATUS_SUCCESS;
++#else
+   if (![layer.delegate isKindOfClass:NSView.class])
+     return STATUS_SUCCESS;
+ 
+@@ -2489,6 +2548,7 @@
+       screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+ 
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -2622,8 +2682,10 @@
+ _MTLBuffer_updateContents(void *obj) {
+   struct unixcall_mtlbuffer_updatecontents *params = obj;
+   memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
++#if !TARGET_OS_IOS
+   if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
+     [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -3034,7 +3096,7 @@
+   else
+     buffer =
+         [heap newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options offset:params->offset];
+-  info->memory.ptr = [heap storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
++  info->memory.ptr = NULL;
+ 
+   params->ret = (obj_handle_t)buffer;
+   info->gpu_address = [buffer gpuAddress];
+@@ -3436,6 +3498,9 @@
+ 
+   return STATUS_SUCCESS;
+ }
++
++#define __wine_unix_call_funcs dxmt_winemetal_unix_call_funcs
++#define __wine_unix_call_wow64_funcs dxmt_winemetal_unix_call_wow64_funcs
+ 
+ const void *__wine_unix_call_funcs[] = {
+     &_NSObject_retain,
+diff --git a/src/util/wsi_platform_win32.cpp b/src/util/wsi_platform_win32.cpp
+--- a/src/util/wsi_platform_win32.cpp
++++ b/src/util/wsi_platform_win32.cpp
+@@ -4,6 +4,12 @@
+ namespace dxmt::wsi {
+ 
+ void *aligned_malloc(size_t size, size_t alignment) {
++#ifdef DXMT_IOS
++  // Guest and host pages have different sizes. Own every host page Metal wires.
++  alignment = alignment < 16384 ? 16384 : alignment;
++  if (size > SIZE_MAX - (alignment - 1)) return nullptr;
++  size = (size + alignment - 1) & ~(alignment - 1);
++#endif
+   return _aligned_malloc(size, alignment);
+ }
+ 
+diff --git a/src/dxmt/dxmt_buffer.cpp b/src/dxmt/dxmt_buffer.cpp
+--- a/src/dxmt/dxmt_buffer.cpp
++++ b/src/dxmt/dxmt_buffer.cpp
+@@ -42,6 +42,10 @@
+     info_.length = DXMT_PAGE_SIZE;
+   }
+   fenceTrackers.resize(suballocation_count_);
++#ifdef DXMT_IOS
++  if (!flags_.test(BufferAllocationFlag::CpuInvisible))
++    flags_.set(BufferAllocationFlag::CpuPlaced);
++#endif
+   if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
+     placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
+     info_.memory.set(placed_buffer);
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -253,7 +253,7 @@
+     buffer_info.length = bytes_per_image_;
+     buffer_info.options = options;
+     buffer_info.memory.set(nullptr);
+-#ifdef __i386__
++#if defined(__i386__) || defined(DXMT_IOS)
+     buffer_info.memory.set(wsi::aligned_malloc(bytes_per_image_, DXMT_PAGE_SIZE));
+ #endif
+     auto buffer = device_.newBuffer(buffer_info);
+diff --git a/src/dxmt/dxmt_occlusion_query.hpp b/src/dxmt/dxmt_occlusion_query.hpp
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -196,7 +196,7 @@
+       queries(queries) {
+         visibility_result_heap_info.options = WMTResourceHazardTrackingModeUntracked;
+         visibility_result_heap_info.memory.set(nullptr);
+-#ifdef __i386__
++#if defined(__i386__) || defined(DXMT_IOS)
+         visibility_result_heap_info.memory.set(wsi::aligned_malloc(num_results * sizeof(uint64_t), DXMT_PAGE_SIZE));
+ #endif
+         visibility_result_heap_info.length = num_results * sizeof(uint64_t);
+@@ -206,7 +206,7 @@
+     for (auto query : queries) {
+       query->issue(seq_id, (uint64_t *)visibility_result_heap_info.memory.get(), num_results);
+     }
+-#ifdef __i386__
++#if defined(__i386__) || defined(DXMT_IOS)
+     wsi::aligned_free(visibility_result_heap_info.memory.get());
+ #endif
+   }
+diff --git a/src/dxmt/dxmt_ring_bump_allocator.hpp b/src/dxmt/dxmt_ring_bump_allocator.hpp
+--- a/src/dxmt/dxmt_ring_bump_allocator.hpp
++++ b/src/dxmt/dxmt_ring_bump_allocator.hpp
+@@ -16,7 +16,7 @@
+ // memory heavy title can approach, and each block costs host RAM plus a Metal
+ // address space registration plus a pre-fault, so there the ring holds more
+ // and smaller blocks instead.
+-#ifdef __i386__
++#if defined(__i386__) || defined(DXMT_IOS)
+ constexpr size_t kStagingBlockSize = 0x800000; // 8MB
+ #else
+ constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
+diff --git a/src/dxmt/dxmt_staging.cpp b/src/dxmt/dxmt_staging.cpp
+--- a/src/dxmt/dxmt_staging.cpp
++++ b/src/dxmt/dxmt_staging.cpp
+@@ -77,7 +77,7 @@
+   }
+   if (ret == ~0ull) {
+     Flags<BufferAllocationFlag> flags;
+-#ifdef __i386__
++#if defined(__i386__) || defined(DXMT_IOS)
+     flags.set(BufferAllocationFlag::CpuPlaced);
+ #endif
+     buffer_pool.push_back(buffer_->allocate(flags));
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -112,7 +112,11 @@
+   WMTResourceCPUCacheModeDefaultCache = 0,
+   WMTResourceCPUCacheModeWriteCombined = 1,
+   WMTResourceStorageModeShared = 0,
++#ifdef DXMT_IOS
++  WMTResourceStorageModeManaged = 0,
++#else
+   WMTResourceStorageModeManaged = 16,
++#endif
+   WMTResourceStorageModePrivate = 32,
+   WMTResourceStorageModeMemoryless = 48,
+   WMTResourceHazardTrackingModeDefault = 0,
+diff --git a/src/airconv/meson.build b/src/airconv/meson.build
+--- a/src/airconv/meson.build
++++ b/src/airconv/meson.build
+@@ -108,6 +108,6 @@
+ 
+ endif
+ 
+-if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
++if not dxmt_crossbuild
+   subdir('darwin')
+ endif
+\ No newline at end of file
+diff --git a/src/winemetal/meson.build b/src/winemetal/meson.build
+--- a/src/winemetal/meson.build
++++ b/src/winemetal/meson.build
+@@ -57,6 +57,6 @@
+   build_by_default : true
+ )
+ 
+-if cpu_family == 'x86_64' or cpu_family == 'aarch64'
++if not dxmt_crossbuild
+   subdir('unix')
+ endif
+\ No newline at end of file

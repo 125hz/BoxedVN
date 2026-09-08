@@ -131,6 +131,11 @@ struct LowAddressProbeReport {
 /// the launch path runs from AppModel and must see the current value whether
 /// or not the Settings screen has ever been opened.
 enum Preferences {
+    static let d3d9MetalKey = "BoxedVN.graphics.d3d9Metal"
+    static var d3d9Metal: Bool {
+        UserDefaults.standard.object(forKey: d3d9MetalKey) == nil
+            ? true : UserDefaults.standard.bool(forKey: d3d9MetalKey)
+    }
     static let soundEnabledKey = "BoxedVN.soundEnabled"
 
     /// Whether a guest gets an audio device at all. Off passes Boxedwine's

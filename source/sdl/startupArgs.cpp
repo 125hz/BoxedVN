@@ -275,7 +275,7 @@ static void mergeWow64DxvkOverride(std::vector<BString>& envValues) {
 // module is linked into the prefix as well, under the same non-destructive
 // rule the system32 projection uses: a real prefix file always wins.
 static void overlayX64WineModules(const BString& overlayDir,
-                                  const BString& winePrefix) {
+                                  const BString& winePrefix, bool d3d9Metal) {
     std::shared_ptr<FsNode> peDir =
         Fs::getNodeFromLocalPath(B(""), B(K_X64_WINE_PE_DIR), true);
     if (!peDir || !peDir->isDirectory()) {
@@ -289,7 +289,9 @@ static void overlayX64WineModules(const BString& overlayDir,
         Fs::getNodeFromLocalPath(B(""), system32, true);
     const bool system32Ready =
         system32Directory != nullptr && system32Directory->isDirectory();
-    for (const std::string& name : boxedvn::x64DxmtModuleNames()) {
+    auto dxmtModules = boxedvn::x64DxmtModuleNames();
+    if (d3d9Metal) dxmtModules.push_back("d3d9.dll");
+    for (const std::string& name : dxmtModules) {
         const BString sourcePath = overlayDir + "/" + name.c_str();
         std::shared_ptr<FsNode> source =
             Fs::getNodeFromLocalPath(B(""), sourcePath, true);
@@ -2110,7 +2112,31 @@ bool StartUpArgs::apply() {
     // has to run after them. A device run that projected before the mounts
     // reported every module missing and Wine fell back to wined3d.
     if (requestedFEX64 && !this->x64ModuleOverlayPath.isEmpty()) {
-        overlayX64WineModules(this->x64ModuleOverlayPath, winePrefix);
+        bool d3d9Metal = false;
+        for (const auto& entry : envValues) {
+            if (entry.startsWith(B("BOXEDVN_D3D9_METAL=")))
+                d3d9Metal = entry == B("BOXEDVN_D3D9_METAL=1");
+        }
+        overlayX64WineModules(this->x64ModuleOverlayPath, winePrefix, d3d9Metal);
+        if (d3d9Metal) {
+            // Replace both the module-root builtin and the prefix link. Wine
+            // reloads builtin-marked DLLs from its architecture-specific root.
+            const BString pe32Root = B(K_X64_WINE_PE32_DIR);
+            const BString syswow64 = winePrefix + "/drive_c/windows/syswow64";
+            auto pe32 = Fs::getNodeFromLocalPath(B(""), pe32Root, true);
+            auto system = Fs::getNodeFromLocalPath(B(""), syswow64, true);
+            for (const char* name : {"d3d9.dll", "winemetal.dll"}) {
+                const BString path = this->x64ModuleOverlayPath + "/dxmt-x86/" + name;
+                auto source = Fs::getNodeFromLocalPath(B(""), path, true);
+                if (source && !source->isDirectory() && pe32 && system) {
+                    Fs::addFileNode(pe32Root + "/" + name, B(""), source->nativePath, false, pe32);
+                    Fs::addFileNode(syswow64 + "/" + name, pe32Root + "/" + name, B(""), false, system);
+                    klog_fmt("BOXEDWINE_D3D9_METAL module=%s arch=i386 status=projected", name);
+                } else {
+                    klog_fmt("BOXEDWINE_D3D9_METAL module=%s arch=i386 status=missing", name);
+                }
+            }
+        }
     }
 
     if (this->args.size()==0) {

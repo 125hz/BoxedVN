@@ -1,0 +1,134 @@
+diff --git a/src/d3d11/d3d11.cpp b/src/d3d11/d3d11.cpp
+index 91dbc45..e62055c 100644
+--- a/src/d3d11/d3d11.cpp
++++ b/src/d3d11/d3d11.cpp
+@@ -84,6 +84,17 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
+   InitReturnPtr(ppSwapChain);
+   InitReturnPtr(ppImmediateContext);
+ 
++  // BoxedVN: the entry point every Direct3D 11 program has to reach. Its
++  // arguments are also the ones a refusal is decided on - driver type, flags
++  // and the feature levels asked for - so they are named before anything can
++  // reject them.
++  Logger::info(str::format(
++      "D3D11CreateDeviceAndSwapChain: adapter ",
++      pAdapter ? "supplied" : "default", ", driver type ", DriverType,
++      ", flags ", Flags, ", ", FeatureLevels, " feature level(s), first ",
++      (pFeatureLevels && FeatureLevels) ? (uint32_t)pFeatureLevels[0] : 0u,
++      ", swap chain ", ppSwapChain ? "requested" : "none"));
++
+   if (pFeatureLevel)
+     *pFeatureLevel = D3D_FEATURE_LEVEL(0);
+ 
+diff --git a/src/dxgi/dxgi.cpp b/src/dxgi/dxgi.cpp
+index 29163f5..4010188 100644
+--- a/src/dxgi/dxgi.cpp
++++ b/src/dxgi/dxgi.cpp
+@@ -66,6 +66,12 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
+ 
+   DisableThreadLibraryCalls(instance);
+ 
++  // BoxedVN: say that the module was loaded, before the cache-path call that
++  // is the first thing it does. A launch whose whole DXMT trace is that one
++  // unix call has loaded dxgi.dll and asked it for nothing; without this line
++  // the two are indistinguishable from the guest's stderr.
++  Logger::info(str::format("dxgi.dll: process attach, exe ", env::getExeName()));
++
+   InitializeMetalCachePath();
+   std::call_once(nvext_init, InitializeVendorExtensionNV);
+ 
+diff --git a/src/dxgi/dxgi_adapter.cpp b/src/dxgi/dxgi_adapter.cpp
+index 6af6c64..2c2281c 100644
+--- a/src/dxgi/dxgi_adapter.cpp
++++ b/src/dxgi/dxgi_adapter.cpp
+@@ -187,6 +187,11 @@ public:
+       return E_INVALIDARG;
+ 
+     HMONITOR monitor = wsi::enumMonitors(Output);
++    // BoxedVN: a program that enumerates outputs before it creates a device
++    // gives up silently when there is none, and whether the emulated display
++    // presents a monitor at all is exactly what that turns on.
++    Logger::info(str::format("DXGIAdapter::EnumOutputs: output ", Output, " ",
++                             monitor ? "found" : "not found"));
+     if (monitor == nullptr)
+       return DXGI_ERROR_NOT_FOUND;
+ 
+diff --git a/src/dxgi/dxgi_factory.cpp b/src/dxgi/dxgi_factory.cpp
+index 0b3fa09..8b420ec 100644
+--- a/src/dxgi/dxgi_factory.cpp
++++ b/src/dxgi/dxgi_factory.cpp
+@@ -173,6 +173,12 @@ public:
+     auto devices = WMT::CopyAllDevices();
+     UINT adapter_count = devices.count();
+ 
++    // BoxedVN: the first call that reaches Metal at all. An empty device list
++    // and a program asking for an adapter that is not there are different
++    // failures and used to look the same from outside.
++    Logger::info(str::format("DXGIFactory::EnumAdapters1: adapter ", Adapter,
++                             " of ", adapter_count));
++
+     if (Adapter >= adapter_count)
+       return DXGI_ERROR_NOT_FOUND;
+ 
+@@ -309,13 +315,20 @@ private:
+ 
+ extern "C" HRESULT __stdcall CreateDXGIFactory2(UINT Flags, REFIID riid,
+                                                 void **ppFactory) {
++  // BoxedVN: this entry point touches no Metal, so a program that creates a
++  // factory and stops leaves no trace at all otherwise.
++  Logger::info(str::format("CreateDXGIFactory2: flags ", Flags, ", riid ",
++                           str::format(riid)));
+   try {
+     MTLDXGIFactory* factory = new MTLDXGIFactory(Flags);
+     HRESULT hr = factory->QueryInterface(riid, ppFactory);
+     factory->Release();
+ 
+-    if (FAILED(hr))
++    if (FAILED(hr)) {
++      Logger::info(str::format("CreateDXGIFactory2: refused, hr ",
++                               (int32_t)hr));
+       return hr;
++    }
+ 
+     return S_OK;
+   } catch (const MTLD3DError &e) {
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+index 43acbd0..04424ef 100644
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -365,15 +365,26 @@ public:
+     if (pNumModes == nullptr)
+       return DXGI_ERROR_INVALID_CALL;
+ 
++    // BoxedVN: an empty mode list is a common reason a title stops before it
++    // ever creates a device, and all three ways of producing one - unknown
++    // format, a format with no back buffer, and a display that enumerates no
++    // mode - returned S_OK with nothing in it and no way to tell them apart.
++    Logger::info(str::format("DXGIOutput::GetDisplayModeList1: format ",
++                             EnumFormat, ", flags ", Flags, ", buffer ",
++                             pDesc ? "given" : "count only"));
++
+     // Special case, just return zero modes
+     if (EnumFormat == DXGI_FORMAT_UNKNOWN) {
+       *pNumModes = 0;
++      Logger::info("DXGIOutput::GetDisplayModeList1: 0 modes, format unknown");
+       return S_OK;
+     }
+     MTL_DXGI_FORMAT_DESC formatDesc;
+     if (FAILED(MTLQueryDXGIFormat(this->adapter_->GetMTLDevice(), EnumFormat, formatDesc))
+       || !(formatDesc.Flag & MTL_DXGI_FORMAT_BACKBUFFER)) {
+       *pNumModes = 0;
++      Logger::info("DXGIOutput::GetDisplayModeList1: 0 modes, format is not a "
++                   "back buffer format");
+       return S_OK;
+     }
+ 
+@@ -434,6 +445,8 @@ public:
+         return DXGI_ERROR_MORE_DATA;
+     }
+ 
++    Logger::info(str::format("DXGIOutput::GetDisplayModeList1: ", dstModeId,
++                             " modes of ", srcModeId - 1, " the display has"));
+     *pNumModes = dstModeId;
+     return S_OK;
+   }

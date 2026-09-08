@@ -1514,6 +1514,7 @@ struct StatusView: View {
 // MARK: - Settings
 
 struct SettingsView: View {
+    @AppStorage(Preferences.d3d9MetalKey) private var d3d9Metal = true
     @EnvironmentObject private var model: AppModel
     @AppStorage("BoxedVN.preferredOrientation")
     private var preferredOrientation = 1
@@ -1532,6 +1533,14 @@ struct SettingsView: View {
 
     var body: some View {
         List {
+            Section {
+                Picker("Direct3D 9 renderer", selection: $d3d9Metal) {
+                    Text("Metal (experimental)").tag(true)
+                    Text("Vulkan").tag(false)
+                }
+            } footer: {
+                Text("Applies to the next container launch, including the 32-bit cube. Select Vulkan to compare compatibility.")
+            }
             Section("Controls") {
                 Picker("Joystick keys", selection: $joystickArrowKeys) {
                     Text("WASD").tag(false)

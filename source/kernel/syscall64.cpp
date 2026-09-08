@@ -67,6 +67,8 @@
 // shader-cache-path substitution below is the only place this side sets it.
 #include "boxedwine_dxmt_guest_pointer.h"
 extern "C" const void *dxmt_winemetal_unix_call_funcs[];
+extern "C" const void *dxmt_winemetal_unix_call_wow64_funcs[];
+extern "C" uint32_t boxedwine_dxmt_dxso_call(uint32_t, void*, bool);
 #endif
 
 // x86-64 Linux syscall numbers used here. The canonical table lives in
@@ -4707,6 +4709,30 @@ static const char* const kDxmtUnixCallNames64[] = {
     /* 124 */ "MTLDevice_newSharedEventWithMachPort",
     /* 125 */ "MTLDevice_registryID",
     /* 126 */ "MTLSharedEvent_waitUntilSignaledValue",
+    /* 127 */ "MTLCounterSampleBuffer_newTimestampBuffer",
+    /* 128 */ "MTLCounterSampleBuffer_resolveCounterRange",
+    /* 129 */ "MTLCommandBuffer_blitCommandEncoderWithSampleBuffers",
+    /* 130 */ "MTLCommandBuffer_property",
+    /* 131 */ "MTLDevice_newTileRenderPipelineState",
+    /* 132 */ "MTLDevice_newResidencySet",
+    /* 133 */ "MTLResidencySet_addAllocations",
+    /* 134 */ "MTLResidencySet_removeAllocations",
+    /* 135 */ "MTLResidencySet_removeAllAllocations",
+    /* 136 */ "MTLResidencySet_commit",
+    /* 137 */ "MTLCommandQueue_addResidencySet",
+    /* 138 */ "MTLDevice_newHeap",
+    /* 139 */ "MTLDevice_heapBufferSizeAndAlign",
+    /* 140 */ "MTLDevice_heapTextureSizeAndAlign",
+    /* 141 */ "MTLHeap_newBuffer",
+    /* 142 */ "MTLHeap_newTexture",
+    /* 143 */ "MTLDevice_newIndirectCommandBuffer",
+    /* 144 */ "MTLDevice_newLibraryWithSource",
+    /* 145 */ "DXSOInitialize",
+    /* 146 */ "DXSODestroy",
+    /* 147 */ "DXSOCompile",
+    /* 148 */ "DXSOGetCompiledBitcode",
+    /* 149 */ "DXSODestroyBitcode",
+    /* 150 */ "MTLTexture_usage",
 };
 
 static_assert(sizeof(kDxmtUnixCallNames64) / sizeof(kDxmtUnixCallNames64[0])
@@ -5012,6 +5038,8 @@ static void boxedwineDxmtEndShaderCachePath64(
 #endif  // BOXEDWINE_DXMT_NATIVE
 
 static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
+    const bool wow64 = (callIndex & 0x80000000ULL) != 0;
+    callIndex &= ~0x80000000ULL;
     static std::atomic<U32> callLogCount{0};
     const U32 logOrdinal = callLogCount.fetch_add(1, std::memory_order_relaxed);
     const char* callName = dxmtUnixCallName64(callIndex);
@@ -5090,7 +5118,13 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
 
 #if defined(BOXEDWINE_DXMT_NATIVE)
     using DxmtUnixEntry = S32 (*)(void*);
-    const void* raw = dxmt_winemetal_unix_call_funcs[callIndex];
+    if (callIndex >= 145 && callIndex <= 149) {
+        const S32 status = (S32)boxedwine_dxmt_dxso_call((U32)callIndex, (void*)(uintptr_t)args, wow64);
+        if (logCall || status) klog_fmt("BOXEDWINE_DXMT_D3D9 index=%u wow64=%d status=0x%x", (U32)callIndex, wow64, status);
+        return (U64)(S64)status;
+    }
+    const void* raw = wow64 ? dxmt_winemetal_unix_call_wow64_funcs[callIndex]
+                           : dxmt_winemetal_unix_call_funcs[callIndex];
     if (!raw) {
         if (logCall) {
             klog_fmt("BOXEDWINE_DXMT_RETURN ordinal=%u status=%d reason=entry",

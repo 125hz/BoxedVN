@@ -65,10 +65,15 @@ for marker in \
 done
 cp "${PROBE}" "${OUTPUT_DIR}/boxedvn-d3d11-cube-x64.exe"
 
-for dll in d3d11 dxgi d3d10core winemetal; do
+for dll in d3d11 dxgi d3d10core winemetal d3d9; do
     source_dll="${DXMT}/x86_64-windows/${dll}.dll"
     verify_x64_pe "${source_dll}"
     cp "${source_dll}" "${OUTPUT_DIR}/dxmt-x64/${dll}.dll"
+done
+mkdir -p "${OUTPUT_DIR}/dxmt-x86"
+for dll in d3d9 winemetal; do
+    require_file "${DXMT}/i386-windows/${dll}.dll"
+    cp "${DXMT}/i386-windows/${dll}.dll" "${OUTPUT_DIR}/dxmt-x86/${dll}.dll"
 done
 if [[ -n "${NATIVE_ARCHIVE}" ]]; then
     cp "${NATIVE_ARCHIVE}" "${OUTPUT_DIR}/libdxmt_combined.a"
@@ -84,6 +89,9 @@ sha256_file() {
 {
     printf '%s\n' '# BoxedVN x86-64 graphics resources manifest v1.'
     printf '%s\n' 'format=boxedvn-x64-graphics-v1'
+    printf 'd3d9_64_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/dxmt-x64/d3d9.dll")"
+    printf 'd3d9_32_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/dxmt-x86/d3d9.dll")"
+    printf 'winemetal_32_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/dxmt-x86/winemetal.dll")"
     printf '%s\n' 'probe=boxedvn-d3d11-cube-x64.exe'
     printf 'probe_sha256=%s\n' "$(sha256_file "${OUTPUT_DIR}/boxedvn-d3d11-cube-x64.exe")"
     for dll in d3d11 dxgi d3d10core winemetal; do
