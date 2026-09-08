@@ -1,0 +1,18 @@
+--- a/src/audio/SDL_audiocvt.c
++++ b/src/audio/SDL_audiocvt.c
+@@ -191,9 +191,13 @@
+         return 0;
+     }
++    /* BoxedVN: padding is measured in audio frames, not filter-table
++     * subdivisions. The interpolation loops read at most ZERO_CROSSINGS+1
++     * frames on either side. Keeping 512 frames starves short OSS buffers.
++     * Retain the conservative rate adjustment when downsampling. */
+     if (inrate > outrate) {
+-        return (RESAMPLER_SAMPLES_PER_ZERO_CROSSING * inrate + outrate - 1) / outrate;
++        return ((RESAMPLER_ZERO_CROSSINGS + 1) * inrate + outrate - 1) / outrate;
+     }
+-    return RESAMPLER_SAMPLES_PER_ZERO_CROSSING;
++    return (RESAMPLER_ZERO_CROSSINGS + 1);
+ }
+ 
+ /* lpadding and rpadding are expected to be buffers of (ResamplePadding(inrate, outrate) * chans * sizeof(float)) bytes. */

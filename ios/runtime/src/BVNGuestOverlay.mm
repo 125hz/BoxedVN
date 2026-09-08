@@ -1450,6 +1450,9 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.touchLayout.opacityChanged = ^(CGFloat opacity) {
         [weakOverlay setNeedsLayout];
     };
+    self.touchLayout.keyboardRequested = ^{
+        [weakOverlay toggleKeyboard];
+    };
     [self addSubview:self.touchLayout];
     self.touchLayoutItem = [self makePanelItemWithTitle:@"Edit on-screen controls"
         action:@selector(editTouchLayout) destructive:NO];
@@ -2419,8 +2422,18 @@ extern "C" void BVNGuestCursorSelect(uint32_t id, int shape, bool visible) {
     self.performanceView.alpha = controlOpacity;
     self.menuPanel.alpha = controlOpacity;
     self.touchLayoutItem.enabled = landscapeFullscreen;
-    self.menuButton.hidden = hosted && !landscapeFullscreen;
-    self.performanceView.hidden = hosted && !landscapeFullscreen;
+    self.menuButton.hidden = hosted;
+    self.performanceView.hidden = hosted;
+    if (hosted) {
+        self.menuOpen = NO;
+        self.menuPanel.hidden = YES;
+        self.scrim.hidden = YES;
+    }
+    if (landscapeFullscreen) {
+        [self bringSubviewToFront:self.touchLayout];
+        if (self.keyboardPanel.superview == self && !self.keyboardPanel.hidden)
+            [self bringSubviewToFront:self.keyboardPanel];
+    }
 
     const UIEdgeInsets safe = self.safeAreaInsets;
     const CGRect bounds = self.bounds;

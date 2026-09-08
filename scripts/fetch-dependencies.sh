@@ -92,11 +92,14 @@ SDL2_GEOMETRY_PATCH="${BOXEDVN_SCRIPT_DIR}/sdl-patches/sdl2-embedded-keyboard-ge
 require_file "${SDL2_GEOMETRY_PATCH}" "The SDL embedded-view geometry patch is missing."
 SDL2_AUDIO_PATCH="${BOXEDVN_SCRIPT_DIR}/sdl-patches/sdl2-ios-multiple-output-queues.patch"
 require_file "${SDL2_AUDIO_PATCH}" "The SDL audio queue patch is missing."
-SDL2_PATCH_KEY="$(cat "${SDL2_PATCH}" "${SDL2_GEOMETRY_PATCH}" "${SDL2_AUDIO_PATCH}" | shasum -a 256 | awk '{print $1}')"
+SDL2_RESAMPLER_PATCH="${BOXEDVN_SCRIPT_DIR}/sdl-patches/sdl2-resampler-lookahead.patch"
+require_file "${SDL2_RESAMPLER_PATCH}" "The SDL resampler patch is missing."
+SDL2_PATCH_KEY="$(cat "${SDL2_PATCH}" "${SDL2_GEOMETRY_PATCH}" "${SDL2_AUDIO_PATCH}" "${SDL2_RESAMPLER_PATCH}" | shasum -a 256 | awk '{print $1}')"
 tar -xzf "${SDL2_TARBALL}" -C "${SOURCES}" \
     "SDL2-${BOXEDVN_SDL2_VERSION}/src/video/uikit/SDL_uikitevents.m" \
     "SDL2-${BOXEDVN_SDL2_VERSION}/src/video/uikit/SDL_uikitviewcontroller.m" \
     "SDL2-${BOXEDVN_SDL2_VERSION}/src/audio/SDL_audio.c" \
+    "SDL2-${BOXEDVN_SDL2_VERSION}/src/audio/SDL_audiocvt.c" \
     "SDL2-${BOXEDVN_SDL2_VERSION}/src/audio/SDL_sysaudio.h" \
     "SDL2-${BOXEDVN_SDL2_VERSION}/src/audio/coreaudio/SDL_coreaudio.m"
 patch --batch --forward -d "${SDL2_SOURCE}" -p1 < "${SDL2_PATCH}" \
@@ -105,6 +108,8 @@ patch --batch --forward -d "${SDL2_SOURCE}" -p1 < "${SDL2_GEOMETRY_PATCH}" \
     || die "The SDL embedded-view geometry patch does not match the pinned source."
 patch --batch --forward -d "${SDL2_SOURCE}" -p1 < "${SDL2_AUDIO_PATCH}" \
     || die "The SDL audio queue patch does not match the pinned source."
+patch --batch --forward -d "${SDL2_SOURCE}" -p1 < "${SDL2_RESAMPLER_PATCH}" \
+    || die "The SDL resampler patch does not match the pinned source."
 python3 "${BOXEDVN_SCRIPT_DIR}/test_sdl_audio_queues.py" --source "${SDL2_SOURCE}"
 python3 "${BOXEDVN_SCRIPT_DIR}/test-sdl-uikit-pump.py" \
     --source "${SDL2_SOURCE}/src/video/uikit/SDL_uikitevents.m"

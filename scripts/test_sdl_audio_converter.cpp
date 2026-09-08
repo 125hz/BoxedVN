@@ -35,7 +35,10 @@ int main() {
             // Filter lookahead must remain in the guest's pending queue.
             assert(converter.bufferedInputBytes() <= 16384);
             assert(converter.bufferedInputBytes() <= submitted);
-            if (offset > 4096) assert(converter.bufferedInputBytes() >= 400 * 8);
+#ifdef BOXEDVN_LOW_LATENCY_RESAMPLER
+            // Short Wine buffers must not lose 512 frames to filter lookahead.
+            if (offset > 4096) assert(converter.bufferedInputBytes() <= 16 * 8);
+#endif
         }
         assert(converter.finish()); drain();
         // SDL2 rounds per internal resampling block; allow <1ms over 1s.

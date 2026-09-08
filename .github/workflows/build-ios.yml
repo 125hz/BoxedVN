@@ -310,6 +310,26 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Build D3D9 Metal shader compiler port
+        shell: bash
+        run: |
+          python3 scripts/prepare-d3d9-metal-port.py --fetch \
+            --source build/d3d9-metal-source --ios-source third_party/fex64/dxmt \
+            --report build/dxso-ios/abi-report.json
+          python3 scripts/test_dxso_guest_bridge.py --source build/d3d9-metal-source
+          bash scripts/build-dxso-ios-compiler.sh build/d3d9-metal-source
+
+      - name: Upload D3D9 compiler port
+        uses: actions/upload-artifact@v7
+        with:
+          name: d3d9-metal-compiler-port
+          path: |
+            build/dxso-ios/libdxso_compiler.a
+            build/dxso-ios/manifest.txt
+            build/dxso-ios/abi-report.json
+            build/dxso-ios/symbols.txt
+          retention-days: 14
+
       # LLVM is the long pole in the first DXMT build. Save its partial Ninja
       # tree even when a later compiler or staging step fails so the next
       # manually dispatched run resumes instead of discarding completed work.
@@ -363,9 +383,13 @@ jobs:
           python3 scripts/test_guest_affinity64.py
           python3 scripts/test_guest_runtime_boundaries.py
           python3 scripts/test_guest_scheduling_lifecycle.py
+          python3 scripts/test_presentation_frame.py
 
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
+
+      - name: Test patched audio resampler latency and continuity
+        run: bash scripts/test-sdl-resampler-latency.sh
 
       - name: Test Wine64 runtime packaging contract
         run: python3 -m unittest scripts/test_wine64_runtime_packaging.py

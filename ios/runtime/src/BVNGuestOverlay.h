@@ -142,6 +142,7 @@ UIView* BVNGuestPresentationView(void);
 
 int BVNGuestPresentationMode(void);
 void BVNGuestSetPresentationMode(int mode);
+CGRect BVNGuestContentFrame(CGRect available, CGSize pixels);
 
 // Re-derives the window-to-guest pointer transform from the rectangle the
 // presenter measured.  Presentation and input are never derived independently:

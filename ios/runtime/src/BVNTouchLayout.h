@@ -10,6 +10,9 @@
 @property(nonatomic, strong) UISlider* sizeSlider;
 @property(nonatomic, strong) UISlider* opacitySlider;
 @property(nonatomic, strong) UILabel* selectionLabel;
+@property(nonatomic, strong) UIStackView* toolbar;
+@property(nonatomic, strong) UIButton* displayButton;
+@property(nonatomic, copy) void (^keyboardRequested)(void);
 @property(nonatomic) NSInteger selection;
 @property(nonatomic) BOOL editing;
 @property(nonatomic, copy) void (^opacityChanged)(CGFloat);
@@ -30,6 +33,23 @@
     for (int n = 0; n <= 9; ++n) [keys addObject:[NSString stringWithFormat:@"%d", n]];
     for (int n = 1; n <= 12; ++n) [keys addObject:[NSString stringWithFormat:@"F%d", n]];
     self.keys = keys;
+    self.toolbar = [[UIStackView alloc] init];
+    self.toolbar.axis = UILayoutConstraintAxisHorizontal;
+    self.toolbar.distribution = UIStackViewDistributionFillEqually;
+    self.toolbar.spacing = 8;
+    self.toolbar.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.85];
+    self.toolbar.layer.cornerRadius = 12;
+    NSArray* titles = @[@"Keyboard", @"Controls", @"Fit"];
+    SEL actions[] = {@selector(showKeyboard), @selector(editLayout), @selector(changeDisplay)};
+    for (NSUInteger i = 0; i < titles.count; ++i) {
+        UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
+        [button setTitle:titles[i] forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightSemibold];
+        [button addTarget:self action:actions[i] forControlEvents:UIControlEventTouchUpInside];
+        [self.toolbar addArrangedSubview:button];
+        if (i == 2) self.displayButton = button;
+    }
+    [self addSubview:self.toolbar];
     id saved = [NSUserDefaults.standardUserDefaults arrayForKey:@"BoxedVN.touchLayout.v1"];
     for (id item in saved) {
         if (![item isKindOfClass:NSDictionary.class] || ![keys containsObject:item[@"key"]]) continue;
@@ -58,6 +78,11 @@
     return value ? MAX(0.1, MIN(1.0, [value doubleValue])) : 0.7;
 }
 - (void)save { [NSUserDefaults.standardUserDefaults setObject:self.items forKey:@"BoxedVN.touchLayout.v1"]; }
+- (void)showKeyboard { if (self.keyboardRequested) self.keyboardRequested(); }
+- (void)changeDisplay {
+    BVNGuestSetPresentationMode((BVNGuestPresentationMode() + 1) % 3);
+    [self setNeedsLayout];
+}
 - (void)send:(NSInteger)index down:(BOOL)down {
     if (index < 0 || index >= (NSInteger)self.items.count) return;
     NSString* key = self.items[index][@"key"];
@@ -106,11 +131,17 @@
         [self addSubview:button]; [self.buttons addObject:button];
     }
     if (self.editor) [self bringSubviewToFront:self.editor];
+    [self bringSubviewToFront:self.toolbar];
     [self setNeedsLayout];
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+    self.toolbar.frame = CGRectMake(CGRectGetMidX(area)-138, CGRectGetMaxY(area)-48, 276, 44);
+    self.toolbar.hidden = self.editing;
+    self.toolbar.alpha = self.controlOpacity;
+    [self.displayButton setTitle:@[@"Fit", @"Fill", @"Stretch"][BVNGuestPresentationMode()]
+                       forState:UIControlStateNormal];
     for (UIButton* button in self.buttons) {
         NSDictionary* item = self.items[button.tag];
         CGFloat size = MAX(44, MIN(140, [item[@"size"] doubleValue]));

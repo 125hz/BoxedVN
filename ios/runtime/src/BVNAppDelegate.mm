@@ -1739,9 +1739,9 @@ static void BVNSyncGuestX11PatchGeometry(UIView* presentation) {
     }
     UIView* host = BVNGuestPresentationHostView();
     if (host != nil) {
-        // The live view: the compositor fills the host, above SDL's view if
-        // UIKit let that view in and at the bottom otherwise, so the touch
-        // overlay and the cursor stay on top of the picture.
+        // Keep the GDI overlay on the same guest-pixel transform as Vulkan.
+        // Filling the host here covered its letterboxed image with a stretched
+        // copy and made the display-mode switch appear ineffective.
         if (gGuestX11PatchView.superview != host) {
             [gGuestX11PatchView removeFromSuperview];
             NSUInteger index = 0;
@@ -1751,8 +1751,15 @@ static void BVNSyncGuestX11PatchGeometry(UIView* presentation) {
             [host insertSubview:gGuestX11PatchView
                         atIndex:MIN(index, host.subviews.count)];
         }
-        gGuestX11PatchView.transform = CGAffineTransformIdentity;
-        gGuestX11PatchView.frame = host.bounds;
+        if (presentation.superview == host) {
+            gGuestX11PatchView.bounds = presentation.bounds;
+            gGuestX11PatchView.center = presentation.center;
+            gGuestX11PatchView.transform = presentation.transform;
+        } else {
+            gGuestX11PatchView.transform = CGAffineTransformIdentity;
+            gGuestX11PatchView.frame = BVNGuestContentFrame(host.bounds,
+                CGSizeMake(gGuestX11PatchWidth, gGuestX11PatchHeight));
+        }
         return;
     }
     UIView* container = presentation.superview;
@@ -2581,7 +2588,24 @@ extern "C" bool BVNSyncGuestPresentationGeometry(void) {
 }
 
 extern "C" int BVNGuestPresentationMode(void) {
-    return gGuestPresentationMode;
+    return BVNGuestPreferredPresentationMode();
+}
+
+// Placement is shared by Metal and the X11 compositor. Never resize a
+// swapchain's pixel extent to implement a user-facing display preference.
+extern "C" CGRect BVNGuestContentFrame(CGRect available, CGSize pixels) {
+    if (pixels.width <= 0 || pixels.height <= 0) return available;
+    CGFloat sx = available.size.width / pixels.width;
+    CGFloat sy = available.size.height / pixels.height;
+    const int mode = BVNGuestPresentationMode();
+    if (mode == 0) sx = sy = MIN(sx, sy);
+    else if (mode == 1) {
+        CGFloat crop = 1.0 - BVNGuestFillCropPercent() / 50.0;
+        sx = sy = MIN(MAX(sx, sy), MIN(sx, sy) / crop);
+    }
+    return CGRectMake(CGRectGetMidX(available)-pixels.width*sx/2,
+                      CGRectGetMidY(available)-pixels.height*sy/2,
+                      pixels.width*sx, pixels.height*sy);
 }
 
 extern "C" void BVNGuestSetPresentationMode(int mode) {
@@ -2599,6 +2623,9 @@ extern "C" void BVNGuestSetPresentationMode(int mode) {
                                         mode);
         BVNGuestPresentationGeometryChanged();
     }
+    BVNSyncGuestX11PatchGeometry(BVNGuestPresentationView());
+    BVNDXMTDisplaySyncOrdering();
+    BVNGuestOverlayGeometryDidChange();
 }
 
 extern "C" void BVNGuestSetFillCropPercent(int percent) {

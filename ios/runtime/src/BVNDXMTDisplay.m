@@ -76,10 +76,9 @@ extern UIWindow* BVNGuestUIWindow(void);
     layer.drawableSize = _guestDrawableSize;
     layer.maximumDrawableCount = 3;
     layer.presentsWithTransaction = NO;
-    // The swapchain's pixel extent rarely matches the view. Letterbox it
-    // rather than stretch it: a 640x480 frame filled a 402x874 window on
-    // device and the picture was unrecognisable.
-    layer.contentsGravity = kCAGravityResizeAspect;
+    // SyncOrdering applies Fit/Fill/Stretch to the view's frame. The layer
+    // fills that frame without imposing a second aspect-ratio policy.
+    layer.contentsGravity = kCAGravityResize;
     return self;
 }
 
@@ -389,9 +388,10 @@ static void BVNDXMTDisplayPlaceOnMain(void) {
     // In the live view the host already carries the container's aspect ratio,
     // so the layer fills it; the window-space desktop rect placed the layer
     // off the bottom of the smaller host and the picture was never on screen.
-    const CGRect desktop = BVNGuestPresentationHostView() != nil
+    const CGRect available = BVNGuestPresentationHostView() != nil
                                ? container.bounds
                                : BVNDXMTDesktopFrame(container);
+    const CGRect desktop = BVNGuestContentFrame(available, view.metalLayer.drawableSize);
     BOOL changed = NO;
     if (view.hidden) {
         view.hidden = NO;
