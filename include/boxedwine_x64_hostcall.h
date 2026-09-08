@@ -15,6 +15,14 @@
 /* Number of entries in the pinned DXMT winemetal unix-call ABI. */
 #define BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL_COUNT 151U
 
+/* Only the three native command-stream interpreters: no guest callback,
+ * allocation, submission, presentation or wait. The WoW64 tag changes pointer
+ * decoding, not the CPU-state contract. Keep in sync with the pinned table. */
+static inline int boxedwineDxmtRecordsCommands(unsigned long long index) {
+    index &= ~0x80000000ULL;
+    return index >= 36 && index <= 38;
+}
+
 /* NTSTATUS returned when the native table has a NULL entry. */
 #define BOXEDWINE_X64_HOSTCALL_STATUS_NOT_IMPLEMENTED 0xc0000002U
 

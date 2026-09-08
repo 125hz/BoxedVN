@@ -44,6 +44,12 @@ def main() -> None:
         / "ios/support/include/boxedvn/fex_exit_dispatch_contract.h"
     )
     backend = read(repository / "ios/runtime/src/BVNFEXBackend.mm")
+    emitter = read(fex / "FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h")
+    require_ordered(emitter, [
+        "constexpr auto STATE = ARMEmitter::XReg::x28;",
+        "constexpr auto TMP1 = ARMEmitter::XReg::x0;",
+        "constexpr auto TMP2 = ARMEmitter::XReg::x1;",
+    ], "native dispatcher leaf scratch registers")
     loadstore_mask_patch = read(
         repository
         / "scripts/fex64-patches/fex-arm64-pair-immediate-mask.patch"

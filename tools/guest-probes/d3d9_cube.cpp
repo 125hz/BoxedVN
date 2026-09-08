@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include "x87_probe.h"
+#include "d3d9_color_probe.h"
 
 namespace {
 
@@ -123,6 +124,7 @@ bool createGraphics(HWND window) {
     gDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     gDevice->SetRenderState(D3DRS_ZENABLE, TRUE);
     gDevice->SetFVF(kVertexFormat);
+    probeD3D9Colors(gDevice);
     gStartedAt = GetTickCount();
     return true;
 }

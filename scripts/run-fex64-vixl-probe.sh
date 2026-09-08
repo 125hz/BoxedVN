@@ -441,4 +441,9 @@ for block_size in 1 500; do
 done
 FEX_BOXEDWINE_TLS_GDT=1 run_one x64-tls-selector "${tmp_dir}/fex64-tls-selector.bin" \
     "${tmp_dir}/fex64-tls-selector.config.bin" 500 1 "" 1
+# Exercise the enabled production L2 lookup with cold/warm translated returns,
+# canonical high addresses and the relocated stack, retaining full key checks.
+FEX_DISABLEL2CACHE=0 run_one x64-l2-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin" \
+    "${tmp_dir}/fex64-highstack-callret.config.bin" 500 0 "" 1
+
 echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, dispatcher-return and high-stack call/ret and TLS-selector fixtures completed in all modes"

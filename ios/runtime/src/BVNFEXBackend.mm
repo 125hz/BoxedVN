@@ -77,6 +77,8 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #include "boxedwine.h"
 #include "cpu64.h"
 #include "fex_unaligned_swap.h"
+#include "fex_dispatch_exit.h"
+#include "fex_host_discard.h"
 #include "kmemory64.h"
 #include "syscall64.h"
 
@@ -421,10 +423,48 @@ uint64_t dispatchExitWithoutBlockLinking(
     return transition.hostTarget;
 }
 
+void reportf(const char* format, ...) __attribute__((format(printf, 1, 2)));
+
 void disableLiveBlockLinking(FEXCore::Core::InternalThreadState* thread) {
     if (!thread || !thread->CurrentFrame) return;
     thread->CurrentFrame->Pointers.ExitFunctionLink =
         reinterpret_cast<uint64_t>(&dispatchExitWithoutBlockLinking);
+    // Keep the conservative no-link policy, but avoid spilling/filling all
+    // static guest registers and calling C++ on every block exit. Publish a
+    // single branch into an immutable native-ABI stub. The destination remains
+    // the ordinary dispatcher, including its cache invalidation checks.
+    static std::mutex patchMutex;
+    static std::unordered_map<uint64_t,uint32_t> installed;
+    std::lock_guard<std::mutex> guard(patchMutex);
+    const uint64_t entry = thread->CurrentFrame->Pointers.ExitFunctionLinker;
+    if (!entry) return;
+    const auto previous = installed.find(entry);
+    if (previous != installed.end() &&
+        __atomic_load_n(reinterpret_cast<const uint32_t*>(entry), __ATOMIC_ACQUIRE) == previous->second) return;
+    const auto segment = gCodeSegments.find(entry);
+    if (segment == boxedvn::FexCodeSegments::maximum) return;
+    auto& bank = gSwapBanks[segment];
+    const auto base = bank.rx.load(std::memory_order_acquire);
+    if (!base) return;
+    const auto slot = bank.next.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= SwapBank::slots) return;
+    const auto rx = base + slot * boxedvn::FexSwapThunk::slotBytes;
+    const auto rw = bank.rw + slot * boxedvn::FexSwapThunk::slotBytes;
+    const auto code = boxedvn::fexDispatchExit(
+        offsetof(FEXCore::Core::CpuStateFrame, State.rip),
+        offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+    const auto branch = boxedvn::FexSwapThunk::branch(entry, rx);
+    if (!code[0] || !branch) return;
+    memcpy(reinterpret_cast<void*>(rw), code.data(), sizeof(code));
+    sys_dcache_flush(reinterpret_cast<void*>(rw), sizeof(code));
+    sys_icache_invalidate(reinterpret_cast<void*>(rx), sizeof(code));
+    auto* writable = reinterpret_cast<uint32_t*>(gCodeSegments.writable(entry));
+    __atomic_store_n(writable, branch, __ATOMIC_RELEASE);
+    sys_dcache_flush(writable, 4);
+    sys_icache_invalidate(reinterpret_cast<void*>(entry), 4);
+    installed[entry] = branch;
+    reportf("BOXEDWINE_FEX64_DISPATCH_FASTPATH entry=0x%llx stub=0x%llx",
+            (unsigned long long)entry, (unsigned long long)rx);
 }
 
 // Published by the maintained downstream translator patch. Arming is only ever
@@ -1108,6 +1148,11 @@ bool initializeFEXGlobals() {
         // Restore the last working block boundary after the 32-bit startup
         // regression. Revisit multiblock independently of hot-path changes.
         FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "0");
+        // The L1-only iOS fork policy makes collisions enter C++ lookup and
+        // locks on every loop iteration. Native mmap reserves the larger L2
+        // lazily; it does not commit the whole Windows-style cache layout.
+        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_DISABLEL2CACHE, "0");
+        reportf("BOXEDWINE_FEX64_CACHE l2=enabled allocation=demand-paged discard=zero");
         reportf("FEX single-block compilation; direct linking remains disabled");
         // Do not use CONFIG_MAXINST as a live-guest diagnostic. Forcing every
         // instruction through a separate exit/link sequence amplified the iOS
@@ -1998,6 +2043,10 @@ extern "C" bool BVNFEXBackendPatchUnalignedSwap(uint64_t pc, uint32_t instructio
 extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address) {
     return poolOwns(reinterpret_cast<const void*>(
         static_cast<uintptr_t>(address)));
+}
+
+extern "C" int boxedvn_fex_madvise(void* address, size_t length, int advice) {
+    return boxedvn::discardFexHostPages(address, length, advice);
 }
 
 extern "C" uint64_t BVNFEXBackendWritableHostCodeAddress(uint64_t address) {

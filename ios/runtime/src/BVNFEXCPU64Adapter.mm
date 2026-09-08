@@ -43,6 +43,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #undef FSCALE
 #endif
 #include "boxedwine.h"
+#include "boxedwine_x64_hostcall.h"
 #include "boxedvn/fex_exit_dispatch_contract.h"
 #include "cpu64.h"
 #include "guest_signal_frame64.h"
@@ -1363,7 +1364,7 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
         boxedvn::armAlignmentAbort(machine->__es.__esr)) {
         const uint32_t instruction = *reinterpret_cast<const uint32_t*>(unalignedPC);
         const unsigned offset = faultAddress & 15;
-        if (!swapFault && inCodeBuffer &&
+        if (!swapFault && inOwnedFexCode &&
             ((offset >= 1 && offset <= 7) || (instruction & 0xfc000000u) == 0x14000000u) &&
             BVNFEXBackendPatchUnalignedSwap(hostPC, instruction)) {
             // Retry at the original site, now branching into the CASPAL leaf.
@@ -1974,21 +1975,24 @@ static bool handlePollingQuery(BVNFEXCPU64Adapter* adapter,
     return true;
 }
 
-// Recording a Vulkan command consumes marshalled guest memory but never changes
+// Recording a Vulkan or Metal command stream consumes marshalled guest memory but never changes
 // the emulated CPU state or enters a guest callback. Keep the spilled FEX frame
 // authoritative instead of copying/reconstructing every SIMD and x87 register
 // twice for every draw, bind and barrier. Queue submission, waits, presentation,
 // allocation and pending signals retain the complete syscall path.
-static bool handleVulkanRecording(BVNFEXCPU64Adapter* adapter,
+extern U64 boxedwineDxmtUnixCall64(CPU64*, U64, U64);
+static bool handleGraphicsRecording(BVNFEXCPU64Adapter* adapter,
                                   FEXCore::Core::CpuStateFrame* frame,
                                   const uint64_t* args, uint64_t& result) {
-    if (args[0] != BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE ||
+    const bool vulkan = args[0] == BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE && vulkanBridge64RecordsCommands(args[1]);
+    const bool metal = args[0] == BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL && boxedwineDxmtRecordsCommands(args[1]);
+    if ((!vulkan && !metal) ||
         frame != adapter->fexThread->CurrentFrame || frame->Thread != adapter->fexThread ||
         frame->State.rip < K64_NATIVE_GUEST_IMAGE_BASE ||
         frame->State.rip >= K64_NATIVE_GUEST_HIGH_END ||
-        adapter->thread->terminating || adapter->cpu->hasDeliverableSignal() ||
-        !vulkanBridge64RecordsCommands(args[1])) return false;
-    result = vulkanBridge64(adapter->cpu, args[1], args[2], args[3]);
+        adapter->thread->terminating || adapter->cpu->hasDeliverableSignal()) return false;
+    result = metal ? boxedwineDxmtUnixCall64(adapter->cpu, args[1], args[2]) :
+        vulkanBridge64(adapter->cpu, args[1], args[2], args[3]);
     frame->State.gregs[X64_RAX] = result;
     frame->State.gregs[X64_RCX] = frame->State.rip + 2;
     frame->State.rip += 2;
@@ -2008,7 +2012,7 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     if (handlePollingQuery(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
                            arguments, pollingResult)) return pollingResult;
     uint64_t recordingResult;
-    if (handleVulkanRecording(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
+    if (handleGraphicsRecording(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
                               arguments, recordingResult)) return recordingResult;
     if (!BVNFEXCPU64AdapterSyncFromFEX(adapter, framePointer)) {
         adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;

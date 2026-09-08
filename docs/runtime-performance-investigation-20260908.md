@@ -1,0 +1,69 @@
+# CPU dispatch, exact arithmetic and Metal submission investigation
+
+## Decision and evidence boundary
+
+Keep BoxedWine, Wine 11, FEX and the native Metal renderer for this iteration. The new logs identify large, specific CPU costs that can be addressed without replacing the operating-system runtime or losing 32-bit support. This does not establish a maximum achievable frame rate. No device FPS improvement is claimed from host benchmarks or IPA compilation.
+
+The two device captures are `boxedvn-20260908-171641.log` (32-bit D3D9 workload) and `boxedvn-20260908-172119.log` (64-bit managed workload). Both embed revision `525985d7+dirty`, build 137. Both reach the native DXMT Metal path. The old Vulkan route is not the explanation for these particular captures.
+
+| Observation | 32-bit workload | 64-bit workload |
+|---|---:|---:|
+| CompileBlock requests | 9.76 million | 9.04 million |
+| Requests resolved to existing compiled blocks | 9.45 million, about 96% | 8.63 million, about 95% |
+| Handled host faults | About 581 | 8.57 million |
+| Dominant late CPU samples | Exact x87 helpers and C++ exit dispatch | Managed runtime and unaligned atomic handling |
+| Native present call duration in sampled reports | About 3–6 microseconds | About 4–5 microseconds |
+| Severe frame submission gaps | 5.28–7.46 seconds | CPU-limited submission also observed |
+
+The lookup-hit count is not a count of new translations. Repeatedly returning through C++ to find existing code is avoidable work. Exact-symbol samples in the 32-bit capture include `softfloat_shiftRightJam128`, `softfloat_roundPackToExtF80`, `softfloat_subMagsExtF80`, and the extended-precision add/sub entry points. Two workers can consume close to a complete CPU core while the main thread waits.
+
+The GPU is executing Metal work. It cannot execute x86 game logic, Wine, or x87 physics arithmetic. Microsecond CPU-side presentation calls and multi-second gaps before the next present support investigating CPU production of frames first. They **do not measure GPU utilization or GPU execution time**; GPU saturation is not ruled out for other scenes. Audio underruns similarly show missed delivery deadlines, rather than proving that the audio renderer is itself the primary bottleneck.
+
+## Implemented changes
+
+1. **Preserve exact x87 arithmetic but compile its helpers together.** A CMake overlay enables a unity build for the pinned SoftFloat library. This exposes helper bodies to the optimizer while retaining full extended-precision results, rounding modes, exception flags and the existing FEX calling convention. Three unused entry points remain separate because their dependencies are intentionally absent from FEX's trimmed archive. There is no fast-math flag, precision reduction or vendor-source modification. SoftFloat's own performance guidance identifies separate translation units as a barrier to cross-function optimization. [SoftFloat documentation, section 9.6](https://www.jhauser.us/arithmetic/SoftFloat-3/doc/SoftFloat.html)
+
+2. **Replace the conservative exit callback's C++ round trip with a four-instruction ARM64 leaf.** The leaf writes the next guest RIP and enters the ordinary dispatcher. It preserves the no-direct-linking policy and retains cache lookup/invalidation behavior. Guest static registers and NZCV are not spilled and refilled for a callback that only redirects execution. A single branch is published through the existing writable/executable aliases after the immutable leaf has been flushed.
+
+3. **Enable the existing second-level lookup cache.** The native FEX allocator uses demand-paged anonymous mappings. Its large virtual reservation is not equivalent to immediately committing the entire allocation on the iPhone. Full guest-address key checks remain in the existing dispatcher. This is a measured-policy experiment: FEX has also changed lookup-cache policies upstream, so the result must be judged against device CPU and resident-memory data rather than assuming a bigger cache is universally faster. [FEX 2511](https://fex-emu.com/FEX-2511/)
+
+4. **Restore the zero-fill contract required when FEX discards anonymous cache pages on Darwin.** Linux-style `MADV_DONTNEED` is used by the library as a reset operation; Darwin's ordinary advice is insufficient for that assumption. The FEX-only host shim checks mappings and uses `MADV_ZERO` for anonymous writable non-executable data, with a zero-before-`MADV_FREE` fallback. File-backed and executable mappings retain ordinary platform behavior. This prevents reusing stale entries when enabling the larger lookup cache. [Apple mmap definitions](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/mman.h), [Apple madvise implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_mman.c)
+
+5. **Avoid full CPU-state reconstruction for Metal command recording.** Only native Unix-call ordinals 36–38, the blit/compute/render command-stream interpreters, qualify. The existing native bridge still validates marshalled pointers. Submission, waits, allocation, presentation, pending signals and all other calls retain the complete path. The WoW64 tag is supported; unknown high bits are rejected. This reduces fixed overhead per recorded batch without moving guest callbacks into native code.
+
+6. **Allow the existing unaligned atomic leaf in owned generated helper code.** Previously eligibility was restricted to translated block ranges. The CASPAL replacement remains limited to an unaligned 64-bit exchange contained in one aligned 16-byte region. It does not weaken atomic ordering or replace split accesses with ordinary loads and stores.
+
+## Validation and remaining costs
+
+Nine million differential add/sub/mul cases compare production unity arithmetic with a separately compiled pinned reference, across precisions 32/64/80, all five supported rounding modes, normal and exceptional operands, output bits, raised flags and already-raised flags. The Windows-hosted WSL benchmark measured:
+
+| Operation | Separate translation units | Unity build |
+|---|---:|---:|
+| add | 8.44 ns/call | 7.62 ns/call |
+| sub | 9.50 ns/call | 6.73 ns/call |
+| mul | 7.30 ns/call | 5.56 ns/call |
+
+These are x86 host arithmetic-call measurements, not ARM64 results or frame-rate predictions. CI repeats the differential/benchmark test natively on its Mac. The emitted dispatch leaf is executed under ARM64 QEMU against register and NZCV snapshots. Additional checks cover dual-alias atomic publication, contention and protection fallback, cache discard zeroing/exclusion, malformed Metal ordinals, and the pinned dispatcher ABI. CI adds an L2-enabled translated high-address call/return fixture.
+
+**The 64-bit split-atomic storm is not fully solved.** The captured instruction is repeatedly `SWPAL x10,x10,[x3]`; many addresses cross a 16-byte boundary. Those cases still require the existing FEX handler. The current fast leaf cannot atomically cover them with one aligned CASPAL. Eliminating signal delivery for them requires a separate validated slow-path entry or a correctly integrated runtime backpatcher, including protection-fault recovery and register reconstruction. It must not be replaced by a racy memcpy. [FEX signal handling](https://wiki.fex-emu.com/index.php/Development:Debugging_FEX_with_Signals)
+
+**The D3D9 color fault remains unlocalized.** Format definitions, packed vertex-color conversion, render-target channel masks and basic native bridge layouts were checked; no evidence justifies globally swapping red and blue or disabling gamma. D3D9 explicitly applies sRGB write conversion to clear operations as well as draws. The cube now performs one-shot offscreen GPU readbacks for red/green/blue clears, red vertex color, red texture sampling and middle-gray sRGB output. These bounded `BOXEDWINE_D3D9_COLOR` lines distinguish rendering from presentation and introduce no work into ordinary games. The sRGB sample allows normal one-unit conversion rounding differences. [Microsoft D3D9 gamma contract](https://learn.microsoft.com/en-us/windows/win32/direct3d9/gamma)
+
+## Architecture alternatives
+
+The current Madeira project describes **ARM64EC Wine with FEX translating x64 application code**, a native Metal bridge, and an in-process server. Its architectural advantage includes executing more Wine/runtime code natively; it is not simply a faster implementation of Linux syscalls. Its current README and code are more reliable for this comparison than its older speculative architecture analysis. Its modified code also has licensing conditions that require review before reuse. [Madeira repository](https://github.com/willfaust/Madeira)
+
+| Option | Expected scope | Decision |
+|---|---|---|
+| Optimize native FEX dispatch, exact arithmetic and command recording in BoxedWine | Targets measured costs while retaining both guest bitnesses | Implemented in this iteration |
+| ARM64EC Wine plus x64 translation | Reduces translated Wine work; requires rebuilding/integrating a different Wine execution ABI | Promising longer-term work, not a drop-in switch |
+| Adopt an ARM64EC launcher wholesale | Also requires a new validated 32-bit execution path and different runtime ownership | Not a replacement for current 32/64 support without substantial work |
+| Relax x86 memory ordering globally | May improve some translated workloads, but introduces concurrency/correctness risk | Not enabled on these samples alone |
+| Reduce x87 precision globally | Could accelerate arithmetic but previously caused compatibility failures | Rejected; exact arithmetic retained |
+| Switch GPU translators again | Would not remove the measured software arithmetic and atomic signal work | Not the first intervention |
+
+FEX documents the cost of strong x86 memory ordering on ARM and has introduced targeted vector-memory optimizations. That supports investigating precise hot paths; it does not justify disabling ordering globally. [FEX 2404](https://fex-emu.com/FEX-2404/), [FEX 2406](https://fex-emu.com/FEX-2406/)
+
+## Device acceptance
+
+Use verbose logging off and leave reduced-precision x87 off. First run both cubes, preserving the new color-oracle log. Then compare the same 32-bit level and the same 64-bit scene with the previous build, including CPU samples, actual presentation intervals, host-fault growth and audio underruns. Record memory use after several minutes. A successful package or a faster arithmetic benchmark does not establish playable performance, correct colors, or glitch-free sound.

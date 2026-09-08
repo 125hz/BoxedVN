@@ -250,8 +250,9 @@ softfloat_namespace="${BUILD}/boxedvn-fex-softfloat.h"
 python3 "${BOXEDVN_ROOT}/scripts/fex-softfloat-namespace.py" \
     "${SOURCE}" "${softfloat_namespace}"
 cmake -S "${SOURCE}" -B "${BUILD}" -G Ninja \
-    -DCMAKE_C_FLAGS="-include ${softfloat_namespace}" \
-    -DCMAKE_CXX_FLAGS="-include ${softfloat_namespace}" \
+    -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${BOXEDVN_ROOT}/scripts/fex-softfloat-overlay.cmake" \
+    -DCMAKE_C_FLAGS="-include ${softfloat_namespace} -include ${BOXEDVN_ROOT}/include/fex_host_memory_hook.h" \
+    -DCMAKE_CXX_FLAGS="-include ${softfloat_namespace} -include ${BOXEDVN_ROOT}/include/fex_host_memory_hook.h" \
     -DCMAKE_SYSTEM_NAME=iOS \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \

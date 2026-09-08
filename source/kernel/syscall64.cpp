@@ -5037,7 +5037,7 @@ static void boxedwineDxmtEndShaderCachePath64(
 }
 #endif  // BOXEDWINE_DXMT_NATIVE
 
-static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
+U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     const bool wow64 = (callIndex & 0x80000000ULL) != 0;
     callIndex &= ~0x80000000ULL;
     static std::atomic<U32> callLogCount{0};
