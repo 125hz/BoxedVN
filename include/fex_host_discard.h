@@ -7,7 +7,6 @@
 #include <cerrno>
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #endif
 namespace boxedvn {
 inline int discardFexHostPages(void* address, size_t length, int advice) {
@@ -17,17 +16,18 @@ inline int discardFexHostPages(void* address, size_t length, int advice) {
         if (begin + length < begin || begin % vm_page_size) { errno=EINVAL; return -1; }
         // Only anonymous writable data may be zeroed. File-backed code-cache
         // views and executable aliases retain the platform's ordinary hint.
-        mach_vm_address_t cursor = begin;
-        const mach_vm_address_t end = begin + length;
+        static_assert(sizeof(vm_address_t) == sizeof(uintptr_t));
+        vm_address_t cursor = begin;
+        const vm_address_t end = begin + length;
         while (cursor < end) {
-            mach_vm_address_t region = cursor; mach_vm_size_t bytes = 0;
+            vm_address_t region = cursor; vm_size_t bytes = 0;
             natural_t depth = 0;
             vm_region_submap_info_data_64_t info{};
             mach_msg_type_number_t count;
             kern_return_t status;
             do {
                 count=VM_REGION_SUBMAP_INFO_COUNT_64;
-                status=mach_vm_region_recurse(mach_task_self(), &region, &bytes, &depth,
+                status=vm_region_recurse(mach_task_self(), &region, &bytes, &depth,
                     reinterpret_cast<vm_region_recurse_info_t>(&info), &count);
                 if(status!=KERN_SUCCESS) {errno=ENOMEM;return -1;}
                 if(info.is_submap) ++depth;

@@ -555,6 +555,7 @@ jobs:
       - name: Verify native cache discard and exact arithmetic optimization
         shell: bash
         run: |
+          xcrun clang++ -target arm64-apple-ios17.0 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -fsyntax-only -std=c++17 -Wall -Wextra -Werror -Iinclude scripts/tests/fex_host_discard.cpp
           xcrun clang++ -O2 -std=c++17 -Wall -Wextra -Werror -Iinclude scripts/tests/fex_host_discard.cpp -o /tmp/fex-discard
           /tmp/fex-discard
           python3 scripts/test_fex_ext80.py
