@@ -5137,9 +5137,9 @@ static U64 boxedwineDxmtUnixCall64(CPU64* cpu, U64 callIndex, U64 args) {
     const bool frameCall = callIndex == 47 || callIndex == 48 || callIndex == 67;
     const U64 frameBegin = frameCall ? KSystem::getMicroCounter() : 0;
     if (callIndex == 47 || callIndex == 48) {
-        if (callIndex == 47) {
-            BVNGuestFrameLimiterWait();
-        }
+        // Both immediate and minimum-duration presentation obey the user's
+        // cap. Metal's minimum duration may impose a lower rate as well.
+        BVNGuestFrameLimiterWait();
         // A presented drawable means the DXMT layer carries frames; the main
         // loop raises it above SDL's later-created view on its next poll.
         BVNDXMTDisplayNotePresented(cpu->thread->process->id);

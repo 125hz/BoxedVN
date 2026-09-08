@@ -271,7 +271,13 @@ def rewrite_source(name: str, text: str) -> str:
         # Shader thunks are the exception and WoW64 must export that table.
         rewritten = rewritten.replace("#ifndef DXMT_NATIVE\n\nstatic NTSTATUS\nthunk32_SM50Initialize", "#if !defined(DXMT_NATIVE) || defined(DXMT_IOS)\n\nstatic NTSTATUS\nthunk32_SM50Initialize")
         rewritten = rewritten.replace("#ifndef DXMT_NATIVE\nconst void *__wine_unix_call_wow64_funcs", "#if !defined(DXMT_NATIVE) || defined(DXMT_IOS)\nconst void *__wine_unix_call_wow64_funcs")
-        rewritten = re.sub(r"UInt32ToPtr\(([^()]+)\)", r"(void *)boxedwine_dxmt_host_pointer((uintptr_t)(\1))", rewritten)
+        # Convert at the helper boundary, preserving its declaration and all
+        # callers. A call-shaped regex also matches the function definition.
+        rewritten = rewrite_options(rewritten, [(
+            "UInt32ToPtr(uint32_t v) {\n  return (void *)(uint64_t)v;\n}",
+            "UInt32ToPtr(uint32_t v) {\n  return (void *)boxedwine_dxmt_host_pointer((uintptr_t)v);\n}",
+            1,
+        )])
     if name in MAIN_THREAD_HELPER_FILES:
         rewritten = rewrite_main_thread_helper(rewritten)
     return rewritten

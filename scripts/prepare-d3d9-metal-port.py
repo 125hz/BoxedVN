@@ -72,19 +72,17 @@ def main():
         "missing_candidate_native_implementations": missing_native,
         "d3d9_sources": sorted(str(p.relative_to(args.source)).replace("\\", "/")
                               for p in (args.source / "src/d3d9").glob("*.cpp")),
-        "enabled_for_runtime": False,
-        "required_before_enabling": [
-            "Port the matching Metal and DXSO compiler implementation to iOS",
-            "Marshal DXSO parameter chains and guest pointers through BoxedWine",
-            "Validate both i386 WoW64 and x86-64 call tables and structure layouts",
-            "Build matching i386 and x86-64 PE DLLs with the native library",
-            "Pass device cube rendering, reset, resource and shader smoke tests",
+        "enabled_for_runtime": pin.get("runtime_enabled", False),
+        "device_validation_pending": [
+            "Cube rendering through the packaged i386 and x86-64 DLLs",
+            "Reset, resource and shader smoke tests on iPhone",
+            "Frame limiting and application compatibility against Vulkan",
         ],
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n")
     print(f"Audited {len(report['d3d9_sources'])} D3D9 source files; {len(new_calls)} new shader calls.")
-    print("Runtime disabled pending native and WoW64 ABI integration: " + str(args.report))
+    print("Source ABI report (not device acceptance): " + str(args.report))
 
 
 if __name__ == "__main__":
