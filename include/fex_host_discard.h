@@ -33,7 +33,7 @@ inline int discardFexHostPages(void* address, size_t length, int advice) {
                 if(info.is_submap) ++depth;
             } while(info.is_submap);
             if(region>cursor || !bytes || region+bytes<=cursor) {errno=ENOMEM;return -1;}
-            if(info.external_pager || (info.protection & (VM_PROT_WRITE|VM_PROT_EXEC)) != VM_PROT_WRITE)
+            if(info.external_pager || (info.protection & (VM_PROT_WRITE|VM_PROT_EXECUTE)) != VM_PROT_WRITE)
                 return ::madvise(address,length,advice);
             cursor=region+bytes;
         }
