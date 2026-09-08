@@ -1,9 +1,11 @@
 extern "C" {
 #include "SoftFloat-3e/platform.h"
 #include "SoftFloat-3e/softfloat.h"
-FEXCORE_PRESERVE_ALL_ATTR extFloat80_t boxedvn_fex_reference_extF80_add(softfloat_state*,extFloat80_t,extFloat80_t);
-FEXCORE_PRESERVE_ALL_ATTR extFloat80_t boxedvn_fex_reference_extF80_sub(softfloat_state*,extFloat80_t,extFloat80_t);
-FEXCORE_PRESERVE_ALL_ATTR extFloat80_t boxedvn_fex_reference_extF80_mul(softfloat_state*,extFloat80_t,extFloat80_t);
+// redefine_extname emits these exact assembler names, without Mach-O's usual
+// leading underscore. Match that spelling when declaring the reference calls.
+FEXCORE_PRESERVE_ALL_ATTR extFloat80_t boxedvn_fex_reference_extF80_add(softfloat_state*,extFloat80_t,extFloat80_t) __asm__("boxedvn_fex_reference_extF80_add");
+FEXCORE_PRESERVE_ALL_ATTR extFloat80_t boxedvn_fex_reference_extF80_sub(softfloat_state*,extFloat80_t,extFloat80_t) __asm__("boxedvn_fex_reference_extF80_sub");
+FEXCORE_PRESERVE_ALL_ATTR extFloat80_t boxedvn_fex_reference_extF80_mul(softfloat_state*,extFloat80_t,extFloat80_t) __asm__("boxedvn_fex_reference_extF80_mul");
 }
 #include <cstdio>
 #include <cstdlib>
