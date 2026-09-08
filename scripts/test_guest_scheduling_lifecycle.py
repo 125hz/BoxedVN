@@ -130,11 +130,12 @@ int main(){
 '''
 
 fault = method("ios/runtime/src/BVNFEXCPU64Adapter.mm",
-               "if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inOwnedFexCode)")
-fault_code = common + r'''
+               "if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inOwnedFexCode &&")
+fault_code = common + (repo / "include/fex_host_abort.h").read_text() + r'''
 constexpr int SIGBUS=10,BUS_ADRALN=1;
 struct Info {int si_code;};
-struct Machine {struct {uint64_t __x[31]{},__pc=0;} __ss;};
+struct Machine {struct {uint64_t __x[31]{},__pc=0;} __ss;struct {uint32_t __esr=0x92000061;} __es;};
+bool BVNFEXBackendPatchUnalignedSwap(uint64_t,uint32_t){return false;}
 struct Process {int id=10;};struct Adapter {void* fexThread=nullptr;Process* process;KThread* thread;};
 bool expectedJit=false;int atomicCalls=0;
 namespace FEXCore::ArchHelpers::Arm64 {
@@ -146,7 +147,7 @@ namespace FEXCore::ArchHelpers::Arm64 {
 }
 bool recover(Adapter* adapter,Machine* machine,int signal,Info* siginfo,
              bool inCodeBuffer,bool inOwnedFexCode,uint64_t hostPC){
- uint64_t faultAddress=0x7802881e2f;
+ uint64_t faultAddress=0x7802881e2f,unalignedPC=hostPC;bool swapFault=false;
 ''' + fault + r'''
  return false;
 }

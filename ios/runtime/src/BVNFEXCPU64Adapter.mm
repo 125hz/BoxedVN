@@ -51,6 +51,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include "fex64loaderhandoff.h"
 #include "fex_callret_guard.h"
 #include "fex_host_abort.h"
+#include "fex_executable_range.h"
 #include "fex_x87_precision.h"
 #include "kmemory64.h"
 #include "kprocess.h"
@@ -85,6 +86,7 @@ extern "C" bool BVNFEXBackendPatchUnalignedSwap(uint64_t, uint32_t);
 extern "C" bool BVNFEXBackendSwapFault(uint64_t, uint64_t*, uint64_t*, bool*);
 
 struct BVNFEXCPU64Adapter {
+    boxedvn::FexExecutableRangeCache executableRanges;
     KProcess* process = nullptr;
     KThread* thread = nullptr;
     CPU64* cpu = nullptr;
@@ -250,22 +252,14 @@ extern "C" bool BVNFEXCPU64AdapterQueryExecutableRange(
     uint64_t* size, bool* writable) {
     if (!validAdapter(adapter) || !base || !size || !writable) return false;
     KMemory64* memory = adapter->process->memory64;
-    const uint64_t page = address >> K64_PAGE_SHIFT;
-    const uint32_t executable = K64_PAGE_MAPPED | K64_PAGE_EXEC;
-    if ((memory->getPageFlags(page) & executable) != executable) return false;
-
-    uint64_t first = page;
-    while (first &&
-           (memory->getPageFlags(first - 1) & executable) == executable) {
-        --first;
-    }
-    uint64_t last = page;
-    while ((memory->getPageFlags(last + 1) & executable) == executable) {
-        ++last;
-    }
+    uint64_t first = 0, last = 0;
+    if (!adapter->executableRanges.query(memory->addressSpaceGeneration(),
+            k64PageCacheGeneration(), address >> K64_PAGE_SHIFT,
+            UINT64_MAX >> K64_PAGE_SHIFT, K64_PAGE_MAPPED | K64_PAGE_EXEC,
+            K64_PAGE_WRITE, [memory](uint64_t page) { return memory->getPageFlags(page); },
+            first, last, *writable)) return false;
     *base = first << K64_PAGE_SHIFT;
     *size = (last - first + 1) << K64_PAGE_SHIFT;
-    *writable = (memory->getPageFlags(page) & K64_PAGE_WRITE) != 0;
     return true;
 }
 

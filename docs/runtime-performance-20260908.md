@@ -45,6 +45,12 @@ cause for every low frame rate.
 - Per-CALL stack witnesses are disabled by default. Set BW64_CALL_WITNESS=1
   to request them; BW64_NO_CALL_WITNESS still overrides. Return prediction,
   full x87 precision, and strict memory ordering remain enabled as before.
+- Executable-range queries cache eight homogeneous permission ranges per
+  adapter, retiring them with the existing memory-map generation. Repeated
+  decoder queries no longer walk every page in an entire module; writable
+  boundaries are also represented correctly. The test covers 1,000 consecutive
+  cache hits with zero extra page reads, protection changes and address-space
+  replacement. This targets compilation overhead, not steady-state GPU work.
 - FEX multiblock compilation is restored to the preceding working setting.
 - Missing DirectSound classes and XAudio2 2.7 registration are supplied for
   each packaged architecture, preserving existing paths and native overrides.

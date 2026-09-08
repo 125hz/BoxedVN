@@ -15,6 +15,7 @@ add_executable(boxedvn_tests
     test_elf_inspector.cpp
     test_elf_loader_policy.cpp
     test_fex_code_buffer_layout.cpp
+    test_fex_executable_range.cpp
     test_fex64_kernel.cpp
     test_fex64_loader_handoff.cpp
     test_fex_callret_guard.cpp
