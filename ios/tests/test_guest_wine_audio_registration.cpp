@@ -130,3 +130,19 @@ BOXEDVN_TEST(media_device_registration_is_architecture_scoped_and_preserves_exis
     CHECK(!boxedvn::registerWineMediaDeviceEnumerator(text, true, true));
     CHECK_EQ(text, saved);
 }
+
+BOXEDVN_TEST(crypto_provider_registration_is_packaged_only_and_preserves_custom_providers) {
+    std::string text;
+    CHECK(!boxedvn::registerWineCryptoProviders(text, false, false));
+    CHECK(boxedvn::registerWineCryptoProviders(text, true, false));
+    CHECK(text.find("Wow6432Node") == std::string::npos);
+    CHECK(text.find("Type 001") != std::string::npos);
+    CHECK(text.find("\"Type\"=dword:00000018") != std::string::npos);
+    CHECK(boxedvn::registerWineCryptoProviders(text, true, true));
+    CHECK(text.find("syswow64\\\\rsaenh.dll") != std::string::npos);
+    auto at = text.find("system32\\\\rsaenh.dll");
+    text.replace(at, std::string("system32\\\\rsaenh.dll").size(), "custom-provider.dll");
+    const auto saved = text;
+    CHECK(!boxedvn::registerWineCryptoProviders(text, true, true));
+    CHECK_EQ(text, saved);
+}

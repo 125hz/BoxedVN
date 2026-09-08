@@ -389,6 +389,9 @@ jobs:
       - name: Test source runtime trimming
         run: python3 scripts/test_wine_source_trim.py
 
+      - name: Test clipped X11 pixel operations
+        run: python3 scripts/test_x11_pixels.py
+
       - name: Test x86-64 X11 shim contract
         run: python3 -m unittest scripts/test_x64_x11_shim.py
 

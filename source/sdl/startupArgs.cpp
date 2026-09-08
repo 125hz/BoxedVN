@@ -607,6 +607,8 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
     const bool media32 = packaged(K_X64_WINE_PE32_DIR "/devenum.dll");
     const bool wbem64 = packaged(K_X64_WINE_PE_DIR "/wbemprox.dll");
     const bool wbem32 = packaged(K_X64_WINE_PE32_DIR "/wbemprox.dll");
+    const bool crypto64 = packaged(K_X64_WINE_PE_DIR "/rsaenh.dll");
+    const bool crypto32 = packaged(K_X64_WINE_PE32_DIR "/rsaenh.dll");
     const bool proxy64 = packaged(K_X64_WINE_PE_DIR "/actxprxy.dll");
     const bool proxy32 = packaged(K_X64_WINE_PE32_DIR "/actxprxy.dll");
     auto node = Fs::getNodeFromLocalPath(B(""), winePrefix + "/system.reg", true);
@@ -630,6 +632,10 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
                 changed |= boxedvn::registerWineWbemLocator(contents, wbem64, wbem32);
                 changed |= boxedvn::registerWineMediaDeviceEnumerator(contents, media64, media32);
                 changed |= boxedvn::registerWineServiceProviderProxy(contents, proxy64, proxy32);
+                const bool cryptoChanged = boxedvn::registerWineCryptoProviders(contents, crypto64, crypto32);
+                changed |= cryptoChanged;
+                klog_fmt("BOXEDWINE_X64_CRYPTO_REGISTRY added_missing_keys=%d pe64=%d pe32=%d",
+                    cryptoChanged ? 1 : 0, crypto64 ? 1 : 0, crypto32 ? 1 : 0);
             }
             if (changed) {
                 const BString temp = node->nativePath + ".boxedvn-com";

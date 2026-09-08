@@ -160,6 +160,7 @@ public:
 
 	const U32 id;
 	std::vector<XRectangle> clip_rects;
+	bool clipRectsSet = false; // An explicitly empty region clips everything.
 
 	void updateValues(U32 mask, XGCValues* values);
 	XGCValues values;

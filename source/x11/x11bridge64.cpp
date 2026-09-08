@@ -2245,7 +2245,9 @@ S64 op_SET_GC_VALUE(Call& call) {
     case BOXEDWINE_X64_X11_GC_FOREGROUND: gc->values.foreground = (U32)value; break;
     case BOXEDWINE_X64_X11_GC_SUBWINDOW_MODE: gc->values.subwindow_mode = (S32)value; break;
     case BOXEDWINE_X64_X11_GC_GRAPHICS_EXPOSURES: gc->values.graphics_exposures = value ? True : False; break;
-    case BOXEDWINE_X64_X11_GC_CLIP_MASK: gc->values.clip_mask = (U32)value; break;
+    case BOXEDWINE_X64_X11_GC_CLIP_MASK:
+        gc->values.clip_mask = (U32)value;
+        gc->clip_rects.clear(); gc->clipRectsSet = false; break;
     case BOXEDWINE_X64_X11_GC_FILL_STYLE: gc->values.fill_style = (S32)value; break;
     case BOXEDWINE_X64_X11_GC_ARC_MODE: gc->values.arc_mode = (S32)value; break;
     default: return BadValue;
@@ -2271,6 +2273,8 @@ S64 op_SET_CLIP_RECTANGLES(Call& call) {
     gc->values.clip_x_origin = call.iarg(2);
     gc->values.clip_y_origin = call.iarg(3);
     gc->clip_rects.clear();
+    gc->clipRectsSet = true;
+    gc->values.clip_mask = 0;
     for (U64 i = 0; i < count; i++) {
         XRectangle r;
         const U32 offset = (U32)(i * L::XRectangle::size);
@@ -2369,18 +2373,38 @@ S64 op_PUT_IMAGE(Call& call) {
     if (srcX < 0 || srcY < 0 || !bytesPerLine || height > 16384 || width > 16384) {
         return BadValue;
     }
-    // Only the rows this transfer reads are copied out of the guest.
-    const U64 firstRow = (U64)bytesPerLine * (U64)srcY;
-    const U64 rowBytes = ((U64)bitsPerPixel * (srcX + width) + 7) / 8;
-    const U64 needed = firstRow + (U64)bytesPerLine * (height ? height - 1 : 0) + rowBytes;
+    if (!width || !height) return Success;
+    // Preserve the packed-bitmap path; the row-gather optimization below is
+    // for byte-aligned images only.
+    if (bitsPerPixel == 1) {
+        const U64 needed = ((U64)srcY + height) * bytesPerLine;
+        if (needed > 256u * 1024u * 1024u) return BadValue;
+        std::vector<U8> bytes((size_t)needed);
+        if (!call.read(dataAddress, bytes.data(), needed)) return BOXEDWINE_X64_X11_E_FAULT;
+        return drawable->copyHostImageData(gc, bytes.data(), (U32)needed, bytesPerLine,
+            1, srcX, srcY, call.iarg(6), call.iarg(7), width, height);
+    }
+    if (bitsPerPixel != 8 && bitsPerPixel != 16 && bitsPerPixel != 24 && bitsPerPixel != 32)
+        return BadMatch;
+    // A small dirty rectangle near the bottom of a large surface must not
+    // copy every preceding scanline. Gather just its pixels into a tight image.
+    const U64 pixelBytes = bitsPerPixel / 8;
+    const U64 firstRow = (U64)bytesPerLine * (U64)srcY + (U64)srcX * pixelBytes;
+    const U64 rowBytes = pixelBytes * width;
+    if (((U64)srcX + width) * pixelBytes > bytesPerLine) return BadValue;
+    const U64 needed = rowBytes * height;
     if (needed > 256u * 1024u * 1024u) {
         return BadValue;
     }
     std::vector<U8> bytes((size_t)needed);
-    if (needed && !call.read(dataAddress, bytes.data(), needed)) {
-        return BOXEDWINE_X64_X11_E_FAULT;
+    for (U32 y = 0; y < height; ++y) {
+        U64 offset = firstRow + (U64)y * bytesPerLine;
+        if (dataAddress > UINT64_MAX - offset ||
+            !call.read(dataAddress + offset, bytes.data() + y*rowBytes, rowBytes))
+            return BOXEDWINE_X64_X11_E_FAULT;
     }
-    return drawable->copyHostImageData(gc, bytes.data(), (U32)bytes.size(), bytesPerLine, (S32)bitsPerPixel, srcX, srcY, call.iarg(6), call.iarg(7), width, height);
+    return drawable->copyHostImageData(gc, bytes.data(), (U32)bytes.size(), (U32)rowBytes,
+        (S32)bitsPerPixel, 0, 0, call.iarg(6), call.iarg(7), width, height);
 }
 
 S64 op_GET_IMAGE(Call& call) {

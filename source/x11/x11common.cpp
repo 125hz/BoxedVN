@@ -2278,6 +2278,8 @@ static void x11_SetClipMask(CPU* cpu) {
         return;
     }
     gc->values.clip_mask = ARG3;
+    gc->clip_rects.clear();
+    gc->clipRectsSet = false;
     EAX = Success;
 }
 
@@ -2294,6 +2296,8 @@ static void x11_SetClipRectangles(CPU* cpu) {
     gc->values.clip_x_origin = (S32)ARG3;
     gc->values.clip_y_origin = (S32)ARG4;
     gc->clip_rects.clear();
+    gc->clipRectsSet = true;
+    gc->values.clip_mask = 0;
 
     U32 count = ARG6;
     U32 rectAddress = ARG5;

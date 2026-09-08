@@ -41,6 +41,45 @@ inline bool insertMissingWineRegistryValue(std::string& contents,
     return true;
 }
 
+// Wine 11 dlls/rsaenh/rsaenh.rgs. Projected DLLs can be available before
+// wineboot has run their registration resources. CryptoAPI needs these keys
+// even for RNG creation; a missing provider can surface as a managed null RNG.
+inline bool registerWineCryptoProviders(std::string& contents, bool pe64, bool pe32) {
+    bool changed = false;
+    struct Provider { const char* name; const char* type; };
+    const Provider providers[] = {
+        {"Microsoft Base Cryptographic Provider v1.0", "dword:00000001"},
+        {"Microsoft Enhanced Cryptographic Provider v1.0", "dword:00000001"},
+        {"Microsoft Strong Cryptographic Provider", "dword:00000001"},
+        {"Microsoft Enhanced RSA and AES Cryptographic Provider", "dword:00000018"},
+        {"Microsoft Enhanced RSA and AES Cryptographic Provider (Prototype)", "dword:00000018"},
+        {"Microsoft RSA SChannel Cryptographic Provider", "dword:0000000c"}
+    };
+    for (int bits : {64, 32}) {
+        if (!(bits == 64 ? pe64 : pe32)) continue;
+        const std::string root = std::string("Software\\\\") +
+            (bits == 32 ? "Wow6432Node\\\\" : "") + "Microsoft\\\\Cryptography\\\\Defaults\\\\";
+        for (const auto& provider : providers) {
+            const auto key = root + "Provider\\\\" + provider.name;
+            const bool added = insertMissingWineRegistryValue(contents, key, "\"Image Path\"",
+                bits == 64 ? "\"C:\\\\windows\\\\system32\\\\rsaenh.dll\"" :
+                             "\"C:\\\\windows\\\\syswow64\\\\rsaenh.dll\"");
+            if (added) {
+                insertMissingWineRegistryValue(contents, key, "\"Type\"", provider.type);
+                insertMissingWineRegistryValue(contents, key, "\"Signature\"", "hex:de,ad,be,ef");
+            }
+            changed |= added;
+        }
+        changed |= insertMissingWineRegistryValue(contents, root + "Provider Types\\\\Type 001", "\"Name\"",
+            "\"Microsoft Enhanced Cryptographic Provider v1.0\"");
+        changed |= insertMissingWineRegistryValue(contents, root + "Provider Types\\\\Type 012", "\"Name\"",
+            "\"Microsoft RSA SChannel Cryptographic Provider\"");
+        changed |= insertMissingWineRegistryValue(contents, root + "Provider Types\\\\Type 024", "\"Name\"",
+            "\"Microsoft Enhanced RSA and AES Cryptographic Provider\"");
+    }
+    return changed;
+}
+
 // Wine 11 actxprxy_servprov.idl registers this proxy factory for
 // IServiceProvider. Shell services marshal it between processes.
 inline bool registerWineServiceProviderProxy(std::string& contents, bool pe64, bool pe32) {

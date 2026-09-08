@@ -54,7 +54,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    }
    params->ret = (obj_handle_t)buffer;
    info->gpu_address = [buffer gpuAddress];
-@@ -1313,22 +1337,46 @@
+@@ -1313,22 +1337,54 @@
  static NTSTATUS
  _MTLBuffer_didModifyRange(void *obj) {
    struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
@@ -82,6 +82,10 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  _MTLCommandBuffer_presentDrawable(void *obj) {
    struct unixcall_generic_obj_obj_noret *params = obj;
 -  [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
++  if (!params->arg) {
++    atomic_fetch_add_explicit(&bvn_present_count, 1, memory_order_relaxed);
++    return STATUS_SUCCESS;
++  }
 +  if (atomic_load_explicit(&bvn_present_mode, memory_order_relaxed) == 1)
 +    [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg
 +                                     afterMinimumDuration:(1.0 / 60.0)];
@@ -94,6 +98,10 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  static NTSTATUS
  _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
    struct unixcall_generic_obj_obj_double_noret *params = obj;
++  if (!params->arg0) {
++    atomic_fetch_add_explicit(&bvn_present_count, 1, memory_order_relaxed);
++    return STATUS_SUCCESS;
++  }
 +  double duration = params->arg1;
 +  if (atomic_load_explicit(&bvn_present_mode, memory_order_relaxed) == 1 && duration < 1.0 / 60.0)
 +    duration = 1.0 / 60.0;
@@ -104,7 +112,51 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    return STATUS_SUCCESS;
  }
  
-@@ -1615,7 +1663,9 @@
+@@ -1584,10 +1640,42 @@
+   return STATUS_SUCCESS;
+ }
+ 
++@interface BVNMetalDrawableClock : NSObject
++@property(nonatomic) CFTimeInterval lastAcquisition;
++@end
++@implementation BVNMetalDrawableClock
++@end
++static char bvnDrawableClockKey;
++
+ static NTSTATUS
+ _MetalLayer_nextDrawable(void *obj) {
+   struct unixcall_generic_obj_obj_ret *params = obj;
+-  params->ret = (obj_handle_t)[(CAMetalLayer *)params->handle nextDrawable];
++  CAMetalLayer *layer = (CAMetalLayer *)params->handle;
++  // Game rendering remains offscreen. Only acquire a display image at the
++  // display cadence, so nextDrawable cannot pace an unlocked CPU to refresh.
++  // The presenter preserves its fence chain when this returns nil.
++  if (atomic_load_explicit(&bvn_present_mode, memory_order_relaxed) == 2) {
++    BVNMetalDrawableClock *clock = objc_getAssociatedObject(layer, &bvnDrawableClockKey);
++    if (!clock) {
++      @synchronized(layer) {
++        clock = objc_getAssociatedObject(layer, &bvnDrawableClockKey);
++        if (!clock) {
++          clock = [[BVNMetalDrawableClock alloc] init];
++          objc_setAssociatedObject(layer, &bvnDrawableClockKey, clock, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++          [clock release];
++        }
++      }
++    }
++    CFTimeInterval now = CACurrentMediaTime();
++    // A layer is encoded by one presenter thread. Different layers have
++    // independent clocks, and replacing a layer resets its clock.
++    if (now - clock.lastAcquisition < 1.0 / 120.0) {
++      params->ret = 0;
++      return STATUS_SUCCESS;
++    }
++    clock.lastAcquisition = now;
++  }
++  params->ret = (obj_handle_t)[layer nextDrawable];
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -1615,7 +1703,9 @@
      layer.opaque = props->opaque;
      layer.framebufferOnly = props->framebuffer_only;
      layer.contentsScale = props->contents_scale;
@@ -114,7 +166,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
      layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
      layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
    });
-@@ -1631,7 +1681,11 @@
+@@ -1631,7 +1721,11 @@
    props->opaque = layer.opaque;
    props->framebuffer_only = layer.framebufferOnly;
    props->contents_scale = layer.contentsScale;
@@ -126,7 +178,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    props->drawable_height = layer.drawableSize.height;
    props->drawable_width = layer.drawableSize.width;
    props->pixel_format = layer.pixelFormat;
-@@ -1840,7 +1894,13 @@
+@@ -1840,7 +1934,13 @@
  static NTSTATUS
  _MTLDevice_setShouldMaximizeConcurrentCompilation(void *args) {
    struct unixcall_generic_obj_uint64_noret *params = args;
@@ -140,7 +192,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    return STATUS_SUCCESS;
  }
  
-@@ -2276,6 +2336,7 @@
+@@ -2276,6 +2376,7 @@
    struct unixcall_generic_obj_ret *params = obj;
    params->ret = kCGNullDirectDisplay;
  
@@ -148,7 +200,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    uint32_t count = 0;
    CGGetOnlineDisplayList(0, NULL, &count);
  
-@@ -2295,10 +2356,12 @@
+@@ -2295,10 +2396,12 @@
      params->ret = id;
      break;
    }
@@ -165,7 +217,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  typedef struct icc_XYZ_t {
    uint32_t sig;      // 0x205a5958
    uint32_t reserved; // 0
-@@ -2340,7 +2403,9 @@
+@@ -2340,7 +2443,9 @@
               profile, kColorSyncSigBlueColorantTag, &desc_out->blue_primaries[0], &desc_out->blue_primaries[1]
           );
  }
@@ -176,7 +228,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  NSScreen *
  GetNSScreenForDisplayID(CGDirectDisplayID display_id) {
    for (NSScreen *screen in [NSScreen screens]) {
-@@ -2351,12 +2416,19 @@
+@@ -2351,12 +2456,19 @@
    }
    return nil;
  }
@@ -197,7 +249,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
    if (!profile || !GetDisplayColorGamut(profile, desc_out))
      GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
-@@ -2372,6 +2444,7 @@
+@@ -2372,6 +2484,7 @@
      desc_out->maximum_reference_edr_color_component_value = 0.0;
      desc_out->maximum_potential_edr_color_component_value = 1.0;
    }
@@ -205,7 +257,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    return STATUS_SUCCESS;
  }
  
-@@ -2391,6 +2464,7 @@
+@@ -2391,6 +2504,7 @@
    value->maximum_edr_color_component_value = 1.0;
    value->maximum_potential_edr_color_component_value = 1.0;
  
@@ -213,7 +265,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    if (![layer.delegate isKindOfClass:NSView.class])
      return STATUS_SUCCESS;
  
-@@ -2406,6 +2480,7 @@
+@@ -2406,6 +2520,7 @@
    value->maximum_edr_color_component_value =
        layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
    value->maximum_potential_edr_color_component_value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
@@ -221,7 +273,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  
    return STATUS_SUCCESS;
  }
-@@ -2466,6 +2541,10 @@
+@@ -2466,6 +2581,10 @@
    struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
  
    params->version = 0;
@@ -232,7 +284,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    if (![layer.delegate isKindOfClass:NSView.class])
      return STATUS_SUCCESS;
  
-@@ -2489,6 +2568,7 @@
+@@ -2489,6 +2608,7 @@
        screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
  
    return STATUS_SUCCESS;
@@ -240,7 +292,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  }
  
  static NTSTATUS
-@@ -2622,8 +2702,10 @@
+@@ -2622,8 +2742,10 @@
  _MTLBuffer_updateContents(void *obj) {
    struct unixcall_mtlbuffer_updatecontents *params = obj;
    memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
@@ -251,7 +303,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
    return STATUS_SUCCESS;
  }
  
-@@ -3034,7 +3116,7 @@
+@@ -3034,7 +3156,7 @@
    else
      buffer =
          [heap newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options offset:params->offset];
@@ -260,7 +312,7 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  
    params->ret = (obj_handle_t)buffer;
    info->gpu_address = [buffer gpuAddress];
-@@ -3436,6 +3518,9 @@
+@@ -3436,6 +3558,9 @@
  
    return STATUS_SUCCESS;
  }
@@ -270,6 +322,71 @@ diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_
  
  const void *__wine_unix_call_funcs[] = {
      &_NSObject_retain,
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -362,6 +362,9 @@
+ };
+ 
+ class ArgumentEncodingContext {
++  // ClearUAV constructs pipelines via this context during member construction.
++  // Declaration order, not the initializer-list order, controls initialization.
++  WMT::Device device_;
+   friend struct SimpleCommandContext<ArgumentEncodingContext>;
+ private:
+   template <PipelineStage stage> void track(GenericAccessTracker &tracker, int flags);
+@@ -1024,7 +1027,6 @@
+ 
+   uint64_t intrapass_barrier_control_bits_ = 0;
+ 
+-  WMT::Device device_;
+   CommandQueue& queue_;
+   bool persistent_residency_retired_ = false;
+   // Depth-write-always state for the depth resolve pass; created on first use.
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -31,6 +31,7 @@
+ namespace dxmt {
+ 
+ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
++    device_(device),
+     lib(lib),
+     emulated_cmd(device, lib, *this),
+     clear_rt_cmd(device, lib, *this),
+@@ -41,7 +42,6 @@
+     mv_scale_cmd(device, lib, *this),
+     tile_barrier_cmd(device, lib, *this),
+     timestamp_state_(device),
+-    device_(device),
+     queue_(queue) {
+   dummy_sampler_info_.support_argument_buffers = true;
+   dummy_sampler_info_.border_color = WMTSamplerBorderColorTransparentBlack;
+diff --git a/src/dxmt/dxmt_presenter.cpp b/src/dxmt/dxmt_presenter.cpp
+--- a/src/dxmt/dxmt_presenter.cpp
++++ b/src/dxmt/dxmt_presenter.cpp
+@@ -190,6 +190,21 @@
+     std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+ ) {
+   auto drawable = layer_.nextDrawable();
++  if (!drawable) {
++    // No display image this frame (unlocked mailbox or a hidden layer).
++    // Keep the dependency chain intact without sampling or overwriting the
++    // application's backbuffer. Merely returning would strand fence users.
++    WMTRenderPassInfo fence_pass;
++    WMT::InitializeRenderPassInfo(fence_pass);
++    fence_pass.colors[0].texture = backbuffer;
++    fence_pass.colors[0].load_action = WMTLoadActionLoad;
++    fence_pass.colors[0].store_action = WMTStoreActionStore;
++    auto encoder = cmdbuf.renderCommandEncoder(fence_pass);
++    wait_fences(encoder);
++    update_fences(encoder);
++    encoder.endEncoding();
++    return {};
++  }
+   auto drawable_tex = drawable.texture();
+ 
+   WMTRenderPassInfo info;
 diff --git a/src/util/wsi_platform_win32.cpp b/src/util/wsi_platform_win32.cpp
 --- a/src/util/wsi_platform_win32.cpp
 +++ b/src/util/wsi_platform_win32.cpp

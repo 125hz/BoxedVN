@@ -12,6 +12,10 @@
 @property(nonatomic, strong) UILabel* selectionLabel;
 @property(nonatomic, strong) UIStackView* toolbar;
 @property(nonatomic, strong) UIButton* displayButton;
+@property(nonatomic, strong) UIButton* menuButton;
+@property(nonatomic) CGPoint menuPosition;
+@property(nonatomic) BOOL menuOpen;
+@property(nonatomic) BOOL menuDimmed;
 @property(nonatomic, copy) void (^keyboardRequested)(void);
 @property(nonatomic) NSInteger selection;
 @property(nonatomic) BOOL editing;
@@ -50,6 +54,21 @@
         if (i == 2) self.displayButton = button;
     }
     [self addSubview:self.toolbar];
+    self.menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.menuButton setImage:[UIImage systemImageNamed:@"line.3.horizontal"] forState:UIControlStateNormal];
+    self.menuButton.accessibilityLabel = @"Fullscreen menu";
+    self.menuButton.accessibilityHint = @"Drag to reposition";
+    self.menuButton.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.85];
+    self.menuButton.layer.cornerRadius = 22;
+    [self.menuButton addTarget:self action:@selector(wakeMenu) forControlEvents:UIControlEventTouchDown];
+    [self.menuButton addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+    [self.menuButton addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragMenu:)]];
+    [self addSubview:self.menuButton];
+    NSArray* menuPosition = [NSUserDefaults.standardUserDefaults arrayForKey:@"BoxedVN.fullscreenMenu.position"];
+    self.menuPosition = menuPosition.count == 2 && [menuPosition[0] isKindOfClass:NSNumber.class] &&
+        [menuPosition[1] isKindOfClass:NSNumber.class]
+        ? CGPointMake(MAX(0, MIN(1, [menuPosition[0] doubleValue])), MAX(0, MIN(1, [menuPosition[1] doubleValue])))
+        : CGPointMake(1, 0.5);
     id saved = [NSUserDefaults.standardUserDefaults arrayForKey:@"BoxedVN.touchLayout.v1"];
     for (id item in saved) {
         if (![item isKindOfClass:NSDictionary.class] || ![keys containsObject:item[@"key"]]) continue;
@@ -64,21 +83,56 @@
         name:UIApplicationWillResignActiveNotification object:nil];
     return self;
 }
-- (void)dealloc { [self releaseControls]; [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (void)dealloc { [NSObject cancelPreviousPerformRequestsWithTarget:self]; [self releaseControls]; [NSNotificationCenter.defaultCenter removeObserver:self]; }
 - (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)event {
     UIView* hit = [super hitTest:p withEvent:event];
     return hit == self ? nil : hit;
 }
 - (void)setHidden:(BOOL)hidden {
-    if (hidden) { [self releaseControls]; self.editing = NO; self.editor.hidden = YES; }
+    if (hidden) {
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(dimMenu) object:nil];
+        [self releaseControls]; self.editing = NO; self.editor.hidden = YES; self.menuOpen = NO;
+    }
     [super setHidden:hidden];
+    if (!hidden) [self wakeMenu];
+}
+- (void)wakeMenu {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(dimMenu) object:nil];
+    self.menuDimmed = NO;
+    [self.menuButton.layer removeAllAnimations];
+    self.menuButton.alpha = self.controlOpacity;
+    if (!self.hidden && !self.menuOpen && !self.editing)
+        [self performSelector:@selector(dimMenu) withObject:nil afterDelay:4
+                      inModes:@[NSRunLoopCommonModes]];
+}
+- (void)dimMenu {
+    if (self.menuOpen || self.editing || self.hidden) return;
+    self.menuDimmed = YES;
+    [UIView animateWithDuration:0.3 animations:^{ self.menuButton.alpha = self.controlOpacity * 0.4; }];
+}
+- (void)toggleMenu {
+    self.menuOpen = !self.menuOpen;
+    [self wakeMenu]; [self setNeedsLayout];
+}
+- (void)dragMenu:(UIPanGestureRecognizer*)gesture {
+    CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
+    CGPoint delta = [gesture translationInView:self]; [gesture setTranslation:CGPointZero inView:self];
+    self.menuPosition = CGPointMake(MAX(0, MIN(1, self.menuPosition.x + delta.x/MAX(1, area.size.width-52))),
+                                   MAX(0, MIN(1, self.menuPosition.y + delta.y/MAX(1, area.size.height-52))));
+    [self wakeMenu]; [self setNeedsLayout];
+    if (gesture.state == UIGestureRecognizerStateEnded || gesture.state == UIGestureRecognizerStateCancelled)
+        [NSUserDefaults.standardUserDefaults setObject:@[@(self.menuPosition.x), @(self.menuPosition.y)]
+                                                forKey:@"BoxedVN.fullscreenMenu.position"];
 }
 - (CGFloat)controlOpacity {
     id value = [NSUserDefaults.standardUserDefaults objectForKey:@"BoxedVN.controls.opacity"];
     return value ? MAX(0.1, MIN(1.0, [value doubleValue])) : 0.7;
 }
 - (void)save { [NSUserDefaults.standardUserDefaults setObject:self.items forKey:@"BoxedVN.touchLayout.v1"]; }
-- (void)showKeyboard { if (self.keyboardRequested) self.keyboardRequested(); }
+- (void)showKeyboard {
+    self.menuOpen = NO; [self wakeMenu]; [self setNeedsLayout];
+    if (self.keyboardRequested) self.keyboardRequested();
+}
 - (void)changeDisplay {
     BVNGuestSetPresentationMode((BVNGuestPresentationMode() + 1) % 3);
     [self setNeedsLayout];
@@ -132,13 +186,22 @@
     }
     if (self.editor) [self bringSubviewToFront:self.editor];
     [self bringSubviewToFront:self.toolbar];
+    [self bringSubviewToFront:self.menuButton];
     [self setNeedsLayout];
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGRect area = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
-    self.toolbar.frame = CGRectMake(CGRectGetMidX(area)-138, CGRectGetMaxY(area)-48, 276, 44);
-    self.toolbar.hidden = self.editing;
+    self.menuButton.frame = CGRectMake(area.origin.x+4+self.menuPosition.x*MAX(0, area.size.width-52),
+                                      area.origin.y+4+self.menuPosition.y*MAX(0, area.size.height-52), 44, 44);
+    self.menuButton.hidden = self.editing;
+    self.menuButton.alpha = self.controlOpacity * (self.menuDimmed ? 0.4 : 1);
+    CGFloat menuWidth = MIN(276, area.size.width-8);
+    CGFloat menuX = self.menuPosition.x < 0.5 ? CGRectGetMaxX(self.menuButton.frame)+4
+                                            : CGRectGetMinX(self.menuButton.frame)-menuWidth-4;
+    menuX = MAX(area.origin.x+4, MIN(menuX, CGRectGetMaxX(area)-menuWidth-4));
+    self.toolbar.frame = CGRectMake(menuX, self.menuButton.frame.origin.y, menuWidth, 44);
+    self.toolbar.hidden = self.editing || !self.menuOpen;
     self.toolbar.alpha = self.controlOpacity;
     [self.displayButton setTitle:@[@"Fit", @"Fill", @"Stretch"][BVNGuestPresentationMode()]
                        forState:UIControlStateNormal];
@@ -175,7 +238,8 @@
     [self.editor addSubview:button]; return button;
 }
 - (void)editLayout {
-    [self releaseControls]; self.editing = YES;
+    [self releaseControls]; self.editing = YES; self.menuOpen = NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(dimMenu) object:nil];
     if (!self.editor) {
         self.editor = [[UIView alloc] init]; self.editor.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.98];
         self.editor.layer.cornerRadius = 12; [self addSubview:self.editor];
@@ -230,7 +294,7 @@
     }
     [self setNeedsLayout];
 }
-- (void)doneEditing { self.editing=NO; self.editor.hidden=YES; [self rebuild]; [self save]; }
+- (void)doneEditing { self.editing=NO; self.editor.hidden=YES; [self rebuild]; [self save]; [self wakeMenu]; }
 - (NSInteger)numberOfComponentsInPickerView:(UIPickerView*)picker { return 1; }
 - (NSInteger)pickerView:(UIPickerView*)picker numberOfRowsInComponent:(NSInteger)component { return self.keys.count; }
 - (NSString*)pickerView:(UIPickerView*)picker titleForRow:(NSInteger)row forComponent:(NSInteger)component { return self.keys[row]; }

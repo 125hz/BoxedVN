@@ -26,7 +26,7 @@
 #include <mutex>
 #include "../../source/kernel/devs/oss.h"
 
-#define DSP_BUFFER_SIZE (1024*32)
+#define DSP_BUFFER_SIZE (1024*64)
 
 // SDL's iOS backend picks the *ambient* AVAudioSession category by default,
 // which is silenced by the hardware ring/silent switch and ducked by whatever

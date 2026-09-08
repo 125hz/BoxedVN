@@ -28,8 +28,8 @@ namespace {
 void testDspAudioWriteMath() {
 	expectEqual(
 		KDspAudioMath::getWriteCapacity(11025, 4096, DSP_TEST_BUFFER_SIZE),
-		4096,
-		"default 11025Hz mono U8 capacity uses at least one fragment");
+		12288,
+		"default 11025Hz mono U8 capacity holds three fragments");
 
 	expectEqual(
 		KDspAudioMath::getWriteCapacity(48000 * 2 * 2, 4096, DSP_TEST_BUFFER_SIZE),

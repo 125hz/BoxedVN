@@ -11,12 +11,12 @@
 #define __KDSPAUDIO_MATH_H__
 
 namespace KDspAudioMath {
-    // OSS fragments must cover at least one host callback period. Wine queues
-    // three fragments ahead; using 4096 bytes for float stereo only covered
-    // half of a 1024-frame callback and gave the producer very little slack.
+    // Cover two host callbacks per default fragment. A translated producer
+    // can miss a callback while compiling shaders/CPU blocks. Wine queues
+    // three fragments ahead, and the capacity below must permit all three.
     inline U32 getDefaultFragmentSize(U32 guestBytesPerSecond, U32 hostRate, U32 hostFrames) {
         if (!hostRate) return 4096;
-        U64 needed = ((U64)guestBytesPerSecond * hostFrames + hostRate - 1) / hostRate;
+        U64 needed = ((U64)guestBytesPerSecond * hostFrames * 2 + hostRate - 1) / hostRate;
         U32 size = 4096;
         while (size < needed && size < 16384) size *= 2;
         return size;
@@ -39,8 +39,9 @@ namespace KDspAudioMath {
 
 	inline U32 getWriteCapacity(U32 bytesPerSecond, U32 fragmentSize, U32 bufferSize) {
 		U32 capacity = bytesPerSecond / 8;
-		if (capacity < fragmentSize) {
-			capacity = fragmentSize;
+		if (capacity < (U64)fragmentSize * 3) {
+			const U64 fragments = (U64)fragmentSize * 3;
+			capacity = fragments > bufferSize ? bufferSize : (U32)fragments;
 		}
 		if (capacity > bufferSize) {
 			capacity = bufferSize;

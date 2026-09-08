@@ -37,7 +37,9 @@ using U64=unsigned long long; using U32=unsigned;
 struct Condition {std::mutex mutex;std::condition_variable cv;};
 using BOXEDWINE_CONDITION=std::shared_ptr<Condition>;
 struct CPU64;
+struct Process { U32 id=10; };
 struct KThread {
+ U32 id=11; Process storage; Process* process=&storage;
  U64 pendingSignals=0; std::mutex pendingSignalsMutex,waitingCondSync;
  CPU64* cpu64=nullptr; bool terminating=false,interruptibleWait64=false;
  BOXEDWINE_CONDITION waitingCond;
@@ -109,6 +111,10 @@ code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleScala
 code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handlePollingQuery(")
 code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleVulkanRecording(")
 code += method("platform/sdl/kvulkanSDL.cpp", "bool KVulkdanSDLImpl::isPendingPresentationWindow(")
+syscalls = (repo / "source/kernel/syscall64.cpp").read_text()
+start = syscalls.index("case X64_SYS_getpid:", syscalls.index("case X64_SYS_getpid:"))
+end = syscalls.index("break;", syscalls.index("case X64_SYS_gettid:", start)) + len("break;")
+code += "enum {X64_SYS_getpid=39,X64_SYS_gettid=186}; U64 identity(CPU64* cpu,int call){U64 ret=0;switch(call){" + syscalls[start:end] + "}return ret;}"
 code += (repo / "include/kdspaudio_math.h").read_text()
 code += r'''
 constexpr int K_EINVAL=22;
@@ -135,10 +141,12 @@ int main() {
  assert(!presentation.isPendingPresentationWindow(window)); // rendered surface wins
  surfaces.clear();surfaces.push_back({window,false,true,false});
  assert(!presentation.isPendingPresentationWindow(window)); // offscreen helper
- assert(KDspAudioMath::getDefaultFragmentSize(44100*8,48000,1024)==8192);
- assert(KDspAudioMath::getDefaultFragmentSize(44100*4,48000,1024)==4096);
+ assert(KDspAudioMath::getDefaultFragmentSize(44100*8,48000,1024)==16384);
+ assert(KDspAudioMath::getDefaultFragmentSize(44100*4,48000,1024)==8192);
  assert(KDspAudioMath::getDefaultFragmentSize(192000*32,48000,4096)==16384);
  assert(KDspAudioMath::getDefaultFragmentSize(352800,0,1024)==4096);
+ assert(KDspAudioMath::getWriteCapacity(352800,16384,65536)==49152);
+ assert(KDspAudioMath::getWriteCapacity(1,0xffffffff,65536)==65536);
  DevDsp dsp;
  assert(dsp.space()==12480); // capacity is 5 fragments; free bytes include the remainder
  assert(dsp.arg.words[0]==3 && dsp.arg.words[1]==5 && dsp.arg.words[3]==12480);
@@ -158,7 +166,7 @@ int main() {
  forgetPhysicalDevices(a);assert(physicalDeviceInstance(da)==nullptr);
  rememberPhysicalDevices(b,&da,1);assert(physicalDeviceInstance(da)==b); // recycled handle
 
- KThread t;CPU64 c;t.cpu64=&c;c.thread=&t;c.sigActions[10]={true,0x8000,K_SA_RESTART};
+ KThread t;CPU64 c; c.thread=&t; assert(identity(&c,39)==10 && identity(&c,186)==11); t.id=22; assert(identity(&c,39)==10 && identity(&c,186)==22);t.cpu64=&c;c.thread=&t;c.sigActions[10]={true,0x8000,K_SA_RESTART};
  c.rip=0x1002;c.syscallRip=0x1000;c.reg[0].setU64(-4ULL);
  t.queuePendingSignal(10,true);assert(c.hasDeliverableSignal());
  c.sigMask=1ULL<<9;assert(!c.hasDeliverableSignal());assert(!c.deliverPendingSignals());

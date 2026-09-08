@@ -6316,6 +6316,11 @@ void ksyscall64(CPU64* cpu) {
             break;
         }
         case X64_SYS_getpid:
+            // Linux process IDs are shared by every CLONE_THREAD sibling.
+            // Returning the caller's TID breaks runtime ownership checks and
+            // directs process-wide signals to the wrong emulated process.
+            ret = cpu->thread && cpu->thread->process ? cpu->thread->process->id : 1;
+            break;
         case X64_SYS_gettid:
             ret = cpu->thread ? cpu->thread->id : 1;
             break;

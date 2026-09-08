@@ -1078,13 +1078,13 @@ bool initializeFEXGlobals() {
                             gReducedX87Precision ? "1" : "0");
         reportf("BOXEDWINE_FEX64_X87 precision=%s",
                 gReducedX87Precision ? "64-fast" : "80-full");
-        // The bundled ELF loader exercises dense, cyclic control flow before
-        // Wine reaches its first process boundary.  Keep each compiled unit to
-        // one basic block while the BoxedWine backend is being brought up.  It
-        // avoids optimizer/linker ambiguity without disabling the JIT, and is
-        // still an optional FEX-only policy.
-        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "0");
-        reportf("FEX multiblock compilation disabled for deterministic guest control flow");
+        // Group connected basic blocks using FEX's normal compilation mode.
+        // Single-block bring-up forced hot control flow through the unlinked
+        // dispatcher repeatedly (millions of cached CompileBlock visits).
+        // Keep the unstable dead-flag pass disabled and the direct linker
+        // bypass below; neither is required for multiblock compilation.
+        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "1");
+        reportf("FEX multiblock compilation enabled; direct linking remains disabled");
         // Do not use CONFIG_MAXINST as a live-guest diagnostic. Forcing every
         // instruction through a separate exit/link sequence amplified the iOS
         // linker-lock defect and changed a later stall into an immediate host
