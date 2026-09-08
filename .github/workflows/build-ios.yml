@@ -369,6 +369,13 @@ jobs:
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
 
+      - name: Execute unaligned ARM atomic regression tests
+        run: |
+          sudo apt-get install --yes --no-install-recommends g++-aarch64-linux-gnu qemu-user
+          bash scripts/test_fex_unaligned_swap.sh
+          python3 scripts/test_fex_host_abort.py
+          python3 scripts/test_fex_swap_publication.py
+
       - name: Test patched audio resampler latency and continuity
         run: bash scripts/test-sdl-resampler-latency.sh
 

@@ -1,4 +1,4 @@
-// Wine 9 COM registration repairs for projected builtin DLLs.
+// COM registration repairs for projected Wine builtin DLLs.
 // GPLv2; see license.txt.
 #pragma once
 #include <string>
@@ -116,6 +116,38 @@ inline bool registerWineAudioEnumerator(std::string& contents, bool pe64, bool p
         // threading model when this repair supplies the missing server path.
         if (added) insertMissingWineRegistryValue(contents, section,
             "\"ThreadingModel\"", "\"Both\"");
+        changed |= added;
+    }
+    return changed;
+}
+
+// Wine 11 dsound_classes.idl and include/xaudio2.idl (XAUDIO2_VER=7).
+// CoCreateInstance needs these even when DirectSoundCreate/XAudio2Create
+// through a directly imported DLL already works. Only register packaged DLLs.
+inline bool registerWineAudioClasses(std::string& contents, bool sound64,
+        bool sound32, bool xaudio64, bool xaudio32) {
+    struct Class { const char* id; bool xaudio; };
+    const Class classes[] = {
+        {"47d4d946-62e8-11cf-93bc-444553540000", false},
+        {"3901cc3f-84b5-4fa4-ba35-aa8172b8a09b", false},
+        {"b2f586d4-5558-49d1-a07b-3249dbbb33c2", false},
+        {"b0210780-89cd-11d0-af08-00a0c925cd16", false},
+        {"e4bcac13-7f99-4908-9a8e-74e3bf24b6e1", false},
+        {"fea4300c-7959-4147-b26a-2377b9e7a91d", false},
+        {"5a508685-a254-4fba-9b82-9a24b00306af", true}
+    };
+    bool changed = false;
+    for (int bits : {64, 32}) for (const auto& cls : classes) {
+        if (!(cls.xaudio ? (bits == 64 ? xaudio64 : xaudio32) :
+                           (bits == 64 ? sound64 : sound32))) continue;
+        const std::string key = std::string("Software\\\\Classes\\\\") +
+            (bits == 32 ? "Wow6432Node\\\\" : "") + "CLSID\\\\{" +
+            cls.id + "}\\\\InprocServer32";
+        const std::string dll = std::string("\"C:\\\\windows\\\\") +
+            (bits == 64 ? "system32\\\\" : "syswow64\\\\") +
+            (cls.xaudio ? "xaudio2_7.dll\"" : "dsound.dll\"");
+        const bool added = insertMissingWineRegistryValue(contents, key, "@", dll);
+        if (added) insertMissingWineRegistryValue(contents, key, "\"ThreadingModel\"", "\"Both\"");
         changed |= added;
     }
     return changed;

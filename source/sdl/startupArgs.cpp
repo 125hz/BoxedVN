@@ -624,6 +624,13 @@ static void configureX64BuiltinRegistration(const BString& winePrefix) {
             bool changed = false;
             if (readable) {
                 changed = boxedvn::registerWineAudioEnumerator(contents, pe64, pe32);
+                const bool audioChanged = boxedvn::registerWineAudioClasses(contents,
+                    packaged(K_X64_WINE_PE_DIR "/dsound.dll"),
+                    packaged(K_X64_WINE_PE32_DIR "/dsound.dll"),
+                    packaged(K_X64_WINE_PE_DIR "/xaudio2_7.dll"),
+                    packaged(K_X64_WINE_PE32_DIR "/xaudio2_7.dll"));
+                changed |= audioChanged;
+                klog_fmt("BOXEDWINE_X64_AUDIO_CLASSES added_missing_keys=%d", audioChanged ? 1 : 0);
                 const bool timezoneChanged = boxedvn::registerWineTimezones(contents);
                 changed |= timezoneChanged;
                 klog_fmt("BOXEDWINE_X64_TIMEZONE_REGISTRY added_missing_keys=%d", timezoneChanged ? 1 : 0);

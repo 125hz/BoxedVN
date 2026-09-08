@@ -2,6 +2,24 @@
 #include "guest_wine_audio_registration.h"
 #include "guest_wine_timezone_registration.h"
 
+BOXEDVN_TEST(audio_classes_preserve_overrides_and_register_only_available_dlls) {
+    std::string text;
+    CHECK(!boxedvn::registerWineAudioClasses(text, false, false, false, false));
+    CHECK(text.empty());
+    CHECK(boxedvn::registerWineAudioClasses(text, false, true, true, false));
+    CHECK(text.find("syswow64\\\\dsound.dll") != std::string::npos);
+    CHECK(text.find("system32\\\\xaudio2_7.dll") != std::string::npos);
+    CHECK(text.find("system32\\\\dsound.dll") == std::string::npos);
+    CHECK(text.find("syswow64\\\\xaudio2_7.dll") == std::string::npos);
+    auto pos = text.find("system32\\\\xaudio2_7.dll");
+    text.replace(pos, std::string("system32\\\\xaudio2_7.dll").size(), "custom-audio.dll");
+    const auto saved = text;
+    CHECK(!boxedvn::registerWineAudioClasses(text, false, true, true, false));
+    CHECK_EQ(text, saved);
+    CHECK(boxedvn::registerWineAudioClasses(text, true, true, true, true));
+    CHECK(text.find("custom-audio.dll") != std::string::npos);
+}
+
 BOXEDVN_TEST(timezone_database_preserves_existing_rules_and_is_idempotent) {
     std::string text = "WINE REGISTRY Version 2\n#arch=win64\n"
         "[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Time Zones\\\\UTC] 123\n"

@@ -291,7 +291,7 @@ public:
     // the caller then falls back to its previous behaviour. Defined alongside
     // the signal-frame helpers in syscall64.cpp. `siCode` is the si_code (e.g.
     // FPE_INTDIV=1), `trapNo` the x86 vector (0 = #DE), `faultAddr` -> si_addr.
-    bool raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr);
+    bool raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr, U32 errorCode = 0);
 
     // Deliver any pending, unmasked async signals queued on this thread by
     // another thread (cross-thread tkill/tgkill — e.g. wineserver's SIGUSR1

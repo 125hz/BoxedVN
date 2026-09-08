@@ -50,6 +50,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #include "guest_segment_table.h"
 #include "fex64loaderhandoff.h"
 #include "fex_callret_guard.h"
+#include "fex_host_abort.h"
 #include "fex_x87_precision.h"
 #include "kmemory64.h"
 #include "kprocess.h"
@@ -80,6 +81,8 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 
 extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address);
 extern "C" bool BVNFEXBackendReducedX87Precision(void);
+extern "C" bool BVNFEXBackendPatchUnalignedSwap(uint64_t, uint32_t);
+extern "C" bool BVNFEXBackendSwapFault(uint64_t, uint64_t*, uint64_t*, bool*);
 
 struct BVNFEXCPU64Adapter {
     KProcess* process = nullptr;
@@ -383,7 +386,7 @@ static thread_local AliasBackingRepairGuard gAliasBackingRepairGuard;
 static std::atomic<uint32_t> gAliasBackingReports {0};
 
 static bool repairGuestLaneHostFault(BVNFEXCPU64Adapter* adapter, int signal,
-                                     uint64_t faultAddress, uint64_t hostPC) {
+                                     uint64_t faultAddress, uint64_t hostPC, bool writeAccess) {
     if (signal != SIGBUS && signal != SIGSEGV) return false;
     if (!adapter->process || !adapter->process->memory64) return false;
 
@@ -395,13 +398,10 @@ static bool repairGuestLaneHostFault(BVNFEXCPU64Adapter* adapter, int signal,
     if (repeat) {
         report.decision = "repeat";
     } else {
-        // The translator cannot tell this handler whether the access was a load
-        // or a store, so the page only has to be READABLE for a repair to be
-        // legal. A store to a page the guest granted read alone is restored
-        // read-only, faults again at the same PC, and the guard above hands it
-        // to the guest.
+        // Require the actual access right from the saved ARM data-abort
+        // syndrome. Reprotecting a read-only guest page cannot repair a store.
         repaired = adapter->process->memory64->nativeRepairHostFault(
-            faultAddress, K_PROT_READ, report);
+            faultAddress, writeAccess ? K_PROT_WRITE : K_PROT_READ, report);
     }
 
     // The witness for this failure mode: which guest address the host address
@@ -567,7 +567,7 @@ struct GuestMemoryFaultClass {
 // host alias the translator dereferenced.
 static GuestMemoryFaultClass classifyGuestMemoryFault(
     BVNFEXCPU64Adapter* adapter, int signal, int hostSignalCode,
-    uint64_t faultAddress) {
+    uint64_t faultAddress, bool writeAccess) {
     GuestMemoryFaultClass result;
     result.signal = hostSignalGuestNumber(signal);
     result.trapNumber = hostSignalTrapNumber(signal);
@@ -594,12 +594,9 @@ static GuestMemoryFaultClass classifyGuestMemoryFault(
 
     const uint64_t pageNumber = guestAddress >> K64_PAGE_SHIFT;
     const bool mapped = memory->isPageMapped(pageNumber);
-    // The translator cannot tell this handler whether the access was a load or
-    // a store, so read is the only right the page has to grant for the access
-    // to have been entitled -- the same requiredProt the repair asks for.
-    const bool readable =
-        mapped && (memory->getPageFlags(pageNumber) & K64_PAGE_READ) != 0;
-    if (!mapped || !readable) {
+    const uint32_t required = writeAccess ? K64_PAGE_WRITE : K64_PAGE_READ;
+    const bool entitled = mapped && (memory->getPageFlags(pageNumber) & required) != 0;
+    if (!mapped || !entitled) {
         result.signal = K_SIGSEGV;
         result.trapNumber = 14; // #PF
         result.code = mapped ? K_SEGV_ACCERR : K_SEGV_MAPERR;
@@ -1304,8 +1301,31 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     }
     auto* machine = context->uc_mcontext;
     auto* siginfo = static_cast<siginfo_t*>(infoPointer);
-    const uint64_t hostPC = machine->__ss.__pc;
-    const uint64_t faultAddress = reinterpret_cast<uint64_t>(siginfo->si_addr);
+    uint64_t hostPC = machine->__ss.__pc;
+    uint64_t faultAddress = reinterpret_cast<uint64_t>(siginfo->si_addr);
+    uint64_t unalignedPC = hostPC, swapSite = 0, swapSlowPC = 0;
+    bool swapStacked = false;
+    const bool swapFault = BVNFEXBackendSwapFault(hostPC, &swapSite, &swapSlowPC, &swapStacked);
+    if (swapFault) {
+        if (swapStacked) {
+            uint64_t saved[16];
+            vm_size_t copied = 0;
+            if (vm_read_overwrite(mach_task_self(), machine->__ss.__sp, sizeof(saved),
+                    reinterpret_cast<vm_address_t>(saved), &copied) != KERN_SUCCESS ||
+                copied != sizeof(saved)) return false;
+            for (unsigned r = 0; r < 12; ++r) machine->__ss.__x[r] = saved[r];
+            machine->__ss.__cpsr = (machine->__ss.__cpsr & 0x0fffffff) | (saved[12] & 0xf0000000);
+            machine->__ss.__sp += sizeof(saved);
+        }
+        const uint32_t op = *reinterpret_cast<const uint32_t*>(swapSlowPC);
+        const unsigned rn = (op >> 5) & 31;
+        faultAddress = rn < 29 ? machine->__ss.__x[rn] :
+                       rn == 29 ? machine->__ss.__fp : machine->__ss.__lr;
+        hostPC = swapSite;
+        machine->__ss.__pc = hostPC;
+        unalignedPC = swapSlowPC; // immutable original SWPAL, never the patched B
+    }
+    const bool writeAccess = swapFault || boxedvn::armWriteAbort(machine->__es.__esr);
     const bool inCodeBuffer =
         adapter->context->IsAddressInCodeBuffer(adapter->fexThread, hostPC);
     // FEX's call/return predictor can drift after non-local guest exits.
@@ -1345,14 +1365,33 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     // BUS_ADRALN inside translated code or generated helpers. FEX emulates the atomic in place or
     // backpatches the access, and returns how far the host PC moves; without
     // this the fault was handed to the guest as SIGBUS and re-taken forever.
-    if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inOwnedFexCode) {
-        const uint32_t instruction = *reinterpret_cast<const uint32_t*>(hostPC);
+    if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inOwnedFexCode &&
+        boxedvn::armAlignmentAbort(machine->__es.__esr)) {
+        const uint32_t instruction = *reinterpret_cast<const uint32_t*>(unalignedPC);
+        const unsigned offset = faultAddress & 15;
+        if (!swapFault && inCodeBuffer &&
+            ((offset >= 1 && offset <= 7) || (instruction & 0xfc000000u) == 0x14000000u) &&
+            BVNFEXBackendPatchUnalignedSwap(hostPC, instruction)) {
+            // Retry at the original site, now branching into the CASPAL leaf.
+            static std::atomic<unsigned> patched {0};
+            if (patched.fetch_add(1, std::memory_order_relaxed) < 16)
+                klog_fmt("BOXEDWINE_FEX64_ATOMIC_FASTPATH pc=0x%llx opcode=0x%x",
+                         (unsigned long long)hostPC, instruction);
+            return true;
+        }
+        // Publication can race a fault that was already in flight, including
+        // one whose destination now needs the split fallback.
+        if (!swapFault) {
+            const uint32_t current = *reinterpret_cast<const uint32_t*>(hostPC);
+            if ((current & 0xfc000000u) == 0x14000000u &&
+                BVNFEXBackendPatchUnalignedSwap(hostPC, current)) return true;
+        }
         const auto handled = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
             adapter->fexThread,
             FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier,
             // Generated helpers have no translated block header. FEX's
             // non-JIT path emulates their atomics without backpatching.
-            hostPC, machine->__ss.__x, inCodeBuffer);
+            unalignedPC, machine->__ss.__x, inCodeBuffer && !swapFault);
         static std::atomic<uint32_t> reports {0};
         if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
             klog_fmt("BOXEDWINE_FEX64_UNALIGNED pid=%d tid=%d host_pc=0x%llx "
@@ -1431,7 +1470,7 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     // to, a host address that is not a guest image at all -- falls through and
     // reaches the guest as the fault it is.
     if (!generatedException &&
-        repairGuestLaneHostFault(adapter, signal, faultAddress, hostPC)) {
+        repairGuestLaneHostFault(adapter, signal, faultAddress, hostPC, writeAccess)) {
         return true;
     }
 
@@ -1448,7 +1487,7 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     faultClass.address = faultAddress;
     if (!generatedException) {
         faultClass = classifyGuestMemoryFault(adapter, signal,
-                                              siginfo->si_code, faultAddress);
+                                              siginfo->si_code, faultAddress, writeAccess);
     }
     uint32_t guestSignal = faultClass.signal;
     uint32_t guestTrapNumber = faultClass.trapNumber;
@@ -1869,7 +1908,9 @@ extern "C" bool BVNFEXCPU64AdapterHandleHostFault(
     }
     if (!adapter->cpu->raiseSyncFault(
             guestSignal, guestTrapNumber,
-            static_cast<int>(guestSignalCode), guestFaultAddress) ||
+            static_cast<int>(guestSignalCode), guestFaultAddress,
+            guestTrapNumber == 14 ? boxedvn::guestPageFaultError(
+                guestSignalCode == K_SEGV_ACCERR, writeAccess) : 0) ||
         !BVNFEXCPU64AdapterSyncToFEX(adapter, frame)) {
         return containUnclassifiedFEXFault(
             adapter, config, context, signal, guestFaultAddress,

@@ -383,7 +383,7 @@ class TheSignalPathRetriesSafely(unittest.TestCase):
         # Those faults are FEX's own trapping stubs; their si_addr describes the
         # stub, not a guest access.
         self.assertIn("if (!generatedException &&\n"
-                      "        repairGuestLaneHostFault(adapter, signal, faultAddress, hostPC)) {",
+                      "        repairGuestLaneHostFault(adapter, signal, faultAddress, hostPC, writeAccess)) {",
                       self.source)
 
     def test_both_host_signals_are_considered(self) -> None:
@@ -393,12 +393,11 @@ class TheSignalPathRetriesSafely(unittest.TestCase):
         self.assertIn("if (signal != SIGBUS && signal != SIGSEGV) return false;",
                       body)
 
-    def test_only_read_access_is_required_for_a_repair(self) -> None:
-        # The translator cannot tell the handler load from store. Requiring read
-        # alone, and restoring exactly the page map's protection, makes a store
-        # to a read-only page fault again rather than succeed.
+    def test_the_actual_access_right_is_required_for_a_repair(self) -> None:
+        # The ARM syndrome identifies stores. A readable page does not
+        # authorize repairing a store; it must reach Wine as a write fault.
         body = self.source.split("static bool repairGuestLaneHostFault(", 1)[1]
-        self.assertIn("nativeRepairHostFault(\n            faultAddress, K_PROT_READ, report)",
+        self.assertIn("nativeRepairHostFault(\n            faultAddress, writeAccess ? K_PROT_WRITE : K_PROT_READ, report)",
                       body)
 
     def test_the_retry_cannot_loop_forever(self) -> None:
@@ -417,7 +416,7 @@ class TheSignalPathRetriesSafely(unittest.TestCase):
         # No RIP advance, no register spill: the host page now backs the address
         # the instruction already computed.
         handler = self.source.split(
-            "repairGuestLaneHostFault(adapter, signal, faultAddress, hostPC)) {", 1)[1]
+            "repairGuestLaneHostFault(adapter, signal, faultAddress, hostPC, writeAccess)) {", 1)[1]
         self.assertTrue(handler.lstrip().startswith("return true;"),
                         "a repaired fault must return straight to the retry")
 
@@ -501,7 +500,7 @@ class TheGuestSignalIsClassifiedFromThePageMap(unittest.TestCase):
         # Not the host signal number, and not si_code: on Darwin neither can
         # tell a protection failure from an alignment fault.
         self.assertIn("isPageMapped(pageNumber)", self.body)
-        self.assertIn("getPageFlags(pageNumber) & K64_PAGE_READ", self.body)
+        self.assertIn("getPageFlags(pageNumber) & required", self.body)
 
     def test_an_unmapped_guest_address_is_a_mapping_error(self) -> None:
         self.assertIn("result.code = mapped ? K_SEGV_ACCERR : K_SEGV_MAPERR;",
@@ -511,7 +510,7 @@ class TheGuestSignalIsClassifiedFromThePageMap(unittest.TestCase):
         # A Wine MEM_RESERVE view is exactly this: K64_PAGE_MAPPED with no
         # K64_PAGE_READ. Wine commits it on demand from its own handler, but
         # only ever reaches that handler for STATUS_ACCESS_VIOLATION.
-        self.assertIn("if (!mapped || !readable) {", self.body)
+        self.assertIn("if (!mapped || !entitled) {", self.body)
         self.assertIn("result.signal = K_SIGSEGV;", self.body)
         self.assertIn("K_SEGV_ACCERR", self.body)
 
@@ -525,7 +524,7 @@ class TheGuestSignalIsClassifiedFromThePageMap(unittest.TestCase):
         # An alignment fault is the one memory fault left on a page the map
         # says the guest may read, so that is the only path that keeps SIGBUS.
         bus = self.body.index("result.signal = K_SIGBUS;")
-        readable_gate = self.body.index("if (!mapped || !readable) {")
+        readable_gate = self.body.index("if (!mapped || !entitled) {")
         self.assertLess(readable_gate, bus,
                         "SIGBUS must only be reachable past the page-map gate")
         self.assertIn("result.trapNumber = 17;", self.body)
@@ -578,7 +577,7 @@ class TheClassificationReachesTheGuest(unittest.TestCase):
         # raiseSyncFault is the architectural operation; it is what builds the
         # Linux siginfo frame the guest handler reads.
         self.assertIn("raiseSyncFault(\n            guestSignal, guestTrapNumber,\n"
-                      "            static_cast<int>(guestSignalCode), guestFaultAddress)",
+                      "            static_cast<int>(guestSignalCode), guestFaultAddress,",
                       self.handler)
 
     def test_fex_still_gets_first_refusal_on_an_unaligned_access(self) -> None:
@@ -593,7 +592,7 @@ class TheClassificationReachesTheGuest(unittest.TestCase):
         # And it is still entered on exactly the host description Darwin gives
         # an unaligned atomic, with no page-map precondition of its own.
         self.assertIn(
-            "if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inCodeBuffer) {",
+            "if (signal == SIGBUS && siginfo->si_code == BUS_ADRALN && inOwnedFexCode &&",
             self.source)
 
     def test_the_repair_is_still_tried_before_the_classification(self) -> None:
@@ -607,7 +606,7 @@ class TheClassificationReachesTheGuest(unittest.TestCase):
         # Its si_addr describes FEX's own trapping stub, not a guest access.
         self.assertIn("if (!generatedException) {\n"
                       "        faultClass = classifyGuestMemoryFault(adapter, signal,\n"
-                      "                                              siginfo->si_code, faultAddress);\n"
+                      "                                              siginfo->si_code, faultAddress, writeAccess);\n"
                       "    }", self.handler)
         # And the generated branch still overrides all four from FEX's own
         # architectural description.

@@ -4058,7 +4058,7 @@ bool CPU64::deliverPendingSignals(U64 restartSyscall) {
 // SIGFPE + si_code → EXCEPTION_INT_DIVIDE_BY_ZERO etc, and uses the ucontext
 // RIP as the exception address. cpu->rip must still point at the faulting
 // instruction when this is called (so the captured RIP is the fault site).
-bool CPU64::raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr) {
+bool CPU64::raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr, U32 errorCode) {
     if (sig < 1 || sig > 64) return false;
     SigAction& sa = this->sigActions[sig];
     if (!sa.installed) return false;
@@ -4074,7 +4074,7 @@ bool CPU64::raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr) {
     // Fill the fault-specific mcontext slots the generic builder leaves zero.
     U64 gregsPtr = uctxPtr + X64_MCONTEXT_OFF_IN_UCTX;
     this->memory->writeq(gregsPtr + 8 * X64_GREG_TRAPNO, (U64)trapNo);
-    this->memory->writeq(gregsPtr + 8 * X64_GREG_ERR, 0);
+    this->memory->writeq(gregsPtr + 8 * X64_GREG_ERR, errorCode);
     this->memory->writeq(gregsPtr + 8 * X64_GREG_CR2, faultAddr);
 
     // Synthesize siginfo above the handler stack. Layout (x86-64):

@@ -76,6 +76,7 @@ extern "C" const char* BVNFEXBackendStageName(BVNFEXBackendStage stage) {
 #endif
 #include "boxedwine.h"
 #include "cpu64.h"
+#include "fex_unaligned_swap.h"
 #include "kmemory64.h"
 #include "syscall64.h"
 
@@ -164,6 +165,22 @@ std::string gReport;
 
 boxedvn::FexCodeSegments gCodeSegments;
 std::array<boxedvn::FexCodeBufferPool, boxedvn::FexCodeSegments::maximum> gCodePools;
+// Reserved with each executable segment before FEX can use it. Signal-time
+// installation only claims an immutable slot; it never allocates or locks.
+struct SwapSlot {
+    uint64_t site = 0;
+    uint32_t instruction = 0, load = 0, cas = 0, fallback = 0;
+    std::atomic<bool> ready {false};
+};
+struct SwapBank {
+    static constexpr unsigned slots = 128;
+    std::atomic<uint64_t> rx {0};
+    uint64_t rw = 0;
+    std::atomic<unsigned> next {0};
+    std::array<SwapSlot, slots> records;
+};
+std::array<SwapBank, boxedvn::FexCodeSegments::maximum> gSwapBanks;
+
 std::atomic<size_t> gPoolUsed {0};
 
 void* gGuestCode = nullptr;
@@ -468,6 +485,16 @@ bool addCodeSegment(size_t minimumRequest) {
         if (!rw || !gCodeSegments.append({reinterpret_cast<uintptr_t>(rx), reinterpret_cast<uintptr_t>(rw), candidate})) {
             BVNExecMemReleaseIfOwned(rx, candidate);
             return false;
+        }
+        const size_t index = gCodeSegments.size() - 1;
+        const auto bank = gCodePools[index].allocate(
+            SwapBank::slots * boxedvn::FexSwapThunk::slotBytes,
+            candidate, kPageBytes, kFEXPageBytes);
+        if (bank) {
+            gSwapBanks[index].rw = reinterpret_cast<uintptr_t>(rw) + bank->layout.allocationOffset;
+            gSwapBanks[index].rx.store(reinterpret_cast<uintptr_t>(rx) + bank->layout.allocationOffset,
+                                       std::memory_order_release);
+            gPoolUsed.fetch_add(gCodePools[index].cursor(), std::memory_order_relaxed);
         }
         reportf("BOXEDWINE_FEX64_CODE_SEGMENT index=%zu bytes=%zu rx=%p rw=%p",
                 gCodeSegments.size() - 1, candidate, rx, rw);
@@ -1078,13 +1105,10 @@ bool initializeFEXGlobals() {
                             gReducedX87Precision ? "1" : "0");
         reportf("BOXEDWINE_FEX64_X87 precision=%s",
                 gReducedX87Precision ? "64-fast" : "80-full");
-        // Group connected basic blocks using FEX's normal compilation mode.
-        // Single-block bring-up forced hot control flow through the unlinked
-        // dispatcher repeatedly (millions of cached CompileBlock visits).
-        // Keep the unstable dead-flag pass disabled and the direct linker
-        // bypass below; neither is required for multiblock compilation.
-        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "1");
-        reportf("FEX multiblock compilation enabled; direct linking remains disabled");
+        // Restore the last working block boundary after the 32-bit startup
+        // regression. Revisit multiblock independently of hot-path changes.
+        FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_MULTIBLOCK, "0");
+        reportf("FEX single-block compilation; direct linking remains disabled");
         // Do not use CONFIG_MAXINST as a live-guest diagnostic. Forcing every
         // instruction through a separate exit/link sequence amplified the iOS
         // linker-lock defect and changed a later stall into an immediate host
@@ -1233,13 +1257,11 @@ std::unique_ptr<FEXContextBundle> createFEXContext(
     // fails, at which point the ring names the CALL that was supposed to have
     // written the slot.
     //
-    // This is on for the device path on purpose: two runs ended with a guest
-    // frame chain whose saved frame pointers were all correct and whose return
-    // addresses were all zero, and nothing observable at RET time can say
-    // whether the push never landed or the slot was cleared afterwards. The
-    // environment variable is the off switch, so a throughput measurement does
-    // not need a different build.
-    const bool callWitness = getenv("BW64_NO_CALL_WITNESS") == nullptr;
+    // Keep the expensive per-CALL memory witness opt-in. It is diagnostic
+    // instrumentation, not part of x86 execution or return prediction.
+    const char* witnessOption = getenv("BW64_CALL_WITNESS");
+    const bool callWitness = witnessOption && strcmp(witnessOption, "1") == 0 &&
+                             getenv("BW64_NO_CALL_WITNESS") == nullptr;
     bundle->context->SetBoxedWineCallWitness(callWitness);
     reportf("BOXEDWINE_FEX64_CALL_WITNESS armed=%d", callWitness ? 1 : 0);
     // Wine's WoW64 layer far-jumps a 64-bit thread into a 32-bit code segment
@@ -1910,6 +1932,68 @@ bool recreateLiveContextAfterExec(LiveProcessState* processState,
 }
 
 } // namespace
+
+// Query only the two guest-memory instructions and the restored slow opcode.
+// A protection fault there must be reconstructed at the original FEX site.
+extern "C" bool BVNFEXBackendSwapFault(uint64_t pc, uint64_t* site,
+                                      uint64_t* slowPC, bool* stacked) {
+    for (const auto& bank : gSwapBanks) {
+        const auto base = bank.rx.load(std::memory_order_acquire);
+        if (!base || pc < base || pc >= base + SwapBank::slots * boxedvn::FexSwapThunk::slotBytes) continue;
+        const size_t index = (pc - base) / boxedvn::FexSwapThunk::slotBytes;
+        const auto& slot = bank.records[index];
+        if (!slot.ready.load(std::memory_order_acquire)) return false;
+        const auto start = base + index * boxedvn::FexSwapThunk::slotBytes;
+        *stacked = pc == start + slot.load * 4 || pc == start + slot.cas * 4;
+        *slowPC = start + slot.fallback * 4;
+        *site = slot.site;
+        return *stacked || pc == *slowPC;
+    }
+    return false;
+}
+
+extern "C" bool BVNFEXBackendPatchUnalignedSwap(uint64_t pc, uint32_t instruction) {
+    const auto segment = gCodeSegments.find(pc);
+    if (segment == boxedvn::FexCodeSegments::maximum) return false;
+    auto& bank = gSwapBanks[segment];
+    const uint64_t base = bank.rx.load(std::memory_order_acquire);
+    if (!base) return false;
+    // Another thread can have faulted on the old SWPAL immediately before
+    // publication. Let it retry the already-installed branch.
+    if ((instruction & 0xfc000000u) == 0x14000000u) {
+        const int64_t delta = static_cast<int32_t>(instruction << 6) >> 4;
+        const uint64_t target = pc + delta;
+        if (target < base || target >= base + SwapBank::slots * boxedvn::FexSwapThunk::slotBytes ||
+            (target - base) % boxedvn::FexSwapThunk::slotBytes) return false;
+        const auto& slot = bank.records[(target - base) / boxedvn::FexSwapThunk::slotBytes];
+        return slot.ready.load(std::memory_order_acquire) && slot.site == pc;
+    }
+    if (!boxedvn::FexSwapThunk::accepts(instruction)) return false;
+    const unsigned index = bank.next.fetch_add(1, std::memory_order_relaxed);
+    if (index >= SwapBank::slots) return false;
+    const uint64_t rx = base + index * boxedvn::FexSwapThunk::slotBytes;
+    const uint64_t rw = bank.rw + index * boxedvn::FexSwapThunk::slotBytes;
+    boxedvn::FexSwapThunk thunk;
+    if (!thunk.build(instruction, rx, pc + 4)) return false;
+    const uint32_t jump = boxedvn::FexSwapThunk::branch(pc, rx);
+    if (!jump) return false;
+    memcpy(reinterpret_cast<void*>(rw), thunk.words.data(), thunk.count * 4);
+    sys_dcache_flush(reinterpret_cast<void*>(rw), thunk.count * 4);
+    sys_icache_invalidate(reinterpret_cast<void*>(rx), thunk.count * 4);
+    auto& slot = bank.records[index];
+    slot.site = pc; slot.instruction = instruction;
+    slot.load = thunk.load; slot.cas = thunk.cas; slot.fallback = thunk.fallback;
+    slot.ready.store(true, std::memory_order_release);
+    auto* writable = reinterpret_cast<uint32_t*>(gCodeSegments.writable(pc));
+    if (!__atomic_compare_exchange_n(writable, &instruction, jump, false,
+                                     __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+        return (instruction & 0xfc000000u) == 0x14000000u &&
+               BVNFEXBackendPatchUnalignedSwap(pc, instruction);
+    }
+    sys_dcache_flush(writable, 4);
+    sys_icache_invalidate(reinterpret_cast<void*>(pc), 4);
+    return true;
+}
 
 extern "C" bool BVNFEXBackendOwnsHostCodeAddress(uint64_t address) {
     return poolOwns(reinterpret_cast<const void*>(
