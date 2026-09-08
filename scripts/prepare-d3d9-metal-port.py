@@ -50,6 +50,11 @@ def main():
     revision = subprocess.check_output(["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip()
     if revision != pin["commit"]:
         raise SystemExit("D3D9 source revision does not match the port pin")
+    if args.fetch:
+        # Native compiler headers are a gitlink, pinned by this exact source
+        # commit. A shallow parent clone does not populate the directory.
+        subprocess.run(["git", "-C", str(args.source), "submodule", "update",
+                        "--init", "--depth", "1", "--", "include/native/directx"], check=True)
     if subprocess.check_output(["git", "-C", str(args.source), "diff", "--name-only", "HEAD"], text=True).strip():
         raise SystemExit("Audit the pristine source before applying port patches")
     header = Path("src/winemetal/airconv_thunks.h")

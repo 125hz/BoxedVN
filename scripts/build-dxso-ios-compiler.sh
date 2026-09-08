@@ -9,6 +9,7 @@ output="${root}/build/dxso-ios"
 pin="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "${root}/scripts/dependencies.d3d9-metal.lock.json")"
 [[ "$(git -C "${source_dir}" rev-parse HEAD)" == "${pin}" ]] || { echo 'D3D9 source pin mismatch' >&2; exit 1; }
 [[ -z "$(git -C "${source_dir}" status --porcelain --untracked-files=no)" ]] || { echo 'D3D9 source must be pristine' >&2; exit 1; }
+[[ -f "${source_dir}/include/native/directx/d3d9.h" ]] || { echo 'Initialize the pinned native DirectX header submodule first' >&2; exit 1; }
 sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
 llvm_build="${fex_dir}/toolchains/llvm-ios-build"
 llvm_source="${fex_dir}/llvm-project/llvm"
