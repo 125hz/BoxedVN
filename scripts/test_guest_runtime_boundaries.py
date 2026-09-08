@@ -19,6 +19,7 @@ def method(file, signature):
 
 code = r'''
 #include <cassert>
+#include "boxedwine_x64_hostcall.h"
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -89,7 +90,11 @@ constexpr U64 K64_NATIVE_GUEST_INTERP_BASE=0x7f00000000ULL,K64_NATIVE_GUEST_HIGH
 constexpr int BVNFEXCPU64AdapterActionContinue=0;
 struct BVNFEXCPU64Adapter {FexThread* fexThread;KThread* thread;CPU64* cpu;int lastAction=99;};
 constexpr U64 BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE=0x7fff0003;
-int recordingCalls=0;
+int recordingCalls=0,metalCalls=0;
+U64 boxedwineDxmtUnixCall64(CPU64*,U64 ordinal,U64 address) {
+ assert(boxedwineDxmtRecordsCommands(ordinal) && address==0x8000);
+ ++metalCalls;return U64(-8);
+}
 bool vulkanBridge64RecordsCommands(U64 op){return op==123;}
 U64 vulkanBridge64(CPU64*,U64 op,U64 address,U64 count) {
  assert(op==123 && address==0x8000 && count==3);++recordingCalls;return uint64_t(-7);
@@ -109,7 +114,7 @@ for signature in ["void rememberPhysicalDevices(", "VkInstance physicalDeviceIns
     code += method("source/vulkan/vulkanbridge64.cpp", signature)
 code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleScalarSyscall(")
 code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handlePollingQuery(")
-code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleVulkanRecording(")
+code += method("ios/runtime/src/BVNFEXCPU64Adapter.mm", "static bool handleGraphicsRecording(")
 code += method("platform/sdl/kvulkanSDL.cpp", "bool KVulkdanSDLImpl::isPendingPresentationWindow(")
 syscalls = (repo / "source/kernel/syscall64.cpp").read_text()
 start = syscalls.index("case X64_SYS_getpid:", syscalls.index("case X64_SYS_getpid:"))
@@ -224,15 +229,34 @@ int main() {
  t.terminating=true;assert(!handleScalarSyscall(&adapter,&frame,24,0,0));
  t.terminating=false;frame.State.rip=0x7a40100000ULL;
  uint64_t recordingArgs[7]={BOXEDWINE_X64_HOSTCALL_VULKAN_BRIDGE,123,0x8000,3};uint64_t result=0;
- assert(handleVulkanRecording(&adapter,&frame,recordingArgs,result));
+ assert(handleGraphicsRecording(&adapter,&frame,recordingArgs,result));
  assert(result==uint64_t(-7) && frame.State.gregs[0]==result && recordingCalls==1);
  assert(frame.State.rip==0x7a40100002ULL && frame.State.gregs[1]==frame.State.rip);
  assert(frame.State.vectors==before);
- recordingArgs[1]=124;assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result)); // submit/wait
+ recordingArgs[1]=124;assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result)); // submit/wait
  recordingArgs[1]=123;t.queuePendingSignal(10,true);
- assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result));t.pendingSignals=0;
- frame.State.rip=0x140001000;assert(!handleVulkanRecording(&adapter,&frame,recordingArgs,result));
+ assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result));t.pendingSignals=0;
+ frame.State.rip=0x140001000;assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result));
  assert(recordingCalls==1);
+ recordingArgs[0]=BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL;
+ for(U64 ordinal : {36ULL,37ULL,38ULL,0x80000024ULL,0x80000025ULL,0x80000026ULL}) {
+  recordingArgs[1]=ordinal;frame.State.rip=0x7a40100000ULL;
+  assert(handleGraphicsRecording(&adapter,&frame,recordingArgs,result));
+  assert(result==uint64_t(-8) && frame.State.gregs[0]==result);
+  assert(frame.State.rip==0x7a40100002ULL && frame.State.gregs[1]==frame.State.rip);
+  assert(frame.State.vectors==before);
+ }
+ assert(metalCalls==6);
+ for(U64 ordinal : {12ULL,13ULL,18ULL,47ULL,0x100000024ULL}) {
+  recordingArgs[1]=ordinal;
+  assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result));
+ }
+ recordingArgs[1]=36;t.queuePendingSignal(10,true);
+ assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result));t.pendingSignals=0;
+ t.terminating=true;assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result));t.terminating=false;
+ frame.Thread=nullptr;assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result));frame.Thread=&ft;
+ frame.State.rip=0x140001000;assert(!handleGraphicsRecording(&adapter,&frame,recordingArgs,result));
+ assert(metalCalls==6 && frame.State.vectors==before);
  frame.State.rip=0x7a40100000ULL;
  uint64_t queryArgs[3]={98,1,0x4000};U64 queryResult=0;
  assert(handlePollingQuery(&adapter,&frame,queryArgs,queryResult));
@@ -255,6 +279,6 @@ with tempfile.TemporaryDirectory() as tmp:
     source = Path(tmp) / "boundaries.cpp"
     binary = Path(tmp) / "boundaries"
     source.write_text(code)
-    subprocess.run(["c++", "-std=c++20", "-pthread", str(source), "-o", str(binary)], check=True)
+    subprocess.run(["c++", "-std=c++20", "-pthread", "-I"+str(repo/"include"), str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=10)
 print("Guest runtime boundary fixtures passed")
