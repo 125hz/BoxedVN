@@ -84,7 +84,9 @@ for opcode, (name, ret, params) in enumerate(api, 1):
     export.append("    " + name)
     declaration = ", ".join(t+" "+n for t,n in params) or "void"
     # EFX functions are also exported: callers normally obtain these by name.
-    guest.append(f'extern "C" __declspec(dllexport) {ret} AL_APIENTRY {name}({declaration}) noexcept {{')
+    # The .def supplies exports. Adding dllexport after a prototype has already
+    # been used by GetProcAddress is rejected by the LLVM-MinGW compiler.
+    guest.append(f'extern "C" {ret} AL_APIENTRY {name}({declaration}) noexcept {{')
     if name.endswith("GetProcAddress"):
         pname = params[-1][1]
         for _,var in params[:-1]:
