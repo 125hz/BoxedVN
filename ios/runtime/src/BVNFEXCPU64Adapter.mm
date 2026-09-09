@@ -1982,6 +1982,7 @@ static bool handlePollingQuery(BVNFEXCPU64Adapter* adapter,
 // twice for every draw, bind and barrier. Queue submission, waits, presentation,
 // allocation and pending signals retain the complete syscall path.
 extern U64 boxedwineDxmtUnixCall64(CPU64*, U64, U64);
+extern U64 boxedwineOpenALCall64(CPU64*, U64, U64);
 static bool handleGraphicsRecording(BVNFEXCPU64Adapter* adapter,
                                   FEXCore::Core::CpuStateFrame* frame,
                                   const uint64_t* args, uint64_t& result) {
@@ -2013,7 +2014,6 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     if (arguments[0]==BOXEDWINE_OPENAL_HOSTCALL &&
         audioFrame==adapter->fexThread->CurrentFrame && audioFrame->Thread==adapter->fexThread &&
         !adapter->thread->terminating && !adapter->cpu->hasDeliverableSignal()) {
-        extern U64 boxedwineOpenALCall64(CPU64*,U64,U64);
         auto* frame=static_cast<FEXCore::Core::CpuStateFrame*>(framePointer);
         const U64 result=boxedwineOpenALCall64(adapter->cpu,arguments[1],arguments[2]);
         frame->State.gregs[X64_RAX]=result;
