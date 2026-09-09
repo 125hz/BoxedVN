@@ -35,6 +35,7 @@
 // K_S_IFMT/K__S_IFCHR: the file-type bits the stderr witness classifies with.
 #include "kstat.h"
 #include "boxedwine_x64_hostcall.h"
+#include "boxedwine_openal_bridge.h"
 #include "boxedwine_x64_x11_bridge.h"
 #include "boxedwine_x64_vulkan_bridge.h"
 #include "../x11/x11bridge64.h"
@@ -2055,6 +2056,40 @@ static U64 sys_clock_gettime64(CPU64* cpu, U64 /*clk*/, U64 tsAddr) {
     cpu->memory->writeq(tsAddr, sec);
     cpu->memory->writeq(tsAddr + 8, nsec);
     return 0;
+}
+
+#ifdef BOXEDWINE_DXMT_NATIVE
+static void* openalGuestPointer(void* opaque, uint64_t address, size_t bytes, int writable) {
+    auto* memory=static_cast<KMemory64*>(opaque);
+    if (!bytes || !address || address+bytes<address) return nullptr;
+    const U32 required=writable ? K64_PAGE_WRITE : K64_PAGE_READ;
+    const U64 first=address>>K64_PAGE_SHIFT, last=(address+bytes-1)>>K64_PAGE_SHIFT;
+    U8* start=nullptr;
+    for (U64 page=first;page<=last;++page) {
+        if (!(memory->getPageFlags(page)&required)) return nullptr;
+        U8* backing=memory->getCommittedPagePtr(page);
+        if (!backing) return nullptr;
+        if (!start) start=backing;
+        else if (backing!=start+(page-first)*K64_PAGE_SIZE) return nullptr;
+    }
+    return start+(address&(K64_PAGE_SIZE-1));
+}
+#endif
+
+U64 boxedwineOpenALCall64(CPU64* cpu, U64 operation, U64 arguments) {
+#ifdef BOXEDWINE_DXMT_NATIVE
+    if (!cpu || !cpu->memory || operation>UINT32_MAX) return (U64)-K_EINVAL;
+    auto* block=static_cast<BvnOpenALPacket*>(openalGuestPointer(cpu->memory,arguments,sizeof(BvnOpenALPacket),1));
+    if (!block || !openalGuestPointer(cpu->memory,arguments,sizeof(BvnOpenALPacket),0)) return (U64)-K_EFAULT;
+    BvnOpenALPacket packet;
+    memcpy(&packet,block,sizeof(packet));
+    const int result=bvnOpenALInvoke(cpu->memory->addressSpaceGeneration(),(uint32_t)operation,&packet,openalGuestPointer,cpu->memory,KSystem::soundEnabled);
+    memcpy(block,&packet,sizeof(packet));
+    return (U64)(S64)result;
+#else
+    (void)cpu; (void)operation; (void)arguments;
+    return (U64)-K_ENOSYS;
+#endif
 }
 
 // Shared by the interpreter and the FEX scalar fast path. Darwin's yield is
@@ -5316,6 +5351,9 @@ void ksyscall64(CPU64* cpu) {
     }
 
     switch (nr) {
+        case BOXEDWINE_OPENAL_HOSTCALL:
+            ret=boxedwineOpenALCall64(cpu,a1,a2);
+            break;
         case BOXEDWINE_X64_HOSTCALL_DXMT_UNIX_CALL:
             // RDI = DXMT unix-call index, RSI = identity-mapped args block.
             ret = boxedwineDxmtUnixCall64(cpu, a1, a2);

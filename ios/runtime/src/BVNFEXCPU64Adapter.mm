@@ -44,6 +44,7 @@ extern "C" uint64_t BVNFEXBackendTakePendingIRCapTarget(const char*) { return 0;
 #endif
 #include "boxedwine.h"
 #include "boxedwine_x64_hostcall.h"
+#include "boxedwine_openal_bridge.h"
 #include "boxedvn/fex_exit_dispatch_contract.h"
 #include "cpu64.h"
 #include "guest_signal_frame64.h"
@@ -2005,6 +2006,20 @@ extern "C" uint64_t BVNFEXCPU64AdapterHandleSyscall(
     if (!validAdapter(adapter) || !framePointer || !arguments) {
         if (adapter) adapter->lastAction = BVNFEXCPU64AdapterActionInvalid;
         return static_cast<uint64_t>(-K_ENOSYS);
+    }
+    // The facade uses INT80 in PE32 and SYSCALL in PE64. This call consumes
+    // buffers but never invokes guest code or changes SIMD/x87/segment state.
+    auto* audioFrame=static_cast<FEXCore::Core::CpuStateFrame*>(framePointer);
+    if (arguments[0]==BOXEDWINE_OPENAL_HOSTCALL &&
+        audioFrame==adapter->fexThread->CurrentFrame && audioFrame->Thread==adapter->fexThread &&
+        !adapter->thread->terminating && !adapter->cpu->hasDeliverableSignal()) {
+        extern U64 boxedwineOpenALCall64(CPU64*,U64,U64);
+        auto* frame=static_cast<FEXCore::Core::CpuStateFrame*>(framePointer);
+        const U64 result=boxedwineOpenALCall64(adapter->cpu,arguments[1],arguments[2]);
+        frame->State.gregs[X64_RAX]=result;
+        frame->State.rip+=2;
+        adapter->lastAction=BVNFEXCPU64AdapterActionContinue;
+        return result;
     }
     if (handleScalarSyscall(adapter, static_cast<FEXCore::Core::CpuStateFrame*>(framePointer),
                           arguments[0], arguments[1], arguments[2])) return 0;

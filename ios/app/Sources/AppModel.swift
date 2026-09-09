@@ -636,7 +636,7 @@ final class AppModel: ObservableObject {
         }
 
         static let dxmtModules = ["d3d11.dll", "dxgi.dll", "d3d10core.dll",
-                                  "winemetal.dll"]
+                                  "winemetal.dll", "openal32.dll"]
         static var environment: [String] { [
             // winedevice and the mount manager trace why the 64-bit
             // desktop's drive links never appear; both are quiet at boot.
@@ -660,8 +660,8 @@ final class AppModel: ObservableObject {
             // below reached the process that was supposed to honour it.
             "WINEDEBUG=warn+module,warn+seh,warn+gdiplus,warn+wincodecs,warn+winedevice,warn+mountmgr,warn+winstation,+msgbox",
             Preferences.d3d9Metal
-                ? "WINEDLLOVERRIDES=d3d9,d3d11,dxgi,d3d10core,winemetal=n,b"
-                : "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b",
+                ? "WINEDLLOVERRIDES=d3d9,d3d11,dxgi,d3d10core,winemetal=n,b;openal32=b,n"
+                : "WINEDLLOVERRIDES=d3d11,dxgi,d3d10core,winemetal=n,b;openal32=b,n",
             "BOXEDVN_D3D9_METAL=\(Preferences.d3d9Metal ? "1" : "0")",
             // DXMT's own logging. It is not wined3d, so no WINEDEBUG channel
             // reaches it: `+d3d11` and `+dxgi` name Wine's implementations,

@@ -290,6 +290,7 @@ static void overlayX64WineModules(const BString& overlayDir,
     const bool system32Ready =
         system32Directory != nullptr && system32Directory->isDirectory();
     auto dxmtModules = boxedvn::x64DxmtModuleNames();
+    dxmtModules.push_back("openal32.dll");
     if (d3d9Metal) dxmtModules.push_back("d3d9.dll");
     for (const std::string& name : dxmtModules) {
         const BString sourcePath = overlayDir + "/" + name.c_str();
@@ -2131,6 +2132,19 @@ bool StartUpArgs::apply() {
                 d3d9Metal = entry == B("BOXEDVN_D3D9_METAL=1");
         }
         overlayX64WineModules(this->x64ModuleOverlayPath, winePrefix, d3d9Metal);
+        // Shared native audio facade, independently of the selected renderer.
+        {
+            const BString root=B(K_X64_WINE_PE32_DIR);
+            const BString systemPath=winePrefix+"/drive_c/windows/syswow64";
+            auto rootNode=Fs::getNodeFromLocalPath(B(""),root,true);
+            auto system=Fs::getNodeFromLocalPath(B(""),systemPath,true);
+            auto source=Fs::getNodeFromLocalPath(B(""),this->x64ModuleOverlayPath+"/dxmt-x86/openal32.dll",true);
+            if(source && !source->isDirectory() && rootNode && system) {
+                Fs::addFileNode(root+"/openal32.dll",B(""),source->nativePath,false,rootNode);
+                Fs::addFileNode(systemPath+"/openal32.dll",root+"/openal32.dll",B(""),false,system);
+                klog("BOXEDWINE_OPENAL_NATIVE arch=i386 status=projected");
+            }
+        }
         if (d3d9Metal) {
             // Replace both the module-root builtin and the prefix link. Wine
             // reloads builtin-marked DLLs from its architecture-specific root.

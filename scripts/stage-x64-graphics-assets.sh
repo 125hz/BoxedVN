@@ -65,13 +65,13 @@ for marker in \
 done
 cp "${PROBE}" "${OUTPUT_DIR}/boxedvn-d3d11-cube-x64.exe"
 
-for dll in d3d11 dxgi d3d10core winemetal d3d9; do
+for dll in d3d11 dxgi d3d10core winemetal d3d9 openal32; do
     source_dll="${DXMT}/x86_64-windows/${dll}.dll"
     verify_x64_pe "${source_dll}"
     cp "${source_dll}" "${OUTPUT_DIR}/dxmt-x64/${dll}.dll"
 done
 mkdir -p "${OUTPUT_DIR}/dxmt-x86"
-for dll in d3d9 winemetal; do
+for dll in d3d9 winemetal openal32; do
     require_file "${DXMT}/i386-windows/${dll}.dll"
     cp "${DXMT}/i386-windows/${dll}.dll" "${OUTPUT_DIR}/dxmt-x86/${dll}.dll"
 done

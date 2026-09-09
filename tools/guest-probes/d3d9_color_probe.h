@@ -92,6 +92,56 @@ inline void probeD3D9Colors(IDirect3DDevice9* device) {
         } else report("texture-setup",status,0,0);
         device->SetRenderState(D3DRS_SRGBWRITEENABLE,TRUE);
         sample("srgb-gray",draw(0xff808080u),0xffbcbcbcu); // +/-1 conversion tolerance
+        device->SetRenderState(D3DRS_SRGBWRITEENABLE,FALSE);
+
+        // Separate programmable constant/swizzle lowering from texture formats.
+        // ps_2_0: mov oC0,c0 (then c0.bgra). No external shader compiler needed.
+        const DWORD shaderIdentity[] = {0xffff0200u,0x02000001u,0x800f0800u,0xa0e40000u,0x0000ffffu};
+        const DWORD shaderSwizzle[] = {0xffff0200u,0x02000001u,0x800f0800u,0xa0c60000u,0x0000ffffu};
+        const float red[] = {1,0,0,1};
+        device->SetPixelShaderConstantF(0,red,1);
+        for (unsigned i=0;i<2;++i) {
+            IDirect3DPixelShader9* shader = nullptr;
+            HRESULT hr = device->CreatePixelShader(i ? shaderSwizzle : shaderIdentity,&shader);
+            if (SUCCEEDED(hr)) hr = device->SetPixelShader(shader);
+            if (SUCCEEDED(hr)) hr = draw(0xffffffffu);
+            sample(i ? "shader-swizzle-blue" : "shader-constant-red",hr,i ? 0xff0000ffu : 0xffff0000u);
+            device->SetPixelShader(nullptr);
+            if (shader) shader->Release();
+        }
+
+        // Solid red BC blocks exercise the compressed upload and sampler path.
+        // RGB565 endpoint 0xf800 is red; every selector chooses endpoint zero.
+        const D3DFORMAT formats[] = {D3DFMT_A8B8G8R8,D3DFMT_DXT1,D3DFMT_DXT3,D3DFMT_DXT5};
+        const char* phases[] = {"texture-rgba-red","texture-bc1-red","texture-bc2-red","texture-bc3-red"};
+        for (unsigned i=0;i<4;++i) {
+            IDirect3DTexture9* source = nullptr;
+            HRESULT hr = device->CreateTexture(4,4,1,0,formats[i],D3DPOOL_MANAGED,&source,nullptr);
+            D3DLOCKED_RECT upload{};
+            if (SUCCEEDED(hr)) hr = source->LockRect(0,&upload,nullptr,0);
+            if (SUCCEEDED(hr)) {
+                if (i==0) {
+                    const DWORD rgbaRed=0xff0000ffu;
+                    for (unsigned y=0;y<4;++y) for (unsigned x=0;x<4;++x)
+                        std::memcpy(static_cast<char*>(upload.pBits)+y*upload.Pitch+x*4,&rgbaRed,4);
+                } else {
+                    unsigned char block[16]{};
+                    const unsigned offset=i==1 ? 0 : 8;
+                    block[offset+1]=0xf8;
+                    if (i==2) std::memset(block,0xff,8); // BC2 opaque alpha
+                    if (i==3) block[0]=0xff; // BC3 alpha endpoint zero = 1
+                    std::memcpy(upload.pBits,block,i==1 ? 8 : 16);
+                }
+                hr=source->UnlockRect(0);
+            }
+            if (SUCCEEDED(hr)) hr=device->SetTexture(0,source);
+            device->SetSamplerState(0,D3DSAMP_SRGBTEXTURE,FALSE);
+            device->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_TEXTURE);
+            if (SUCCEEDED(hr)) hr=draw(0xffffffffu);
+            sample(phases[i],hr,0xffff0000u);
+            device->SetTexture(0,nullptr);
+            if (source) source->Release();
+        }
     } else report("setup",status,0,0);
     if (state) {state->Apply();state->Release();}
     device->SetRenderTarget(0,oldTarget);

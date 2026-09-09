@@ -204,6 +204,17 @@ source by `scripts/build-dxmt-x64-pe.sh` and
 
 ---
 
+## Native OpenAL playback
+
+OpenAL Soft 1.24.3, copyright Christopher Fitzgerald and contributors,
+is built from https://github.com/kcat/openal-soft at commit
+`dc7d7054a5b4f3bec1dc23a42fd616a0847af948` under LGPL-2.0-or-later.
+The app bundles its complete license as `OpenAL-Soft-COPYING.txt`.
+The unmodified upstream mixer is linked statically with the shared
+BoxedWine playback bridge in `tools/openal`; reproducible source builds
+and both architecture facades are in `scripts/build-openal-native.sh`.
+The bridge performs playback and EFX processing, with no microphone capture.
+
 ## Not used
 
 For the avoidance of doubt, BoxedVN contains no code from, and no dependency

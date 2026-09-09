@@ -18,6 +18,7 @@ fixture_top_alias_repmov="${root}/scripts/guest-probes/fex64-top-alias-repmov.as
 fixture_top_alias_stack="${root}/scripts/guest-probes/fex64-top-alias-stack.asm"
 fixture_dispatcher_return="${root}/scripts/guest-probes/fex64-dispatcher-return.asm"
 fixture_highstack_callret="${root}/scripts/guest-probes/fex64-highstack-callret.asm"
+fixture_writable_code="${root}/scripts/guest-probes/fex64-writable-code.asm"
 host_word_check="${root}/scripts/guest-probes/check-ircap-host-words.py"
 host_stubs_source="${root}/scripts/guest-probes/fex64-host-stubs.cpp"
 encoding_check_source="${root}/scripts/guest-probes/fex64-emitter-encoding-check.cpp"
@@ -35,6 +36,7 @@ runtime_patches=(
     "${root}/scripts/fex64-patches/fex-boxedwine-ir-capture-arm.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-low-address-alias.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-masked-memory-alias.patch"
+    "${root}/scripts/fex64-patches/fex-boxedwine-writable-code-validation.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-segmented-code-alias.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-null-exit-target.patch"
     "${root}/scripts/fex64-patches/fex-boxedwine-call-return-witness.patch"
@@ -256,6 +258,7 @@ prepare_fixture "${fixture_top_alias}" fex64-top-alias
 prepare_fixture "${fixture_top_alias_repmov}" fex64-top-alias-repmov
 prepare_fixture "${fixture_top_alias_stack}" fex64-top-alias-stack
 prepare_fixture "${fixture_dispatcher_return}" fex64-dispatcher-return
+prepare_fixture "${fixture_writable_code}" fex64-writable-code
 prepare_fixture "${fixture_highstack_callret}" fex64-highstack-callret
 prepare_fixture "${root}/scripts/guest-probes/fex64-tls-selector.asm" fex64-tls-selector
 
@@ -446,4 +449,9 @@ FEX_BOXEDWINE_TLS_GDT=1 run_one x64-tls-selector "${tmp_dir}/fex64-tls-selector.
 FEX_DISABLEL2CACHE=0 run_one x64-l2-highstack-callret "${tmp_dir}/fex64-highstack-callret.bin" \
     "${tmp_dir}/fex64-highstack-callret.config.bin" 500 0 "" 1
 
-echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, dispatcher-return and high-stack call/ret and TLS-selector fixtures completed in all modes"
+run_one x64-writable-code-alias "${tmp_dir}/fex64-writable-code.bin" \
+    "${tmp_dir}/fex64-writable-code.config.bin" 500 0 "" 1
+run_one x64-writable-code-alias "${tmp_dir}/fex64-writable-code.bin" \
+    "${tmp_dir}/fex64-writable-code.config.bin" 1 0 "" 1
+
+echo "[fex-vixl] PASS: x64 loader, IA-32 core, vector-store, negative-add, indexed-alias, top-alias, alias-enabled rep-movs and stack, dispatcher-return, writable code and high-stack call/ret and TLS-selector fixtures completed in all modes"

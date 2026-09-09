@@ -1624,17 +1624,32 @@ FEXCore::HLE::ExecutableRangeInfo queryLiveExecutableRange(uint64_t address) {
 
 void invalidateLiveExecutableRange(FEXCore::Core::InternalThreadState* thread,
                                    uint64_t start, uint64_t length) {
+    if (!thread || !length || start + length < start) return;
     std::lock_guard<std::mutex> guard(gLiveMutex);
     auto it = gLiveThreadContexts.find(thread);
     if (it != gLiveThreadContexts.end() && it->second != nullptr) {
-        it->second->InvalidateThreadCachedCodeRange(thread, start, length);
+        auto* context = it->second;
+        // ThreadRemoveCodeEntryFromJit and the runtime backpatcher enter this
+        // callback without the invalidation lock. Clear the shared translated
+        // blocks as well as every thread's lookup cache under the same lock;
+        // otherwise an L1/L2 miss can repopulate the stale block from L3.
+        // Filter by context, including a still-running retired exec epoch.
+        std::scoped_lock codeLock(context->GetCodeInvalidationMutex());
+        context->InvalidateCodeBuffersCodeRange(start, length);
+        for (const auto& entry : gLiveThreadContexts) {
+            if (entry.second == context)
+                context->InvalidateThreadCachedCodeRange(entry.first, start, length);
+        }
         return;
     }
     // The probe uses its own mode-explicit context rather than the live
     // process table. Preserve FEX's SMC invalidation semantics there as well;
     // silently dropping this callback leaves stale translated blocks after
     // self-modifying guest code.
-    if (gProbeContext != nullptr && gProbeContext->context != nullptr) {
+    if (gProbeContext != nullptr && gProbeContext->context != nullptr &&
+        thread->CTX == gProbeContext->context.get()) {
+        std::scoped_lock codeLock(gProbeContext->context->GetCodeInvalidationMutex());
+        gProbeContext->context->InvalidateCodeBuffersCodeRange(start, length);
         gProbeContext->context->InvalidateThreadCachedCodeRange(
             thread, start, length);
     }

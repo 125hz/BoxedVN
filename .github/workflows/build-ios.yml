@@ -294,13 +294,16 @@ jobs:
             --output-dir build/dxmt-pe
           bash scripts/build-fex64-toolchains.sh --stage llvm-ios
           bash scripts/build-dxmt-ios-native.sh
+          bash scripts/build-openal-native.sh "${mingw}" build/dxmt-pe build/openal-ios/libboxedvn_openal.a
+          xcrun --sdk iphoneos libtool -static -o build/openal-ios/libgraphics_audio.a \
+            third_party/fex64/dxmt-ios/libdxmt_combined.a build/openal-ios/libboxedvn_openal.a
           bash scripts/build-x64-graphics-probe.sh \
             --toolchain "${mingw}" \
             --output build/guest-probes/boxedvn-d3d11-cube-x64.exe
           bash scripts/stage-x64-graphics-assets.sh \
             --probe build/guest-probes/boxedvn-d3d11-cube-x64.exe \
             --dxmt build/dxmt-pe \
-            --native-archive third_party/fex64/dxmt-ios/libdxmt_combined.a \
+            --native-archive build/openal-ios/libgraphics_audio.a \
             --output-dir build/x64-graphics
 
       - name: Upload x86-64 graphics resources
@@ -363,8 +366,12 @@ jobs:
           /tmp/test-sdl-audio-converter
           python3 scripts/test_guest_affinity64.py
           python3 scripts/test_guest_runtime_boundaries.py
+          python3 scripts/test_fex_code_invalidation.py
           python3 scripts/test_guest_scheduling_lifecycle.py
           python3 scripts/test_presentation_frame.py
+
+      - name: Test native audio mixing and guest boundaries
+        run: bash scripts/test-openal-native.sh
 
       - name: Test DXMT ABI validator
         run: python3 -m unittest scripts/test_validate_dxmt_guest_abi.py
@@ -438,7 +445,7 @@ jobs:
           path: |
             third_party/fex64/fex
             build/fex-vixl-probe
-          key: boxedvn-fex-vixl-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/run-fex64-vixl-probe.sh', 'scripts/fex64-patches/**', 'scripts/test-fex-exit-dispatch-contract.py', 'ios/support/include/boxedvn/fex_exit_dispatch_contract.h', 'scripts/guest-probes/fex64-loader-stall.asm', 'scripts/guest-probes/fex32-core-contract.asm', 'scripts/guest-probes/fex64-host-stubs.cpp', 'scripts/guest-probes/fex64-emitter-encoding-check.cpp', 'scripts/guest-probes/fex64-vector-store-contract.asm', 'scripts/guest-probes/fex64-negative-add-contract.asm', 'scripts/guest-probes/check-ircap-host-words.py', 'include/guest_low_alias.h', 'ios/support/include/boxedvn/launch_preflight.h', 'scripts/guest-probes/fex64-indexed-alias-contract.asm', 'scripts/guest-probes/fex64-top-alias-contract.asm', 'scripts/guest-probes/fex64-top-alias-repmov.asm', 'scripts/guest-probes/fex64-top-alias-stack.asm', 'scripts/guest-probes/fex64-dispatcher-return.asm', 'scripts/guest-probes/fex64-highstack-callret.asm', 'scripts/guest-probes/fex64-tls-selector.asm', 'include/guest_segment_table.h', 'scripts/guest-probes/fex64-kernel-probe.S', 'ios/support/include/boxedvn/exec_transition.h') }}
+          key: boxedvn-fex-vixl-${{ runner.os }}-${{ hashFiles('scripts/dependencies.fex64.lock.sh', 'scripts/run-fex64-vixl-probe.sh', 'scripts/fex64-patches/**', 'scripts/test-fex-exit-dispatch-contract.py', 'ios/support/include/boxedvn/fex_exit_dispatch_contract.h', 'scripts/guest-probes/fex64-loader-stall.asm', 'scripts/guest-probes/fex64-writable-code.asm', 'scripts/guest-probes/fex32-core-contract.asm', 'scripts/guest-probes/fex64-host-stubs.cpp', 'scripts/guest-probes/fex64-emitter-encoding-check.cpp', 'scripts/guest-probes/fex64-vector-store-contract.asm', 'scripts/guest-probes/fex64-negative-add-contract.asm', 'scripts/guest-probes/check-ircap-host-words.py', 'include/guest_low_alias.h', 'ios/support/include/boxedvn/launch_preflight.h', 'scripts/guest-probes/fex64-indexed-alias-contract.asm', 'scripts/guest-probes/fex64-top-alias-contract.asm', 'scripts/guest-probes/fex64-top-alias-repmov.asm', 'scripts/guest-probes/fex64-top-alias-stack.asm', 'scripts/guest-probes/fex64-dispatcher-return.asm', 'scripts/guest-probes/fex64-highstack-callret.asm', 'scripts/guest-probes/fex64-tls-selector.asm', 'include/guest_segment_table.h', 'scripts/guest-probes/fex64-kernel-probe.S', 'ios/support/include/boxedvn/exec_transition.h') }}
 
       - name: Fetch pinned translator source
         shell: bash
@@ -540,7 +547,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: third_party
-          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/fetch-dependencies.sh', 'scripts/sdl-patches/**', 'scripts/test-sdl-uikit-pump.py', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex-softfloat-namespace.py', 'scripts/fex-softfloat-overlay.cmake', 'include/fex_host_memory_hook.h', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/build-boxedwine-x64-x11.sh', 'scripts/validate-x64-x11-shim.py', 'tools/x11-64/**', 'include/boxedwine_x64_x11_bridge.h', 'scripts/build-boxedwine-x64-vulkan.sh', 'scripts/validate-x64-vulkan-shim.py', 'tools/vulkan-64/**', 'include/boxedwine_x64_vulkan_bridge.h', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/dxmt-patches/**', 'scripts/d3d9-metal-patches/**', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/rewrite-dxmt-guest-pointers.py', 'include/boxedwine_dxmt_guest_pointer.h', 'tools/dxmt/**', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/guest-probes/x64-d3d11-cube-shaders.h', 'scripts/guest-probes/x64-d3d11-cube.hlsl', 'scripts/wine64-runtime-manifest.example') }}
+          key: boxedvn-third-party-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/dependencies.lock.sh', 'scripts/fetch-dependencies.sh', 'scripts/sdl-patches/**', 'scripts/test-sdl-uikit-pump.py', 'scripts/dependencies.fex64.lock.sh', 'scripts/build-fex64-fex.sh', 'scripts/fex-softfloat-namespace.py', 'scripts/fex-softfloat-overlay.cmake', 'include/fex_host_memory_hook.h', 'scripts/fex64-patches/**', 'scripts/validate-wine64-runtime.sh', 'scripts/prepare-wine64-runtime.sh', 'scripts/build-wine64-runtime-ci.sh', 'scripts/build-boxedwine-x64-x11.sh', 'scripts/validate-x64-x11-shim.py', 'tools/x11-64/**', 'include/boxedwine_x64_x11_bridge.h', 'scripts/build-boxedwine-x64-vulkan.sh', 'scripts/validate-x64-vulkan-shim.py', 'tools/vulkan-64/**', 'include/boxedwine_x64_vulkan_bridge.h', 'scripts/prepare-dxmt-x64-dependencies.sh', 'scripts/build-dxmt-x64-pe.sh', 'scripts/dxmt-patches/**', 'scripts/d3d9-metal-patches/**', 'scripts/build-fex64-toolchains.sh', 'scripts/build-dxmt-ios-native.sh', 'scripts/rewrite-dxmt-guest-pointers.py', 'include/boxedwine_dxmt_guest_pointer.h', 'tools/dxmt/**', 'scripts/stage-x64-graphics-assets.sh', 'scripts/build-openal-native.sh', 'scripts/generate-openal-bridge.py', 'tools/openal/**', 'include/boxedwine_openal_bridge.h', 'scripts/build-x64-graphics-probe.sh', 'scripts/guest-probes/x64-d3d11-cube.c', 'scripts/guest-probes/x64-d3d11-cube-shaders.h', 'scripts/guest-probes/x64-d3d11-cube.hlsl', 'scripts/wine64-runtime-manifest.example') }}
 
       - name: Fetch pinned dependencies
         shell: bash

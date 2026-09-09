@@ -9,6 +9,7 @@
 
 #include "boxedwine.h"
 #include "kmemory64.h"
+#include "boxedwine_openal_bridge.h"
 #include "guest_mmap_placement.h"
 #include "native_map_plan.h"
 #include "native_shared_alias.h"
@@ -993,6 +994,9 @@ KMemory64::KMemory64(KProcess* process, bool nativeIdentity) : process(process) 
     if (this->nativeIdentity) k64ReportGuestLanesOnce(generation);
 }
 KMemory64::~KMemory64() {
+#ifdef BOXEDWINE_DXMT_NATIVE
+    bvnOpenALRetire(generation);
+#endif
 #if defined(BOXEDWINE_KMEMORY64_NATIVE_IDENTITY) && (defined(__APPLE__) || defined(__unix__))
     nativeDemoteSharedPages();
     nativeUnmapAll();

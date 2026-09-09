@@ -99,7 +99,7 @@ if [[ -n "${X64_GRAPHICS_RUNTIME_INPUT}" ]]; then
     require_file "${X64_GRAPHICS_RUNTIME_INPUT}/libdxmt_combined.a"
     [[ -d "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x64" ]] || die \
         "x64 graphics resources are missing dxmt-x64/."
-    for dxmt_dll in d3d11 dxgi d3d10core winemetal; do
+    for dxmt_dll in d3d11 dxgi d3d10core winemetal openal32; do
         require_file "${X64_GRAPHICS_RUNTIME_INPUT}/dxmt-x64/${dxmt_dll}.dll"
     done
     require_command python3
